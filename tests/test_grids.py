@@ -927,6 +927,38 @@ class TestShardLabel:
             with pytest.raises(ValueError):
                 morton_word(bad)
 
+    def test_morton_words_from_decimals_matches_scalar(self):
+        # Issue #322: the batch parse must be the scalar parse, elementwise —
+        # same values, INPUT order (not sorted), across both hemispheres and a
+        # spread of orders. The callers (bitmap decode, root-range expansion)
+        # sort/unique afterwards, so an order-scrambling batch parse would go
+        # unnoticed there and corrupt any future positional use.
+        from mortie import geo2mort
+
+        from zagg.grids.morton import morton_decimal, morton_word, morton_words_from_decimals
+
+        decimals = [
+            morton_decimal(int(geo2mort(np.array([lat]), np.array([lon]), order=order)[0]))
+            for lat, lon in [(-78.5, -132.0), (78.3, 12.0), (-72.1, 25.4), (0.1, 0.1)]
+            for order in (0, 6, 9, 18)
+        ]
+        batch = morton_words_from_decimals(decimals)
+        assert batch.dtype == np.uint64
+        scalar = np.asarray([morton_word(d) for d in decimals], dtype=np.uint64)
+        np.testing.assert_array_equal(batch, scalar)
+
+    def test_morton_words_from_decimals_edge_cases(self):
+        from zagg.grids.morton import morton_words_from_decimals
+
+        # Empty input is legal and stays typed: a bitmap with no set bits and a
+        # store with no stamped leaves both reach the batch parse with nothing.
+        empty = morton_words_from_decimals([])
+        assert empty.dtype == np.uint64 and empty.size == 0
+        # One malformed member fails the whole batch loudly (the scalar posture:
+        # a path component must never be silently wrong).
+        with pytest.raises(ValueError):
+            morton_words_from_decimals(["-4211322", "bogus"])
+
     def test_morton_word_returns_python_int(self):
         # Issue #322: the public mortie parse defaults to np.uint64; the
         # boundary pins dtype=int. A silent uint64 return would pass every
