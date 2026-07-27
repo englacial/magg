@@ -688,7 +688,7 @@ def decode_coverage_bitmap(payload: bytes, shard_key, cell_order: int) -> np.nda
     """
     from numcodecs import Zstd
 
-    from zagg.grids.morton import morton_decimal, morton_word
+    from zagg.grids.morton import morton_decimal, morton_words_from_decimals
 
     shard = morton_decimal(shard_key)
     depth = int(cell_order) - _decimal_order(shard)
@@ -701,14 +701,8 @@ def decode_coverage_bitmap(payload: bytes, shard_key, cell_order: int) -> np.nda
             f"(a partial cell set would be a false negative)"
         )
     bits = np.unpackbits(raw, count=4**depth)
-    words = np.empty(int(bits.sum()), dtype=np.uint64)
-    for i, rank in enumerate(np.flatnonzero(bits)):
-        digits, rank = [], int(rank)
-        for _ in range(depth):
-            digits.append(str(rank % 4 + 1))
-            rank //= 4
-        words[i] = morton_word(shard + "".join(reversed(digits)))
-    return np.sort(words)
+    decimals = [shard + _rank_tail(int(rank), depth) for rank in np.flatnonzero(bits)]
+    return np.sort(morton_words_from_decimals(decimals))
 
 
 def write_coverage_sidecar(leaf_root: str, payload: bytes, **store_kwargs) -> None:
@@ -969,10 +963,10 @@ def root_coverage_words(envelope: dict) -> np.ndarray:
     no word materialization) is the upgrade path if root objects ever reach
     continental-accumulation scale; out of scope here.
     """
-    from zagg.grids.morton import morton_word
+    from zagg.grids.morton import morton_words_from_decimals
 
     order = int(envelope["order"])
-    words = []
+    decimals = []
     for lo, hi in envelope["ranges"]:
         base = _decimal_base(lo)
         lo_rank, hi_rank = _decimal_rank(lo), _decimal_rank(hi)
@@ -980,8 +974,8 @@ def root_coverage_words(envelope: dict) -> np.ndarray:
         ok = ok and _decimal_order(lo) == order and _decimal_order(hi) == order
         if not ok:
             raise ValueError(f"malformed coverage range [{lo}, {hi}] at order {order}")
-        words.extend(morton_word(base + _rank_tail(r, order)) for r in range(lo_rank, hi_rank + 1))
-    return np.unique(np.asarray(words, dtype=np.uint64))
+        decimals.extend(base + _rank_tail(r, order) for r in range(lo_rank, hi_rank + 1))
+    return np.unique(morton_words_from_decimals(decimals))
 
 
 def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict:

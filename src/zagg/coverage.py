@@ -229,7 +229,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     import obstore
     from obstore.exceptions import NotFoundError
 
-    from zagg.grids.morton import morton_word
+    from zagg.grids.morton import morton_words_from_decimals
     from zagg.store import open_store
 
     manifest = read_manifest(store_root, **store_kwargs)
@@ -238,7 +238,9 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     order = int(manifest["shard_order"])
     store = open_object_store(store_root, **store_kwargs)
     root = store_root.rstrip("/")
-    keys: list = []
+    # Decimals accumulate through the walk and parse once at the end (issue
+    # #322) — a full-store refresh visits every stamped leaf.
+    decimals: list = []
     time_ranges: list = []
     stack = [""]
     while stack:
@@ -285,7 +287,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                         f"foreign-order data) — it will NOT be listed in {ROOT_COVERAGE_NAME}"
                     )
                     continue
-                keys.append(morton_word(decimal))
+                decimals.append(decimal)
                 # D15: windowed stamps carry the leaf's actual time range;
                 # the rebuilt root summary re-derives the union from this
                 # walk's stamps (truth), superseding any cached value.
@@ -297,14 +299,17 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
             if is_digit_node:
                 stack.append(rel + "/")
     _stale_warned.discard(root)
-    if not keys:
+    if not decimals:
         try:
             obstore.delete(store, ROOT_COVERAGE_NAME)
         except (FileNotFoundError, NotFoundError):
             pass
         return None
     envelope = build_root_coverage(
-        keys, order, source="refresh", time_range=union_time_range(*time_ranges)
+        morton_words_from_decimals(decimals),
+        order,
+        source="refresh",
+        time_range=union_time_range(*time_ranges),
     )
     obstore.put(store, ROOT_COVERAGE_NAME, json.dumps(envelope, indent=1).encode())
     return envelope
