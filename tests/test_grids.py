@@ -927,6 +927,16 @@ class TestShardLabel:
             with pytest.raises(ValueError):
                 morton_word(bad)
 
+    def test_morton_word_returns_python_int(self):
+        # Issue #322: the public mortie parse defaults to np.uint64; the
+        # boundary pins dtype=int. A silent uint64 return would pass every
+        # equality/dict-key assertion above yet wrap on the uint64 arithmetic
+        # the hive path does (rank offsets, order deltas), so pin the type.
+        from zagg.grids.morton import morton_word
+
+        word = morton_word("-4211322")
+        assert type(word) is int
+
     def test_morton_decimal_raises_valueerror_on_invalid(self):
         # The emit direction's advertised contract (review finding, PR #205):
         # the empty sentinel raises, and a NEGATIVE input — a legacy signed

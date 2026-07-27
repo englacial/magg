@@ -118,18 +118,18 @@ def morton_word(label: str) -> int:
     external decimal id re-enters (``--morton-cell``, hive leaf ids on the
     read path). Raises ``ValueError`` on a malformed id.
 
-    Implementation note: this rides mortie's private-but-documented
-    ``_decimal_to_word`` (the issue-104 parse-back) rather than the public
-    ``MortonIndexArray.from_hive_path(label, suffix="")`` because the array
-    classes are built lazily and require pandas — the private function is
-    numpy-only, keeping the reader path light. The upstream ask (a public
-    numpy-only export) stands. Same non-injectivity caveat mortie documents: an
-    order-29 *point* id parses back to the *area* word (irrelevant for shard
-    keys at order <= 11; noted since this is a general boundary helper).
+    Rides mortie's public numpy-only parse export (``decimal_to_word``, mortie
+    0.9.1+, espg/mortie#114) — the upstream ask this boundary used to work
+    around with the private ``_decimal_to_word``. ``dtype=int`` keeps the
+    Python-``int`` return the callers (dict keys, path building) expect; the
+    default would hand back ``np.uint64``. Same non-injectivity caveat mortie
+    documents: an order-29 *point* id parses back to the *area* word
+    (irrelevant for shard keys at order <= 11; noted since this is a general
+    boundary helper). See :func:`morton_words_from_decimals` for the batch form.
     """
-    from mortie.morton_index import _decimal_to_word
+    from mortie import decimal_to_word
 
-    return _decimal_to_word(str(label))
+    return decimal_to_word(str(label), dtype=int)
 
 
 def morton_box(values) -> np.ndarray:
