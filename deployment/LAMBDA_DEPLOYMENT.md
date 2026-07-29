@@ -81,8 +81,9 @@ the prompt). See
 [docs/deployment/lambda.md](../docs/deployment/lambda.md) for the parameter
 table and overrides.
 
-`deploy.sh` (below) is the maintainer path for *in-place updates* to an
-already-deployed function and does not create the role/function/bucket.
+`deploy.sh` is the maintainer path for *in-place updates* to an already-deployed
+function and does not create the role/function/bucket — see
+[Rebuilding the Layer](#rebuilding-the-layer) below for what it consumes.
 
 ---
 
@@ -144,8 +145,19 @@ The zip lands in `deployment/layers/lambda_layer_<arch>.zip`. The script
 enforces the 250 MB unzipped limit itself; CI additionally gates the combined
 layer + function size. CI builds both arches this same way on arch-matched
 runners (`lambda-build.yml` → `lambda-build-reusable.yml`), and release zips
-come from `publish.yml` calling the same reusable workflow — deploys consume
-those via `stand_up.sh` (above).
+come from `publish.yml` calling the same reusable workflow.
+
+**What consumes the zip:** nothing in the repo deploys
+`deployment/layers/lambda_layer_<arch>.zip` — it is for local verification and
+size-checking. To actually put a layer on a function:
+
+- **in-place maintainer update** — `deployment/aws/deploy.sh`. Note it pulls the
+  **CI artifact**, not your local build (`gh run download --name
+  "lambda-layer-${ARCH}"`), then `publish-layer-version` (staging through S3
+  when the zip is >50 MB) and `update-function-configuration`.
+- **full standup, or a fresh account/region** — cut a release and use
+  `stand_up.sh`, which deploys the release zips staged on the distribution
+  bucket (above), not local ones.
 
 ---
 
