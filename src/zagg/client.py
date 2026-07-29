@@ -13,6 +13,15 @@ shardmap → dispatch → harvest — as library API::
         r = fut.result()                       # worker envelope / raises ShardError
     handle.status()                            # {"pending", "ok", "failed"}
 
+Draining the harvest iterator to exhaustion (``as_completed`` / ``progress`` /
+``results`` / a clean ``raise_first``) also joins the post-run tail — the
+finalize backstop and the coverage/stats/sweep rollup invokes — so the loop
+above IS the whole run and :meth:`RunHandle.wait` is only needed for explicit
+control (a timeout, or a handle harvested some other way). Abandoning a handle
+without draining it is the one flow that truncates the tail: the finisher is a
+daemon thread, so an undrained handle cannot wedge interpreter exit (review
+finding, PR #333).
+
 **v1 transport** (ratified on issue #265): a ``ThreadPoolExecutor`` over the
 existing synchronous ``RequestResponse`` invokes — each shard is one
 :func:`zagg.runner._invoke_lambda_cell` call and its pool future is the
@@ -109,7 +118,12 @@ class RunHandle:
     A background finisher thread waits for every shard, then runs the same
     worker-invoke tail as ``agg``'s lambda path: the finalize backstop, plus
     the fail-open coverage/stats/sweep rollup invokes (D8: all worker-side).
-    :meth:`wait` joins it and surfaces a finalize failure.
+    Draining any of the harvest iterators (:meth:`as_completed`,
+    :meth:`progress`, :meth:`results`, a clean :meth:`raise_first`) joins that
+    finisher before returning and surfaces a finalize failure, so a completed
+    harvest loop means a completed run; :meth:`wait` is the explicit form (and
+    the only one taking a timeout). Only a handle nobody drains truncates the
+    tail — the finisher is a daemon so that case cannot hang exit.
     """
 
     def __init__(self, futures: dict[int, Future], *, store_path: str):
@@ -129,8 +143,15 @@ class RunHandle:
         )
 
     def as_completed(self, timeout: float | None = None) -> Iterator[Future]:
-        """Yield each shard future as it completes (``concurrent.futures`` order)."""
-        return as_completed(self.futures.values(), timeout=timeout)
+        """Yield each shard future as it completes (``concurrent.futures`` order).
+
+        Exhausting this iterator joins the post-run tail (see :meth:`wait`) and
+        re-raises a finalize failure, so the documented harvest loop finishes a
+        complete run without calling :meth:`wait` (review finding, PR #333).
+        Breaking out early skips that join — call :meth:`wait` if you do.
+        """
+        yield from as_completed(self.futures.values(), timeout=timeout)
+        self._join_tail()
 
     def status(self) -> dict[str, int]:
         """Non-blocking snapshot: ``{"pending": n, "ok": n, "failed": n}``."""
@@ -150,19 +171,31 @@ class RunHandle:
         With ``return_exceptions=False`` (default) the first failed shard's
         :class:`ShardError` propagates (key order); with ``True`` failures
         appear as the exception object in the mapping instead — the
-        ``asyncio.gather`` convention.
+        ``asyncio.gather`` convention. Either way the post-run tail is joined
+        first (see :meth:`as_completed`), so a shard failure does not truncate
+        the rollups.
         """
         out: dict[int, Any] = {}
+        first_exc: BaseException | None = None
         for key, fut in self.futures.items():
-            if return_exceptions:
-                exc = fut.exception()
-                out[key] = exc if exc is not None else fut.result()
-            else:
+            exc = fut.exception()
+            if exc is None:
                 out[key] = fut.result()
+            else:
+                out[key] = exc
+                if first_exc is None:
+                    first_exc = exc
+        self._join_tail()
+        if first_exc is not None and not return_exceptions:
+            raise first_exc
         return out
 
     def raise_first(self) -> None:
-        """Block until the first failure (raising it) or all shards complete."""
+        """Block until the first failure (raising it) or all shards complete.
+
+        A clean run drains :meth:`as_completed`, so it joins the post-run tail;
+        raising on a failure leaves the tail in flight (:meth:`wait` joins it).
+        """
         for fut in self.as_completed():
             exc = fut.exception()
             if exc is not None:
@@ -193,11 +226,27 @@ class RunHandle:
         reader-facing schema, D6); the coverage/stats/sweep rollups are
         fail-open by design and never raise here. Raises ``TimeoutError``
         when the tail is still running at ``timeout``.
+
+        Draining a harvest iterator already joins the tail, so ``wait`` is for
+        explicit control.
         """
         if self._finisher is not None:
             self._finisher.join(timeout)
             if self._finisher.is_alive():
                 raise TimeoutError(f"run tail still in flight after {timeout}s")
+        self._raise_tail_error()
+
+    def _join_tail(self) -> None:
+        """Join the post-run finisher, then re-raise what it recorded.
+
+        Idempotent (joining a finished thread is a no-op), so draining a
+        harvest iterator and then calling :meth:`wait` is safe.
+        """
+        if self._finisher is not None:
+            self._finisher.join()
+        self._raise_tail_error()
+
+    def _raise_tail_error(self) -> None:
         if self._finalize_error is not None:
             raise self._finalize_error
 
