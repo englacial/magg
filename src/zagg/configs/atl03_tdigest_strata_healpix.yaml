@@ -17,6 +17,11 @@
 # below-compression-knee regime). The committed threshold is recorded in the
 # field's ``attrs`` so readers bind to store metadata, not this file.
 #
+# The low/med/high lanes are ABSOLUTE (conf == 2/3/4), never renumbered against
+# ``threshold``: at the default threshold 2 all three carry counts, and a
+# variant committing a higher threshold simply ships empty lower lanes rather
+# than shifted ones -- one lane layout for every product.
+#
 # The five ``signal_conf_*`` columns are read from the single 2-D
 # ``signal_conf_ph`` dataset via the per-variable ``column`` selector (one
 # read, five columns -- the dataset path is deduped with the TEP filter's).

@@ -17,7 +17,10 @@ is **committed at ingest** and carried through the store in three pieces:
    of quantized fractions of the signal stratum — five per-surface lanes
    (`signal_conf_ph` column order: land, ocean, sea_ice, land_ice,
    inland_water) and three low/med/high lanes (a signal photon's *strongest*
-   per-surface confidence, 2/3/4).
+   per-surface confidence, 2/3/4). The level lanes are **absolute** — always
+   `conf == 2/3/4`, never renumbered against the threshold — so a product
+   committing a higher threshold ships empty lower lanes rather than shifted
+   ones, and one lane layout serves every product.
 3. **Store attrs** recording the commitment: each stratum array carries
    `stratum` + `signal_threshold`, and the composition array carries the
    versioned `composition` block (`spec`, `lanes`, `of` — the digest whose
