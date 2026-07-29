@@ -442,6 +442,97 @@ class TestCalculateCellStatistics:
         assert result["h_nanmin"] == 1.0
 
 
+class TestStratifiedAggregation:
+    """Signal/noise strata + packed composition through the cell path (issue #321)."""
+
+    _SIGNAL = "(c_land >= 2) | (c_ocean >= 2) | (c_sea >= 2) | (c_ice >= 2) | (c_water >= 2)"
+
+    def _config(self):
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            aggregation={
+                "variables": {
+                    "count": {"function": "len", "source": "h_li", "dtype": "int32"},
+                    "h_sig": {
+                        "kind": "ragged",
+                        "function": "zagg.stats.tdigest.build_tdigest_where",
+                        "source": "h_li",
+                        "inner_shape": [2],
+                        "dtype": "float32",
+                        "params": {"delta": 64, "where": self._SIGNAL},
+                    },
+                    "h_noise": {
+                        "kind": "ragged",
+                        "function": "zagg.stats.tdigest.build_tdigest_where",
+                        "source": "h_li",
+                        "inner_shape": [2],
+                        "dtype": "float32",
+                        "params": {"delta": 64, "where": f"~({self._SIGNAL})"},
+                    },
+                    "composition": {
+                        "function": "zagg.stats.composition.pack_composition",
+                        "source": "h_li",
+                        "dtype": "uint64",
+                        "fill_value": 0,
+                        "params": {
+                            "conf_land": "c_land",
+                            "conf_ocean": "c_ocean",
+                            "conf_sea_ice": "c_sea",
+                            "conf_land_ice": "c_ice",
+                            "conf_inland_water": "c_water",
+                            "threshold": 2,
+                        },
+                    },
+                }
+            }
+        )
+
+    def _cell(self, n=40, seed=7):
+        rng = np.random.default_rng(seed)
+        conf = rng.integers(-2, 5, size=(n, 5))
+        cols = ("c_land", "c_ocean", "c_sea", "c_ice", "c_water")
+        data = {name: conf[:, i] for i, name in enumerate(cols)}
+        data["h_li"] = rng.standard_normal(n)
+        return data, conf
+
+    def test_strata_are_disjoint_and_exhaustive(self):
+        data, conf = self._cell()
+        result = calculate_cell_statistics(data, config=self._config())
+        n_sig = int(result["h_sig"][:, 1].sum())
+        n_noise = int(result["h_noise"][:, 1].sum())
+        assert n_sig + n_noise == result["count"] == 40
+        assert n_sig == int((conf >= 2).any(axis=1).sum())
+
+    def test_composition_word_survives_above_2_53(self):
+        # A word with a high byte set exceeds float64's exact-integer ceiling;
+        # the integer coercion path must round-trip it exactly.
+        data, conf = self._cell()
+        result = calculate_cell_statistics(data, config=self._config())
+        from zagg.stats.composition import pack_composition
+
+        cols = ("c_land", "c_ocean", "c_sea", "c_ice", "c_water")
+        kw = dict(
+            zip(
+                ("conf_land", "conf_ocean", "conf_sea_ice", "conf_land_ice", "conf_inland_water"),
+                (data[c] for c in cols),
+            )
+        )
+        expected = pack_composition(data["h_li"], **kw, threshold=2)
+        assert result["composition"] == expected
+        assert isinstance(result["composition"], int)
+        assert expected > 2**53  # the regime float() would corrupt
+
+    def test_empty_cell_integer_fill(self):
+        cols = ("c_land", "c_ocean", "c_sea", "c_ice", "c_water")
+        data = {name: np.array([], dtype=np.int64) for name in cols}
+        data["h_li"] = np.array([])
+        result = calculate_cell_statistics(data, config=self._config())
+        assert result["composition"] == 0
+        assert result["count"] == 0
+        assert result["h_sig"] == [] and result["h_noise"] == []
+
+
 class TestVectorOutputs:
     """Issue #29 phase 2: a ``kind: vector`` field yields a per-cell ndarray of
     its declared ``trailing_shape``/``dtype``; scalar fields are unchanged."""
