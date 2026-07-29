@@ -133,8 +133,12 @@ docker run --rm \
 ```
 
 On an SELinux-enforcing Linux host, add `:z` to the podman volume mount
-(`-v "$(pwd)":/workspace:z`) so the container can write the zip back; it is
-not needed on macOS (`podman machine`).
+(`-v "$(pwd)":/workspace:z`). Without it the container cannot *read* the
+unlabeled mount either, so the build dies at the top (`chmod +x build_layer.sh`,
+or reading `../../pyproject.toml` for `MORTIE_SPEC`) rather than at zip-write
+time. Note `:z` relabels the mount **recursively with a shared label** — and the
+mount here is the whole repo root, not a scratch dir; `:Z` is the private-label
+variant. Neither is needed on macOS (`podman machine`).
 
 The zip lands in `deployment/layers/lambda_layer_<arch>.zip`. The script
 enforces the 250 MB unzipped limit itself; CI additionally gates the combined
