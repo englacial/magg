@@ -250,14 +250,35 @@ class TestDispatch:
         handle = _run(catalog, client=stub).dispatch(shard_keys=[_WORDS[1]])
         handle.results()
         (_, _, event) = stub.cell_events()[0]
+        # The complete key set, not a spot check: a key added to or dropped
+        # from the cell event has to fail here (review finding, PR #333).
+        assert set(event) == {
+            "chunk_idx",
+            "shard_key",
+            "parent_order",
+            "child_order",
+            "granule_urls",
+            "store_path",
+            "s3_credentials",
+            "config",
+            "handoff",
+            "run_id",
+            "submap",
+        }
         assert event["shard_key"] == _WORDS[1]
+        assert event["parent_order"] == 6
+        assert event["child_order"] == 12
         assert event["granule_urls"] == [_rec(3)["s3"]]
         assert event["store_path"] == _STORE
-        assert event["s3_credentials"]["accessKeyId"] == "AK"
+        assert event["s3_credentials"] == _CREDS
         assert event["config"]["output"]["grid"]["parent_order"] == 6
         assert event["handoff"] == "arrow"
         assert event["run_id"]
-        assert event["submap"]["granules"] == [_rec(3)]
+        assert event["submap"] == {
+            "grid_signature": _ATL06_SIG,
+            "metadata": {"short_name": "ATL06", "version": "006"},
+            "granules": [_rec(3)],
+        }
 
     def test_hive_setup_handshake_precedes_cells(self, catalog):
         stub = StubLambdaClient()
@@ -299,6 +320,108 @@ class TestDispatch:
         run = _run(catalog, client=StubLambdaClient())
         with pytest.raises(ValueError, match="not in shardmap"):
             run.dispatch(shard_keys=[123])
+
+
+# -- parity with the runner's lambda path -------------------------------------
+
+
+class TestRunnerParity:
+    """The PR's central claim, made differential (review finding, PR #333).
+
+    Spot-checking hand-picked keys cannot catch a divergence the facade grows
+    later, so drive the SAME config + shardmap through ``runner.agg(backend=
+    "lambda", invocation="sync")`` against an equivalent stub and compare the
+    cell events field-by-field.
+    """
+
+    @staticmethod
+    def _agg_cell_events(catalog_file, monkeypatch, cfg=None, **agg_kwargs):
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        from zagg import hive, runner
+        from zagg.concurrency import ConcurrencyReport
+
+        stub = StubLambdaClient()
+        session = MagicMock()
+        session.client.side_effect = lambda service, **k: (
+            stub if service == "lambda" else MagicMock()
+        )
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: session)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 900)
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                3,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: dict(_CREDS))
+        # The hive manifest checker (issue #274) polls the output store; keep
+        # this run read-free rather than reaching for a bucket that isn't there.
+        monkeypatch.setattr(hive, "read_manifest", lambda *a, **k: None)
+        runner.agg(
+            cfg if cfg is not None else default_config("atl06"),
+            catalog=catalog_file,
+            store=_STORE,
+            backend="lambda",
+            invocation="sync",
+            function_name="process-shard-test",
+            max_workers=3,
+            **agg_kwargs,
+        )
+        return {e["shard_key"]: e for _, _, e in stub.cell_events()}
+
+    def test_cell_events_match_the_runner_lambda_path(self, catalog, catalog_file, monkeypatch):
+        agg_events = self._agg_cell_events(catalog_file, monkeypatch)
+        stub = StubLambdaClient()
+        _run(catalog, client=stub).dispatch().results()
+        client_events = {e["shard_key"]: e for _, _, e in stub.cell_events()}
+
+        assert set(client_events) == set(agg_events) == set(_WORDS)
+        for key in _WORDS:
+            mine, theirs = dict(client_events[key]), dict(agg_events[key])
+            # run_id is a fresh uuid per dispatch by construction; both paths
+            # carry one and the worker only echoes it into the stats record.
+            assert mine.pop("run_id") and theirs.pop("run_id")
+            assert mine == theirs
+
+    def test_driver_https_is_the_one_deliberate_divergence(
+        self, catalog, catalog_file, monkeypatch
+    ):
+        # The facade resolves granule_urls through the config's data_source
+        # driver; runner._cell_work hardcodes "s3" (_run_lambda takes no driver
+        # at all), so a `driver: https` config is the ONE field where the two
+        # paths differ. Kept deliberately — the worker selects HTTPDriver from
+        # that same config key (processing/worker.py) and read.py passes an
+        # https url through unrewritten, so agg's lambda path hands s3:// urls
+        # to an HTTP driver. Pinned here in both directions; whether _run_lambda
+        # should be fixed to match is an espg call (PR #333 "Questions for
+        # review").
+        cfg = default_config("atl06")
+        cfg.data_source["driver"] = "https"
+        agg_events = self._agg_cell_events(catalog_file, monkeypatch, cfg=cfg)
+        stub = StubLambdaClient()
+        _run(catalog, client=stub, config=cfg).dispatch().results()
+        client_events = {e["shard_key"]: e for _, _, e in stub.cell_events()}
+
+        key = _WORDS[1]
+        assert client_events[key]["granule_urls"] == [_rec(3)["https"]]
+        assert agg_events[key]["granule_urls"] == [_rec(3)["s3"]]
+        # granule_urls is the ONLY divergence: everything else still matches.
+        mine, theirs = dict(client_events[key]), dict(agg_events[key])
+        for ev in (mine, theirs):
+            ev.pop("granule_urls")
+            ev.pop("run_id")
+        assert mine == theirs
 
 
 # -- futures -----------------------------------------------------------------
