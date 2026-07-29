@@ -82,6 +82,10 @@ class TestPackComposition:
         w_high_only = pack_composition(np.zeros(3), **_conf_kwargs(conf), threshold=4)
         lanes = unpack_composition(w_high_only)
         assert lanes[0] == 255 and lanes[7] == 255  # 1 signal photon, high
+        # Documented behavior, not a surprise: level lanes are ABSOLUTE
+        # (conf == 2/3/4 at every threshold), so raising the threshold empties
+        # the lower lanes instead of renumbering them — one lane layout for
+        # every product (see pack_composition's docstring).
         assert lanes[5] == 0 and lanes[6] == 0
 
     def test_row_mismatch_raises(self):

@@ -25,6 +25,12 @@ The per-surface lanes are **overlapping marginals** (``surf_type`` is
 multi-hot): they do not sum to 255 and cannot split the height distribution
 per surface. Empty signal stratum packs to 0.
 
+The level lanes are **absolute** — always ``conf == 2 / 3 / 4``, never
+renumbered against the signal ``threshold``. Raising the threshold therefore
+empties lanes rather than shifting them (``threshold=4`` ⇒ ``low``/``med``
+structurally 0), which keeps one lane layout across every product; see
+:func:`pack_composition`.
+
 Merge law (order-independent monoid over ``(word, n)`` pairs)::
 
     lane_merged = quantize((n_a * lane_a + n_b * lane_b) / (n_a + n_b))
@@ -113,6 +119,22 @@ def pack_composition(
     (``attrs.composition.threshold`` vs ``params.threshold``) and the ``of``
     reference, but the predicate itself is an arbitrary expression and stays
     the config author's responsibility.
+
+    **Level lanes are absolute, not threshold-relative.** Lanes 5–7 always mean
+    ``strongest conf == 2 / 3 / 4`` — the meanings never renumber, so a reader
+    binding to :data:`LANES` needs no knowledge of ``threshold``. The
+    consequence at a raised threshold is *empty* lanes, not shifted ones:
+    ``threshold=3`` leaves ``low`` structurally 0, ``threshold=4`` leaves
+    ``low`` and ``med`` 0, since a signal photon is ``>= threshold`` by
+    construction. That is the ratified design (a high-only product carries the
+    same lane layout as the default one), not an accident of the reducer.
+
+    Confidence values are ATL03's ``-2..4``, so ``strongest`` always lands in
+    ``(2, 3, 4)`` for a signal photon and the three level lanes partition the
+    signal stratum exactly. A source whose confidences exceeded 4 would fall
+    outside all three lanes (``counts[5:].sum() < n``) while the surface lanes
+    stayed populated — out of contract for this spec rather than defended
+    against here.
     """
     values = np.asarray(values, dtype=np.float64)
     conf = np.column_stack(
