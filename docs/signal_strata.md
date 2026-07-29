@@ -21,11 +21,13 @@ is **committed at ingest** and carried through the store in three pieces:
    `conf == 2/3/4`, never renumbered against the threshold — so a product
    committing a higher threshold ships empty lower lanes rather than shifted
    ones, and one lane layout serves every product.
-3. **Store attrs** recording the commitment: each stratum array carries
-   `stratum` + `signal_threshold`, and the composition array carries the
+3. **Store attrs** recording the commitment: each stratum's *payload* array
+   carries `stratum` + `signal_threshold`, and the composition array carries the
    versioned `composition` block (`spec`, `lanes`, `of` — the digest whose
    total weight is `N_signal` — and `threshold`). Readers bind to these,
-   never to config conventions.
+   never to config conventions. The located sibling
+   (`{field}_locations`) carries no user attrs: it is addressed through its
+   payload array, which holds the pair's provenance.
 
 The shipped template is `zagg/configs/atl03_tdigest_strata_healpix.yaml` —
 **located strata is the default**: both digest fields carry `location:
