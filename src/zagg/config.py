@@ -570,6 +570,64 @@ def validate_config(config: PipelineConfig) -> None:
                     f"Variable '{name}': attrs must be JSON-serializable ({exc})"
                 ) from exc
 
+            _validate_composition_attrs(name, meta, attrs, agg_vars)
+
+
+def _validate_composition_attrs(name: str, meta: dict, attrs: dict, agg_vars: dict) -> None:
+    """Cross-check a ``composition`` attrs block against the field it describes.
+
+    The whole field rests on one invariant: the ``N`` a reader divides the lanes
+    by is the total weight of the digest named by ``of``, and the lanes were
+    packed at the ``threshold`` recorded here (issue #321). Both halves are
+    silent-wrong-answer failures — lanes stay in range, only the recovered
+    counts are wrong — so they are checked at load:
+
+    * ``of`` must name another ``aggregation.variables`` entry of
+      ``kind: ragged`` (a typo or a later rename of the digest field would
+      otherwise leave readers dereferencing a field that does not exist);
+    * ``threshold`` must equal the field's own ``params.threshold`` (the value
+      the reducer actually packs at).
+
+    The third coupling — the digest fields' ``where`` predicates committing the
+    same cut as ``threshold`` — is *not* validated here: ``where`` is an
+    arbitrary expression, so any check would be a regex over Python source that
+    both misses real drift (``> 1`` is the same cut as ``>= 2``) and rejects
+    valid predicates. It is stated in :func:`zagg.stats.composition.pack_composition`'s
+    docstring instead, where it travels with the function rather than with one
+    config template.
+    """
+    block = attrs.get("composition")
+    if not isinstance(block, dict):
+        return
+    of = block.get("of")
+    if of is not None:
+        if of == name:
+            raise ValueError(
+                f"Variable '{name}': attrs.composition.of names the composition field "
+                f"itself; it must name the signal digest whose total weight is N_signal"
+            )
+        target = agg_vars.get(of)
+        if target is None:
+            raise ValueError(
+                f"Variable '{name}': attrs.composition.of '{of}' is not a declared "
+                f"aggregation.variables field (readers resolve N_signal through it)"
+            )
+        if target.get("kind") != "ragged":
+            raise ValueError(
+                f"Variable '{name}': attrs.composition.of '{of}' must be a "
+                f"'kind: ragged' digest field (got kind "
+                f"{target.get('kind', 'scalar')!r}) — N_signal is its total weight"
+            )
+    threshold = block.get("threshold")
+    if threshold is not None:
+        packed = (meta.get("params") or {}).get("threshold")
+        if packed is not None and packed != threshold:
+            raise ValueError(
+                f"Variable '{name}': attrs.composition.threshold {threshold!r} disagrees "
+                f"with params.threshold {packed!r} — the recorded threshold must be the "
+                f"one the reducer packs at (issue #321)"
+            )
+
 
 # Required per-variable keys for a temporal/event aggregation spec. ``mask``
 # is optional (``specs_from_config`` defaults it to ``"ais"``); capability
