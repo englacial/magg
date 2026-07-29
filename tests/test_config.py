@@ -498,6 +498,44 @@ class TestValidation:
         with pytest.raises(ValueError, match="path string or a"):
             validate_config(cfg)
 
+    def _config_with_field_attrs(self, attrs):
+        return PipelineConfig(
+            data_source={"variables": {"h_li": "/path"}},
+            aggregation={
+                "variables": {
+                    "n": {"function": "len", "source": "h_li", "dtype": "int32", "attrs": attrs},
+                }
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+
+    def test_field_attrs_accepted(self):
+        validate_config(self._config_with_field_attrs({"stratum": "signal", "signal_threshold": 2}))
+
+    def test_field_attrs_reserved_ragged_key_rejected(self):
+        with pytest.raises(ValueError, match="reserved"):
+            validate_config(self._config_with_field_attrs({"ragged": {}}))
+
+    def test_field_attrs_non_str_key_rejected(self):
+        with pytest.raises(ValueError, match="string keys"):
+            validate_config(self._config_with_field_attrs({1: "x"}))
+
+    def test_field_attrs_non_json_rejected(self):
+        import numpy as np
+
+        with pytest.raises(ValueError, match="JSON-serializable"):
+            validate_config(self._config_with_field_attrs({"arr": np.zeros(2)}))
+
+    def test_shipped_strata_config_validates(self):
+        from importlib import resources
+
+        from zagg.config import load_config
+
+        cfg = load_config(
+            str(resources.files("zagg.configs").joinpath("atl03_tdigest_strata_healpix.yaml"))
+        )
+        validate_config(cfg)
+
     def test_missing_source(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},

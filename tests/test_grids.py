@@ -1505,3 +1505,53 @@ class TestSharded:
         g0 = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6)
         g1 = HealpixGrid(4, 8, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
         assert g0.signature() == g1.signature()
+
+
+class TestFieldAttrsTemplate:
+    """Config-declared field attrs land on the template arrays (issue #321)."""
+
+    def _grid(self):
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "count": {"function": "len", "source": "h_li", "dtype": "int32"},
+                    "h_sig": {
+                        "kind": "ragged",
+                        "function": "zagg.stats.tdigest.build_tdigest_where",
+                        "source": "h_li",
+                        "inner_shape": [2],
+                        "dtype": "float32",
+                        "params": {"delta": 64, "where": "h_li > 0"},
+                        "attrs": {"stratum": "signal", "signal_threshold": 2},
+                    },
+                    "composition": {
+                        "function": "zagg.stats.composition.pack_composition",
+                        "source": "h_li",
+                        "dtype": "uint64",
+                        "fill_value": 0,
+                        "attrs": {"composition": {"spec": "zagg-composition/1", "threshold": 2}},
+                    },
+                }
+            }
+        )
+        return HealpixGrid(parent_order=4, child_order=8, chunk_inner=6, sharded=True, config=cfg)
+
+    def test_scalar_field_attrs(self):
+        m = self._grid().spec().members
+        assert dict(m["composition"].attributes) == {
+            "composition": {"spec": "zagg-composition/1", "threshold": 2}
+        }
+
+    def test_ragged_field_attrs_merge_with_ragged_block(self):
+        m = self._grid().spec().members
+        attrs = dict(m["h_sig"].attributes)
+        # The layout block survives; the declared attrs ride alongside.
+        assert attrs["ragged"]["spec"] == "zagg-ragged/1"
+        assert attrs["stratum"] == "signal"
+        assert attrs["signal_threshold"] == 2
+
+    def test_undeclared_fields_unchanged(self):
+        m = self._grid().spec().members
+        assert dict(m["count"].attributes) == {}

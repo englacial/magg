@@ -546,6 +546,30 @@ def validate_config(config: PipelineConfig) -> None:
                     f"field/coordinate of that name — rename one of them (issue #209)"
                 )
 
+        # Field-level store attrs (issue #321): free-form provenance the grid
+        # template merges onto the field's array spec (e.g. the composition
+        # field's lane order and signal threshold), so readers bind to
+        # metadata instead of reconstructing config conventions.
+        attrs = meta.get("attrs")
+        if attrs is not None:
+            if not isinstance(attrs, dict) or not all(isinstance(k, str) for k in attrs):
+                raise ValueError(f"Variable '{name}': attrs must be a mapping with string keys")
+            from zagg.grids.base import RAGGED_ELEMENT_ATTR
+
+            if RAGGED_ELEMENT_ATTR in attrs:
+                raise ValueError(
+                    f"Variable '{name}': attrs key {RAGGED_ELEMENT_ATTR!r} is reserved "
+                    f"for the ragged layout block (issue #209)"
+                )
+            import json
+
+            try:
+                json.dumps(attrs)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Variable '{name}': attrs must be JSON-serializable ({exc})"
+                ) from exc
+
 
 # Required per-variable keys for a temporal/event aggregation spec. ``mask``
 # is optional (``specs_from_config`` defaults it to ``"ais"``); capability

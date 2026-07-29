@@ -59,6 +59,22 @@ RAGGED_SPEC = "zagg-ragged/1"
 RAGGED_ZSTD_LEVEL = 3
 
 
+def apply_field_attrs(spec, meta: dict):
+    """Merge a variable's config-declared ``attrs`` onto its array spec.
+
+    ``aggregation.variables.{name}.attrs`` (issue #321) records field-level
+    provenance in the store — e.g. the composition field's lane order and the
+    signal threshold the split was committed at — so readers bind to metadata
+    rather than reconstructing config conventions. Declared keys are merged
+    over the spec's own attributes; the reserved ``ragged`` block cannot be
+    overridden (enforced at config validation).
+    """
+    attrs = meta.get("attrs")
+    if not attrs:
+        return spec
+    return spec.with_attributes({**dict(spec.attributes or {}), **attrs})
+
+
 def ragged_locations_name(field_name: str) -> str:
     """On-disk array name of a located ragged field's uint64 channel (issue #87).
 
