@@ -88,13 +88,14 @@ def _envelope(body: dict, status=200):
 class StubLambdaClient:
     """boto3-Lambda-shaped stub: records invokes, answers canned envelopes."""
 
-    def __init__(self, *, fail=(), benign=(), timeout=(), delays=None):
+    def __init__(self, *, fail=(), benign=(), timeout=(), delays=None, mode_delay=0):
         self.events: list[tuple[str, str, dict]] = []
         self._lock = threading.Lock()
         self._fail = set(fail)
         self._benign = set(benign)
         self._timeout = set(timeout)
         self._delays = delays or {}
+        self._mode_delay = mode_delay
         self.gate: threading.Event | None = None  # holds cell invokes open
 
     def invoke(self, **kwargs):
@@ -102,6 +103,10 @@ class StubLambdaClient:
         with self._lock:
             self.events.append((kwargs["FunctionName"], kwargs["InvocationType"], event))
         if event.get("mode") is not None:  # ping/setup/finalize/coverage/stats/sweep
+            # A non-zero mode_delay stands in for a real tail round trip, so a
+            # test that fails to join the finisher observes a truncated tail
+            # deterministically rather than racily.
+            time.sleep(self._mode_delay)
             return _envelope({"zagg_version": "stub"})
         key = event["shard_key"]
         if self.gate is not None:
@@ -305,6 +310,39 @@ class TestFutures:
         first = next(iter(handle.as_completed()))
         assert first is handle.futures[_WORDS[2]]  # the undelayed shard lands first
         handle.results()
+
+    @pytest.mark.parametrize("drain", ["as_completed", "progress", "results", "raise_first"])
+    def test_draining_joins_the_post_run_tail(self, catalog, drain):
+        # Regression (review finding, PR #333): the documented flow never calls
+        # wait(), so the finisher used to be cut off at process exit with the
+        # coverage/stats rollups undispatched. Draining any harvest iterator
+        # joins the tail, so the loop alone completes the run.
+        if drain == "progress":
+            pytest.importorskip("tqdm")
+        stub = StubLambdaClient(mode_delay=0.05)
+        handle = _run(catalog, client=stub).dispatch()
+        if drain == "results":
+            handle.results()
+        elif drain == "raise_first":
+            handle.raise_first()
+        else:
+            for fut in getattr(handle, drain)():
+                fut.result()
+        # Whole tail landed, in order, with no wait() call anywhere above.
+        assert stub.modes()[-3:] == ["finalize", "coverage", "stats"]
+        assert not handle._finisher.is_alive()
+
+    def test_break_out_of_the_loop_leaves_the_tail_to_wait(self, catalog):
+        # The documented escape hatch: an undrained iterator does not join, so
+        # wait() stays the explicit form (and the finisher is a daemon, so an
+        # abandoned handle cannot wedge interpreter exit).
+        stub = StubLambdaClient(mode_delay=0.05)
+        handle = _run(catalog, client=stub).dispatch()
+        for fut in handle.as_completed():
+            fut.result()
+            break
+        handle.wait(timeout=10)
+        assert "stats" in stub.modes()
 
     def test_error_payload_surfaces_as_shard_error(self, catalog):
         stub = StubLambdaClient(fail={_WORDS[1]})
