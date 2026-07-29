@@ -108,6 +108,35 @@ class TestStreamingConfig:
         with pytest.raises(ValueError, match="not.*mergeable|mergeable"):
             validate_streaming(cfg)
 
+    def test_stratified_where_reducer_rejected(self):
+        # Streaming/spill-fold rebuilds digests from the raw source column
+        # ((source, delta) only), so the ``where`` mask would be silently
+        # ignored — the merge surface must reject it until a masked fold law
+        # exists (issue #321).
+        cfg = _config()
+        cfg.aggregation["variables"]["h_sig"] = {
+            "kind": "ragged",
+            "function": "zagg.stats.tdigest.build_tdigest_where",
+            "source": "h_ph",
+            "inner_shape": [2],
+            "params": {"delta": 64, "where": "h_ph > 0"},
+        }
+        with pytest.raises(ValueError, match="h_sig.*no.*merge law"):
+            validate_streaming(cfg)
+
+    def test_composition_scalar_rejected(self):
+        # The packed composition word's fold (digest-weighted lane mean, issue
+        # #321) is not wired into the streaming state — reject, don't corrupt.
+        cfg = _config()
+        cfg.aggregation["variables"]["composition"] = {
+            "function": "zagg.stats.composition.pack_composition",
+            "source": "h_ph",
+            "dtype": "uint64",
+            "fill_value": 0,
+        }
+        with pytest.raises(ValueError, match="composition.*not.*mergeable"):
+            validate_streaming(cfg)
+
     def test_non_tdigest_ragged_rejected(self):
         cfg = _config()
         cfg.aggregation["variables"]["h_raw"] = {
