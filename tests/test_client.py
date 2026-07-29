@@ -68,7 +68,9 @@ def catalog_file(tmp_path, catalog):
 def _no_stats_verify(monkeypatch):
     # The post-run tail's run-stats invoke verifies the parquet landed with a
     # read-only poll (issue #313); zero window skips it so the finisher thread
-    # never opens a (fake) store.
+    # never opens a (fake) store. TestTailTiming re-enables a scaled window so
+    # the fire -> verify -> re-fire path is exercised somewhere (review
+    # finding, PR #333).
     from zagg import runner
 
     monkeypatch.setattr(runner, "_RUN_STATS_VERIFY_WINDOW_S", 0)
@@ -610,6 +612,37 @@ class TestFutures:
             handle.raise_first()
         clean = _run(catalog, client=StubLambdaClient()).dispatch()
         assert clean.raise_first() is None
+
+
+# -- tail timing -------------------------------------------------------------
+
+
+class TestTailTiming:
+    def test_wait_timeout_must_clear_the_stats_verify_window(self, catalog, monkeypatch):
+        # With the verify window zeroed everywhere else, nothing in the suite
+        # sees the tail's real floor: the run-stats leg fires, polls for the
+        # parquet over _RUN_STATS_VERIFY_WINDOW_S (20 s shipped), then re-fires
+        # once and polls again — so a successful run can spend ~2x the window
+        # in the tail and a "generous" wait(timeout=30) reports a false
+        # timeout. Scaled 100x down here, with the poll faked so no store is
+        # opened (review finding, PR #333).
+        from zagg import runner
+
+        window = 0.2
+        monkeypatch.setattr(runner, "_RUN_STATS_VERIFY_WINDOW_S", window)
+
+        def _never_visible(store_path, key, store_kwargs, *, window_s=None):
+            time.sleep(window)  # stands in for the read-only HEAD poll
+            return False
+
+        monkeypatch.setattr(runner, "_await_run_stats_object", _never_visible)
+        stub = StubLambdaClient()
+        handle = _run(catalog, client=stub).dispatch()
+        with pytest.raises(TimeoutError, match="still in flight"):
+            handle.wait(timeout=window / 4)  # the "obviously generous" choice
+        handle.wait(timeout=10)  # > 2x the window: clean
+        # Fire -> verify -> re-fire: the stats invoke went out twice.
+        assert stub.modes().count("stats") == 2
 
 
 # -- tqdm optionality --------------------------------------------------------

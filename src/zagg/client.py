@@ -231,7 +231,13 @@ class RunHandle:
         running at ``timeout``.
 
         Draining a harvest iterator already joins the tail, so ``wait`` is for
-        explicit control.
+        explicit control. Size ``timeout`` off the tail's own floor, not the
+        shard work: the run-stats leg fires its Event invoke, then *verifies*
+        the parquet landed over a read-only poll window
+        (``runner._RUN_STATS_VERIFY_WINDOW_S``, 20 s as shipped) and re-fires
+        once if it has not — so even a fully successful run can spend ~2x that
+        window here. Anything under ~40 s risks a false ``TimeoutError``; pass
+        ``None`` to just block (review finding, PR #333).
         """
         if self._finisher is not None:
             self._finisher.join(timeout)
