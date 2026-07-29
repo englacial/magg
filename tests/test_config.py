@@ -526,6 +526,60 @@ class TestValidation:
         with pytest.raises(ValueError, match="JSON-serializable"):
             validate_config(self._config_with_field_attrs({"arr": np.zeros(2)}))
 
+    def _config_with_composition(self, block, *, params=None, digest_kind="ragged"):
+        """Composition field + a sibling digest field, for the attrs cross-checks."""
+        return PipelineConfig(
+            data_source={"variables": {"h_li": "/path"}},
+            aggregation={
+                "variables": {
+                    "h_tdigest_signal": {
+                        "kind": digest_kind,
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "source": "h_li",
+                        "inner_shape": [2],
+                        "dtype": "float32",
+                    },
+                    "composition": {
+                        "function": "zagg.stats.composition.pack_composition",
+                        "source": "h_li",
+                        "dtype": "uint64",
+                        "params": {"threshold": 2} if params is None else params,
+                        "attrs": {"composition": block},
+                    },
+                }
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+
+    def test_composition_attrs_accepted(self):
+        validate_config(
+            self._config_with_composition({"of": "h_tdigest_signal", "threshold": 2})
+        )  # should not raise
+
+    def test_composition_of_must_name_a_declared_field(self):
+        with pytest.raises(ValueError, match="of 'h_tdigest_sginal' is not a declared"):
+            validate_config(self._config_with_composition({"of": "h_tdigest_sginal"}))
+
+    def test_composition_of_must_be_ragged(self):
+        with pytest.raises(ValueError, match="must be a 'kind: ragged' digest field"):
+            validate_config(
+                self._config_with_composition({"of": "h_tdigest_signal"}, digest_kind="scalar")
+            )
+
+    def test_composition_of_cannot_be_itself(self):
+        with pytest.raises(ValueError, match="names the composition field itself"):
+            validate_config(self._config_with_composition({"of": "composition"}))
+
+    def test_composition_threshold_must_match_params(self):
+        with pytest.raises(ValueError, match="disagrees with params.threshold"):
+            validate_config(
+                self._config_with_composition({"of": "h_tdigest_signal", "threshold": 3})
+            )
+
+    def test_composition_attrs_without_block_is_inert(self):
+        # A non-composition attrs block (or a non-mapping one) skips the checks.
+        validate_config(self._config_with_field_attrs({"composition": "zagg-composition/1"}))
+
     def test_shipped_strata_config_validates(self):
         from importlib import resources
 

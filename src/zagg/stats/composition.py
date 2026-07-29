@@ -102,6 +102,17 @@ def pack_composition(
     ``params``-as-columns mechanism). A photon is signal when **any** surface
     clears ``threshold`` (the ATBD predicate at the default ``threshold=2``,
     i.e. ``> 1``); its level lane is its *strongest* per-surface confidence.
+
+    **Caller invariant (unenforceable here):** ``threshold`` must commit the
+    same cut as the ``where`` predicate of the signal digest the lanes are
+    fractions *of* — the digest whose total weight a reader uses as ``N``.
+    Disagree and nothing raises: the lanes stay in range and only the recovered
+    counts are wrong, off by the signal/noise ratio. This reducer sees the conf
+    columns but not the digest's predicate, so it cannot check it; config
+    validation cross-checks the two *recorded* thresholds
+    (``attrs.composition.threshold`` vs ``params.threshold``) and the ``of``
+    reference, but the predicate itself is an arbitrary expression and stays
+    the config author's responsibility.
     """
     values = np.asarray(values, dtype=np.float64)
     conf = np.column_stack(
