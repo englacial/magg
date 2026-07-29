@@ -112,6 +112,10 @@ viz = [
     "ipyleaflet>=0.19",
 ]
 analysis = [
+    # tqdm drives zagg.client's RunHandle.progress() bar (issue #326); espg
+    # ratified adding it to this existing extra — never to `lambda` — on
+    # https://github.com/englacial/zagg/issues/265#issuecomment-5124017044
+    "tqdm>=4.66",
     "cubed>=0.24.0",
     "cubed-xarray>=0.0.9",
     "xarray[io]",
