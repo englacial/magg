@@ -136,6 +136,43 @@ class TestMergeComposition:
             n += 100
         assert unpack_composition(w)[4] >= 1
 
+    def test_n_is_the_signal_digest_weight(self):
+        # The ratified law takes ``n`` from the signal DIGEST's total weight,
+        # not from the cell's observation count. Every other merge test here
+        # passes an ``n`` it computed itself on a fixture rigged so N == n, so
+        # that half of the law was unpinned (review finding). Build two blocks
+        # with non-signal rows AND non-finite heights, so N != len(values) on
+        # both axes, and source ``n`` the way a reader would.
+        rng = np.random.default_rng(321)
+        conf = rng.integers(-2, 5, size=(100, 5))
+        values = rng.standard_normal(100)
+        values[::13] = np.nan  # dropped by BOTH the digest and the packer
+        signal = (conf >= 2).any(axis=1)
+        blocks = ((slice(0, 40), 40), (slice(40, 100), 60))
+        words, weights = [], []
+        for sl, size in blocks:
+            digest = build_tdigest_where(values[sl], where=signal[sl])
+            n = int(digest[:, 1].sum())
+            assert 0 < n < size  # both drops actually bite
+            words.append(pack_composition(values[sl], **_conf_kwargs(conf[sl]), threshold=2))
+            weights.append(n)
+        merged = merge_composition(words[0], weights[0], words[1], weights[1])
+
+        n_total = weights[0] + weights[1]
+        pooled_digest = build_tdigest_where(values, where=signal)
+        assert int(pooled_digest[:, 1].sum()) == n_total  # weights are additive
+        pooled = pack_composition(values, **_conf_kwargs(conf), threshold=2)
+        m_counts = counts_from_composition(merged, n_total)
+        p_counts = counts_from_composition(pooled, n_total)
+        assert np.max(np.abs(m_counts - p_counts)) <= 1
+        assert np.array_equal(unpack_composition(merged) > 0, unpack_composition(pooled) > 0)
+        # Ground the recovered counts in the raw rows, so a wrong ``n`` cannot
+        # pass: lanes are fractions of the SIGNAL stratum's finite rows.
+        keep = signal & np.isfinite(values)
+        assert p_counts[:5].tolist() == (conf[keep] >= 2).sum(axis=0).tolist()
+        # The observation count is the wrong divisor and shows it.
+        assert not np.array_equal(counts_from_composition(pooled, len(values)), p_counts)
+
     def test_symmetric(self):
         rng = np.random.default_rng(5)
         conf_a = rng.integers(-2, 5, size=(30, 5))
