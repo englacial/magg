@@ -255,6 +255,52 @@ class TestLocatedBuildTDigest:
         assert isinstance(out, np.ndarray)
 
 
+def _centroid_ancestors_reference(locations, starts, n):
+    """Pre-fast-path reference: common_ancestor over every centroid, singletons included."""
+    from mortie import common_ancestor
+
+    bounds = [*starts.tolist(), n]
+    out = np.empty(len(starts), dtype=np.uint64)
+    for j in range(len(starts)):
+        out[j] = common_ancestor(locations[bounds[j] : bounds[j + 1]])
+    return out
+
+
+class TestCentroidAncestorsFastPath:
+    """The singleton fast path matches the all-loop reference (issue #265)."""
+
+    def test_mixed_singleton_and_merged_partitions(self):
+        from zagg.stats.tdigest import _centroid_ancestors
+
+        locs = _point_words(20, seed=6)
+        # Partition mixing singletons with 2-, 3- and 4-member centroids,
+        # including singleton runs at both ends.
+        starts = np.array([0, 1, 3, 4, 5, 8, 12, 16, 17, 18, 19], dtype=np.int64)
+        got = _centroid_ancestors(locs, starts, 20)
+        assert np.array_equal(got, _centroid_ancestors_reference(locs, starts, 20))
+
+    def test_all_singletons_round_trip_verbatim(self):
+        from zagg.stats.tdigest import _centroid_ancestors
+
+        locs = _point_words(32, seed=7)
+        starts = np.arange(32, dtype=np.int64)
+        assert np.array_equal(_centroid_ancestors(locs, starts, 32), locs)
+
+    def test_build_equivalence_across_compression_knee(self):
+        # End-to-end: a delta that leaves some centroids singleton and merges
+        # others must produce the same locations as the reference reduction.
+        from zagg.stats.tdigest import _compress
+
+        rng = np.random.default_rng(87)
+        values = np.sort(rng.standard_normal(300))
+        locs = _point_words(300, seed=8)
+        digest, out_locs = build_tdigest(values, delta=64, locations=locs)
+        weights = digest[:, 1]
+        assert np.any(weights == 1.0) and np.any(weights > 1.0), "want a mixed regime"
+        _, _, starts = _compress(values, np.ones(300), 64.0)
+        assert np.array_equal(out_locs, _centroid_ancestors_reference(locs, starts, 300))
+
+
 class TestLocatedMergeTDigests:
     """The ``locations`` channel of ``merge_tdigests`` (issue #87)."""
 

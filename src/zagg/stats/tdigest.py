@@ -163,7 +163,7 @@ def _compress(
     return out_means, out_weights, starts
 
 
-def _centroid_ancestors(locations: np.ndarray, starts: list[int], n: int) -> np.ndarray:
+def _centroid_ancestors(locations: np.ndarray, starts: np.ndarray, n: int) -> np.ndarray:
     """Reduce per-member morton locations to one enclosing cell per centroid.
 
     ``locations`` is member-ordered (aligned with the sorted values / combined
@@ -173,13 +173,22 @@ def _centroid_ancestors(locations: np.ndarray, starts: list[int], n: int) -> np.
     fine (a below-order-29 mean-morton from a prior merge folds with fresh
     order-29 points), and a single member returns itself with its point kind
     preserved, so a 1-obs centroid round-trips its exact order-29 point word.
+
+    Below the compression knee (n ≤ δ) every centroid is a singleton, so the
+    per-centroid ``common_ancestor`` loop would run once per *photon* — the
+    same O(n) Python-loop shape issue #279 removed from the build path.
+    Singletons copy their sole member's word through vectorized; the loop only
+    covers multi-member centroids.
     """
     from mortie import common_ancestor
 
-    bounds = [*starts, n]
+    starts = np.asarray(starts, dtype=np.int64)
+    sizes = np.diff(starts, append=n)
     out = np.empty(len(starts), dtype=np.uint64)
-    for j in range(len(starts)):
-        out[j] = common_ancestor(locations[bounds[j] : bounds[j + 1]])
+    single = sizes == 1
+    out[single] = locations[starts[single]]
+    for j in np.flatnonzero(~single):
+        out[j] = common_ancestor(locations[starts[j] : starts[j] + sizes[j]])
     return out
 
 
@@ -272,7 +281,7 @@ def build_tdigest(
     out[:, 0] = out_means
     out[:, 1] = out_weights
     if locations is not None:
-        return out, _centroid_ancestors(locations, starts.tolist(), n)
+        return out, _centroid_ancestors(locations, starts, n)
     return out
 
 
@@ -376,7 +385,7 @@ def merge_tdigests(
     out[:, 0] = out_means
     out[:, 1] = out_weights
     if combined_locs is not None:
-        return out, _centroid_ancestors(combined_locs, starts.tolist(), len(combined))
+        return out, _centroid_ancestors(combined_locs, starts, len(combined))
     return out
 
 
@@ -469,7 +478,7 @@ def merge_tdigests_kway(
     out[:, 1] = out_weights
     if located:
         combined_locs = np.concatenate(locs)[order]
-        return out, _centroid_ancestors(combined_locs, starts.tolist(), len(combined))
+        return out, _centroid_ancestors(combined_locs, starts, len(combined))
     return out
 
 
