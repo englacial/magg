@@ -169,10 +169,16 @@ and the dist-info handling — zarr/pydantic_zarr keep theirs, stripping them
 breaks `importlib.metadata`):
 
 ```bash
-# Build zip (auto-detects arch and Python). Native deps (obstore) resolve for
-# the host, so run on Linux with the function's arch/Python — CI uses
-# arch-matched ubuntu runners; on a Mac, run inside a Linux container as with
-# the layer build.
+# Build zip. Native deps (obstore) resolve for the host, so run on Linux with
+# the function's arch and Python 3.12. The script auto-detects both from the
+# ambient `python3`/`uname -m` and bakes them into the zip name — it has no
+# cp312 fallback (unlike build_layer.sh), so a non-3.12 `python3` silently
+# yields a mislabeled lambda_function_<arch>_py<other>.zip that stand_up.sh
+# won't find. Unlike the layer, this does NOT run in the manylinux image, whose
+# default `python3` is not cp312; CI runs it on the arch-matched ubuntu runner
+# under actions/setup-python 3.12. If you use a container, use one whose
+# `python3` IS 3.12 (e.g. python:3.12) or prepend
+# /opt/python/cp312-cp312/bin to PATH.
 deployment/aws/build_function.sh
 
 # Deploy
