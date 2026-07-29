@@ -449,7 +449,7 @@ def calculate_cell_statistics(
                         f"requires a scalar result (declare 'kind: vector' to store an "
                         f"array per cell)"
                     )
-                result[name] = float(out)
+                result[name] = _coerce_scalar_value(out, sig)
             continue
 
         values = cell_data[source]
@@ -520,9 +520,23 @@ def calculate_cell_statistics(
         elif sig["kind"] == "ragged":
             result[name] = _coerce_ragged_value(out, sig)
         else:
-            result[name] = float(out)
+            result[name] = _coerce_scalar_value(out, sig)
 
     return result
+
+
+def _coerce_scalar_value(out, sig: dict):
+    """Coerce one scalar field result per its declared dtype.
+
+    Float dtypes keep the pre-#29 ``float()`` round-trip byte-for-byte. An
+    integer dtype coerces via ``int()`` instead: a float64 round-trip corrupts
+    exact integers above 2**53, which a packed 64-bit lane word (the issue
+    #321 composition field) legitimately exceeds.
+    """
+    dtype = sig.get("dtype")
+    if dtype is not None and np.issubdtype(np.dtype(dtype), np.integer):
+        return int(out)
+    return float(out)
 
 
 def _empty_cell_value(meta: dict):
@@ -551,7 +565,14 @@ def _empty_cell_value(meta: dict):
     if sig["kind"] == "vector":
         dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
         return np.full(sig["trailing_shape"], _field_sentinel(meta), dtype=dtype)
-    return 0 if meta.get("function") in ("len", "count") else np.nan
+    if meta.get("function") in ("len", "count"):
+        return 0
+    # An integer-dtype scalar cannot hold NaN; empty cells take the field's
+    # declared fill_value (issue #321 — e.g. the packed composition word's 0).
+    dtype_str = sig["dtype"]
+    if dtype_str is not None and np.issubdtype(np.dtype(dtype_str), np.integer):
+        return int(meta.get("fill_value", 0))
+    return np.nan
 
 
 def _coerce_field_value(value, sig: dict) -> np.ndarray:
