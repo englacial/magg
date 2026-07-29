@@ -1211,6 +1211,9 @@ class TestInvocationPassthrough:
                 poll_timeout_s=k.get("poll_timeout_s"),
                 label=k.get("label"),
             )
+            # positional 5 is granule_urls; accumulated across cells so
+            # TestDriverPassthroughLambda can assert the resolved hrefs.
+            captured.setdefault("granule_urls", []).extend(a[5])
             return {
                 "status_code": 200,
                 "body": {"total_obs": 1},
@@ -1290,6 +1293,37 @@ class TestInvocationPassthrough:
                 backend="lambda",
                 invocation="poll",
             )
+
+
+class TestDriverPassthroughLambda:
+    """`driver` reaches the LAMBDA path's url selection (espg ruling, PR #333).
+
+    ``_cell_work`` hardcoded ``_resolve_urls(records, "s3")`` while ``agg``
+    resolved ``driver`` for ``_run_local`` only, so a ``driver: https`` config
+    (a STAC catalog substituting https for an s3 object this account can't read
+    — requester-pays, cross-region) still dispatched ``s3://`` urls to a worker
+    that builds ``HTTPDriver`` from the same config key.
+    """
+
+    def _urls(self, monkeypatch, atl06_config, catalog_file, **agg_kwargs):
+        captured = TestInvocationPassthrough()._drive(
+            monkeypatch, atl06_config, catalog_file, invocation="sync", **agg_kwargs
+        )
+        return captured["granule_urls"]
+
+    def test_default_resolves_s3_hrefs(self, monkeypatch, atl06_config, catalog_file):
+        urls = self._urls(monkeypatch, atl06_config, catalog_file)
+        assert urls and all(u.startswith("s3://") for u in urls)
+
+    def test_https_kwarg_resolves_https_hrefs(self, monkeypatch, atl06_config, catalog_file):
+        urls = self._urls(monkeypatch, atl06_config, catalog_file, driver="https")
+        assert urls and all(u.startswith("https://") for u in urls)
+
+    def test_https_config_resolves_https_hrefs(self, monkeypatch, atl06_config, catalog_file):
+        # No kwarg: the config key alone has to reach the Lambda path too.
+        atl06_config.data_source["driver"] = "https"
+        urls = self._urls(monkeypatch, atl06_config, catalog_file)
+        assert urls and all(u.startswith("https://") for u in urls)
 
 
 class TestHandoffPassthrough:

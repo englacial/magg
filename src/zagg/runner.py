@@ -182,7 +182,13 @@ def agg(
     driver : str, optional
         Data access driver: ``"s3"`` (direct S3, us-west-2 only) or
         ``"https"`` (HTTPS, works anywhere). Overrides
-        ``config.data_source.driver``. Default ``"s3"``.
+        ``config.data_source.driver``. Default ``"s3"``. Honored on **both**
+        backends: the lambda backend selects each cell event's granule href
+        with it, so a catalog carrying an https substitute for an unreadable s3
+        object (requester-pays, cross-region) is ingestible as an explicit
+        override (espg ruling on PR #333; the Lambda path previously always
+        resolved the s3 href while the worker still built its driver from the
+        config key).
     max_cells : int, optional
         Limit number of cells to process (for testing).
     morton_cell : str, optional
@@ -454,6 +460,7 @@ class SpatialStrategy:
                 dry_run=dry_run,
                 region=region,
                 function_name=function_name,
+                driver=resolved_driver,
                 output_credentials=output_credentials,
                 output_endpoint_url=resolved_endpoint,
                 handoff=resolved_handoff,
@@ -3007,6 +3014,7 @@ def _run_lambda(
     dry_run,
     region,
     function_name,
+    driver="s3",
     output_credentials=None,
     output_endpoint_url=None,
     handoff="arrow",
@@ -3017,6 +3025,11 @@ def _run_lambda(
     on_progress=None,
 ):
     """Run processing via AWS Lambda invocation.
+
+    ``driver`` is the resolved data-access driver (kwarg > config, same value
+    ``_run_local`` gets): it selects which catalog href each cell event carries.
+    Defaults to ``"s3"`` — the pre-#333 hardcoded behavior — so a direct caller
+    that omits it is unchanged.
 
     The fan-out -> retry -> measured-cost loop is the generic
     :func:`zagg.dispatch.dispatch`; this function owns the Lambda-specific
@@ -3222,7 +3235,14 @@ def _run_lambda(
         # Clamp on the RESOLVED url count — what the worker actually reads —
         # since _resolve_urls drops href-less records (review finding,
         # PR #187).
-        granule_urls = _resolve_urls(records, "s3")
+        # ``driver`` (espg ruling on PR #333) selects the href: s3 dominates,
+        # but a catalog may carry an https substitute for an s3 object this
+        # account cannot (or should not) read — requester-pays, cross-region —
+        # and the worker already picks HTTPDriver off the same config key
+        # (processing/worker.py:250-254), so an explicit override has to reach
+        # the url selection. Was hardcoded "s3" while ``agg`` resolved driver
+        # for _run_local only, which handed s3:// urls to an HTTP driver.
+        granule_urls = _resolve_urls(records, driver)
         ds = _clamped_data_source(config.data_source, len(granule_urls))
         cell_config_dict = {**config_dict, "data_source": ds} if ds is not None else config_dict
         # Leaf sub-map fields (issue #300, D22): the worker writes the full

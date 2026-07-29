@@ -333,7 +333,9 @@ class TestRunnerParity:
     Spot-checking hand-picked keys cannot catch a divergence the facade grows
     later, so drive the SAME config + shardmap through ``runner.agg(backend=
     "lambda", invocation="sync")`` against an equivalent stub and compare the
-    cell events field-by-field.
+    cell events field-by-field — with **no carve-outs** now that
+    ``_run_lambda`` threads ``driver`` too (espg ruling on PR #333): the
+    ``driver: s3`` and ``driver: https`` configs both have to match whole.
     """
 
     @staticmethod
@@ -382,10 +384,15 @@ class TestRunnerParity:
         )
         return {e["shard_key"]: e for _, _, e in stub.cell_events()}
 
-    def test_cell_events_match_the_runner_lambda_path(self, catalog, catalog_file, monkeypatch):
-        agg_events = self._agg_cell_events(catalog_file, monkeypatch)
+    @pytest.mark.parametrize("driver", ["s3", "https"])
+    def test_cell_events_match_the_runner_lambda_path(
+        self, catalog, catalog_file, monkeypatch, driver
+    ):
+        cfg = default_config("atl06")
+        cfg.data_source["driver"] = driver
+        agg_events = self._agg_cell_events(catalog_file, monkeypatch, cfg=cfg)
         stub = StubLambdaClient()
-        _run(catalog, client=stub).dispatch().results()
+        _run(catalog, client=stub, config=cfg).dispatch().results()
         client_events = {e["shard_key"]: e for _, _, e in stub.cell_events()}
 
         assert set(client_events) == set(agg_events) == set(_WORDS)
@@ -394,36 +401,12 @@ class TestRunnerParity:
             # run_id is a fresh uuid per dispatch by construction; both paths
             # carry one and the worker only echoes it into the stats record.
             assert mine.pop("run_id") and theirs.pop("run_id")
-            assert mine == theirs
-
-    def test_driver_https_is_the_one_deliberate_divergence(
-        self, catalog, catalog_file, monkeypatch
-    ):
-        # The facade resolves granule_urls through the config's data_source
-        # driver; runner._cell_work hardcodes "s3" (_run_lambda takes no driver
-        # at all), so a `driver: https` config is the ONE field where the two
-        # paths differ. Kept deliberately — the worker selects HTTPDriver from
-        # that same config key (processing/worker.py) and read.py passes an
-        # https url through unrewritten, so agg's lambda path hands s3:// urls
-        # to an HTTP driver. Pinned here in both directions; whether _run_lambda
-        # should be fixed to match is an espg call (PR #333 "Questions for
-        # review").
-        cfg = default_config("atl06")
-        cfg.data_source["driver"] = "https"
-        agg_events = self._agg_cell_events(catalog_file, monkeypatch, cfg=cfg)
-        stub = StubLambdaClient()
-        _run(catalog, client=stub, config=cfg).dispatch().results()
-        client_events = {e["shard_key"]: e for _, _, e in stub.cell_events()}
-
-        key = _WORDS[1]
-        assert client_events[key]["granule_urls"] == [_rec(3)["https"]]
-        assert agg_events[key]["granule_urls"] == [_rec(3)["s3"]]
-        # granule_urls is the ONLY divergence: everything else still matches.
-        mine, theirs = dict(client_events[key]), dict(agg_events[key])
-        for ev in (mine, theirs):
-            ev.pop("granule_urls")
-            ev.pop("run_id")
-        assert mine == theirs
+            assert mine == theirs  # every other field, both drivers
+        # And the driver actually moved the href — otherwise the equality above
+        # would pass on two identically-wrong url lists.
+        href = _rec(3)["s3"] if driver == "s3" else _rec(3)["https"]
+        assert client_events[_WORDS[1]]["granule_urls"] == [href]
+        assert agg_events[_WORDS[1]]["granule_urls"] == [href]
 
 
 # -- futures -----------------------------------------------------------------
