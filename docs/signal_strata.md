@@ -74,6 +74,18 @@ streaming state. Heavy multi-block shards need the fold-law follow-up
 ## What the mask channel gains
 
 With the strata in place, the HHDC reader's occupancy mask (issue #265)
-upgrades from 2-state to 3-state from store contents alone: **unobserved**
-(both strata empty), **observed with zero signal returns** (noise occupied,
-signal empty — the laser crossed the cell), and **observed with signal**.
+upgrades from 2-state to 3-state from store contents alone. State the rule
+against `count`, which the template already writes:
+
+- **unobserved** — `count == 0`: no observation fell in the cell.
+- **observed with zero signal returns** — `count > 0` and the signal stratum
+  is empty: the laser crossed the cell and every photon was background.
+- **observed with signal** — the signal stratum is non-empty.
+
+`count` rather than "both strata empty" because the strata are keyed to
+*finite* heights: `build_tdigest_where` and `pack_composition` both drop
+non-finite `source` rows (that is what makes the `N_signal` alignment exact),
+so a cell whose every observation carried a non-finite height would report
+`count > 0`, both strata empty, `composition == 0`. ATL03 `h_ph` is not
+nullable, so the shipped template cannot produce that cell — but the `count`
+form is the robust rule for any source and costs nothing to prefer.
