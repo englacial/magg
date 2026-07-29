@@ -504,6 +504,20 @@ class TestStratifiedAggregation:
         assert n_sig + n_noise == result["count"] == 40
         assert n_sig == int((conf >= 2).any(axis=1).sum())
 
+    def test_non_finite_heights_leave_count_above_the_strata(self):
+        # The strata are keyed to FINITE heights, so ``n_sig + n_noise ==
+        # count`` holds only on all-finite data — the 3-state mask rule in
+        # docs/signal_strata.md is therefore stated against ``count``, not
+        # against "both strata empty" (review finding). Pin the gap here so the
+        # all-finite test above cannot drift into implying the stronger claim.
+        data, _ = self._cell()
+        data["h_li"][[3, 11, 29]] = np.nan
+        result = calculate_cell_statistics(data, config=self._config())
+        n_sig = int(result["h_sig"][:, 1].sum())
+        n_noise = int(result["h_noise"][:, 1].sum())
+        assert result["count"] == 40
+        assert n_sig + n_noise == 37 < result["count"]
+
     def test_composition_word_survives_above_2_53(self):
         # A word with a high byte set exceeds float64's exact-integer ceiling;
         # the integer coercion path must round-trip it exactly.
