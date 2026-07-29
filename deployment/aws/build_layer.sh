@@ -96,6 +96,14 @@ print(next(d for d in deps if re.match(r"mortie($|[\s<>=!~\[])", d)))
 echo "Installing h5coro, h5coro-hidefix and mortie ('$MORTIE_SPEC' from pyproject, --no-deps)..."
 $PIP install "h5coro==1.0.5" "h5coro-hidefix==0.3.1" "$MORTIE_SPEC" --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
+# Assert the derived spec actually landed: mortie is the one dep whose spec is
+# computed, and pip exits 0 on specs it skips (a PEP 508 marker that does not
+# match the build environment is "Ignoring mortie: markers ... don't match"),
+# which would ship a mortie-less layer past the size-only CI gates.
+if ! ls "$OUTPUT_DIR/python" | grep -qE "^mortie-"; then
+    echo "ERROR: mortie ('$MORTIE_SPEC') missing from layer - check the spec in pyproject.toml!"; exit 1
+fi
+
 # async-tiff (issue #218): the raster worker's GeoTIFF/COG decode engine
 # (mode="process_raster"). abi3 manylinux_2_28 wheel (~4 MB) on both arches;
 # its only dep is obspec (pure-python, tiny). Keep the pins in sync with the
