@@ -95,31 +95,32 @@ GB-seconds per full run, this saves ~$0.60/run. Over many runs it adds up.
 ### The build (containerized — the one normative path)
 
 `deployment/aws/build_layer.sh` is the normative build entry point for the layer
-(package set, numpy page-alignment build, bloat strip, 250 MB gate). Its pins
+(package set, numpy page-alignment build, bloat strip, 250 MB gate). The script must run inside an arch-matched `manylinux_2_28` container
+(cp312) — it hard-fails on a mismatch (`ERROR: building <arch> layer on
+<machine> machine`, `build_layer.sh` L27-33), so there is no cross-arch build:
+CI builds each arch on a native runner (`ubuntu-latest` / `ubuntu-24.04-arm`,
+`lambda-build-reusable.yml`). Its pins
 are co-owned with the `lambda` extra in `pyproject.toml` — the script says "keep
 in sync" at each one — and mortie's spec is read out of `pyproject.toml`
 directly (issue #322), so a floor bump there reaches the layer with no second
-edit. Do not hand-maintain a parallel pip recipe — the script must run inside
-an arch-matched `manylinux_2_28` container (cp312), exactly as CI does in
-`.github/workflows/lambda-build-reusable.yml`.
+edit. Do not hand-maintain a parallel pip recipe.
 
-With podman (what we use locally), from the repo root:
+Production is **arm64**, and Apple Silicon runs `linux/arm64` containers
+natively, so the local recipe is the arm64 one. With podman (what we use
+locally), from the repo root:
 
 ```bash
-# arm64 (native on Apple Silicon)
 podman run --rm \
   -v "$(pwd)":/workspace \
   -w /workspace/deployment/aws \
   quay.io/pypa/manylinux_2_28_aarch64 \
   bash -c "yum install -y zip && chmod +x build_layer.sh && ./build_layer.sh arm64"
-
-# x86_64 (on Apple Silicon this is emulated — needs Rosetta/qemu in the podman machine)
-podman run --rm \
-  -v "$(pwd)":/workspace \
-  -w /workspace/deployment/aws \
-  quay.io/pypa/manylinux_2_28_x86_64 \
-  bash -c "yum install -y zip && chmod +x build_layer.sh && ./build_layer.sh x86_64"
 ```
+
+**x86_64 is not a local-Mac path.** It exists for testing parity only; build it
+on an x86_64 Linux host (same command with `manylinux_2_28_x86_64` /
+`build_layer.sh x86_64`) or just take CI's `lambda-layer-x86_64` artifact. Don't
+try to emulate it on Apple Silicon.
 
 Docker equivalents are identical apart from the binary name:
 
