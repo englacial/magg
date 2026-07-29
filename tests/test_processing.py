@@ -546,6 +546,35 @@ class TestStratifiedAggregation:
         assert result["count"] == 0
         assert result["h_sig"] == [] and result["h_noise"] == []
 
+    def test_integer_dtype_is_verified_not_trusted(self):
+        # An integer declaration used to be trusted: bare int() silently
+        # truncated a reducer that returned 2.7. Integral values (including
+        # np.float64(3.0)) still pass; a fractional one names the field.
+        from zagg.config import PipelineConfig
+
+        def _cfg(dtype="int32"):
+            return PipelineConfig(
+                aggregation={
+                    "variables": {"m": {"function": "np.max", "source": "h", "dtype": dtype}}
+                }
+            )
+
+        result = calculate_cell_statistics({"h": np.array([1.0, 3.0])}, config=_cfg())
+        assert result["m"] == 3 and isinstance(result["m"], int)
+        with pytest.raises(ValueError, match=r"'m'.*not integral"):
+            calculate_cell_statistics({"h": np.array([1.0, 2.7])}, config=_cfg())
+        # A float dtype is unchanged: fractional values are exactly what it stores.
+        assert calculate_cell_statistics({"h": np.array([1.0, 2.7])}, config=_cfg("float32"))[
+            "m"
+        ] == pytest.approx(2.7)
+        # The integral check must not route a packed word through float(): a
+        # uint64 above 2**53 stays exact (the issue #321 composition field).
+        word = np.uint64(0xFF000000FF0000FF)
+        big = calculate_cell_statistics(
+            {"h": np.array([word], dtype=np.uint64)}, config=_cfg("uint64")
+        )
+        assert big["m"] == int(word) > 2**53
+
     def test_integer_field_rejects_the_nan_sentinel(self):
         # ``_field_sentinel``'s default sentinel is the string "NaN", which an
         # integer array cannot hold. Both integer paths (empty scalar cell,

@@ -486,7 +486,7 @@ def calculate_cell_statistics(
                         f"requires a scalar result (declare 'kind: vector' to store an "
                         f"array per cell)"
                     )
-                result[name] = _coerce_scalar_value(out, sig)
+                result[name] = _coerce_scalar_value(out, sig, name)
             continue
 
         values = cell_data[source]
@@ -558,21 +558,39 @@ def calculate_cell_statistics(
         elif sig["kind"] == "ragged":
             result[name] = _coerce_ragged_value(out, sig)
         else:
-            result[name] = _coerce_scalar_value(out, sig)
+            result[name] = _coerce_scalar_value(out, sig, name)
 
     return result
 
 
-def _coerce_scalar_value(out, sig: dict):
+def _coerce_scalar_value(out, sig: dict, name: str = "<field>"):
     """Coerce one scalar field result per its declared dtype.
 
     Float dtypes keep the pre-#29 ``float()`` round-trip byte-for-byte. An
     integer dtype coerces via ``int()`` instead: a float64 round-trip corrupts
     exact integers above 2**53, which a packed 64-bit lane word (the issue
     #321 composition field) legitimately exceeds.
+
+    An integer declaration is **verified, not trusted**: a reducer returning a
+    fractional value into an integer field is a config/reducer mismatch, and
+    bare ``int()`` would silently truncate it toward zero (``2.7 -> 2``). Python
+    and numpy integers pass through; floats pass only when they carry no
+    fractional part (``np.float64(3.0)`` is a legitimate reducer return); a
+    fractional value raises naming the field, its dtype, and the value — the
+    same fail-fast shape as :func:`_coerce_field_value`'s trailing-shape check.
     """
     dtype = sig.get("dtype")
     if dtype is not None and np.issubdtype(np.dtype(dtype), np.integer):
+        if not isinstance(out, (int, np.integer)):
+            # Anything else (float, np.floating, 0-d array) must be integral;
+            # ``float()`` first so a 0-d array or np scalar answers uniformly.
+            if not float(out).is_integer():
+                raise ValueError(
+                    f"scalar field {name!r}: declared dtype {np.dtype(dtype)} but the "
+                    f"reducer returned {out!r}, which is not integral — an integer field "
+                    f"cannot store a fractional value (declare a float dtype, or round "
+                    f"in the reducer)"
+                )
         return int(out)
     return float(out)
 
