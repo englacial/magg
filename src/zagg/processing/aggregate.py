@@ -79,6 +79,27 @@ def _field_sentinel(meta: dict) -> float:
     return np.nan if fill_value == "NaN" else fill_value
 
 
+def _integer_fill(meta: dict, dtype) -> int:
+    """:func:`_field_sentinel` for an INTEGER-dtype field: the sentinel must be numeric.
+
+    The float default is the string ``"NaN"``, which no integer array can hold
+    (issue #321's packed composition word declares ``fill_value: 0`` instead).
+    Reject a non-numeric sentinel by name here rather than letting it surface
+    mid-shard as a stray ``int('NaN')`` parse error or a numpy
+    ``np.full(..., np.nan, dtype=uint64)`` failure — the two integer paths
+    (empty scalar cells, ``vector`` padding) then agree with each other and with
+    :func:`_field_sentinel` on where the value comes from (review finding).
+    """
+    fill = meta.get("fill_value", 0)
+    if isinstance(fill, str):
+        raise ValueError(
+            f"integer field (dtype {np.dtype(dtype)}) declares fill_value {fill!r}: an "
+            f"integer array cannot hold a non-numeric sentinel — declare a numeric "
+            f"fill_value (e.g. 0) or a float dtype"
+        )
+    return int(fill)
+
+
 def _group_columns(
     col_dict: dict[str, np.ndarray],
     cell_col: np.ndarray,
@@ -581,14 +602,19 @@ def _empty_cell_value(meta: dict):
         return []
     if sig["kind"] == "vector":
         dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
-        return np.full(sig["trailing_shape"], _field_sentinel(meta), dtype=dtype)
+        sentinel = (
+            _integer_fill(meta, dtype)
+            if np.issubdtype(dtype, np.integer)
+            else _field_sentinel(meta)
+        )
+        return np.full(sig["trailing_shape"], sentinel, dtype=dtype)
     if meta.get("function") in ("len", "count"):
         return 0
     # An integer-dtype scalar cannot hold NaN; empty cells take the field's
     # declared fill_value (issue #321 — e.g. the packed composition word's 0).
     dtype_str = sig["dtype"]
     if dtype_str is not None and np.issubdtype(np.dtype(dtype_str), np.integer):
-        return int(meta.get("fill_value", 0))
+        return _integer_fill(meta, dtype_str)
     return np.nan
 
 
