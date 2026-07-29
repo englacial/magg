@@ -88,11 +88,11 @@ $PIP install \
 # one edit site: a future floor bump or exact pin there reaches the layer with
 # no second edit. The layer's mortie still floats to latest-above-floor, so
 # this is floor enforcement, not pinning.
-MORTIE_SPEC=$($PYTHON -c "
-import pathlib, re, tomllib
-deps = tomllib.loads(pathlib.Path('${SCRIPT_DIR}/../../pyproject.toml').read_text())['project']['dependencies']
-print(next(d for d in deps if re.match(r'mortie($|[\s<>=!~\[])', d)))
-")
+MORTIE_SPEC=$($PYTHON -c '
+import pathlib, re, sys, tomllib
+deps = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["project"]["dependencies"]
+print(next(d for d in deps if re.match(r"mortie($|[\s<>=!~\[])", d)))
+' "${SCRIPT_DIR}/../../pyproject.toml")
 echo "Installing h5coro, h5coro-hidefix and mortie ('$MORTIE_SPEC' from pyproject, --no-deps)..."
 $PIP install "h5coro==1.0.5" "h5coro-hidefix==0.3.1" "$MORTIE_SPEC" --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
