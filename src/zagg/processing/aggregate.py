@@ -9,6 +9,7 @@ DAG stays acyclic.
 
 import logging
 import os
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -49,6 +50,21 @@ def _rss_log(stage: str) -> None:
     """Opt-in per-stage RSS trace (set ``ZAGG_PROFILE_RSS=1``) for #130 diagnostics."""
     if os.environ.get("ZAGG_PROFILE_RSS"):
         logger.info(f"  [rss] {stage:34s} {_rss_mb():7.0f} MB")
+
+
+@lru_cache(maxsize=256)
+def _compile_param_expr(expression: str):
+    """Cache the code object for a params expression (review finding, PR #334).
+
+    A params value that names columns is evaluated **per cell**, so passing the
+    source string to ``eval`` recompiles it once per cell per field. Measured on
+    the issue #321 strata config's 5-term ``where`` predicate: 18.9 us per
+    ``eval(str)`` vs 3.8 us per ``eval(code)`` — i.e. ~2.5 s of pure
+    recompilation per o11 shard (65,536 cells x two ``where`` fields). Compiling
+    in ``"eval"`` mode is semantically identical to ``eval`` on the string; the
+    bounded cache keys on the expression source, of which a config has a handful.
+    """
+    return compile(expression, "<zagg-param>", "eval")
 
 
 def _field_sentinel(meta: dict) -> float:
@@ -296,7 +312,7 @@ def _eval_chunk_precompute(config: PipelineConfig, pooled: dict[str, np.ndarray]
                     resolved_params[pkey] = pooled[pval]
                 elif isinstance(pval, str) and any(c in pval for c in pooled):
                     ns = {"__builtins__": {}, "np": np, "numpy": np, **pooled}
-                    resolved_params[pkey] = eval(pval, ns)  # noqa: S307
+                    resolved_params[pkey] = eval(_compile_param_expr(pval), ns)  # noqa: S307
                 else:
                     resolved_params[pkey] = pval
             value = resolve_function(meta["function"])(values, **resolved_params)
@@ -471,7 +487,8 @@ def calculate_cell_statistics(
                     "numpy": np,
                     **cell_data,
                 }
-                resolved_params[pkey] = eval(pval, ns)  # noqa: S307
+                # Cached code object, not the source string: this runs per cell.
+                resolved_params[pkey] = eval(_compile_param_expr(pval), ns)  # noqa: S307
             else:
                 resolved_params[pkey] = pval
 

@@ -532,6 +532,22 @@ class TestStratifiedAggregation:
         assert result["count"] == 0
         assert result["h_sig"] == [] and result["h_noise"] == []
 
+    def test_where_expression_compiles_once_across_cells(self):
+        # The params expression is evaluated per CELL, so it must run against a
+        # cached code object rather than being recompiled every call (review
+        # finding: ~2.5 s/shard of pure compilation at o11/o19 with two ``where``
+        # fields). Pin the mechanism, not the timing.
+        from zagg.processing.aggregate import _compile_param_expr
+
+        _compile_param_expr.cache_clear()
+        cfg = self._config()
+        for seed in range(5):
+            data, _ = self._cell(seed=seed)
+            calculate_cell_statistics(data, config=cfg)
+        info = _compile_param_expr.cache_info()
+        assert info.currsize == 2  # the signal predicate and its negation
+        assert info.misses == 2 and info.hits == 8  # 5 cells x 2 fields
+
 
 class TestVectorOutputs:
     """Issue #29 phase 2: a ``kind: vector`` field yields a per-cell ndarray of
