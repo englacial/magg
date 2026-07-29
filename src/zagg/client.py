@@ -632,15 +632,10 @@ class Run:
         granule-worker clamp, leaf sub-map) minus the async result channel —
         v1 is the legacy sync ``RequestResponse`` path by design.
 
-        One deliberate divergence (review finding, PR #333): the url selection
-        below honors ``data_source.driver``, where ``_cell_work`` hardcodes
-        ``"s3"`` (``_run_lambda`` takes no ``driver`` at all — ``agg`` forwards
-        it only to ``_run_local``). The worker picks its driver from that same
-        config key (``processing/worker.py``) and ``processing/read.py`` passes
-        an https url through unrewritten, so honoring it is the more correct
-        behavior; whether ``_run_lambda`` should be fixed to match is an open
-        question on PR #333. Pinned both ways in
-        ``TestRunnerParity.test_driver_https_is_the_one_deliberate_divergence``.
+        The url selection honors ``data_source.driver`` — as does ``_cell_work``
+        since the espg ruling on PR #333 (it hardcoded ``"s3"`` before), so the
+        two paths build identical events for an ``https`` config too;
+        ``TestRunnerParity`` asserts that field-by-field.
         """
         from zagg import runner
 
