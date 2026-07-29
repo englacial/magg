@@ -300,6 +300,17 @@ class TestCentroidAncestorsFastPath:
         _, _, starts = _compress(values, np.ones(300), 64.0)
         assert np.array_equal(out_locs, _centroid_ancestors_reference(locs, starts, 300))
 
+    def test_singleton_fill_value_word_still_raises(self):
+        # The removed per-centroid ``common_ancestor`` call validated every
+        # word; the copy-through must keep that, or an invalid word (0 is the
+        # configs' fill value) would raise only in the compressed regime.
+        from zagg.stats.tdigest import _centroid_ancestors
+
+        locs = _point_words(4, seed=9)
+        locs[2] = np.uint64(0)
+        with pytest.raises(ValueError):
+            _centroid_ancestors(locs, np.arange(4, dtype=np.int64), 4)
+
 
 class TestLocatedMergeTDigests:
     """The ``locations`` channel of ``merge_tdigests`` (issue #87)."""

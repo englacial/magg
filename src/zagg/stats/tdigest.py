@@ -178,15 +178,22 @@ def _centroid_ancestors(locations: np.ndarray, starts: np.ndarray, n: int) -> np
     per-centroid ``common_ancestor`` loop would run once per *photon* — the
     same O(n) Python-loop shape issue #279 removed from the build path.
     Singletons copy their sole member's word through vectorized; the loop only
-    covers multi-member centroids.
+    covers multi-member centroids.  ``common_ancestor`` also *validates* its
+    input (a zero — the configs' fill value — or any word with a bad base-cell
+    prefix raises), so the copy-through keeps that guarantee by validating the
+    whole singleton set in one kernel pass; otherwise a bad word would raise
+    only in the compressed regime.
     """
-    from mortie import common_ancestor
+    from mortie import common_ancestor, validate_morton
 
     starts = np.asarray(starts, dtype=np.int64)
     sizes = np.diff(starts, append=n)
     out = np.empty(len(starts), dtype=np.uint64)
     single = sizes == 1
-    out[single] = locations[starts[single]]
+    singles = locations[starts[single]]
+    if singles.size:
+        validate_morton(singles)
+    out[single] = singles
     for j in np.flatnonzero(~single):
         out[j] = common_ancestor(locations[starts[j] : starts[j] + sizes[j]])
     return out
