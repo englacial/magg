@@ -81,9 +81,13 @@ $PIP install \
 # sync with the `lambda` extra in pyproject.toml.
 # mortie's version spec is single-sourced from pyproject.toml (issue #322):
 # --no-deps means pip never resolves the runtime floor declared there, so an
-# unpinned install took "latest at build time" and a layer built before a
-# floor bump could silently predate it. Deriving the spec here makes bumping
-# pyproject sufficient — no second pin to keep in sync.
+# unpinned install silently accepted whatever was latest at build time -- even
+# a release below the floor. Passing the declared spec (a) makes pip error and
+# abort under `set -e` when the floor is ahead of what PyPI has published
+# (pyproject L30-38 documents that state for h5coro-hidefix), and (b) leaves
+# one edit site: a future floor bump or exact pin there reaches the layer with
+# no second edit. The layer's mortie still floats to latest-above-floor, so
+# this is floor enforcement, not pinning.
 MORTIE_SPEC=$($PYTHON -c "
 import pathlib, re, tomllib
 deps = tomllib.loads(pathlib.Path('${SCRIPT_DIR}/../../pyproject.toml').read_text())['project']['dependencies']
