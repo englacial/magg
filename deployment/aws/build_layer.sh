@@ -79,8 +79,18 @@ $PIP install \
 # `sidecar` index backend. abi3 manylinux_2_28 wheel (~2.2 MB) on both arches;
 # its only runtime dep is numpy (already installed above). Keep the pin in
 # sync with the `lambda` extra in pyproject.toml.
-echo "Installing h5coro, h5coro-hidefix and mortie (--no-deps)..."
-$PIP install "h5coro==1.0.5" "h5coro-hidefix==0.3.1" mortie --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
+# mortie's version spec is single-sourced from pyproject.toml (issue #322):
+# --no-deps means pip never resolves the runtime floor declared there, so an
+# unpinned install took "latest at build time" and a layer built before a
+# floor bump could silently predate it. Deriving the spec here makes bumping
+# pyproject sufficient — no second pin to keep in sync.
+MORTIE_SPEC=$($PYTHON -c "
+import pathlib, re, tomllib
+deps = tomllib.loads(pathlib.Path('${SCRIPT_DIR}/../../pyproject.toml').read_text())['project']['dependencies']
+print(next(d for d in deps if re.match(r'mortie($|[\s<>=!~\[])', d)))
+")
+echo "Installing h5coro, h5coro-hidefix and mortie ('$MORTIE_SPEC' from pyproject, --no-deps)..."
+$PIP install "h5coro==1.0.5" "h5coro-hidefix==0.3.1" "$MORTIE_SPEC" --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
 # async-tiff (issue #218): the raster worker's GeoTIFF/COG decode engine
 # (mode="process_raster"). abi3 manylinux_2_28 wheel (~4 MB) on both arches;
