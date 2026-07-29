@@ -270,13 +270,23 @@ class TestCentroidAncestorsFastPath:
     """The singleton fast path matches the all-loop reference (issue #265)."""
 
     def test_mixed_singleton_and_merged_partitions(self):
+        from mortie import common_ancestor, infer_order_from_morton
+
         from zagg.stats.tdigest import _centroid_ancestors
 
         locs = _point_words(20, seed=6)
+        # A below-order-29 AREA word from a prior merge, spliced in as the
+        # singleton member at index 4 — exactly the mixed-order input
+        # ``merge_tdigests`` feeds this helper. It must copy through verbatim
+        # (kind and order preserved), not be re-reduced to a point word.
+        area = np.uint64(common_ancestor(locs[:4]))
+        assert infer_order_from_morton(int(area)) < 29
+        locs[4] = area
         # Partition mixing singletons with 2-, 3- and 4-member centroids,
         # including singleton runs at both ends.
         starts = np.array([0, 1, 3, 4, 5, 8, 12, 16, 17, 18, 19], dtype=np.int64)
         got = _centroid_ancestors(locs, starts, 20)
+        assert got[starts.tolist().index(4)] == area
         assert np.array_equal(got, _centroid_ancestors_reference(locs, starts, 20))
 
     def test_all_singletons_round_trip_verbatim(self):
