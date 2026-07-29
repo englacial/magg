@@ -96,15 +96,17 @@ GB-seconds per full run, this saves ~$0.60/run. Over many runs it adds up.
 ### The build (containerized — the one normative path)
 
 `deployment/aws/build_layer.sh` is the normative build entry point for the layer
-(package set, numpy page-alignment build, bloat strip, 250 MB gate). The script must run inside an arch-matched `manylinux_2_28` container
-(cp312) — it hard-fails on a mismatch (`ERROR: building <arch> layer on
-<machine> machine`, `build_layer.sh` L27-33), so there is no cross-arch build:
-CI builds each arch on a native runner (`ubuntu-latest` / `ubuntu-24.04-arm`,
-`lambda-build-reusable.yml`). Its pins
+(package set, numpy page-alignment build, bloat strip, 250 MB gate). Its pins
 are co-owned with the `lambda` extra in `pyproject.toml` — the script says "keep
 in sync" at each one — and mortie's spec is read out of `pyproject.toml`
 directly (issue #322), so a floor bump there reaches the layer with no second
 edit. Do not hand-maintain a parallel pip recipe.
+
+The script must run inside an arch-matched `manylinux_2_28` container (cp312),
+and it hard-fails on a mismatch (`ERROR: building <arch> layer on <machine>
+machine`, `build_layer.sh` L27-33) — so there is no cross-arch build. CI builds
+each arch on a native runner (`ubuntu-latest` / `ubuntu-24.04-arm`,
+`lambda-build-reusable.yml`).
 
 Production is **arm64**, and Apple Silicon runs `linux/arm64` containers
 natively, so the local recipe is the arm64 one. With podman (what we use
