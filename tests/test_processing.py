@@ -546,6 +546,25 @@ class TestStratifiedAggregation:
         assert result["count"] == 0
         assert result["h_sig"] == [] and result["h_noise"] == []
 
+    def test_integer_field_rejects_the_nan_sentinel(self):
+        # ``_field_sentinel``'s default sentinel is the string "NaN", which an
+        # integer array cannot hold. Both integer paths (empty scalar cell,
+        # vector padding) must say so naming the config key, not surface as a
+        # stray int('NaN') / np.full(..., nan, dtype=uint64) error (review nit).
+        from zagg.processing.aggregate import _empty_cell_value
+
+        scalar = {"function": "np.max", "source": "h", "dtype": "uint64", "fill_value": "NaN"}
+        with pytest.raises(ValueError, match="cannot hold a non-numeric sentinel"):
+            _empty_cell_value(scalar)
+        vector = {**scalar, "kind": "vector", "trailing_shape": 3}
+        with pytest.raises(ValueError, match="cannot hold a non-numeric sentinel"):
+            _empty_cell_value(vector)
+        # A declared numeric fill still comes through on both paths.
+        assert _empty_cell_value({**scalar, "fill_value": 7}) == 7
+        np.testing.assert_array_equal(
+            _empty_cell_value({**vector, "fill_value": 7}), np.full(3, 7, dtype="uint64")
+        )
+
     def test_where_expression_compiles_once_across_cells(self):
         # The params expression is evaluated per CELL, so it must run against a
         # cached code object rather than being recompiled every call (review
