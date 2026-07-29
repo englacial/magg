@@ -335,6 +335,13 @@ LAMBDA_PRICE_PER_GB_SEC_BY_ARCH = {"arm64": 0.0000133334}
 LAMBDA_MEMORY_GB = 4.0  # issue #193: production worker sized to 4 GB (2.3 vCPU)
 LAMBDA_PRICE_PER_GB_SEC = LAMBDA_PRICE_PER_GB_SEC_BY_ARCH[LAMBDA_ARCH]
 
+#: Worker errors that mean "nothing to do", not "something broke": counted
+#: neither as data nor as an error by the dispatch accounting, kept out of the
+#: notebook failures table, and resolved (not raised) by ``zagg.client``. One
+#: definition for all three -- it used to be duplicated in ``notebook`` and
+#: inlined in ``runner`` (review finding, PR #333).
+BENIGN_ERRORS = ("No granules found", "No data after filtering")
+
 
 def max_cost_usd(
     n_units: int,

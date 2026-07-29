@@ -48,6 +48,7 @@ from zagg.config import (
     get_windowing,
 )
 from zagg.dispatch import (
+    BENIGN_ERRORS,
     LAMBDA_ARCH,
     LAMBDA_MEMORY_GB,
     LAMBDA_PRICE_PER_GB_SEC,
@@ -3402,7 +3403,7 @@ def _run_lambda(
             obs = result.get("body", {}).get("total_obs", 0)
             report.total_obs += obs
             report.cells_with_data += 1
-        elif error not in ("No granules found", "No data after filtering"):
+        elif error not in BENIGN_ERRORS:
             report.cells_error += 1
             key = result.get("shard_key")
             # _safe_label: error reporting must not raise on the bad key itself.
