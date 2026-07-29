@@ -33,7 +33,9 @@ x86_64 / py3.12 is available for local/testing parity.
 
 ### What's in the layer vs function code
 
-**Layer** (built by `build_layer.sh` — the script is the single source of truth):
+**Layer** (built by `build_layer.sh` — the normative build entry point; its pins
+are co-owned with the `lambda` extra in `pyproject.toml`, and mortie's version
+spec is read from `pyproject.toml` at build time — issue #322):
 numpy, pandas, arro3-core, fastparquet, cramjam, xarray, h5netcdf, h5py, shapely,
 pyproj, odc-geo, affine, cachetools, h5coro, h5coro-hidefix, mortie, async-tiff,
 obspec, and their transitive deps. (`earthaccess` is orchestrator-only and
@@ -92,9 +94,12 @@ GB-seconds per full run, this saves ~$0.60/run. Over many runs it adds up.
 
 ### The build (containerized — the one normative path)
 
-`deployment/aws/build_layer.sh` is the single source of truth for layer
-contents (package set, pins, numpy page-alignment build, bloat strip, 250 MB
-gate). Do not hand-maintain a parallel pip recipe — the script must run inside
+`deployment/aws/build_layer.sh` is the normative build entry point for the layer
+(package set, numpy page-alignment build, bloat strip, 250 MB gate). Its pins
+are co-owned with the `lambda` extra in `pyproject.toml` — the script says "keep
+in sync" at each one — and mortie's spec is read out of `pyproject.toml`
+directly (issue #322), so a floor bump there reaches the layer with no second
+edit. Do not hand-maintain a parallel pip recipe — the script must run inside
 an arch-matched `manylinux_2_28` container (cp312), exactly as CI does in
 `.github/workflows/lambda-build-reusable.yml`.
 
