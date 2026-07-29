@@ -4018,6 +4018,86 @@ class TestReadGroupFilters:
 # ---------------------------------------------------------------------------
 
 
+class TestVariableColumnSelector:
+    """``data_source.variables`` column-selector mapping form (issue #321)."""
+
+    def _data_source(self, variables):
+        return {
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+            "variables": variables,
+        }
+
+    def test_column_form_selects_scalar_column(self):
+        conf = np.array([[0, 4], [3, 0], [2, 1]])
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(3.0),
+                "/lon": np.arange(3.0),
+                "/h": np.arange(3.0, dtype=np.float32),
+                "/conf": conf,
+            }
+        )
+        ds = self._data_source(
+            {
+                "h": "/h",
+                "conf_land": {"path": "/conf", "column": 0},
+                "conf_ocean": {"path": "/conf", "column": 1},
+            }
+        )
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["conf_land"].tolist() == [0, 3, 2]
+        assert df["conf_ocean"].tolist() == [4, 0, 1]
+
+    def test_shared_path_deduped_and_filter_coincides(self):
+        # Five columns off one dataset plus a structured filter on the same
+        # path: values line up after the filter mask, one read for all six uses.
+        conf = np.array([[-2, 9], [0, 8], [4, 7], [-2, 6], [3, 5]])
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(5.0),
+                "/lon": np.arange(5.0),
+                "/h": np.arange(5.0, dtype=np.float32),
+                "/conf": conf,
+            }
+        )
+        ds = self._data_source(
+            {
+                "h": "/h",
+                "c0": {"path": "/conf", "column": 0},
+                "c1": {"path": "/conf", "column": 1},
+            }
+        )
+        ds["filters"] = [{"dataset": "/conf", "column": 0, "op": "ne", "value": -2}]
+        df = _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+        assert df["c0"].tolist() == [0, 4, 3]
+        assert df["c1"].tolist() == [8, 7, 5]
+
+    def test_column_on_1d_rejected(self):
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(2.0),
+                "/lon": np.arange(2.0),
+                "/h": np.arange(2.0, dtype=np.float32),
+            }
+        )
+        ds = self._data_source({"h": {"path": "/h", "column": 0}})
+        with pytest.raises(ValueError, match="'column' set but array is 1-D"):
+            _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+
+    def test_2d_without_column_rejected(self):
+        conf = np.zeros((2, 3))
+        h5 = _FakeH5(
+            {
+                "/lat": np.arange(2.0),
+                "/lon": np.arange(2.0),
+                "/conf": conf,
+            }
+        )
+        ds = self._data_source({"conf": "/conf"})
+        with pytest.raises(ValueError, match="requires an integer 'column'"):
+            _read_group(h5, "gt1l", ds, 0, _ShardGrid())
+
+
 class TestExpandMaskToBase:
     def test_single_parent_kept(self):
         # 1 parent keeps base rows 0-2 (3 photons).
