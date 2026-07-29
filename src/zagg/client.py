@@ -49,6 +49,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+import warnings
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from concurrent.futures import wait as futures_wait
 from dataclasses import asdict
@@ -80,11 +81,12 @@ from zagg.hive import effective_store_root
 
 logger = logging.getLogger(__name__)
 
-#: Fan-out width when ``dispatch(max_workers=...)`` is not given. Deliberately
-#: modest: the v1 sync transport holds one connection per in-flight shard and
-#: this path runs no account-concurrency probe (unlike ``agg``'s preflight,
-#: which clamps against account limits before sizing the pool) — fine at
-#: notebook/NEON scale; pass ``max_workers`` explicitly for bigger fan-outs.
+#: Fallback fan-out width: used when ``dispatch(max_workers=...)`` is not given
+#: AND the account-concurrency preflight cannot run (a custom ``lambda_client``
+#: is injected, or the probe was denied — see :meth:`Run._probe_workers`).
+#: Deliberately modest, since the v1 sync transport holds one connection per
+#: in-flight shard: fine at notebook/NEON scale, and ``max_workers`` is the
+#: explicit override for bigger fan-outs.
 _DEFAULT_MAX_WORKERS = 64
 
 
@@ -367,8 +369,11 @@ class Run:
             An injected boto3 Lambda client (testability / custom botocore
             config). Default ``None`` builds one per dispatch, sized to the
             fan-out (``read_timeout`` above the 900 s function ceiling). With
-            an injected client no STS caller-identity probe runs, so worker
-            stats records carry a null ``invoked_by`` (fail-open, issue #297).
+            an injected client neither the STS caller-identity probe nor the
+            account-concurrency preflight runs, so worker stats records carry a
+            null ``invoked_by`` (fail-open, issue #297) and the fan-out falls
+            back to :data:`_DEFAULT_MAX_WORKERS` unless ``max_workers`` is
+            given — a stub client must not have to answer either probe.
         driver, handoff, profile, max_retries, overwrite,
         output_credentials, output_endpoint_url
             Same semantics as the matching :func:`zagg.runner.agg` kwargs.
@@ -479,6 +484,45 @@ class Run:
 
     # -- dispatch -----------------------------------------------------------
 
+    def _probe_workers(self, session, n: int) -> int:
+        """Account-concurrency preflight, degrading to the default on denial.
+
+        Runs ``agg``'s own :func:`~zagg.concurrency.compute_available_workers`
+        (local FD ceiling ∩ account-wide Lambda headroom) against the work
+        size, so a notebook fan-out is sized by what the account can actually
+        take rather than by a hardcoded guess (espg ruling on PR #333: whoever
+        can invoke the workers normally can read the concurrency too).
+
+        Fail-open by design: ANY probe failure — ``AccessDenied`` under a
+        narrow-permission deployment (the cryocloud case, where the worker role
+        holds the perms and the caller only deploys), missing CloudWatch
+        permissions, a throttle — falls back to :data:`_DEFAULT_MAX_WORKERS`
+        with a ``warnings.warn`` naming the denial. A run the caller is allowed
+        to dispatch must not fail on an optional preflight read. Skipped
+        entirely when ``max_workers`` is explicit or a client was injected.
+        """
+        from zagg import runner
+
+        try:
+            workers, report = runner.compute_available_workers(
+                n,
+                session.client("lambda", region_name=self.region),
+                session.client("cloudwatch", region_name=self.region),
+                self.function_name,
+            )
+            runner._log_concurrency_report(report, workers)
+            return workers
+        except Exception as e:
+            warnings.warn(
+                f"account-concurrency preflight failed ({type(e).__name__}: {e}); "
+                f"sizing the fan-out at the default max_workers="
+                f"{_DEFAULT_MAX_WORKERS} instead. Pass max_workers= to set it "
+                f"explicitly and skip the probe.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return _DEFAULT_MAX_WORKERS
+
     def dispatch(self, shard_keys=None, max_workers: int | None = None) -> RunHandle:
         """Fan the shards out; return a :class:`RunHandle` of per-shard futures.
 
@@ -493,9 +537,10 @@ class Run:
             Subset of shards to dispatch — raw int shardmap keys or external
             string labels (decimal morton for HEALPix). Default all shards.
         max_workers : int, optional
-            Pool width, clamped to the shard count. Default
-            :data:`_DEFAULT_MAX_WORKERS`; no account-concurrency probe runs
-            on this path (see the constant's note).
+            Pool width, clamped to the shard count. An explicit value wins
+            verbatim and skips the preflight probe; omitted, the account
+            concurrency probe sizes the pool (see :meth:`_probe_workers`) and
+            :data:`_DEFAULT_MAX_WORKERS` is the fallback when it cannot run.
         """
         from zagg import runner
 
@@ -503,15 +548,20 @@ class Run:
         if not cells:
             raise ValueError("no shards selected")
         n = len(cells)
-        workers = min(max_workers or _DEFAULT_MAX_WORKERS, n)
 
         client = self._lambda_client
         invoked_by = None
-        if client is None:
+        if client is not None:
+            # Injected client (the test seam): no probe, no STS — a stub must
+            # not need to answer GetAccountSettings or get-caller-identity.
+            workers = min(max_workers or _DEFAULT_MAX_WORKERS, n)
+        else:
             import boto3
             from botocore.config import Config
 
             session = boto3.Session()
+            requested = max_workers if max_workers is not None else self._probe_workers(session, n)
+            workers = max(1, min(requested, n))
             # read_timeout must exceed the 900 s function ceiling (same
             # rationale as agg's preflight-built client, issue #148); the
             # connection pool tracks the fan-out width.
