@@ -65,9 +65,17 @@ def apply_field_attrs(spec, meta: dict):
     ``aggregation.variables.{name}.attrs`` (issue #321) records field-level
     provenance in the store — e.g. the composition field's lane order and the
     signal threshold the split was committed at — so readers bind to metadata
-    rather than reconstructing config conventions. Declared keys are merged
-    over the spec's own attributes; the reserved ``ragged`` block cannot be
-    overridden (enforced at config validation).
+    rather than reconstructing config conventions.
+
+    Attrs land on the **payload array only**. A located ragged field's sibling
+    uint64 channel (:func:`ragged_locations_name`) is addressed *through* the
+    payload array, so it deliberately carries no user attrs — the provenance of
+    the pair lives on the field the config named (review finding, PR #334).
+
+    Declared keys are merged **over** the spec's own attributes, so a config
+    could in principle shadow spec-owned metadata; the reserved ``ragged``
+    block is the one key protected from that (enforced at config validation),
+    which is a denylist of exactly the one populated spec attr in tree today.
     """
     attrs = meta.get("attrs")
     if not attrs:
