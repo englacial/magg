@@ -471,6 +471,31 @@ class TestSpillConfig:
         assert not agg._mergeable
         agg.close()
 
+    def test_stratified_config_single_block_only(self):
+        # Signal/noise strata + composition (issue #321): accepted by spill,
+        # pinned non-mergeable (single-block regime, exact via the pooled
+        # replay) — the fold surface would silently drop the ``where`` mask.
+        variables = _base_variables()
+        variables["h_sig"] = {
+            "kind": "ragged",
+            "function": "zagg.stats.tdigest.build_tdigest_where",
+            "source": "h_ph",
+            "inner_shape": [2],
+            "params": {"delta": 64, "where": "h_ph > 0"},
+            "dtype": "float32",
+            "fill_value": 0,
+        }
+        variables["composition"] = {
+            "function": "zagg.stats.composition.pack_composition",
+            "source": "h_ph",
+            "dtype": "uint64",
+            "fill_value": 0,
+        }
+        cfg = _config(streaming={"mode": "spill"}, variables=variables)
+        agg = SpillAggregator(cfg, _grid(cfg), "pandas", 25)
+        assert not agg._mergeable
+        agg.close()
+
     def test_guard_fires_at_construction(self, monkeypatch):
         import os as _os
 
