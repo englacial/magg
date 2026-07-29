@@ -21,7 +21,7 @@ x86_64 / py3.12 is available for local/testing parity.
 ### Current Config
 - **Runtime**: python3.12
 - **Architecture**: arm64 (default; x86_64 also supported)
-- **Layer**: `zagg-deps-{arch}` (py3.12, pyproj/odc-geo for rectilinear grids, h5coro==0.0.8)
+- **Layer**: `zagg-deps-{arch}` (py3.12; contents defined by `build_layer.sh` — see below)
 - **Function code**: `lambda_handler.py` + `zagg/` package + obstore/zarr/pydantic-zarr/pyyaml
 - **Role**: created by `template.yaml` (CloudFormation-auto-named; the template
   sets no `RoleName`), scoped least-privilege to the `OutputBucketName` bucket
@@ -33,11 +33,12 @@ x86_64 / py3.12 is available for local/testing parity.
 
 ### What's in the layer vs function code
 
-**Layer** (built by `build_layer.sh`):
-numpy, pandas, fastparquet, cramjam, shapely, pyproj, odc-geo, affine, cachetools,
-h5coro, mortie, and their transitive deps. (Corrected: `earthaccess` is
-orchestrator-only and **not** in the layer; `boto3` is provided by the Lambda
-runtime; `astropy`/`s3fs`/`pyarrow` are not installed by `build_layer.sh`. The old
+**Layer** (built by `build_layer.sh` — the script is the single source of truth):
+numpy, pandas, arro3-core, fastparquet, cramjam, xarray, h5netcdf, h5py, shapely,
+pyproj, odc-geo, affine, cachetools, h5coro, h5coro-hidefix, mortie, async-tiff,
+obspec, and their transitive deps. (`earthaccess` is orchestrator-only and
+**not** in the layer; `boto3` is provided by the Lambda runtime and explicitly
+stripped; `pyarrow` was replaced by `arro3-core` — issue #130. The old
 `xagg-dependencies:1`/222MB figure is historical.)
 
 **Function code** (built by `build_function.sh`):
@@ -83,124 +84,79 @@ already-deployed function and does not create the role/function/bucket.
 
 ---
 
-## Rebuilding the ARM64 Layer
+## Rebuilding the Layer
 
-### Why
+### Why arm64
 ARM64 Lambda is 20% cheaper ($0.0000133334 vs $0.0000166667 per GB-second). At ~90,000
 GB-seconds per full run, this saves ~$0.60/run. Over many runs it adds up.
 
-### What needs to happen
+### The build (containerized — the one normative path)
 
-1. Build a new layer with all deps compiled for `manylinux2014_aarch64` + `cp312`
-2. The layer must include the same packages as `xagg-dependencies:1` but for ARM64/py3.12
-3. Deploy the function with architecture `arm64` and runtime `python3.12`
+`deployment/aws/build_layer.sh` is the single source of truth for layer
+contents (package set, pins, numpy page-alignment build, bloat strip, 250 MB
+gate). Do not hand-maintain a parallel pip recipe — the script must run inside
+an arch-matched `manylinux_2_28` container (cp312), exactly as CI does in
+`.github/workflows/lambda-build-reusable.yml`.
 
-### Option A: Build on Apple Silicon (manual)
-
-On an Apple Silicon Mac:
+With podman (what we use locally), from the repo root:
 
 ```bash
-# Create build directory
-mkdir -p /tmp/layer_build/python
+# arm64 (native on Apple Silicon)
+podman run --rm \
+  -v "$(pwd)":/workspace \
+  -w /workspace/deployment/aws \
+  quay.io/pypa/manylinux_2_28_aarch64 \
+  bash -c "yum install -y zip && chmod +x build_layer.sh && ./build_layer.sh arm64"
 
-# Install deps targeting Lambda's manylinux environment
-pip install \
-  --platform manylinux2014_aarch64 \
-  --target /tmp/layer_build/python \
-  --implementation cp \
-  --python-version 3.12 \
-  --only-binary=:all: \
-  numpy==2.2.6 pandas==2.2.3 h5coro==0.0.8 mortie earthaccess \
-  boto3 fastparquet pyarrow shapely pyproj odc-geo cramjam astropy requests
-
-# Trim bloat
-find /tmp/layer_build -type d -name '__pycache__' -exec rm -rf {} +
-find /tmp/layer_build -type d -name '*.dist-info' -exec rm -rf {} +
-find /tmp/layer_build -type d -name 'tests' -exec rm -rf {} +
-
-# Check size (must be <250MB unzipped when combined with function code)
-du -sh /tmp/layer_build/
-
-# Zip
-cd /tmp/layer_build && zip -qr /tmp/lambda_layer_arm64.zip python/
-
-# Publish
-aws lambda publish-layer-version \
-  --layer-name zagg-deps-arm64 \
-  --compatible-runtimes python3.12 \
-  --compatible-architectures arm64 \
-  --zip-file fileb:///tmp/lambda_layer_arm64.zip \
-  --region us-west-2
-
-# Update function
-aws lambda update-function-configuration \
-  --function-name process-shard \
-  --runtime python3.12 \
-  --layers "arn:aws:lambda:us-west-2:429435741471:layer:zagg-deps-arm64:1" \
-  --region us-west-2
-
-# Then update code with arm64 arch
-aws lambda update-function-code \
-  --function-name process-shard \
-  --zip-file fileb:///tmp/lambda_function.zip \
-  --architectures arm64 \
-  --region us-west-2
+# x86_64 (on Apple Silicon this is emulated — needs Rosetta/qemu in the podman machine)
+podman run --rm \
+  -v "$(pwd)":/workspace \
+  -w /workspace/deployment/aws \
+  quay.io/pypa/manylinux_2_28_x86_64 \
+  bash -c "yum install -y zip && chmod +x build_layer.sh && ./build_layer.sh x86_64"
 ```
 
-### Option B: CI/CD on GitHub Actions with macOS Apple Silicon (recommended)
+Docker equivalents are identical apart from the binary name:
 
-GitHub provides free macOS Apple Silicon runners for public repos. This is the best
-option because Linux ARM64 runners have had issues building some of our deps.
-
-Key findings:
-- `macos-15` runners use M1 Apple Silicon (ARM64), 3 CPUs, 7GB RAM
-- Free for public repos (englacial/zagg is public), $0.062/min for private
-- Docker is NOT available on macOS ARM64 runners (Apple Virtualization limitation)
-- `pip install --platform manylinux2014_aarch64 --only-binary=:all:` works from macOS
-  to cross-compile Lambda layers — no Docker needed
-- All our deps have pre-built `manylinux2014_aarch64` wheels on PyPI
-
-The layer + function are now built in CI by `.github/workflows/lambda-build.yml` (both arches, with the combined 250MB size gate); the originally-planned `deploy-lambda.yml` was never added. The manual/CI options below are historical design notes.
-
-### Option C: Cross-compile from x86_64 (current approach for testing)
-
-Works for packages with pre-built `manylinux_2_17_x86_64` wheels. Download with:
 ```bash
-pip download --python-version 311 --platform manylinux_2_17_x86_64 \
-  --only-binary :all: --no-deps <package> -d /tmp/wheels
+docker run --rm \
+  -v "$(pwd)":/workspace \
+  -w /workspace/deployment/aws \
+  quay.io/pypa/manylinux_2_28_aarch64 \
+  bash -c "yum install -y zip && chmod +x build_layer.sh && ./build_layer.sh arm64"
 ```
-Then unzip wheels into the build directory. This is what we're doing now for testing.
+
+On an SELinux-enforcing Linux host, add `:z` to the podman volume mount
+(`-v "$(pwd)":/workspace:z`) so the container can write the zip back; it is
+not needed on macOS (`podman machine`).
+
+The zip lands in `deployment/layers/lambda_layer_<arch>.zip`. The script
+enforces the 250 MB unzipped limit itself; CI additionally gates the combined
+layer + function size. CI builds both arches this same way on arch-matched
+runners (`lambda-build.yml` → `lambda-build-reusable.yml`), and release zips
+come from `publish.yml` calling the same reusable workflow — deploys consume
+those via `stand_up.sh` (above).
 
 ---
 
 ## Deploying Updated Function Code (no layer change)
 
-When only `lambda_handler.py` or `zagg/` package code changes (no new deps):
+When only `lambda_handler.py` or `zagg/` package code changes (no new deps),
+build with the script (it owns the function dep list, the layer-overlap strip,
+and the dist-info handling — zarr/pydantic_zarr keep theirs, stripping them
+breaks `importlib.metadata`):
 
 ```bash
-# Build zip
-rm -rf /tmp/lambda_build && mkdir -p /tmp/lambda_build
-cp deployment/aws/lambda_handler.py /tmp/lambda_build/
-cp -r src/zagg /tmp/lambda_build/zagg
-
-# Add deps not in layer (skip native ones if already unpacked)
-pip install --target /tmp/lambda_build --no-deps \
-  zarr pydantic-zarr pyyaml pydantic typeguard typing_inspect annotated-types
-
-# For obstore (native): download correct wheel and unzip
-pip download --python-version <VER> --platform <PLAT> --only-binary :all: \
-  --no-deps obstore -d /tmp/wheels
-unzip -qo /tmp/wheels/obstore-*.whl -d /tmp/lambda_build
-
-# Clean and zip
-find /tmp/lambda_build -type d -name '*.dist-info' -exec rm -rf {} +
-find /tmp/lambda_build -type d -name '__pycache__' -exec rm -rf {} +
-cd /tmp/lambda_build && zip -qr /tmp/lambda_function.zip .
+# Build zip (auto-detects arch and Python). Native deps (obstore) resolve for
+# the host, so run on Linux with the function's arch/Python — CI uses
+# arch-matched ubuntu runners; on a Mac, run inside a Linux container as with
+# the layer build.
+deployment/aws/build_function.sh
 
 # Deploy
 aws lambda update-function-code \
   --function-name process-shard \
-  --zip-file fileb:///tmp/lambda_function.zip \
+  --zip-file fileb://deployment/builds/lambda_function_arm64_py312.zip \
   --region us-west-2
 ```
 
@@ -249,7 +205,7 @@ deps from the layer into the function code (or vice versa).
 ## Build Infrastructure
 
 ### Scripts
-- `deployment/aws/build_layer.sh [x86_64|arm64]` — Lambda layer build (runs in an arch-matched Docker container)
+- `deployment/aws/build_layer.sh [x86_64|arm64]` — Lambda layer build (runs in an arch-matched manylinux container via podman/docker — see "Rebuilding the Layer" above)
 - `deployment/aws/build_function.sh` — function code build (handler + zagg + non-layer deps)
 
 ### CI/CD
