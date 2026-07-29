@@ -27,6 +27,17 @@ class TestPackComposition:
         lanes = unpack_composition(word)
         assert lanes.tolist() == [255, 0, 0, 255, 0, 0, 0, 255]  # land, land_ice; strongest=4
 
+    def test_golden_word_pins_lsb_first_byte_order(self):
+        # Every other assertion goes through ``unpack_composition``, so a
+        # layout flip to MSB-first would keep the whole suite green while
+        # breaking the ratified byte order for any independent reader
+        # (moczarr). Pin the literal: lane i occupies bits 8i..8i+8, so lanes
+        # [255, 0, 0, 255, 0, 0, 0, 255] -> land (b0) | land_ice (b3) | high
+        # (b7). MSB-first would give 0xFF0000FF000000FF instead.
+        conf = np.array([[4, -1, 0, 3, 1]])
+        word = pack_composition(np.array([10.0]), **_conf_kwargs(conf), threshold=2)
+        assert word == 0xFF000000FF0000FF
+
     def test_exact_count_recovery_below_knee(self):
         rng = np.random.default_rng(321)
         n = 200
