@@ -718,18 +718,36 @@ class Run:
         each a fire-and-forget worker invoke (D8), each swallowed on failure
         exactly like ``_run_lambda``'s tail. A finalize failure is recorded on
         the handle and re-raised from :meth:`RunHandle.wait`.
+
+        Every shard contributes exactly one result dict, so every shard gets a
+        run-stats row: a worker envelope, a :class:`ShardError` payload, or —
+        for a transport-level exception that never produced an envelope (the
+        payload-cap ``ValueError``, an fd-exhaustion re-raise, a botocore error
+        escaping the retry loop) — a synthesized failure dict, which
+        ``_lambda_result_rows`` turns into a ``failure_record`` row rather than
+        dropping the shard from telemetry (review finding, PR #333).
         """
         from zagg import runner
 
         futures = list(handle.futures.values())
         futures_wait(futures)
         results = []
-        for fut in futures:
+        for key, fut in handle.futures.items():
             exc = fut.exception()
             if exc is None:
                 results.append(fut.result())
             elif isinstance(exc, ShardError):
                 results.append(exc.payload)
+            else:
+                results.append(
+                    {
+                        "shard_key": key,
+                        "status_code": None,
+                        "body": {},
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "retries": None,
+                    }
+                )
         layout = get_store_layout(self.config)
         try:
             if layout == "hive":

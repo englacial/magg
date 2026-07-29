@@ -6,6 +6,7 @@ tests exercise the real payload construction, future resolution, error
 surfacing, and the worker-invoke post-run tail.
 """
 
+import errno
 import importlib
 import json
 import sys
@@ -362,6 +363,46 @@ class TestFutures:
         # try/finally ran: the pool refuses new work.
         with pytest.raises(RuntimeError, match="shutdown"):
             pools[0].submit(len, "")
+
+    def test_transport_exception_still_gets_a_failure_row(self, catalog, monkeypatch):
+        # Regression (review finding, PR #333): a shard failing with something
+        # other than ShardError — fd exhaustion here, likewise the payload-cap
+        # ValueError or a botocore error escaping the retry loop — contributed
+        # no run-stats row at all, vanishing from telemetry while status() still
+        # counted it failed.
+        from zagg import runner
+
+        real_rows = runner._lambda_result_rows
+        captured: dict = {}
+
+        def _capture(results, *, run_id=None):
+            out = real_rows(results, run_id=run_id)
+            captured["rows"] = out[0]
+            return out
+
+        monkeypatch.setattr(runner, "_lambda_result_rows", _capture)
+
+        class _FdExhaustedStub(StubLambdaClient):
+            def invoke(self, **kwargs):
+                event = json.loads(kwargs["Payload"])
+                if event.get("mode") is None and event["shard_key"] == _WORDS[0]:
+                    # What botocore surfaces at the fd ceiling; runner's
+                    # raise_for_fd_exhaustion re-raises it past the retry loop.
+                    raise OSError(errno.EMFILE, "Too many open files")
+                return super().invoke(**kwargs)
+
+        handle = _run(catalog, client=_FdExhaustedStub()).dispatch()
+        with pytest.raises(OSError, match="Too many open files"):
+            handle.futures[_WORDS[0]].result()
+        mapped = handle.results(return_exceptions=True)  # also joins the tail
+        assert isinstance(mapped[_WORDS[0]], OSError)
+        assert handle.status() == {"pending": 0, "ok": 2, "failed": 1}
+        # All three shards are in the run record, the dropped one as a failure.
+        rows = captured["rows"]
+        assert sorted(r["shard_key"] for r in rows) == sorted(_WORDS)
+        (bad,) = [r for r in rows if r["shard_key"] == _WORDS[0]]
+        assert bad["success"] is False
+        assert "Too many open files" in bad["error"]
 
     def test_finalize_failure_wins_over_a_tail_crash(self, catalog, monkeypatch):
         # Two distinct channels: the D6 manifest backstop failure is the one
