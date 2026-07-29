@@ -324,6 +324,121 @@ class TestDispatch:
             run.dispatch(shard_keys=[123])
 
 
+# -- concurrency preflight ----------------------------------------------------
+
+
+class TestConcurrencyPreflight:
+    """`dispatch()` sizes the pool with agg's probe, degrading on denial.
+
+    espg ruling on PR #333, option (a): a notebook caller who can invoke the
+    workers can normally read the account concurrency too, so probe by default;
+    but a narrow-permission deployment (cryocloud: worker role holds the perms,
+    caller only deploys) must degrade, not fail.
+    """
+
+    @staticmethod
+    def _dispatch(catalog, monkeypatch, *, probe=None, **dispatch_kwargs):
+        """Dispatch with NO injected client; return (pool_width, probe_calls)."""
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        from zagg import runner
+
+        stub = StubLambdaClient()
+        session = MagicMock()
+        session.client.side_effect = lambda service, **k: (
+            stub if service == "lambda" else MagicMock()
+        )
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: session)
+
+        calls: list = []
+        if probe is not None:
+
+            def _probe(requested, lambda_client, cloudwatch_client, function_name, **k):
+                calls.append((requested, function_name))
+                return probe(requested)
+
+            monkeypatch.setattr(runner, "compute_available_workers", _probe)
+
+        widths: list = []
+
+        class _TrackedPool(ThreadPoolExecutor):
+            def __init__(self, *a, **k):
+                widths.append(k.get("max_workers"))
+                super().__init__(*a, **k)
+
+        monkeypatch.setattr(zagg.client, "ThreadPoolExecutor", _TrackedPool)
+        run = Run.from_config(
+            default_config("atl06"),
+            shardmap=catalog,
+            store=_STORE,
+            function_name="process-shard-test",
+            source_credentials=_CREDS,
+        )
+        run.dispatch(**dispatch_kwargs).results()
+        return widths[0], calls
+
+    @staticmethod
+    def _report():
+        from zagg.concurrency import ConcurrencyReport
+
+        return ConcurrencyReport(
+            account_limit=1000,
+            current_concurrent=0,
+            padding=100,
+            available=900,
+            function_reserved=None,
+        )
+
+    def test_probe_sizes_the_pool(self, catalog, monkeypatch):
+        width, calls = self._dispatch(
+            catalog, monkeypatch, probe=lambda requested: (2, self._report())
+        )
+        assert width == 2  # the probe's clamp, not _DEFAULT_MAX_WORKERS
+        # It asks for the work size and names the dispatch target.
+        assert calls == [(3, "process-shard-test")]
+
+    def test_probe_denial_falls_back_with_a_warning(self, catalog, monkeypatch):
+        # Distinguish the fallback from the shard-count clamp by shrinking the
+        # default below the shard count.
+        monkeypatch.setattr(zagg.client, "_DEFAULT_MAX_WORKERS", 2)
+
+        def _denied(requested):
+            from botocore.exceptions import ClientError
+
+            raise ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "no cloudwatch for you"}},
+                "GetMetricStatistics",
+            )
+
+        with pytest.warns(RuntimeWarning, match="AccessDenied"):
+            width, calls = self._dispatch(catalog, monkeypatch, probe=_denied)
+        assert width == 2  # degraded to the default, run still dispatched
+        assert calls == [(3, "process-shard-test")]
+
+    def test_explicit_max_workers_skips_the_probe(self, catalog, monkeypatch):
+        def _must_not_run(requested):
+            raise AssertionError("probe ran despite an explicit max_workers")
+
+        width, calls = self._dispatch(catalog, monkeypatch, probe=_must_not_run, max_workers=1)
+        assert width == 1
+        assert calls == []
+
+    def test_injected_client_skips_the_probe(self, catalog, monkeypatch):
+        # The stub-client seam: a test double must not have to answer
+        # GetAccountSettings/GetMetricStatistics (nor the STS identity probe).
+        from zagg import runner
+
+        def _must_not_run(*a, **k):
+            raise AssertionError("probe ran with an injected lambda_client")
+
+        monkeypatch.setattr(runner, "compute_available_workers", _must_not_run)
+        handle = _run(catalog, client=StubLambdaClient()).dispatch()
+        handle.results()
+        assert len(handle) == 3
+
+
 # -- parity with the runner's lambda path -------------------------------------
 
 
