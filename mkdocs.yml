@@ -27,6 +27,7 @@ nav:
       - "Schema": "design/schema.md"
       - "Sharded output": "sharding.md"
       - "Ragged store layout": "ragged_layout.md"
+      - "Signal strata + composition": "signal_strata.md"
       - "Hive store layout": "hive_layout.md"
       - "Typed morton boundary": "morton_arrow.md"
       - "Temporal events": "temporal_events.md"
