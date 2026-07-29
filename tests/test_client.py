@@ -11,6 +11,7 @@ import json
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -331,6 +332,54 @@ class TestFutures:
         # Whole tail landed, in order, with no wait() call anywhere above.
         assert stub.modes()[-3:] == ["finalize", "coverage", "stats"]
         assert not handle._finisher.is_alive()
+
+    def test_tail_exception_surfaces_and_still_shuts_the_pool_down(self, catalog, monkeypatch):
+        # Regression (review finding, PR #333): _post_run's plumbing used to sit
+        # outside every try, so a crash there died in threading.excepthook while
+        # wait() reported a clean run and the pool was never shut down.
+        from zagg import runner
+
+        def _boom(*a, **k):
+            raise RuntimeError("tail blew up")
+
+        monkeypatch.setattr(runner, "_lambda_result_rows", _boom)
+        stub = StubLambdaClient()
+        run = _run(catalog, client=stub)
+        pools: list = []
+
+        class _TrackedPool(ThreadPoolExecutor):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                pools.append(self)
+
+        monkeypatch.setattr(zagg.client, "ThreadPoolExecutor", _TrackedPool)
+        handle = run.dispatch()
+        with pytest.raises(RuntimeError, match="tail blew up"):
+            handle.wait(timeout=10)
+        # ... and the same failure is what a plain drain surfaces.
+        with pytest.raises(RuntimeError, match="tail blew up"):
+            handle.results()
+        # try/finally ran: the pool refuses new work.
+        with pytest.raises(RuntimeError, match="shutdown"):
+            pools[0].submit(len, "")
+
+    def test_finalize_failure_wins_over_a_tail_crash(self, catalog, monkeypatch):
+        # Two distinct channels: the D6 manifest backstop failure is the one
+        # raised when both a finalize failure and a tail crash are recorded.
+        from zagg import runner
+
+        def _fail(*a, **k):
+            raise RuntimeError("finalize down")
+
+        def _boom(*a, **k):
+            raise RuntimeError("tail blew up")
+
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", _fail)
+        monkeypatch.setattr(runner, "_lambda_result_rows", _boom)
+        handle = _run(catalog, client=StubLambdaClient()).dispatch()
+        with pytest.raises(RuntimeError, match="finalize down"):
+            handle.wait(timeout=10)
+        assert isinstance(handle._tail_error, RuntimeError)
 
     def test_break_out_of_the_loop_leaves_the_tail_to_wait(self, catalog):
         # The documented escape hatch: an undrained iterator does not join, so

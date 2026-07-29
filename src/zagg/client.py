@@ -131,6 +131,7 @@ class RunHandle:
         self.store_path = store_path
         self._finisher: threading.Thread | None = None
         self._finalize_error: BaseException | None = None
+        self._tail_error: BaseException | None = None
 
     def __len__(self) -> int:
         return len(self.futures)
@@ -224,8 +225,10 @@ class RunHandle:
 
         Re-raises a failed finalize backstop (the manifest is required
         reader-facing schema, D6); the coverage/stats/sweep rollups are
-        fail-open by design and never raise here. Raises ``TimeoutError``
-        when the tail is still running at ``timeout``.
+        fail-open by design and never raise here, but an exception in the
+        tail's own plumbing does surface (it would otherwise vanish into the
+        finisher thread). Raises ``TimeoutError`` when the tail is still
+        running at ``timeout``.
 
         Draining a harvest iterator already joins the tail, so ``wait`` is for
         explicit control.
@@ -247,8 +250,12 @@ class RunHandle:
         self._raise_tail_error()
 
     def _raise_tail_error(self) -> None:
+        # Finalize first: it is the D6 manifest backstop, a strictly more
+        # load-bearing failure than a crashed fail-open rollup leg.
         if self._finalize_error is not None:
             raise self._finalize_error
+        if self._tail_error is not None:
+            raise self._tail_error
 
 
 class Run:
@@ -678,6 +685,31 @@ class Run:
         output_creds_event: dict | None,
         run_id: str,
     ) -> None:
+        """Finisher-thread entry point: run the tail, never lose its failure.
+
+        Anything the tail raises outside its own fail-open guards would
+        otherwise die in ``threading.excepthook`` while ``wait()`` reported a
+        clean run, so it is recorded on the handle as ``_tail_error`` (kept
+        distinct from the D6-load-bearing ``_finalize_error``) and the pool is
+        shut down either way (review finding, PR #333).
+        """
+        try:
+            self._run_tail(handle, client, config_dict, dataset, output_creds_event, run_id)
+        except BaseException as e:
+            handle._tail_error = e
+            logger.warning(f"post-run tail failed (surfaced via handle.wait()): {e}")
+        finally:
+            pool.shutdown(wait=False)
+
+    def _run_tail(
+        self,
+        handle: RunHandle,
+        client,
+        config_dict: dict,
+        dataset: dict | None,
+        output_creds_event: dict | None,
+        run_id: str,
+    ) -> None:
         """After every shard settles: the same worker-invoke tail as ``agg``.
 
         Finalize backstop (hive always — the idempotent manifest self-heal;
@@ -780,4 +812,3 @@ class Run:
                     )
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
-        pool.shutdown(wait=False)
