@@ -20,6 +20,7 @@ from zagg.config import (
 )
 from zagg.grids.base import (
     InconsistentShardError,
+    apply_field_attrs,
     chunk_array_spec,
     ragged_array_spec,
     ragged_locations_name,
@@ -614,11 +615,14 @@ class HealpixGrid:
                         "shard_shape": rag_shard,
                     }
                 located = ragged_locations_name(name) if sig.get("location") else None
-                members[name] = ragged_array_spec(
-                    element_dtype=sig["dtype"] or "float32",
-                    inner_shape=sig["inner_shape"],
-                    locations=located,
-                    **rag_kw,
+                members[name] = apply_field_attrs(
+                    ragged_array_spec(
+                        element_dtype=sig["dtype"] or "float32",
+                        inner_shape=sig["inner_shape"],
+                        locations=located,
+                        **rag_kw,
+                    ),
+                    meta,
                 )
                 if located:
                     members[located] = ragged_array_spec(element_dtype="uint64", **rag_kw)
@@ -634,26 +638,32 @@ class HealpixGrid:
                 # appends the field's trailing_shape (chunked whole) for a vector
                 # companion. A scalar/ragged field has an empty trailing_shape, so
                 # vector_array_spec returns the chunk base unchanged.
-                members[name] = vector_array_spec(
-                    chunk_array_spec(
-                        spec,
-                        chunk_grid_shape=chunk_grid_shape,
-                        chunk_dims=("chunks",),
+                members[name] = apply_field_attrs(
+                    vector_array_spec(
+                        chunk_array_spec(
+                            spec,
+                            chunk_grid_shape=chunk_grid_shape,
+                            chunk_dims=("chunks",),
+                        ),
+                        sig,
+                        base_dims=("chunks",),
+                        base_chunk_shape=(1,),
                     ),
-                    sig,
-                    base_dims=("chunks",),
-                    base_chunk_shape=(1,),
+                    meta,
                 )
                 continue
             # A vector field (issue #29) gets a trailing payload dim chunked
             # whole; scalars are returned unchanged.
-            members[name] = _shard(
-                vector_array_spec(
-                    spec,
-                    sig,
-                    base_dims=("cells",),
-                    base_chunk_shape=(self.cells_per_chunk,),
-                )
+            members[name] = apply_field_attrs(
+                _shard(
+                    vector_array_spec(
+                        spec,
+                        sig,
+                        base_dims=("cells",),
+                        base_chunk_shape=(self.cells_per_chunk,),
+                    )
+                ),
+                meta,
             )
 
         return GroupSpec(members=members, attributes=self._dggs_attrs())
