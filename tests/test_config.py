@@ -461,6 +461,43 @@ class TestValidation:
         # Should not raise
         validate_config(atl06_config)
 
+    def _config_with_variables(self, variables):
+        return PipelineConfig(
+            data_source={"variables": variables},
+            aggregation={
+                "variables": {
+                    "n": {"function": "len", "source": "h_li", "dtype": "int32"},
+                }
+            },
+            output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+        )
+
+    def test_variable_column_form_accepted(self):
+        cfg = self._config_with_variables(
+            {"h_li": "/path", "conf_land": {"path": "/conf", "column": 0}}
+        )
+        validate_config(cfg)  # should not raise
+
+    def test_variable_column_form_unknown_key_rejected(self):
+        cfg = self._config_with_variables(
+            {"h_li": "/path", "c": {"path": "/conf", "column": 0, "slice": 1}}
+        )
+        with pytest.raises(ValueError, match="unknown keys.*slice"):
+            validate_config(cfg)
+
+    def test_variable_column_form_bad_column_rejected(self):
+        for column in (-1, "0", None, True):
+            cfg = self._config_with_variables(
+                {"h_li": "/path", "c": {"path": "/conf", "column": column}}
+            )
+            with pytest.raises(ValueError, match="column must be an integer"):
+                validate_config(cfg)
+
+    def test_variable_non_str_non_dict_rejected(self):
+        cfg = self._config_with_variables({"h_li": "/path", "c": 7})
+        with pytest.raises(ValueError, match="path string or a"):
+            validate_config(cfg)
+
     def test_missing_source(self):
         cfg = PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},

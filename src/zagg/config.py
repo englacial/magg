@@ -392,6 +392,10 @@ def validate_config(config: PipelineConfig) -> None:
             if "start_date" not in temporal or "end_date" not in temporal:
                 raise ValueError("bounds.temporal requires start_date and end_date")
 
+    # Validate base-level variable entries: plain path string, or the
+    # column-selector mapping form (issue #321)
+    _validate_ds_variables(config.data_source)
+
     # Validate the structured filter list (issue #43, Phase A)
     _validate_filters(config.data_source)
 
@@ -1458,6 +1462,41 @@ def _normalize_filter(f: dict) -> dict:
     else:
         out["value"] = f["value"]
     return out
+
+
+def _validate_ds_variables(data_source: dict) -> None:
+    """Validate ``data_source.variables`` entries (issue #321).
+
+    Each value is either a path-template string (reads the whole dataset) or a
+    mapping ``{path: <str>, column: <int >= 0>}`` selecting one column of a 2-D
+    dataset — the variable analogue of the ``column`` key on structured
+    filters, so several scalar columns can be declared against one shared
+    dataset path (deduped to a single read).
+    """
+    variables = (data_source or {}).get("variables", {})
+    if not isinstance(variables, dict):
+        raise ValueError("data_source.variables must be a mapping of name -> path")
+    for name, entry in variables.items():
+        if isinstance(entry, str):
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"data_source.variables['{name}'] must be a path string or a "
+                f"{{path, column}} mapping (got {type(entry).__name__})"
+            )
+        extra = set(entry) - {"path", "column"}
+        if extra:
+            raise ValueError(
+                f"data_source.variables['{name}']: unknown keys {sorted(extra)} "
+                "(the mapping form takes exactly 'path' and 'column')"
+            )
+        if not isinstance(entry.get("path"), str):
+            raise ValueError(f"data_source.variables['{name}'].path must be a string")
+        column = entry.get("column")
+        if not isinstance(column, int) or isinstance(column, bool) or column < 0:
+            raise ValueError(
+                f"data_source.variables['{name}'].column must be an integer >= 0 (got {column!r})"
+            )
 
 
 def _validate_filters(data_source: dict) -> None:

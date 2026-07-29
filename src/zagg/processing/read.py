@@ -239,6 +239,36 @@ def _read_segment_broadcasts(
     return out
 
 
+def _variable_specs(variables: dict) -> dict[str, tuple[str, int | None]]:
+    """Normalize ``data_source.variables`` entries to ``(path_template, column)``.
+
+    A plain-string entry reads the whole dataset. The mapping form
+    ``{path: ..., column: k}`` selects one column of a 2-D dataset (issue
+    #321) — the same semantics as ``column`` on structured filters — so
+    several scalar columns can be pulled from one multi-column dataset (e.g.
+    the five ``signal_conf_ph`` surfaces) while the shared path is still read
+    once via the existing path dedup.
+    """
+    specs: dict[str, tuple[str, int | None]] = {}
+    for col, entry in variables.items():
+        if isinstance(entry, str):
+            specs[col] = (entry, None)
+        else:
+            specs[col] = (entry["path"], int(entry["column"]))
+    return specs
+
+
+def _select_column(values: np.ndarray, column: int | None, col_name: str) -> np.ndarray:
+    """Apply a variable's ``column`` selector; shape-check both directions."""
+    if column is not None:
+        if values.ndim < 2:
+            raise ValueError(f"variable '{col_name}': 'column' set but array is 1-D")
+        return values[:, column]
+    if values.ndim > 1:
+        raise ValueError(f"variable '{col_name}': N-D dataset requires an integer 'column'")
+    return values
+
+
 def _predicate_mask(arr: np.ndarray, f: dict) -> np.ndarray:
     """Build a 1-D boolean keep-mask for one structured predicate (issue #43).
 
@@ -509,7 +539,8 @@ def _execute_plan_group(
 
     # Read the variables and base-level filter datasets via the same plan. Read
     # each distinct path once (the variable and filter dataset paths can coincide).
-    var_paths = {col: tmpl.format(group=group) for col, tmpl in variables.items()}
+    var_specs = _variable_specs(variables)
+    var_paths = {col: tmpl.format(group=group) for col, (tmpl, _) in var_specs.items()}
     filter_paths = {id(f): f["dataset"].format(group=group) for f in base_structured}
     # dtype hint isn't load-bearing -- execute_read_plan dtype-casts via
     # np.asarray, which is a no-op when the source dtype already matches.
@@ -586,7 +617,8 @@ def _execute_plan_group(
     leaf_after_spatial = leaf_ids[mask_spatial]
     data_dict: dict[str, np.ndarray] = {}
     for col_name, path in var_paths.items():
-        values = arrays_by_path[path][mask_spatial]
+        values = _select_column(arrays_by_path[path], var_specs[col_name][1], col_name)
+        values = values[mask_spatial]
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values
@@ -864,7 +896,8 @@ def _read_group_full(
     # Read each distinct path once; flag datasets may coincide with a variable.
     datasets = []
     paths_seen = set()
-    var_paths = {col: tmpl.format(group=group) for col, tmpl in variables.items()}
+    var_specs = _variable_specs(variables)
+    var_paths = {col: tmpl.format(group=group) for col, (tmpl, _) in var_specs.items()}
     for path in var_paths.values():
         if path not in paths_seen:
             datasets.append({"dataset": path, "hyperslice": [(min_idx, max_idx)]})
@@ -914,7 +947,8 @@ def _read_group_full(
     leaf_sliced = leaf_ids[min_idx:max_idx][mask_sliced]
     data_dict = {}
     for col_name, path in var_paths.items():
-        values = data[path][mask_sliced]
+        values = _select_column(data[path], var_specs[col_name][1], col_name)
+        values = values[mask_sliced]
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values
