@@ -1063,6 +1063,36 @@ class TestWindowedCellConfig:
         # The original config is untouched (per-unit copy).
         assert "filters" not in cfg.data_source
 
+    def test_mapping_form_time_field_carries_its_column(self, cfg):
+        # A ``time_field`` declared in the ``{path, column}`` variables form
+        # (issue #321) must filter on that column, not blow up on the "should
+        # have been rejected" guard (review finding: the mapping form reached a
+        # consumer that assumed a bare path string).
+        from zagg.config import windowed_cell_config
+
+        cfg.data_source["variables"]["delta_time"] = {
+            "path": "/{group}/land_ice_segments/packed_time",
+            "column": 2,
+        }
+        _windowed(cfg)
+        unit_cfg, _ = windowed_cell_config(cfg, {"label": "2019", "start": 1.5, "end": 9.5})
+        assert unit_cfg.data_source["filters"][-2:] == [
+            {
+                "level": None,
+                "dataset": "/{group}/land_ice_segments/packed_time",
+                "column": 2,
+                "op": "ge",
+                "value": 1.5,
+            },
+            {
+                "level": None,
+                "dataset": "/{group}/land_ice_segments/packed_time",
+                "column": 2,
+                "op": "lt",
+                "value": 9.5,
+            },
+        ]
+
     def test_unwindowed_config_refuses(self, cfg):
         from zagg.config import windowed_cell_config
 

@@ -649,6 +649,33 @@ class TestInlineReadGroup:
         assert "compiled decode unavailable" not in caplog.text
         assert "no chunk map" not in caplog.text
 
+    @pytest.mark.parametrize("write_back", [False, True])
+    def test_mapping_form_variables_read(self, write_back):
+        # The ``{path, column}`` variable form (issue #321, the strata config's
+        # five signal_conf surfaces) must survive BOTH inline arms. Under
+        # ``write_back`` the manifest prebuild assumed every variables value was
+        # a path-template string, so a mapping entry died in
+        # ``_prebuild_group_maps`` before the first byte was read (review
+        # finding); the two columns also share one dataset, so the prebuild
+        # must dedup them to a single chunk map.
+        ds = _fixture_data_source(
+            variables={
+                "h_ph": "/{group}/heights/h_ph",
+                "conf_land": {"path": "/{group}/heights/signal_conf_ph", "column": 0},
+                "conf_ocean": {"path": "/{group}/heights/signal_conf_ph", "column": 1},
+            }
+        )
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        idx = InlineIndex(write_back=write_back)
+        df_i = idx.read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        df_h = HierarchicalIndex().read_group(_open_fixture(), "gt1l", ds, 1, grid)
+        assert df_i is not None and len(df_i) > 0
+        pd.testing.assert_frame_equal(df_i, df_h)
+        assert {"conf_land", "conf_ocean"} <= set(df_i.columns)
+        if write_back:
+            maps = next(iter(idx._pending.values()))
+            assert "/gt1l/heights/signal_conf_ph" in maps  # one map, both columns
+
     def test_falls_back_to_h5coro_on_compiled_failure(self, monkeypatch, caplog):
         # A broken Index reconstruction degrades per dataset (warning, h5coro
         # decode) and never aborts the shard; rows stay identical.
