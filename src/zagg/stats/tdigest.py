@@ -292,6 +292,38 @@ def build_tdigest(
     return out
 
 
+def build_tdigest_where(
+    values: np.ndarray,
+    delta: int = _DEFAULT_DELTA,
+    *,
+    where: np.ndarray,
+    locations: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """t-digest of the observations selected by a row-aligned boolean mask.
+
+    The stratified reducer for issue #321: a config declares two ragged fields
+    over the same ``source`` whose ``where`` params are complementary
+    expressions (e.g. the ATBD signal predicate over the ``signal_conf``
+    columns and its negation), yielding disjoint signal/noise digests whose
+    total weights are the exact stratum counts. Everything else —
+    serialization, merge laws, the located channel — is inherited from
+    :func:`build_tdigest`, which this delegates to after masking.
+    """
+    values = np.asarray(values)
+    where = np.asarray(where)
+    if where.shape != values.shape:
+        raise ValueError(f"where shape {where.shape} does not match values shape {values.shape}")
+    where = where.astype(bool, copy=False)
+    if locations is not None:
+        locations = np.asarray(locations)
+        if locations.shape != values.shape:
+            raise ValueError(
+                f"locations shape {locations.shape} does not match values shape {values.shape}"
+            )
+        return build_tdigest(values[where], delta=delta, locations=locations[where])
+    return build_tdigest(values[where], delta=delta)
+
+
 @overload
 def merge_tdigests(
     d1: np.ndarray, d2: np.ndarray, delta: int = ..., locations1: None = ..., locations2: None = ...
