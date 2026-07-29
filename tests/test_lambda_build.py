@@ -579,6 +579,14 @@ class TestLayerExtraParity:
     This pins the contract.
     """
 
+    # Distributions whose layer spec build_layer.sh *derives* from
+    # ``[project.dependencies]`` instead of hard-coding (issue #322), keyed to the
+    # shell fragment that does the deriving. No literal ``"name==x.y.z"`` string
+    # exists for these, so the substring check below cannot apply — and the two
+    # mechanisms are mutually exclusive: an exact pin added to the ``lambda`` extra
+    # would not reach the layer, which the failure message has to say out loud.
+    _DERIVED = {"mortie": "MORTIE_SPEC=$("}
+
     def test_every_lambda_extra_pin_is_in_build_layer(self):
         import tomllib
 
@@ -586,9 +594,13 @@ class TestLayerExtraParity:
         pins = pyproject["project"]["optional-dependencies"]["lambda"]
         script = (REPO_ROOT / "deployment" / "aws" / "build_layer.sh").read_text()
         missing = []
+        derived = []
         for pin in pins:
             m = re.match(r"([A-Za-z0-9._-]+)==([A-Za-z0-9.]+)$", pin)
             if not m:  # unpinned entries (cramjam, astropy) aren't layer-exact
+                continue
+            if m.group(1) in self._DERIVED:
+                derived.append(pin)
                 continue
             if f'"{pin}"' not in script:
                 missing.append(pin)
@@ -596,3 +608,26 @@ class TestLayerExtraParity:
             f"lambda-extra pins absent from deployment/aws/build_layer.sh: {missing} "
             "(the layer would ship without them — see issue #218's async-tiff gap)"
         )
+        assert not derived, (
+            f"{derived} is pinned in the lambda extra, but build_layer.sh derives that "
+            "spec from [project.dependencies] (issue #322), so the exact pin never "
+            "reaches the layer. Either move the pin to [project.dependencies], or "
+            "replace the derivation in build_layer.sh with a literal pin."
+        )
+
+    def test_derived_specs_still_come_from_project_dependencies(self):
+        """The derivation the test above exempts must actually exist and resolve."""
+        import tomllib
+
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        deps = pyproject["project"]["dependencies"]
+        script = (REPO_ROOT / "deployment" / "aws" / "build_layer.sh").read_text()
+        for name, fragment in self._DERIVED.items():
+            assert fragment in script, (
+                f"build_layer.sh no longer derives {name}'s spec ({fragment!r} gone) — "
+                "drop it from _DERIVED so the pin-parity check covers it again"
+            )
+            assert any(re.match(rf"{re.escape(name)}($|[\s<>=!~\[])", d) for d in deps), (
+                f"{name} is derived from [project.dependencies] but is not declared "
+                "there — the layer build would fail on an empty spec"
+            )
