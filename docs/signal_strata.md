@@ -24,7 +24,10 @@ is **committed at ingest** and carried through the store in three pieces:
    total weight is `N_signal` — and `threshold`). Readers bind to these,
    never to config conventions.
 
-The shipped template is `zagg/configs/atl03_tdigest_strata_healpix.yaml`. The
+The shipped template is `zagg/configs/atl03_tdigest_strata_healpix.yaml` —
+**located strata is the default**: both digest fields carry `location:
+leaf_id`, so each centroid stores its order-29 morton word (an exact photon
+position at weight 1) in the `{field}_locations` sibling arrays. The
 five confidence columns are read from the single 2-D `signal_conf_ph` dataset
 via the per-variable `column` selector (`{path: ..., column: k}` — the
 variable analogue of the structured-filter `column`); the shared path is
