@@ -73,11 +73,10 @@ from zagg.config import (
     load_config_from_dict,
     validate_config,
 )
-from zagg.dispatch import LAMBDA_ARCH, max_cost_usd
+from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, max_cost_usd
 from zagg.grids import from_config as grid_from_config
 from zagg.grids.morton import morton_word
 from zagg.hive import effective_store_root
-from zagg.notebook import _BENIGN_ERRORS
 
 logger = logging.getLogger(__name__)
 
@@ -679,7 +678,7 @@ class Run:
         error = result.get("error")
         if result.get("status_code") == 200 and not error:
             return result
-        if error in _BENIGN_ERRORS:
+        if error in BENIGN_ERRORS:
             # "Nothing to do" is a normal outcome, not a failure — matching
             # _run_lambda's error counting (neither with_data nor error).
             return result

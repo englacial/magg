@@ -21,7 +21,7 @@ import html
 import logging
 
 from zagg.config import PipelineConfig, get_pipeline_type, get_store_layout, get_windowing
-from zagg.dispatch import LAMBDA_ARCH, max_cost_usd
+from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, max_cost_usd
 
 logger = logging.getLogger(__name__)
 
@@ -180,10 +180,6 @@ def _make_progress(total: int, desc: str = "shards"):
 # Run wrapper + report view
 # ---------------------------------------------------------------------------
 
-#: Errors that mean "nothing to do", not "something broke" -- excluded from the
-#: failures table, matching ``_run_lambda``'s error counting.
-_BENIGN_ERRORS = ("No granules found", "No data after filtering")
-
 #: Row cap for the per-shard table in ``_repr_html_``; full detail stays in
 #: ``summary["results"]``.
 _HTML_MAX_ROWS = 20
@@ -216,7 +212,7 @@ class RunView:
         rows = []
         for r in self.summary.get("results") or []:
             error = r.get("error")
-            if error and str(error) not in _BENIGN_ERRORS:
+            if error and str(error) not in BENIGN_ERRORS:
                 rows.append(r)
         return rows
 
