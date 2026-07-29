@@ -543,10 +543,19 @@ class InlineIndex(VirtualIndex):
         group-read failure the data read would produce.
         """
         from zagg.config import filters_from_data_source
-        from zagg.processing.read import _level_coord_paths
+        from zagg.processing.read import _level_coord_paths, _variable_specs
 
         paths = [tmpl.format(group=group) for tmpl in data_source["coordinates"].values()]
-        paths += [tmpl.format(group=group) for tmpl in data_source["variables"].values()]
+        # Variables go through the read path's normalizer: an entry is either a
+        # path-template string or the ``{path, column}`` mapping form (issue
+        # #321). Chunk maps are per DATASET, so the column selector is
+        # irrelevant here — several selectors on one path collapse in the
+        # ``dict.fromkeys`` dedup below (one chunk map for all five
+        # ``signal_conf_ph`` surfaces).
+        paths += [
+            tmpl.format(group=group)
+            for tmpl, _ in _variable_specs(data_source["variables"]).values()
+        ]
         base_level = data_source.get("base_level")
         for f in filters_from_data_source(data_source):
             if "expression" in f:

@@ -2314,22 +2314,46 @@ def window_time_filters(config: PipelineConfig, start: float, end: float) -> lis
     ``time_field`` is rejected at validation and never reaches here. Appended
     to :func:`filters_from_data_source`'s normalized output by the hive write
     path, preserving any declared filters.
+
+    A ``time_field`` declared in the ``{path, column}`` mapping form (issue
+    #321) carries its column selector into both predicates — a structured
+    filter takes the same ``column`` key, so a time column packed inside a 2-D
+    dataset filters at base rate like any other.
     """
     windowing = get_windowing(config)
     if windowing is None:
         raise ValueError("window_time_filters requires a windowed config (output.windowing)")
     field = windowing["time_field"]
-    path = ((config.data_source or {}).get("variables") or {}).get(field)
+    entry = ((config.data_source or {}).get("variables") or {}).get(field)
+    path, column = _variable_entry(entry)
     if not (isinstance(path, str) and path):
         raise ValueError(
             f"windowing time_field {field!r} has no base-rate dataset path in "
             f"data_source.variables — validate_config should have rejected "
             f"this configuration"
         )
+    # ``column`` is emitted only for the mapping form, so the string form's
+    # filter pair stays byte-identical to the pre-#321 shape.
+    col = {"column": column} if column is not None else {}
     return [
-        {"level": None, "dataset": path, "op": "ge", "value": float(start)},
-        {"level": None, "dataset": path, "op": "lt", "value": float(end)},
+        {"level": None, "dataset": path, **col, "op": "ge", "value": float(start)},
+        {"level": None, "dataset": path, **col, "op": "lt", "value": float(end)},
     ]
+
+
+def _variable_entry(entry) -> tuple[str | None, int | None]:
+    """``(path, column)`` of one ``data_source.variables`` entry, mapping form or not.
+
+    The read path's :func:`zagg.processing.read._variable_specs` normalizes the
+    whole block; this is the single-entry form for config-side consumers that
+    hold one name (currently the windowing time_field).
+    """
+    if isinstance(entry, str):
+        return entry, None
+    if isinstance(entry, dict):
+        col = entry.get("column")
+        return entry.get("path"), None if col is None else int(col)
+    return None, None
 
 
 def windowed_cell_config(config: PipelineConfig, window: dict) -> tuple[PipelineConfig, dict]:
