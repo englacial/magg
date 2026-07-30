@@ -556,6 +556,47 @@ class TestValidation:
             self._config_with_composition({"of": "h_tdigest_signal", "threshold": 2})
         )  # should not raise
 
+    def test_composition_spec_must_match_the_convention(self):
+        # spec/lanes are writer-stamped (spec §3.3); a declaration that
+        # disagrees with the module constants is rejected, not merged.
+        with pytest.raises(ValueError, match="is not the convention this writer packs"):
+            validate_config(
+                self._config_with_composition(
+                    {"of": "h_tdigest_signal", "threshold": 2, "spec": "zagg-composition/2"}
+                )
+            )
+
+    def test_composition_lanes_must_match_lane_order(self):
+        from zagg.stats.composition import LANES
+
+        permuted = [LANES[1], LANES[0], *LANES[2:]]
+        with pytest.raises(ValueError, match="lane order"):
+            validate_config(
+                self._config_with_composition(
+                    {"of": "h_tdigest_signal", "threshold": 2, "lanes": permuted}
+                )
+            )
+        with pytest.raises(ValueError, match="lane order"):
+            validate_config(
+                self._config_with_composition(
+                    {"of": "h_tdigest_signal", "threshold": 2, "lanes": list(LANES[:5])}
+                )
+            )
+
+    def test_composition_declared_spec_and_lanes_accepted_when_they_agree(self):
+        from zagg.stats.composition import COMPOSITION_SPEC, LANES
+
+        validate_config(
+            self._config_with_composition(
+                {
+                    "of": "h_tdigest_signal",
+                    "threshold": 2,
+                    "spec": COMPOSITION_SPEC,
+                    "lanes": list(LANES),
+                }
+            )
+        )  # should not raise
+
     def test_composition_of_must_name_a_declared_field(self):
         with pytest.raises(ValueError, match="of 'h_tdigest_sginal' is not a declared"):
             validate_config(self._config_with_composition({"of": "h_tdigest_sginal"}))

@@ -73,14 +73,24 @@ def apply_field_attrs(spec, meta: dict):
     the pair lives on the field the config named (review finding, PR #334).
 
     Declared keys are merged **over** the spec's own attributes, so a config
-    could in principle shadow spec-owned metadata; the reserved ``ragged``
-    block is the one key protected from that (enforced at config validation),
-    which is a denylist of exactly the one populated spec attr in tree today.
+    could in principle shadow spec-owned metadata. Two keys are protected from
+    that: ``ragged`` is reserved outright (enforced at config validation), and
+    the ``composition`` block's spec-owned halves (``spec``/``lanes``) are
+    **stamped here** from the module constants
+    (:func:`zagg.stats.composition.composition_attrs_block`), with config
+    validation rejecting a declaration that disagrees — so neither convention
+    marker in tree is an author transcription (review finding, issue #340).
     """
     attrs = meta.get("attrs")
     if not attrs:
         return spec
-    return spec.with_attributes({**dict(spec.attributes or {}), **attrs})
+    from zagg.stats.composition import COMPOSITION_ATTR, composition_attrs_block
+
+    merged = {**dict(spec.attributes or {}), **attrs}
+    block = merged.get(COMPOSITION_ATTR)
+    if isinstance(block, dict):
+        merged[COMPOSITION_ATTR] = composition_attrs_block(block)
+    return spec.with_attributes(merged)
 
 
 def ragged_locations_name(field_name: str) -> str:
