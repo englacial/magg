@@ -206,9 +206,59 @@ mechanics are normative now:
 
 ## 2. Digest payload semantics
 
-**Status: contract (payload bytes); the digest algebra is informative.**
+**Status: contract (payload bytes); the digest algebra is deliberately NOT
+specified.**
 
-*Populated in phase 3 of the #340 PR.*
+A t-digest field is a `zagg-ragged/1` (or `/2`) array whose element
+declaration is `{"dtype": "float32", "shape": [-1, 2]}`. Source of truth in
+code: `zagg.stats.tdigest`.
+
+### 2.1 Centroid array
+
+**Contract.** A populated cell's decoded payload is a `(k, 2)` **float32**
+array of weighted centroids:
+
+- column 0 is the centroid **mean**; column 1 is the centroid **weight**
+  (the number of observations merged into it, ≥ 1);
+- rows MUST be sorted **ascending by mean**;
+- `sum(weights)` MUST equal the cell's **exact** observation count — the
+  number of finite `source` values the digest was built over (non-finite
+  source rows are dropped before building). For a stratified product (§3)
+  each stratum digest's total weight is the exact stratum count;
+- an absent cell decodes as the zero-length `(0, 2)` array (the `b""` fill).
+
+### 2.2 The location channel
+
+**Contract.** A located digest field (issue #87) carries one **uint64 morton
+word per centroid row** in its `{field}_locations` sibling (§1.1), row-aligned
+with the payload:
+
+- Per-observation locations enter as **order-29 point-kind morton words**
+  (mortie spec §4 — encoding-carried kind; an exact observation position).
+- A centroid of weight 1 carries its single member's word unchanged — an
+  exact observation position.
+- A merged centroid carries the **deepest common ancestor** of its members'
+  words (`mortie.common_ancestor`): the finest morton cell enclosing every
+  member. Point and area words share the same path prefix, so mixed inputs
+  (a fresh point word folded with an earlier merge's coarser area word)
+  compose under the same rule.
+
+Word semantics (bit layout, kind marking, coarsening) are mortie's
+specification §1/§4, not restated here.
+
+### 2.3 What is deliberately not specified (informative)
+
+The build/merge **algebra** — Dunning's k1 scale function, the `delta`
+compression budget, merge order, `merge_tdigests` / `merge_tdigests_kway` —
+is zagg-owned and referenced informatively only (`zagg.stats.tdigest`
+docstrings). Readers do not need it to decode: the stored bytes above are the
+whole contract, and keeping the algebra out of the spec preserves zagg's
+freedom to optimize it (issue #279) without a spec revision. Two consequences
+a consumer should know (informative): digest merging is **order-dependent**
+(approximate composability class — `np.isclose`, not byte equality, across
+different fold orders), and quantile estimates from the centroids are
+approximations with the usual t-digest accuracy profile (tight tails, looser
+middle).
 
 ## 3. `zagg-composition/1`
 
