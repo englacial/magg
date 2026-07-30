@@ -1679,6 +1679,32 @@ class TestStatsMode:
         assert resp["statusCode"] == 200
         assert json.loads(resp["body"])["rows"] == 2
 
+    def test_finalize_error_withholds_the_marker(self, handler_mod, tmp_path):
+        # Review finding, PR #343: the marker means "the tail RAN", and
+        # Run.attach reads it as "skip the whole tail" — including the
+        # idempotent finalize backstop a failed-finalize run is exactly the one
+        # that needs. So a stats event carrying #335's finalize_error writes
+        # the run parquet (the durable failure column) but NOT the marker.
+        root = str(tmp_path / "out")
+        url = str(tmp_path / "out.zarr.status" / "run-runid1" / "tail.json")
+        event = {
+            "mode": "stats",
+            "store_path": root,
+            "run_id": "runid1",
+            "timestamp": "20260720T010203Z",
+            "rows": self._rows(),
+            "tail_status_url": url,
+            "finalize_error": "finalize down",
+        }
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["rows"] == 2  # the record still lands
+        assert not Path(url).exists()
+        # ... and a successful finalize (None on the wire) still writes it.
+        event["finalize_error"] = None
+        assert handler_mod.lambda_handler(event, MagicMock())["statusCode"] == 200
+        assert json.loads(Path(url).read_text())["status"] == "tail_done"
+
     def test_no_tail_status_url_writes_no_marker(self, handler_mod, tmp_path):
         root = str(tmp_path / "out")
         event = {

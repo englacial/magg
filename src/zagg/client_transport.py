@@ -108,9 +108,9 @@ STATUS_SCHEMA_VERSION = 1
 MANIFEST_NAME = "manifest.json"
 
 #: Tail-completion marker under the run prefix (issue #327 phase 5): written
-#: by the mode="stats" worker when the post-run tail's record leg completes,
-#: so a reattached handle re-runs the (idempotent / fail-open) tail only when
-#: it was never recorded.
+#: by the mode="stats" worker when the post-run tail's record leg completes AND
+#: the run's finalize succeeded, so a reattached handle re-runs the (idempotent
+#: / fail-open) tail whenever it was never recorded or its finalize failed.
 TAIL_NAME = "tail.json"
 
 
@@ -282,10 +282,25 @@ def write_tail_status(event: dict, store_kwargs: dict[str, Any]) -> None:
     Worker-side (the ``mode="stats"`` handler — the last recorded leg of the
     post-run tail), fail-open like every status write: absent key or any
     failure logs and never fails the stats invoke.
+
+    NOT written when the stats event carries a ``finalize_error`` (issue #335):
+    :meth:`zagg.client.Run.attach` reads this marker as "the tail ran" and
+    skips the WHOLE tail, including the idempotent hive finalize /
+    ``ensure_manifest`` backstop — and a run whose finalize failed is precisely
+    the one that needs another pass. Leaving the marker unwritten is the safe
+    direction: attach re-runs a tail that is idempotent by construction
+    (review finding, PR #343). The run parquet still records the failure as its
+    run-level column, so the postmortem signal is not lost.
     """
     try:
         url = event.get("tail_status_url")
         if not url:
+            return
+        if event.get("finalize_error"):
+            logger.info(
+                "tail marker withheld: this run's finalize failed, so a reattached "
+                "handle must re-run the (idempotent) tail (issues #327/#335)"
+            )
             return
         import obstore
 

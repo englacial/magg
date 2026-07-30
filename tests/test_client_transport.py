@@ -105,7 +105,9 @@ class EventStubLambdaClient:
         fail_times=None,
         drop_times=None,
         record=False,
+        fail_modes=(),
     ):
+        self._fail_modes = set(fail_modes)  # mode invokes that raise (e.g. finalize)
         self.status_store = status_store
         self._record = record  # deployed workers ride a stats record; stale ones don't
         self.events: list[tuple[str, str, dict]] = []
@@ -122,6 +124,8 @@ class EventStubLambdaClient:
         with self._lock:
             self.events.append((kwargs["FunctionName"], kwargs["InvocationType"], event))
         if event.get("mode") is not None:
+            if event["mode"] in self._fail_modes:
+                raise RuntimeError(f"{event['mode']} down")
             # Simulate the deployed worker's status-prefix writes off the mode
             # invokes (issue #327): the setup event's dispatch manifest and
             # the stats event's tail-completion marker.
@@ -132,7 +136,13 @@ class EventStubLambdaClient:
                     "config": event.get("config"),
                 }
                 obstore.put(self.status_store, ct.MANIFEST_NAME, json.dumps(manifest).encode())
-            if event["mode"] == "stats" and event.get("tail_status_url"):
+            if (
+                event["mode"] == "stats"
+                and event.get("tail_status_url")
+                # Mirrors write_tail_status: a failed finalize withholds the
+                # marker so a reattached handle re-runs the idempotent tail.
+                and not event.get("finalize_error")
+            ):
                 marker = {"status": "tail_done", "run_id": event.get("run_id")}
                 obstore.put(self.status_store, ct.TAIL_NAME, json.dumps(marker).encode())
             return {
@@ -873,6 +883,30 @@ class TestAttach:
         with pytest.raises(_shard_error(), match="failed-unknown") as excinfo:
             handle.futures[_WORDS[2]].result(timeout=10)
         assert excinfo.value.payload["outcome"] == "failed-unknown"
+
+    def test_attach_reruns_the_tail_after_a_failed_finalize(
+        self, catalog, status_store, monkeypatch
+    ):
+        # Reattaching after a failure is the headline Run.attach use case, and a
+        # failed finalize is the case that needs another pass. The stats event
+        # carries #335's finalize_error, so no tail marker is written and the
+        # reattached handle re-fires the idempotent backstop (review, PR #343).
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "_FINALIZE_BACKOFF_S", 0)
+        live = EventStubLambdaClient(status_store, fail_modes={"finalize"})
+        with pytest.warns(RuntimeWarning, match="finalize"):
+            handle = _run(catalog, client=live).dispatch(transport="event")
+            with pytest.raises(RuntimeError, match="finalize down"):
+                handle.results()  # joins the tail, then re-raises (issue #335)
+        run_id = live.cell_events()[0][2]["run_id"]
+        (stats,) = [e for _, _, e in live.events if e.get("mode") == "stats"]
+        assert stats["finalize_error"] == "finalize down"
+        assert not ct.tail_recorded("ignored-by-the-fixture", {})
+
+        fresh = EventStubLambdaClient(status_store)
+        Run.attach(_STORE, run_id, lambda_client=fresh).results()
+        assert "finalize" in [m for m in fresh.modes() if m]
 
     def test_attach_missing_manifest_raises(self, status_store):
         with pytest.raises(ValueError, match="no dispatch manifest"):

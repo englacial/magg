@@ -1045,6 +1045,7 @@ class Run:
         # the failure (espg ruling on PR #333, middle option) so a notebook sees
         # it in-stream rather than only at the join, retries once, and RETURNS
         # the error — the handle keeps this path's re-raise semantics.
+        finalize_error = None
         finalize_kwargs: dict = {}
         if layout == "hive":
             finalize_kwargs = {
@@ -1068,6 +1069,7 @@ class Run:
                 ),
             )
             if error is not None:
+                finalize_error = str(error)
                 handle._finalize_error = error
                 logger.warning(f"finalize invoke failed (surfaced via handle.wait()): {error}")
 
@@ -1117,6 +1119,12 @@ class Run:
             output_creds_event=output_creds_event,
             store_kwargs=runner._output_store_kwargs(output_creds_event, self.region),
             inline_rows=stats_inline,
+            # Same wire contract as runner's tail (issue #335): always present,
+            # None on success, so the parquet's column set does not vary — and
+            # it is what makes the worker WITHHOLD the tail marker on a failed
+            # finalize, so a reattached handle re-runs the idempotent backstop
+            # instead of reading "recorded" as "succeeded" (review, PR #343).
+            finalize_error=finalize_error,
             tail_status_url=f"{run_status_prefix(self.store, run_id)}/{TAIL_NAME}",
         )
         if layout == "hive" and get_sweep(self.config):
