@@ -404,8 +404,8 @@ def dispatch_event_shards(
 
 def attach_run(
     run_cls,
-    store: str,
-    run_id: str,
+    store,
+    run_id,
     *,
     function_name=None,
     region="us-west-2",
@@ -610,7 +610,7 @@ class StatusPoller:
         clock: Callable[[], float] = time.time,
     ):
         self._store_factory = store_factory
-        self._store = None
+        self._store: Any = None
         self._drop_timeout_s = drop_timeout_s
         self._max_retries = max(1, int(max_retries))
         self._max_in_flight = max_in_flight
@@ -741,12 +741,15 @@ class StatusPoller:
                 dispatched = True
 
     def _fire(self, entry: _ShardEntry) -> None:
+        dispatch = entry.dispatch
+        if dispatch is None:  # observe-only entries are never queued (attach)
+            return
         entry.attempts += 1
         entry.dispatched_at = self._clock()
         if entry.first_dispatched_at is None:
             entry.first_dispatched_at = entry.dispatched_at
         try:
-            entry.dispatch()
+            dispatch()
         except Exception as e:
             # An invoke fault burns this attempt (throttles included): the
             # retry budget re-fires it on a later tick, mirroring the sync
