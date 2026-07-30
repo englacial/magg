@@ -133,6 +133,14 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Enumerated exact ARNs (issue #341): the former
+              # ${...FunctionName}* wildcards were declined -- enumeration
+              # keeps least privilege. Each family lists its base function
+              # plus the variants template.yaml provisions for it (prod:
+              # WorkerSizeVariants + WorkerDiskVariants, plain + -disk; test:
+              # WorkerTestDiskVariants, -disk only). All invokes/probes are
+              # unqualified ($LATEST), so no :qualifier ARN forms are needed.
+              # Drift vs the matrix is guarded by tests/test_deploy_lambda.py.
               - Sid: InvokeBenchmarkFunctions
                 Effect: Allow
                 Action:
@@ -140,8 +148,17 @@ Resources:
                   - lambda:GetFunctionConfiguration
                   - lambda:GetFunctionConcurrency
                 Resource:
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}*"
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}*"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-2048"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-4096"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-8192"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-2048-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-4096-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-8192-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-2048-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-4096-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-8192-disk"
               # Pre-flight worker-sizing probe (issue #28/#63 via concurrency.py);
               # these degrade gracefully but are needed for the guard to work.
               # Neither action supports resource-level scoping -> "*".

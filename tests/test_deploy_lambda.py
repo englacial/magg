@@ -276,7 +276,7 @@ def _template_variant_suffixes():
     return test, prod
 
 
-def _update_statement_arns(role, sid):
+def _statement_arns(role, sid):
     """The !Sub ARN strings of the role's Sid=<sid> policy statement."""
     tpl = _load_cfn(CICD)
     statements = tpl["Resources"][role]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
@@ -295,7 +295,7 @@ def _script_default_variants():
 def test_deploy_role_enumerates_test_stack_variants():
     # Test-stack shape: base + every WorkerTestDiskVariants function.
     test_suffixes, _ = _template_variant_suffixes()
-    arns = _update_statement_arns("DeployRole", "UpdateTestFunction")
+    arns = _statement_arns("DeployRole", "UpdateTestFunction")
     assert any(a.endswith("function:${TestFunctionName}") for a in arns), (
         f"DeployRole.UpdateTestFunction in {CICD} must keep the base "
         "function:${TestFunctionName} ARN"
@@ -312,7 +312,7 @@ def test_deploy_role_enumerates_test_stack_variants():
 def test_release_role_enumerates_prod_variant_family():
     # Prod family: base + plain and -disk variants for every memory size.
     _, prod_suffixes = _template_variant_suffixes()
-    arns = _update_statement_arns("ReleaseRole", "UpdateProdFunction")
+    arns = _statement_arns("ReleaseRole", "UpdateProdFunction")
     assert any(a.endswith("function:${BenchmarkFunctionName}") for a in arns), (
         f"ReleaseRole.UpdateProdFunction in {CICD} must keep the base "
         "function:${BenchmarkFunctionName} ARN"
@@ -336,11 +336,37 @@ def test_script_default_family_matches_template_matrix():
     )
 
 
-def test_update_statements_enumerate_exact_arns():
-    # The issue #341 ruling: enumerated exact ARNs, no wildcard, in both
-    # Update statements (the invoke role's wildcard is a separate question).
-    for role, sid in (("DeployRole", "UpdateTestFunction"), ("ReleaseRole", "UpdateProdFunction")):
-        for arn in _update_statement_arns(role, sid):
+def test_invoke_role_enumerates_both_families():
+    # The invoke role dispatches (and CodeSha256-probes, issue #341) whatever
+    # variant a target's ``worker:`` block resolves, against either the prod or
+    # the test base function -- so it must enumerate both full families.
+    test_suffixes, prod_suffixes = _template_variant_suffixes()
+    arns = _statement_arns("BenchmarkInvokeRole", "InvokeBenchmarkFunctions")
+    families = [
+        ("${BenchmarkFunctionName}", sorted(prod_suffixes | _script_default_variants())),
+        ("${TestFunctionName}", sorted(test_suffixes)),
+    ]
+    for base, suffixes in families:
+        for suffix in ["", *suffixes]:
+            want = f"function:{base}{suffix}"
+            assert any(a.endswith(want) for a in arns), (
+                f"the benchmark harness can invoke/probe '{base}{suffix}' but "
+                f"BenchmarkInvokeRole.InvokeBenchmarkFunctions in {CICD} has no ARN "
+                f"ending '{want}' -- add the enumerated ARN (wildcards declined, issue #341)"
+            )
+
+
+def test_role_statements_enumerate_exact_arns():
+    # The issue #341 ruling: enumerated exact ARNs, no wildcard, in all three
+    # function-scoped statements (ConcurrencyProbe's "*" stays -- its actions
+    # take no resource-level scoping).
+    statements = (
+        ("DeployRole", "UpdateTestFunction"),
+        ("ReleaseRole", "UpdateProdFunction"),
+        ("BenchmarkInvokeRole", "InvokeBenchmarkFunctions"),
+    )
+    for role, sid in statements:
+        for arn in _statement_arns(role, sid):
             assert "*" not in arn, (
                 f"{role}.{sid} in {CICD} must enumerate exact ARNs, found wildcard: {arn}"
             )
