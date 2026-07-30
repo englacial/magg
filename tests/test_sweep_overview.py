@@ -681,3 +681,141 @@ class TestOverviewWriter:
         g = _overview_group(tmp_path, "-3", "all.zarr", 1)
         np.testing.assert_array_equal(g["count"][:], [3, 0, 0, 0])
         assert g["h_min"][0] == 1.0
+
+
+class TestSection83Obligations:
+    """The standing D22 test claims for the overview family (§8.3)."""
+
+    #: Two shards' observations, keyed (leaf decimal, leaf row). Exact binary
+    #: floats so exact-class equality asserts are byte-for-byte.
+    OBS = {
+        ("-311", 0): [1.5, 2.5, -3.0],
+        ("-311", 3): [8.0],
+        ("-311", 5): [0.25, 0.75],
+        ("-311", 15): [4.0, 6.0],
+        ("-312", 0): [3.0, -1.0],
+        ("-312", 9): [2.0],
+    }
+
+    def _populate(self, root, orders=(1, 0)):
+        _write_manifest(root, orders=orders)
+        cells: dict = {}
+        for (dec, row), obs in self.OBS.items():
+            cells.setdefault(dec, {})[row] = obs
+        for dec, rows in cells.items():
+            _make_leaf(root, dec, rows)
+        return [(morton_word(d), None) for d in sorted(cells)]
+
+    def _direct(self, k):
+        """Direct aggregation at overview order ``k``: pool raw observations
+        per overview cell (the oracle the fold must match)."""
+        span = 4 ** (CELL_ORDER - SHARD_ORDER - (SHARD_ORDER - k))
+        pooled: dict[int, list] = {}
+        for (dec, row), obs in self.OBS.items():
+            shard_rank = {"-311": 0, "-312": 1}[dec]
+            cell = shard_rank * span + row // 4 ** (SHARD_ORDER - k)
+            pooled.setdefault(cell, []).extend(obs)
+        return pooled
+
+    @pytest.mark.parametrize("k", [1, 0])
+    def test_rollup_equals_direct_at_every_declared_order(self, tmp_path, k):
+        from zagg.stats.tdigest import build_tdigest, quantile_from_tdigest
+
+        refs = self._populate(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        rel = {1: "-3/1", 0: "-3"}[k]
+        g = _overview_group(tmp_path, rel, "all.zarr", CELL_ORDER - (SHARD_ORDER - k))
+        count, h_min = g["count"][:], g["h_min"][:]
+        digests = g["h_tdigest"][:]
+        direct = self._direct(k)
+        for cell in range(len(count)):
+            if cell not in direct:
+                assert count[cell] == 0 and np.isnan(h_min[cell])
+                assert len(bytes(digests[cell])) == 0
+                continue
+            obs = np.asarray(direct[cell], dtype=np.float64)
+            # Exact class: byte-equal to the direct aggregation (§8.3).
+            assert count[cell] == len(obs)
+            assert h_min[cell] == np.float32(obs.min())
+            # Approximate class: np.isclose against the direct digest (D24).
+            merged = decode_digest(bytes(digests[cell]), "float32")
+            oracle = build_tdigest(obs, delta=64)
+            for q in (0.25, 0.5, 0.75):
+                assert np.isclose(
+                    quantile_from_tdigest(merged, q),
+                    quantile_from_tdigest(oracle, q),
+                    rtol=0.05,
+                    atol=0.25,
+                )
+
+    def test_second_pass_over_unchanged_tree_writes_nothing(self, tmp_path):
+        refs = self._populate(tmp_path)
+        first = run_sweep(str(tmp_path), refs, families=("moc", "overview"))
+        assert first["families"]["overview"]["written"] == 2
+        env_before = (tmp_path / "-3" / "1" / "overview.rollup.json").read_text()
+        second = run_sweep(str(tmp_path), refs, families=("moc", "overview"))
+        counts = second["families"]["overview"]
+        assert counts["written"] == 0 and counts["current"] == 2
+        assert "manifest_updated" not in counts  # no write, no manifest touch
+        assert (tmp_path / "-3" / "1" / "overview.rollup.json").read_text() == env_before
+
+    def test_same_second_leaf_rerun_rewrites_via_content_hash(self, tmp_path, monkeypatch):
+        # Leaf stamps resolve to whole seconds, so a back-to-back re-run
+        # carries an UNCHANGED generation stamp; freeze the clock to force the
+        # collision and prove the content hash is the backstop that rewrites.
+        import zagg.hive as hive_mod
+
+        monkeypatch.setattr(hive_mod, "_utcnow", lambda: "2026-05-01T12:00:00+00:00")
+        refs = self._populate(tmp_path, orders=(0,))
+        run_sweep(str(tmp_path), refs, families=("moc", "overview"))
+        stale = json.loads((tmp_path / "-3" / "overview.rollup.json").read_text())
+        # Same wall-clock second, different content: leaf -311 changes.
+        _make_leaf(tmp_path, "-311", {0: [100.0]})
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["written"] == 1
+        fresh = json.loads((tmp_path / "-3" / "overview.rollup.json").read_text())
+        assert fresh["windows"]["all"]["generation"] == stale["windows"]["all"]["generation"]
+        assert fresh["windows"]["all"]["content_hash"] != stale["windows"]["all"]["content_hash"]
+        g = _overview_group(tmp_path, "-3", "all.zarr", 2)
+        # The re-run leaf's new fold, with the untouched sibling retained
+        # (candidates come from the root MOC, not just the dirty set).
+        assert g["count"][0] == 1 and g["count"][1] == 3
+        assert g["h_min"][0] == 100.0
+
+    def test_deleting_every_overview_leaves_leaf_reads_green(self, tmp_path):
+        import shutil
+
+        from zagg.hive import read_commit as read_stamp
+
+        refs = self._populate(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("moc", "overview"))
+        hashes = {
+            p: json.loads(p.read_text())["windows"]["all"]["content_hash"]
+            for p in tmp_path.rglob("overview.rollup.json")
+        }
+        assert hashes
+        for p in tmp_path.rglob("all.zarr"):
+            shutil.rmtree(p)
+        for p in list(tmp_path.rglob("overview.rollup.json")):
+            p.unlink()
+        # Leaf truth reads back untouched (nothing-load-bearing, D9)...
+        for dec in ("-311", "-312"):
+            leaf = open_store(shard_leaf_path(str(tmp_path), morton_word(dec)))
+            assert read_stamp(leaf) is not None
+            g = zarr.open_group(leaf, path=str(CELL_ORDER), mode="r", zarr_format=3)
+            assert g["count"][0] >= 1
+        # ...and one sweep regenerates byte-identical folds (same hashes).
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        for p, digest in hashes.items():
+            assert json.loads(p.read_text())["windows"]["all"]["content_hash"] == digest
+
+    def test_role_never_inferred_from_position(self, tmp_path):
+        # D11/D24: an overview is classified by its role attr, never by tree
+        # depth — the leaf carries NO role, the overview always does.
+        refs = self._populate(tmp_path, orders=(1,))
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        leaf = zarr.open_group(
+            open_store(shard_leaf_path(str(tmp_path), morton_word("-311"))), mode="r"
+        )
+        assert ROLE_ATTR not in leaf.attrs
+        assert _overview_root(tmp_path, "-3/1", "all.zarr").attrs[ROLE_ATTR] == "overview"
