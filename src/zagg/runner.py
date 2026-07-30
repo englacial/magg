@@ -19,6 +19,7 @@ import statistics
 import threading
 import time
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import timedelta
@@ -3001,6 +3002,47 @@ def _run_local(
     return summary
 
 
+def _finalize_with_retry(executor, *, store_path, retries=1, backoff_s=5) -> Exception | None:
+    """Guarded ``executor.finalize()``: warn at failure, retry, return the error.
+
+    Issue #335 ((d)+(c), espg-ratified): the finalize backstop is an idempotent
+    worker invoke — nothing is corrupted on failure (every shard's outputs are
+    already written; only the root manifest may be stale), so a failure warns
+    immediately (same message contract as the PR #333 client facade, so the two
+    paths read identically) and retries once after a fixed 5 s backoff —
+    deliberately not knobs (espg ruling on issue #335). Returns ``None`` on
+    success or the last exception; the caller owns failure semantics
+    (``_run_lambda`` runs the full post-run tail with the error recorded in
+    run-stats, then re-raises so ``agg`` still exits nonzero). The success path
+    is untouched: no sleep, no warning.
+    """
+    error = None
+    for attempt in range(retries + 1):
+        try:
+            executor.finalize()
+            return None
+        except Exception as e:
+            error = e
+            retrying = attempt < retries
+            tail = (
+                f"Retrying once in {backoff_s} s."
+                if retrying
+                else "This error re-raises after the post-run tail completes."
+            )
+            warnings.warn(
+                f"finalize (manifest backstop) failed for {store_path}: {e}. "
+                f"Shard outputs are written; the store's root manifest may be "
+                f"stale until finalize runs again. It is idempotent — re-run "
+                f"the dispatch (or re-dispatch finalize) to stamp the manifest. "
+                f"{tail}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            if retrying:
+                time.sleep(backoff_s)
+    return error
+
+
 def _run_lambda(
     config,
     catalog_data,
@@ -3461,9 +3503,12 @@ def _run_lambda(
     fanout_s = time.time() - start_time
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
-    # requiring orchestrator-side S3 access).
+    # requiring orchestrator-side S3 access). Guarded (issue #335): a failed
+    # finalize warns + retries once, then DEFERS — the tail below (coverage,
+    # run-stats recording the failure, sweep) runs as on success and the error
+    # re-raises at the end so agg still exits nonzero.
     finalize_start = time.time()
-    executor.finalize()
+    finalize_error = _finalize_with_retry(executor, store_path=store_path)
     finalize_s = time.time() - finalize_start
     wall_time = time.time() - start_time
 
@@ -3614,6 +3659,12 @@ def _run_lambda(
         "setup_s": setup_s,
         "fanout_s": fanout_s,
         "finalize_s": finalize_s,
+        # Always-present, None on success (issue #335): the run-stats record can
+        # finally distinguish "finalize failed" from "run never happened", and
+        # the key set stays deterministic (the run_stats_path precedent).
+        "finalize_error": (
+            None if finalize_error is None else f"{type(finalize_error).__name__}: {finalize_error}"
+        ),
         "function_timeout_s": function_timeout_s,
         "worker_max_s": worker_max_s,
         "worker_median_s": worker_median_s,
@@ -3696,6 +3747,12 @@ def _run_lambda(
         breakdown = ", ".join(f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items())
         logger.info(f"Worker phases (max across cells): {breakdown}")
     _log_container_stats(container_stats)
+    # Deferred finalize failure (issue #335): the tail above ran to completion
+    # with the error recorded in run-stats; re-raise the original exception
+    # (traceback preserved on the stored object) so agg exits nonzero — the
+    # CI/cron failure signal is unchanged, only richer in what got written first.
+    if finalize_error is not None:
+        raise finalize_error
     return summary
 
 

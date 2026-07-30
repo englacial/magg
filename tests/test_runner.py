@@ -1,6 +1,7 @@
 """Tests for the runner module (Python API)."""
 
 import json
+import warnings
 from datetime import datetime, timezone
 
 import pytest
@@ -1564,6 +1565,8 @@ class TestSummaryKeysByteIdentical:
         "setup_s",
         "fanout_s",
         "finalize_s",
+        # Guarded finalize (issue #335); always present, None on success.
+        "finalize_error",
         "function_timeout_s",
         "worker_max_s",
         "worker_median_s",
@@ -4144,6 +4147,184 @@ class TestManifestChecker:
         # root via the poller's output-store path (issue #274 Fix 2).
         assert captured["predicate"]() is True
         assert seen["root"] == "s3://out/x.zarr"
+
+
+class TestFinalizeGuard:
+    """Guarded finalize on agg's Lambda path (issue #335, (d)+(c)):
+
+    a failed ``executor.finalize()`` warns immediately, retries ONCE after a
+    fixed 5 s backoff, then defers — the full post-run tail (coverage, run-stats
+    with the failure recorded, sweep) runs as on success and the original
+    exception re-raises at the end so ``agg`` still exits nonzero. Success path
+    byte-identical: no sleep, no warning, ``finalize_error: None``.
+    """
+
+    def _drive(self, monkeypatch, atl06_config, *, finalize):
+        """Hive-path drive (mirrors ``TestManifestChecker._hive_finalize_calls``)
+        with the tail invokes stubbed into an ordered ``events`` log; ``finalize``
+        is called once per backstop-invoke attempt (raise from it to fail one)."""
+        import threading
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        import zagg.grids as grids_mod
+        import zagg.hive as hive
+        import zagg.sweep as sweep_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        events = []
+        sleeps = []
+        captured = {}
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        atl06_config.output["store_layout"] = "hive"
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_invoke_lambda_ping", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_setup_async", lambda *a, **k: None)
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_cell",
+            lambda client, chunk_idx, shard_key, *a, **k: {
+                "shard_key": shard_key,
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "timeout": False,
+            },
+        )
+        # Manifest absent -> the finalize backstop invoke actually runs.
+        monkeypatch.setattr(
+            runner,
+            "_start_manifest_checker",
+            lambda check_present, **k: (threading.Event(), threading.Event(), MagicMock()),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_finalize",
+            lambda *a, **k: (events.append("finalize"), finalize())[-1],
+        )
+        # Fixed 5 s backoff must not slow the test; record it instead.
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        # Tail invokes -> ordered event log (coverage envelope stubbed so the
+        # stub grid's shard keys don't have to be valid morton words).
+        monkeypatch.setattr(hive, "build_root_coverage", lambda *a, **k: {"ranges": [1]})
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_coverage", lambda *a, **k: events.append("coverage")
+        )
+
+        def fake_stats(*a, **k):
+            events.append("stats")
+            captured["summary"] = k.get("summary")
+
+        monkeypatch.setattr(runner, "_dispatch_run_stats", fake_stats)
+        monkeypatch.setattr(sweep_mod, "leaves_from_stats_records", lambda *a, **k: [123])
+        monkeypatch.setattr(runner, "_invoke_lambda_sweep", lambda *a, **k: events.append("sweep"))
+
+        def run():
+            return runner._run_lambda(
+                atl06_config,
+                _run_catalog(),
+                "s3://out/x.zarr",
+                12,
+                max_cells=None,
+                morton_cell=None,
+                max_workers=1,
+                overwrite=False,
+                dry_run=False,
+                region="us-west-2",
+                function_name="fn",
+            )
+
+        return run, events, sleeps, captured
+
+    _TAIL = ["coverage", "stats", "sweep"]
+
+    def test_success_path_unchanged(self, monkeypatch, atl06_config):
+        run, events, sleeps, _captured = self._drive(
+            monkeypatch, atl06_config, finalize=lambda: None
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            summary = run()
+        assert events == ["finalize"] + self._TAIL  # one attempt, tail as before
+        assert sleeps == []  # no backoff on the success path
+        assert summary["finalize_error"] is None  # always-present, None on success
+        assert not [w for w in caught if "finalize" in str(w.message)]
+
+    def test_retry_succeeds_warns_sleeps_no_raise(self, monkeypatch, atl06_config):
+        outcomes = iter([RuntimeError("throttled"), None])
+
+        def flaky():
+            e = next(outcomes)
+            if e is not None:
+                raise e
+
+        run, events, sleeps, _captured = self._drive(monkeypatch, atl06_config, finalize=flaky)
+        with pytest.warns(RuntimeWarning, match=r"finalize \(manifest backstop\) failed"):
+            summary = run()  # no raise: the retry healed it
+        assert events == ["finalize", "finalize"] + self._TAIL
+        assert sleeps == [5]  # fixed 5 s backoff, espg-ratified (no knobs)
+        assert summary["finalize_error"] is None  # retry success IS success
+
+    def test_both_attempts_fail_tail_runs_then_reraises(self, monkeypatch, atl06_config):
+        boom = RuntimeError("invoke failed")
+
+        def always_fail():
+            raise boom
+
+        run, events, sleeps, captured = self._drive(monkeypatch, atl06_config, finalize=always_fail)
+        with pytest.warns(RuntimeWarning) as caught:
+            with pytest.raises(RuntimeError) as excinfo:
+                run()
+        assert excinfo.value is boom  # the ORIGINAL exception, after the tail
+        assert events == ["finalize", "finalize"] + self._TAIL  # full tail ran
+        assert sleeps == [5]  # exactly one retry, no more
+        assert captured["summary"]["finalize_error"] == "RuntimeError: invoke failed"
+        # Message contract mirrors the PR #333 client facade: store path +
+        # shard-outputs-written + stale-manifest + idempotent re-invoke.
+        msgs = [str(w.message) for w in caught if "manifest backstop" in str(w.message)]
+        assert len(msgs) == 2  # warned at BOTH failures
+        for m in msgs:
+            assert "s3://out/x.zarr" in m
+            assert "Shard outputs are written" in m
+            assert "idempotent" in m
+
+    def test_helper_makes_exactly_one_retry(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from zagg import runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        executor = MagicMock()
+        executor.finalize.side_effect = RuntimeError("nope")
+        with pytest.warns(RuntimeWarning):
+            err = runner._finalize_with_retry(executor, store_path="s3://out/x.zarr")
+        assert executor.finalize.call_count == 2  # initial + exactly one retry
+        assert sleeps == [5]
+        assert isinstance(err, RuntimeError)  # returned, not raised: caller defers
 
 
 class TestResolveSourceCredentials:
