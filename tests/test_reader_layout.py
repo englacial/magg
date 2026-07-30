@@ -306,6 +306,47 @@ class TestBlockAssembly:
             with pytest.raises(ValueError, match="block_order .* out of range"):
                 list(read_tensors(store, "12/h_tdigest", block_order=bad))
 
+    @pytest.mark.parametrize("block_order,side", [(5, 128), (4, 256)])
+    def test_block_coarser_than_the_shard_assembles(self, block_order, side):
+        """A block COARSER than the stored shard assembles too (fold review):
+        on a nested-ordered cells axis the block-local index is still the
+        nested rank, so the shard's 64×64 tensor lands whole at the
+        deinterleave of the shard's rank within the coarser parent. The
+        axis-length check is what rejects an untileable block order."""
+        from mortie import clip2order, generate_morton_children
+
+        populate = {0, 3, 7, 12}
+        store, shard6 = self._store(populate)
+        ((block, _mask, _scale, word),) = read_tensors(
+            store, "12/h_tdigest", block_order=block_order
+        )
+        assert block.shape == (side, side, 128)
+        parent = int(clip2order(block_order, np.array([shard6], dtype=np.uint64))[0])
+        assert word == parent
+        # The whole order-6 shard tensor, placed at its rank within `parent`.
+        ((shard_tensor, *_rest),) = read_tensors(store, "12/h_tdigest", block_order=6)
+        kids = [int(k) for k in np.asarray(generate_morton_children(parent, 6))]
+        assert len(kids) == 4 ** (6 - block_order)
+        row, col = (int(v) * 64 for v in rank_to_rowcol(kids.index(shard6), 6 - block_order))
+        np.testing.assert_array_equal(block[row : row + 64, col : col + 64, :], shard_tensor)
+        # Nothing outside the shard's tile (every other order-6 child is empty).
+        assert block.sum() == shard_tensor.sum()
+
+    def test_morton_not_in_nested_order_raises(self):
+        """The corrected guard in ``_chunk_word``: a span whose ``morton``
+        coordinate is NOT nested-ordered (cells from two subtrees) cannot be
+        indexed by cells-axis arithmetic, so it raises."""
+        import zarr
+
+        vals = np.random.default_rng(8).uniform(5.0, 25.0, 100)
+        store, grid, words = _build_store({_KEY_A: {0: vals, 1: vals}})
+        morton = zarr.open_array(store, path="12/morton", mode="r+")
+        base = grid.block_index(words[_KEY_A])[0] * grid.cells_per_chunk
+        # Graft a cell from the OTHER shard's subtree over a written cell.
+        morton[base + 1] = np.asarray(grid.children(morton_word(_KEY_B)))[1]
+        with pytest.raises(ValueError, match="not in nested order"):
+            list(read_tensors(store, "12/h_tdigest"))
+
     def test_chunk_order_block_matches_default(self):
         store, _shard6 = self._store({0, 5})
         default = list(read_tensors(store, "12/h_tdigest"))
