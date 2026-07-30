@@ -2314,6 +2314,7 @@ def _dispatch_run_stats(
     store_kwargs=None,
     summary=None,
     inline_rows=None,
+    tail_status_url=None,
 ) -> str | None:
     """Fire-and-forget worker-invoke run-record write (issue #313, D8).
 
@@ -2333,6 +2334,10 @@ def _dispatch_run_stats(
     ``run_stats_path`` names the real object — best-effort: the invoke is
     fire-and-forget, mirroring the root MOC's semantics. Fail-open
     everywhere: telemetry must never fail a run whose data landed.
+    ``tail_status_url`` (issue #327) has the worker additionally PUT the
+    run's tail-completion marker at that url when the write completes, so a
+    reattached handle knows the tail was recorded; ``None`` keeps the event
+    byte-identical.
     """
     from datetime import datetime, timezone
 
@@ -2350,6 +2355,8 @@ def _dispatch_run_stats(
             "run_id": run_id,
             "timestamp": timestamp,
         }
+        if tail_status_url is not None:
+            event["tail_status_url"] = tail_status_url
         if output_creds_event is not None:
             event["output_credentials"] = output_creds_event
         if len(json.dumps(rows)) <= _RUN_STATS_INLINE_CAP_BYTES:
@@ -3649,6 +3656,8 @@ def _run_lambda(
     # PUT itself rides a fire-and-forget worker invoke — the dispatcher may
     # hold an invoke-only role with no S3 write access.
     stats_rows, stats_inline_rows = _lambda_result_rows(report.results, run_id=run_id)
+    from zagg.client_transport import TAIL_NAME, run_status_prefix
+
     _dispatch_run_stats(
         state["lambda_client"],
         function_name,
@@ -3660,6 +3669,9 @@ def _run_lambda(
         store_kwargs=_output_store_kwargs(output_creds_event, region),
         summary=summary,
         inline_rows=stats_inline_rows,
+        # Tail-completion marker (issue #327): worker-written at the v2 status
+        # prefix so Run.attach knows this run's tail was recorded.
+        tail_status_url=f"{run_status_prefix(store_path, run_id)}/{TAIL_NAME}",
     )
     # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
     # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"

@@ -112,6 +112,26 @@ class ShardError(RuntimeError):
         self.payload = payload
 
 
+def _fail_with_shard_error(entry, result: dict) -> None:
+    """v2 poller ``on_failed``: a terminal failure raises :class:`ShardError`.
+
+    Shared by :meth:`Run.dispatch` (event transport) and :meth:`Run.attach` so
+    a failed status, a spent retry budget, and the ``failed-unknown`` drop
+    outcome all surface from ``future.result()`` exactly like the v1 transport
+    — the payload is the same per-shard result dict, with ``outcome`` marking
+    a drop.
+    """
+    detail = result.get("error") or f"status {result.get('status_code')}"
+    entry.future.set_exception(
+        ShardError(
+            f"shard {entry.label}: {detail}",
+            shard_key=entry.shard_key,
+            label=entry.label,
+            payload=result,
+        )
+    )
+
+
 class RunHandle:
     """Live handle over one dispatched fan-out: per-shard futures + rollup.
 
@@ -461,6 +481,151 @@ class Run:
             source_credentials=source_credentials,
         )
 
+    @classmethod
+    def attach(
+        cls,
+        store: str,
+        run_id: str,
+        *,
+        function_name: str | None = None,
+        region: str = "us-west-2",
+        lambda_client=None,
+        output_credentials: dict | None = None,
+        output_endpoint_url: str | None = None,
+    ) -> RunHandle:
+        """Reattach to a dispatched run by id (issue #327 phase 5).
+
+        Rebuilds a :class:`RunHandle` from the run's dispatch manifest
+        (``<store>.status/run-<run_id>/manifest.json`` — the config, shard
+        set, and identity the setup invoke recorded worker-side) plus the
+        current status objects: shards already settled resolve on the first
+        poll tick, the rest resolve as their statuses land. A notebook kernel
+        restart or a second machine can adopt a running fleet this way — the
+        Event invokes are already in flight and owe the client nothing.
+
+        Observe-only by design: the manifest carries no granule records, so a
+        ``failed`` status resolves that shard's :class:`ShardError`
+        immediately (no re-dispatch), and a shard with no status object by
+        the drop deadline — anchored at the manifest's ``dispatched_at`` —
+        resolves ``failed-unknown``. The post-run tail runs only if not
+        already recorded (the run's ``tail.json`` marker, checked read-only);
+        when it does run it is the same worker-invoke tail as a live handle
+        (D8 intact — this method's own store traffic is reads).
+
+        Parameters
+        ----------
+        store : str
+            The run's effective store root exactly as dispatched
+            (``handle.store_path`` / the summary's ``store_path``).
+        run_id : str
+            The dispatch's run id (``manifest.json`` names it; it is also in
+            every cell event and stats record).
+        function_name, region, lambda_client, output_credentials,
+        output_endpoint_url
+            Same semantics as :meth:`from_config`; the function/client are
+            only used for the tail invokes when the tail is not yet recorded.
+        """
+        from zagg import client_transport, runner
+
+        output_creds_event = runner._build_output_creds_event(
+            output_credentials, output_endpoint_url, region
+        )
+        store_kwargs = runner._output_store_kwargs(output_creds_event, region)
+        prefix = client_transport.run_status_prefix(store, run_id)
+        manifest = client_transport.read_dispatch_manifest(prefix, store_kwargs)
+        if manifest is None:
+            raise ValueError(
+                f"no dispatch manifest at {prefix}/{client_transport.MANIFEST_NAME} — "
+                f"wrong store/run_id, a dispatcher predating issue #327, or a hive "
+                f"setup Event that was dropped (its manifest write is best-effort)"
+            )
+        if not manifest.get("config"):
+            raise ValueError(f"dispatch manifest for run {run_id} carries no config")
+        config = load_config_from_dict(manifest["config"])
+        validate_config(config)
+        if get_windowing(config) is not None:
+            raise NotImplementedError(
+                "Run.attach covers unwindowed spatial runs; windowed units are "
+                "(shard, window) pairs the manifest does not enumerate"
+            )
+        shards = [int(s) for s in manifest.get("shards") or []]
+        if not shards:
+            raise ValueError(f"dispatch manifest for run {run_id} lists no shards")
+
+        grid = grid_from_config(config)
+        catalog_data = {
+            "shard_keys": shards,
+            "granules": [[] for _ in shards],
+            "grid_signature": grid.spatial_signature(),
+            "metadata": manifest.get("dataset"),
+        }
+        run = cls(
+            config,
+            catalog_data,
+            store=store,
+            function_name=runner._resolve_function_name(config, function_name),
+            region=region,
+            lambda_client=lambda_client,
+            driver=get_driver(config),
+            handoff=get_handoff(config),
+            output_credentials=output_credentials,
+            output_endpoint_url=output_endpoint_url or get_output_endpoint_url(config),
+        )
+        client = lambda_client
+        if client is None:
+            import boto3
+            from botocore.config import Config
+
+            client = boto3.Session().client(
+                "lambda",
+                region_name=region,
+                config=Config(read_timeout=960, connect_timeout=10, retries={"max_attempts": 0}),
+            )
+
+        # Drop deadline anchored at the manifest's dispatched_at: attaching
+        # long after the fleet finished classifies status-less shards
+        # immediately instead of waiting a fresh window.
+        dispatched_at = None
+        try:
+            from datetime import datetime
+
+            dispatched_at = datetime.fromisoformat(manifest["dispatched_at"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            pass
+        timeout_s = runner._get_function_timeout_s(client, run.function_name)
+        poller = client_transport.StatusPoller(
+            lambda: client_transport.open_status_store(prefix, store_kwargs),
+            drop_timeout_s=client_transport.drop_timeout_s(timeout_s),
+            on_failed=_fail_with_shard_error,
+        )
+        futures: dict[int, Future] = {}
+        for key in shards:
+            label = runner._safe_label(run.grid, key)
+            futures[key] = poller.register(key, label, dispatch=None, dispatched_at=dispatched_at)
+        poller.start()
+
+        handle = RunHandle(futures, store_path=store)
+        finisher = threading.Thread(
+            target=run._post_run,
+            args=(
+                handle,
+                client,
+                poller,
+                asdict(config),
+                manifest.get("dataset"),
+                output_creds_event,
+                run_id,
+            ),
+            kwargs={
+                "tail_done_check": lambda: client_transport.tail_recorded(prefix, store_kwargs)
+            },
+            name="zagg-client-finish",
+            daemon=True,
+        )
+        handle._finisher = finisher
+        finisher.start()
+        return handle
+
     # -- shard selection ----------------------------------------------------
 
     def _resolve_key(self, key) -> int:
@@ -758,24 +923,12 @@ class Run:
         # the helper falls back to the template default (an injected stub
         # client need not answer get_function_configuration).
         timeout_s = runner._get_function_timeout_s(client, self.function_name)
-
-        def _failed(entry, result):
-            detail = result.get("error") or f"status {result.get('status_code')}"
-            entry.future.set_exception(
-                ShardError(
-                    f"shard {entry.label}: {detail}",
-                    shard_key=entry.shard_key,
-                    label=entry.label,
-                    payload=result,
-                )
-            )
-
         poller = client_transport.StatusPoller(
             lambda: client_transport.open_status_store(prefix, store_kwargs),
             drop_timeout_s=client_transport.drop_timeout_s(timeout_s),
             max_retries=self.max_retries,
             max_in_flight=workers,
-            on_failed=_failed,
+            on_failed=_fail_with_shard_error,
         )
         futures: dict[int, Future] = {}
         for key, records in cells:
@@ -900,6 +1053,7 @@ class Run:
         dataset: dict | None,
         output_creds_event: dict | None,
         run_id: str,
+        tail_done_check=None,
     ) -> None:
         """Finisher-thread entry point: run the tail, never lose its failure.
 
@@ -909,9 +1063,17 @@ class Run:
         distinct from the D6-load-bearing ``_finalize_error``) and ``closer``
         — the v1 invoke pool or the v2 status poller, both
         ``shutdown(wait=False)``-shaped — is shut down either way (review
-        finding, PR #333).
+        finding, PR #333). ``tail_done_check`` (issue #327, the attach path):
+        a zero-arg read-only predicate consulted AFTER every shard settles —
+        True means the tail was already recorded (the run's ``tail.json``
+        marker), so a reattached handle never re-runs it.
         """
         try:
+            if tail_done_check is not None:
+                futures_wait(list(handle.futures.values()))
+                if tail_done_check():
+                    logger.info(f"post-run tail already recorded for run {run_id}; skipping")
+                    return
             self._run_tail(handle, client, config_dict, dataset, output_creds_event, run_id)
         except BaseException as e:
             handle._tail_error = e
@@ -1035,9 +1197,13 @@ class Run:
             except Exception as e:
                 logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
 
-        # Run-record + sweep, both fail-open (issues #297/#313/#300): sync
-        # transport -> no status prefix, so oversized row sets skip inside
-        # _dispatch_run_stats exactly like agg's invocation="sync" path.
+        # Run-record + sweep, both fail-open (issues #297/#313/#300): no #151
+        # envelope-mirror prefix on either transport, so oversized row sets
+        # skip inside _dispatch_run_stats exactly like agg's sync path. The
+        # worker also records the tail-completion marker (issue #327) so a
+        # reattached handle knows this tail ran.
+        from zagg.client_transport import TAIL_NAME, run_status_prefix
+
         stats_rows, stats_inline = runner._lambda_result_rows(results, run_id=run_id)
         runner._dispatch_run_stats(
             client,
@@ -1049,6 +1215,7 @@ class Run:
             output_creds_event=output_creds_event,
             store_kwargs=runner._output_store_kwargs(output_creds_event, self.region),
             inline_rows=stats_inline,
+            tail_status_url=f"{run_status_prefix(self.store, run_id)}/{TAIL_NAME}",
         )
         if layout == "hive" and get_sweep(self.config):
             try:

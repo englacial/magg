@@ -97,6 +97,19 @@ class EventStubLambdaClient:
         with self._lock:
             self.events.append((kwargs["FunctionName"], kwargs["InvocationType"], event))
         if event.get("mode") is not None:
+            # Simulate the deployed worker's status-prefix writes off the mode
+            # invokes (issue #327): the setup event's dispatch manifest and
+            # the stats event's tail-completion marker.
+            if event["mode"] == "setup" and event.get("run_manifest"):
+                manifest = {
+                    "schema_version": 1,
+                    **event["run_manifest"],
+                    "config": event.get("config"),
+                }
+                obstore.put(self.status_store, ct.MANIFEST_NAME, json.dumps(manifest).encode())
+            if event["mode"] == "stats" and event.get("tail_status_url"):
+                marker = {"status": "tail_done", "run_id": event.get("run_id")}
+                obstore.put(self.status_store, ct.TAIL_NAME, json.dumps(marker).encode())
             return {
                 "Payload": type(
                     "P", (), {"read": lambda self: b'{"statusCode": 200, "body": "{}"}'}
@@ -151,6 +164,38 @@ def _run(catalog, *, client, config=None, **kwargs):
         source_credentials=_CREDS,
         **kwargs,
     )
+
+
+def _put_status(store, shard_key, status="ok", attempt_id=None, **fields):
+    """Hand-craft one status object (the worker-half schema)."""
+    obj = {
+        "schema_version": 1,
+        "status": status,
+        "attempt_id": attempt_id or f"aid-{time.time_ns()}",
+        "shard": str(shard_key),
+        "timings": None,
+        "error": fields.pop("error", None),
+        "status_code": fields.pop("status_code", 200),
+        "body": fields.pop("body", {}),
+    }
+    obstore.put(store, ct.shard_status_key(shard_key), json.dumps(obj).encode())
+
+
+def _put_manifest(store, run_id, shards, dispatched_at=None, config=None):
+    """Hand-craft one dispatch manifest (what the worker writes off setup)."""
+    from dataclasses import asdict
+    from datetime import datetime, timezone
+
+    manifest = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "shards": [str(int(w)) for w in shards],
+        "semantic_hash": "ab" * 32,
+        "dispatched_at": dispatched_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "dataset": {"short_name": "ATL06", "version": "006"},
+        "config": config if config is not None else asdict(default_config("atl06")),
+    }
+    obstore.put(store, ct.MANIFEST_NAME, json.dumps(manifest).encode())
 
 
 # -- Run.dispatch(transport="event") -------------------------------------------
@@ -241,20 +286,6 @@ class TestStatusPoller:
         kwargs.setdefault("drop_timeout_s", 1050.0)
         return ct.StatusPoller(lambda: store, **kwargs)
 
-    @staticmethod
-    def _put_status(store, shard_key, status="ok", attempt_id=None, **fields):
-        obj = {
-            "schema_version": 1,
-            "status": status,
-            "attempt_id": attempt_id or f"aid-{time.time_ns()}",
-            "shard": str(shard_key),
-            "timings": None,
-            "error": fields.pop("error", None),
-            "status_code": fields.pop("status_code", 200),
-            "body": fields.pop("body", {}),
-        }
-        obstore.put(store, ct.shard_status_key(shard_key), json.dumps(obj).encode())
-
     def test_pacing_window_bounds_in_flight_dispatch(self):
         # max_in_flight=1: the second shard's Event must not fire until the
         # first resolves — load-bearing under the fleet's 60 s max event age.
@@ -269,13 +300,13 @@ class TestStatusPoller:
             time.sleep(0.005)
         time.sleep(0.05)  # a few idle ticks: the window must still hold
         assert fired == [1]
-        self._put_status(store, 1)
+        _put_status(store, 1)
         assert f1.result(timeout=5)["status_code"] == 200
         deadline = time.time() + 5
         while len(fired) < 2 and time.time() < deadline:
             time.sleep(0.005)
         assert fired == [1, 2]
-        self._put_status(store, 2)
+        _put_status(store, 2)
         assert f2.result(timeout=5)["status_code"] == 200
         poller.shutdown(wait=True)
 
@@ -286,7 +317,7 @@ class TestStatusPoller:
         fired: list[float] = []
         poller = self._poller(store, max_retries=3)
         fut = poller.register(1, "1", dispatch=lambda: fired.append(time.time()))
-        self._put_status(store, 1, status="failed", attempt_id="a1", error="boom")
+        _put_status(store, 1, status="failed", attempt_id="a1", error="boom")
         poller.start()
         deadline = time.time() + 5
         while len(fired) < 2 and time.time() < deadline:
@@ -296,7 +327,7 @@ class TestStatusPoller:
         time.sleep(0.1)
         assert len(fired) == 2
         # The retry's execution lands with a fresh id and resolves the future.
-        self._put_status(store, 1, status="ok", attempt_id="a2")
+        _put_status(store, 1, status="ok", attempt_id="a2")
         assert fut.result(timeout=5)["retries"] == 1
         poller.shutdown(wait=True)
 
@@ -316,7 +347,7 @@ class TestStatusPoller:
         while calls["n"] < 2 and time.time() < deadline:
             time.sleep(0.005)
         assert calls["n"] == 2
-        self._put_status(store, 1)
+        _put_status(store, 1)
         assert fut.result(timeout=5)["retries"] == 1
         poller.shutdown(wait=True)
 
@@ -326,7 +357,7 @@ class TestStatusPoller:
         store = MemoryStore()
         poller = self._poller(store, max_retries=1)
         fut = poller.register(7, "7", dispatch=lambda: None)
-        self._put_status(store, 7, status="failed", error="boom", status_code=500)
+        _put_status(store, 7, status="failed", error="boom", status_code=500)
         poller.start()
         result = fut.result(timeout=5)
         assert result["error"] == "boom"
@@ -347,7 +378,7 @@ class TestStatusPoller:
 
         poller = self._poller(store)
         fut = poller.register(1, "1", dispatch=lambda: None)
-        self._put_status(store, 1)
+        _put_status(store, 1)
         try:
             obstore.list = flaky_list
             poller.start()
@@ -367,7 +398,7 @@ class TestStatusPoller:
             on_failed=lambda e, r: (failures.append(r), e.future.set_result(r)),
         )
         fut = poller.register(1, "1", dispatch=None)
-        self._put_status(store, 1, status="failed", error="boom")
+        _put_status(store, 1, status="failed", error="boom")
         poller.start()
         assert fut.result(timeout=5)["error"] == "boom"
         assert len(failures) == 1
@@ -426,25 +457,11 @@ class TestDropDetection:
             time.sleep(0.005)
         assert len(fired) == 2 and not fut.done()
         # The retry's execution lands its status: the shard recovers.
-        self._late_status(store, 5)
+        _put_status(store, 5)
         result = fut.result(timeout=5)
         assert result["retries"] == 1
         assert "outcome" not in result
         poller.shutdown(wait=True)
-
-    @staticmethod
-    def _late_status(store, shard_key):
-        obj = {
-            "schema_version": 1,
-            "status": "ok",
-            "attempt_id": "late",
-            "shard": str(shard_key),
-            "timings": None,
-            "error": None,
-            "status_code": 200,
-            "body": {"duration_s": 2.0},
-        }
-        obstore.put(store, ct.shard_status_key(shard_key), json.dumps(obj).encode())
 
     def test_client_event_run_counts_a_drop_failed(self, catalog, status_store, monkeypatch):
         # End-to-end: the invoke is accepted (202) but no status ever lands;
@@ -461,6 +478,103 @@ class TestDropDetection:
         assert handle.status() == {"pending": 0, "ok": 2, "failed": 1}
         attempts = [e for _, _, e in stub.cell_events() if e["shard_key"] == _WORDS[0]]
         assert len(attempts) == 2  # the budget was spent on re-dispatches
+
+
+# -- reattach (issue #327 phase 5) ------------------------------------------------
+
+
+class TestAttach:
+    """``Run.attach(store, run_id)`` rebuilds a handle from the dispatch
+    manifest + current status objects; the post-run tail runs only when not
+    already recorded. Observe-only: reads, no re-dispatch (D8 intact)."""
+
+    def test_attach_post_run_resolves_and_skips_the_tail(self, catalog, status_store):
+        # A completed live run left manifest + statuses + tail marker behind.
+        live = EventStubLambdaClient(status_store)
+        _run(catalog, client=live).dispatch(transport="event").results()
+        run_id = live.cell_events()[0][2]["run_id"]
+
+        fresh = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, run_id, lambda_client=fresh)
+        results = handle.results()
+        assert set(results) == set(_WORDS)
+        assert all(r["body"]["total_obs"] == 7 for r in results.values())
+        assert handle.status() == {"pending": 0, "ok": 3, "failed": 0}
+        # The tail was recorded (tail.json): the reattached handle fires NOTHING.
+        assert fresh.events == []
+
+    def test_attach_mid_run_resolves_late_shards_and_runs_the_tail(self, status_store):
+        # Mid-run state: manifest + two settled shards; the third lands later.
+        _put_manifest(status_store, "midrun", _WORDS)
+        body = {"total_obs": 7, "duration_s": 1.0, "stats": {"schema_version": 1}}
+        _put_status(status_store, _WORDS[0], body=dict(body))
+        _put_status(status_store, _WORDS[1], body=dict(body))
+
+        stub = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, "midrun", lambda_client=stub)
+        assert handle.futures[_WORDS[0]].result(timeout=10)["body"]["total_obs"] == 7
+        assert not handle.futures[_WORDS[2]].done()
+        _put_status(status_store, _WORDS[2], body=dict(body))  # the fleet finishes
+        handle.results()
+        handle.wait(timeout=10)
+        # No tail marker existed, so the SAME worker-invoke tail ran (D8):
+        # finalize backstop + coverage + stats — and zero cell re-dispatches.
+        modes = [m for m in stub.modes() if m]
+        assert "finalize" in modes and "stats" in modes
+        assert stub.cell_events() == []
+        # ... and the stats leg recorded the marker: a second attach skips it.
+        again = EventStubLambdaClient(status_store)
+        Run.attach(_STORE, "midrun", lambda_client=again).results()
+        assert again.events == []
+
+    def test_attach_failed_status_raises_without_redispatch(self, status_store):
+        _put_manifest(status_store, "failedrun", _WORDS)
+        body = {"total_obs": 7, "duration_s": 1.0}
+        _put_status(status_store, _WORDS[0], body=dict(body))
+        _put_status(status_store, _WORDS[1], body=dict(body))
+        _put_status(status_store, _WORDS[2], status="failed", error="boom", status_code=500)
+        stub = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, "failedrun", lambda_client=stub)
+        with pytest.raises(ShardError, match="boom"):
+            handle.futures[_WORDS[2]].result(timeout=10)
+        handle.results(return_exceptions=True)
+        assert handle.status() == {"pending": 0, "ok": 2, "failed": 1}
+        # Observe-only: attach holds no granule records, so no re-dispatch.
+        assert stub.cell_events() == []
+
+    def test_attach_classifies_stale_missing_shard_failed_unknown(self, status_store):
+        # The drop deadline anchors at the manifest's dispatched_at: attaching
+        # LONG after the fleet finished classifies a status-less shard
+        # immediately instead of waiting a fresh window.
+        _put_manifest(status_store, "stale", _WORDS, dispatched_at="2020-01-01T00:00:00+00:00")
+        body = {"total_obs": 7, "duration_s": 1.0}
+        _put_status(status_store, _WORDS[0], body=dict(body))
+        _put_status(status_store, _WORDS[1], body=dict(body))
+        stub = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, "stale", lambda_client=stub)
+        with pytest.raises(ShardError, match="failed-unknown") as excinfo:
+            handle.futures[_WORDS[2]].result(timeout=10)
+        assert excinfo.value.payload["outcome"] == "failed-unknown"
+
+    def test_attach_missing_manifest_raises(self, status_store):
+        with pytest.raises(ValueError, match="no dispatch manifest"):
+            Run.attach(_STORE, "nosuchrun", lambda_client=EventStubLambdaClient(status_store))
+
+    def test_attach_windowed_config_refused(self, status_store):
+        from dataclasses import asdict
+
+        cfg = default_config("atl06")
+        cfg.output["windowing"] = {
+            "schedule": "explicit",
+            "time_field": "h_li",  # a declared column, so validate_config passes
+            "epoch": "2018-01-01T00:00:00Z",
+            "windows": [
+                {"label": "w1", "start": "2020-01-01T00:00:00Z", "end": "2021-01-01T00:00:00Z"}
+            ],
+        }
+        _put_manifest(status_store, "windowed", _WORDS, config=asdict(cfg))
+        with pytest.raises(NotImplementedError, match="windowed"):
+            Run.attach(_STORE, "windowed", lambda_client=EventStubLambdaClient(status_store))
 
 
 # -- keys / prefix ---------------------------------------------------------------

@@ -154,6 +154,10 @@ the dispatcher at end of run, like coverage mode):
     "rows_from": str (optional) -- the run's async status prefix; the worker
         assembles success rows from the mirrored result envelopes when the
         row set exceeds the async payload budget,
+    "tail_status_url": str (optional, issue #327) -- where to ALSO write the
+        run's tail-completion marker on success (the v2 status prefix's
+        tail.json); a reattached handle (Run.attach) then skips a tail that
+        already ran. Fail-open; absent -> no write, byte-identical.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -645,6 +649,16 @@ def _write_dispatch_manifest(event: Dict[str, Any]) -> None:
         logger.warning(f"dispatch manifest write failed (fail-open, issue #327): {e}")
 
 
+def _write_tail_status(event: Dict[str, Any]) -> None:
+    """Tail-completion marker off the stats event (issue #327), doubly fail-open."""
+    try:
+        from zagg.client_transport import write_tail_status
+
+        write_tail_status(event, _output_store_kwargs(event))
+    except Exception as e:
+        logger.warning(f"tail status write failed (fail-open, issue #327): {e}")
+
+
 def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, Any]) -> bool:
     """Write the response envelope to ``result_url`` as JSON (issue #151).
 
@@ -1063,6 +1077,7 @@ def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
         if not rows:
             # A pointer prefix that yielded nothing (and no inline rows):
             # nothing to persist — not an error (fail-open telemetry).
+            _write_tail_status(event)
             return {
                 "statusCode": 200,
                 "body": json.dumps({"ok": True, "mode": "stats", "rows": 0}),
@@ -1074,6 +1089,10 @@ def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
             timestamp=event.get("timestamp"),
             store_kwargs=_output_store_kwargs(event),
         )
+        # Tail-completion marker (issue #327): the stats leg is the recorded
+        # end of the post-run tail, so a reattached handle can skip a tail
+        # that already ran. Fail-open; absent url -> no-op.
+        _write_tail_status(event)
         return {
             "statusCode": 200,
             "body": json.dumps({"ok": True, "mode": "stats", "rows": len(rows), "path": path}),

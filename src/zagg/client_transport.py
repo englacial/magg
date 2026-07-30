@@ -90,6 +90,12 @@ STATUS_SCHEMA_VERSION = 1
 #: Dispatch-manifest object name under the run prefix (issue #327 phase 2).
 MANIFEST_NAME = "manifest.json"
 
+#: Tail-completion marker under the run prefix (issue #327 phase 5): written
+#: by the mode="stats" worker when the post-run tail's record leg completes,
+#: so a reattached handle re-runs the (idempotent / fail-open) tail only when
+#: it was never recorded.
+TAIL_NAME = "tail.json"
+
 
 def run_status_prefix(store_path: str, run_id: str) -> str:
     """The run's status prefix: ``<store>.status/run-<run_id>`` (a store SIBLING)."""
@@ -253,9 +259,66 @@ def write_shard_status(event: dict, response: dict, store_kwargs: dict[str, Any]
         logger.warning(f"shard status write failed (fail-open, issue #327): {e}")
 
 
+def write_tail_status(event: dict, store_kwargs: dict[str, Any]) -> None:
+    """PUT the tail-completion marker named by ``event["tail_status_url"]``.
+
+    Worker-side (the ``mode="stats"`` handler — the last recorded leg of the
+    post-run tail), fail-open like every status write: absent key or any
+    failure logs and never fails the stats invoke.
+    """
+    try:
+        url = event.get("tail_status_url")
+        if not url:
+            return
+        import obstore
+
+        from zagg.store import open_object_store
+
+        prefix, _, key = url.rpartition("/")
+        marker = {
+            "schema_version": STATUS_SCHEMA_VERSION,
+            "status": "tail_done",
+            "run_id": event.get("run_id"),
+        }
+        obstore.put(open_object_store(prefix, **store_kwargs), key, json.dumps(marker).encode())
+        logger.info(f"Wrote tail status to {url}")
+    except Exception as e:
+        logger.warning(f"tail status write failed (fail-open, issue #327): {e}")
+
+
 # ---------------------------------------------------------------------------
-# Client half: the polling resolver (issue #327 phases 3-4).
+# Client half: the polling resolver (issue #327 phases 3-4) + reattach reads
+# (phase 5). The reads below are the D8-safe half: LIST/GET only.
 # ---------------------------------------------------------------------------
+
+
+def read_dispatch_manifest(prefix: str, store_kwargs: dict[str, Any]) -> dict | None:
+    """The run's dispatch manifest, or ``None`` when absent (read-only)."""
+    import obstore
+    from obstore.exceptions import NotFoundError
+
+    try:
+        store = open_status_store(prefix, store_kwargs)
+        return json.loads(bytes(obstore.get(store, MANIFEST_NAME).bytes()))
+    except (FileNotFoundError, NotFoundError):
+        return None
+
+
+def tail_recorded(prefix: str, store_kwargs: dict[str, Any]) -> bool:
+    """Whether the run's post-run tail marker exists (read-only).
+
+    Any read failure counts as "not recorded": the reattached tail then
+    re-runs, which is safe — finalize is idempotent and the rollup legs are
+    fail-open duplicates at worst.
+    """
+    import obstore
+
+    try:
+        store = open_status_store(prefix, store_kwargs)
+        obstore.get(store, TAIL_NAME)
+        return True
+    except Exception:
+        return False
 
 
 def open_status_store(prefix: str, store_kwargs: dict[str, Any]):

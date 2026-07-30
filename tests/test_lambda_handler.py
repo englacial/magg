@@ -1611,6 +1611,64 @@ class TestStatsMode:
         )
         assert resp["statusCode"] == 500
 
+    def test_tail_status_url_writes_the_marker(self, handler_mod, tmp_path):
+        # Issue #327 phase 5: the stats leg is the recorded end of the
+        # post-run tail; the marker lets Run.attach skip a tail that ran.
+        root = str(tmp_path / "out")
+        url = str(tmp_path / "out.zarr.status" / "run-runid1" / "tail.json")
+        event = {
+            "mode": "stats",
+            "store_path": root,
+            "run_id": "runid1",
+            "timestamp": "20260720T010203Z",
+            "rows": self._rows(),
+            "tail_status_url": url,
+        }
+        assert handler_mod.lambda_handler(event, MagicMock())["statusCode"] == 200
+        marker = json.loads(Path(url).read_text())
+        assert marker["status"] == "tail_done"
+        assert marker["run_id"] == "runid1"
+        # The 0-row path records the marker too (nothing to persist != no tail).
+        url2 = str(tmp_path / "out.zarr.status" / "run-runid2" / "tail.json")
+        resp = handler_mod.lambda_handler(
+            {"mode": "stats", "store_path": root, "run_id": "runid2", "tail_status_url": url2},
+            MagicMock(),
+        )
+        assert resp["statusCode"] == 200
+        assert json.loads(Path(url2).read_text())["run_id"] == "runid2"
+
+    def test_marker_failure_never_fails_the_stats_write(self, handler_mod, monkeypatch, tmp_path):
+        import zagg.client_transport
+
+        def boom(*a, **k):
+            raise RuntimeError("marker down")
+
+        monkeypatch.setattr(zagg.client_transport, "write_tail_status", boom)
+        root = str(tmp_path / "out")
+        event = {
+            "mode": "stats",
+            "store_path": root,
+            "run_id": "runid1",
+            "timestamp": "20260720T010203Z",
+            "rows": self._rows(),
+            "tail_status_url": str(tmp_path / "t.json"),
+        }
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["rows"] == 2
+
+    def test_no_tail_status_url_writes_no_marker(self, handler_mod, tmp_path):
+        root = str(tmp_path / "out")
+        event = {
+            "mode": "stats",
+            "store_path": root,
+            "run_id": "runid1",
+            "timestamp": "20260720T010203Z",
+            "rows": self._rows(),
+        }
+        assert handler_mod.lambda_handler(event, MagicMock())["statusCode"] == 200
+        assert not (tmp_path / "out.zarr.status").exists()
+
 
 class TestPingMode:
     """Issue #252: the hive pre-fan-out preflight. Answering 200 at all gates
