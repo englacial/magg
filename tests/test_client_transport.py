@@ -349,6 +349,53 @@ class TestStatusPoller:
         kwargs.setdefault("drop_timeout_s", 1050.0)
         return ct.StatusPoller(lambda: store, **kwargs)
 
+    def test_unknown_schema_version_warns_and_still_resolves(self, caplog):
+        # A newer worker against an older client is the normal fleet state
+        # during a layer roll: the object is honored (a shard whose data landed
+        # must not fail on telemetry) but the mismatch is LOUD, so a future
+        # bump can't read as v1 in silence (review, PR #343).
+        store = MemoryStore()
+        poller = self._poller(store)
+        poller.register(1, "1", dispatch=lambda: None)
+        entry = poller._entries[ct.shard_status_key(1)]
+        poller._store = store
+        obj = {
+            "schema_version": 99,
+            "status": "ok",
+            "attempt_id": "a1",
+            "status_code": 200,
+            "body": {},
+        }
+        obstore.put(store, entry.key, json.dumps(obj).encode())
+        with caplog.at_level("WARNING"):
+            assert poller._consume(entry) is True
+        assert "schema_version 99" in caplog.text
+        assert entry.future.result(timeout=1)["status_code"] == 200
+
+    def test_missing_attempt_id_does_not_poison_the_dedupe(self):
+        # A falsy attempt_id used to land None in `consumed`, after which EVERY
+        # later object read as None too and was ignored — so a shard that
+        # succeeded on its re-fire was reported failed-unknown. Absent ids are
+        # always-new instead (review, PR #343).
+        store = MemoryStore()
+        poller = self._poller(store, max_retries=3)
+        poller.register(1, "1", dispatch=lambda: None)
+        entry = poller._entries[ct.shard_status_key(1)]
+        poller._store = store
+
+        def _put_idless(status):
+            obj = {"schema_version": 1, "status": status, "status_code": 200, "body": {}}
+            obstore.put(store, entry.key, json.dumps(obj).encode())
+
+        _put_idless("failed")
+        assert poller._consume(entry) is True
+        assert entry.consumed == set()  # nothing poisoned
+        # A second id-less object is consumed again rather than ignored.
+        entry.future = Future()
+        _put_idless("ok")
+        assert poller._consume(entry) is True
+        assert entry.future.result(timeout=1)["status_code"] == 200
+
     def test_pacing_window_bounds_in_flight_dispatch(self):
         # max_in_flight=1: the second shard's Event must not fire until the
         # first resolves — load-bearing under the fleet's 60 s max event age.

@@ -101,7 +101,9 @@ def drop_timeout_s(function_timeout_s: float) -> float:
     return float(function_timeout_s) + MAX_EVENT_AGE_S + _DROP_MARGIN_S
 
 
-#: Version stamped into every status object; bump on any key change.
+#: Version stamped into every status object; bump on any key change. Read back
+#: in :meth:`StatusPoller._consume`, which warns on a mismatch so a future bump
+#: is loud rather than subtly wrong (review finding, PR #343).
 STATUS_SCHEMA_VERSION = 1
 
 #: Dispatch-manifest object name under the run prefix (issue #327 phase 2).
@@ -905,7 +907,24 @@ class StatusPoller:
         return keys
 
     def _consume(self, entry: _ShardEntry) -> bool:
-        """GET one listed status object; act on it once per attempt_id."""
+        """GET one listed status object; act on it once per attempt_id.
+
+        Two read-side guards on the fields the channel's forward-compat rests
+        on (review findings, PR #343):
+
+        - An unrecognized ``schema_version`` WARNS. A newer worker against an
+          older client is the normal fleet state during a layer roll, so the
+          version is only worth stamping if a bump is loud; the object is still
+          consumed (a shard whose data landed must not fail on telemetry), but
+          the log names the mismatch instead of reading v99 as v1 in silence.
+        - A falsy/absent ``attempt_id`` is treated as always-new. Adding
+          ``None`` to ``consumed`` used to poison the dedupe permanently: every
+          later attempt's object read as ``None`` too and was ignored, so a
+          shard that SUCCEEDED on its re-fire waited out the whole drop window
+          and was reported ``failed-unknown``. ``build_shard_status`` always
+          sets the id, so this needs a foreign or truncated object — but a
+          silent-wrong-answer mode is worth one line to close.
+        """
         import obstore
 
         try:
@@ -913,10 +932,24 @@ class StatusPoller:
         except Exception as e:
             logger.warning(f"shard {entry.label}: status GET failed (retrying): {e}")
             return False
+        version = obj.get("schema_version")
+        if version != STATUS_SCHEMA_VERSION:
+            logger.warning(
+                f"shard {entry.label}: status object schema_version {version!r} != "
+                f"{STATUS_SCHEMA_VERSION} (this client's); reading it as v"
+                f"{STATUS_SCHEMA_VERSION} — a newer worker may carry keys this "
+                f"client ignores (issue #327)"
+            )
         attempt_id = obj.get("attempt_id")
-        if attempt_id in entry.consumed:
+        if not attempt_id:
+            logger.warning(
+                f"shard {entry.label}: status object carries no attempt_id; "
+                f"treating it as a new attempt (issue #327)"
+            )
+        elif attempt_id in entry.consumed:
             return False  # already acted on (a not-yet-overwritten prior attempt)
-        entry.consumed.add(attempt_id)
+        else:
+            entry.consumed.add(attempt_id)
         result = self._result(
             entry,
             status_code=obj.get("status_code"),
