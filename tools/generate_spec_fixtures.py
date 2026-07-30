@@ -259,6 +259,28 @@ def _fake_process_shard(grid, by_chunk, kitchen_sink: bool):
     return fake
 
 
+def _element_bytes(element) -> bytes:
+    """One vlen cell's payload bytes, per the §5.2 normalization.
+
+    ``None`` (an unwritten cell may decode as ``None``, not ``b""``) is
+    zero-length; bytes are as-is; a typed ``/2`` ndarray cell normalizes to
+    C-contiguous little-endian bytes. Anything else RAISES — a silently wrong
+    digest is worse than no digest.
+    """
+    if element is None:
+        return b""
+    if isinstance(element, bytes | bytearray | memoryview):
+        return bytes(element)
+    if isinstance(element, str):
+        return element.encode()
+    if isinstance(element, np.ndarray):
+        values = np.ascontiguousarray(element)
+        if values.dtype.byteorder == ">":
+            values = values.astype(values.dtype.newbyteorder("<"))
+        return values.tobytes()
+    raise ValueError(f"vlen element of type {type(element).__name__} has no O11 byte recipe")
+
+
 def _o11_hashes(leaf_path: str) -> dict:
     """The §5 O11 recipe over every array beneath the leaf root."""
     import zarr
@@ -272,7 +294,7 @@ def _o11_hashes(leaf_path: str) -> dict:
         if values.dtype.kind == "O":  # vlen: length-prefixed payloads, C order
             digest = hashlib.sha256()
             for element in values.ravel(order="C"):
-                payload = b"" if element is None else bytes(element)
+                payload = _element_bytes(element)
                 digest.update(len(payload).to_bytes(8, "little"))
                 digest.update(payload)
             hashes[key] = digest.hexdigest()
