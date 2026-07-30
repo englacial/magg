@@ -199,6 +199,13 @@ for tensor, mask, (offset, gain), morton in read_tensors(store, field):
   z-window and `fit` policy are reconciled **block-wide**: one shared
   `(offset, gain) = (z_lo, resolution)` per block, so bin `i` covers
   `[offset + i*gain, offset + (i+1)*gain)` for every cell in the block.
+  Coarser than the stored shard assembles too (the block-local index is still
+  the nested rank), but the memory bound is then per *block*: the block's
+  decoded digests are all held for the block-wide window, and the emitted
+  tensor grows 4× per coarser order (an order-6 block on the production
+  order-19 geometry would be 34 TB). `max_block_bytes=` (2 GiB default)
+  refuses that allocation with a pointed error instead of a bare
+  `MemoryError`.
 - **Mask** — the block's occupancy channel on the same deinterleaved layout:
   `0` unobserved, `1` observed with no stored digest, `2` observed with data.
   States 1/2 come from the hive leaf's `coverage.moc` occupancy sidecar
