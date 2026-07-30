@@ -73,6 +73,14 @@ MAX_EVENT_AGE_S = 60.0
 #: ``_ASYNC_POLL_MARGIN_S``.
 _DROP_MARGIN_S = 90.0
 
+#: Class-(b) re-fire budget (see :class:`StatusPoller`): a status-less shard
+#: re-fires at most this many times. ONE, so the worst case is 2 executions —
+#: the bounded double-billing the queue-drop class trades for recovering a
+#: silently discarded invoke (issue #151: ``MaximumRetryAttempts: 0`` exists to
+#: stop the fleet re-billing 900 s executions, so the client must not
+#: reintroduce an unbounded version of it from the outside).
+_MAX_DROP_REFIRES = 1
+
 
 def drop_timeout_s(function_timeout_s: float) -> float:
     """Seconds after dispatch with NO status object => ``failed-unknown``.
@@ -561,6 +569,7 @@ class _ShardEntry:
     granule_count: int = 0
     attempts: int = 0  # dispatches so far (the v1 attempt counter)
     queued: bool = True  # awaiting a dispatch slot
+    drop_refires: int = 0  # class-(b) re-fires spent (see StatusPoller)
     dispatched_at: float | None = None  # this attempt's dispatch clock
     first_dispatched_at: float | None = None
     consumed: set = field(default_factory=set)  # attempt_ids already acted on
@@ -574,17 +583,41 @@ class StatusPoller:
     re-attempted) object. Never writes (D8: the LIST/GETs are reads; every
     write stays worker-side).
 
-    The poller also owns Event dispatch and the migrated retry policy (issue
-    #327 amendment (b) — function errors never return to an Event caller, so
-    ``max_retries`` becomes status-driven): shards register with a zero-arg
-    ``dispatch`` closure, at most ``max_in_flight`` are dispatched-unresolved
-    at once (the concurrency preflight's clamp — load-bearing under the
-    fleet's 60 s ``MaximumEventAgeInSeconds``, which silently drops an Event
-    that cannot start in time), and a ``failed`` status re-dispatches until
-    the shard's total attempts reach ``max_retries``. ``attempt_id`` keeps the
-    accounting straight: each status object is acted on at most once, so a
-    duplicate execution's re-write (or a poll catching a stale pre-retry
-    object) never double-counts.
+    The poller also owns Event dispatch: shards register with a zero-arg
+    ``dispatch`` closure and at most ``max_in_flight`` are
+    dispatched-unresolved at once (the concurrency preflight's clamp —
+    load-bearing under the fleet's 60 s ``MaximumEventAgeInSeconds``, which
+    silently drops an Event that cannot start in time).
+
+    **Retry policy — three fault classes** (issue #327 amendment (b) as folded
+    from the PR #343 review; espg's to veto). Function errors never return to
+    an Event caller, so v1's single ``max_retries`` loop has to be split by
+    what actually failed:
+
+    (a) **Deterministic worker failure** — a ``failed`` STATUS object. By
+        construction the worker RAN TO COMPLETION and reported an error, which
+        is the case issue #119 already excludes from retry on the sync
+        transport (*"Every FunctionError on a synchronous invoke is
+        deterministic for a given shard ... so none are retried"*). It resolves
+        immediately; no re-fire, no second billing.
+    (b) **Queue drop** — no status object by the drop deadline
+        (``failed-unknown``). Genuinely worth one more shot, since the invoke
+        may simply have aged out of the async queue under backpressure. Bounded
+        at :data:`_MAX_DROP_REFIRES` = 1 re-fire, so the exposure is at most
+        **2 × function timeout** billed for a shard that may be unrecoverable
+        (a drop and an OOM/timeout death are indistinguishable from the
+        client). That bound is the point: issue #151 pinned
+        ``MaximumRetryAttempts: 0`` precisely so async fan-out is never
+        re-billed at 900 s per service retry, and an unbounded client-side
+        re-dispatch would reintroduce it.
+    (c) **Invoke-layer fault** — the ``client.invoke`` call itself raised
+        (throttle, read timeout, connection reset). This is v1's ``max_retries``
+        in its original meaning, and it retries up to that budget with
+        exponential backoff.
+
+    ``attempt_id`` keeps the accounting straight across all three: each status
+    object is acted on at most once, so a duplicate execution's re-write (or a
+    poll catching a stale pre-retry object) never double-counts.
 
     Resolution policy is the caller's: a terminal success/no-data sets the
     result dict (the exact shape the sync transport returns); a terminal
@@ -751,11 +784,10 @@ class StatusPoller:
         try:
             dispatch()
         except Exception as e:
-            # An invoke fault burns this attempt (throttles included): the
-            # retry budget re-fires it on a later tick, mirroring the sync
-            # transport's bounded transient retry.
+            # Fault class (c): the invoke CALL failed (throttle, read timeout).
+            # Burns this attempt and re-fires within max_retries.
             logger.warning(f"shard {entry.label}: Event invoke failed ({e})")
-            self._attempt_failed(
+            self._invoke_faulted(
                 entry,
                 self._result(entry, status_code=None, body={}, error=f"Event invoke failed: {e}"),
             )
@@ -795,7 +827,7 @@ class StatusPoller:
         if obj.get("status") in ("ok", "no_data"):
             entry.future.set_result(result)
         else:
-            self._attempt_failed(entry, result)
+            self._worker_failed(entry, result)
         return True
 
     def _result(self, entry: _ShardEntry, *, status_code, body, error, outcome=None) -> dict:
@@ -816,8 +848,45 @@ class StatusPoller:
             result["outcome"] = outcome
         return result
 
-    def _attempt_failed(self, entry: _ShardEntry, result: dict) -> None:
-        """Status-driven retry (issue #327 amendment (b)): re-dispatch or resolve."""
+    # -- the three retry classes (see the class docstring) --------------------
+
+    def _worker_failed(self, entry: _ShardEntry, result: dict) -> None:
+        """Class (a): a ``failed`` status object is TERMINAL — never re-fired.
+
+        The object exists, so the worker ran to completion and reported its own
+        error: deterministic for this shard, exactly the case issue #119
+        excludes from retry on the sync transport. Re-firing it would bill a
+        second full execution for a guaranteed second failure.
+        """
+        self._resolve_failure(entry, result)
+
+    def _drop_failed(self, entry: _ShardEntry, result: dict) -> None:
+        """Class (b): a status-less shard re-fires at most :data:`_MAX_DROP_REFIRES`.
+
+        The one class where a re-fire can actually succeed (an invoke aged out
+        of the async queue never ran), bounded at one so the worst case is two
+        billed executions rather than ``max_retries`` of them (issue #151).
+        ``max_retries <= 1`` opts out entirely, keeping the knob's "no retries"
+        meaning.
+        """
+        if (
+            entry.dispatch is not None
+            and entry.drop_refires < _MAX_DROP_REFIRES
+            and entry.attempts < self._max_retries
+        ):
+            logger.warning(
+                f"shard {entry.label}: no status object (attempt {entry.attempts}); "
+                f"re-firing once — a dropped invoke can still succeed, a dead "
+                f"worker will not (bounded at {_MAX_DROP_REFIRES} re-fire, issue #151)"
+            )
+            with self._lock:
+                entry.drop_refires += 1
+                entry.queued = True
+            return
+        self._resolve_failure(entry, result)
+
+    def _invoke_faulted(self, entry: _ShardEntry, result: dict) -> None:
+        """Class (c): the invoke call itself faulted — retry within ``max_retries``."""
         if entry.dispatch is not None and entry.attempts < self._max_retries:
             logger.warning(
                 f"shard {entry.label}: attempt {entry.attempts} failed "
@@ -827,6 +896,10 @@ class StatusPoller:
             with self._lock:
                 entry.queued = True
             return
+        self._resolve_failure(entry, result)
+
+    def _resolve_failure(self, entry: _ShardEntry, result: dict) -> None:
+        """Terminal failure: the caller's policy, defaulting to ``set_result``."""
         if self._on_failed is not None:
             self._on_failed(entry, result)
         else:
@@ -839,8 +912,7 @@ class StatusPoller:
         margin, so a shard reaching it either had its Event invoke silently
         dropped under backpressure (issue #327 amendment (a')) or died before
         its always-on status write — indistinguishable from here, hence the
-        dedicated outcome. Participates in the same re-dispatch budget as a
-        ``failed`` status.
+        dedicated outcome. Fault class (b): one bounded re-fire.
         """
         result = self._result(
             entry,
@@ -854,4 +926,4 @@ class StatusPoller:
             ),
             outcome="failed-unknown",
         )
-        self._attempt_failed(entry, result)
+        self._drop_failed(entry, result)

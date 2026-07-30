@@ -95,7 +95,9 @@ class EventStubLambdaClient:
     invokes (ping/setup/finalize/...) answer synchronously like the v1 stub.
     """
 
-    def __init__(self, status_store, *, fail=(), benign=(), drop=(), fail_times=None):
+    def __init__(
+        self, status_store, *, fail=(), benign=(), drop=(), fail_times=None, drop_times=None
+    ):
         self.status_store = status_store
         self.events: list[tuple[str, str, dict]] = []
         self._lock = threading.Lock()
@@ -103,6 +105,7 @@ class EventStubLambdaClient:
         self._benign = set(benign)
         self._drop = set(drop)  # invoke accepted, no status ever lands
         self._fail_times = dict(fail_times or {})  # key -> failures before success
+        self._drop_times = dict(drop_times or {})  # key -> silent drops before success
         self.status_writes = 0
 
     def invoke(self, **kwargs):
@@ -132,6 +135,12 @@ class EventStubLambdaClient:
         assert kwargs["InvocationType"] == "Event", "v2 cell invokes are fire-and-forget"
         key = event["shard_key"]
         if key in self._drop:
+            return {"StatusCode": 202}
+        if self._drop_times.get(key, 0) > 0:
+            # A queue drop: the invoke is accepted (202) and no status ever
+            # lands for this attempt — fault class (b).
+            with self._lock:
+                self._drop_times[key] -= 1
             return {"StatusCode": 202}
         if key in self._fail:
             response = _envelope({"error": "boom"}, status=500)
@@ -246,22 +255,27 @@ class TestEventDispatch:
         assert handle.results()[_WORDS[2]]["error"] == "No granules found"
         assert handle.status() == {"pending": 0, "ok": 3, "failed": 0}
 
-    def test_failed_status_redispatches_then_raises_shard_error(self, catalog, status_store):
+    def test_failed_status_raises_shard_error_without_redispatch(self, catalog, status_store):
+        # Fault class (a): the worker RAN and reported an error, so the status
+        # object is terminal — one execution billed, never max_retries of them
+        # (issue #119's sync-transport rule, folded from the PR #343 review).
         stub = EventStubLambdaClient(status_store, fail={_WORDS[1]})
-        handle = _run(catalog, client=stub, max_retries=2).dispatch(transport="event")
+        handle = _run(catalog, client=stub, max_retries=3).dispatch(transport="event")
         with pytest.raises(_shard_error(), match="boom") as excinfo:
             handle.futures[_WORDS[1]].result(timeout=10)
         err = excinfo.value
         assert err.shard_key == _WORDS[1]
         assert err.label == _LABELS[1]
-        assert err.payload["retries"] == 1  # second (last) attempt
+        assert err.payload["retries"] == 0  # the first and only attempt
         handle.results(return_exceptions=True)
-        # The migrated retry policy actually re-dispatched: two Event invokes.
         attempts = [e for _, _, e in stub.cell_events() if e["shard_key"] == _WORDS[1]]
-        assert len(attempts) == 2
+        assert len(attempts) == 1
 
-    def test_redispatch_recovers_a_transiently_failing_shard(self, catalog, status_store):
-        stub = EventStubLambdaClient(status_store, fail_times={_WORDS[0]: 1})
+    def test_dropped_invoke_refires_once_and_recovers(self, catalog, status_store, monkeypatch):
+        # Fault class (b): the first invoke is accepted but aged out of the
+        # queue (no status object), so the one bounded re-fire recovers it.
+        monkeypatch.setattr(ct, "drop_timeout_s", lambda timeout_s: 0.05)
+        stub = EventStubLambdaClient(status_store, drop_times={_WORDS[0]: 1})
         handle = _run(catalog, client=stub, max_retries=3).dispatch(transport="event")
         result = handle.futures[_WORDS[0]].result(timeout=10)
         assert result["body"]["total_obs"] == 7
@@ -318,22 +332,40 @@ class TestStatusPoller:
         poller.shutdown(wait=True)
 
     def test_attempt_id_dedupe_acts_once_per_execution(self):
-        # A duplicate poll of the SAME attempt's object must not double-count
-        # against the retry budget; only a NEW attempt_id is consumed.
+        # A duplicate poll of the SAME attempt's object is acted on once; only
+        # a NEW attempt_id is consumed. Driven straight through _consume (the
+        # loop skips a settled entry anyway, so the property lives here).
         store = MemoryStore()
-        fired: list[float] = []
         poller = self._poller(store, max_retries=3)
-        fut = poller.register(1, "1", dispatch=lambda: fired.append(time.time()))
+        poller.register(1, "1", dispatch=lambda: None)
+        entry = poller._entries[ct.shard_status_key(1)]
+        poller._store = store
         _put_status(store, 1, status="failed", attempt_id="a1", error="boom")
+        assert poller._consume(entry) is True
+        assert poller._consume(entry) is False  # same attempt_id: not re-acted
+        assert entry.consumed == {"a1"}
+
+    def test_drop_refire_consumes_a_late_status_object(self):
+        # The re-fire of a dropped invoke (class (b)) is the one place a
+        # queued entry can still see an object land; it resolves normally.
+        store = MemoryStore()
+        now = {"t": 0.0}
+        fired: list[float] = []
+        poller = ct.StatusPoller(
+            lambda: store,
+            drop_timeout_s=10.0,
+            max_retries=3,
+            clock=lambda: now["t"],
+        )
+        fut = poller.register(1, "1", dispatch=lambda: fired.append(now["t"]))
         poller.start()
+        deadline = time.time() + 5
+        while len(fired) < 1 and time.time() < deadline:
+            time.sleep(0.005)
+        now["t"] = 11.0  # the first attempt drops -> the single re-fire
         deadline = time.time() + 5
         while len(fired) < 2 and time.time() < deadline:
             time.sleep(0.005)
-        assert len(fired) == 2  # initial dispatch + ONE re-dispatch for a1
-        # Ticks keep seeing the stale a1 object: no further consumption.
-        time.sleep(0.1)
-        assert len(fired) == 2
-        # The retry's execution lands with a fresh id and resolves the future.
         _put_status(store, 1, status="ok", attempt_id="a2")
         assert fut.result(timeout=5)["retries"] == 1
         poller.shutdown(wait=True)
@@ -419,7 +451,8 @@ class TestDropDetection:
     """A shard with no status object after (function timeout + 60 s max event
     age + margin) resolves ``failed-unknown`` — the silent-drop outcome the
     fleet's ``MaximumEventAgeInSeconds: 60`` makes possible under
-    backpressure — instead of hanging; it spends the same re-dispatch budget."""
+    backpressure — instead of hanging. Fault class (b): exactly ONE bounded
+    re-fire, so the worst case is 2 billed executions (issue #151)."""
 
     def test_drop_resolves_failed_unknown_after_deadline(self):
         store = MemoryStore()
@@ -443,7 +476,38 @@ class TestDropDetection:
         assert result["body"] == {}
         poller.shutdown(wait=True)
 
-    def test_drop_participates_in_the_redispatch_budget(self):
+    def test_drop_refires_exactly_once_then_resolves(self):
+        # max_retries=5, but a status-less shard costs at most TWO executions:
+        # the bound that keeps the client from reintroducing the 3 x 900 s
+        # re-billing MaximumRetryAttempts: 0 exists to prevent (issue #151).
+        store = MemoryStore()
+        now = {"t": 0.0}
+        fired: list[float] = []
+        poller = ct.StatusPoller(
+            lambda: store,
+            drop_timeout_s=10.0,
+            max_retries=5,
+            clock=lambda: now["t"],
+        )
+        fut = poller.register(5, "5", dispatch=lambda: fired.append(now["t"]))
+        poller.start()
+        deadline = time.time() + 5
+        while len(fired) < 1 and time.time() < deadline:
+            time.sleep(0.005)
+        now["t"] = 11.0  # first attempt drops -> the single re-fire
+        deadline = time.time() + 5
+        while len(fired) < 2 and time.time() < deadline:
+            time.sleep(0.005)
+        assert len(fired) == 2 and not fut.done()
+        now["t"] = 22.0  # the re-fire drops too: terminal, no third execution
+        result = fut.result(timeout=5)
+        assert result["outcome"] == "failed-unknown"
+        assert result["retries"] == 1
+        time.sleep(0.1)
+        assert len(fired) == 2
+        poller.shutdown(wait=True)
+
+    def test_drop_refire_recovers_the_shard(self):
         store = MemoryStore()
         now = {"t": 0.0}
         fired: list[float] = []
@@ -458,12 +522,12 @@ class TestDropDetection:
         deadline = time.time() + 5
         while len(fired) < 1 and time.time() < deadline:
             time.sleep(0.005)
-        now["t"] = 11.0  # first attempt drops -> re-dispatch, not resolution
+        now["t"] = 11.0  # first attempt drops -> re-fire, not resolution
         deadline = time.time() + 5
         while len(fired) < 2 and time.time() < deadline:
             time.sleep(0.005)
         assert len(fired) == 2 and not fut.done()
-        # The retry's execution lands its status: the shard recovers.
+        # The re-fire's execution lands its status: the shard recovers.
         _put_status(store, 5)
         result = fut.result(timeout=5)
         assert result["retries"] == 1
@@ -473,18 +537,18 @@ class TestDropDetection:
     def test_client_event_run_counts_a_drop_failed(self, catalog, status_store, monkeypatch):
         # End-to-end: the invoke is accepted (202) but no status ever lands;
         # the shard's future raises ShardError with the DISTINCT outcome in
-        # the payload, status() buckets it failed, and the drop burned the
-        # whole re-dispatch budget.
+        # the payload, status() buckets it failed, and the drop cost exactly
+        # one re-fire even at max_retries=5.
         monkeypatch.setattr(ct, "drop_timeout_s", lambda timeout_s: 0.05)
         stub = EventStubLambdaClient(status_store, drop={_WORDS[0]})
-        handle = _run(catalog, client=stub, max_retries=2).dispatch(transport="event")
+        handle = _run(catalog, client=stub, max_retries=5).dispatch(transport="event")
         with pytest.raises(_shard_error(), match="failed-unknown") as excinfo:
             handle.futures[_WORDS[0]].result(timeout=10)
         assert excinfo.value.payload["outcome"] == "failed-unknown"
         handle.results(return_exceptions=True)
         assert handle.status() == {"pending": 0, "ok": 2, "failed": 1}
         attempts = [e for _, _, e in stub.cell_events() if e["shard_key"] == _WORDS[0]]
-        assert len(attempts) == 2  # the budget was spent on re-dispatches
+        assert len(attempts) == 2  # one bounded re-fire, not five
 
 
 # -- agg invocation="event" (issue #327 phase 6) -----------------------------------
