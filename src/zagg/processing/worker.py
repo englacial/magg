@@ -56,6 +56,14 @@ logger = logging.getLogger(__name__)
 _EXEMPLAR_LIMIT = 3
 _EXEMPLAR_CHARS = 300
 
+#: Distinct messages whose FIRST occurrence logs a full traceback. Deliberately
+#: larger than :data:`_EXEMPLAR_LIMIT` (fold review): coupling the two meant the
+#: 4th distinct failure got neither an exemplar nor a traceback, so on a shard
+#: where three flavors of transient S3 error precede the real cause, the real
+#: cause was invisible. The bound still caps the issue #175 WorkerErrorCount
+#: metric filter (which matches "Traceback") at N per shard.
+_TRACEBACK_LIMIT = 5
+
 
 def _granule_workers(data_source: dict) -> int:
     """Granules in flight per shard (issue #180).
@@ -327,29 +335,34 @@ def process_shard(
     # strata run a blind "No data after filtering (N group reads raised)" —
     # nothing in the log or the result carried even one message. Record the
     # first _EXEMPLAR_LIMIT distinct messages for the result payload, and log
-    # the FULL traceback (WARNING) once per distinct message — repeats keep
-    # the existing one-line warning, so the issue #175 WorkerErrorCount metric
-    # filter (which matches "Traceback") fires at most _EXEMPLAR_LIMIT times
-    # per shard instead of once per failed group read. Lock-guarded: group
-    # errors are raised inside granule-pool threads (issue #180).
+    # the FULL traceback (WARNING) on the first occurrence of each of the first
+    # _TRACEBACK_LIMIT distinct messages — repeats keep the existing one-line
+    # warning. The two budgets are SEPARATE (fold review): the payload stays
+    # small on the wire while a distinct message beyond the payload cap still
+    # gets its traceback in the log, so a real cause behind three flavors of
+    # transient noise is not silently dropped. Lock-guarded: group errors are
+    # raised inside granule-pool threads (issue #180).
     _exemplar_lock = threading.Lock()
     read_error_exemplars: list = []
+    traced_messages: set = set()
 
     def _record_read_error(what: str, exc: Exception) -> None:
         """Warn + exemplar one read failure. ``what`` is the log phrase (and so
         the scope): ``reading track <group>`` or ``processing file <url>``."""
         msg = f"{type(exc).__name__}: {exc}"[:_EXEMPLAR_CHARS]
         with _exemplar_lock:
-            fresh = msg not in read_error_exemplars and len(read_error_exemplars) < _EXEMPLAR_LIMIT
-            if fresh:
+            if msg not in read_error_exemplars and len(read_error_exemplars) < _EXEMPLAR_LIMIT:
                 read_error_exemplars.append(msg)
+            trace = msg not in traced_messages and len(traced_messages) < _TRACEBACK_LIMIT
+            if trace:
+                traced_messages.add(msg)
         # A raised read error is always a real failure: a legitimately-empty
         # group returns ``None`` (no exception), so WARNING does not get noisy
         # on shards where many granules contribute 0 photons (issue #116).
         # Logging at DEBUG hid the dem_h broadcast failure behind the
         # misleading "No data after filtering"; swallowing the traceback hid
         # the strata AttributeError entirely (issue #341).
-        logger.warning(f"  Error {what}: {exc}", exc_info=fresh)
+        logger.warning(f"  Error {what}: {exc}", exc_info=trace)
 
     # Streaming buffered aggregation (issue #148 phase 4): when
     # ``aggregation.streaming`` is set, reads accumulate for ``buffer_granules``
