@@ -22,6 +22,7 @@ nav:
       - Processing: "api/processing.md"
       - Catalog: "api/catalog.md"
       - Auth: "api/auth.md"
+  - "Specification": "specification.md"
   - "Design":
       - "Architecture": "design/architecture.md"
       - "Schema": "design/schema.md"
