@@ -540,6 +540,51 @@ def test_invoke_role_enumerates_both_families():
             )
 
 
+def test_benchmark_targets_resolve_only_provisioned_test_variants():
+    # Fold review: enumeration opened a reachable seam. ``_validate_worker``
+    # accepts ``{"memory": 4096}`` with NO ``extra_disk``, which resolves
+    # ``${TestFunctionName}-4096`` -- a name the test stack does not provision and
+    # the invoke role does not enumerate, so the sequence was probe ->
+    # AccessDenied -> warn-and-continue -> invoke -> AccessDenied again, as an
+    # opaque dispatch failure. The runtime half is now a loud pre-dispatch refusal
+    # (check_variant_current hard-fails when the base probes but the variant does
+    # not); this is the static half, so the "one targets.json edit away" case goes
+    # red in CI instead of costing an invoke to diagnose.
+    import json
+    import sys
+
+    sys.path.insert(0, str(REPO / ".github" / "scripts"))
+    import run_benchmark
+
+    manifest = json.loads((REPO / "tests" / "data" / "benchmark" / "targets.json").read_text())
+    test_suffixes, _ = _template_variant_suffixes()
+    arns = _statement_arns("BenchmarkInvokeRole", "InvokeBenchmarkFunctions")
+    checked = 0
+    for section in ("targets", "provisional_targets"):
+        for name, target in manifest.get(section, {}).items():
+            worker = target.get("worker") if isinstance(target, dict) else None
+            if not worker:
+                continue
+            checked += 1
+            # Resolve off an EMPTY base so the result is the bare suffix, using
+            # the harness's own rule rather than a copy of it.
+            suffix = run_benchmark.resolve_variant("", worker)
+            assert suffix in test_suffixes, (
+                f"benchmark target '{name}' has worker {worker!r}, which resolves "
+                f"'${{TestFunctionName}}{suffix}' -- a variant template.yaml does not "
+                f"provision for the test stack (it stamps {sorted(test_suffixes)}). The "
+                f"per-merge run would refuse at the pre-dispatch guard (issue #341); "
+                f"either set extra_disk, or provision + enumerate the variant."
+            )
+            want = "function:${TestFunctionName}" + suffix
+            assert any(a.endswith(want) for a in arns), (
+                f"benchmark target '{name}' resolves '{want}' but "
+                f"BenchmarkInvokeRole.InvokeBenchmarkFunctions in {CICD} does not "
+                f"enumerate it -- the probe and the invoke would both AccessDeny"
+            )
+    assert checked, "no benchmark target declares a worker: block -- guard is vacuous"
+
+
 def test_role_statements_enumerate_exact_arns():
     # The issue #341 ruling: enumerated exact ARNs, no wildcard, in all three
     # function-scoped statements (ConcurrencyProbe's "*" stays -- its actions
