@@ -443,7 +443,7 @@ regionally heterogeneous resolution).
 ```json
 "zagg_overview": {
   "spec": "zagg-overview/1",
-  "node": "-311",
+  "node": "-3111",
   "order": 3,
   "cell_order": 11,
   "source_shard_order": 5,
@@ -458,8 +458,11 @@ regionally heterogeneous resolution).
 ```
 
   `spec` follows the conformance rule (strict-check, fail loudly on an
-  unknown revision). `node` is the ancestor's morton decimal string; `order`
-  its order; `cell_order` the overview's own cell order
+  unknown revision). `node` is the ancestor's morton decimal string and
+  `order` its order — mortie's decimal grammar puts one digit per order after
+  the base-cell digit, so `order` is always `len(digits) - 1` for the node
+  string (`"-3111"` is order 3; the leading `-` marks a southern base cell and
+  is not a digit); `cell_order` the overview's own cell order
   (`source_cell_order - (source_shard_order - order)` — constant tree depth,
   §4.4); `window` the §4.2 window key (`"all"` for the all-time fold);
   `fields` the per-field composability class + fold method actually applied;
