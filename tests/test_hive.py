@@ -194,8 +194,13 @@ class TestManifest:
         assert m["shard_order"] == 6
         # Explicit split schedule: one digit per level down to the shard order.
         assert m["split_schedule"] == [1] * 6
-        # Declared-only in round one (populated by the pyramid sweep, D11).
-        assert m["pyramid"] == {"orders": [], "aggregation": {}}
+        # Template-time overview declaration (issue #201): default every-2
+        # schedule below the shard order, per-field D24 classes; the sweep
+        # adds `materialized` actuals later (D11).
+        overview = m["pyramid"]["overview"]
+        assert overview["orders"] == [4, 2, 0]
+        assert overview["fields"]["count"]["class"] == "exact"
+        assert overview["fields"]["h_mean"] == {"class": "none"}
         assert m["generated_at"]
 
     def test_ensure_write_read_round_trip(self, cfg, tmp_path):

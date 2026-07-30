@@ -318,6 +318,132 @@ class TestFoldDigests:
         assert forward == backward  # the issue #279 order-independent law
 
 
+class TestPyramidBlock:
+    """The manifest declaration (Phase C): template time + config grammar."""
+
+    def _cfg(self, **output):
+        from zagg.config import default_config
+
+        cfg = default_config("atl06")
+        cfg.output.update(output)
+        return cfg
+
+    def test_default_declaration_from_atl06(self, caplog):
+        from zagg.sweep_overview import build_pyramid_block
+
+        block = build_pyramid_block(self._cfg(), shard_order=6)
+        overview = block["overview"]
+        assert block["spec"] == PYRAMID_SPEC
+        assert overview["spacing"] == 2 and overview["orders"] == [4, 2, 0]
+        assert overview["all_time"] is False
+        assert overview["fields"]["count"] == {
+            "class": "exact",
+            "method": "sum",
+            "dtype": "int32",
+            "fill_value": 0,
+        }
+        assert overview["fields"]["h_min"] == {
+            "class": "exact",
+            "method": "min",
+            "dtype": "float32",
+            "fill_value": "NaN",  # JSON-safe token, not float nan
+        }
+        assert overview["fields"]["h_mean"] == {"class": "none"}
+        # The D24 loud template-time warning names the excluded fields.
+        assert "non-composable" in caplog.text and "h_mean" in caplog.text
+        json.dumps(block)  # JSON-safe by construction
+
+    def test_tdigest_field_declaration_carries_delta(self):
+        from zagg.config import default_config
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = default_config("atl03_tdigest_healpix")
+        block = build_pyramid_block(cfg, shard_order=9)
+        entry = block["overview"]["fields"]["h_tdigest"]
+        assert entry["class"] == "approximate" and entry["method"] == "tdigest_kway"
+        assert entry["inner_shape"] == [2] and entry["delta"] == 256
+
+    def test_explicit_orders_and_all_time(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"orders": [5, 1], "all_time": True})
+        overview = build_pyramid_block(cfg, shard_order=6)["overview"]
+        assert overview["orders"] == [5, 1] and overview["all_time"] is True
+
+    def test_spacing_knob(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"spacing": 3})
+        assert build_pyramid_block(cfg, shard_order=9)["overview"]["orders"] == [6, 3, 0]
+
+    def test_disabled_declares_off(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        block = build_pyramid_block(self._cfg(pyramid=False), shard_order=6)
+        assert block["overview"] == {"orders": []}
+
+    def test_build_manifest_carries_the_block(self):
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.hive import build_manifest
+
+        grid = HealpixGrid(6, 8, config=self._cfg())
+        manifest = build_manifest(grid, dataset={"short_name": "ATL06", "version": "007"})
+        assert manifest["pyramid"]["overview"]["orders"] == [4, 2, 0]
+        json.dumps(manifest)
+
+    def test_validate_rejects_bad_grammar(self):
+        from zagg.config import validate_config
+
+        with pytest.raises(ValueError, match="spacing must be an int >= 1"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"spacing": 0}))
+        with pytest.raises(ValueError, match="orders must be a list of ancestor orders"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"orders": [6]}))
+        with pytest.raises(ValueError, match="all_time must be a boolean"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"all_time": "yes"}))
+        with pytest.raises(ValueError, match="unknown keys"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"levels": [1]}))
+        with pytest.raises(ValueError, match="must be a mapping or false"):
+            validate_config(self._cfg(store_layout="hive", pyramid=True))
+
+    def test_validate_rejects_pyramid_on_flat(self):
+        from zagg.config import validate_config
+
+        with pytest.raises(ValueError, match="output.pyramid requires"):
+            validate_config(
+                self._cfg(
+                    store_layout="flat", coverage_moc=False, sweep=False, pyramid={"spacing": 2}
+                )
+            )
+
+    def test_validate_summarize_grammar(self):
+        from zagg.config import validate_config
+
+        ok = self._cfg(store_layout="hive", pyramid={"summarize": {"h_mean": {"as": "h_mean_d"}}})
+        validate_config(ok)
+        with pytest.raises(ValueError, match="unknown field"):
+            validate_config(
+                self._cfg(store_layout="hive", pyramid={"summarize": {"nope": {"as": "x"}}})
+            )
+        with pytest.raises(ValueError, match="collides with a declared field"):
+            validate_config(
+                self._cfg(store_layout="hive", pyramid={"summarize": {"h_mean": {"as": "count"}}})
+            )
+        with pytest.raises(ValueError, match="requires 'as'"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"summarize": {"h_mean": {}}}))
+
+    def test_summarize_recorded_in_block(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"summarize": {"h_mean": {"as": "h_mean_digest"}}})
+        overview = build_pyramid_block(cfg, shard_order=6)["overview"]
+        assert overview["summarize"] == {"h_mean": {"as": "h_mean_digest"}}
+
+    def test_default_pyramid_validates_clean(self):
+        from zagg.config import validate_config
+
+        validate_config(self._cfg(store_layout="hive"))  # absent knob is legal
+
+
 class TestOverviewWriter:
     def test_folds_leaves_at_every_declared_order(self, tmp_path):
         from zagg.stats.tdigest import quantile_from_tdigest
@@ -501,6 +627,44 @@ class TestOverviewWriter:
         assert "skipping unreadable leaf" in caplog.text
         g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
         assert g["count"][0] == 1
+
+    def test_summarize_declaration_warns_and_skips(self, tmp_path, caplog):
+        _write_manifest(tmp_path, orders=(1,))
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        manifest["pyramid"]["overview"]["summarize"] = {"h_mean": {"as": "h_mean_digest"}}
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["written"] == 1
+        assert "derived summaries" in caplog.text and "issue #265" in caplog.text
+        g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        assert "h_mean_digest" not in g
+
+    def test_sweep_populates_manifest_materialized(self, tmp_path):
+        from zagg.hive import read_manifest
+
+        _write_manifest(tmp_path, orders=(1, 0))
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["manifest_updated"] is True
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block["materialized"]["orders"] == [0, 1]
+        assert block["materialized"]["generated_at"]
+        # The declaration itself is untouched (the sweep populates, never
+        # rewrites — D11/D22 write-once discipline).
+        assert block["orders"] == [1, 0] and block["fields"] == FIELDS_DECL
+
+    def test_manifest_update_keeps_frozen_keys_resumable(self, tmp_path):
+        # The pyramid block is excluded from the frozen resume keys, so the
+        # sweep's materialized update can never brick an append precheck.
+        from zagg.hive import _frozen_matches, read_manifest
+
+        before = _write_manifest(tmp_path, orders=(1,))
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        after = read_manifest(str(tmp_path))
+        assert after["pyramid"] != before["pyramid"]
+        assert _frozen_matches(after, before)
 
     def test_coarser_than_shard_order_accumulates(self, tmp_path):
         # Overview cells COARSER than the shard order (deep schedule, shallow

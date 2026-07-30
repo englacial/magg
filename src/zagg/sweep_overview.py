@@ -173,6 +173,116 @@ def fold_digests(cell_digests: list, *, delta: int, dtype="float32") -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# The manifest pyramid block: template-time declaration (D22, per-family
+# schedules), sweep-populated actuals.
+# ---------------------------------------------------------------------------
+
+
+def build_pyramid_block(config, shard_order: int) -> dict:
+    """The manifest ``pyramid`` block: the template-time declaration (D22).
+
+    Declares the overview family's order schedule (``output.pyramid`` knob;
+    default every :data:`DEFAULT_SPACING` orders below the shard order —
+    espg-ratified) and each field's composability class + fold method (D24).
+    ``none`` fields are declared with their class ONLY — the recorded absence
+    that gives readers zero-open filtering (option A, the ruled default) —
+    and warned about loudly at template time, per the D24 ruling. The sweep
+    later adds ``materialized`` actuals; it never rewrites the declaration.
+    """
+    from zagg.config import get_agg_fields, get_pyramid
+    from zagg.semantics import EXACT_MERGE_LAWS, _fold_function_name, composability_classes
+
+    knob = get_pyramid(config)
+    if knob is None:  # output.pyramid: false — declared off
+        return {"spec": PYRAMID_SPEC, "overview": {"orders": []}}
+    spacing = int(knob.get("spacing") or DEFAULT_SPACING)
+    if knob.get("orders") is not None:
+        orders = sorted({int(k) for k in knob["orders"]}, reverse=True)
+    else:
+        orders = list(range(int(shard_order) - spacing, -1, -spacing))
+    agg = get_agg_fields(config)
+    fields: dict = {}
+    excluded = []
+    for name, cls in composability_classes(config).items():
+        meta = agg[name]
+        if cls == "exact":
+            fields[name] = {
+                "class": "exact",
+                "method": EXACT_MERGE_LAWS[_fold_function_name(meta.get("function"))],
+                "dtype": meta.get("dtype", "float32"),
+                "fill_value": _json_fill(meta.get("fill_value", "NaN")),
+            }
+        elif cls == "approximate":
+            inner = meta.get("inner_shape") or (2,)
+            fields[name] = {
+                "class": "approximate",
+                "method": TDIGEST_LAW,
+                "dtype": meta.get("dtype", "float32"),
+                "inner_shape": [int(inner)] if isinstance(inner, int) else [int(x) for x in inner],
+                "delta": int((meta.get("params") or {}).get("delta", 512)),
+            }
+        else:
+            fields[name] = {"class": "none"}
+            excluded.append(name)
+    if excluded and orders:
+        logger.warning(
+            f"pyramid: fields {excluded} are non-composable (D24 class 'none') and will "
+            f"exist ONLY at native resolution — excluded from every overview order (the "
+            f"per-field-exclusion default; declare a derived summary to opt in, issue #201)"
+        )
+    overview: dict = {
+        "spacing": spacing,
+        "orders": orders,
+        "all_time": bool(knob.get("all_time", False)),
+        "fields": fields,
+    }
+    if knob.get("summarize"):
+        overview["summarize"] = {str(k): dict(v) for k, v in knob["summarize"].items()}
+    return {"spec": PYRAMID_SPEC, "overview": overview}
+
+
+def _json_fill(fill_value):
+    """A JSON-safe fill token (zarr v3 uses the string ``"NaN"``)."""
+    if isinstance(fill_value, float) and np.isnan(fill_value):
+        return "NaN"
+    return fill_value
+
+
+def _update_manifest_pyramid(store_root, orders, store_kwargs) -> bool:
+    """Record materialized overview orders in the manifest pyramid block.
+
+    The one manifest key the sweep may touch (D11: the block is populated/
+    updated by the §7 sweep; it is excluded from the frozen resume keys, so
+    this RMW can never brick appends). Fail-open — the declaration readers
+    key on is untouched; ``materialized`` is a convenience actual.
+    """
+    import obstore
+
+    from zagg.hive import MANIFEST_NAME, _utcnow, read_manifest
+    from zagg.store import open_object_store
+
+    try:
+        fresh = read_manifest(store_root, **store_kwargs)
+        if fresh is None:
+            return False
+        block = fresh.setdefault("pyramid", {}).setdefault("overview", {})
+        known = set((block.get("materialized") or {}).get("orders") or [])
+        block["materialized"] = {
+            "orders": sorted(known | {int(k) for k in orders}),
+            "generated_at": _utcnow(),
+        }
+        obstore.put(
+            open_object_store(store_root, **store_kwargs),
+            MANIFEST_NAME,
+            json.dumps(fresh, indent=1).encode(),
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"sweep[overview]: manifest pyramid update failed (fail-open): {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Phase B: the overview writer — the family's whole-tree sweep.
 # ---------------------------------------------------------------------------
 
@@ -236,6 +346,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
         orders = [k for k in orders if k not in bad]
     candidates = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
     store = open_object_store(store_root, **store_kwargs)
+    materialized: set[int] = set()
     for k in orders:
         nodes = sorted({_node_at(d, k) for d in by_shard})
         for node in nodes:
@@ -264,6 +375,8 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
                 )
                 if entry is not None:
                     entries[key] = entry
+            if entries:
+                materialized.add(k)
             fresh = {
                 "spec": _sweep().SWEEP_SPEC,
                 "family": "overview",
@@ -275,8 +388,14 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
                 import obstore
 
                 obstore.put(
-                    store, f"{_node_rel(node)}/{ENVELOPE_NAME}", json.dumps(fresh, indent=1).encode()
+                    store,
+                    f"{_node_rel(node)}/{ENVELOPE_NAME}",
+                    json.dumps(fresh, indent=1).encode(),
                 )
+    if counts["written"]:
+        counts["manifest_updated"] = _update_manifest_pyramid(
+            store_root, sorted(materialized), store_kwargs
+        )
     return counts
 
 
@@ -483,7 +602,9 @@ def _fold_node(
     for name, meta in fields.items():
         if meta["class"] == "exact":
             dtype = np.dtype(meta.get("dtype") or "float32")
-            slabs[name] = np.full(n_cells, _fill_scalar(meta.get("fill_value", "NaN"), dtype), dtype)
+            slabs[name] = np.full(
+                n_cells, _fill_scalar(meta.get("fill_value", "NaN"), dtype), dtype
+            )
         else:
             digests[name] = [[] for _ in range(n_cells)]
     if target_order >= shard_order:

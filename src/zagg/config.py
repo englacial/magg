@@ -856,6 +856,10 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
             "output.sweep requires output.store_layout: hive (the rollup sweep "
             "folds hive-tree leaf artifacts; flat stores have no digit tree)"
         )
+    # Overview pyramid declaration (issue #201): explicit blocks are grammar-
+    # checked here; the D24 none-field warning fires at manifest build time
+    # (template time for the store), not per config validation.
+    _validate_pyramid(config)
 
 
 def _validate_windowing(config: PipelineConfig) -> None:
@@ -2298,6 +2302,88 @@ def get_sweep(config: PipelineConfig) -> bool:
     if flag is None:
         return get_store_layout(config) == "hive"
     return bool(flag)
+
+
+def get_pyramid(config: PipelineConfig) -> dict | None:
+    """The overview pyramid declaration knob, or ``None`` when disabled (#201).
+
+    ``output.pyramid`` shapes the manifest's template-time pyramid block
+    (``zagg.sweep_overview.build_pyramid_block``): absent/null returns ``{}``
+    — the defaults apply (an every-2-orders overview schedule below the shard
+    order, the espg-ratified display default; no all-time fold) — and
+    ``false`` returns ``None``, declaring the overview family OFF for the
+    store. An explicit mapping may carry ``spacing`` (int >= 1), ``orders``
+    (explicit ancestor orders, winning over ``spacing``), ``all_time``
+    (bool: also maintain the ``all.zarr`` cross-window fold on windowed
+    stores), and ``summarize`` (the D24 opt-in derived-summary declarations,
+    ``{source_field: {"as": name, ...}}`` — recorded in the pyramid block,
+    never the semantic core).
+    """
+    raw = config.output.get("pyramid")
+    if raw is False:
+        return None
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"output.pyramid must be a mapping or false (got {raw!r})")
+    return dict(raw)
+
+
+def _validate_pyramid(config: PipelineConfig) -> None:
+    """Validate the ``output.pyramid`` knob's grammar (issue #201).
+
+    Only an EXPLICIT block is checked (absent/false are always legal); an
+    explicit block requires the hive store layout, like ``sweep`` — the
+    pyramid materializes through the hive manifest.
+    """
+    raw = config.output.get("pyramid")
+    if raw is None or raw is False:
+        return
+    knob = get_pyramid(config)  # raises on a non-mapping
+    if get_store_layout(config) != "hive":
+        raise ValueError(
+            "output.pyramid requires output.store_layout: hive (overviews live at "
+            "hive-tree ancestor nodes; flat stores have no digit tree)"
+        )
+    unknown = set(knob) - {"spacing", "orders", "all_time", "summarize"}
+    if unknown:
+        raise ValueError(f"output.pyramid has unknown keys {sorted(unknown)}")
+    spacing = knob.get("spacing")
+    if spacing is not None and (not isinstance(spacing, int) or spacing < 1):
+        raise ValueError(f"output.pyramid.spacing must be an int >= 1 (got {spacing!r})")
+    parent_order = int((config.output.get("grid") or {}).get("parent_order", 0))
+    orders = knob.get("orders")
+    if orders is not None:
+        ok = isinstance(orders, list) and all(isinstance(k, int) for k in orders)
+        if not ok or any(not (0 <= k < parent_order) for k in orders):
+            raise ValueError(
+                f"output.pyramid.orders must be a list of ancestor orders in "
+                f"[0, parent_order) = [0, {parent_order}) (got {orders!r})"
+            )
+    all_time = knob.get("all_time")
+    if all_time is not None and not isinstance(all_time, bool):
+        raise ValueError(f"output.pyramid.all_time must be a boolean (got {all_time!r})")
+    summarize = knob.get("summarize")
+    if summarize is None:
+        return
+    if not isinstance(summarize, dict):
+        raise ValueError(f"output.pyramid.summarize must be a mapping (got {summarize!r})")
+    fields = get_agg_fields(config)
+    for source, decl in summarize.items():
+        if source not in fields:
+            raise ValueError(
+                f"output.pyramid.summarize names unknown field {source!r} "
+                f"(declared: {sorted(fields)})"
+            )
+        target = (decl or {}).get("as")
+        if not isinstance(target, str) or not target:
+            raise ValueError(f"output.pyramid.summarize.{source} requires 'as': <new field name>")
+        if target in fields:
+            raise ValueError(
+                f"output.pyramid.summarize.{source}.as = {target!r} collides with a "
+                f"declared field: derived summaries must use a DIFFERENT name so overview "
+                f"schema never silently differs from source (D24)"
+            )
 
 
 def get_windowing(config: PipelineConfig) -> dict | None:
