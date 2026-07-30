@@ -5958,11 +5958,12 @@ class _PerGroupRaisingH5:
 
 
 class TestReadErrorExemplars:
-    """Issue #341: the first N distinct group-read exception messages ride the
-    result payload (``read_error_exemplars``) and the no-data error text, and
-    the FIRST occurrence of each distinct message logs its full traceback at
-    WARNING (repeats keep the one-line warning). Bounded: N=3 distinct, ~300
-    chars each, no tracebacks on the wire."""
+    """Issue #341: the first ``_EXEMPLAR_LIMIT`` distinct group-read exception
+    messages ride the result payload (``read_error_exemplars``) and the no-data
+    error text (bounded: 3 distinct, ~300 chars each, no tracebacks on the wire).
+    The traceback budget is SEPARATE and larger (``_TRACEBACK_LIMIT``): the first
+    occurrence of each of the first 5 distinct messages logs its full traceback
+    at WARNING, repeats keep the one-line warning."""
 
     def _patch_h5(self, monkeypatch, factory):
         monkeypatch.setattr("zagg.processing.h5coro.H5Coro", factory)
@@ -6041,6 +6042,37 @@ class TestReadErrorExemplars:
         assert len(records) == 2
         assert records[0].exc_info  # first distinct: full traceback
         assert not records[1].exc_info  # repeat: one-liner, no traceback
+
+    def test_traceback_budget_is_decoupled_from_the_exemplar_budget(self, monkeypatch, caplog):
+        # Fold review: ``fresh`` gated BOTH the exemplar list and exc_info, so
+        # the 4th distinct message got neither a message nor a traceback. On a
+        # shard where the first three failures are transient noise and the fourth
+        # is the real cause, the real cause was invisible. The payload cap stays
+        # at 3; the traceback cap is _TRACEBACK_LIMIT (5).
+        import logging as _logging
+
+        from zagg.processing.worker import _EXEMPLAR_LIMIT, _TRACEBACK_LIMIT
+
+        assert _TRACEBACK_LIMIT > _EXEMPLAR_LIMIT
+        groups = ["gt1l", "gt1r", "gt2l", "gt2r", "gt3l", "gt3r"]  # 6 distinct messages
+        self._patch_h5(monkeypatch, lambda *a, **k: _PerGroupRaisingH5())
+        cfg = self._multi_group_cfg(groups)
+        with caplog.at_level(_logging.WARNING, logger="zagg.processing.worker"):
+            _df, meta = process_shard(_ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=cfg)
+        # Payload still bounded at 3 distinct messages...
+        assert len(meta["read_error_exemplars"]) == _EXEMPLAR_LIMIT
+        # ...but 5 distinct messages carried a traceback, including the 4th and
+        # 5th, which under the coupled budget had none.
+        traced = [r.getMessage() for r in caplog.records if "Error reading track" in r.getMessage()]
+        with_tb = [
+            r.getMessage()
+            for r in caplog.records
+            if "Error reading track" in r.getMessage() and r.exc_info
+        ]
+        assert len(traced) == len(groups)
+        assert len(with_tb) == _TRACEBACK_LIMIT
+        assert any("gt2r" in m for m in with_tb)  # the 4th distinct message
+        assert not any("gt3r" in m for m in with_tb)  # the 6th is past the cap
 
     def test_success_path_payload_unchanged(self, monkeypatch):
         self._patch_h5(monkeypatch, lambda *a, **k: _CloseRecordingH5(_canned_arrays(), []))
