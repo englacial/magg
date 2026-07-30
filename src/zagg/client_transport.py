@@ -700,6 +700,17 @@ class StatusPoller:
         ``dispatched_at`` seeds the drop deadline for observe-only entries
         (attach: the manifest's dispatch time); live entries get stamped at
         their own Event invoke.
+
+        A registration that lands AFTER :meth:`shutdown` resolves immediately
+        as a failure. :meth:`_run` is deliberately open-ended on the other side
+        (registration may trail :meth:`start` — agg's pool registers shards as
+        its threads reach them), so without this guard the loop is already gone
+        and nothing would ever resolve the Future: ``runner``'s
+        ``fut.result()`` has no timeout, so a pool thread would block forever
+        and ``executor.shutdown()`` would never return. Today that ordering is
+        safe only because ``_run_lambda``'s ``finally`` drains the executor
+        before shutting the poller down — load-bearing and undocumented
+        (review finding, PR #343).
         """
         entry = _ShardEntry(
             shard_key=int(shard_key),
@@ -715,7 +726,24 @@ class StatusPoller:
             entry.dispatched_at = dispatched_at if dispatched_at is not None else self._clock()
             entry.first_dispatched_at = entry.dispatched_at
         with self._lock:
-            self._entries[entry.key] = entry
+            stopped = self._stop.is_set()
+            if not stopped:
+                self._entries[entry.key] = entry
+        if stopped:
+            entry.queued = False
+            self._resolve_failure(
+                entry,
+                self._result(
+                    entry,
+                    status_code=None,
+                    body={},
+                    error=(
+                        f"shard {entry.label} registered after the status poller shut "
+                        f"down: no loop left to resolve it (issue #327)"
+                    ),
+                    outcome="not-dispatched",
+                ),
+            )
         return entry.future
 
     def start(self) -> "StatusPoller":
@@ -724,8 +752,14 @@ class StatusPoller:
         return self
 
     def shutdown(self, wait: bool = False) -> None:
-        """Stop the poller thread (pool-shaped so the finisher can close it)."""
-        self._stop.set()
+        """Stop the poller thread (pool-shaped so the finisher can close it).
+
+        The flag is set under the entry lock so it cannot interleave with a
+        :meth:`register` that is mid-insert: a registration either lands while
+        the loop is live, or is refused and resolved (see ``register``).
+        """
+        with self._lock:
+            self._stop.set()
         if wait and self._thread is not None:
             self._thread.join()
 

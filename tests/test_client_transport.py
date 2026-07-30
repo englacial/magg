@@ -972,3 +972,38 @@ def test_register_returns_unresolved_future():
     fut = poller.register(1, "1", dispatch=lambda: None)
     assert isinstance(fut, Future)
     assert not fut.done()
+
+
+def test_register_after_shutdown_resolves_instead_of_hanging():
+    # An unbounded block is the worst failure mode for a blocking API: agg's
+    # `fut.result()` has no timeout, so a Future nothing can resolve would hang
+    # a pool thread — and its executor.shutdown() — forever (review, PR #343).
+    store = MemoryStore()
+    poller = ct.StatusPoller(lambda: store, drop_timeout_s=10.0)
+    poller.start()
+    poller.shutdown(wait=True)
+    fut = poller.register(1, "1", dispatch=lambda: None)
+    result = fut.result(timeout=1)
+    assert result["outcome"] == "not-dispatched"
+    assert "after the status poller shut down" in result["error"]
+    # The refused entry is not tracked, and a late status object cannot revive it.
+    assert poller._entries == {}
+
+
+def test_register_after_shutdown_honors_the_failure_policy():
+    # The client's policy (ShardError) must apply to the refusal too, so a
+    # post-shutdown registration surfaces as a failed shard, not a silent ok.
+    failures: list = []
+    poller = ct.StatusPoller(
+        lambda: MemoryStore(),
+        drop_timeout_s=10.0,
+        on_failed=lambda e, r: (
+            failures.append(r),
+            e.future.set_exception(RuntimeError(r["error"])),
+        ),
+    )
+    poller.shutdown()
+    fut = poller.register(1, "1", dispatch=lambda: None)
+    with pytest.raises(RuntimeError, match="after the status poller shut down"):
+        fut.result(timeout=1)
+    assert len(failures) == 1
