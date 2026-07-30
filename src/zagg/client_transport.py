@@ -321,6 +321,221 @@ def tail_recorded(prefix: str, store_kwargs: dict[str, Any]) -> bool:
         return False
 
 
+def dispatch_event_shards(
+    run,
+    client,
+    cells,
+    *,
+    run_id,
+    workers,
+    config_dict,
+    s3_creds,
+    output_creds_event,
+    aoi_by_shard,
+    invoked_by,
+    on_failed,
+):
+    """The v2 Event fan-out for :meth:`zagg.client.Run.dispatch` (issue #327).
+
+    Split out of ``client.py`` for the §4 module ceiling (the split the PR
+    plan pre-authorized); ``run`` is the :class:`~zagg.client.Run` instance.
+    Builds each shard's event through the SAME construction the sync/agg
+    paths use (``runner._build_cell_event`` — payloads byte-identical modulo
+    InvocationType, asserted by the parity tests), registers it with a
+    :class:`StatusPoller` that paces dispatch to the ``workers`` window, and
+    returns ``(futures, poller)`` — the poller is the finisher's ``closer``.
+    The payload-cap ValueError raises BEFORE anything fires, so an
+    undispatchable run fails whole rather than mid-fan-out. D8 audit: this
+    path's only store traffic is the poller's LIST/GETs (reads).
+    """
+
+    from zagg import runner
+
+    prefix = run_status_prefix(run.store, run_id)
+    store_kwargs = runner._output_store_kwargs(output_creds_event, run.region)
+    # The drop deadline keys off the live function Timeout when readable; the
+    # helper falls back to the template default (an injected stub client need
+    # not answer get_function_configuration).
+    timeout_s = runner._get_function_timeout_s(client, run.function_name)
+    poller = StatusPoller(
+        lambda: open_status_store(prefix, store_kwargs),
+        drop_timeout_s=drop_timeout_s(timeout_s),
+        max_retries=run.max_retries,
+        max_in_flight=workers,
+        on_failed=on_failed,
+    )
+    futures: dict[int, Future] = {}
+    for key, records in cells:
+        key = int(key)
+        label = runner._safe_label(run.grid, key)
+        granule_urls = runner._resolve_urls(records, run.driver)
+        ds = runner._clamped_data_source(dict(run.config.data_source), len(granule_urls))
+        cell_config = {**config_dict, "data_source": ds} if ds is not None else config_dict
+        event = runner._build_cell_event(
+            run.grid.block_index(key),
+            key,
+            run._parent_order,
+            run._child_order,
+            granule_urls,
+            run.store,
+            s3_creds,
+            config_dict=cell_config,
+            output_creds_event=output_creds_event,
+            handoff=run.handoff,
+            profile=run.profile,
+            aoi_payload=aoi_by_shard.get(key),
+            invoked_by=invoked_by,
+            run_id=run_id,
+        )
+        submap = {
+            "grid_signature": run.catalog_data["grid_signature"],
+            "metadata": run.catalog_data.get("metadata"),
+            "granules": records,
+        }
+        payload = runner._cell_payload(event, submap=submap, async_invoke=True, label=label)
+
+        def _fire(p=payload):
+            client.invoke(FunctionName=run.function_name, InvocationType="Event", Payload=p)
+
+        futures[key] = poller.register(key, label, dispatch=_fire, granule_count=len(granule_urls))
+    poller.start()
+    return futures, poller
+
+
+def attach_run(
+    run_cls,
+    store: str,
+    run_id: str,
+    *,
+    function_name=None,
+    region="us-west-2",
+    lambda_client=None,
+    output_credentials=None,
+    output_endpoint_url=None,
+):
+    """The rebuild behind :meth:`zagg.client.Run.attach` (issue #327 phase 5).
+
+    Split out of ``client.py`` for the §4 module ceiling; the public contract
+    (and its full docstring) lives on ``Run.attach``. Reads the dispatch
+    manifest, rebuilds a Run from its embedded config, registers every listed
+    shard observe-only with a :class:`StatusPoller` (drop deadline anchored at
+    the manifest's ``dispatched_at``), and starts the finisher with the
+    read-only ``tail_recorded`` check so an already-recorded tail never
+    re-runs.
+    """
+    import threading
+    from dataclasses import asdict
+
+    from zagg import runner
+    from zagg.client import RunHandle, _fail_with_shard_error
+    from zagg.config import (
+        get_driver,
+        get_handoff,
+        get_output_endpoint_url,
+        get_windowing,
+        load_config_from_dict,
+        validate_config,
+    )
+    from zagg.grids import from_config as grid_from_config
+
+    output_creds_event = runner._build_output_creds_event(
+        output_credentials, output_endpoint_url, region
+    )
+    store_kwargs = runner._output_store_kwargs(output_creds_event, region)
+    prefix = run_status_prefix(store, run_id)
+    manifest = read_dispatch_manifest(prefix, store_kwargs)
+    if manifest is None:
+        raise ValueError(
+            f"no dispatch manifest at {prefix}/{MANIFEST_NAME} — wrong store/run_id, "
+            f"a dispatcher predating issue #327, or a hive setup Event that was "
+            f"dropped (its manifest write is best-effort)"
+        )
+    if not manifest.get("config"):
+        raise ValueError(f"dispatch manifest for run {run_id} carries no config")
+    config = load_config_from_dict(manifest["config"])
+    validate_config(config)
+    if get_windowing(config) is not None:
+        raise NotImplementedError(
+            "Run.attach covers unwindowed spatial runs; windowed units are "
+            "(shard, window) pairs the manifest does not enumerate"
+        )
+    shards = [int(s) for s in manifest.get("shards") or []]
+    if not shards:
+        raise ValueError(f"dispatch manifest for run {run_id} lists no shards")
+
+    grid = grid_from_config(config)
+    catalog_data = {
+        "shard_keys": shards,
+        "granules": [[] for _ in shards],
+        "grid_signature": grid.spatial_signature(),
+        "metadata": manifest.get("dataset"),
+    }
+    run = run_cls(
+        config,
+        catalog_data,
+        store=store,
+        function_name=runner._resolve_function_name(config, function_name),
+        region=region,
+        lambda_client=lambda_client,
+        driver=get_driver(config),
+        handoff=get_handoff(config),
+        output_credentials=output_credentials,
+        output_endpoint_url=output_endpoint_url or get_output_endpoint_url(config),
+    )
+    client = lambda_client
+    if client is None:
+        import boto3
+        from botocore.config import Config
+
+        client = boto3.Session().client(
+            "lambda",
+            region_name=region,
+            config=Config(read_timeout=960, connect_timeout=10, retries={"max_attempts": 0}),
+        )
+
+    # Drop deadline anchored at the manifest's dispatched_at: attaching long
+    # after the fleet finished classifies status-less shards immediately
+    # instead of waiting a fresh window.
+    dispatched_at = None
+    try:
+        from datetime import datetime
+
+        dispatched_at = datetime.fromisoformat(manifest["dispatched_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        pass
+    timeout_s = runner._get_function_timeout_s(client, run.function_name)
+    poller = StatusPoller(
+        lambda: open_status_store(prefix, store_kwargs),
+        drop_timeout_s=drop_timeout_s(timeout_s),
+        on_failed=_fail_with_shard_error,
+    )
+    futures: dict[int, Future] = {}
+    for key in shards:
+        label = runner._safe_label(run.grid, key)
+        futures[key] = poller.register(key, label, dispatch=None, dispatched_at=dispatched_at)
+    poller.start()
+
+    handle = RunHandle(futures, store_path=store)
+    finisher = threading.Thread(
+        target=run._post_run,
+        args=(
+            handle,
+            client,
+            poller,
+            asdict(config),
+            manifest.get("dataset"),
+            output_creds_event,
+            run_id,
+        ),
+        kwargs={"tail_done_check": lambda: tail_recorded(prefix, store_kwargs)},
+        name="zagg-client-finish",
+        daemon=True,
+    )
+    handle._finisher = finisher
+    finisher.start()
+    return handle
+
+
 def open_status_store(prefix: str, store_kwargs: dict[str, Any]):
     """obstore store rooted at a run's status prefix (the poller's seam).
 

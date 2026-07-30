@@ -525,106 +525,18 @@ class Run:
             Same semantics as :meth:`from_config`; the function/client are
             only used for the tail invokes when the tail is not yet recorded.
         """
-        from zagg import client_transport, runner
+        from zagg.client_transport import attach_run
 
-        output_creds_event = runner._build_output_creds_event(
-            output_credentials, output_endpoint_url, region
-        )
-        store_kwargs = runner._output_store_kwargs(output_creds_event, region)
-        prefix = client_transport.run_status_prefix(store, run_id)
-        manifest = client_transport.read_dispatch_manifest(prefix, store_kwargs)
-        if manifest is None:
-            raise ValueError(
-                f"no dispatch manifest at {prefix}/{client_transport.MANIFEST_NAME} — "
-                f"wrong store/run_id, a dispatcher predating issue #327, or a hive "
-                f"setup Event that was dropped (its manifest write is best-effort)"
-            )
-        if not manifest.get("config"):
-            raise ValueError(f"dispatch manifest for run {run_id} carries no config")
-        config = load_config_from_dict(manifest["config"])
-        validate_config(config)
-        if get_windowing(config) is not None:
-            raise NotImplementedError(
-                "Run.attach covers unwindowed spatial runs; windowed units are "
-                "(shard, window) pairs the manifest does not enumerate"
-            )
-        shards = [int(s) for s in manifest.get("shards") or []]
-        if not shards:
-            raise ValueError(f"dispatch manifest for run {run_id} lists no shards")
-
-        grid = grid_from_config(config)
-        catalog_data = {
-            "shard_keys": shards,
-            "granules": [[] for _ in shards],
-            "grid_signature": grid.spatial_signature(),
-            "metadata": manifest.get("dataset"),
-        }
-        run = cls(
-            config,
-            catalog_data,
-            store=store,
-            function_name=runner._resolve_function_name(config, function_name),
+        return attach_run(
+            cls,
+            store,
+            run_id,
+            function_name=function_name,
             region=region,
             lambda_client=lambda_client,
-            driver=get_driver(config),
-            handoff=get_handoff(config),
             output_credentials=output_credentials,
-            output_endpoint_url=output_endpoint_url or get_output_endpoint_url(config),
+            output_endpoint_url=output_endpoint_url,
         )
-        client = lambda_client
-        if client is None:
-            import boto3
-            from botocore.config import Config
-
-            client = boto3.Session().client(
-                "lambda",
-                region_name=region,
-                config=Config(read_timeout=960, connect_timeout=10, retries={"max_attempts": 0}),
-            )
-
-        # Drop deadline anchored at the manifest's dispatched_at: attaching
-        # long after the fleet finished classifies status-less shards
-        # immediately instead of waiting a fresh window.
-        dispatched_at = None
-        try:
-            from datetime import datetime
-
-            dispatched_at = datetime.fromisoformat(manifest["dispatched_at"]).timestamp()
-        except (KeyError, TypeError, ValueError):
-            pass
-        timeout_s = runner._get_function_timeout_s(client, run.function_name)
-        poller = client_transport.StatusPoller(
-            lambda: client_transport.open_status_store(prefix, store_kwargs),
-            drop_timeout_s=client_transport.drop_timeout_s(timeout_s),
-            on_failed=_fail_with_shard_error,
-        )
-        futures: dict[int, Future] = {}
-        for key in shards:
-            label = runner._safe_label(run.grid, key)
-            futures[key] = poller.register(key, label, dispatch=None, dispatched_at=dispatched_at)
-        poller.start()
-
-        handle = RunHandle(futures, store_path=store)
-        finisher = threading.Thread(
-            target=run._post_run,
-            args=(
-                handle,
-                client,
-                poller,
-                asdict(config),
-                manifest.get("dataset"),
-                output_creds_event,
-                run_id,
-            ),
-            kwargs={
-                "tail_done_check": lambda: client_transport.tail_recorded(prefix, store_kwargs)
-            },
-            name="zagg-client-finish",
-            daemon=True,
-        )
-        handle._finisher = finisher
-        finisher.start()
-        return handle
 
     # -- shard selection ----------------------------------------------------
 
@@ -915,61 +827,21 @@ class Run:
         budget, or the ``failed-unknown`` drop outcome) raises
         :class:`ShardError` from the shard's future, exactly like v1.
         """
-        from zagg import client_transport, runner
+        from zagg.client_transport import dispatch_event_shards
 
-        prefix = client_transport.run_status_prefix(self.store, run_id)
-        store_kwargs = runner._output_store_kwargs(output_creds_event, self.region)
-        # The drop deadline keys off the live function Timeout when readable;
-        # the helper falls back to the template default (an injected stub
-        # client need not answer get_function_configuration).
-        timeout_s = runner._get_function_timeout_s(client, self.function_name)
-        poller = client_transport.StatusPoller(
-            lambda: client_transport.open_status_store(prefix, store_kwargs),
-            drop_timeout_s=client_transport.drop_timeout_s(timeout_s),
-            max_retries=self.max_retries,
-            max_in_flight=workers,
+        return dispatch_event_shards(
+            self,
+            client,
+            cells,
+            run_id=run_id,
+            workers=workers,
+            config_dict=config_dict,
+            s3_creds=s3_creds,
+            output_creds_event=output_creds_event,
+            aoi_by_shard=aoi_by_shard,
+            invoked_by=invoked_by,
             on_failed=_fail_with_shard_error,
         )
-        futures: dict[int, Future] = {}
-        for key, records in cells:
-            key = int(key)
-            label = runner._safe_label(self.grid, key)
-            granule_urls = runner._resolve_urls(records, self.driver)
-            ds = runner._clamped_data_source(dict(self.config.data_source), len(granule_urls))
-            cell_config = {**config_dict, "data_source": ds} if ds is not None else config_dict
-            event = runner._build_cell_event(
-                self.grid.block_index(key),
-                key,
-                self._parent_order,
-                self._child_order,
-                granule_urls,
-                self.store,
-                s3_creds,
-                config_dict=cell_config,
-                output_creds_event=output_creds_event,
-                handoff=self.handoff,
-                profile=self.profile,
-                aoi_payload=aoi_by_shard.get(key),
-                invoked_by=invoked_by,
-                run_id=run_id,
-            )
-            submap = {
-                "grid_signature": self.catalog_data["grid_signature"],
-                "metadata": self.catalog_data.get("metadata"),
-                "granules": records,
-            }
-            # May raise the payload-cap ValueError — BEFORE anything fires, so
-            # an undispatchable run fails whole rather than mid-fan-out.
-            payload = runner._cell_payload(event, submap=submap, async_invoke=True, label=label)
-
-            def _fire(p=payload):
-                client.invoke(FunctionName=self.function_name, InvocationType="Event", Payload=p)
-
-            futures[key] = poller.register(
-                key, label, dispatch=_fire, granule_count=len(granule_urls)
-            )
-        poller.start()
-        return futures, poller
 
     def _shard_work(
         self,
