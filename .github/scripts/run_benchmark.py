@@ -146,6 +146,38 @@ def _resolve_target(manifest: dict, name: str) -> dict:
     raise KeyError(f"unknown target '{name}'; have {known}")
 
 
+def check_variant_current(client, function_name: str, resolved: str) -> None:
+    """Refuse to dispatch onto a stale pre-provisioned worker variant (issue #341).
+
+    The deploy path updates the base function and its worker-size variants from
+    the same zip (deploy_lambda.sh); a variant whose ``CodeSha256`` differs from
+    the base's is running different code than the run believes it is testing —
+    the run 30503334617 failure mode, where ``-4096-disk`` served standup-time
+    code. Hard-fail on mismatch (the benchmark invoke role carries
+    ``lambda:GetFunctionConfiguration`` on both function families). A probe
+    that itself fails degrades to a warning so third-party stacks whose invoke
+    role lacks the permission still dispatch.
+    """
+    try:
+        base_sha = client.get_function_configuration(FunctionName=function_name)["CodeSha256"]
+        variant_sha = client.get_function_configuration(FunctionName=resolved)["CodeSha256"]
+    except Exception as e:
+        print(
+            f"WARN: could not compare CodeSha256 of {resolved} against {function_name} "
+            f"({e}); dispatching without the staleness guard",
+            file=sys.stderr,
+        )
+        return
+    if base_sha != variant_sha:
+        raise RuntimeError(
+            f"worker variant {resolved} is STALE: its CodeSha256 {variant_sha} does not "
+            f"match base {function_name}'s {base_sha}. The variant would run code this "
+            f"benchmark is not testing (issue #341) — redeploy the variant family "
+            f"(deploy_lambda.sh updates the base and every provisioned variant from "
+            f"the same zip) and re-dispatch."
+        )
+
+
 def run_target(
     name: str,
     manifest: dict,
@@ -255,6 +287,19 @@ def run_target(
         summary: dict = {}
     else:
         from zagg.runner import agg
+
+        # Staleness guard (issue #341): a target whose ``worker:`` block resolved
+        # a pre-provisioned variant must run the same code as the base function
+        # the deploy path just updated — hard-fail before paying for a dispatch
+        # that benchmarks the wrong build.
+        if resolved_function_name != function_name:
+            import boto3
+
+            check_variant_current(
+                boto3.client("lambda", region_name=region),
+                function_name,
+                resolved_function_name,
+            )
 
         # AOI-mask arm (issue #202): the committed map is the plain o9 map; build
         # the strict-AOI per-cell mask on the fly (mortie, no spherely) and

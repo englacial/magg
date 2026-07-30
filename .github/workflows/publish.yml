@@ -182,6 +182,9 @@ jobs:
   # update-function-configuration handles a deps change that the function-code
   # update alone would miss. Needs `distribute` so the layer is staged in S3 for
   # publish-layer-version (the layer zip can exceed the 50 MB direct-upload cap).
+  # deploy_lambda.sh updates the WHOLE worker-size variant family (base +
+  # ${FN}-<mem>[-disk], issue #341) from the same zip, so the pre-provisioned
+  # variants (e.g. process-shard-4096-disk) no longer stay on standup-time code.
   deploy-prod:
     name: Deploy production Lambda
     needs: [github-release, distribute]

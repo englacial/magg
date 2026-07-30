@@ -403,6 +403,50 @@ def test_run_target_dry_run():
     assert rec["total_obs"] is None  # no dispatch in dry-run
 
 
+# --- variant staleness guard (issue #341) ----------------------------------
+
+
+class _StubLambdaClient:
+    """get_function_configuration stub: CodeSha256 keyed by function name."""
+
+    def __init__(self, shas, raises=None):
+        self._shas = shas
+        self._raises = raises
+
+    def get_function_configuration(self, FunctionName):  # noqa: N803 (boto3 API)
+        if self._raises is not None:
+            raise self._raises
+        return {"CodeSha256": self._shas[FunctionName]}
+
+
+def test_variant_guard_passes_on_matching_sha():
+    client = _StubLambdaClient({"process-shard": "abc", "process-shard-4096-disk": "abc"})
+    run_benchmark.check_variant_current(client, "process-shard", "process-shard-4096-disk")
+
+
+def test_variant_guard_hard_fails_on_stale_variant():
+    # The run 30503334617 failure mode: the -disk variant serves standup-time
+    # code while the base was just deployed. Must name both hashes and the
+    # remediation (redeploy the family).
+    client = _StubLambdaClient({"process-shard": "newsha", "process-shard-4096-disk": "oldsha"})
+    with pytest.raises(RuntimeError) as exc:
+        run_benchmark.check_variant_current(client, "process-shard", "process-shard-4096-disk")
+    msg = str(exc.value)
+    assert "process-shard-4096-disk" in msg and "STALE" in msg
+    assert "newsha" in msg and "oldsha" in msg
+    assert "redeploy the variant family" in msg
+
+
+def test_variant_guard_degrades_on_probe_failure(capsys):
+    # A failed probe (e.g. an invoke role without lambda:GetFunctionConfiguration
+    # on the family) warns and continues — third-party stacks still dispatch.
+    client = _StubLambdaClient({}, raises=PermissionError("AccessDenied"))
+    run_benchmark.check_variant_current(client, "process-shard", "process-shard-4096-disk")
+    err = capsys.readouterr().err
+    assert "WARN: could not compare CodeSha256" in err
+    assert "without the staleness guard" in err
+
+
 def _fake_record(target, *, total_obs, max_memory_mb):
     # Minimal record with the fields main()'s per-target print + the empty-metrics
     # guard read (issue #145). Enough to drive main() without a real dispatch.

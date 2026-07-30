@@ -5,17 +5,33 @@
 # is required so a deps/layer change is actually picked up, and the layer is read
 # from S3 because the zip can exceed Lambda's 50 MB direct-upload cap.
 #
+# The base function is only half the fleet (issue #341): template.yaml also
+# provisions pre-provisioned worker-size variants — ${FN}-<mem> and
+# ${FN}-<mem>-disk for each WorkerMemorySizes entry (default 2048,4096,8192) —
+# that run_benchmark resolves BY NAME from a target's `worker:` block. Updating
+# only the base left ${FN}-4096-disk on standup-time code, so every -disk arm
+# ran stale. The script now updates the WHOLE family from the same zip: each
+# default-matrix variant is probed (get-function-configuration) and updated if
+# it exists; a missing variant is skipped with a note (e.g. the test stack only
+# provisions the -disk trio). Pass --variants to override the suffix list
+# (--variants "" deploys the base only).
+#
 # Shared by the release path (publish.yml -> production) and the benchmark
 # test-deploy path (lambda-benchmark.yml -> process-shard-test).
 #
 # Usage:
 #   deploy_lambda.sh --function NAME --layer-bucket B --layer-key K \
-#       --function-zip PATH --region R
+#       --function-zip PATH --region R [--variants "-4096-disk -8192-disk"]
 #
 # Requires: aws CLI (creds in env). arm64 / python3.12 only (the deployed target).
 set -euo pipefail
 
+# Default variant family: the template.yaml WorkerMemorySizes matrix
+# ("2048,4096,8192"), plain + -disk. Keep in sync with the template.
+DEFAULT_VARIANTS="-2048 -4096 -8192 -2048-disk -4096-disk -8192-disk"
+
 FUNCTION="" LAYER_BUCKET="" LAYER_KEY="" FUNCTION_ZIP="" REGION=""
+VARIANTS="$DEFAULT_VARIANTS"
 while [ $# -gt 0 ]; do
   case "$1" in
     --function) FUNCTION="$2"; shift 2 ;;
@@ -23,6 +39,7 @@ while [ $# -gt 0 ]; do
     --layer-key) LAYER_KEY="$2"; shift 2 ;;
     --function-zip) FUNCTION_ZIP="$2"; shift 2 ;;
     --region) REGION="$2"; shift 2 ;;
+    --variants) VARIANTS="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -38,25 +55,50 @@ LAYER_ARN=$(aws lambda publish-layer-version \
   --region "$REGION" \
   --query LayerVersionArn --output text)
 
-# Config update (new layer) and code update can't overlap -- wait between them.
-aws lambda update-function-configuration \
-  --function-name "$FUNCTION" --layers "$LAYER_ARN" --region "$REGION"
-aws lambda wait function-updated --function-name "$FUNCTION" --region "$REGION"
-aws lambda update-function-code \
-  --function-name "$FUNCTION" --zip-file "fileb://${FUNCTION_ZIP}" --publish --region "$REGION"
+deploy_one() {
+  local FN="$1"
+  # Config update (new layer) and code update can't overlap -- wait between them.
+  aws lambda update-function-configuration \
+    --function-name "$FN" --layers "$LAYER_ARN" --region "$REGION"
+  aws lambda wait function-updated --function-name "$FN" --region "$REGION"
+  aws lambda update-function-code \
+    --function-name "$FN" --zip-file "fileb://${FUNCTION_ZIP}" --publish --region "$REGION"
 
-# Async-invoke hygiene (issue #151): the runner dispatches with
-# InvocationType=Event and polls for worker-written results; Lambda's async
-# defaults would re-run a timed-out/OOM'd shard twice with delays, so pin
-# retries to 0, and keep event age under the runner's 90 s poll margin so no
-# delivery starts after the runner stops listening (mirrors
-# ProcessFnAsyncConfig in deployment/aws/template.yaml -- keep in sync).
-# Warn-only: the deploy role may not yet carry
-# lambda:PutFunctionEventInvokeConfig, and the pipeline still works (just
-# noisier on worker crashes) without it.
-aws lambda put-function-event-invoke-config \
-  --function-name "$FUNCTION" --maximum-retry-attempts 0 \
-  --maximum-event-age-in-seconds 60 --region "$REGION" \
-  || echo "WARN: could not set event-invoke config on $FUNCTION (needs lambda:PutFunctionEventInvokeConfig); async service retries stay at the default" >&2
+  # Async-invoke hygiene (issue #151): the runner dispatches with
+  # InvocationType=Event and polls for worker-written results; Lambda's async
+  # defaults would re-run a timed-out/OOM'd shard twice with delays, so pin
+  # retries to 0, and keep event age under the runner's 90 s poll margin so no
+  # delivery starts after the runner stops listening (mirrors
+  # ProcessFnAsyncConfig in deployment/aws/template.yaml -- keep in sync).
+  # Warn-only: the deploy role may not yet carry
+  # lambda:PutFunctionEventInvokeConfig, and the pipeline still works (just
+  # noisier on worker crashes) without it.
+  aws lambda put-function-event-invoke-config \
+    --function-name "$FN" --maximum-retry-attempts 0 \
+    --maximum-event-age-in-seconds 60 --region "$REGION" \
+    || echo "WARN: could not set event-invoke config on $FN (needs lambda:PutFunctionEventInvokeConfig); async service retries stay at the default" >&2
 
-echo "deployed $FUNCTION (layer $LAYER_ARN)"
+  echo "deployed $FN (layer $LAYER_ARN)"
+}
+
+# Base function first (hard-required, unchanged failure semantics), then every
+# provisioned worker-size variant from the same layer version + zip (issue #341).
+deploy_one "$FUNCTION"
+
+for SUFFIX in $VARIANTS; do
+  VARIANT="${FUNCTION}${SUFFIX}"
+  if PROBE_ERR=$(aws lambda get-function-configuration \
+      --function-name "$VARIANT" --region "$REGION" 2>&1 >/dev/null); then
+    deploy_one "$VARIANT"
+  elif echo "$PROBE_ERR" | grep -q ResourceNotFoundException; then
+    echo "variant $VARIANT does not exist; skipping"
+  else
+    # Probe failed for a non-404 reason (most likely the deploy role's IAM is
+    # scoped to the base function name only): skip LOUDLY — a silently stale
+    # variant is exactly the issue #341 failure mode.
+    echo "WARN: could not probe variant $VARIANT (skipping; it may now be STALE" \
+      "relative to $FUNCTION): $PROBE_ERR" >&2
+    echo "WARN: the deploy role likely needs lambda:GetFunctionConfiguration +" \
+      "Update* on the ${FUNCTION}-* family (see issue #341)" >&2
+  fi
+done
