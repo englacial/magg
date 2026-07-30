@@ -504,3 +504,115 @@ class TestMaskChannel:
         store = self._leaf([0], cell_order=11)
         with pytest.raises(ValueError, match="cannot be aligned"):
             list(read_tensors(store, "12/h_tdigest"))
+
+
+class TestMaskBlockCrossing:
+    """The mask channel (phase 4) crossed with ``block_order`` (phase 3) — the
+    one seam where ``_block_mask`` slices a leaf-wide bitmap against a
+    MULTI-CHUNK window and deinterleaves at ``block_depth != depth`` (fold
+    review). A stamped 16-chunk leaf: order-6 shard, order-12 cells, order-8
+    read chunks (16×16), digests at leaf ranks 11/300/1000/4000 and extra
+    occupancy at 12/301/2500."""
+
+    DIGESTS = [11, 300, 1000, 4000]
+    EXTRA = [12, 301, 2500]
+
+    @staticmethod
+    def _leaf(digest_ranks, extra_occupied):
+        """A committed 16-chunk leaf (``chunk_inner=8``, ShardingCodec'd)."""
+        import zarr
+        from test_readers import _cfg
+
+        from zagg import hive
+        from zagg.grids import HealpixGrid
+        from zagg.processing import write_ragged_leaf_to_zarr
+        from zagg.stats.tdigest import build_tdigest
+
+        cfg = _cfg()
+        cfg.output["grid"]["chunk_inner"] = 8
+        cfg.output["grid"]["sharded"] = True
+        grid = HealpixGrid(6, 12, layout="fullsphere", config=cfg, chunk_inner=8, sharded=True)
+        word = morton_word(_KEY_A)
+        store = MemoryStore()
+        grid.emit_shard_template(store)
+        children = np.asarray(grid.children(word), dtype=np.uint64)
+        zarr.open_array(store, path="12/morton", mode="r+")[:] = children
+        # Digests go in at leaf-LOCAL chunk blocks with chunk-local ranks.
+        rng = np.random.default_rng(9)
+        per_chunk: dict[int, list[int]] = {}
+        for rank in sorted(digest_ranks):
+            per_chunk.setdefault(rank // grid.cells_per_chunk, []).append(
+                rank % grid.cells_per_chunk
+            )
+        entries = [
+            (
+                (block,),
+                {
+                    "h_tdigest": (
+                        [build_tdigest(rng.uniform(10.0, 30.0, 50), delta=512) for _ in local],
+                        local,
+                    )
+                },
+            )
+            for block, local in sorted(per_chunk.items())
+        ]
+        write_ragged_leaf_to_zarr(entries, store, grid=grid)
+        occupied = np.sort(children[sorted(set(digest_ranks) | set(extra_occupied))])
+        bitmap = hive.encode_coverage_bitmap(word, occupied, 12)
+        _put_object(store, hive.COVERAGE_SIDECAR, bitmap)
+        hive.stamp_commit(
+            store,
+            cells_with_data=len(digest_ranks),
+            granule_count=1,
+            coverage=hive.build_coverage(word, occupied, 12, bitmap=bitmap),
+        )
+        return store
+
+    @staticmethod
+    def _states(mask):
+        return tuple(
+            sorted(tuple(map(int, p)) for p in zip(*np.nonzero(mask == state))) for state in (1, 2)
+        )
+
+    @pytest.mark.parametrize(
+        "block_order,side,expected",
+        [
+            # Per chunk (block_depth == depth == 4): ranks are chunk-local.
+            (8, 16, [([(2, 2)], [(3, 1)]), ([(6, 3)], [(6, 2)]), ([], [(14, 8)]), ([], [(12, 0)])]),
+            # 4-chunk blocks (block_depth 5): only POPULATED blocks are yielded,
+            # so leaf block 2 (occupancy 2500 but no digest) is not emitted.
+            (7, 32, [([(2, 2), (6, 19)], [(3, 1), (6, 18), (30, 24)]), ([], [(28, 16)])]),
+            # The whole leaf (block_depth 6): every rank at its leaf-local
+            # deinterleave — 12→(2,2), 301→(6,19), 2500→(40,26) observed-only;
+            # 11→(3,1), 300→(6,18), 1000→(30,24), 4000→(60,48) with data.
+            (
+                6,
+                64,
+                [
+                    (
+                        [(2, 2), (6, 19), (40, 26)],
+                        [(3, 1), (6, 18), (30, 24), (60, 48)],
+                    )
+                ],
+            ),
+        ],
+    )
+    def test_mask_deinterleaves_at_the_block_depth(self, block_order, side, expected):
+        store = self._leaf(self.DIGESTS, self.EXTRA)
+        out = list(read_tensors(store, "12/h_tdigest", block_order=block_order))
+        assert [o[1].shape for o in out] == [(side, side)] * len(expected)
+        for (_t, mask, _s, _w), (ones, twos) in zip(out, expected):
+            assert self._states(mask) == (ones, twos)
+
+    def test_block_mask_states_agree_with_the_per_chunk_read(self):
+        """Assembling the mask must not invent or lose occupancy: the leaf
+        block's state counts equal the per-chunk reads' totals."""
+        store = self._leaf(self.DIGESTS, self.EXTRA)
+        chunk_masks = [mask for _t, mask, _s, _w in read_tensors(store, "12/h_tdigest")]
+        ((tensor, block_mask, _s, _w),) = read_tensors(store, "12/h_tdigest", block_order=6)
+        assert int((block_mask == 2).sum()) == sum(int((m == 2).sum()) for m in chunk_masks)
+        # Cell 2500 is occupancy-only in a chunk with no digest at all, so the
+        # per-chunk sweep never yields it — the whole-leaf block does.
+        assert int((block_mask == 1).sum()) == sum(int((m == 1).sum()) for m in chunk_masks) + 1
+        # And the digest-bearing cells still match the tensor's mass exactly.
+        np.testing.assert_array_equal(block_mask == 2, tensor.sum(axis=2) > 0)
