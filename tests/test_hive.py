@@ -584,10 +584,16 @@ class TestLeafTemplateAndStamp:
 
     def test_overwrite_survives_orphan_member_dir(self, cfg):
         # Issue #341 (Bug A regression): a member dir holding chunk objects but
-        # no zarr.json — the shape the post-#337 ``cell_ids`` orphan left, which
-        # the store walk died on ("No array found in store ... at path
-        # 19/cell_ids") — must never kill the re-template. The leaf prefix is
-        # cleared wholesale up front, so the walk never parses the orphan.
+        # no zarr.json — the shape a retired post-#337 ``cell_ids`` member leaves.
+        # The leaf prefix is cleared wholesale up front, so the re-template never
+        # parses the orphan and the objects do not survive as pseudo-data.
+        #
+        # NOTE (fold review): on the pinned zarr 3.2.1 the enumeration would
+        # warn-skip this orphan rather than raise, so this pins the WHOLESALE
+        # replacement (the orphan's chunks are gone), not a crash fix — the
+        # observed "No array found in store ... at path 19/cell_ids" came from the
+        # stale deploy on fresh stores, not from orphans. See
+        # HealpixGrid.emit_shard_template's docstring.
         store = MemoryStore()
         g = self._grid(cfg)
         g.emit_shard_template(store, overwrite=True)
