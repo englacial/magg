@@ -730,10 +730,18 @@ Each fixture ships a sibling **`{name}.expected.json`** recording the shard
 key, leaf path, geometry, every populated cell's decoded values (digest
 centroids, location words and composition words as decimal strings — JSON
 numbers cannot carry `uint64` faithfully), the per-stratum exact counts,
-and the §5 O11 `content_hashes` (per-array + combined). Expected values
-were computed from the generator's *inputs* — the arrays handed to the
-writers — never read back through a zagg reader, so the reader is pinned,
-not self-certified.
+and the §5 O11 `content_hashes` (per-array + combined). The expected
+**decoded values** were computed from the generator's *inputs* — the arrays
+handed to the writers — never read back through a zagg reader, so the reader
+is pinned, not self-certified. The `content_hashes` are necessarily computed
+from the **written leaf** (a content hash of nothing else would mean
+anything), so they are pinned differently: the suite carries the combined
+digest and one per-array digest per §5.2 element kind as **frozen hex
+literals**, and recomputes the vlen digests a second time from the shard
+objects alone (§1.4/§1.5 byte recipes, no zarr). A recipe change — prefix
+width, joiner, key set — therefore fails a test instead of agreeing with
+itself on both sides, which is also the only mechanism that catches a future
+zagg↔moczarr divergence (neither side's fixture can: espg/moczarr#23).
 
 **Conformance criteria for an external reader**: decode every ragged array
 per §1–§2 and the composition array per §3, reproducing the expected

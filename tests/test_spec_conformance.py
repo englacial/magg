@@ -44,6 +44,59 @@ RAGGED_ARRAYS = [
 ]
 SENTINEL = 2**64 - 1
 
+#: FROZEN §5 combined digests, as literals — the anti-circularity pin (the
+#: ``FROZEN_COMBINED_4111`` precedent, espg/moczarr ``ba804e6``). Both the
+#: fixture generator and every recomputation here run the §5 recipe, so a
+#: changed length-prefix width, joiner, hash function, or key set would agree
+#: with itself and sail through. These literals are what such a change has to
+#: get past — and §5 is the recipe moczarr adopts verbatim, so a silent zagg
+#: change is a silent cross-implementation divergence.
+FROZEN_COMBINED = {
+    "minimal": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
+    "kitchen_sink": "57c413489b33fd82187072504a51b76dbb6455d357c4702d9bf92f77bcafab31",
+}
+#: FROZEN per-array digests, one per §5.2 element kind: a vlen digest payload
+#: array, a vlen uint64 locations sibling, and two fixed-width arrays.
+FROZEN_ARRAYS = {
+    ("minimal", "6/h_tdigest"): "ba43774865b69f60aaf42875c9c4a72edaca6058bd9a4fb95760d43f203c9d4c",
+    ("minimal", "6/morton"): "f6282635e373d534ef4d91166d306441049e7bbed3d7d2ec8add306f62274d06",
+    (
+        "kitchen_sink",
+        "6/h_tdigest_signal_locations",
+    ): "ffd8bcc3be76c43184fd9ce6ddef16e24dba6c5615e302d6a8ad3b3cb603734a",
+    (
+        "kitchen_sink",
+        "6/composition",
+    ): "04886a9dfb60c8a53de48202dc3d5ac694698864825426f084be961aa678acd5",
+}
+
+
+def _decode_shard(path: Path, k: int) -> dict:
+    """``{chunk_ordinal: raw framed bytes}`` per the §1.5 index recipe."""
+    blob = path.read_bytes()
+    index = np.frombuffer(blob[-(16 * k + 4) : -4], dtype="<u8").reshape(k, 2)
+    chunks = {}
+    for ordinal, (offset, nbytes) in enumerate(index):
+        if int(offset) == SENTINEL:
+            assert int(nbytes) == SENTINEL
+            continue
+        chunks[ordinal] = bytes(Zstd().decode(blob[int(offset) : int(offset) + int(nbytes)]))
+    return chunks
+
+
+def _decode_framing(raw: bytes, n_cells: int) -> list:
+    """The §1.4 recipe: u32 cell count, then u32 length + payload per cell."""
+    (count,) = struct.unpack_from("<I", raw, 0)
+    assert count == n_cells
+    payloads, pos = [], 4
+    for _ in range(count):
+        (length,) = struct.unpack_from("<I", raw, pos)
+        pos += 4
+        payloads.append(raw[pos : pos + length])
+        pos += length
+    assert pos == len(raw)
+    return payloads
+
 
 def _expected(name):
     return json.loads((SPEC_DATA / f"{name}.expected.json").read_text())
@@ -128,45 +181,18 @@ class TestWireFraming:
     decoded payloads must equal the committed expectations.
     """
 
-    @staticmethod
-    def _decode_shard(path: Path, k: int):
-        """``{chunk_ordinal: raw framed bytes}`` per the §1.5 index recipe."""
-        blob = path.read_bytes()
-        index = np.frombuffer(blob[-(16 * k + 4) : -4], dtype="<u8").reshape(k, 2)
-        chunks = {}
-        for ordinal, (offset, nbytes) in enumerate(index):
-            if int(offset) == SENTINEL:
-                assert int(nbytes) == SENTINEL
-                continue
-            chunks[ordinal] = bytes(Zstd().decode(blob[int(offset) : int(offset) + int(nbytes)]))
-        return chunks
-
-    @staticmethod
-    def _decode_framing(raw: bytes, n_cells: int):
-        """The §1.4 recipe: u32 cell count, then u32 length + payload per cell."""
-        (count,) = struct.unpack_from("<I", raw, 0)
-        assert count == n_cells
-        payloads, pos = [], 4
-        for _ in range(count):
-            (length,) = struct.unpack_from("<I", raw, pos)
-            pos += 4
-            payloads.append(raw[pos : pos + length])
-            pos += length
-        assert pos == len(raw)
-        return payloads
-
     @pytest.mark.parametrize(("name", "field", "dtype", "inner"), RAGGED_ARRAYS)
     def test_payloads_decode_per_spec(self, name, field, dtype, inner):
         exp = _expected(name)
         per_chunk = exp["cells_per_chunk"]
-        chunks = self._decode_shard(
+        chunks = _decode_shard(
             _leaf_dir(name, exp) / exp["group"] / field / "c" / "0", exp["chunks_per_shard"]
         )
         # The empty chunk is absent from the shard index (the §1.5 sentinel).
         assert exp["empty_chunk"] not in chunks
         decoded: dict[int, np.ndarray] = {}
         for ordinal, raw in chunks.items():
-            for local, payload in enumerate(self._decode_framing(raw, per_chunk)):
+            for local, payload in enumerate(_decode_framing(raw, per_chunk)):
                 cell = ordinal * per_chunk + local
                 decoded[cell] = np.frombuffer(payload, dtype=f"<{np.dtype(dtype).str[1:]}")
                 decoded[cell] = decoded[cell].reshape(-1, *inner)
@@ -187,12 +213,12 @@ class TestWireFraming:
     def test_populated_chunks_only_no_ghost_payloads(self):
         # Cells outside the expected set decode as b"" (the fill) — §1.1.
         exp = _expected("minimal")
-        chunks = self._decode_shard(
+        chunks = _decode_shard(
             _leaf_dir("minimal", exp) / "6" / "h_tdigest" / "c" / "0", exp["chunks_per_shard"]
         )
         populated = {c["index"] for c in exp["cells"]}
         for ordinal, raw in chunks.items():
-            for local, payload in enumerate(self._decode_framing(raw, exp["cells_per_chunk"])):
+            for local, payload in enumerate(_decode_framing(raw, exp["cells_per_chunk"])):
                 cell = ordinal * exp["cells_per_chunk"] + local
                 assert (len(payload) > 0) == (cell in populated)
 
@@ -316,7 +342,15 @@ class TestComposition:
 
 
 class TestContentHashes:
-    """§5 — the O11 recipe, reimplemented from spec text only."""
+    """§5 — the O11 recipe, reimplemented from spec text only.
+
+    Three legs, because the recipe is what moczarr adopts verbatim: the
+    decoded-value hasher below (recomputed over the written store), an
+    independent recomputation of the vlen digests from the shard objects
+    alone, and the :data:`FROZEN_COMBINED` / :data:`FROZEN_ARRAYS` literals —
+    the only leg that can fail when a recipe change is made consistently on
+    both sides.
+    """
 
     @staticmethod
     def _hash_leaf(leaf: Path) -> dict:
@@ -339,10 +373,42 @@ class TestContentHashes:
             hashes[key] = hashlib.sha256(values.tobytes()).hexdigest()
         return hashes
 
+    @staticmethod
+    def _vlen_digest_from_shard_bytes(name, exp, field) -> str:
+        """The §5.2 vlen digest with NO zarr and no shared helper.
+
+        Payloads come from the §1.4/§1.5 byte recipes (``_decode_shard`` /
+        ``_decode_framing``), so this is a second, independent implementation
+        of the recipe — an absent inner chunk (the §1.5 sentinel) contributes
+        its cells' zero lengths, which is what makes the digest cover the
+        cell *grid* rather than only the payloads.
+        """
+        chunks = _decode_shard(
+            _leaf_dir(name, exp) / exp["group"] / field / "c" / "0", exp["chunks_per_shard"]
+        )
+        per_chunk = exp["cells_per_chunk"]
+        digest = hashlib.sha256()
+        for ordinal in range(exp["chunks_per_shard"]):
+            raw = chunks.get(ordinal)
+            payloads = _decode_framing(raw, per_chunk) if raw is not None else [b""] * per_chunk
+            for payload in payloads:
+                digest.update(len(payload).to_bytes(8, "little"))
+                digest.update(payload)
+        return digest.hexdigest()
+
     @pytest.mark.parametrize("name", FIXTURES)
     def test_per_array_hashes_match_golden(self, name):
         exp = _expected(name)
         assert self._hash_leaf(_leaf_dir(name, exp)) == exp["content_hashes"]["arrays"]
+
+    @pytest.mark.parametrize(("name", "field", "dtype", "inner"), RAGGED_ARRAYS)
+    def test_vlen_digest_from_shard_bytes_only(self, name, field, dtype, inner):
+        # The §5.2 vlen recipe reproduced from the shard objects alone — the
+        # decoded-value hasher above and the generator both go through zarr,
+        # so this is the leg that proves the spec text suffices.
+        exp = _expected(name)
+        want = exp["content_hashes"]["arrays"][f"{exp['group']}/{field}"]
+        assert self._vlen_digest_from_shard_bytes(name, exp, field) == want
 
     @pytest.mark.parametrize("name", FIXTURES)
     def test_combined_hash_recipe(self, name):
@@ -350,6 +416,17 @@ class TestContentHashes:
         arrays = exp["content_hashes"]["arrays"]
         combined = hashlib.sha256("\n".join(sorted(arrays.values())).encode()).hexdigest()
         assert combined == exp["content_hashes"]["combined"]
+
+    @pytest.mark.parametrize("name", FIXTURES)
+    def test_frozen_digests_pin_the_recipe(self, name):
+        # Not self-certified: the literals are the pin. Every other assertion
+        # here (and the generator's) runs the same recipe on both sides, so
+        # only a frozen value catches a recipe change made consistently.
+        exp = _expected(name)
+        assert exp["content_hashes"]["combined"] == FROZEN_COMBINED[name]
+        for (fixture, key), frozen in FROZEN_ARRAYS.items():
+            if fixture == name:
+                assert exp["content_hashes"]["arrays"][key] == frozen
 
 
 class TestStoreEnvelope:
