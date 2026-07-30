@@ -303,7 +303,11 @@ def _o11_hashes(leaf_path: str) -> dict:
             values = values.astype(values.dtype.newbyteorder("<"))
         hashes[key] = hashlib.sha256(values.tobytes()).hexdigest()
     combined = hashlib.sha256("\n".join(sorted(hashes.values())).encode()).hexdigest()
-    return {"arrays": hashes, "combined": combined}
+    # Key-sorted so regeneration is diff-clean: ``group.members()`` yields
+    # concurrently, so insertion order varies per run. ``combined`` is immune
+    # either way (it sorts the DIGESTS), which is a real robustness property
+    # of the recipe — but the recorded map would otherwise churn every run.
+    return {"arrays": dict(sorted(hashes.items())), "combined": combined}
 
 
 def build(out: Path, kitchen_sink: bool) -> None:
