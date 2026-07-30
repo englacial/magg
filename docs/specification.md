@@ -223,8 +223,15 @@ array of weighted centroids:
 - rows MUST be sorted **ascending by mean**;
 - `sum(weights)` MUST equal the cell's **exact** observation count — the
   number of finite `source` values the digest was built over (non-finite
-  source rows are dropped before building). For a stratified product (§3)
-  each stratum digest's total weight is the exact stratum count;
+  source rows are dropped before building) — **while that count is
+  representable in float32, i.e. `<= 2^24` (16,777,216)**; above that bound
+  the weights and their sum are the nearest float32 values to the true counts,
+  so a reader recovering counts from weights (§3.3 tells it to, for
+  `N_signal`) gets the exact integer at or below the bound and a rounded one
+  above it. The bound is comfortable at leaf cell orders and is the one to
+  watch at coarse overview orders (§4.4). For a stratified product (§3) each
+  stratum digest's total weight is the exact stratum count, under the same
+  bound;
 - an absent cell decodes as the zero-length `(0, 2)` array (the `b""` fill).
 
 ### 2.2 The location channel
@@ -478,7 +485,10 @@ is the store's resolution axis, partially materialized). Concretely:
   descendant words of the node, in canonical nested order;
 - each **included** field is the same array kind as at the leaves: dense
   fields as dense arrays, digest fields as `zagg-ragged/1` (or `/2`) vlen
-  arrays — §1–§3 of this page apply to overview arrays unchanged;
+  arrays — §1–§3 of this page apply to overview arrays unchanged, **including
+  §2.1's float32 exactness bound**: a coarse overview cell can pool more than
+  `2^24` observations, and there `sum(weights)` is the nearest float32 to the
+  true count rather than the count itself;
 - field inclusion is gated by the field's **composability class** (§4.5):
   `exact` and `approximate` fields appear, `none` fields are **absent**.
 
