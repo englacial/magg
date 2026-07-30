@@ -966,9 +966,7 @@ def cell_index(
     side, depth = _tensor_side(arr, field)
     cells_per_chunk = side * side
     if not (0 <= int(row) < side and 0 <= int(col) < side):
-        raise ValueError(
-            f"({row}, {col}) is outside {field!r}'s ({side}, {side}) read-chunk block"
-        )
+        raise ValueError(f"({row}, {col}) is outside {field!r}'s ({side}, {side}) read-chunk block")
     rank = int(rowcol_to_rank(int(row), int(col), depth))
     target = int(morton_index)
     for span_start, span_stop in _stored_chunk_spans(arr):
