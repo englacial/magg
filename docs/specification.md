@@ -574,6 +574,23 @@ root** — data fields, the ragged vlen payload arrays and their
 `{field}_locations` siblings, `morton`, every coordinate — keyed by the
 array's **path relative to the leaf root** (e.g. `"8/morton"`).
 
+The scope is therefore **discovery-based**: both shipped implementations
+enumerate (`group.members(max_depth=None)`), so the key set is whatever named
+arrays exist under the leaf root, not what the template declared. That has
+one normative consequence a verifier MUST honour: **a key-set difference is a
+distinct outcome from a digest mismatch.** Debris inside a leaf — a foreign
+array prefix, the [issue #341](https://github.com/englacial/zagg/issues/341)
+Bug A class, an
+[issue #327](https://github.com/englacial/zagg/issues/327) `.zarr.status/`
+prefix — adds a key and so changes `combined`, which means a verifier
+comparing `combined` alone reports an intact leaf as tampered. A verifier MUST
+compare the per-array map first and report extra or missing keys as their own
+outcome ("extra array present" / "array missing"), reserving "mismatch" for a
+differing digest on a **shared** key. Hashing is the only path that
+enumerates: the read and fold paths open leaf arrays **by name** (no member
+enumeration, no LIST — [#344](https://github.com/englacial/zagg/pull/344)), so
+debris is inert everywhere else.
+
 ### 5.2 Per-array recipe
 
 **Contract.**
