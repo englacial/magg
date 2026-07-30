@@ -260,8 +260,18 @@ def agg(
         caller to have read access to the output bucket for the poll. Note the
         async request payload cap is 256 KB (vs 6 MB synchronous); pass
         ``"sync"`` for older deployed workers or extreme per-cell payloads
-        (granule-dense shards with large AOI masks). Ignored by the
-        ``"local"`` backend.
+        (granule-dense shards with large AOI masks). ``"event"`` (issue #327,
+        spatial point path only) keeps the same blocking call-shape, return
+        value, and exceptions, with the v2 status-object transport
+        underneath: fire-and-forget Event invokes (no ``result_url``),
+        futures resolved from the workers' always-on per-shard status
+        objects by ONE shared poller (one LIST per tick instead of per-shard
+        GETs), status-driven re-dispatch under the same ``max_retries``, a
+        distinct ``failed-unknown`` outcome for silently-dropped invokes,
+        and the run reattachable by run id (``zagg.client.Run.attach``).
+        Requires a worker deployed with the #327 status writes. The
+        benchmark harness and CI stay on ``"sync"`` — their metrics come
+        from invoke responses. Ignored by the ``"local"`` backend.
     force_cold : bool
         Lambda-only (issue #171), default ``False``. The explicit big-hammer
         for certification runs -- benchmark baselines, memory forensics, or
@@ -445,8 +455,10 @@ class SpatialStrategy:
             max_workers = min(max_workers, n_cells)
             if not store_path.startswith("s3://"):
                 raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
-            if invocation not in ("async", "sync"):
-                raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
+            if invocation not in ("async", "sync", "event"):
+                raise ValueError(
+                    f"Unknown invocation: {invocation!r} (expected 'async', 'sync', or 'event')"
+                )
             function_name = _resolve_function_name(config, function_name)
             return _run_lambda(
                 config,
@@ -1195,6 +1207,8 @@ class RasterStrategy:
         from botocore.config import Config
 
         if invocation not in ("async", "sync"):
+            # invocation="event" (issue #327) covers the spatial point path;
+            # the raster fan-out keeps the #286 async envelope channel.
             raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
         function_name = _resolve_function_name(config, function_name)
         max_workers = min(max_workers or 64, len(cells)) or 1
@@ -1681,6 +1695,8 @@ def _run_lambda_events(
             "the config so the collected rows are written"
         )
     if invocation not in ("async", "sync"):
+        # invocation="event" (issue #327) covers the spatial point path; the
+        # temporal fan-out keeps the #151 async envelope channel.
         raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
     function_name = _resolve_function_name(config, function_name)
 
@@ -3129,9 +3145,18 @@ def _run_lambda(
     run_id = uuid.uuid4().hex
     result_prefix = None
     result_box: dict = {}
+    status_prefix = None
     if invocation == "async":
         result_prefix = f"{store_path.rstrip('/')}.status/{run_id}"
         logger.info(f"Async worker results at {result_prefix}")
+    elif invocation == "event":
+        # v2 Event transport (issue #327): no per-shard result_url — futures
+        # resolve from the ALWAYS-ON per-shard status objects, one LIST of
+        # this prefix per poll tick.
+        from zagg.client_transport import run_status_prefix
+
+        status_prefix = run_status_prefix(store_path, run_id)
+        logger.info(f"Event-transport statuses at {status_prefix}")
 
     # Dispatch manifest block (issue #327): rides the setup invoke so the
     # WORKER records the run's shard set + identity at the status prefix (D8)
@@ -3275,6 +3300,47 @@ def _run_lambda(
             "metadata": catalog_data.get("metadata"),
             "granules": records,
         }
+        # v2 Event transport (issue #327): the SAME event construction as the
+        # sync/async paths (no result_url) fired fire-and-forget; the shard's
+        # future resolves from its always-on status object via the run's
+        # shared poller. Blocking on it here keeps the dispatch loop's
+        # call-shape (accumulator, summary, tail all unchanged); the poller
+        # owns the status-driven re-dispatches, and the pool width bounds
+        # dispatched-unresolved shards — the pacing the fleet's 60 s max
+        # event age makes load-bearing.
+        if invocation == "event":
+            cell_event = _build_cell_event(
+                grid.block_index(int(shard_key)),
+                int(shard_key),
+                parent_order,
+                child_order,
+                granule_urls,
+                store_path,
+                s3_creds,
+                config_dict=cell_config_dict,
+                output_creds_event=output_creds_event,
+                handoff=handoff,
+                profile=profile,
+                aoi_payload=extra.get("aoi_payload"),
+                window=window,
+                invoked_by=invoked_by,
+                run_id=run_id,
+            )
+            cell_payload = _cell_payload(cell_event, submap=submap, async_invoke=True, label=label)
+
+            def _fire(p=cell_payload):
+                state["lambda_client"].invoke(
+                    FunctionName=function_name, InvocationType="Event", Payload=p
+                )
+
+            fut = state["event_poller"].register(
+                int(shard_key),
+                label,
+                dispatch=_fire,
+                window=window["label"] if window is not None else None,
+                granule_count=len(granule_urls),
+            )
+            return fut.result()
         return _invoke_lambda_cell(
             state["lambda_client"],
             grid.block_index(int(shard_key)),
@@ -3368,6 +3434,21 @@ def _run_lambda(
     # preflight() runs the probe, builds the sized client, and sizes the pool.
     executor.preflight(len(cells))
     max_workers = state["workers"]
+
+    # v2 status poller (issue #327): one background thread resolving every
+    # in-flight shard from one LIST of the run's status prefix per tick.
+    # Default failure resolution (result dicts, never exceptions) keeps the
+    # accumulator's error counting identical to the sync/async paths; the
+    # drop deadline is function timeout + 60 s max event age + margin.
+    if invocation == "event":
+        from zagg.client_transport import StatusPoller, drop_timeout_s, open_status_store
+
+        _status_kwargs = _output_store_kwargs(output_creds_event, region)
+        state["event_poller"] = StatusPoller(
+            lambda: open_status_store(status_prefix, _status_kwargs),
+            drop_timeout_s=drop_timeout_s(state["function_timeout_s"]),
+            max_retries=max_retries,
+        ).start()
 
     # Create template via Lambda (flat only). The template write happens
     # inside the function so the orchestrator only needs
@@ -3473,6 +3554,8 @@ def _run_lambda(
         )
     finally:
         executor.shutdown()
+        if state.get("event_poller") is not None:
+            state["event_poller"].shutdown()
         # Stop the overlapped manifest checker and read its verdict (#274 Fix 2).
         # It ran the whole fan-out; stopping now wakes it from its interval wait
         # and joins cleanly (a final check already ran), leaving manifest_found
@@ -3664,7 +3747,10 @@ def _run_lambda(
         store_path,
         stats_rows,
         run_id=run_id,
-        result_prefix=result_prefix,
+        # The oversized-rows pointer: the #151 envelope prefix on async runs,
+        # the v2 status prefix on event runs (rows_from_status reads the
+        # ``stats`` record out of either object shape — issue #327).
+        result_prefix=result_prefix if result_prefix is not None else status_prefix,
         output_creds_event=output_creds_event,
         store_kwargs=_output_store_kwargs(output_creds_event, region),
         summary=summary,

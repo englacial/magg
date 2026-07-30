@@ -461,6 +461,11 @@ class StatusPoller:
     # -- the loop -------------------------------------------------------------
 
     def _run(self) -> None:
+        # Runs until shutdown(), never self-exits on "all done": registration
+        # may TRAIL start() (agg's pool registers shards as its threads reach
+        # them), so an empty/settled entry map is not proof the run is over.
+        # An idle tick with nothing in flight returns before the LIST, so a
+        # drained poller costs zero requests while it waits to be shut down.
         interval = self._initial_interval_s
         while not self._stop.is_set():
             try:
@@ -470,16 +475,10 @@ class StatusPoller:
                 # persistent one surfaces through the drop deadline instead.
                 logger.warning(f"status poll tick failed (retrying): {e}")
                 progressed = False
-            if self._all_done():
-                return
             interval = (
                 self._initial_interval_s if progressed else min(interval * 2, self._max_interval_s)
             )
             self._stop.wait(interval)
-
-    def _all_done(self) -> bool:
-        with self._lock:
-            return all(e.future.done() for e in self._entries.values())
 
     def _pending(self) -> list[_ShardEntry]:
         with self._lock:

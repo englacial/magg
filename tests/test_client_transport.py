@@ -121,23 +121,17 @@ class EventStubLambdaClient:
         if key in self._drop:
             return {"StatusCode": 202}
         if key in self._fail:
-            response = _envelope({"error": "boom", "shard_key": key}, status=500)
+            response = _envelope({"error": "boom"}, status=500)
         elif self._fail_times.get(key, 0) > 0:
             with self._lock:
                 self._fail_times[key] -= 1
-            response = _envelope({"error": "boom", "shard_key": key}, status=500)
+            response = _envelope({"error": "boom"}, status=500)
         elif key in self._benign:
-            response = _envelope({"error": "No granules found", "shard_key": key}, status=500)
+            response = _envelope({"error": "No granules found"})
         else:
-            response = _envelope(
-                {
-                    "shard_key": key,
-                    "total_obs": 7,
-                    "duration_s": 1.5,
-                    "phase_timings": {"read": 1.0},
-                    "stats": {"schema_version": 1, "shard_key": key, "run_id": event.get("run_id")},
-                }
-            )
+            # Same canned ok body as tests/test_client.py's v1 stub, so agg
+            # sync/event parity compares identical worker outputs.
+            response = _envelope({"total_obs": 7, "duration_s": 1.5})
         self._write_status(event, response)
         return {"StatusCode": 202}
 
@@ -478,6 +472,181 @@ class TestDropDetection:
         assert handle.status() == {"pending": 0, "ok": 2, "failed": 1}
         attempts = [e for _, _, e in stub.cell_events() if e["shard_key"] == _WORDS[0]]
         assert len(attempts) == 2  # the budget was spent on re-dispatches
+
+
+# -- agg invocation="event" (issue #327 phase 6) -----------------------------------
+
+
+class TestAggEventMode:
+    """``agg(..., invocation="event")``: the same blocking call-shape, return
+    value, and tail as sync, with Event dispatch + status-object resolution
+    underneath (espg ruling, session 2026-07-29). The benchmark harness and CI
+    stay on sync — their metrics come from invoke responses."""
+
+    @staticmethod
+    def _agg(catalog_file, monkeypatch, stub, invocation, **agg_kwargs):
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        from zagg import hive, runner
+        from zagg.concurrency import ConcurrencyReport
+
+        session = MagicMock()
+        session.client.side_effect = lambda service, **k: (
+            stub if service == "lambda" else MagicMock()
+        )
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: session)
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 900)
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                3,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: dict(_CREDS))
+        monkeypatch.setattr(hive, "read_manifest", lambda *a, **k: None)
+        return runner.agg(
+            default_config("atl06"),
+            catalog=catalog_file,
+            store=_STORE,
+            backend="lambda",
+            invocation=invocation,
+            function_name="process-shard-test",
+            max_workers=3,
+            **agg_kwargs,
+        )
+
+    @pytest.fixture
+    def catalog_file(self, catalog, tmp_path):
+        p = tmp_path / "shardmap.json"
+        p.write_text(json.dumps(catalog))
+        return str(p)
+
+    def test_agg_event_parity_with_sync(self, catalog_file, monkeypatch, status_store):
+        from test_client import StubLambdaClient
+
+        sync_stub = StubLambdaClient()
+        sync_summary = self._agg(catalog_file, monkeypatch, sync_stub, "sync")
+        event_stub = EventStubLambdaClient(status_store)
+        event_summary = self._agg(catalog_file, monkeypatch, event_stub, "event")
+
+        # Same return value shape and counts.
+        assert set(event_summary) == set(sync_summary)
+        for key in (
+            "total_cells",
+            "cells_with_data",
+            "cells_error",
+            "total_obs",
+            "backend",
+            "store_path",
+            "function_name",
+        ):
+            assert event_summary[key] == sync_summary[key], key
+
+        # Same cell events modulo InvocationType (+ per-run identity).
+        sync_cells = {e["shard_key"]: e for _, _, e in sync_stub.cell_events()}
+        event_cells = {e["shard_key"]: e for _, _, e in event_stub.cell_events()}
+        assert set(event_cells) == set(sync_cells) == set(_WORDS)
+        for key in _WORDS:
+            mine, theirs = dict(event_cells[key]), dict(sync_cells[key])
+            assert mine.pop("run_id") and theirs.pop("run_id")
+            assert mine == theirs
+        assert all(t == "Event" for _, t, _ in event_stub.cell_events())
+        assert all(t == "RequestResponse" for _, t, _ in sync_stub.cell_events())
+
+        # Same tail: identical worker-invoke mode sequence (ping, setup,
+        # finalize backstop, coverage, stats).
+        assert [m for m in event_stub.modes() if m] == [m for m in sync_stub.modes() if m]
+
+    def test_agg_event_records_a_failed_shard_like_sync(
+        self, catalog_file, monkeypatch, status_store
+    ):
+        from test_client import StubLambdaClient
+
+        sync_summary = self._agg(
+            catalog_file,
+            monkeypatch,
+            StubLambdaClient(fail={_WORDS[1]}),
+            "sync",
+            max_retries=1,
+        )
+        event_summary = self._agg(
+            catalog_file,
+            monkeypatch,
+            EventStubLambdaClient(status_store, fail={_WORDS[1]}),
+            "event",
+            max_retries=1,
+        )
+        for key in ("cells_error", "cells_with_data", "total_obs"):
+            assert event_summary[key] == sync_summary[key], key
+        assert event_summary["cells_error"] == 1
+        (bad,) = [r for r in event_summary["results"] if r.get("error")]
+        assert bad["error"] == "boom" and bad["shard_key"] == _WORDS[1]
+
+    def test_agg_event_drop_is_a_failed_cell(self, catalog_file, monkeypatch, status_store):
+        monkeypatch.setattr(ct, "drop_timeout_s", lambda timeout_s: 0.05)
+        summary = self._agg(
+            catalog_file,
+            monkeypatch,
+            EventStubLambdaClient(status_store, drop={_WORDS[0]}),
+            "event",
+            max_retries=1,
+        )
+        assert summary["cells_error"] == 1
+        (bad,) = [r for r in summary["results"] if r.get("error")]
+        assert bad["outcome"] == "failed-unknown"
+
+    def test_bogus_invocation_refused(self, catalog_file, monkeypatch, status_store):
+        with pytest.raises(ValueError, match="Unknown invocation"):
+            self._agg(
+                catalog_file, monkeypatch, EventStubLambdaClient(status_store), "carrier-pigeon"
+            )
+
+    def test_raster_fanout_refuses_event(self):
+        from zagg import runner
+
+        with pytest.raises(ValueError, match="Unknown invocation"):
+            runner.RasterStrategy()._run_lambda_shards(
+                default_config("atl06"),
+                [],
+                {},
+                None,
+                "s3://b/x.zarr",
+                times_us=[],
+                overwrite=False,
+                max_workers=1,
+                region="us-west-2",
+                function_name="f",
+                max_retries=1,
+                output_credentials=None,
+                output_endpoint_url=None,
+                invocation="event",
+            )
+
+    def test_temporal_fanout_refuses_event(self):
+        from zagg import runner
+
+        cfg = default_config("atl06")
+        cfg.output["format"] = "parquet"
+        with pytest.raises(ValueError, match="Unknown invocation"):
+            runner._run_lambda_events(
+                cfg,
+                [],
+                "s3://b/x.parquet",
+                max_workers=1,
+                region="us-west-2",
+                function_name="f",
+                invocation="event",
+            )
 
 
 # -- reattach (issue #327 phase 5) ------------------------------------------------

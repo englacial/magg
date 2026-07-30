@@ -473,8 +473,15 @@ def rows_from_status(status_prefix: str, *, store_kwargs: dict | None = None) ->
     def _record(key: str) -> dict | None:
         try:
             envelope = _json.loads(bytes(obstore.get(store, key).bytes()))
-            body = _json.loads(envelope.get("body", "{}"))
-            record = body.get("stats")
+            # Two object shapes share the prefix layout: the #151 result
+            # envelope carries the response body as a JSON STRING; the v2
+            # per-shard status object (issue #327) embeds it as a dict. The
+            # run prefix's non-shard objects (dispatch manifest, tail marker)
+            # parse fine and simply carry no ``stats`` record.
+            body = envelope.get("body", "{}")
+            if isinstance(body, str):
+                body = _json.loads(body or "{}")
+            record = (body or {}).get("stats") if isinstance(body, dict) else None
         except Exception as e:
             logger.warning(f"skipping unparsable status envelope {key}: {e}")
             return None
