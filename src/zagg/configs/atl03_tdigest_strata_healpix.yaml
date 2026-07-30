@@ -148,3 +148,4 @@ output:
     sharded: true
     child_order: 19              # leaf cell resolution (~10 m)
   store_layout: hive
+  pyramid: false                 # overview sweep opted out pending Phase E fleet sizing (issue #201)

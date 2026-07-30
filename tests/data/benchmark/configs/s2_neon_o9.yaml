@@ -29,6 +29,7 @@ output:
   # Hive: the promoted production default for HEALPix raster (issue #237,
   # ratified issue #272). One leaf zarr object per array per dispatch shard.
   store_layout: hive
+  pyramid: false                 # overview sweep opted out pending Phase E fleet sizing (issue #201)
   grid:
     type: healpix
     indexing_scheme: nested
