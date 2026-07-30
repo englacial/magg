@@ -407,9 +407,14 @@ within `O(n/510)`. The `n` inputs come from the `of` digests' total weights
 
 **Status: ratified design; implementation in flight
 ([#201](https://github.com/englacial/zagg/issues/201)).** The decisions this
-section records are ratified (D11/D22–D24 in
-[`design/sparse_coverage.md`](design/sparse_coverage.md) and the
-[#201 rulings](https://github.com/englacial/zagg/issues/201)); the grammar
+section records are ratified — D11/D22–D24 in
+[`design/sparse_coverage.md`](design/sparse_coverage.md), plus three rulings on
+the #201 thread that this section's grammar traces to directly:
+[`all.zarr` + `role: overview` confirmed, display schedule every 2 orders](https://github.com/englacial/zagg/issues/201#issuecomment-5025459421),
+[the D24 `none`-class ruling (per-field exclusion the default, declared derived summary the opt-in, never the semantic core)](https://github.com/englacial/zagg/issues/201#issuecomment-5025509889),
+and
+[the A/B/C/D option space (C an espg-flagged opt-in phase, D rejected)](https://github.com/englacial/zagg/issues/201#issuecomment-5025519604);
+the grammar
 below is what the #201 implementation lands and what moczarr's level-node
 reader plans against (espg/moczarr#15, the 8b seam). Any divergence
 discovered while landing #201 is resolved **on this section first** — the
@@ -588,9 +593,12 @@ overview family under the versioned `pyramid` block:
   derivation (e.g. an auto-digest of a roster field's raw values), living in
   the pyramid block and **never** in the semantic core — leaf truth is
   unchanged, and overview schema never silently differs from source except
-  by declaration. (Ruled on the
-  [#201 thread](https://github.com/englacial/zagg/issues/201); deterministic
-  seeded subsampling is deferred; roster concatenation is rejected.)
+  by declaration. ([Ruled on the #201 thread](https://github.com/englacial/zagg/issues/201#issuecomment-5025509889);
+  deterministic seeded subsampling is **deferred as an opt-in phase, not
+  rejected** — it shares this block's declaration grammar and stays
+  declared/never-default when it lands
+  ([option space](https://github.com/englacial/zagg/issues/201#issuecomment-5025519604));
+  roster concatenation is rejected.)
 - The sweep MAY additionally record materialized-actuals bookkeeping in the
   block; the template-time declaration above is never rewritten by the
   sweep, and the `pyramid` block is excluded from the manifest's frozen
