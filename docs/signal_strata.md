@@ -56,9 +56,11 @@ ones, and one lane layout serves every product.
 ## Merge law
 
 `merge_composition(word_a, n_a, word_b, n_b)` folds lanes as the
-digest-weighted mean, re-quantized with the same presence floor — an
-order-independent monoid whose `n` inputs come from the signal digests' total
-weights. The law is normative in
+digest-weighted mean, re-quantized with the same presence floor — symmetric,
+and associative **up to the bounded re-quantization error** (fold order never
+affects presence; it affects counts only within `O(n/510)`, so folds are not
+byte-stable across orders) — whose `n` inputs come from the signal digests'
+total weights. The law is normative in
 [spec §3.4](specification.md#34-merge-law) (a reader may fold views, so it is
 part of the store contract, not a zagg implementation detail).
 

@@ -31,7 +31,9 @@ empties lanes rather than shifting them (``threshold=4`` ⇒ ``low``/``med``
 structurally 0), which keeps one lane layout across every product; see
 :func:`pack_composition`.
 
-Merge law (order-independent monoid over ``(word, n)`` pairs)::
+Merge law over ``(word, n)`` pairs — symmetric, and associative up to the
+bounded re-quantization error (presence is order-independent exactly; counts
+only within ``O(n/510)``, so folds are not byte-stable across orders)::
 
     lane_merged = quantize((n_a * lane_a + n_b * lane_b) / (n_a + n_b))
 
