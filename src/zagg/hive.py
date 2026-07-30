@@ -400,32 +400,49 @@ def validate_manifest(
                 f"data (e.g. {children[0]!r}/), and overwrite replaces the "
                 f"manifest only — clear the store root first"
             )
-    if (
-        overwrite
-        and existing is not None
-        and frozen_matches
-        and existing.get("semantic_hash") is None
-        and manifest.get("semantic_hash") is not None
-    ):
-        # Hash-guard coherence (issue #341): ``_frozen_matches`` EXEMPTS
-        # ``semantic_hash`` when the existing manifest predates #299 (no hash
-        # to compare — the exemption keeps old stores resumable), so this
-        # overwrite proceeds even though the existing data's semantics cannot
-        # be verified. The store it leaves IS coherent going forward — the
-        # manifest rewrite stamps the run's hash, and every re-dispatched
-        # leaf is re-templated wholesale (``emit_shard_template`` clears the
-        # leaf prefix first) — but leaves this run does not rewrite may carry
-        # the old schema, so say so when shard data already exists.
+    # Hash-guard coherence (issue #341): ``_frozen_matches`` EXEMPTS
+    # ``semantic_hash`` when EITHER side lacks it (no hash to compare — the
+    # exemption keeps pre-#299 stores resumable), so an overwrite proceeds past
+    # a comparison that never happened. Warn on BOTH directions of that
+    # exemption (fold review: the guard was asymmetric where the exemption is
+    # symmetric), because they fail differently:
+    #
+    # * existing has no hash, this run does  -> the existing DATA's semantics are
+    #   unverifiable. The store is coherent going forward (the rewrite stamps
+    #   this run's hash, and every re-dispatched leaf is re-templated wholesale
+    #   — ``emit_shard_template`` clears the leaf prefix first) but leaves this
+    #   run does not rewrite may carry the old schema.
+    # * existing HAS a hash, this run does not -> the overwrite strips the
+    #   recorded hash from a hashed store, un-provenancing a #299 store rather
+    #   than merely failing to verify one. Strictly the worse direction, and the
+    #   one no warning covered.
+    #
+    # ``build_manifest`` always stamps a hash, so the second direction is not
+    # reachable from a zagg-built manifest today — it is the "older zagg (or a
+    # hand-assembled manifest) writes into a newer store" shape, one refactor of
+    # ``build_manifest`` away from being live.
+    hash_exempted = existing is not None and (existing.get("semantic_hash") is None) != (
+        manifest.get("semantic_hash") is None
+    )
+    if overwrite and frozen_matches and hash_exempted:
         listing = obstore.list_with_delimiter(store)
         children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
         if any(_is_base_component(c) for c in children):
-            logger.warning(
-                f"overwriting {MANIFEST_NAME} at {store_root}: the existing manifest "
-                f"predates semantic hashing (issue #299), so semantic compatibility "
-                f"of the existing shard data cannot be verified; re-dispatched leaves "
-                f"are re-templated wholesale, but leaves this run does not rewrite "
-                f"may carry the old schema"
-            )
+            if existing.get("semantic_hash") is None:
+                detail = (
+                    "the existing manifest predates semantic hashing (issue #299), so "
+                    "semantic compatibility of the existing shard data cannot be "
+                    "verified; re-dispatched leaves are re-templated wholesale, but "
+                    "leaves this run does not rewrite may carry the old schema"
+                )
+            else:
+                detail = (
+                    "this run's manifest carries NO semantic hash while the existing "
+                    "one does (issue #299), so the overwrite DROPS the recorded hash "
+                    "from a hashed store — the existing shard data becomes "
+                    "un-provenanced, not merely unverified"
+                )
+            logger.warning(f"overwriting {MANIFEST_NAME} at {store_root}: {detail}")
     return existing
 
 
