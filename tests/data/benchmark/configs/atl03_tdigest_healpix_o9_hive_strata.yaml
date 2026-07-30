@@ -1,0 +1,140 @@
+# ATL03 t-digest, SIGNAL/NOISE STRATIFIED epoch config -- o9 HIVE benchmark arm.
+#
+# The issue #321/#265 schema-epoch candidate at benchmark geometry: identical to
+# atl03_tdigest_healpix_o9_hive.yaml in data_source read shape and output grid,
+# with the aggregation replaced by the ratified strata trio (PR #334, mirroring
+# the shipped atl03_tdigest_strata_healpix.yaml at o9 instead of o11):
+#
+#   - h_tdigest_signal / h_tdigest_noise -- disjoint located digests split at
+#     ingest by the ATBD union predicate (any signal_conf_ph column >= 2), each
+#     centroid carrying its order-29 morton word (located strata is the
+#     default per the PR #334 ruling)
+#   - composition -- one packed uint64/cell (zagg-composition/1)
+#
+# The five conf columns ride the per-variable ``column`` selector off the same
+# 2-D dataset the TEP filter already reads (path deduped -- no extra read).
+#
+# A/B ladder on the pinned densest NEON o9 shard (all sidecar/spill/4GB-disk):
+#   tdigest_healpix_o9_hive_sidecar  (live baseline)
+#   tdigest_healpix_o9_hive_located  (+ located channel, PR #324)
+#   tdigest_healpix_o9_hive_strata   (this: + strata split + composition)
+# so strata-vs-located isolates the split+composition cost and strata-vs-live
+# gives the total epoch delta. Located ragged => non-mergeable => single-block
+# spill only (same caveat as the located arm; fine on this shard).
+data_source:
+  # issue #193: the sharded inline-vs-sidecar matrix. The read backend is set
+  # per target (index_backend: inline|sidecar) by run_benchmark; granule-level
+  # read concurrency is pinned to K=4 (issue #180 sizing sweet spot).
+  granule_workers: 4
+  reader: h5coro
+  driver: s3
+  groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
+  coordinates:
+    latitude: "/{group}/heights/lat_ph"
+    longitude: "/{group}/heights/lon_ph"
+  variables:
+    h_ph: "/{group}/heights/h_ph"
+    signal_conf_land: {path: "/{group}/heights/signal_conf_ph", column: 0}
+    signal_conf_ocean: {path: "/{group}/heights/signal_conf_ph", column: 1}
+    signal_conf_sea_ice: {path: "/{group}/heights/signal_conf_ph", column: 2}
+    signal_conf_land_ice: {path: "/{group}/heights/signal_conf_ph", column: 3}
+    signal_conf_inland_water: {path: "/{group}/heights/signal_conf_ph", column: 4}
+  filters:
+    - dataset: "/{group}/heights/signal_conf_ph"
+      column: 0                  # land surface type; TEP is uniform across columns
+      op: ne
+      value: -2
+  base_level: photons
+  levels:
+    photons:
+      path: "/{group}/heights"
+      coordinates: {latitude: lat_ph, longitude: lon_ph}
+      link: null
+    segments:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: reference_photon_lat, longitude: reference_photon_lon}
+      link:
+        to: photons
+        index_beg: "/{group}/geolocation/ph_index_beg"
+        count: "/{group}/geolocation/segment_ph_cnt"
+        index_base: 1            # ATL03 ph_index_beg is 1-based per the v3 dict
+  read_plan:
+    spatial_index: segments
+    pad: 1                       # one segment of padding on each side per #43
+
+aggregation:
+  coordinates:
+    cell_ids:
+      dtype: uint64
+      fill_value: 0
+    morton:
+      dtype: uint64
+      fill_value: 0
+  variables:
+    count:
+      function: len
+      source: h_ph
+      dtype: int32
+      fill_value: 0
+    h_tdigest_signal:
+      kind: ragged
+      function: "zagg.stats.tdigest.build_tdigest_where"
+      source: h_ph
+      location: leaf_id
+      inner_shape: [2]
+      params:
+        delta: 256
+        where: >-
+          (signal_conf_land >= 2) | (signal_conf_ocean >= 2) |
+          (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) |
+          (signal_conf_inland_water >= 2)
+      dtype: float32
+      fill_value: 0
+      attrs:
+        stratum: signal
+        signal_threshold: 2
+    h_tdigest_noise:
+      kind: ragged
+      function: "zagg.stats.tdigest.build_tdigest_where"
+      source: h_ph
+      location: leaf_id
+      inner_shape: [2]
+      params:
+        delta: 256
+        where: >-
+          ~((signal_conf_land >= 2) | (signal_conf_ocean >= 2) |
+          (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) |
+          (signal_conf_inland_water >= 2))
+      dtype: float32
+      fill_value: 0
+      attrs:
+        stratum: noise
+        signal_threshold: 2
+    composition:
+      function: "zagg.stats.composition.pack_composition"
+      source: h_ph
+      dtype: uint64
+      fill_value: 0
+      params:
+        conf_land: signal_conf_land
+        conf_ocean: signal_conf_ocean
+        conf_sea_ice: signal_conf_sea_ice
+        conf_land_ice: signal_conf_land_ice
+        conf_inland_water: signal_conf_inland_water
+        threshold: 2
+      attrs:
+        composition:
+          spec: zagg-composition/1
+          lanes: [land, ocean, sea_ice, land_ice, inland_water, low, med, high]
+          of: h_tdigest_signal
+          threshold: 2
+
+output:
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 9              # shard / dispatch unit: 4^(19-9) = 1024x1024 cells
+    chunk_inner: 13              # inner Zarr chunk: 4^(19-13) = 64x64 cells (K=256 per shard)
+    sharded: true                # issue #193: sharded output fixed on for the matrix
+    child_order: 19              # leaf cell resolution (~10 m)
+  store_layout: hive             # issue #240: the hive regression arm (leaf zarr per shard)
