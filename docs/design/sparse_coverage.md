@@ -61,8 +61,12 @@ contract: [mortie #48](https://github.com/espg/mortie/issues/48) discussion →
 [`docs/specification.md`](https://github.com/espg/mortie/blob/main/docs/specification.md),
 the normative page). Grammars and constants are normative **there only**;
 this registry records decisions and rationale and cites the page (the #305
-acceptance criterion — duplicated normative text drifts). Summary of
-what zagg consumes:
+acceptance criterion — duplicated normative text drifts). The
+**array-level** contracts *inside* a leaf — the ragged vlen layout, digest
+payload bytes, composition word, overview attrs, O11 hashes — are normative
+on zagg's own [`specification.md`](../specification.md)
+([issue #340](https://github.com/englacial/zagg/issues/340)), under the same
+division of labor. Summary of what zagg consumes:
 
 ```
 {store_root}/                    <- multi-product form (D19): a directory of
