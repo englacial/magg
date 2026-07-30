@@ -735,9 +735,18 @@ point of the revision):
   MUST NOT require the attrs block on a `/2` array.
 - A located `/2` payload array still declares its sibling binding in
   **metadata, never by naming convention** (the §1.2 rule survives the
-  revision); the exact attrs key is reserved for the `/2` implementation PR
-  to pin *in this section* before any `/2` store exists. The
-  sibling-alignment semantics of §1.1 are unchanged.
+  revision), and it does so under a **new top-level attrs key** — not a
+  residual `ragged` block with `spec`/`element` dropped. "Retired" is
+  literal: no `ragged` key is written on a `/2` array. That is a ruling, not
+  a leftover choice — a `ragged` block carrying only `locations` would be, by
+  §1.2's own words, an array with no well-formed `element` declaration, which
+  a `/1`-only reader MUST refuse with a pointed "not a `zagg-ragged/1` array"
+  error, i.e. the misleading path instead of the actionable "install
+  `zarr-vlen-ndarray`" one below. The `ragged` key stays **reserved but
+  unwritten** under `/2` (config-declared attrs still MUST NOT shadow it), and
+  the new key's exact name is for the `/2` implementation PR to pin *in this
+  section* before any `/2` store exists. The sibling-alignment semantics of
+  §1.1 are unchanged.
 - An array with the `variable_length_bytes`/`bytes` dtype and a
   `spec: "zagg-ragged/1"` attrs block **is** `zagg-ragged/1`.
 - A reader without the `vlen-ndarray` extension installed MUST surface an
