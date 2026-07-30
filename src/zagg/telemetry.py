@@ -385,6 +385,7 @@ def write_run_parquet(
     run_id: str,
     timestamp: str | None = None,
     store_kwargs: dict | None = None,
+    finalize_error: str | None = None,
 ) -> str:
     """PUT the run-level stats parquet at the store root (issue #297 phase 3).
 
@@ -400,6 +401,12 @@ def write_run_parquet(
     worker-invoke transport (issue #313): the dispatcher names the object at
     dispatch so ``summary["run_stats_path"]`` is knowable without reading the
     fire-and-forget worker's response.
+
+    ``finalize_error`` is the one RUN-level column (issue #335): the guarded
+    finalize's failure string (``None`` on a clean run), broadcast constant
+    across the rows like ``run_id``/``n_shards`` already are, so a postmortem
+    can tell "finalize failed" from "the run never happened" off the parquet
+    alone. Always written, so the column set is the same every run.
     """
     import tempfile
 
@@ -412,6 +419,8 @@ def write_run_parquet(
         raise ValueError("write_run_parquet requires at least one row")
     key = run_parquet_key(run_id, timestamp)
     df = pd.DataFrame(rows)
+    # Run-level (issue #335): constant down the column, None on a clean run.
+    df["finalize_error"] = finalize_error
     # Packed morton shard keys exceed 2^53 (and int64 for high base cells), so
     # the DataFrame's float64 inference on a column that mixes ints with
     # failure-row ``None``s silently corrupts them (issue #300 — the sweep's

@@ -3753,6 +3753,29 @@ class TestDispatchRunStats:
         assert runner._dispatch_run_stats(client, "fn", "s3://b/x", [], run_id="r") is None
         assert client.events == []
 
+    def test_finalize_error_rides_the_event(self):
+        """Issue #335: the deferred finalize failure goes ON THE WIRE, so the
+        worker can stamp it into the run parquet — always present, None on a
+        clean run (same determinism rule as summary["run_stats_path"])."""
+        from zagg import runner
+
+        client = self._Client()
+        runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/out.zarr",
+            self._rows(),
+            run_id="rid",
+            finalize_error="RuntimeError: invoke failed",
+        )
+        (event,) = client.events
+        assert event["finalize_error"] == "RuntimeError: invoke failed"
+
+        clean = self._Client()
+        runner._dispatch_run_stats(clean, "fn", "s3://b/out.zarr", self._rows(), run_id="rid")
+        (event,) = clean.events
+        assert event["finalize_error"] is None  # key present, not absent
+
 
 class TestRunStatsRows:
     """Run-parquet row building from lambda dispatch results (issue #297)."""
@@ -4237,6 +4260,7 @@ class TestFinalizeGuard:
         def fake_stats(*a, **k):
             events.append("stats")
             captured["summary"] = k.get("summary")
+            captured["stats_finalize_error"] = k.get("finalize_error")
 
         monkeypatch.setattr(runner, "_dispatch_run_stats", fake_stats)
         monkeypatch.setattr(sweep_mod, "leaves_from_stats_records", lambda *a, **k: [123])
@@ -4262,7 +4286,7 @@ class TestFinalizeGuard:
     _TAIL = ["coverage", "stats", "sweep"]
 
     def test_success_path_unchanged(self, monkeypatch, atl06_config):
-        run, events, sleeps, _captured = self._drive(
+        run, events, sleeps, captured = self._drive(
             monkeypatch, atl06_config, finalize=lambda: None
         )
         with warnings.catch_warnings(record=True) as caught:
@@ -4271,6 +4295,7 @@ class TestFinalizeGuard:
         assert events == ["finalize"] + self._TAIL  # one attempt, tail as before
         assert sleeps == []  # no backoff on the success path
         assert summary["finalize_error"] is None  # always-present, None on success
+        assert captured["stats_finalize_error"] is None  # ... and on the wire too
         assert not [w for w in caught if "finalize" in str(w.message)]
 
     def test_retry_succeeds_warns_sleeps_no_raise(self, monkeypatch, atl06_config):
@@ -4302,6 +4327,10 @@ class TestFinalizeGuard:
         assert events == ["finalize", "finalize"] + self._TAIL  # full tail ran
         assert sleeps == [5]  # exactly one retry, no more
         assert captured["summary"]["finalize_error"] == "RuntimeError: invoke failed"
+        # ...and it is HANDED TO THE RUN-STATS DISPATCH (issue #335 fold): the
+        # worker stamps it into the parquet, which is the durable record a
+        # postmortem reads — this summary dict never leaves the raising call.
+        assert captured["stats_finalize_error"] == "RuntimeError: invoke failed"
         # Message contract mirrors the PR #333 client facade: store path +
         # shard-outputs-written + stale-manifest + idempotent re-invoke.
         msgs = [str(w.message) for w in caught if "manifest backstop" in str(w.message)]
