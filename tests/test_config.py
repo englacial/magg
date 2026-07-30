@@ -2495,3 +2495,57 @@ class TestWorkerBlock:
         )
         with pytest.raises(ValueError, match=r"worker\.memory must be one of"):
             validate_config(cfg)
+
+
+class TestNanAmbiguousReductionWarning:
+    """Plain min/max/sum + NaN fill warns at validation (espg ruling, issue #201).
+
+    Warning, never error: NaN data is the same bytes as the fill at read, so
+    the reduction behaves as its nan-skipping form downstream (the pyramid
+    block declares ``nan_policy: "skip"``); declaring the ``nan*`` form states
+    that explicitly and silences the warning. The shipped atl06 config trips
+    it by design and must stay valid.
+    """
+
+    def _cfg(self, function, **meta):
+        return {
+            "pipeline": {"type": "spatial"},
+            "data_source": {
+                "reader": "h5coro",
+                "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+                "variables": {"h": "/h"},
+            },
+            "aggregation": {
+                "variables": {
+                    "x": {"source": "h", "function": function, "dtype": "float32", **meta}
+                }
+            },
+            "output": {
+                "store": ".",
+                "grid": {"type": "healpix", "parent_order": 6, "child_order": 12},
+            },
+        }
+
+    def test_min_with_explicit_nan_fill_warns(self, caplog):
+        validate_config(load_config_from_dict(self._cfg("min", fill_value="NaN")))
+        assert "indistinguishable from fill" in caplog.text
+        assert "nanmin" in caplog.text and "issue #201" in caplog.text
+
+    def test_float_default_fill_warns_too(self, caplog):
+        # No fill_value declared: floats default to the NaN sentinel — the
+        # exact posture of the shipped atl06 h_min/h_max declarations.
+        validate_config(load_config_from_dict(self._cfg("max")))
+        assert "nanmax" in caplog.text and "indistinguishable from fill" in caplog.text
+
+    def test_nan_form_is_silent(self, caplog):
+        validate_config(load_config_from_dict(self._cfg("nanmin", fill_value="NaN")))
+        assert "indistinguishable from fill" not in caplog.text
+
+    def test_non_nan_fill_is_silent(self, caplog):
+        validate_config(load_config_from_dict(self._cfg("min", fill_value=0.0)))
+        assert "indistinguishable from fill" not in caplog.text
+
+    def test_shipped_atl06_warns_and_stays_valid(self, caplog):
+        cfg = default_config("atl06")  # h_min/h_max: min/max, float32, NaN default
+        validate_config(cfg)  # must NOT raise
+        assert "h_min" in caplog.text and "h_max" in caplog.text

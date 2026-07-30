@@ -74,6 +74,99 @@ FINGERPRINT_HEX = 12
 GRID_SPATIAL_KEYS = ("crs", "resolution", "bounds")
 
 
+#: D24 exact merge laws: aggregator name -> fold law. These are the reducers
+#: whose per-cell outputs compose EXACTLY across cell orders — count/sum by
+#: addition, min/max by extremum — so an up-tree fold of leaf values equals a
+#: direct aggregation at the coarser order, byte for byte (§8.3). Names are
+#: matched after :func:`_fold_function_name` normalization, so ``min``,
+#: ``np.min`` and ``numpy.min`` all key the same law.
+#:
+#: The plain and nan-aware variants share a law ON PURPOSE, and the exactness
+#: claim is against the **nan-skipping** reduction for both (review finding,
+#: issue #201): a leaf's stored NaN is the same bytes whether it is the fill
+#: sentinel or a NaN datum, so nothing downstream can tell them apart —
+#: :func:`zagg.sweep_overview.fold_dense` skips both, and the overview records
+#: :data:`zagg.sweep_overview.EXACT_NAN_POLICY` per field so a reader knows
+#: which reduction it actually got. A NaN-propagating ``min``/``max``/``sum``
+#: is unrecoverable at this seam, not merely unimplemented.
+EXACT_MERGE_LAWS = {
+    "len": "sum",
+    "count": "sum",
+    "sum": "sum",
+    "nansum": "sum",
+    "min": "min",
+    "nanmin": "min",
+    "max": "max",
+    "nanmax": "max",
+}
+
+#: The three D24 composability classes, weakest first. ``exact`` folds byte-
+#: equal; ``approximate`` merges natively but order-dependently (t-digests —
+#: ``np.isclose`` equality, the merge-vs-spill epistemic class); ``none`` has
+#: no merge law and exists only at native resolution (per-field exclusion —
+#: the ruled D24 default, issue #201).
+COMPOSABILITY_CLASSES = ("none", "approximate", "exact")
+
+
+def _fold_function_name(name) -> str | None:
+    """Normalize an aggregator ``function`` name for merge-law lookup.
+
+    ``np.``/``numpy.`` prefixes strip (they resolve to the same callables in
+    :func:`zagg.config.resolve_function`); other dotted paths pass through
+    unchanged (their laws are keyed by full path, e.g. the t-digest builders).
+    """
+    if not isinstance(name, str):
+        return None
+    for prefix in ("np.", "numpy."):
+        if name.startswith(prefix):
+            return name.removeprefix(prefix)
+    return name
+
+
+def field_composability(meta: dict) -> str:
+    """The D24 composability class of one aggregation field's metadata.
+
+    Derived from the field's aggregator via the merge-law flags the #217
+    mergeable-reducer machinery already established (the same set
+    ``validate_streaming`` accepts, widened by the exact sum/min/max laws):
+
+    - ``exact`` — scalar ``function`` in :data:`EXACT_MERGE_LAWS`;
+    - ``approximate`` — an unlocated ragged t-digest field with the standard
+      ``(2,)`` centroid inner shape (merge is order-dependent; ``np.isclose``
+      equality class, cf. D24);
+    - ``none`` — everything else: expressions, vector fields, chunk-resolution
+      companions, located ragged (no streaming merge law for the location
+      channel yet), and any scalar reducer without an exact law (mean, std,
+      median, quantiles, ...).
+    """
+    from zagg.config import get_output_signature
+
+    sig = get_output_signature(meta)
+    if meta.get("expression") is not None or sig["resolution"] != "cell":
+        return "none"
+    function = _fold_function_name(meta.get("function"))
+    if sig["kind"] == "ragged":
+        from zagg.processing.streaming import _TDIGEST_FUNCTIONS
+
+        if (
+            sig["location"] is None
+            and meta.get("function") in _TDIGEST_FUNCTIONS
+            and tuple(sig["inner_shape"]) == (2,)
+        ):
+            return "approximate"
+        return "none"
+    if sig["kind"] == "scalar" and function in EXACT_MERGE_LAWS:
+        return "exact"
+    return "none"
+
+
+def composability_classes(config: PipelineConfig) -> dict[str, str]:
+    """``{field_name: composability class}`` for every aggregation field (D24)."""
+    from zagg.config import get_agg_fields
+
+    return {name: field_composability(meta) for name, meta in get_agg_fields(config).items()}
+
+
 def _without(mapping: dict, keys: tuple[str, ...]) -> dict:
     return {k: v for k, v in (mapping or {}).items() if k not in keys}
 
@@ -160,10 +253,14 @@ def semantic_fingerprint(digest: str) -> str:
 
 __all__ = [
     "AGGREGATION_PACKAGING_KEYS",
+    "COMPOSABILITY_CLASSES",
     "DATA_SOURCE_PACKAGING_KEYS",
+    "EXACT_MERGE_LAWS",
     "FINGERPRINT_HEX",
     "GRID_SPATIAL_KEYS",
     "canonical_semantic_json",
+    "composability_classes",
+    "field_composability",
     "semantic_core",
     "semantic_fingerprint",
     "semantic_hash",

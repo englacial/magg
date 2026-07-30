@@ -41,9 +41,9 @@ leaf zarr** under a morton digit tree::
   root ``coverage.moc`` (issue #200 phase 3, default-on for hive) is a
   shard-order ranges MOC at the store root — the second root-only object,
   written fail-open by the dispatcher (locally) or a fire-and-forget worker
-  invoke (Lambda), and a regenerable cache under D9. The pyramid sweep (§7)
-  is a follow-on; the manifest's ``pyramid`` block is declared-only in round
-  one (D11/D12).
+  invoke (Lambda), and a regenerable cache under D9. The manifest's
+  ``pyramid`` block declares the overview schedule at template time and the
+  §7 sweep populates its actuals (D11/D22 — issue #201).
 """
 
 from __future__ import annotations
@@ -285,9 +285,13 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
     ``grid`` supplies the orders; ``dataset`` (typically the ShardMap's
     ``metadata``) supplies identity — only ``short_name`` and ``version`` are
     recorded. The split schedule is implicit under D2 (one digit per level down
-    to the shard order) but recorded explicitly for forward compatibility; the
-    ``pyramid`` block is declared-only in round one (D11: overviews are a
-    second-pass sweep, never written at fan-out time).
+    to the shard order) but recorded explicitly for forward compatibility. The
+    ``pyramid`` block carries the template-time overview declaration —
+    per-family order schedule + per-field D24 composability classes
+    (:func:`zagg.sweep_overview.build_pyramid_block`, issue #201); the §7
+    sweep populates ``materialized`` actuals but never rewrites the
+    declaration (overviews are a second-pass sweep, never written at
+    fan-out time — D11).
 
     ``windowing`` (issue #246) is the normalized declaration from
     :func:`zagg.config.get_windowing`; when given, the manifest declares
@@ -299,6 +303,7 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
     manifest byte-identical to pre-windowing runs.
     """
     from zagg.semantics import semantic_hash
+    from zagg.sweep_overview import build_pyramid_block
 
     dataset = dataset or {}
     manifest = {
@@ -318,7 +323,7 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
         # stores are retroactively 1 (the _frozen normalization); new stores
         # declare it explicitly.
         "path_grouping": 1,
-        "pyramid": {"orders": [], "aggregation": {}},
+        "pyramid": build_pyramid_block(grid.config, int(grid.parent_order)),
         "generated_at": _utcnow(),
     }
     if windowing:

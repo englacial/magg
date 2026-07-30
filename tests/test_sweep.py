@@ -363,13 +363,17 @@ class TestMocRollup:
         _put_leaf(tmp_path, "-311")
         _stamp_leaf(tmp_path, "-311")
         summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
-        assert set(summary["families"]) == {"stats", "moc", "submap"}
+        assert set(summary["families"]) == {"stats", "moc", "submap", "overview"}
         assert _rollup(tmp_path, "-3", family="stats") is not None
         assert _rollup(tmp_path, "-3", family="moc") is not None
         # No leaf sub-map was written -> the submap family finds nothing and
         # stays empty without failing the pass.
         assert summary["families"]["submap"]["empty"] >= 1
         assert _rollup(tmp_path, "-3", family="submap") is None
+        # The fixture manifest carries no pyramid overview declaration
+        # (template-time, issue #201) -> the overview family no-ops.
+        assert summary["families"]["overview"]["declared"] is False
+        assert summary["families"]["overview"]["written"] == 0
 
 
 SUBMAP_SIG = {
@@ -626,7 +630,7 @@ class TestFamilyRegistry:
 
     @pytest.mark.parametrize(
         ("name", "marker"),
-        [("overview", "issue #201"), ("debris", "not implemented")],
+        [("debris", "not implemented")],
     )
     def test_stub_families_refuse_with_pointer(self, name, marker):
         assert name in sweep_mod.FAMILIES  # registered slot stays visible
@@ -637,8 +641,14 @@ class TestFamilyRegistry:
         except NotImplementedError as e:
             assert marker in str(e)
 
+    def test_overview_family_is_available(self):
+        # Issue #201: the reserved slot is implemented — a whole-tree family
+        # (sweep_store hook), not a per-node JSON fold.
+        fam = get_family("overview")
+        assert callable(fam.sweep_store)
+
     def test_default_families_are_the_implemented_set(self):
-        assert sweep_mod.DEFAULT_FAMILIES == ("stats", "moc", "submap")
+        assert sweep_mod.DEFAULT_FAMILIES == ("stats", "moc", "submap", "overview")
 
 
 def _run_record(root, rows, run_id="r1"):

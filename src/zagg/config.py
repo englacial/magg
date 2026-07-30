@@ -2,6 +2,7 @@
 
 import importlib
 import inspect
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ import numpy as np
 import yaml
 
 import zagg.configs
+
+logger = logging.getLogger(__name__)
 
 
 class LinkDict(TypedDict):
@@ -856,6 +859,13 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
             "output.sweep requires output.store_layout: hive (the rollup sweep "
             "folds hive-tree leaf artifacts; flat stores have no digit tree)"
         )
+    # Overview pyramid declaration (issue #201): explicit blocks are grammar-
+    # checked here; the D24 none-field warning fires at manifest build time
+    # (template time for the store), not per config validation. The NaN-fill
+    # reduction warning below IS per config validation (espg ruling on the
+    # PR #344 nan-policy finding): it concerns the store encoding itself.
+    _validate_pyramid(config)
+    _warn_nan_ambiguous_reductions(config)
 
 
 def _validate_windowing(config: PipelineConfig) -> None:
@@ -1038,6 +1048,17 @@ def _validate_windowing_windows(block: dict, schedule: str) -> None:
             start, end = _windows.parse_utc(entry["start"]), _windows.parse_utc(entry["end"])
         except ValueError as e:
             raise ValueError(f"output.windowing.windows: {e}") from e
+        if label == _windows.SCHEDULE_NONE_TOKEN:
+            # The opaque grammar admits it, but the token names the unwindowed
+            # / all-time artifact everywhere (leaf_name_v3, the D23 overview
+            # basename and its envelope key), so an explicit window by this
+            # name would ALIAS the all-time fold — the per-window overview gets
+            # overwritten and never regenerates (review finding, issue #201).
+            raise ValueError(
+                f"explicit window label {label!r} is the reserved schedule:none token "
+                f"(SCHEDULE_NONE_TOKEN, D23) — it would alias the all-time artifact; "
+                f"declare a different explicit label"
+            )
         if not start < end:
             raise ValueError(
                 f"explicit window {label!r} is not half-open: start "
@@ -2298,6 +2319,137 @@ def get_sweep(config: PipelineConfig) -> bool:
     if flag is None:
         return get_store_layout(config) == "hive"
     return bool(flag)
+
+
+def get_pyramid(config: PipelineConfig) -> dict | None:
+    """The overview pyramid declaration knob, or ``None`` when disabled (#201).
+
+    ``output.pyramid`` shapes the manifest's template-time pyramid block
+    (``zagg.sweep_overview.build_pyramid_block``): absent/null returns ``{}``
+    — the defaults apply (an every-2-orders overview schedule below the shard
+    order, the espg-ratified display default; no all-time fold) — and
+    ``false`` returns ``None``, declaring the overview family OFF for the
+    store. An explicit mapping may carry ``spacing`` (int >= 1), ``orders``
+    (explicit ancestor orders, winning over ``spacing``), ``all_time``
+    (bool: also maintain the ``all.zarr`` cross-window fold on windowed
+    stores), and ``summarize`` (the D24 opt-in derived-summary declarations,
+    ``{source_field: {"as": name, ...}}`` — recorded in the pyramid block,
+    never the semantic core).
+    """
+    raw = config.output.get("pyramid")
+    if raw is False:
+        return None
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"output.pyramid must be a mapping or false (got {raw!r})")
+    return dict(raw)
+
+
+def _validate_pyramid(config: PipelineConfig) -> None:
+    """Validate the ``output.pyramid`` knob's grammar (issue #201).
+
+    Only an EXPLICIT block is checked (absent/false are always legal); an
+    explicit block requires the hive store layout, like ``sweep`` — the
+    pyramid materializes through the hive manifest.
+    """
+    raw = config.output.get("pyramid")
+    if raw is None or raw is False:
+        return
+    knob = get_pyramid(config) or {}  # raises on a non-mapping
+    if get_store_layout(config) != "hive":
+        raise ValueError(
+            "output.pyramid requires output.store_layout: hive (overviews live at "
+            "hive-tree ancestor nodes; flat stores have no digit tree)"
+        )
+    unknown = set(knob) - {"spacing", "orders", "all_time", "summarize"}
+    if unknown:
+        raise ValueError(f"output.pyramid has unknown keys {sorted(unknown)}")
+    spacing = knob.get("spacing")
+    if spacing is not None and (not isinstance(spacing, int) or spacing < 1):
+        raise ValueError(f"output.pyramid.spacing must be an int >= 1 (got {spacing!r})")
+    parent_order = int((config.output.get("grid") or {}).get("parent_order", 0))
+    orders = knob.get("orders")
+    if orders is not None:
+        ok = isinstance(orders, list) and all(isinstance(k, int) for k in orders)
+        if not ok or any(not (0 <= k < parent_order) for k in orders):
+            raise ValueError(
+                f"output.pyramid.orders must be a list of ancestor orders in "
+                f"[0, parent_order) = [0, {parent_order}) (got {orders!r})"
+            )
+    all_time = knob.get("all_time")
+    if all_time is not None and not isinstance(all_time, bool):
+        raise ValueError(f"output.pyramid.all_time must be a boolean (got {all_time!r})")
+    summarize = knob.get("summarize")
+    if summarize is None:
+        return
+    if not isinstance(summarize, dict):
+        raise ValueError(f"output.pyramid.summarize must be a mapping (got {summarize!r})")
+    fields = get_agg_fields(config)
+    for source, decl in summarize.items():
+        if source not in fields:
+            raise ValueError(
+                f"output.pyramid.summarize names unknown field {source!r} "
+                f"(declared: {sorted(fields)})"
+            )
+        target = (decl or {}).get("as")
+        if not isinstance(target, str) or not target:
+            raise ValueError(f"output.pyramid.summarize.{source} requires 'as': <new field name>")
+        if target in fields:
+            raise ValueError(
+                f"output.pyramid.summarize.{source}.as = {target!r} collides with a "
+                f"declared field: derived summaries must use a DIFFERENT name so overview "
+                f"schema never silently differs from source (D24)"
+            )
+
+
+#: Exact-law reductions whose plain (NaN-propagating) forms cannot round-trip
+#: through a NaN fill: at read, a NaN datum and the fill are the same bytes.
+_NAN_AMBIGUOUS_REDUCTIONS = ("min", "max", "sum")
+
+
+def _warn_nan_ambiguous_reductions(config: PipelineConfig) -> None:
+    """Warn when a plain ``min``/``max``/``sum`` pairs with a NaN fill (#201).
+
+    Warning, not error — the pairing is legal (the shipped atl06 config uses
+    it by design), but the store encoding has a consequence the author should
+    have chosen knowingly: a NaN datum and the fill sentinel are the same
+    bytes, so downstream the reduction behaves as its nan-skipping form (the
+    pyramid block declares this as ``nan_policy: "skip"``) and a
+    NaN-propagating result is unrecoverable. Declaring ``nanmin``/``nanmax``/
+    ``nansum`` states the same semantics explicitly and silences this.
+    """
+    from zagg.semantics import _fold_function_name, field_composability
+
+    for name, meta in get_agg_fields(config).items():
+        fn = _fold_function_name(meta.get("function"))
+        if fn not in _NAN_AMBIGUOUS_REDUCTIONS or not _is_nan_fill(meta):
+            continue
+        try:
+            if field_composability(meta) != "exact":
+                continue
+        except Exception:
+            continue  # malformed meta: the kind/shape validators own the error
+        logger.warning(
+            f"aggregation.variables.{name}: {meta.get('function')!r} with a NaN fill_value — "
+            f"NaN data is indistinguishable from fill at read; the reduction behaves as "
+            f'nan{fn} in overviews (declared in the pyramid block as nan_policy: "skip") '
+            f"and any NaN-carrying result is unrecoverable — use nan{fn} explicitly to "
+            f"silence this (issue #201)"
+        )
+
+
+def _is_nan_fill(meta: dict) -> bool:
+    """Whether a field's fill sentinel is NaN (explicitly, or by float default)."""
+    fill = meta.get("fill_value")
+    if fill is None:
+        try:
+            return np.issubdtype(np.dtype(meta.get("dtype", "float32")), np.floating)
+        except TypeError:
+            return False
+    if isinstance(fill, str):
+        return fill.strip().lower() == "nan"
+    return isinstance(fill, float) and np.isnan(fill)
 
 
 def get_windowing(config: PipelineConfig) -> dict | None:

@@ -198,6 +198,39 @@ def warn_if_stale(store_root: str, shard_key, envelope: dict | None) -> bool:
     return True
 
 
+def _is_decimal_id(decimal: str) -> bool:
+    """Whether ``decimal`` is a well-formed D1 id: ``{sign+base}`` + ``[1-4]`` digits.
+
+    The guard that keeps ``morton_words_from_decimals`` from raising out of the
+    repair walk: a foreign basename can satisfy the leaf-name grammar AND
+    :func:`~zagg.hive._decimal_order` without being a morton id at all
+    (``all.zarr`` — ``_decimal_order("all") == 2``).
+    """
+    base = _decimal_base(decimal)
+    return _is_base_component(base) and all(ch in "1234" for ch in decimal[len(base) :])
+
+
+def _is_derived_zarr(zarr_root: str, store_kwargs: dict) -> bool:
+    """Whether a ``.zarr``'s root attrs declare a D11 ``role`` (derived artifact).
+
+    Overview pyramid zarrs (issue #201) sit at ANCESTOR digit nodes under
+    ``{window}.zarr`` basenames, so the walker's leaf grammar can match them
+    (``all.zarr``, or a digits-only window label that parses as a decimal); the
+    ``role`` attr is the sanctioned discriminator — D11 forbids inferring the
+    role from tree position. One small GET of the root group metadata, gated by
+    the caller on a non-shard-order depth so source leaves never pay it.
+    """
+    from zagg.hive import _read_json
+    from zagg.sweep_overview import ROLE_ATTR
+
+    try:
+        meta = _read_json(open_object_store(zarr_root, **store_kwargs), "zarr.json")
+    except ValueError:
+        return False
+    attrs = (meta or {}).get("attributes")
+    return isinstance(attrs, dict) and ROLE_ATTR in attrs
+
+
 def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     """Rebuild the root MOC from a full tree walk — the explicit escape hatch.
 
@@ -215,6 +248,10 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     shards whose commit stamp is present — unstamped debris is excluded,
     exactly as the D4 model demands. The fresh envelope carries
     ``source: "refresh"`` and REPLACES the root object (no union: the walk
+    supersedes it). DERIVED zarrs at ancestor nodes — the overview pyramid
+    family, issue #201 — are stamped and can wear leaf-shaped basenames, so a
+    ``.zarr`` off the shard-order depth is checked for the D11 ``role`` attr and
+    skipped when it carries one (never classified by position). A
     supersedes it). A successful refresh also re-arms the
     :func:`warn_if_stale` once-per-episode latch for this store. Returns the
     envelope written, or ``None`` — deleting any existing root object — when
@@ -258,6 +295,13 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                 stamp = read_commit(open_store(f"{root}/{rel}", **store_kwargs))
                 if stamp is None:
                     continue  # unstamped debris (D4)
+                if rel.count("/") - 1 != order and _is_derived_zarr(f"{root}/{rel}", store_kwargs):
+                    # A DERIVED artifact at an ancestor node, not source data:
+                    # overview pyramid zarrs are stamped and their basenames can
+                    # collide with the leaf grammar (issue #201). Silent like all
+                    # non-data children — the role attr is authoritative (D11).
+                    logger.debug(f"refresh: skipping derived zarr {rel!r} (D11 role attr)")
+                    continue
                 # Windowed leaves (issue #246, D13): `{full_id}_{window}.zarr`
                 # names split on the first `_` (frozen parse rule); several
                 # windows of one shard collapse to one coverage entry below.
@@ -271,6 +315,17 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                     logger.warning(
                         f"refresh: skipping STAMPED leaf {name!r} with a malformed "
                         f"window label (frozen grammar, mortie#62) — it will NOT be "
+                        f"listed in {ROOT_COVERAGE_NAME}"
+                    )
+                    continue
+                if not _is_decimal_id(decimal):
+                    # Same posture, one grammar down: the name split succeeded
+                    # but the id is not a morton decimal, so no MOC word exists
+                    # for it. Skipped HERE rather than left to raise out of the
+                    # closing `morton_words_from_decimals` (issue #201 review).
+                    logger.warning(
+                        f"refresh: skipping STAMPED leaf {name!r} whose id {decimal!r} is not "
+                        f"a D1 morton decimal (sign+base then [1-4] digits) — it will NOT be "
                         f"listed in {ROOT_COVERAGE_NAME}"
                     )
                     continue

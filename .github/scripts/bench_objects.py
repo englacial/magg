@@ -46,9 +46,18 @@ through).
 
 from __future__ import annotations
 
+import re
+
 # Per-shard attribution on the flat layout assumes the 1-D fullsphere HEALPix
 # layout the benchmark manifests use (block index arithmetic on the cells
 # axis); the hive layout attributes by leaf prefix and is layout-agnostic.
+
+#: A leaf zarr basename's morton-id stem (D1 grammar: sign + base 1-6, then
+#: digits 1-4). Sweep overview basenames (issue #201, D23 window naming:
+#: ``{window}.zarr`` / ``all.zarr``) can never match it — window labels carry
+#: 0/5-9 digits or letters and ``all`` is the reserved token — which is what
+#: lets the hive walk tell an overview zarr from a stray source leaf.
+_MORTON_ID_RE = re.compile(r"-?[1-6][1-4]*")
 
 
 def _require_fullsphere(grid) -> None:
@@ -247,6 +256,7 @@ def store_object_counts(
     other: list[str] = []
     metadata = 0
     rollups = 0
+    overviews = 0
 
     if store_layout == "flat":
         _require_fullsphere(grid)
@@ -317,6 +327,20 @@ def store_object_counts(
                 if key.endswith(".rollup.json"):
                     rollups += 1
                     continue
+                # Sweep overview zarrs (issue #201): `{window}.zarr/...` at a
+                # digit node. The window-token basename can never parse as a
+                # morton id (see _MORTON_ID_RE), while a source leaf's stem
+                # before the first `_` always does — so an overview classifies
+                # into its own D9 second-pass bucket (like the rollups above,
+                # excluded from the audited write-path total) while a stray
+                # id-named `.zarr` outside the dispatched leaf set stays a
+                # loud ``other`` finding.
+                seg = next((p for p in key.split("/") if p.endswith(".zarr")), None)
+                if seg is not None and not _MORTON_ID_RE.fullmatch(
+                    seg.removesuffix(".zarr").split("_", 1)[0]
+                ):
+                    overviews += 1
+                    continue
                 node, _, name = key.rpartition("/")
                 is_sibling = any(
                     name == f"{stem}.json"
@@ -335,6 +359,7 @@ def store_object_counts(
         "objects_metadata": metadata,
         "objects_per_shard": per_shard,
         "objects_rollups": rollups,
+        "objects_overviews": overviews,
         "objects_other": len(other),
         "other_keys": other[:20],
     }
@@ -391,13 +416,17 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     know every object the run writes.
     """
     problems = []
-    # Sweep rollups (issue #300) are second-pass D9 caches, not write-path
-    # objects: the end-of-run sweep may or may not have landed them by
-    # measurement time (fire-and-forget on Lambda), so they are tallied in
-    # their own bucket and excluded from the write-path total this model
-    # audits (the #215 bypass guard below is untouched — rollups never live
-    # inside a leaf prefix).
-    total = measured["objects_total"] - measured.get("objects_rollups", 0)
+    # Sweep rollups (issue #300) and overview zarrs (issue #201) are
+    # second-pass D9 caches, not write-path objects: the end-of-run sweep may
+    # or may not have landed them by measurement time (fire-and-forget on
+    # Lambda), so they are tallied in their own buckets and excluded from the
+    # write-path total this model audits (the #215 bypass guard below is
+    # untouched — neither ever lives inside a leaf prefix).
+    total = (
+        measured["objects_total"]
+        - measured.get("objects_rollups", 0)
+        - measured.get("objects_overviews", 0)
+    )
     meta = measured["objects_metadata"]
     meta_lo, meta_hi = expected["metadata_min"], expected["metadata"]
     if not (meta_lo <= meta <= meta_hi):

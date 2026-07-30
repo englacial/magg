@@ -105,3 +105,4 @@ output:
     sharded: true                # issue #193: sharded output fixed on for the matrix
     child_order: 19              # leaf cell resolution (~10 m)
   store_layout: hive             # issue #240: the hive regression arm (leaf zarr per shard)
+  pyramid: false                 # overview sweep opted out pending Phase E fleet sizing (issue #201)
