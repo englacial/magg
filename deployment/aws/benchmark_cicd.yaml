@@ -189,6 +189,12 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Enumerated exact ARNs (issue #341): a ${TestFunctionName}*
+              # wildcard was proposed and declined -- enumeration keeps least
+              # privilege. Base function plus exactly the variants the test
+              # stack provisions (template.yaml's WorkerTestDiskVariants loop
+              # over WorkerMemorySizes: the -disk trio only). Drift against
+              # that matrix is guarded by tests/test_deploy_lambda.py.
               - Sid: UpdateTestFunction
                 Effect: Allow
                 Action:
@@ -198,7 +204,11 @@ Resources:
                   - lambda:PutFunctionEventInvokeConfig
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-2048-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-4096-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-8192-disk"
               - Sid: PublishTestLayer
                 Effect: Allow
                 # GetLayerVersion: update-function-configuration --layers validates
@@ -234,6 +244,12 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Enumerated exact ARNs (issue #341): a ${BenchmarkFunctionName}*
+              # wildcard was proposed and declined -- enumeration keeps least
+              # privilege. Base function plus the full prod worker-size family
+              # (template.yaml's WorkerSizeVariants + WorkerDiskVariants loops
+              # over WorkerMemorySizes: plain + -disk). Drift against that
+              # matrix is guarded by tests/test_deploy_lambda.py.
               - Sid: UpdateProdFunction
                 Effect: Allow
                 Action:
@@ -243,7 +259,14 @@ Resources:
                   - lambda:PutFunctionEventInvokeConfig
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-2048"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-4096"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-8192"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-2048-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-4096-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-8192-disk"
               - Sid: PublishProdLayer
                 Effect: Allow
                 # GetLayerVersion: update-function-configuration --layers validates
