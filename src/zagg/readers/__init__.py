@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from zagg.readers._layout import rank_to_rowcol, rowcol_to_rank
 from zagg.readers.tdigest_tensor import (
+    cell_index,
     chunk_z_range,
     rasterize_cell,
     read_cell,
@@ -18,6 +19,7 @@ from zagg.readers.tdigest_tensor import (
 )
 
 __all__ = [
+    "cell_index",
     "chunk_z_range",
     "rank_to_rowcol",
     "rasterize_cell",
