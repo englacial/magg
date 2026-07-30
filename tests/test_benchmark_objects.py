@@ -310,10 +310,15 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     assert measured["objects_metadata"] == expected["metadata"] == 4
     assert measured["objects_other"] == 0
     assert list(measured["objects_per_shard"]) == [_KEY_A]
-    # The end-of-run sweep (issue #300) lands its rollups in their own bucket
-    # (second-pass D9 caches); the write-path total excludes them.
+    # The end-of-run sweep lands its rollups (issue #300) and overview zarrs
+    # (issue #201) in their own buckets (second-pass D9 caches); the
+    # write-path total excludes both.
     assert measured["objects_rollups"] > 0
-    assert measured["objects_total"] - measured["objects_rollups"] == expected["total_max"]
+    assert measured["objects_overviews"] > 0
+    write_path = (
+        measured["objects_total"] - measured["objects_rollups"] - measured["objects_overviews"]
+    )
+    assert write_path == expected["total_max"]
     assert bench_objects.object_count_mismatch(measured, expected) is None
     # Attribution really is the leaf prefix.
     leaf = hive.shard_leaf_path("", word).lstrip("/")
@@ -347,6 +352,38 @@ def test_hive_misplaced_rollup_counts_into_shard(monkeypatch):
     assert measured["objects_per_shard"] == {label: 2}  # data + misplaced rollup
     assert measured["objects_other"] == 0
     assert not any(k.endswith("stats.rollup.json") for k in measured["other_keys"])
+
+
+def test_hive_overview_zarrs_count_into_their_own_bucket(monkeypatch):
+    # Sweep overview zarrs (issue #201) are `{window}.zarr` / `all.zarr` at a
+    # digit node — window tokens can never parse as morton ids, so they get
+    # their own D9 bucket; a stray *id*-named zarr outside the dispatched leaf
+    # set stays a loud ``other`` finding, and anything inside a leaf prefix
+    # still attributes to that shard (the #215 guard is untouched).
+    from zagg import hive
+
+    grid = from_config(_cfg())
+    word = int(morton_word(_KEY_A))
+    label = grid.shard_label(word)
+    leaf = hive.shard_leaf_path("", word).lstrip("/")
+    node = leaf.rsplit("/", 1)[0]
+    base = node.split("/", 1)[0]
+    keys = [
+        f"{leaf}/count/c/0",  # in-leaf data -> this shard
+        f"{base}/all.zarr/zarr.json",  # all-time overview at the base node
+        f"{node}/2019.zarr/2/count/c/0",  # per-window overview at the node
+        f"{node}/overview.rollup.json",  # the family's envelope -> rollups
+        f"{base}/-311.zarr/zarr.json",  # stray ID-named zarr -> other
+    ]
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: keys)
+    measured = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[word], store_layout="hive"
+    )
+    assert measured["objects_overviews"] == 2
+    assert measured["objects_rollups"] == 1
+    assert measured["objects_per_shard"] == {label: 1}
+    assert measured["objects_other"] == 1
+    assert measured["other_keys"] == [f"{base}/-311.zarr/zarr.json"]
 
 
 # --- mismatch helper (pure) --------------------------------------------------
@@ -594,8 +631,11 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     # ... + the stats.json AND shardmap.json siblings (issues #297/#300).
     assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 2
     assert expected["metadata"] == 4
-    # Sweep rollups (issue #300) ride their own bucket, outside the
-    # write-path total this model audits.
-    assert measured["objects_total"] - measured["objects_rollups"] == expected["total_max"]
+    # Sweep rollups (issue #300) and overview zarrs (issue #201) ride their
+    # own buckets, outside the write-path total this model audits.
+    write_path = (
+        measured["objects_total"] - measured["objects_rollups"] - measured["objects_overviews"]
+    )
+    assert write_path == expected["total_max"]
     assert measured["objects_other"] == 0
     assert bench_objects.object_count_mismatch(measured, expected) is None

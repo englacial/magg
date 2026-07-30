@@ -493,6 +493,7 @@ def _read_envelope(store, node: str) -> dict | None:
         envelope = None
     usable = (
         isinstance(envelope, dict)
+        and envelope.get("spec") == _sweep().SWEEP_SPEC
         and envelope.get("family") == "overview"
         and isinstance(envelope.get("windows"), dict)
     )
