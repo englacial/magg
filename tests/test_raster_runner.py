@@ -1319,13 +1319,20 @@ class TestRasterHiveLambdaBackend:
             return str(s3root / path.removeprefix("s3://")) if path.startswith("s3://") else path
 
         real_open_store = store_mod.open_store
-        real_open_object = hive.open_object_store
+        real_open_object = store_mod.open_object_store
         monkeypatch.setattr(
             store_mod, "open_store", lambda path, **kw: real_open_store(_translate(path))
         )
-        monkeypatch.setattr(
-            hive, "open_object_store", lambda path, **kw: real_open_object(_translate(path))
-        )
+        # Since the issue #330 phase-1 split each hive submodule binds
+        # ``open_object_store`` at its own import, so patch every binding the
+        # hive write path reaches (the facade no longer holds one).
+        for hive_mod in (hive.layout, hive.manifest, hive.coverage):
+            monkeypatch.setattr(
+                hive_mod,
+                "open_object_store",
+                lambda path, **kw: real_open_object(_translate(path)),
+                raising=False,
+            )
         # The handler binds open_store at its own import; patch that binding too.
         monkeypatch.setattr(
             handler_mod, "open_store", lambda path, **kw: real_open_store(_translate(path))
