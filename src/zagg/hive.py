@@ -1190,6 +1190,25 @@ def process_and_write_hive(
             # new template lands, and no enumeration ever walks stale/orphan
             # member dirs (the pre-#341 walk warned on the sidecar and could
             # die on an orphan array dir).
+            #
+            # This DOES widen the redundant-duplicate-writer window (fold
+            # review), and the change is deliberate. ``dispatch._LAMBDA_RETRYABLE``
+            # classifies off the exception string of the ``Invoke`` call itself,
+            # and for ``InvocationType=Event`` a request Lambda accepted whose
+            # HTTP response timed out is indistinguishable from one it never
+            # got — so a retry can produce a second live worker for one shard.
+            # Before: A wrote + stamped, B templated over the top, and if B died
+            # the leaf still held A's objects under A's stamp (stale-but-complete,
+            # certified). After: B's clear removes A's committed leaf first, so a
+            # B that dies mid-write leaves the leaf EMPTY and unstamped. Nothing
+            # is silently corrupt — the stamp is written last, so the leaf reads
+            # as debris and is re-dispatchable (test_leaf_clear_under_a_live_
+            # writer_leaves_debris_not_corruption) — but a redundant retry can now
+            # destroy a leaf that had already succeeded, which write-over could
+            # not. Refusing the clear on a valid stamp is the lever if that
+            # trade stops being acceptable; it is not taken here because D4 makes
+            # "replaced wholesale" the contract and a stamp must never block a
+            # retry.
             grid.emit_shard_template(store, overwrite=True)
             box["store"] = store
         return box["store"]

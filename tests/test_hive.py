@@ -730,6 +730,38 @@ class TestLeafTemplateAndStamp:
         # Walker termination: no leaf at all is the same answer as debris.
         assert hive.read_commit(MemoryStore()) is None
 
+    def test_leaf_clear_under_a_live_writer_leaves_debris_not_corruption(self, cfg):
+        # Fold review on the clear-first template: the redundant-duplicate-writer
+        # window WIDENED, and this pins what it widened to.
+        #
+        # Two live workers on one shard is reachable — dispatch classifies
+        # retryability off the Invoke call's exception string, and an Event invoke
+        # Lambda accepted whose HTTP response timed out is indistinguishable from
+        # one it never got. Writer A commits and stamps; writer B (the redundant
+        # retry) re-templates and dies mid-write.
+        #
+        # Pre-#341 the leaf would still hold A's objects under A's stamp
+        # (stale-but-complete). Now B's clear removes them first, so the leaf is
+        # EMPTY and UNSTAMPED. That is a real loss of an already-successful leaf —
+        # but not silent corruption: the stamp is written last, so read_commit
+        # reports debris and the shard stays re-dispatchable, which is the property
+        # the walker and the retry model actually depend on.
+        store = MemoryStore()
+        g = self._grid(cfg)
+
+        # Writer A: template, write, stamp -> complete.
+        g.emit_shard_template(store, overwrite=True)
+        self._put(store, f"{g.group_path}/h_max/c/0")
+        hive.stamp_commit(store, cells_with_data=5, granule_count=2)
+        assert hive.read_commit(store)["complete"] is True
+
+        # Writer B: re-templates the same leaf (the clear fires) and then dies
+        # before writing anything or stamping.
+        g.emit_shard_template(store, overwrite=True)
+
+        assert not self._exists(store, f"{g.group_path}/h_max/c/0")  # A's data is gone
+        assert hive.read_commit(store) is None  # ...and it reads as debris, not complete
+
 
 # ── local write path (runner) ────────────────────────────────────────────────
 
