@@ -4340,6 +4340,53 @@ class TestFinalizeGuard:
             assert "Shard outputs are written" in m
             assert "idempotent" in m
 
+    def test_finalize_error_wins_over_a_later_tail_crash(self, monkeypatch, atl06_config, caplog):
+        """D6 precedence (fold of the review finding), matching PR #333's
+        ``RunHandle._raise_tail_error``: a tail exception AFTER a finalize
+        failure is logged + chained, never the one that surfaces."""
+        import logging
+
+        from zagg import runner
+
+        boom = RuntimeError("invoke failed")
+
+        def always_fail():
+            raise boom
+
+        run, events, _sleeps, _captured = self._drive(
+            monkeypatch, atl06_config, finalize=always_fail
+        )
+        # Crash the tail's UNGUARDED row building (the reviewer's example), i.e.
+        # after the fold point and before the re-raise.
+        tail_boom = RuntimeError("tail blew up")
+
+        def _boom(*a, **k):
+            raise tail_boom
+
+        monkeypatch.setattr(runner, "_lambda_result_rows", _boom)
+        with caplog.at_level(logging.ERROR, logger="zagg.runner"):
+            with pytest.warns(RuntimeWarning):
+                with pytest.raises(RuntimeError) as excinfo:
+                    run()
+        assert excinfo.value is boom  # the FINALIZE error, not the tail crash
+        assert excinfo.value.__cause__ is tail_boom  # tail error still reachable
+        assert "tail blew up" in caplog.text  # ...and visible in the log
+        assert events == ["finalize", "finalize", "coverage"]  # crashed before stats
+
+    def test_tail_crash_alone_still_propagates(self, monkeypatch, atl06_config):
+        """The other half of the precedence rule: with finalize CLEAN a tail
+        exception propagates exactly as it did before the guard existed."""
+        from zagg import runner
+
+        run, _events, _sleeps, _captured = self._drive(
+            monkeypatch, atl06_config, finalize=lambda: None
+        )
+        monkeypatch.setattr(
+            runner, "_lambda_result_rows", lambda *a, **k: (_ for _ in ()).throw(ValueError("nope"))
+        )
+        with pytest.raises(ValueError, match="nope"):
+            run()
+
     def test_helper_makes_exactly_one_retry(self, monkeypatch):
         from unittest.mock import MagicMock
 
