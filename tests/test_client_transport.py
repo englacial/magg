@@ -746,6 +746,56 @@ class TestAttach:
             Run.attach(_STORE, "windowed", lambda_client=EventStubLambdaClient(status_store))
 
 
+# -- D8 audit (issue #327 phase 7) -------------------------------------------------
+
+
+class TestD8Audit:
+    def test_client_event_run_makes_no_store_writes(self, catalog, status_store, monkeypatch):
+        # Dispatcher-never-writes: every PUT observed during a full v2 client
+        # run must be attributable to the (stub) WORKER — the shard statuses,
+        # the dispatch manifest, and the tail marker, each riding a worker
+        # invoke. The client/poller side only LISTs and GETs (reads).
+        puts: list[str] = []
+        real_put = obstore.put
+
+        def counting_put(store, key, data, *a, **k):
+            puts.append(str(key))
+            return real_put(store, key, data, *a, **k)
+
+        monkeypatch.setattr(obstore, "put", counting_put)
+        stub = EventStubLambdaClient(status_store)
+        handle = _run(catalog, client=stub).dispatch(transport="event")
+        handle.results()
+        handle.wait(timeout=10)
+        expected = [ct.MANIFEST_NAME, ct.TAIL_NAME] + [ct.shard_status_key(w) for w in _WORDS]
+        assert sorted(puts) == sorted(expected)
+
+
+def test_rows_from_status_reads_both_object_shapes(tmp_path):
+    # The run-record pointer transport (issue #313) now also serves event runs
+    # (issue #327): the worker assembles rows from the #151 envelope shape
+    # (body as a JSON string) AND the v2 status-object shape (body as a dict);
+    # the prefix's manifest/tail objects parse fine and contribute no rows.
+    from zagg.telemetry import build_record, rows_from_status
+
+    prefix = tmp_path / "out.zarr.status" / "run-r1"
+    prefix.mkdir(parents=True)
+    rec1 = build_record(shard_key=1, metadata={"total_obs": 5, "duration_s": 1.0})
+    (prefix / "11.json").write_text(
+        json.dumps({"statusCode": 200, "body": json.dumps({"stats": rec1})})
+    )
+    rec2 = build_record(shard_key=2, metadata={"total_obs": 3, "duration_s": 2.0})
+    (prefix / "shard-2.json").write_text(
+        json.dumps(
+            {"schema_version": 1, "status": "ok", "attempt_id": "a", "body": {"stats": rec2}}
+        )
+    )
+    (prefix / "manifest.json").write_text(json.dumps({"schema_version": 1, "run_id": "r1"}))
+    (prefix / "tail.json").write_text(json.dumps({"status": "tail_done"}))
+    rows = rows_from_status(str(prefix))
+    assert sorted(r["shard_key"] for r in rows) == [1, 2]
+
+
 # -- keys / prefix ---------------------------------------------------------------
 
 
