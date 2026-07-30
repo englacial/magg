@@ -1042,6 +1042,17 @@ def _validate_windowing_windows(block: dict, schedule: str) -> None:
             start, end = _windows.parse_utc(entry["start"]), _windows.parse_utc(entry["end"])
         except ValueError as e:
             raise ValueError(f"output.windowing.windows: {e}") from e
+        if label == _windows.SCHEDULE_NONE_TOKEN:
+            # The opaque grammar admits it, but the token names the unwindowed
+            # / all-time artifact everywhere (leaf_name_v3, the D23 overview
+            # basename and its envelope key), so an explicit window by this
+            # name would ALIAS the all-time fold — the per-window overview gets
+            # overwritten and never regenerates (review finding, issue #201).
+            raise ValueError(
+                f"explicit window label {label!r} is the reserved schedule:none token "
+                f"(SCHEDULE_NONE_TOKEN, D23) — it would alias the all-time artifact; "
+                f"declare a different explicit label"
+            )
         if not start < end:
             raise ValueError(
                 f"explicit window {label!r} is not half-open: start "

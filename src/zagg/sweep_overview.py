@@ -464,7 +464,9 @@ def _window_work(decl, windowed, dirty_windows, entries) -> list:
     Per-window overviews inherit window naming (D23); the reserved ``all``
     token is the unwindowed leaf AND the opt-in all-time fold on a windowed
     store (``all_time`` in the declaration; a preexisting all-time entry stays
-    maintained even if the declaration later drops the flag).
+    maintained even if the declaration later drops the flag). A window whose
+    label IS that token can therefore never own a separate overview — same
+    basename, same envelope key — so it yields the all-time item alone.
     """
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
@@ -476,6 +478,19 @@ def _window_work(decl, windowed, dirty_windows, entries) -> list:
     )
     work = [(w, [w]) for w in labels]
     if decl.get("all_time") or SCHEDULE_NONE_TOKEN in entries:
+        if SCHEDULE_NONE_TOKEN in labels:
+            # A window literally labeled with the reserved token (config
+            # validation now rejects it; a hand-edited or pre-guard manifest can
+            # still carry one). Its per-window overview would resolve to the
+            # SAME basename and envelope key as the all-time fold, be
+            # overwritten, and never regenerate — so yield only the all-time
+            # item, which folds this window in anyway (review finding, #201).
+            logger.warning(
+                f"sweep[overview]: window label {SCHEDULE_NONE_TOKEN!r} is the reserved "
+                f"all-time token (D23) — no separate per-window overview is written for "
+                f"it; its leaves fold into the all-time overview instead"
+            )
+            work = [item for item in work if item[0] != SCHEDULE_NONE_TOKEN]
         work.append((SCHEDULE_NONE_TOKEN, labels))
     return work
 

@@ -572,6 +572,24 @@ class TestOverviewWriter:
         ]
         assert read_commit(open_store(str(tmp_path / "-3" / "1" / "2019.zarr")))["window"] == "2019"
 
+    def test_window_named_all_folds_into_the_all_time_overview(self, tmp_path, caplog):
+        # Review finding, issue #201: a window labeled with the reserved token
+        # resolves to the same basename AND envelope key as the all-time fold,
+        # which used to overwrite it and then never regenerate it. Config
+        # validation now rejects the label; a pre-guard manifest folds the
+        # window into the all-time overview with a warning instead.
+        _write_manifest(tmp_path, orders=(1,), windowed=True, all_time=True)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]}, window="2019")
+        _make_leaf(tmp_path, "-311", {0: [10.0]}, window="all")
+        word = morton_word("-311")
+        result = run_sweep(str(tmp_path), [(word, "2019"), (word, "all")], families=("overview",))
+        assert result["families"]["overview"]["written"] == 2  # 2019 + all-time
+        assert "reserved all-time token" in caplog.text
+        gall = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        assert gall["count"][0] == 3  # both windows' leaves are folded in
+        envelope = json.loads((tmp_path / "-3" / "1" / "overview.rollup.json").read_text())
+        assert sorted(envelope["windows"]) == ["2019", "all"]
+
     def test_sibling_contribution_via_root_moc(self, tmp_path):
         # Incremental run: the second sweep names ONLY the new leaf; the
         # untouched sibling still contributes through the root coverage.moc

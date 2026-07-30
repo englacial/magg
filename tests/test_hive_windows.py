@@ -261,6 +261,18 @@ class TestWindowingConfig:
         with pytest.raises(ValueError, match="grammar"):
             validate_config(cfg)
 
+    def test_explicit_reserved_all_label(self, cfg):
+        # The opaque grammar admits "all", but the token names the unwindowed /
+        # all-time artifact (leaf_name_v3, the D23 overview basename), so an
+        # explicit window by that name would alias it (issue #201 review).
+        _windowed(
+            cfg,
+            schedule="explicit",
+            windows=[{"label": "all", "start": "2019-01-01", "end": "2020-01-01"}],
+        )
+        with pytest.raises(ValueError, match="reserved schedule:none token"):
+            validate_config(cfg)
+
     def test_explicit_reversed_range(self, cfg):
         _windowed(
             cfg,
