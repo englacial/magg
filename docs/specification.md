@@ -262,9 +262,110 @@ middle).
 
 ## 3. `zagg-composition/1`
 
-**Status: contract.**
+**Status: contract.** Source of truth in code: `zagg.stats.composition`
+(issue #321). Rationale and narrative:
+[`signal_strata.md`](signal_strata.md).
 
-*Populated in phase 4 of the #340 PR.*
+A composition field is one dense **uint64** word per cell carrying eight
+8-bit lanes of quantized fractions of the cell's **signal stratum**
+(`N_signal` = the signal digest's total weight — magnitude lives in the
+digest, composition here). An empty signal stratum packs to `0` (the array's
+fill value).
+
+### 3.1 Word layout
+
+**Contract.** Lanes are packed **LSB-first**: lane `i` occupies bits
+`8*i .. 8*i + 7` of the word. Lane order (`LANES`):
+
+| lane (byte) | meaning |
+|---|---|
+| 0–4 | per-surface fractions, `signal_conf_ph` column order: `land`, `ocean`, `sea_ice`, `land_ice`, `inland_water` — the count of signal photons whose per-surface confidence clears the threshold, over `N_signal` |
+| 5–7 | `low` / `med` / `high`: signal photons whose *strongest* per-surface confidence is exactly 2 / 3 / 4, over `N_signal` |
+
+- The per-surface lanes are **overlapping marginals** (`surf_type` is
+  multi-hot): they do not sum to 255 and cannot split the height distribution
+  per surface.
+- The level lanes are **absolute** — always `conf == 2 / 3 / 4`, never
+  renumbered against the signal `threshold`. A product committing a higher
+  threshold ships **empty** lower lanes rather than shifted ones
+  (`threshold=3` leaves `low` structurally 0; `threshold=4` leaves `low` and
+  `med` 0), so one lane layout serves every product. For ATL03 confidences
+  (`-2..4`) the three level lanes partition the signal stratum exactly; a
+  source with confidences above 4 is out of contract for this revision.
+
+**Golden word.** For a single signal photon with per-surface confidences
+`[4, -1, 0, 3, 1]` at `threshold=2`, the lanes are
+`[255, 0, 0, 255, 0, 0, 0, 255]` (land, land_ice; strongest = 4 ⇒ high) and
+the packed word is exactly
+
+```text
+0xFF000000FF0000FF
+```
+
+(an MSB-first layout would give `0xFF0000FF000000FF`). Pinned by
+`tests/test_composition.py::TestPackComposition::test_golden_word_pins_lsb_first_byte_order`
+and the §7 kitchen-sink fixture.
+
+### 3.2 Quantization: the presence floor
+
+**Contract.** Lanes quantize as `k = round(255 * c / N)` — round-half-even,
+clipped to `0..255` — **except any nonzero count quantizes to at least 1**
+(the presence floor). Consequences:
+
+- `lane > 0` means "this flag occurred" **exactly, at every N**, through
+  arbitrary merge chains.
+- Count recovery `round(k * N / 255)` is exact whenever `N <= 254`
+  (quantization error `<= N/510 < 1/2`).
+- Above that, counts are within `±N/510` (plus `O(N/510)` per re-quantizing
+  merge); presence stays exact.
+- A cell with one signal photon has lanes in `{0, 255}` — the lanes *are*
+  that photon's flags.
+
+### 3.3 The attrs block
+
+**Contract.** The composition array's attrs carry the versioned
+`composition` block; readers MUST bind to it, never to config conventions,
+and MUST strict-check `spec` per the conformance rule:
+
+```json
+"composition": {
+  "spec": "zagg-composition/1",
+  "lanes": ["land", "ocean", "sea_ice", "land_ice", "inland_water", "low", "med", "high"],
+  "of": "h_tdigest_signal",
+  "threshold": 2
+}
+```
+
+- **`lanes`** — the lane names in bit order (LSB byte first). For `/1` the
+  value is exactly the §3.1 order.
+- **`of`** — the name of the sibling digest field whose total weight is the
+  `N_signal` the lanes are fractions of. The composition word is
+  uninterpretable without it: readers recover counts by pairing the word with
+  that digest's `sum(weights)`.
+- **`threshold`** — the committed signal cut (`conf >= threshold`; the ATBD
+  predicate is `> 1`, i.e. `threshold=2`). Each stratum digest's payload
+  array carries the companion provenance attrs `stratum`
+  (`"signal"`/`"noise"`) and `signal_threshold`, which MUST agree with this
+  value.
+
+### 3.4 Merge law
+
+**Contract** (normative here, not a zagg implementation detail: a reader
+folding views — e.g. cells into a coarser cell — must reproduce it). Two
+`(word, n_signal)` pairs fold as the digest-weighted mean per lane,
+re-quantized with the same presence floor:
+
+```text
+lane_merged = quantize((n_a * lane_a + n_b * lane_b) / (n_a + n_b))
+```
+
+where `quantize` rounds half-even, clips to `0..255`, and floors a lane that
+is nonzero on **either** input to at least 1. The identity element is
+`(0, 0)`; a pair with `n <= 0` returns the other word unchanged. The
+operation is symmetric and, up to the bounded re-quantization error,
+associative — fold order never affects presence, and affects counts only
+within `O(n/510)`. The `n` inputs come from the `of` digests' total weights
+(§3.3).
 
 ## 4. Pyramid / overview declarations
 
