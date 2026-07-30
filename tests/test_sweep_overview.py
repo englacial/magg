@@ -809,6 +809,37 @@ class TestSection83Obligations:
         for p, digest in hashes.items():
             assert json.loads(p.read_text())["windows"]["all"]["content_hash"] == digest
 
+    def test_repair_walk_ignores_overviews(self, tmp_path):
+        # Review finding, issue #201: overview basenames collide with the leaf
+        # grammar, so the D9 repair walk must classify them out by the D11 role
+        # attr. `all.zarr` used to die outright on a shard_order-2 store
+        # (_decimal_order("all") == 2 -> "malformed decimal Morton id 'all'").
+        from zagg.coverage import refresh_root_coverage
+        from zagg.grids.morton import morton_decimal
+        from zagg.hive import root_coverage_words
+
+        refs = self._populate(tmp_path, orders=(1, 0))
+        run_sweep(str(tmp_path), refs, families=("moc", "overview"))
+        assert sorted(p.name for p in tmp_path.rglob("all.zarr")) == ["all.zarr"] * 2
+        env = refresh_root_coverage(str(tmp_path))
+        assert [morton_decimal(int(w)) for w in root_coverage_words(env)] == ["-311", "-312"]
+
+    def test_repair_walk_ignores_digit_labeled_overviews(self, tmp_path):
+        # The windowed half of the same finding: a window label made of [1-4]
+        # digits at length shard_order+1 parses as a VALID decimal, so the
+        # rebuilt root MOC used to gain a phantom positive-base shard ("2411")
+        # that then poisons every root-MOC consumer.
+        from zagg.coverage import refresh_root_coverage
+        from zagg.grids.morton import morton_decimal
+        from zagg.hive import root_coverage_words
+
+        _write_manifest(tmp_path, orders=(1,), windowed=True, shard_order=3)
+        _make_leaf(tmp_path, "-3111", {0: [1.0]}, window="2411", shard_order=3)
+        run_sweep(str(tmp_path), [(morton_word("-3111"), "2411")], families=("moc", "overview"))
+        assert (tmp_path / "-3" / "1" / "2411.zarr").is_dir()
+        env = refresh_root_coverage(str(tmp_path))
+        assert [morton_decimal(int(w)) for w in root_coverage_words(env)] == ["-3111"]
+
     def test_role_never_inferred_from_position(self, tmp_path):
         # D11/D24: an overview is classified by its role attr, never by tree
         # depth — the leaf carries NO role, the overview always does.

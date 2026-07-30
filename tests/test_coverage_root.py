@@ -726,6 +726,33 @@ class TestRefreshRootCoverage:
         assert any("mixed-order stores are unsupported" in r.message for r in caplog.records)
         np.testing.assert_array_equal(hive.root_coverage_words(env), _words(SHARD))
 
+    def test_non_decimal_stamped_leaf_skipped_with_warning(self, tmp_path, caplog):
+        # A stamped `.zarr` whose stem satisfies the leaf grammar but is not a
+        # morton decimal ("all.zarr" — the window-only /3 token, hand-copied or
+        # role-less debris) used to sail past `_decimal_order` and raise
+        # "malformed decimal Morton id 'all'" out of the repair path itself
+        # (review finding, issue #201). It is skipped with a warning instead.
+        import logging
+        import pathlib
+
+        from zagg.coverage import refresh_root_coverage
+        from zagg.grids import HealpixGrid
+        from zagg.store import open_store
+
+        root = self._store_with_leaves(tmp_path, stamped=(SHARD,))
+        node = pathlib.Path(hive.shard_leaf_path(root, morton_word(SHARD))).parent
+        grid = HealpixGrid(
+            parent_order=6, child_order=8, layout="fullsphere", config=default_config("atl06")
+        )
+        store = open_store(str(node / "all.zarr"))
+        grid.emit_shard_template(store, overwrite=True)
+        hive.stamp_commit(store, cells_with_data=1, granule_count=1)
+
+        with caplog.at_level(logging.WARNING, logger="zagg.coverage"):
+            env = refresh_root_coverage(root)
+        assert any("not a D1 morton decimal" in r.message for r in caplog.records)
+        np.testing.assert_array_equal(hive.root_coverage_words(env), _words(SHARD))
+
     def test_not_a_hive_root_raises(self, tmp_path):
         from zagg.coverage import refresh_root_coverage
 
