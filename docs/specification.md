@@ -824,10 +824,21 @@ K = 4 inner chunks of 4 cells), sharded (the hive default):
   empty `(0, 2)` array), and `count`.
 
 Both stores pin the layout edge cases a reader must handle: inner chunk
-ordinal 2 is **empty** (absent from the shard index — the §1.5 sentinel),
-populated chunks contain empty cells (the `b""` fill), and one cell's
-digest carries merged centroids (weight > 1) whose location words are
-common ancestors (§2.2).
+ordinal 2 is **empty** (absent from the shard index — the §1.5 sentinel, and
+that sparsity reaches the dense arrays too: the `morton` coordinate and
+`count` hold their fill across that chunk, so a reader MUST NOT assume the
+coordinate is dense across a shard), populated chunks contain empty cells
+(the `b""` fill), and one cell's digest carries merged centroids (weight > 1)
+whose location words are common ancestors (§2.2).
+
+Both fixtures are **sharded**, so §7's conformance claim is scoped to the
+§1.5 sharded geometry. The per-inner-chunk geometry — identical §1.4 framing,
+one object per inner chunk, no shard index — has no committed golden here; it
+is pinned zagg-side by
+`tests/test_processing.py::TestRaggedVlenLayout`. A reader that derives the
+stored span from the array's own metadata, as §1.5 requires, reads both from
+one code path; a reader that hard-codes the shard-index suffix passes §7 and
+still fails on an unsharded store.
 
 Each fixture ships a sibling **`{name}.expected.json`** recording the shard
 key, leaf path, geometry, every populated cell's decoded values (digest
