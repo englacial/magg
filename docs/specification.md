@@ -528,6 +528,20 @@ overview family under the versioned `pyramid` block:
   = pyramid declared off). `spacing` records the schedule step (default 2 —
   the ratified display schedule). Schedules are per artifact family and
   deliberately decoupled from the tree's `path_grouping`.
+- **The declared-off form is smaller, and `orders` is the only key a reader
+  may bind unconditionally.** With the pyramid knob off the block is exactly
+
+  ```json
+  "pyramid": {"spec": "zagg-pyramid/1", "overview": {"orders": []}}
+  ```
+
+  — `spacing`, `all_time`, `fields`, and `summarize` are **absent**, not empty.
+  A reader MUST branch on `orders` first: an empty `orders` (or no `pyramid`
+  block at all — pre-pyramid manifests) means no overview family exists and no
+  other key of the block may be assumed. When `orders` is **non-empty**,
+  `spacing`, `all_time`, and `fields` MUST all be present (`summarize` stays
+  optional), so the zero-open field query of §4.4 is well-defined exactly when
+  there is something to query.
 - **`fields`** — every aggregation field, keyed by name, with its
   **composability class**: `exact` (folds byte-equal — count/sum/min/max),
   `approximate` (t-digest merge — `np.isclose` equality class), or `none`
