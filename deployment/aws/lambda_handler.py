@@ -84,6 +84,13 @@ writes the raster (time, cells) template instead, from a synchronous invoke):
         time coordinate, int64 microseconds since the epoch; the orchestrator
         owns the global timestep index and threads it here so the template
         write needs no S3 access from the dispatcher.
+    "run_manifest": dict (optional, issue #327) -- {"run_id", "shards"
+        (decimal shard-key strings), "semantic_hash", "dispatched_at",
+        "dataset"} dispatch identity: on a successful setup the worker writes
+        it (plus this event's "config") as
+        "<store>.status/run-<run_id>/manifest.json" -- what Run.attach
+        rebuilds a handle from (D8: the dispatcher never writes). Fail-open;
+        absent -> no write, byte-identical to pre-#327 events.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -147,6 +154,10 @@ the dispatcher at end of run, like coverage mode):
     "rows_from": str (optional) -- the run's async status prefix; the worker
         assembles success rows from the mirrored result envelopes when the
         row set exceeds the async payload budget,
+    "tail_status_url": str (optional, issue #327) -- where to ALSO write the
+        run's tail-completion marker on success (the v2 status prefix's
+        tail.json); a reattached handle (Run.attach) then skips a tail that
+        already ran. Fail-open; absent -> no write, byte-identical.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -543,7 +554,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     telemetry = _container_telemetry()
     mode = event.get("mode", "process")
     if mode == "setup":
-        return _handle_setup(event)
+        response = _handle_setup(event)
+        # Dispatch manifest (issue #327 phase 2): the run's shard set +
+        # identity, recorded by the WORKER off the same setup invoke (D8) so
+        # a run is reattachable by run id. Fail-open; absent block -> no-op.
+        if response.get("statusCode") == 200:
+            _write_dispatch_manifest(event)
+        return response
     if mode == "finalize":
         return _handle_finalize(event)
     if mode == "ping":
@@ -568,6 +585,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # setup/finalize/extract bodies stay byte-identical (their consumers don't
     # aggregate container state).
     response = _attach_container_telemetry(response, telemetry)
+    # Per-shard status object (issue #327): always-on for every per-unit
+    # response carrying a run identity, every status branch (200/400/500,
+    # including the caught-error envelope) -- the v2 Event transport resolves
+    # futures from these instead of the invoke response. Fail-open by
+    # ratification: never affects the shard result.
+    _write_shard_status(event, response)
     # Async result channel (issue #151): on an Event invoke the return value is
     # discarded, so mirror the response envelope to the orchestrator-supplied
     # result_url for it to poll. Covers every branch (200 / 400 / 500) of both
@@ -592,6 +615,48 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if mirrored:
             _maybe_self_recycle()
     return response
+
+
+def _write_shard_status(event: Dict[str, Any], response: Dict[str, Any]) -> None:
+    """Always-on per-shard status object (issue #327), doubly fail-open.
+
+    The body lives in ``zagg.client_transport.write_shard_status`` (itself
+    fail-open); this wrapper additionally swallows an import/lookup failure so
+    a function zip missing the module cannot fail a shard either. Uses the
+    same output-store resolution as every other worker write.
+    """
+    try:
+        from zagg.client_transport import write_shard_status
+
+        write_shard_status(event, response, _output_store_kwargs(event))
+    except Exception as e:
+        logger.warning(f"shard status write failed (fail-open, issue #327): {e}")
+
+
+def _write_dispatch_manifest(event: Dict[str, Any]) -> None:
+    """Run dispatch manifest off the setup event (issue #327), doubly fail-open.
+
+    Mirrors ``_write_shard_status``: the body lives in
+    ``zagg.client_transport.write_dispatch_manifest`` (itself fail-open); this
+    wrapper additionally swallows an import failure so a function zip missing
+    the module cannot fail the setup either.
+    """
+    try:
+        from zagg.client_transport import write_dispatch_manifest
+
+        write_dispatch_manifest(event, _output_store_kwargs(event))
+    except Exception as e:
+        logger.warning(f"dispatch manifest write failed (fail-open, issue #327): {e}")
+
+
+def _write_tail_status(event: Dict[str, Any]) -> None:
+    """Tail-completion marker off the stats event (issue #327), doubly fail-open."""
+    try:
+        from zagg.client_transport import write_tail_status
+
+        write_tail_status(event, _output_store_kwargs(event))
+    except Exception as e:
+        logger.warning(f"tail status write failed (fail-open, issue #327): {e}")
 
 
 def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, Any]) -> bool:
@@ -1014,6 +1079,7 @@ def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
         if not rows:
             # A pointer prefix that yielded nothing (and no inline rows):
             # nothing to persist — not an error (fail-open telemetry).
+            _write_tail_status(event)
             return {
                 "statusCode": 200,
                 "body": json.dumps({"ok": True, "mode": "stats", "rows": 0}),
@@ -1029,6 +1095,10 @@ def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
             # failure becomes durable. Absent on a pre-#335 dispatcher -> None.
             finalize_error=event.get("finalize_error"),
         )
+        # Tail-completion marker (issue #327): the stats leg is the recorded
+        # end of the post-run tail, so a reattached handle can skip a tail
+        # that already ran. Fail-open; absent url -> no-op.
+        _write_tail_status(event)
         return {
             "statusCode": 200,
             "body": json.dumps({"ok": True, "mode": "stats", "rows": len(rows), "path": path}),

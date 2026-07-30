@@ -136,6 +136,13 @@ RECORD_COLUMNS = [
     "streaming_mode",
     "tmp_mb",
     "ephemeral_cost_usd",
+    # Worker-build provenance (issues #341/#296): did the pre-dispatch guard
+    # actually verify that the resolved worker variant runs the same code as the
+    # freshly-deployed base function? "verified" | "skipped" (the probe
+    # degraded) | "base" (no ``worker:`` block, nothing to verify). Null on rows
+    # recorded before the guard existed -- which is exactly the window in which
+    # the issue #341 stale-variant numbers were measured.
+    "variant_guard",
 ]
 
 # summary["worker_phase_max"] key -> series column (issues #250/#256). A phase
@@ -293,6 +300,10 @@ def build_record(
     record["streaming_mode"] = context.get("streaming_mode")
     record["tmp_mb"] = context.get("tmp_mb")
     record["ephemeral_cost_usd"] = eph
+    # Worker-build provenance (issues #341/#296), threaded in by run_benchmark's
+    # pre-dispatch staleness guard; ``comment_markdown`` banners the "skipped"
+    # case so a degraded guard is visible in the artifact, not only in stderr.
+    record["variant_guard"] = context.get("variant_guard")
     return record
 
 
@@ -398,6 +409,18 @@ def comment_markdown(records: list[dict], worker_note: str = "") -> str:
     lines = [marker, f"### Lambda benchmark — `{_fmt(head.get('commit'))[:7]}`", ""]
     if worker_note:
         lines += [f"> ⚠️ {worker_note}", ""]
+    # Degraded staleness guard (issues #341/#296): a target whose variant probe
+    # failed was dispatched WITHOUT the CodeSha256 check, so its number may have
+    # been measured on a stale build. Name those targets above the table -- the
+    # stderr warning is invisible on an otherwise-green run.
+    unverified = sorted({r["target"] for r in records if r.get("variant_guard") == "skipped"})
+    if unverified:
+        lines += [
+            "> ⚠️ worker-build staleness guard SKIPPED (probe failed) for: "
+            f"`{'`, `'.join(unverified)}` — these numbers are not verified to have "
+            "run this commit's code (issue #341).",
+            "",
+        ]
     lines += _table_block(records)
     lines += [
         "",

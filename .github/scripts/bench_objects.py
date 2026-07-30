@@ -193,6 +193,20 @@ def _is_run_parquet(key: str) -> bool:
     return "/" not in key and key.startswith("stats_") and key.endswith(".parquet")
 
 
+def _is_status_object(key: str) -> bool:
+    """Any key under a ``.status`` prefix segment: the per-run status channel.
+
+    Generalizes the :func:`_is_run_parquet` telemetry filter (ratified on
+    issue #327): ``<store>.status/run-<id>/...`` holds the always-on per-shard
+    status objects, dispatch manifests, and the issue #151 result envelopes —
+    run telemetry, never write-path store objects, so the #215/#240 tripwire
+    must not count them. The prefix is a store SIBLING, which the
+    "/"-delimited prefix join already keeps out of a store-rooted LIST; this
+    explicit exclusion covers a listing taken from a parent prefix.
+    """
+    return any(part.endswith(".status") for part in key.split("/")[:-1])
+
+
 def list_store_keys(store_path: str, **store_kwargs) -> list[str]:
     """All object keys under a store prefix — local path or ``s3://`` alike.
 
@@ -237,7 +251,7 @@ def store_object_counts(
     a stray write is visible rather than silently pooled. ``other_keys`` is a
     capped sample of unclassifiable keys.
     """
-    keys = list_store_keys(store_path, **store_kwargs)
+    keys = [k for k in list_store_keys(store_path, **store_kwargs) if not _is_status_object(k)]
     per_shard: dict[str, int] = {}
     other: list[str] = []
     metadata = 0

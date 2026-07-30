@@ -455,7 +455,8 @@ class TestRunnerParity:
     """
 
     @staticmethod
-    def _agg_cell_events(catalog_file, monkeypatch, cfg=None, **agg_kwargs):
+    def _agg_stub(catalog_file, monkeypatch, cfg=None, **agg_kwargs):
+        """Drive ``runner.agg(backend="lambda")`` against a fresh stub; return it."""
         from unittest.mock import MagicMock
 
         import boto3
@@ -488,16 +489,21 @@ class TestRunnerParity:
         # The hive manifest checker (issue #274) polls the output store; keep
         # this run read-free rather than reaching for a bucket that isn't there.
         monkeypatch.setattr(hive, "read_manifest", lambda *a, **k: None)
+        agg_kwargs.setdefault("invocation", "sync")
         runner.agg(
             cfg if cfg is not None else default_config("atl06"),
             catalog=catalog_file,
             store=_STORE,
             backend="lambda",
-            invocation="sync",
             function_name="process-shard-test",
             max_workers=3,
             **agg_kwargs,
         )
+        return stub
+
+    @classmethod
+    def _agg_cell_events(cls, catalog_file, monkeypatch, cfg=None, **agg_kwargs):
+        stub = cls._agg_stub(catalog_file, monkeypatch, cfg=cfg, **agg_kwargs)
         return {e["shard_key"]: e for _, _, e in stub.cell_events()}
 
     @pytest.mark.parametrize("driver", ["s3", "https"])
@@ -523,6 +529,91 @@ class TestRunnerParity:
         href = _rec(3)["s3"] if driver == "s3" else _rec(3)["https"]
         assert client_events[_WORDS[1]]["granule_urls"] == [href]
         assert agg_events[_WORDS[1]]["granule_urls"] == [href]
+
+
+# -- dispatch manifest (issue #327 phase 2) ------------------------------------
+
+
+class TestDispatchManifestBlock:
+    """The setup invoke carries the ``run_manifest`` block (issue #327): the
+    worker records the run's shard set + identity at the status prefix, so
+    every lambda run is reattachable by run id — client and agg alike."""
+
+    @staticmethod
+    def _setup_block(stub):
+        (setup,) = [e for _, _, e in stub.events if e.get("mode") == "setup"]
+        return setup["run_manifest"]
+
+    def test_client_setup_carries_the_block(self, catalog):
+        from zagg.semantics import semantic_hash
+
+        stub = StubLambdaClient()
+        run = _run(catalog, client=stub)
+        run.dispatch().wait(timeout=10)
+        block = self._setup_block(stub)
+        assert sorted(block["shards"]) == sorted(str(w) for w in _WORDS)
+        assert block["run_id"] == stub.cell_events()[0][2]["run_id"]
+        assert block["semantic_hash"] == semantic_hash(run.config)
+        assert block["dataset"] == {"short_name": "ATL06", "version": "006"}
+        assert block["dispatched_at"]  # dispatcher clock, worker copies verbatim
+
+    def test_flat_setup_also_carries_the_block(self, catalog):
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "flat"
+        stub = StubLambdaClient()
+        _run(catalog, client=stub, config=cfg).dispatch().wait(timeout=10)
+        assert sorted(self._setup_block(stub)["shards"]) == sorted(str(w) for w in _WORDS)
+
+    def test_agg_setup_block_matches_the_client(self, catalog, catalog_file, monkeypatch):
+        agg_stub = TestRunnerParity._agg_stub(catalog_file, monkeypatch)
+        theirs = self._setup_block(agg_stub)
+        stub = StubLambdaClient()
+        _run(catalog, client=stub).dispatch().wait(timeout=10)
+        mine = self._setup_block(stub)
+        # run_id / dispatched_at are per-dispatch by construction.
+        for block in (mine, theirs):
+            assert block.pop("run_id") and block.pop("dispatched_at")
+        assert mine == theirs
+
+    def test_subset_dispatch_lists_only_dispatched_shards(self, catalog):
+        stub = StubLambdaClient()
+        _run(catalog, client=stub).dispatch(shard_keys=[_WORDS[1]]).wait(timeout=10)
+        assert self._setup_block(stub)["shards"] == [str(_WORDS[1])]
+
+    def test_async_setup_size_gate_drops_the_block(self, monkeypatch):
+        # The hive setup invoke is a 256 KB-capped Event; an oversized shard
+        # list drops the block (never fatal) — attach degrades to statuses.
+        from zagg import runner
+
+        stub = StubLambdaClient()
+        monkeypatch.setattr(runner, "_ASYNC_PAYLOAD_CAP_BYTES", 10)
+        runner._invoke_lambda_setup_async(
+            stub,
+            "fn",
+            _STORE,
+            config_dict={},
+            run_manifest={"run_id": "r", "shards": ["1"]},
+        )
+        (_, _, event) = stub.events[0]
+        assert "run_manifest" not in event
+
+    def test_sync_setup_has_no_size_gate(self):
+        # The flat setup invoke is synchronous (6 MB cap): the block always rides.
+        from zagg import runner
+
+        stub = StubLambdaClient()
+        runner._invoke_lambda_setup(
+            stub,
+            "fn",
+            _STORE,
+            parent_order=6,
+            child_order=12,
+            overwrite=False,
+            config_dict={},
+            run_manifest={"run_id": "r", "shards": ["1"]},
+        )
+        (_, _, event) = stub.events[0]
+        assert event["run_manifest"] == {"run_id": "r", "shards": ["1"]}
 
 
 # -- futures -----------------------------------------------------------------

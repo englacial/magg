@@ -133,6 +133,14 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Enumerated exact ARNs (issue #341): the former
+              # ${...FunctionName}* wildcards were declined -- enumeration
+              # keeps least privilege. Each family lists its base function
+              # plus the variants template.yaml provisions for it (prod:
+              # WorkerSizeVariants + WorkerDiskVariants, plain + -disk; test:
+              # WorkerTestDiskVariants, -disk only). All invokes/probes are
+              # unqualified ($LATEST), so no :qualifier ARN forms are needed.
+              # Drift vs the matrix is guarded by tests/test_deploy_lambda.py.
               - Sid: InvokeBenchmarkFunctions
                 Effect: Allow
                 Action:
@@ -140,8 +148,17 @@ Resources:
                   - lambda:GetFunctionConfiguration
                   - lambda:GetFunctionConcurrency
                 Resource:
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}*"
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}*"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-2048"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-4096"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-8192"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-2048-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-4096-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-8192-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-2048-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-4096-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-8192-disk"
               # Pre-flight worker-sizing probe (issue #28/#63 via concurrency.py);
               # these degrade gracefully but are needed for the guard to work.
               # Neither action supports resource-level scoping -> "*".
@@ -189,6 +206,12 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Enumerated exact ARNs (issue #341): a ${TestFunctionName}*
+              # wildcard was proposed and declined -- enumeration keeps least
+              # privilege. Base function plus exactly the variants the test
+              # stack provisions (template.yaml's WorkerTestDiskVariants loop
+              # over WorkerMemorySizes: the -disk trio only). Drift against
+              # that matrix is guarded by tests/test_deploy_lambda.py.
               - Sid: UpdateTestFunction
                 Effect: Allow
                 Action:
@@ -198,7 +221,11 @@ Resources:
                   - lambda:PutFunctionEventInvokeConfig
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-2048-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-4096-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${TestFunctionName}-8192-disk"
               - Sid: PublishTestLayer
                 Effect: Allow
                 # GetLayerVersion: update-function-configuration --layers validates
@@ -234,6 +261,18 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Enumerated exact ARNs (issue #341): a ${BenchmarkFunctionName}*
+              # wildcard was proposed and declined -- enumeration keeps least
+              # privilege. Base function plus the full prod worker-size family
+              # (template.yaml's WorkerSizeVariants + WorkerDiskVariants loops
+              # over WorkerMemorySizes: plain + -disk), plus the -extract twin
+              # (template.yaml's ExtractFn -- same code zip, so the release must
+              # redeploy it or it stays on standup-time code, issue #341's
+              # failure mode; it is dispatched by explicit name for full-archive
+              # extraction, issue #148, and never by suffix resolution, so the
+              # INVOKE role deliberately does not enumerate it -- the benchmark
+              # harness never touches it). Drift against that matrix is guarded
+              # by tests/test_deploy_lambda.py.
               - Sid: UpdateProdFunction
                 Effect: Allow
                 Action:
@@ -243,7 +282,15 @@ Resources:
                   - lambda:PutFunctionEventInvokeConfig
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-2048"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-4096"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-8192"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-2048-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-4096-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-8192-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-extract"
               - Sid: PublishProdLayer
                 Effect: Allow
                 # GetLayerVersion: update-function-configuration --layers validates

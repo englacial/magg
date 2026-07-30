@@ -52,7 +52,6 @@ import json
 import logging
 import re
 import time
-import warnings
 from datetime import datetime, timezone
 
 import numpy as np
@@ -394,6 +393,9 @@ def validate_manifest(
         # already written under the OLD configuration. Their leaves are
         # stamped and walker-discoverable, so replacing just the manifest
         # would leave them masquerading as legal mixed-order data (D2).
+        # ``semantic_hash`` is a frozen key (D19), so overwrite does NOT
+        # bypass the semantic-hash refusal when both manifests carry one —
+        # a changed aggregation block over existing data refuses right here.
         listing = obstore.list_with_delimiter(store)
         children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
         if any(_is_base_component(c) for c in children):
@@ -403,6 +405,49 @@ def validate_manifest(
                 f"data (e.g. {children[0]!r}/), and overwrite replaces the "
                 f"manifest only — clear the store root first"
             )
+    # Hash-guard coherence (issue #341): ``_frozen_matches`` EXEMPTS
+    # ``semantic_hash`` when EITHER side lacks it (no hash to compare — the
+    # exemption keeps pre-#299 stores resumable), so an overwrite proceeds past
+    # a comparison that never happened. Warn on BOTH directions of that
+    # exemption (fold review: the guard was asymmetric where the exemption is
+    # symmetric), because they fail differently:
+    #
+    # * existing has no hash, this run does  -> the existing DATA's semantics are
+    #   unverifiable. The store is coherent going forward (the rewrite stamps
+    #   this run's hash, and every re-dispatched leaf is re-templated wholesale
+    #   — ``emit_shard_template`` clears the leaf prefix first) but leaves this
+    #   run does not rewrite may carry the old schema.
+    # * existing HAS a hash, this run does not -> the overwrite strips the
+    #   recorded hash from a hashed store, un-provenancing a #299 store rather
+    #   than merely failing to verify one. Strictly the worse direction, and the
+    #   one no warning covered.
+    #
+    # ``build_manifest`` always stamps a hash, so the second direction is not
+    # reachable from a zagg-built manifest today — it is the "older zagg (or a
+    # hand-assembled manifest) writes into a newer store" shape, one refactor of
+    # ``build_manifest`` away from being live.
+    hash_exempted = existing is not None and (existing.get("semantic_hash") is None) != (
+        manifest.get("semantic_hash") is None
+    )
+    if overwrite and frozen_matches and hash_exempted:
+        listing = obstore.list_with_delimiter(store)
+        children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
+        if any(_is_base_component(c) for c in children):
+            if existing.get("semantic_hash") is None:
+                detail = (
+                    "the existing manifest predates semantic hashing (issue #299), so "
+                    "semantic compatibility of the existing shard data cannot be "
+                    "verified; re-dispatched leaves are re-templated wholesale, but "
+                    "leaves this run does not rewrite may carry the old schema"
+                )
+            else:
+                detail = (
+                    "this run's manifest carries NO semantic hash while the existing "
+                    "one does (issue #299), so the overwrite DROPS the recorded hash "
+                    "from a hashed store — the existing shard data becomes "
+                    "un-provenanced, not merely unverified"
+                )
+            logger.warning(f"overwriting {MANIFEST_NAME} at {store_root}: {detail}")
     return existing
 
 
@@ -1143,14 +1188,33 @@ def process_and_write_hive(
             store = open_store(leaf_path, **store_kwargs)
             # overwrite=True: any existing prefix here is either debris from a
             # torn run (D4) or a prior committed write being redone — both are
-            # replaced wholesale; per-leaf state never blocks a retry. The
-            # overwrite enumeration warns about the prior attempt's coverage
-            # sidecar — the ONE foreign key we put there ourselves — so that
-            # specific warning is expected and suppressed; anything else in
-            # the prefix stays loud (review finding, PR #208 round 2).
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
-                grid.emit_shard_template(store, overwrite=True)
+            # replaced wholesale; per-leaf state never blocks a retry. Since
+            # issue #341 the template DELETES the leaf prefix up front, so the
+            # wholesale claim is literal: retired members of a narrowed schema
+            # (and the prior attempt's coverage sidecar) are gone before the
+            # new template lands, and no enumeration ever walks stale/orphan
+            # member dirs (the pre-#341 walk warned on the sidecar and could
+            # die on an orphan array dir).
+            #
+            # This DOES widen the redundant-duplicate-writer window (fold
+            # review), and the change is deliberate. ``dispatch._LAMBDA_RETRYABLE``
+            # classifies off the exception string of the ``Invoke`` call itself,
+            # and for ``InvocationType=Event`` a request Lambda accepted whose
+            # HTTP response timed out is indistinguishable from one it never
+            # got — so a retry can produce a second live worker for one shard.
+            # Before: A wrote + stamped, B templated over the top, and if B died
+            # the leaf still held A's objects under A's stamp (stale-but-complete,
+            # certified). After: B's clear removes A's committed leaf first, so a
+            # B that dies mid-write leaves the leaf EMPTY and unstamped. Nothing
+            # is silently corrupt — the stamp is written last, so the leaf reads
+            # as debris and is re-dispatchable (test_leaf_clear_under_a_live_
+            # writer_leaves_debris_not_corruption) — but a redundant retry can now
+            # destroy a leaf that had already succeeded, which write-over could
+            # not. Refusing the clear on a valid stamp is the lever if that
+            # trade stops being acceptable; it is not taken here because D4 makes
+            # "replaced wholesale" the contract and a stamp must never block a
+            # retry.
+            grid.emit_shard_template(store, overwrite=True)
             box["store"] = store
         return box["store"]
 

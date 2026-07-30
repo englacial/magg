@@ -146,6 +146,83 @@ def _resolve_target(manifest: dict, name: str) -> dict:
     raise KeyError(f"unknown target '{name}'; have {known}")
 
 
+def resolve_variant(function_name: str, worker: dict | None) -> str:
+    """The pre-provisioned worker variant a target's ``worker:`` block names.
+
+    ``-<memory>`` plus ``-disk`` when ``extra_disk``, appended to the base
+    function — the same rule as ``zagg.runner._resolve_function_name``. No
+    ``worker:`` block resolves the base function itself. Shared by
+    ``run_target`` and ``main``'s pre-dispatch staleness guard so the two
+    cannot drift.
+    """
+    if not worker:
+        return function_name
+    return function_name + f"-{worker['memory']}" + ("-disk" if worker.get("extra_disk") else "")
+
+
+def check_variant_current(client, function_name: str, resolved: str) -> str:
+    """Refuse to dispatch onto a stale pre-provisioned worker variant (issue #341).
+
+    The deploy path updates the base function and its worker-size variants from
+    the same zip (deploy_lambda.sh); a variant whose ``CodeSha256`` differs from
+    the base's is running different code than the run believes it is testing —
+    the run 30503334617 failure mode, where ``-4096-disk`` served standup-time
+    code.
+
+    The two probes are read separately and treated differently (fold review),
+    because ``except Exception`` around both swallowed the guard's own strongest
+    positive signal:
+
+    * **base probe fails** → degrade to a warning and return ``"skipped"``. This
+      is the genuine "this stack's invoke role carries no
+      ``lambda:GetFunctionConfiguration`` at all" case, and the only one where
+      continuing is defensible.
+    * **base probe succeeds, variant probe fails** → hard-fail. Under the issue
+      #341 enumeration ruling ``InvokeBenchmarkFunctions`` lists exact ARNs, so
+      an ``AccessDenied`` here means the variant is absent from the in-repo
+      enumeration — and a variant nobody enumerated for the invoke role is one
+      nobody enumerated for the deploy role either, i.e. one ``deploy_lambda.sh``
+      WARN-and-skipped, i.e. definitely stale. ``ResourceNotFound`` is harder
+      still: the dispatch would fail anyway, later and more opaquely.
+    * hashes differ → hard-fail.
+
+    Returns the guard's provenance status (``"verified"`` | ``"skipped"``), which
+    rides the benchmark record so a number measured on an unverified build is not
+    byte-indistinguishable from a verified one (issue #296).
+    """
+    try:
+        base_sha = client.get_function_configuration(FunctionName=function_name)["CodeSha256"]
+    except Exception as e:
+        print(
+            f"WARN: could not probe base function {function_name} ({e}); dispatching "
+            f"{resolved} without the staleness guard — the run record is stamped "
+            f"variant_guard=skipped",
+            file=sys.stderr,
+        )
+        return "skipped"
+    try:
+        variant_sha = client.get_function_configuration(FunctionName=resolved)["CodeSha256"]
+    except Exception as e:
+        raise RuntimeError(
+            f"worker variant {resolved} is NOT REACHABLE ({e}) while base "
+            f"{function_name} probes fine, so this is specific to the variant: it is "
+            f"either not provisioned by template.yaml or absent from the enumerated "
+            f"InvokeBenchmarkFunctions ARNs in deployment/aws/benchmark_cicd.yaml. "
+            f"Either way deploy_lambda.sh cannot have updated it, so it would run "
+            f"code this benchmark is not testing (issue #341) — provision/enumerate "
+            f"the variant, or point the target's worker: block at one that exists."
+        ) from e
+    if base_sha != variant_sha:
+        raise RuntimeError(
+            f"worker variant {resolved} is STALE: its CodeSha256 {variant_sha} does not "
+            f"match base {function_name}'s {base_sha}. The variant would run code this "
+            f"benchmark is not testing (issue #341) — redeploy the variant family "
+            f"(deploy_lambda.sh updates the base and every provisioned variant from "
+            f"the same zip) and re-dispatch."
+        )
+    return "verified"
+
+
 def run_target(
     name: str,
     manifest: dict,
@@ -156,6 +233,7 @@ def run_target(
     function_name: str,
     context: dict,
     dry_run: bool = False,
+    variant_guard: str = "base",
 ) -> dict:
     """Dispatch one target's shard and return its benchmark record."""
     from zagg import __version__ as zagg_version
@@ -213,8 +291,7 @@ def run_target(
     resolved_function_name = function_name
     if worker:
         config.worker = dict(worker)
-        suffix = f"-{worker['memory']}" + ("-disk" if worker.get("extra_disk") else "")
-        resolved_function_name = function_name + suffix
+        resolved_function_name = resolve_variant(function_name, worker)
         tmp_mb = worker["memory"] + 2048 if worker.get("extra_disk") else 512
     # parent_order lives in the config grid for HEALPix; the kwarg is just a
     # legacy fallback. Rect grids ignore it. ``from_config`` gives us the grid
@@ -247,6 +324,12 @@ def run_target(
         # its /tmp size for the ephemeral cost. None on the default merge targets.
         streaming_mode=streaming_mode,
         tmp_mb=tmp_mb,
+        # Staleness-guard provenance (issues #341/#296): "verified" when the
+        # resolved variant's CodeSha256 was checked against the base, "skipped"
+        # when the probe degraded, "base" when no variant was resolved. Without
+        # it a number measured on an unverified build reads identically to one
+        # measured on a verified build.
+        variant_guard=variant_guard,
     )
 
     objects = None
@@ -255,6 +338,10 @@ def run_target(
         summary: dict = {}
     else:
         from zagg.runner import agg
+
+        # NOTE: the issue #341 CodeSha256 staleness guard runs in ``main``,
+        # BEFORE the dispatch pool spins up (fold review) — a stale variant
+        # must refuse without the sibling targets' dispatches being billed.
 
         # AOI-mask arm (issue #202): the committed map is the plain o9 map; build
         # the strict-AOI per-cell mask on the fly (mortie, no spherely) and
@@ -297,6 +384,41 @@ def run_target(
         zagg_version=zagg_version,
         objects=objects,
     )
+
+
+def check_requested_variants(
+    manifest: dict, names: list[str], function_name: str, *, region: str
+) -> dict:
+    """Probe every distinct worker variant the requested targets resolve (#341).
+
+    Called from ``main`` BEFORE the dispatch pool (fold review): running the
+    guard inside ``run_target`` meant a stale variant only raised after its
+    sibling targets had already been launched — the pool's ``shutdown(wait=True)``
+    then billed every one of them to completion (up to 900 s each) and the
+    exception escaped ``main`` before ``metrics.json`` was written, so the run
+    paid in full and recorded nothing. Up here the refusal costs two
+    ``GetFunctionConfiguration`` calls and zero dispatches.
+
+    Distinct variants are probed once, not once per target that shares them.
+    Returns ``{target_name: "verified" | "skipped" | "base"}`` — the per-record
+    provenance stamp (``"base"`` = no ``worker:`` block, nothing to verify).
+    """
+    import boto3
+
+    client = None
+    by_variant: dict[str, str] = {}
+    status: dict[str, str] = {}
+    for name in names:
+        resolved = resolve_variant(function_name, _resolve_target(manifest, name).get("worker"))
+        if resolved == function_name:
+            status[name] = "base"
+            continue
+        if resolved not in by_variant:
+            if client is None:
+                client = boto3.client("lambda", region_name=region)
+            by_variant[resolved] = check_variant_current(client, function_name, resolved)
+        status[name] = by_variant[resolved]
+    return status
 
 
 def _utc_now_iso() -> str:
@@ -381,6 +503,16 @@ def main(argv: list[str] | None = None) -> int:
         if name not in known:
             raise SystemExit(f"unknown target '{name}'; have {sorted(known)}")
 
+    # Worker-variant staleness guard (issue #341), in the same pre-dispatch slot
+    # as the name validation above: a target whose ``worker:`` block resolves a
+    # pre-provisioned variant must run the same code as the base function the
+    # deploy path just updated. Read-only probes, no dispatch, no auth yet.
+    guard_status = dict.fromkeys(names, "base")
+    if not args.dry_run:
+        guard_status = check_requested_variants(
+            manifest, names, args.function_name, region=args.region
+        )
+
     # Authenticate once up front so the concurrent targets below don't race to
     # initialize earthaccess's process-global auth singleton (issue #137). Skipped
     # under --dry-run (no dispatch, no auth) and pointless for a single target (no
@@ -403,6 +535,7 @@ def main(argv: list[str] | None = None) -> int:
             function_name=args.function_name,
             context=context,
             dry_run=args.dry_run,
+            variant_guard=guard_status.get(name, "base"),
         )
 
     # Launch all targets concurrently (issue #137). Each is an independent

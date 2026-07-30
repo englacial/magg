@@ -489,11 +489,52 @@ class HealpixGrid:
         object spanning the whole leaf, written at leaf block 0 — the
         ShardingCodec is vanilla zarr v3, so the leaf stays self-describing
         (D3), same as the ragged field's sharded vlen array (issue #209).
+
+        ``overwrite=True`` clears the leaf prefix FIRST (issue #341, Bug A):
+        D4 says a retried/overwritten leaf is replaced WHOLESALE, but the
+        template write alone only rewrites members the NEW schema declares —
+        a schema-narrowed rerun would leave the retired members' objects
+        behind (e.g. the post-#337 ``cell_ids`` chunk orphans), masquerading
+        as data.
+
+        Scope of the justification (fold review — the evidence, not more): the
+        observed ``No array found in store … at path 19/cell_ids`` signature is
+        attributed by the issue's own diagnosis to the STALE DEPLOY, on FRESH
+        stores (the stale worker still expected the ``cell_ids`` member that
+        post-#337 configs no longer declare) — no orphan objects required. On the
+        pinned zarr 3.2.1 an orphan member dir does NOT kill the enumeration
+        either: ``members()`` emits ``Object at cell_ids is not recognized as a
+        component of a Zarr hierarchy`` and skips it. So this clear is not the fix
+        for the observed crash; it makes D4's "wholesale" literal and removes the
+        retired-member class, which is worth its cost (one LIST + N DELETE per
+        leaf write) on its own terms.
+
+        The issue also asked for a second layer — make the store WALKER
+        skip/inventory unknown array dirs rather than dying. Not landed, and
+        deliberately: zagg owns no walk that enumerates leaf members (nothing in
+        the tree calls ``members()``), and the one enumeration in play is
+        zarr's/pydantic-zarr's, which already warn-skips on the pinned version.
+        The residual is a leaf this run does not rewrite in a schema-narrowed
+        store, which ``validate_manifest`` now warns about by name.
+
+        Scoping: the store is rooted AT the leaf, so ``delete_dir("")`` can only
+        reach the leaf prefix — sibling prefixes (e.g. the run's
+        ``<root>.zarr.status/`` objects, which live beside the store root) are
+        outside it. On the fleet backend that is not quite "by construction":
+        zarr's ``ObjectStore.delete_dir`` leaves the empty prefix un-slashed, so
+        the delimiter is re-added by obstore's prefix store. It does re-add it
+        (verified, and pinned by ``test_overwrite_clear_is_scoped_on_an_obstore_
+        prefix_store``), which is what makes a name-prefix twin like
+        ``<leaf>.status`` safe rather than merely unlikely.
         """
         spec = GroupSpec(members={self.group_path: self.shard_spec()}, attributes={})
         # Ragged vlen-array creation warns about the dtype NAME only
         # (zarr-python#3517); message-scoped suppression, see grids.base.
         with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
+            if overwrite:
+                from zarr.core.sync import sync
+
+                sync(store.delete_dir(""))
             spec.to_zarr(store, "", overwrite=overwrite)
         return store
 
