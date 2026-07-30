@@ -269,8 +269,13 @@ middle).
 A composition field is one dense **uint64** word per cell carrying eight
 8-bit lanes of quantized fractions of the cell's **signal stratum**
 (`N_signal` = the signal digest's total weight — magnitude lives in the
-digest, composition here). An empty signal stratum packs to `0` (the array's
-fill value).
+digest, composition here). An empty signal stratum packs to `0`, and a
+composition array **MUST** declare `fill_value: 0` so an *unwritten* cell
+decodes to the same word: readers key presence off `lane > 0` (§3.2), so a
+nonzero fill would make every unwritten cell report spurious flag presence
+(a fill of `1` reads as lanes `[1,0,0,0,0,0,0,0]` — "`land` occurred
+exactly"). Enforced at config validation, alongside the §3.3 `of`/`threshold`
+cross-checks.
 
 ### 3.1 Word layout
 

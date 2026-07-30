@@ -586,7 +586,10 @@ def _validate_composition_attrs(name: str, meta: dict, attrs: dict, agg_vars: di
       ``kind: ragged`` (a typo or a later rename of the digest field would
       otherwise leave readers dereferencing a field that does not exist);
     * ``threshold`` must equal the field's own ``params.threshold`` (the value
-      the reducer actually packs at).
+      the reducer actually packs at);
+    * ``fill_value`` must be ``0`` — an empty signal stratum packs to ``0`` and
+      readers key presence off ``lane > 0``, so a nonzero fill would make every
+      *unwritten* cell report spurious flag presence (spec §3).
 
     The block's other two keys are **spec-owned**, not author config: the
     template stamps ``spec``/``lanes`` from
@@ -625,6 +628,14 @@ def _validate_composition_attrs(name: str, meta: dict, attrs: dict, agg_vars: di
             f"Variable '{name}': attrs.composition.lanes must be the {COMPOSITION_SPEC} "
             f"lane order {list(LANES)} — pack_composition packs lane i at bits 8i..8i+7 "
             f"in that fixed order, so a permuted declaration would mislabel every lane"
+        )
+    fill = meta.get("fill_value")
+    if fill != 0:
+        raise ValueError(
+            f"Variable '{name}': a composition field must declare fill_value: 0 (got "
+            f"{fill!r}) — an empty signal stratum packs to 0, and readers key presence "
+            f"off 'lane > 0', so a nonzero fill makes every unwritten cell report "
+            f"spurious flag presence (spec §3)"
         )
     of = block.get("of")
     if of is not None:

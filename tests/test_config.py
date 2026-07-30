@@ -526,7 +526,7 @@ class TestValidation:
         with pytest.raises(ValueError, match="JSON-serializable"):
             validate_config(self._config_with_field_attrs({"arr": np.zeros(2)}))
 
-    def _config_with_composition(self, block, *, params=None, digest_kind="ragged"):
+    def _config_with_composition(self, block, *, params=None, digest_kind="ragged", fill_value=0):
         """Composition field + a sibling digest field, for the attrs cross-checks."""
         return PipelineConfig(
             data_source={"variables": {"h_li": "/path"}},
@@ -543,6 +543,7 @@ class TestValidation:
                         "function": "zagg.stats.composition.pack_composition",
                         "source": "h_li",
                         "dtype": "uint64",
+                        "fill_value": fill_value,
                         "params": {"threshold": 2} if params is None else params,
                         "attrs": {"composition": block},
                     },
@@ -555,6 +556,21 @@ class TestValidation:
         validate_config(
             self._config_with_composition({"of": "h_tdigest_signal", "threshold": 2})
         )  # should not raise
+
+    def test_composition_fill_value_must_be_zero(self):
+        # §3: a nonzero fill makes every unwritten cell report presence.
+        with pytest.raises(ValueError, match="must declare fill_value: 0"):
+            validate_config(
+                self._config_with_composition(
+                    {"of": "h_tdigest_signal", "threshold": 2}, fill_value=1
+                )
+            )
+        with pytest.raises(ValueError, match="must declare fill_value: 0"):
+            validate_config(
+                self._config_with_composition(
+                    {"of": "h_tdigest_signal", "threshold": 2}, fill_value=None
+                )
+            )
 
     def test_composition_spec_must_match_the_convention(self):
         # spec/lanes are writer-stamped (spec §3.3); a declaration that
