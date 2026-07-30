@@ -75,7 +75,7 @@ import zarr
 from zarr.abc.store import Store
 
 from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC
-from zagg.readers._layout import rank_to_rowcol
+from zagg.readers._layout import rank_to_rowcol, rowcol_to_rank
 from zagg.stats.tdigest import cdf_from_tdigest, quantile_from_tdigest
 
 __all__ = [
@@ -85,6 +85,7 @@ __all__ = [
     "read_raw_values",
     "read_locations",
     "read_cell",
+    "cell_index",
 ]
 
 FitMode = Literal["raise", "degrade_resolution", "collapse_bins"]
@@ -703,8 +704,11 @@ def read_raw_values(
         ``values`` is the cell's recovered 1-D sample vector (sorted ascending,
         as the digest stores centroids by mean); ``(row, col)`` its
         deinterleaved 2-D position within the chunk — the same tensor position
-        :func:`read_tensors` places the cell at (issue #336; invert with
-        :func:`zagg.readers._layout.rowcol_to_rank`).
+        :func:`read_tensors` places the cell at (issue #336).
+        :func:`zagg.readers._layout.rowcol_to_rank` inverts it to the
+        **chunk-local** rank; for a :func:`read_cell` key (a GLOBAL cells-axis
+        index) compose through :func:`cell_index`, which adds the chunk's
+        start offset.
 
     Raises
     ------
@@ -826,3 +830,61 @@ def read_cell(
         )
     (raw,) = arr[cell : cell + 1]
     return _decode_cell(raw, elem_dtype, elem_shape)
+
+
+def cell_index(
+    store: Store,
+    field: str,
+    morton_index: int,
+    row: int,
+    col: int,
+    *,
+    zarr_format: Literal[2, 3] = 3,
+) -> int:
+    """Global cells-axis index of a reported ``(row, col)`` — the :func:`read_cell` key.
+
+    The sweep readers report a chunk-local position:
+    :func:`zagg.readers._layout.rowcol_to_rank` inverts the deinterleave back
+    to a rank ``0..4**depth - 1`` **within the chunk**, while
+    :func:`read_cell` addresses the array's GLOBAL cells axis — so the
+    chunk's own start offset is the missing term, and feeding a bare rank to
+    :func:`read_cell` silently reads the wrong cell (it is always in range).
+    This resolves the offset from the sibling ``morton`` coordinate and
+    returns ``chunk_start + rowcol_to_rank(row, col, depth)``.
+
+    ``morton_index`` is a READ-CHUNK id — the id :func:`read_raw_values`,
+    :func:`read_locations`, and the default (per-chunk) :func:`read_tensors`
+    report. A coarser ``block_order`` block id names no single chunk and
+    raises. Only the array's STORED spans are searched (the populated chunks
+    the sweep readers yield from), one small slice of the ``morton``
+    coordinate per span — never the whole axis, and no digest bytes.
+
+    Raises
+    ------
+    ValueError
+        If ``row``/``col`` are outside the chunk's ``(side, side)`` block, or
+        no stored chunk carries ``morton_index``.
+    """
+    arr, _dt, _sh, _meta = _open_ragged(store, field, zarr_format)
+    morton = _open_morton(store, field, zarr_format)
+    side, depth = _tensor_side(arr, field)
+    cells_per_chunk = side * side
+    if not (0 <= int(row) < side and 0 <= int(col) < side):
+        raise ValueError(
+            f"({row}, {col}) is outside {field!r}'s ({side}, {side}) read-chunk block"
+        )
+    rank = int(rowcol_to_rank(int(row), int(col), depth))
+    target = int(morton_index)
+    for span_start, span_stop in _stored_chunk_spans(arr):
+        span_words = morton[span_start:span_stop]
+        for offset in range(0, span_stop - span_start, cells_per_chunk):
+            words = span_words[offset : offset + cells_per_chunk]
+            start = span_start + offset
+            if not np.any(words) or _chunk_word(words, field, start) != target:
+                continue
+            return start + rank
+    raise ValueError(
+        f"no stored read chunk of {field!r} carries morton id {target} — "
+        f"cell_index resolves the READ-CHUNK ids the sweep readers report "
+        f"(a coarser block_order block id names no single chunk)"
+    )

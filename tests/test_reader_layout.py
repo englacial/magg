@@ -11,12 +11,12 @@ so zagg cannot drift from the spec by construction.
 
 import numpy as np
 import pytest
-from test_readers import _KEY_A, _build_store, _sharded_store
+from test_readers import _KEY_A, _KEY_B, _build_store, _sharded_store
 from zarr.storage import MemoryStore
 
 from zagg.grids.morton import morton_word
 from zagg.readers._layout import rank_to_rowcol, rowcol_to_rank
-from zagg.readers.tdigest_tensor import read_tensors
+from zagg.readers.tdigest_tensor import cell_index, read_cell, read_raw_values, read_tensors
 
 # Golden (rank, x, y) triples copied verbatim from mortie's merged test file
 # mortie/tests/test_rank_xy.py (espg/mortie#150) — provenance: healpy 1.20.0
@@ -160,6 +160,56 @@ class TestTensorPlacement:
         # Values identify the cell: rank recovered from (row, col) round-trips.
         for _m, (row, col), v in read_raw_values(store, "12/h_tdigest"):
             assert v[0] == float(rowcol_to_rank(row, col, 6))
+
+
+class TestCellIndexComposition:
+    """A reported ``(row, col)`` composes all the way to :func:`read_cell`.
+
+    ``rowcol_to_rank`` inverts to the CHUNK-LOCAL rank; ``read_cell`` keys on
+    the global cells axis, so ``cell_index`` supplies the chunk start."""
+
+    _FIELD = "12/h_tdigest"
+
+    def _store(self):
+        rng = np.random.default_rng(7)
+        # 3 samples per cell → no merged centroids, so read_raw_values recovers
+        # the exact means and read_cell's payload can be compared to them.
+        vals = {rank: np.sort(rng.uniform(10.0, 30.0, 3)) for rank in (0, 5, 11, 4095)}
+        store, _grid, _words = _build_store({_KEY_A: vals, _KEY_B: vals})
+        return store
+
+    def test_reported_rowcol_round_trips_to_read_cell(self):
+        store = self._store()
+        seen = 0
+        for morton, (row, col), values in read_raw_values(store, self._FIELD):
+            cell = cell_index(store, self._FIELD, morton, row, col)
+            digest = read_cell(store, self._FIELD, cell)
+            np.testing.assert_allclose(digest[:, 0], values, rtol=1e-6)
+            seen += 1
+        assert seen == 8  # 4 cells × 2 shards
+
+    def test_bare_chunk_local_rank_reads_the_wrong_cell(self):
+        # The composition the docs used to claim: a chunk-local rank is always
+        # in range, so read_cell(rank) picks a different cell and does NOT
+        # raise — which is why cell_index exists.
+        store = self._store()
+        for morton, (row, col), _values in read_raw_values(store, self._FIELD):
+            rank = int(rowcol_to_rank(row, col, 6))
+            cell = cell_index(store, self._FIELD, morton, row, col)
+            assert cell != rank
+            assert len(read_cell(store, self._FIELD, rank)) == 0  # silently empty
+
+    def test_block_id_and_out_of_block_position_raise(self):
+        store = MemoryStore()
+        _grid, shard6, targets = _sharded_store(store, populate={0, 1})
+        # The order-8 read chunks report order-8 ids; the order-6 shard id
+        # (what block_order=6 would yield) names no single chunk.
+        with pytest.raises(ValueError, match="no stored read chunk"):
+            cell_index(store, self._FIELD, shard6, 3, 1)
+        chunk_word = next(m for m, _rc, _v in read_raw_values(store, self._FIELD))
+        assert cell_index(store, self._FIELD, chunk_word, 3, 1) == targets[0]
+        with pytest.raises(ValueError, match="outside"):
+            cell_index(store, self._FIELD, chunk_word, 16, 0)  # 16×16 read chunk
 
 
 class TestBlockAssembly:

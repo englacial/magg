@@ -213,8 +213,22 @@ for tensor, mask, (offset, gain), morton in read_tensors(store, field):
   upgrade is data-driven, not a reader flag.
 
 `read_raw_values` / `read_locations` report the same deinterleaved
-`(row, col)` per cell (invert with `readers._layout.rowcol_to_rank` to get a
-cells-axis index for `read_cell`).
+`(row, col)` per cell. `readers._layout.rowcol_to_rank` inverts that to the
+**chunk-local** nested rank (`0..4**depth - 1`) — *not* a `read_cell` key,
+which is a **global** cells-axis index; the chunk's start offset is the
+missing term, and a bare rank is always in range so `read_cell` would read
+the wrong cell without raising. `cell_index` composes the two:
+
+```python
+for morton, (row, col), values in read_raw_values(store, field):
+    cell = cell_index(store, field, morton, row, col)  # chunk_start + rank
+    assert (read_cell(store, field, cell)[:, 0] == values).all()
+```
+
+It resolves the offset from the sibling `morton` coordinate, searching only
+the array's stored spans (the populated chunks the sweep readers yield from)
+and no digest bytes. `morton_index` must be a read-chunk id — a coarser
+`block_order` block id names no single chunk and raises.
 
 ## Issue #210 typed-dtype migration
 
