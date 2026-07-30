@@ -15,6 +15,11 @@ is not. Names a pre-split module merely imported (``json``, ``zarr``,
 deliberately NOT frozen: they were import artifacts, never API, and re-exporting
 a dependency on the facade would be a trap — a ``monkeypatch.setattr`` against
 the facade binding would silently miss the submodule that actually calls it.
+
+For the same reason a facade re-export is **read** compat only. Tests that
+patch an internal (``zagg.hive``'s ``open_object_store``,
+``zagg.processing.raster``'s ``_STORE_CACHE``) patch the owning SUBMODULE, since
+that is where the calling code reads the global from.
 """
 
 import importlib
@@ -80,9 +85,52 @@ HIVE_NAMES = (
     "write_semantic_core",
 )
 
+#: Top-level names ``src/zagg/processing/raster.py`` defined before the phase-2
+#: split (the module was 1,266 lines).
+RASTER_NAMES = (
+    "_DEFAULT_SHARD_WORKERS",
+    "_DEFAULT_WRITE_BUFFER",
+    "_DTYPES",
+    "_S3_VHOST",
+    "_STORE_CACHE",
+    "_STORE_LOCK",
+    "_TIME_ATTRS",
+    "_build_store",
+    "_check_raster_grid",
+    "_chord2",
+    "_combine_by_ownership",
+    "_geo_from_ifd",
+    "_iso_us",
+    "_raster_array_spec",
+    "_raster_center_lonlat",
+    "_raster_members",
+    "_run_sync",
+    "_sample_one",
+    "_shard_cell_range",
+    "_shard_workers",
+    "_store_and_path",
+    "_us_iso",
+    "_write_buffer",
+    "emit_raster_leaf_template",
+    "emit_raster_template",
+    "new_stage_stats",
+    "process_and_write_raster_hive",
+    "process_raster_shard",
+    "raster_group_spec",
+    "raster_leaf_spec",
+    "raster_time_index",
+    "sample_asset",
+    "sample_asset_async",
+    "sample_item_async",
+    "write_raster_coords",
+    "write_raster_leaf_slab",
+    "write_raster_slab",
+)
+
 #: ``{facade module: (pre-split names, submodules it re-exports from)}``.
 SPLITS = {
     "zagg.hive": (HIVE_NAMES, ("layout", "manifest", "coverage")),
+    "zagg.processing.raster": (RASTER_NAMES, ("decode", "template", "write")),
 }
 
 

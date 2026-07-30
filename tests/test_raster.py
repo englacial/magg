@@ -350,9 +350,13 @@ class TestStoreAndPath:
     @pytest.fixture(autouse=True)
     def _fresh_cache(self, monkeypatch):
         # The store cache is process-lifetime (issue #244); isolate per test.
-        from zagg.processing import raster as raster_mod
+        # Patched on the module that OWNS the binding: since the issue #330
+        # phase-2 split ``_store_and_path`` reads the cache out of
+        # ``raster.decode``'s globals, so patching the facade re-export would
+        # rebind a name nothing reads.
+        from zagg.processing.raster import decode as decode_mod
 
-        monkeypatch.setattr(raster_mod, "_STORE_CACHE", {})
+        monkeypatch.setattr(decode_mod, "_STORE_CACHE", {})
 
     def test_same_href_reuses_store(self):
         s1, _ = _store_and_path("s3://bkt/a.tif", region="us-west-2")
@@ -373,7 +377,7 @@ class TestStoreAndPath:
     def test_constructor_called_once_per_key(self, monkeypatch):
         import async_tiff.store as ats
 
-        from zagg.processing import raster as raster_mod
+        from zagg.processing.raster import decode as decode_mod
 
         calls = {"n": 0}
         real = ats.S3Store
@@ -383,7 +387,7 @@ class TestStoreAndPath:
                 calls["n"] += 1
                 return real(*a, **k)
 
-        monkeypatch.setattr(raster_mod, "_STORE_CACHE", {})
+        monkeypatch.setattr(decode_mod, "_STORE_CACHE", {})
         monkeypatch.setattr(ats, "S3Store", _Counting)
         for _ in range(5):
             _store_and_path("s3://bkt/x.tif", region="us-west-2")
