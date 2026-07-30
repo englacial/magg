@@ -208,7 +208,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
         if cls == "exact":
             fields[name] = {
                 "class": "exact",
-                "method": EXACT_MERGE_LAWS[_fold_function_name(meta.get("function"))],
+                "method": EXACT_MERGE_LAWS[_fold_function_name(meta.get("function")) or ""],
                 "dtype": meta.get("dtype", "float32"),
                 "fill_value": _json_fill(meta.get("fill_value", "NaN")),
             }
@@ -767,6 +767,7 @@ def _write_overview(
     """
     import zarr
     from mortie import generate_morton_children
+    from zarr import open_array
 
     from zagg.grids.healpix import HealpixGrid
     from zagg.grids.morton import morton_word
@@ -780,11 +781,12 @@ def _write_overview(
     grid = HealpixGrid(k, target_order, config=_overview_config(fields), sharded=True)
     store = open_store(path, **store_kwargs)
     grid.emit_shard_template(store, overwrite=True)
-    group = zarr.open_group(store, path=str(target_order), mode="r+", zarr_format=3)
     words = np.asarray(generate_morton_children(morton_word(node), target_order), dtype=np.uint64)
-    group["morton"][:] = words
+    arr = open_array(store, path=f"{target_order}/morton", zarr_format=3, consolidated=False)
+    arr[:] = words
     for name, slab in fold["slabs"].items():
-        group[name][:] = slab
+        arr = open_array(store, path=f"{target_order}/{name}", zarr_format=3, consolidated=False)
+        arr[:] = slab
     populated = _populated_mask(fold["slabs"], fields)
     root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
     root.attrs.update(

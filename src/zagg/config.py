@@ -2339,7 +2339,7 @@ def _validate_pyramid(config: PipelineConfig) -> None:
     raw = config.output.get("pyramid")
     if raw is None or raw is False:
         return
-    knob = get_pyramid(config)  # raises on a non-mapping
+    knob = get_pyramid(config) or {}  # raises on a non-mapping
     if get_store_layout(config) != "hive":
         raise ValueError(
             "output.pyramid requires output.store_layout: hive (overviews live at "
