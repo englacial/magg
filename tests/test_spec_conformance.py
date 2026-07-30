@@ -278,6 +278,17 @@ class TestComposition:
             "threshold": 2,
         }
 
+    def test_attrs_block_binds_to_the_writer_constants(self):
+        # §3.3: spec/lanes are writer-stamped, so the committed block must
+        # equal the module constants — not just the literal above (which the
+        # generator's own config could otherwise have dictated).
+        from zagg.stats.composition import COMPOSITION_SPEC, LANES
+
+        _exp, arr = self._array()
+        block = arr.attrs["composition"]
+        assert block["spec"] == COMPOSITION_SPEC
+        assert block["lanes"] == list(LANES)
+
     def test_words_match_expected_and_empty_cells_zero(self):
         exp, arr = self._array()
         words = np.asarray(arr[:])

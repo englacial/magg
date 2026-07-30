@@ -1539,9 +1539,39 @@ class TestFieldAttrsTemplate:
         return HealpixGrid(parent_order=4, child_order=8, chunk_inner=6, sharded=True, config=cfg)
 
     def test_scalar_field_attrs(self):
+        # spec/lanes are stamped from the module constants; the config's own
+        # keys ride alongside (spec §3.3, review finding issue #340).
+        from zagg.stats.composition import COMPOSITION_SPEC, LANES
+
         m = self._grid().spec().members
         assert dict(m["composition"].attributes) == {
-            "composition": {"spec": "zagg-composition/1", "threshold": 2}
+            "composition": {"spec": COMPOSITION_SPEC, "lanes": list(LANES), "threshold": 2}
+        }
+
+    def test_composition_lanes_stamped_when_config_omits_them(self):
+        from zagg.config import PipelineConfig
+        from zagg.stats.composition import COMPOSITION_SPEC, LANES
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "composition": {
+                        "function": "zagg.stats.composition.pack_composition",
+                        "source": "h_li",
+                        "dtype": "uint64",
+                        "fill_value": 0,
+                        "attrs": {"composition": {"of": "h_sig", "threshold": 2}},
+                    }
+                }
+            }
+        )
+        grid = HealpixGrid(parent_order=4, child_order=8, chunk_inner=6, sharded=True, config=cfg)
+        block = dict(grid.spec().members["composition"].attributes)["composition"]
+        assert block == {
+            "of": "h_sig",
+            "threshold": 2,
+            "spec": COMPOSITION_SPEC,
+            "lanes": list(LANES),
         }
 
     def test_ragged_field_attrs_merge_with_ragged_block(self):

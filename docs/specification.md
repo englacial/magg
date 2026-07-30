@@ -337,7 +337,19 @@ and MUST strict-check `spec` per the conformance rule:
 ```
 
 - **`lanes`** — the lane names in bit order (LSB byte first). For `/1` the
-  value is exactly the §3.1 order.
+  value is exactly the §3.1 order — lane order is **not** a product knob: the
+  packer writes lane `i` at bits `8*i .. 8*i+7` in that fixed order, so a
+  permuted, truncated, or renamed `lanes` value is **out of contract** and a
+  writer MUST reject it rather than emit it.
+- `spec` and `lanes` are **writer-stamped, not author-declared**: the store's
+  values come from the writer's own constants
+  (`zagg.stats.composition.COMPOSITION_SPEC` / `LANES`, stamped onto the array
+  spec by `grids.base.apply_field_attrs`), the same posture as the §1.2
+  `ragged` block, and a config declaration that disagrees with either is
+  rejected at config validation. `of` and `threshold` are per-product and
+  author-declared, cross-checked at config validation (`of` must name a
+  declared `kind: ragged` field; `threshold` must equal the reducer's own
+  `params.threshold`).
 - **`of`** — the name of the sibling digest field whose total weight is the
   `N_signal` the lanes are fractions of. The composition word is
   uninterpretable without it: readers recover counts by pairing the word with

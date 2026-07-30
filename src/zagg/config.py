@@ -588,6 +588,17 @@ def _validate_composition_attrs(name: str, meta: dict, attrs: dict, agg_vars: di
     * ``threshold`` must equal the field's own ``params.threshold`` (the value
       the reducer actually packs at).
 
+    The block's other two keys are **spec-owned**, not author config: the
+    template stamps ``spec``/``lanes`` from
+    :data:`~zagg.stats.composition.COMPOSITION_SPEC` /
+    :data:`~zagg.stats.composition.LANES`
+    (:func:`~zagg.stats.composition.composition_attrs_block`), and a config
+    that *declares* either one must agree with the constant. Lane order in
+    particular is not a knob — :func:`~zagg.stats.composition.pack_composition`
+    packs in fixed ``LANES`` order — so a permuted or truncated declaration
+    would mislabel every lane for a reader binding to it per spec §3.3 and is
+    rejected here (review finding, issue #340).
+
     The third coupling — the digest fields' ``where`` predicates committing the
     same cut as ``threshold`` — is *not* validated here: ``where`` is an
     arbitrary expression, so any check would be a regex over Python source that
@@ -599,6 +610,22 @@ def _validate_composition_attrs(name: str, meta: dict, attrs: dict, agg_vars: di
     block = attrs.get("composition")
     if not isinstance(block, dict):
         return
+    from zagg.stats.composition import COMPOSITION_SPEC, LANES
+
+    spec = block.get("spec")
+    if spec is not None and spec != COMPOSITION_SPEC:
+        raise ValueError(
+            f"Variable '{name}': attrs.composition.spec {spec!r} is not the convention "
+            f"this writer packs ({COMPOSITION_SPEC!r}) — the marker is stamped from "
+            f"zagg.stats.composition, not declared (issue #340)"
+        )
+    lanes = block.get("lanes")
+    if lanes is not None and list(lanes) != list(LANES):
+        raise ValueError(
+            f"Variable '{name}': attrs.composition.lanes must be the {COMPOSITION_SPEC} "
+            f"lane order {list(LANES)} — pack_composition packs lane i at bits 8i..8i+7 "
+            f"in that fixed order, so a permuted declaration would mislabel every lane"
+        )
     of = block.get("of")
     if of is not None:
         if of == name:

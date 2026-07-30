@@ -44,8 +44,10 @@ from __future__ import annotations
 import numpy as np
 
 __all__ = [
+    "COMPOSITION_ATTR",
     "COMPOSITION_SPEC",
     "LANES",
+    "composition_attrs_block",
     "counts_from_composition",
     "merge_composition",
     "pack_composition",
@@ -58,7 +60,32 @@ COMPOSITION_SPEC = "zagg-composition/1"
 #: order), then the three confidence levels of the union-signal stratum.
 LANES = ("land", "ocean", "sea_ice", "land_ice", "inland_water", "low", "med", "high")
 
+#: Array-attrs key carrying the versioned composition block (spec §3.3). The
+#: block's ``spec``/``lanes`` halves are spec-owned: the template stamps them
+#: from :data:`COMPOSITION_SPEC` / :data:`LANES`
+#: (:func:`composition_attrs_block`, called by
+#: ``grids.base.apply_field_attrs``) and config validation rejects a declared
+#: value that disagrees, so a store's marker is never an author transcription.
+COMPOSITION_ATTR = "composition"
+
 _SURFACES = 5
+
+
+def composition_attrs_block(declared: dict) -> dict:
+    """Stamp the spec-owned keys onto a config-declared ``composition`` block.
+
+    ``spec`` and ``lanes`` are derived here rather than trusted from the
+    config — the :func:`~zagg.grids.base.ragged_array_spec` posture, so the
+    store's convention marker and lane binding come from this module's
+    constants. ``of`` and ``threshold`` stay author-declared (they are
+    per-product) and are cross-checked at config validation.
+
+    Lane order is **not** a knob: :func:`pack_composition` packs lane ``i``
+    at bits ``8*i .. 8*i+7`` in fixed :data:`LANES` order, so a permuted or
+    truncated declaration could not be honoured — config validation rejects
+    it instead of silently mislabelling every lane.
+    """
+    return {**declared, "spec": COMPOSITION_SPEC, "lanes": list(LANES)}
 
 
 def _quantize(counts: np.ndarray, n: int) -> np.ndarray:
