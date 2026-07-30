@@ -1418,6 +1418,7 @@ class RasterStrategy:
                     timesteps_written += body["timesteps"]
 
         wall_time = time.time() - t0
+        finalize_error = None
         if store_layout == "hive":
             # Finalize-backstop-before-all-failed-raise, mirroring the local
             # backend (where ensure_manifest + root coverage run ahead of the
@@ -1428,17 +1429,24 @@ class RasterStrategy:
             # fires (natural gating); the finalize backstop still runs.
             #
             # Finalize backstop (issue #252 hybrid): idempotent ensure_manifest
-            # worker-side — required reader-facing schema (D6), so a failure
-            # raises, unlike the fail-open coverage dispatch below.
-            _invoke_lambda_finalize(
-                client,
-                function_name,
-                store_path,
-                output_creds_event=output_creds_event,
-                config_dict=config_dict,
-                dataset=dataset,
-                parent_order=int(grid.parent_order),
-                overwrite=overwrite,
+            # worker-side. Guarded exactly like the aggregation path (issue #335,
+            # same shared helper — raster is not scoped out of store/telemetry
+            # parity): warn, retry once, then DEFER so the tail below (coverage,
+            # the run-stats record that carries the failure, sweep) still runs
+            # and the error re-raises at the end.
+            finalize_error = _finalize_with_retry(
+                lambda: _invoke_lambda_finalize(
+                    client,
+                    function_name,
+                    store_path,
+                    output_creds_event=output_creds_event,
+                    config_dict=config_dict,
+                    dataset=dataset,
+                    parent_order=int(grid.parent_order),
+                    overwrite=overwrite,
+                ),
+                store_path=store_path,
+                reraise_note="This error re-raises after the post-run tail completes.",
             )
             if get_coverage_moc(config):
                 # Root coverage.moc (issue #200 phase 3): one fire-and-forget
@@ -1486,7 +1494,12 @@ class RasterStrategy:
             )
             for key, error, body in stats_failures
         ]
-        # D8 worker-invoke transport (issue #313): mirrors the spatial path.
+        # D8 worker-invoke transport (issue #313): mirrors the spatial path,
+        # deferred finalize failure included (issue #335) — this write is what
+        # makes it durable, and it happens BEFORE the all-failed raise below.
+        finalize_error_str = (
+            None if finalize_error is None else f"{type(finalize_error).__name__}: {finalize_error}"
+        )
         run_stats_path = _dispatch_run_stats(
             client,
             function_name,
@@ -1496,6 +1509,7 @@ class RasterStrategy:
             result_prefix=result_prefix,
             output_creds_event=output_creds_event,
             store_kwargs=_output_store_kwargs(output_creds_event, region),
+            finalize_error=finalize_error_str,
         )
         # End-of-run rollup sweep (issue #300): D8 worker-invoke transport,
         # mirroring the aggregation lambda path — one fire-and-forget
@@ -1516,6 +1530,11 @@ class RasterStrategy:
                     logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+        # Precedence note (issue #335): the all-failed verdict still raises
+        # FIRST — it is the run's own root cause, not a tail crash, and a stale
+        # manifest is moot when no shard wrote anything. The finalize failure is
+        # already durable (the run-stats write above) and is what re-raises when
+        # some shards did land.
         if cells and errors == len(cells):
             raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
         # Worker telemetry rollup (issue #250): billed durations and peak RSS,
@@ -1562,6 +1581,10 @@ class RasterStrategy:
             "store_path": store_path,
             "backend": "lambda",
             "run_stats_path": run_stats_path,
+            # Guarded finalize (issue #335): always present, None on success —
+            # same key and same meaning as the aggregation lambda summary, so
+            # the two paths' summaries keep one shape for this field.
+            "finalize_error": finalize_error_str,
         }
         if profile:
             # Straggler-maxed stage seconds (+ the write bucket) and summed
@@ -1580,6 +1603,11 @@ class RasterStrategy:
             f"Done (lambda): {shards_with_data}/{len(cells)} shards, "
             f"{errors} errors, {wall_time:.1f}s"
         )
+        # Deferred finalize failure (issue #335): the tail ran with the error
+        # recorded in run-stats; re-raise the original so agg still exits
+        # nonzero, exactly as the aggregation lambda path does.
+        if finalize_error is not None:
+            raise finalize_error
         return summary
 
 

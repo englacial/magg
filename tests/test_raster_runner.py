@@ -1369,6 +1369,80 @@ class TestRasterHiveLambdaBackend:
             assert ma.get(key) == mb.get(key)
 
 
+class TestRasterFinalizeGuard:
+    """Guarded finalize on the raster Lambda path (issue #335 fold): the same
+    warn / retry-once / defer-and-re-raise contract as the aggregation path, via
+    the same shared helper — raster is never scoped out of store/telemetry
+    parity. Failure is a stale root manifest only; every shard already wrote."""
+
+    def _drive(self, manifest, monkeypatch, *, finalize):
+        import boto3
+
+        from zagg import runner
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        monkeypatch.setattr(runner, "_FINALIZE_BACKOFF_S", 0)
+        stats: dict = {}
+
+        def _stats(*a, **k):
+            stats.update(k)
+            return "s3://bucket/out.zarr/stats_x.parquet"
+
+        monkeypatch.setattr(runner, "_dispatch_run_stats", _stats)
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "finalize":
+                finalize()
+                return {"statusCode": 200, "body": json.dumps({"ok": True, "mode": "finalize"})}
+            if mode in ("setup", "coverage", "sweep"):
+                return {"statusCode": 200, "body": "{}"}
+            if mode == "ping":
+                body = {"ok": True, "mode": "ping", "zagg_version": "test"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            assert mode == "process_raster"
+            body = {"shard_key": event["shard_key"], "timesteps": 2, "cells_with_data": 7}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+
+        def run():
+            return agg(
+                cfg,
+                catalog=sm_path,
+                store="s3://bucket/out.zarr",
+                backend="lambda",
+                max_workers=2,
+                invocation="sync",
+            )
+
+        return run, fake, stats
+
+    def test_success_path_unchanged(self, manifest, monkeypatch):
+        run, fake, stats = self._drive(manifest, monkeypatch, finalize=lambda: None)
+        summary = run()
+        assert [e["mode"] for e in fake.events].count("finalize") == 1  # no retry
+        assert summary["finalize_error"] is None  # always present, None on success
+        assert stats["finalize_error"] is None
+
+    def test_failure_defers_through_the_tail_then_reraises(self, manifest, monkeypatch):
+        def _fail():
+            raise RuntimeError("finalize down")
+
+        run, fake, stats = self._drive(manifest, monkeypatch, finalize=_fail)
+        with pytest.warns(RuntimeWarning, match=r"finalize \(manifest backstop\) failed"):
+            with pytest.raises(RuntimeError, match="finalize down"):
+                run()
+        modes = [e["mode"] for e in fake.events]
+        assert modes.count("finalize") == 2  # initial + exactly one retry
+        assert "coverage" in modes  # the tail ran despite the failure...
+        # ...and the failure is DURABLE: it rode the run-stats write (which the
+        # dispatcher cannot do itself — D8), before the re-raise.
+        assert stats["finalize_error"] == "RuntimeError: finalize down"
+
+
 class TestRasterHiveIdempotency:
     """Window re-run + backfill (D13) and the flat-raster default pin
     (issue #247 phase 5)."""
