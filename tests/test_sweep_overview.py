@@ -795,6 +795,47 @@ class TestSection83Obligations:
                     atol=0.25,
                 )
 
+    @pytest.mark.parametrize("k", [1, 0])
+    def test_morton_labels_address_the_folded_cells(self, tmp_path, k):
+        # Review finding, issue #201: the writer places slabs by base-4 rank
+        # arithmetic but LABELS them with generate_morton_children(), two
+        # orderings that must agree — and `_direct()` above cannot catch a
+        # disagreement because it recomputes the writer's own formula. Resolve
+        # every slot from the overview's OWN morton value instead: a leaf cell
+        # belongs to the overview cell its morton decimal PREFIXES.
+        from mortie import generate_morton_children
+
+        from zagg.grids.morton import morton_decimal
+
+        refs = self._populate(tmp_path, orders=(k,))
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        target_order = CELL_ORDER - (SHARD_ORDER - k)
+        node = {1: "-31", 0: "-3"}[k]
+        base = node[: len(node) - k]
+        g = _overview_group(tmp_path, {1: "-3/1", 0: "-3"}[k], "all.zarr", target_order)
+
+        pooled: dict[str, list] = {}
+        for (dec, row), obs in self.OBS.items():
+            word = generate_morton_children(morton_word(dec), CELL_ORDER)[row]
+            cell = morton_decimal(int(word))  # the order-4 leaf cell's id
+            pooled.setdefault(cell[: len(base) + target_order], []).extend(obs)
+        assert pooled  # every OBS cell resolved to an overview cell
+
+        morton, count, h_min = g["morton"][:], g["count"][:], g["h_min"][:]
+        assert len(set(morton.tolist())) == len(morton)  # labels are distinct
+        seen = set()
+        for j, word in enumerate(morton.tolist()):
+            label = morton_decimal(int(word))
+            assert label.startswith(node) and len(label) == len(base) + target_order
+            if label in pooled:
+                obs = np.asarray(pooled[label], dtype=np.float64)
+                assert count[j] == len(obs)
+                assert h_min[j] == np.float32(obs.min())
+                seen.add(label)
+            else:  # unclaimed slots stay at the fill
+                assert count[j] == 0 and np.isnan(h_min[j])
+        assert seen == set(pooled)  # no populated cell went unlabelled
+
     def test_second_pass_over_unchanged_tree_writes_nothing(self, tmp_path):
         refs = self._populate(tmp_path)
         first = run_sweep(str(tmp_path), refs, families=("moc", "overview"))
