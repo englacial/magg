@@ -180,9 +180,10 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
     cols = bench_metrics.RECORD_COLUMNS
     assert cols.index("codec") < cols.index("read") < cols.index("total_wall_s")
     # The wall breakdown (#180), read backend (#193), object counts (#240),
-    # store layout (#240 phase 4), worker phase split (#250/#256) and the
-    # streaming-mode/ephemeral axis (#272) appended in that order.
-    assert cols[-15:] == [
+    # store layout (#240 phase 4), worker phase split (#250/#256), the
+    # streaming-mode/ephemeral axis (#272) and the worker-build provenance stamp
+    # (#341/#296) appended in that order.
+    assert cols[-16:] == [
         "total_wall_s",
         "setup_s",
         "fanout_s",
@@ -198,6 +199,7 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
         "streaming_mode",
         "tmp_mb",
         "ephemeral_cost_usd",
+        "variant_guard",
     ]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
@@ -436,7 +438,8 @@ def test_resolve_variant_matches_the_runner_rule():
 
 def test_variant_guard_passes_on_matching_sha():
     client = _StubLambdaClient({"process-shard": "abc", "process-shard-4096-disk": "abc"})
-    run_benchmark.check_variant_current(client, "process-shard", "process-shard-4096-disk")
+    status = run_benchmark.check_variant_current(client, "process-shard", "process-shard-4096-disk")
+    assert status == "verified"
 
 
 def test_variant_guard_hard_fails_on_stale_variant():
@@ -452,14 +455,40 @@ def test_variant_guard_hard_fails_on_stale_variant():
     assert "redeploy the variant family" in msg
 
 
-def test_variant_guard_degrades_on_probe_failure(capsys):
-    # A failed probe (e.g. an invoke role without lambda:GetFunctionConfiguration
-    # on the family) warns and continues — third-party stacks still dispatch.
+def test_variant_guard_degrades_only_when_the_BASE_probe_fails(capsys):  # noqa: N802
+    # A role with no lambda:GetFunctionConfiguration at all (the third-party
+    # stack case) fails the BASE probe -> warn and continue, stamped "skipped".
     client = _StubLambdaClient({}, raises=PermissionError("AccessDenied"))
-    run_benchmark.check_variant_current(client, "process-shard", "process-shard-4096-disk")
+    status = run_benchmark.check_variant_current(client, "process-shard", "process-shard-4096-disk")
+    assert status == "skipped"
     err = capsys.readouterr().err
-    assert "WARN: could not compare CodeSha256" in err
-    assert "without the staleness guard" in err
+    assert "could not probe base function process-shard" in err
+    assert "variant_guard=skipped" in err
+
+
+def test_variant_guard_hard_fails_when_only_the_variant_probe_fails():
+    # Fold review: base OK + variant denied/absent is the STALENESS signal, not
+    # a reason to degrade. Under the issue #341 enumeration ruling, a variant
+    # missing from InvokeBenchmarkFunctions is one deploy_lambda.sh
+    # WARN-and-skipped, so it cannot be current. Must name the two places to fix.
+    class _BaseOnly:
+        def __init__(self):
+            self.probed = []
+
+        def get_function_configuration(self, FunctionName):  # noqa: N803 (boto3 API)
+            self.probed.append(FunctionName)
+            if FunctionName == "process-shard-test":
+                return {"CodeSha256": "abc"}
+            raise PermissionError("AccessDeniedException")
+
+    client = _BaseOnly()
+    with pytest.raises(RuntimeError) as exc:
+        run_benchmark.check_variant_current(client, "process-shard-test", "process-shard-test-4096")
+    msg = str(exc.value)
+    assert "process-shard-test-4096" in msg and "NOT REACHABLE" in msg
+    assert "template.yaml" in msg and "benchmark_cicd.yaml" in msg
+    # The base probe ran first, so the diagnosis is genuinely variant-specific.
+    assert client.probed == ["process-shard-test", "process-shard-test-4096"]
 
 
 def _stub_boto3(monkeypatch, client):
@@ -536,6 +565,91 @@ def test_variant_guard_probes_each_distinct_variant_once(tmp_path, monkeypatch):
     )
     assert rc == 0
     assert client.probed == ["process-shard", "process-shard-4096-disk"]
+
+
+def _guard_stamping_run_target(name, manifest, base, **kwargs):
+    """run_target stand-in that echoes back the guard status main() handed it."""
+    rec = _fake_record(name, total_obs=1, max_memory_mb=1)
+    rec["variant_guard"] = kwargs["variant_guard"]
+    return rec
+
+
+def test_variant_guard_status_rides_the_record(tmp_path, monkeypatch):
+    # Provenance (issues #341/#296): the record carries whether the guard
+    # actually verified the build. A degraded probe must be legible in
+    # metrics.json and banner-ed in the PR comment, not only on stderr.
+    _stub_boto3(monkeypatch, _StubLambdaClient({}, raises=PermissionError("AccessDenied")))
+    monkeypatch.setattr(run_benchmark, "run_target", _guard_stamping_run_target)
+    out = tmp_path / "metrics.json"
+    comment = tmp_path / "comment.md"
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o9_hive",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(out),
+            "--out-comment",
+            str(comment),
+            "--no-fail-on-empty",
+            "--no-fail-on-object-mismatch",
+        ]
+    )
+    assert rc == 0
+    (rec,) = json.loads(out.read_text())
+    assert rec["variant_guard"] == "skipped"
+    body = comment.read_text()
+    assert "staleness guard SKIPPED" in body
+    assert "tdigest_healpix_o9_hive" in body
+
+
+def test_variant_guard_status_verified_and_base(tmp_path, monkeypatch):
+    # A clean probe stamps "verified"; a target with no ``worker:`` block has no
+    # variant to verify and stamps "base" (never null, so a missing stamp on a
+    # future row is unambiguously a pre-guard row).
+    _stub_boto3(
+        monkeypatch,
+        _StubLambdaClient({"process-shard": "same", "process-shard-4096-disk": "same"}),
+    )
+    monkeypatch.setattr(run_benchmark, "run_target", _guard_stamping_run_target)
+    out = tmp_path / "metrics.json"
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o9_hive",
+            "--target",
+            "tdigest_healpix_o10_inline",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(out),
+            "--no-fail-on-empty",
+            "--no-fail-on-object-mismatch",
+        ]
+    )
+    assert rc == 0
+    by_target = {r["target"]: r["variant_guard"] for r in json.loads(out.read_text())}
+    assert by_target == {
+        "tdigest_healpix_o9_hive": "verified",
+        "tdigest_healpix_o10_inline": "base",
+    }
+
+
+def test_variant_guard_column_is_in_the_series_schema():
+    # Appended to the stable RECORD_COLUMNS schema so update_series's reindex
+    # retains it (legacy rows read back null).
+    assert bench_metrics.RECORD_COLUMNS[-1] == "variant_guard"
+    rec = bench_metrics.build_record(
+        _summary(), grid=HealpixGrid(11, 19), context={"target": "t", "variant_guard": "verified"}
+    )
+    assert rec["variant_guard"] == "verified"
+    # No banner when nothing degraded.
+    assert "staleness guard SKIPPED" not in bench_metrics.comment_markdown([rec])
 
 
 def test_variant_guard_skipped_under_dry_run(tmp_path, monkeypatch):
@@ -1991,7 +2105,7 @@ def test_objects_columns_are_last_and_threaded():
     # appended after the object counts in phase 4; the #250/#256 phase split
     # then the #272 streaming-mode/ephemeral axis appended after those).
     cols = bench_metrics.RECORD_COLUMNS
-    assert cols[-10:-7] == ["objects_total", "objects_expected", "store_layout"]
+    assert cols[-11:-8] == ["objects_total", "objects_expected", "store_layout"]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={}, objects=_objects_payload())
     assert rec["objects_total"] == 10
