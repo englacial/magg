@@ -371,6 +371,38 @@ class TestSemanticManifest:
         assert "predates semantic hashing" in caplog.text
         assert hive.read_manifest(str(root))["semantic_hash"] == fresh["semantic_hash"]
 
+    def test_overwrite_dropping_a_hash_from_a_hashed_store_warns(self, cfg, tmp_path, caplog):
+        # Fold review: the exemption in ``_frozen_matches`` is symmetric (either
+        # side missing the hash drops it from the comparison), so the guard must
+        # be too. This is the REVERSE direction — the existing store carries a
+        # hash and this run's manifest does not — which un-provenances a #299
+        # store rather than merely failing to verify one. Latent today
+        # (build_manifest always stamps) but the strictly worse direction.
+        root = tmp_path / "store"
+        grid = self._grid(cfg)
+        hive.ensure_manifest(str(root), hive.build_manifest(grid))
+        (root / "-5" / "1").mkdir(parents=True)
+        (root / "-5" / "1" / "obj").write_text("x")
+        unhashed = hive.build_manifest(grid)
+        del unhashed["semantic_hash"]
+        with caplog.at_level("WARNING"):
+            hive.ensure_manifest(str(root), unhashed, overwrite=True)
+        assert "DROPS the recorded hash" in caplog.text
+        assert "un-provenanced" in caplog.text
+
+    def test_overwrite_both_hashes_present_is_silent(self, cfg, tmp_path, caplog):
+        # Both sides hashed and equal -> the comparison actually happened, so
+        # neither exemption warning fires (the normal resume/redo path).
+        root = tmp_path / "store"
+        grid = self._grid(cfg)
+        hive.ensure_manifest(str(root), hive.build_manifest(grid))
+        (root / "-5" / "1").mkdir(parents=True)
+        (root / "-5" / "1" / "obj").write_text("x")
+        with caplog.at_level("WARNING"):
+            hive.ensure_manifest(str(root), hive.build_manifest(grid), overwrite=True)
+        assert "semantic hash" not in caplog.text
+        assert "predates semantic hashing" not in caplog.text
+
     def test_overwrite_pre_hash_store_empty_tree_is_silent(self, cfg, tmp_path, caplog):
         # No shard data -> nothing whose compatibility could be in question;
         # the manifest is simply replaced (hash stamped), no warning.
