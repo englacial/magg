@@ -706,7 +706,7 @@ class TestAggEventMode:
     stay on sync — their metrics come from invoke responses."""
 
     @staticmethod
-    def _agg(catalog_file, monkeypatch, stub, invocation, **agg_kwargs):
+    def _agg(catalog_file, monkeypatch, stub, invocation, config=None, **agg_kwargs):
         from unittest.mock import MagicMock
 
         import boto3
@@ -737,7 +737,7 @@ class TestAggEventMode:
         monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: dict(_CREDS))
         monkeypatch.setattr(hive, "read_manifest", lambda *a, **k: None)
         return runner.agg(
-            default_config("atl06"),
+            config if config is not None else default_config("atl06"),
             catalog=catalog_file,
             store=_STORE,
             backend="lambda",
@@ -826,6 +826,40 @@ class TestAggEventMode:
         assert summary["cells_error"] == 1
         (bad,) = [r for r in summary["results"] if r.get("error")]
         assert bad["outcome"] == "failed-unknown"
+
+    def test_windowed_units_resolve_on_both_windows(self, catalog_file, monkeypatch, status_store):
+        # The ONE seam where the channel's two halves derive the same object
+        # name independently: runner registers with window["label"], the worker
+        # half reads it off event["window"]["label"] in build_shard_status. A
+        # disagreement is silent (the client waits out the whole drop window and
+        # reports failed-unknown for a shard that succeeded), and nothing joined
+        # the two before — the helper and worker tests each cover one side
+        # (review finding, PR #343). Locally testable: one event run over a
+        # 2-window explicit schedule.
+        cfg = default_config("atl06")
+        cfg.output["windowing"] = {
+            "schedule": "explicit",
+            "time_field": "h_li",  # a declared column, so validate_config passes
+            "epoch": "2018-01-01T00:00:00Z",
+            "windows": [
+                {"label": "w1", "start": "2020-01-01T00:00:00Z", "end": "2021-01-01T00:00:00Z"},
+                {"label": "w2", "start": "2021-01-01T00:00:00Z", "end": "2022-01-01T00:00:00Z"},
+            ],
+        }
+        stub = EventStubLambdaClient(status_store)
+        summary = self._agg(catalog_file, monkeypatch, stub, "event", config=cfg)
+        # 3 shards x 2 windows, every unit resolved from its own status object.
+        assert summary["total_cells"] == 6
+        assert summary["cells_error"] == 0
+        assert summary["cells_with_data"] == 6
+        cells = stub.cell_events()
+        assert len(cells) == 6
+        assert sorted(e["window"]["label"] for _, _, e in cells) == ["w1"] * 3 + ["w2"] * 3
+        # Both halves agreed on the per-window key: no shard clobbered another.
+        listed = sorted(str(m["path"]) for b in obstore.list(status_store) for m in b)
+        assert [k for k in listed if k.startswith("shard-")] == sorted(
+            ct.shard_status_key(w, window=lbl) for w in _WORDS for lbl in ("w1", "w2")
+        )
 
     def test_bogus_invocation_refused(self, catalog_file, monkeypatch, status_store):
         with pytest.raises(ValueError, match="Unknown invocation"):
@@ -1015,6 +1049,33 @@ class TestD8Audit:
         handle.wait(timeout=10)
         expected = [ct.MANIFEST_NAME, ct.TAIL_NAME] + [ct.shard_status_key(w) for w in _WORDS]
         assert sorted(puts) == sorted(expected)
+
+    def test_attach_makes_no_store_writes(self, status_store, monkeypatch):
+        # The audit above only covers Run.dispatch, but Run.attach is the one
+        # client path that fires a tail from a FRESH process with no dispatch
+        # state — the path most likely to grow a client-side write later
+        # (review finding, PR #343). Same PUT counter, mid-run state so the
+        # whole tail actually runs.
+        _put_manifest(status_store, "d8attach", _WORDS)
+        body = {"total_obs": 7, "duration_s": 1.0, "stats": {"schema_version": 1}}
+        for word in _WORDS:
+            _put_status(status_store, word, body=dict(body))
+        puts: list[str] = []
+        real_put = obstore.put
+
+        def counting_put(store, key, data, *a, **k):
+            puts.append(str(key))
+            return real_put(store, key, data, *a, **k)
+
+        monkeypatch.setattr(obstore, "put", counting_put)
+        stub = EventStubLambdaClient(status_store)
+        handle = Run.attach(_STORE, "d8attach", lambda_client=stub)
+        handle.results()
+        handle.wait(timeout=10)
+        # The tail ran (finalize + rollups) and the ONLY PUT is the worker's
+        # tail marker, riding the stats invoke.
+        assert "finalize" in [m for m in stub.modes() if m]
+        assert puts == [ct.TAIL_NAME]
 
 
 def test_rows_from_status_reads_both_object_shapes(tmp_path):
