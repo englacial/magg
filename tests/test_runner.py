@@ -1,6 +1,7 @@
 """Tests for the runner module (Python API)."""
 
 import json
+import warnings
 from datetime import datetime, timezone
 
 import pytest
@@ -1564,6 +1565,8 @@ class TestSummaryKeysByteIdentical:
         "setup_s",
         "fanout_s",
         "finalize_s",
+        # Guarded finalize (issue #335); always present, None on success.
+        "finalize_error",
         "function_timeout_s",
         "worker_max_s",
         "worker_median_s",
@@ -3750,6 +3753,29 @@ class TestDispatchRunStats:
         assert runner._dispatch_run_stats(client, "fn", "s3://b/x", [], run_id="r") is None
         assert client.events == []
 
+    def test_finalize_error_rides_the_event(self):
+        """Issue #335: the deferred finalize failure goes ON THE WIRE, so the
+        worker can stamp it into the run parquet — always present, None on a
+        clean run (same determinism rule as summary["run_stats_path"])."""
+        from zagg import runner
+
+        client = self._Client()
+        runner._dispatch_run_stats(
+            client,
+            "fn",
+            "s3://b/out.zarr",
+            self._rows(),
+            run_id="rid",
+            finalize_error="RuntimeError: invoke failed",
+        )
+        (event,) = client.events
+        assert event["finalize_error"] == "RuntimeError: invoke failed"
+
+        clean = self._Client()
+        runner._dispatch_run_stats(clean, "fn", "s3://b/out.zarr", self._rows(), run_id="rid")
+        (event,) = clean.events
+        assert event["finalize_error"] is None  # key present, not absent
+
 
 class TestRunStatsRows:
     """Run-parquet row building from lambda dispatch results (issue #297)."""
@@ -4144,6 +4170,268 @@ class TestManifestChecker:
         # root via the poller's output-store path (issue #274 Fix 2).
         assert captured["predicate"]() is True
         assert seen["root"] == "s3://out/x.zarr"
+
+
+class TestFinalizeGuard:
+    """Guarded finalize on agg's Lambda path (issue #335, (d)+(c)):
+
+    a failed ``executor.finalize()`` warns immediately, retries ONCE after a
+    fixed 5 s backoff, then defers — the full post-run tail (coverage, run-stats
+    with the failure recorded, sweep) runs as on success and the original
+    exception re-raises at the end so ``agg`` still exits nonzero. Success path
+    byte-identical: no sleep, no warning, ``finalize_error: None``.
+    """
+
+    def _drive(self, monkeypatch, atl06_config, *, finalize):
+        """Hive-path drive (mirrors ``TestManifestChecker._hive_finalize_calls``)
+        with the tail invokes stubbed into an ordered ``events`` log; ``finalize``
+        is called once per backstop-invoke attempt (raise from it to fail one)."""
+        import threading
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        import zagg.grids as grids_mod
+        import zagg.hive as hive
+        import zagg.sweep as sweep_mod
+        from zagg import runner
+        from zagg.concurrency import ConcurrencyReport
+
+        events = []
+        sleeps = []
+        captured = {}
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        atl06_config.output["store_layout"] = "hive"
+        monkeypatch.setattr(runner, "_get_function_timeout_s", lambda *a, **k: 720)
+        monkeypatch.setattr(runner, "_invoke_lambda_ping", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_invoke_lambda_setup_async", lambda *a, **k: None)
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(
+            runner,
+            "compute_available_workers",
+            lambda requested, *a, **k: (
+                1,
+                ConcurrencyReport(
+                    account_limit=1000,
+                    current_concurrent=0,
+                    padding=100,
+                    available=900,
+                    function_reserved=None,
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_cell",
+            lambda client, chunk_idx, shard_key, *a, **k: {
+                "shard_key": shard_key,
+                "status_code": 200,
+                "body": {"total_obs": 1},
+                "error": None,
+                "timeout": False,
+            },
+        )
+        # Manifest absent -> the finalize backstop invoke actually runs.
+        monkeypatch.setattr(
+            runner,
+            "_start_manifest_checker",
+            lambda check_present, **k: (threading.Event(), threading.Event(), MagicMock()),
+        )
+        monkeypatch.setattr(
+            runner,
+            "_invoke_lambda_finalize",
+            lambda *a, **k: (events.append("finalize"), finalize())[-1],
+        )
+        # Fixed 5 s backoff must not slow the test; record it instead.
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        # Tail invokes -> ordered event log (coverage envelope stubbed so the
+        # stub grid's shard keys don't have to be valid morton words).
+        monkeypatch.setattr(hive, "build_root_coverage", lambda *a, **k: {"ranges": [1]})
+        monkeypatch.setattr(
+            runner, "_invoke_lambda_coverage", lambda *a, **k: events.append("coverage")
+        )
+
+        def fake_stats(*a, **k):
+            events.append("stats")
+            captured["summary"] = k.get("summary")
+            captured["stats_finalize_error"] = k.get("finalize_error")
+
+        monkeypatch.setattr(runner, "_dispatch_run_stats", fake_stats)
+        monkeypatch.setattr(sweep_mod, "leaves_from_stats_records", lambda *a, **k: [123])
+        monkeypatch.setattr(runner, "_invoke_lambda_sweep", lambda *a, **k: events.append("sweep"))
+
+        def run():
+            return runner._run_lambda(
+                atl06_config,
+                _run_catalog(),
+                "s3://out/x.zarr",
+                12,
+                max_cells=None,
+                morton_cell=None,
+                max_workers=1,
+                overwrite=False,
+                dry_run=False,
+                region="us-west-2",
+                function_name="fn",
+            )
+
+        return run, events, sleeps, captured
+
+    _TAIL = ["coverage", "stats", "sweep"]
+
+    def test_success_path_unchanged(self, monkeypatch, atl06_config):
+        run, events, sleeps, captured = self._drive(
+            monkeypatch, atl06_config, finalize=lambda: None
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            summary = run()
+        assert events == ["finalize"] + self._TAIL  # one attempt, tail as before
+        assert sleeps == []  # no backoff on the success path
+        assert summary["finalize_error"] is None  # always-present, None on success
+        assert captured["stats_finalize_error"] is None  # ... and on the wire too
+        assert not [w for w in caught if "finalize" in str(w.message)]
+
+    def test_retry_succeeds_warns_sleeps_no_raise(self, monkeypatch, atl06_config):
+        outcomes = iter([RuntimeError("throttled"), None])
+
+        def flaky():
+            e = next(outcomes)
+            if e is not None:
+                raise e
+
+        run, events, sleeps, _captured = self._drive(monkeypatch, atl06_config, finalize=flaky)
+        with pytest.warns(RuntimeWarning, match=r"finalize \(manifest backstop\) failed"):
+            summary = run()  # no raise: the retry healed it
+        assert events == ["finalize", "finalize"] + self._TAIL
+        assert sleeps == [5]  # fixed 5 s backoff, espg-ratified (no knobs)
+        assert summary["finalize_error"] is None  # retry success IS success
+
+    def test_both_attempts_fail_tail_runs_then_reraises(self, monkeypatch, atl06_config):
+        boom = RuntimeError("invoke failed")
+
+        def always_fail():
+            raise boom
+
+        run, events, sleeps, captured = self._drive(monkeypatch, atl06_config, finalize=always_fail)
+        with pytest.warns(RuntimeWarning) as caught:
+            with pytest.raises(RuntimeError) as excinfo:
+                run()
+        assert excinfo.value is boom  # the ORIGINAL exception, after the tail
+        assert events == ["finalize", "finalize"] + self._TAIL  # full tail ran
+        assert sleeps == [5]  # exactly one retry, no more
+        assert captured["summary"]["finalize_error"] == "RuntimeError: invoke failed"
+        # ...and it is HANDED TO THE RUN-STATS DISPATCH (issue #335 fold): the
+        # worker stamps it into the parquet, which is the durable record a
+        # postmortem reads — this summary dict never leaves the raising call.
+        assert captured["stats_finalize_error"] == "RuntimeError: invoke failed"
+        msgs = [str(w.message) for w in caught if "manifest backstop" in str(w.message)]
+        assert len(msgs) == 2  # warned at BOTH failures
+        for m in msgs:
+            assert "s3://out/x.zarr" in m and "invoke failed" in m  # store + diagnosis
+        # The retryable attempt says only that a retry is imminent (review
+        # finding): the stale-manifest contract would be FALSE if the retry
+        # healed it. The terminal warning carries the full remediation.
+        assert msgs[0].endswith("Retrying in 5 s.")
+        assert "Shard outputs are written" not in msgs[0]
+        assert "Shard outputs are written" in msgs[1] and "idempotent" in msgs[1]
+        assert msgs[1].endswith("This error re-raises after the post-run tail completes.")
+
+    def test_finalize_error_wins_over_a_later_tail_crash(self, monkeypatch, atl06_config, caplog):
+        """D6 precedence (fold of the review finding), matching PR #333's
+        ``RunHandle._raise_tail_error``: a tail exception AFTER a finalize
+        failure is logged + chained, never the one that surfaces."""
+        import logging
+
+        from zagg import runner
+
+        boom = RuntimeError("invoke failed")
+
+        def always_fail():
+            raise boom
+
+        run, events, _sleeps, _captured = self._drive(
+            monkeypatch, atl06_config, finalize=always_fail
+        )
+        # Crash the tail's UNGUARDED row building (the reviewer's example), i.e.
+        # after the fold point and before the re-raise.
+        tail_boom = RuntimeError("tail blew up")
+
+        def _boom(*a, **k):
+            raise tail_boom
+
+        monkeypatch.setattr(runner, "_lambda_result_rows", _boom)
+        with caplog.at_level(logging.ERROR, logger="zagg.runner"):
+            with pytest.warns(RuntimeWarning):
+                with pytest.raises(RuntimeError) as excinfo:
+                    run()
+        assert excinfo.value is boom  # the FINALIZE error, not the tail crash
+        assert excinfo.value.__cause__ is tail_boom  # tail error still reachable
+        assert "tail blew up" in caplog.text  # ...and visible in the log
+        assert events == ["finalize", "finalize", "coverage"]  # crashed before stats
+
+    def test_tail_crash_alone_still_propagates(self, monkeypatch, atl06_config):
+        """The other half of the precedence rule: with finalize CLEAN a tail
+        exception propagates exactly as it did before the guard existed."""
+        from zagg import runner
+
+        run, _events, _sleeps, _captured = self._drive(
+            monkeypatch, atl06_config, finalize=lambda: None
+        )
+        monkeypatch.setattr(
+            runner, "_lambda_result_rows", lambda *a, **k: (_ for _ in ()).throw(ValueError("nope"))
+        )
+        with pytest.raises(ValueError, match="nope"):
+            run()
+
+    def test_helper_makes_exactly_one_retry(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from zagg import runner
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        finalize = MagicMock(side_effect=RuntimeError("nope"))
+        with pytest.warns(RuntimeWarning) as caught:
+            err = runner._finalize_with_retry(
+                finalize, store_path="s3://out/x.zarr", reraise_note="RE-RAISES LATER."
+            )
+        assert finalize.call_count == 2  # initial + exactly one retry
+        assert sleeps == [5]
+        assert isinstance(err, RuntimeError)  # returned, not raised: caller defers
+        # The caller's re-raise semantics are the one clause that varies, so the
+        # CLI and the client facade can share the rest verbatim (issue #335).
+        assert "RE-RAISES LATER." in str(caught[-1].message)
+
+    def test_retries_validated_not_silently_open(self, monkeypatch):
+        """Review finding: a negative ``retries`` would leave ``range(0)`` empty
+        — finalize never called, None returned, read as SUCCESS by every call
+        site. It raises instead; 0 stays legal (one attempt, no sleep)."""
+        from unittest.mock import MagicMock
+
+        from zagg import runner
+
+        finalize = MagicMock(side_effect=RuntimeError("nope"))
+        with pytest.raises(ValueError, match="retries must be >= 0"):
+            runner._finalize_with_retry(
+                finalize, store_path="s3://out/x.zarr", reraise_note="x", retries=-1
+            )
+        assert finalize.call_count == 0
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        with pytest.warns(RuntimeWarning):
+            err = runner._finalize_with_retry(
+                finalize, store_path="s3://out/x.zarr", reraise_note="x", retries=0
+            )
+        assert finalize.call_count == 1 and sleeps == []  # one attempt, no backoff
+        assert isinstance(err, RuntimeError)  # ...and the error still comes back
 
 
 class TestResolveSourceCredentials:

@@ -1594,6 +1594,28 @@ class TestStatsMode:
         df = pd.read_parquet(f"{root}/stats_20260720T010203Z_runid2.parquet", engine="fastparquet")
         assert set(df["shard_key"]) == {2, 11, 12}
 
+    def test_finalize_error_from_event_lands_in_the_parquet(self, handler_mod, tmp_path):
+        """Issue #335: the dispatcher defers a finalize failure through its
+        tail and ships it on this event; the worker write is what makes it
+        durable (D8 — the dispatcher cannot PUT)."""
+        import pandas as pd
+
+        root = str(tmp_path / "out")
+        resp = handler_mod.lambda_handler(
+            {
+                "mode": "stats",
+                "store_path": root,
+                "run_id": "runid3",
+                "timestamp": "20260720T010203Z",
+                "rows": self._rows(),
+                "finalize_error": "RuntimeError: invoke failed",
+            },
+            MagicMock(),
+        )
+        assert resp["statusCode"] == 200, resp["body"]
+        df = pd.read_parquet(json.loads(resp["body"])["path"], engine="fastparquet")
+        assert set(df["finalize_error"]) == {"RuntimeError: invoke failed"}
+
     def test_empty_rows_is_ok_and_writes_nothing(self, handler_mod, tmp_path):
         root = str(tmp_path / "out")
         resp = handler_mod.lambda_handler(

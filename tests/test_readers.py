@@ -116,10 +116,11 @@ class _CountingStore(MemoryStore):
         return r
 
 
-def _sharded_store(store, *, populate):
+def _sharded_store(store, *, populate, values=None):
     """A K=16 ShardingCodec'd store with one populated cell per chunk in
     ``populate`` (local chunk ordinals); returns ``(grid, shard_word,
-    {local: global_cell})``."""
+    {local: global_cell})``. ``values`` optionally maps a local chunk ordinal
+    to that chunk's sample vector (default: 300 uniform draws per chunk)."""
     rng = np.random.default_rng(21)
     cfg = _cfg()
     cfg.output["grid"]["chunk_inner"] = 8
@@ -137,7 +138,8 @@ def _sharded_store(store, *, populate):
         if local not in populate:
             chunk_results.append((block, pd.DataFrame(), {}))
             continue
-        payloads = [build_tdigest(rng.uniform(0.0, 30.0, 300), delta=512)]
+        vals = rng.uniform(0.0, 30.0, 300) if values is None else np.asarray(values[local])
+        payloads = [build_tdigest(vals, delta=512)]
         chunk_results.append((block, pd.DataFrame(), {"h_tdigest": (payloads, [11])}))
         targets[local] = base + 11
     write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard6)
@@ -297,32 +299,42 @@ class TestReadTensors:
         return store
 
     def test_shape_and_dtype_default(self):
-        out = dict((m, t) for t, m in read_tensors(self._store(), "12/h_tdigest"))
+        out = {
+            m: (t, mask, scale) for t, mask, scale, m in read_tensors(self._store(), "12/h_tdigest")
+        }
         assert set(out) == {morton_word(_KEY_A), morton_word(_KEY_B)}
-        for t in out.values():
+        for t, mask, (offset, gain) in out.values():
             assert t.shape == (64, 64, 128)
             assert t.dtype == np.uint32
+            # The contract's mask + offset/gain channels (issue #336): a flat
+            # store has no occupancy sidecar, so the mask is the 2-state {0, 2}.
+            assert mask.shape == (64, 64) and mask.dtype == np.uint8
+            assert set(np.unique(mask)) <= {0, 2}
+            assert offset == float(math.floor(offset)) and gain == 0.5
 
     def test_morton_derived_from_coordinate(self):
         # Chunk identity round trip: the per-cell morton coordinate coarsens
         # to the chunk's coverage-cell id (the packed shard word at K==1).
-        mortons = sorted(m for _, m in read_tensors(self._store(), "12/h_tdigest"))
+        mortons = sorted(m for *_tms, m in read_tensors(self._store(), "12/h_tdigest"))
         assert mortons == sorted(morton_word(k) for k in (_KEY_A, _KEY_B))
 
-    def test_populated_cell_placement_rowmajor(self):
-        out = dict((m, t) for t, m in read_tensors(self._store(), "12/h_tdigest"))
+    def test_populated_cell_placement_deinterleaved(self):
+        out = {m: t for t, _mask, _scale, m in read_tensors(self._store(), "12/h_tdigest")}
         t = out[morton_word(_KEY_A)]
-        # cell 5 → row 0, col 5; cell 4095 → row 63, col 63.
-        assert t[0, 5].sum() > 0
+        # Deinterleave (issue #336): rank 5 = 0b101 → (row, col) = (y, x) =
+        # (0, 3); rank 4095 → (63, 63); rank 0 → (0, 0).
+        assert t[0, 0].sum() > 0
+        assert t[0, 3].sum() > 0
         assert t[63, 63].sum() > 0
-        # An unpopulated cell stays zero.
+        # The old row-major position of rank 5 is now an unpopulated zero.
+        assert t[0, 5].sum() == 0
         assert t[10, 10].sum() == 0
 
     def test_counts_match_population(self):
         rng = np.random.default_rng(11)
         n = 5_000
         store, _g, words = _build_store({_KEY_A: {0: rng.uniform(0.0, 40.0, n)}})
-        t, m = next(read_tensors(store, "12/h_tdigest", n_bins=128, resolution=0.5))
+        t, _mask, _scale, m = next(read_tensors(store, "12/h_tdigest", n_bins=128, resolution=0.5))
         assert m == words[_KEY_A]
         # Most of the population should land in-window (uniform [0,40] in a 64 m
         # window anchored at floor of the 5th pct).
@@ -335,7 +347,7 @@ class TestReadTensors:
     def test_dtype_flag(self, dtype, np_dtype):
         rng = np.random.default_rng(12)
         store, _g, _w = _build_store({_KEY_A: {0: rng.uniform(0.0, 30.0, 2_000)}})
-        t, _ = next(read_tensors(store, "12/h_tdigest", dtype=dtype))
+        t, *_rest = next(read_tensors(store, "12/h_tdigest", dtype=dtype))
         assert t.dtype == np_dtype
 
     def test_raise_when_chunk_too_wide(self):
@@ -347,7 +359,7 @@ class TestReadTensors:
     def test_degrade_resolution_fits(self):
         rng = np.random.default_rng(15)
         store, _g, _w = _build_store({_KEY_A: {0: rng.uniform(0.0, 400.0, 5_000)}})
-        t, _ = next(
+        t, *_rest = next(
             read_tensors(store, "12/h_tdigest", bottom=0.0, top=1.0, fit="degrade_resolution")
         )
         assert t.shape == (64, 64, 128)
@@ -468,12 +480,14 @@ class TestReadTensors:
             chunk_results.append((block, pd.DataFrame(), {"h_tdigest": (payloads, cell_ids)}))
         write_shard_to_zarr(chunk_results, store_b, grid=grid_b, shard_key=shard6)
 
-        out_a = sorted(read_tensors(store_a, "12/h_tdigest"), key=lambda tm: tm[1])
-        out_b = sorted(read_tensors(store_b, "12/h_tdigest"), key=lambda tm: tm[1])
-        assert [m for _t, m in out_a] == [m for _t, m in out_b] == sorted(data)
-        for (t_a, _ma), (t_b, _mb) in zip(out_a, out_b):
+        out_a = sorted(read_tensors(store_a, "12/h_tdigest"), key=lambda o: o[-1])
+        out_b = sorted(read_tensors(store_b, "12/h_tdigest"), key=lambda o: o[-1])
+        assert [m for *_o, m in out_a] == [m for *_o, m in out_b] == sorted(data)
+        for (t_a, mask_a, scale_a, _ma), (t_b, mask_b, scale_b, _mb) in zip(out_a, out_b):
             assert t_a.shape == (16, 16, 128)
             np.testing.assert_array_equal(t_a, t_b)
+            np.testing.assert_array_equal(mask_a, mask_b)
+            assert scale_a == scale_b
 
 
 class TestReadRawValues:
@@ -483,9 +497,10 @@ class TestReadRawValues:
         store, _g, words = _build_store({_KEY_A: {7: vals}})
         out = list(read_raw_values(store, "12/h_tdigest"))
         assert len(out) == 1
-        morton, cell_id, recovered = out[0]
+        morton, rowcol, recovered = out[0]
         assert morton == words[_KEY_A]
-        assert cell_id == 7
+        # Rank 7 = 0b111 deinterleaves to (row, col) = (y, x) = (1, 3).
+        assert rowcol == (1, 3)
         # Digest stores centroids sorted by mean → sorted samples.
         np.testing.assert_allclose(recovered, np.sort(vals))
 
@@ -521,9 +536,11 @@ class TestReadLocations:
 
     def test_yields_per_cell_uint64_vectors(self):
         store, vals, locs_in, word = self._located_store()
-        out = {(m, c): locs for m, c, locs in read_locations(store, "12/h_tdigest")}
-        assert set(out) == {(word, 3), (word, 9)}
-        for (_, cid), locs in out.items():
+        out = {(m, rc): locs for m, rc, locs in read_locations(store, "12/h_tdigest")}
+        # Cell ranks 3 and 9 deinterleave to (row, col) = (1, 1) and (2, 1).
+        assert set(out) == {(word, (1, 1)), (word, (2, 1))}
+        for cid, rc in [(3, (1, 1)), (9, (2, 1))]:
+            locs = out[(word, rc)]
             assert locs.dtype == np.uint64
             # Loss-free regime: locations are the cell's point words co-sorted
             # with the values (digest rows sort by mean).
@@ -640,7 +657,12 @@ class TestReadParityWithoutConsolidation:
 
     @staticmethod
     def _read_all(store):
-        tensors = {m: t for t, m in read_tensors(store, "12/h_tdigest", n_bins=64, resolution=0.5)}
+        tensors = {
+            m: t
+            for t, _mask, _scale, m in read_tensors(
+                store, "12/h_tdigest", n_bins=64, resolution=0.5
+            )
+        }
         raw = {(m, c): v for m, c, v in read_raw_values(store, "12/h_tdigest")}
         locs = {(m, c): loc for m, c, loc in read_locations(store, "12/h_tdigest")}
         return tensors, raw, locs
@@ -656,10 +678,11 @@ class TestReadParityWithoutConsolidation:
         assert root.metadata.consolidated_metadata is None
 
         tensors_plain, raw_plain, locs_plain = self._read_all(store)
-        # Sanity: the readers actually reached the data.
+        # Sanity: the readers actually reached the data. Ranks 0 and 63
+        # deinterleave to (row, col) = (0, 0) and (7, 7).
         word_a, word_b = morton_word(_KEY_A), morton_word(_KEY_B)
         assert set(tensors_plain) == {word_a, word_b}
-        assert (word_a, 0) in raw_plain and (word_b, 63) in raw_plain
+        assert (word_a, (0, 0)) in raw_plain and (word_b, (7, 7)) in raw_plain
 
         # Consolidate the SAME store and re-read: consolidation only adds a
         # metadata blob no reader consults, so every byte must match.

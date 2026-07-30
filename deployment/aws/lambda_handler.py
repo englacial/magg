@@ -1063,9 +1063,11 @@ def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
     rows, which have no mirrored envelope to read back), and/or ``rows_from``
     — the run's async status prefix, from which the worker assembles the
     success rows (issue #151 envelopes; worker-role read). ``timestamp``
-    pins the D20 key so the dispatcher knows the path it announced. Nobody
-    reads this response on the Event invoke; errors log and fail open — the
-    run record is best-effort telemetry, never load-bearing.
+    pins the D20 key so the dispatcher knows the path it announced.
+    ``finalize_error`` (issue #335) rides the same event and lands as the one
+    run-level column — the durable record of a deferred finalize failure.
+    Nobody reads this response on the Event invoke; errors log and fail open —
+    the run record is best-effort telemetry, never load-bearing.
     """
     from zagg.telemetry import rows_from_status, write_run_parquet
 
@@ -1088,6 +1090,10 @@ def _handle_stats(event: Dict[str, Any]) -> Dict[str, Any]:
             run_id=event["run_id"],
             timestamp=event.get("timestamp"),
             store_kwargs=_output_store_kwargs(event),
+            # Run-level guarded-finalize outcome (issue #335): the dispatcher
+            # defers a finalize failure through its tail, so this is where the
+            # failure becomes durable. Absent on a pre-#335 dispatcher -> None.
+            finalize_error=event.get("finalize_error"),
         )
         # Tail-completion marker (issue #327): the stats leg is the recorded
         # end of the post-run tail, so a reattached handle can skip a tail

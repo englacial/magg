@@ -19,6 +19,7 @@ import statistics
 import threading
 import time
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import timedelta
@@ -1431,6 +1432,7 @@ class RasterStrategy:
                     timesteps_written += body["timesteps"]
 
         wall_time = time.time() - t0
+        finalize_error = None
         if store_layout == "hive":
             # Finalize-backstop-before-all-failed-raise, mirroring the local
             # backend (where ensure_manifest + root coverage run ahead of the
@@ -1441,17 +1443,24 @@ class RasterStrategy:
             # fires (natural gating); the finalize backstop still runs.
             #
             # Finalize backstop (issue #252 hybrid): idempotent ensure_manifest
-            # worker-side — required reader-facing schema (D6), so a failure
-            # raises, unlike the fail-open coverage dispatch below.
-            _invoke_lambda_finalize(
-                client,
-                function_name,
-                store_path,
-                output_creds_event=output_creds_event,
-                config_dict=config_dict,
-                dataset=dataset,
-                parent_order=int(grid.parent_order),
-                overwrite=overwrite,
+            # worker-side. Guarded exactly like the aggregation path (issue #335,
+            # same shared helper — raster is not scoped out of store/telemetry
+            # parity): warn, retry once, then DEFER so the tail below (coverage,
+            # the run-stats record that carries the failure, sweep) still runs
+            # and the error re-raises at the end.
+            finalize_error = _finalize_with_retry(
+                lambda: _invoke_lambda_finalize(
+                    client,
+                    function_name,
+                    store_path,
+                    output_creds_event=output_creds_event,
+                    config_dict=config_dict,
+                    dataset=dataset,
+                    parent_order=int(grid.parent_order),
+                    overwrite=overwrite,
+                ),
+                store_path=store_path,
+                reraise_note="This error re-raises after the post-run tail completes.",
             )
             if get_coverage_moc(config):
                 # Root coverage.moc (issue #200 phase 3): one fire-and-forget
@@ -1499,7 +1508,12 @@ class RasterStrategy:
             )
             for key, error, body in stats_failures
         ]
-        # D8 worker-invoke transport (issue #313): mirrors the spatial path.
+        # D8 worker-invoke transport (issue #313): mirrors the spatial path,
+        # deferred finalize failure included (issue #335) — this write is what
+        # makes it durable, and it happens BEFORE the all-failed raise below.
+        finalize_error_str = (
+            None if finalize_error is None else f"{type(finalize_error).__name__}: {finalize_error}"
+        )
         run_stats_path = _dispatch_run_stats(
             client,
             function_name,
@@ -1509,6 +1523,7 @@ class RasterStrategy:
             result_prefix=result_prefix,
             output_creds_event=output_creds_event,
             store_kwargs=_output_store_kwargs(output_creds_event, region),
+            finalize_error=finalize_error_str,
         )
         # End-of-run rollup sweep (issue #300): D8 worker-invoke transport,
         # mirroring the aggregation lambda path — one fire-and-forget
@@ -1529,6 +1544,11 @@ class RasterStrategy:
                     logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
             except Exception as e:
                 logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
+        # Precedence note (issue #335): the all-failed verdict still raises
+        # FIRST — it is the run's own root cause, not a tail crash, and a stale
+        # manifest is moot when no shard wrote anything. The finalize failure is
+        # already durable (the run-stats write above) and is what re-raises when
+        # some shards did land.
         if cells and errors == len(cells):
             raise RuntimeError(f"all {errors} raster shard(s) failed; last error: {last_error}")
         # Worker telemetry rollup (issue #250): billed durations and peak RSS,
@@ -1575,6 +1595,10 @@ class RasterStrategy:
             "store_path": store_path,
             "backend": "lambda",
             "run_stats_path": run_stats_path,
+            # Guarded finalize (issue #335): always present, None on success —
+            # same key and same meaning as the aggregation lambda summary, so
+            # the two paths' summaries keep one shape for this field.
+            "finalize_error": finalize_error_str,
         }
         if profile:
             # Straggler-maxed stage seconds (+ the write bucket) and summed
@@ -1593,6 +1617,11 @@ class RasterStrategy:
             f"Done (lambda): {shards_with_data}/{len(cells)} shards, "
             f"{errors} errors, {wall_time:.1f}s"
         )
+        # Deferred finalize failure (issue #335): the tail ran with the error
+        # recorded in run-stats; re-raise the original so agg still exits
+        # nonzero, exactly as the aggregation lambda path does.
+        if finalize_error is not None:
+            raise finalize_error
         return summary
 
 
@@ -2330,6 +2359,7 @@ def _dispatch_run_stats(
     store_kwargs=None,
     summary=None,
     inline_rows=None,
+    finalize_error=None,
     tail_status_url=None,
 ) -> str | None:
     """Fire-and-forget worker-invoke run-record write (issue #313, D8).
@@ -2350,6 +2380,12 @@ def _dispatch_run_stats(
     ``run_stats_path`` names the real object — best-effort: the invoke is
     fire-and-forget, mirroring the root MOC's semantics. Fail-open
     everywhere: telemetry must never fail a run whose data landed.
+
+    ``finalize_error`` rides the event (always present, ``None`` on success)
+    and lands as a run-level parquet column (issue #335): the guarded finalize
+    defers its failure through the tail, and this is the durable record a
+    postmortem reads — the alternative is a signal that lives only in the
+    orchestrator's ``RuntimeWarning``. The write stays worker-side (D8).
     ``tail_status_url`` (issue #327) has the worker additionally PUT the
     run's tail-completion marker at that url when the write completes, so a
     reattached handle knows the tail was recorded; ``None`` keeps the event
@@ -2370,6 +2406,10 @@ def _dispatch_run_stats(
             "store_path": store_path,
             "run_id": run_id,
             "timestamp": timestamp,
+            # Always on the wire, None on success (issue #335) — same
+            # determinism rule as summary["run_stats_path"] below, so the
+            # parquet's column set does not vary run to run.
+            "finalize_error": finalize_error,
         }
         if tail_status_url is not None:
             event["tail_status_url"] = tail_status_url
@@ -3024,6 +3064,82 @@ def _run_local(
     return summary
 
 
+#: Fixed backoff between the finalize attempts (issue #335): not a user knob
+#: (espg ruling), a module constant so tests can collapse the wait.
+_FINALIZE_BACKOFF_S = 5
+
+
+def _finalize_with_retry(
+    finalize, *, store_path, reraise_note, retries=1, backoff_s=None
+) -> Exception | None:
+    """Guarded finalize backstop: warn at failure, retry, return the error.
+
+    Issue #335 ((d)+(c), espg-ratified): the finalize backstop is an idempotent
+    worker invoke — nothing is corrupted on failure (every shard's outputs are
+    already written; only the root manifest may be stale), so a failure warns
+    immediately and retries once after a fixed 5 s backoff — deliberately not
+    knobs (espg ruling on issue #335). Returns ``None`` on success or the last
+    exception; the caller owns failure semantics and describes them in
+    ``reraise_note``, the one clause of the warning that differs between
+    callers. The success path is untouched: no sleep, no warning.
+
+    Two warning shapes, one per attempt kind: a retryable failure warns the
+    diagnosis only (the remediation is not yet true — the retry may heal it),
+    and the terminal failure carries the full stale-manifest contract plus
+    ``reraise_note``.
+
+    ``finalize`` is any zero-arg callable, so this is the ONE implementation of
+    the warn/retry/record contract for every dispatch path: ``_run_lambda``
+    (``executor.finalize``, then the full tail with the error recorded in
+    run-stats before it re-raises), ``RasterStrategy``'s Lambda driver, and the
+    :class:`zagg.client.Run` facade's finisher thread (records it on the handle
+    for :meth:`~zagg.client.RunHandle.wait`). Sharing it is the issue #335
+    phase-1 acceptance criterion — ``agg`` and the client cannot drift.
+    """
+    # Validated, not clamped (review finding): a negative ``retries`` would make
+    # ``range(0)`` empty — finalize NEVER called and None returned, which every
+    # call site reads as success. The helper is deliberately importable for
+    # other paths to adopt, so a computed value must fail loudly. 0 is legal:
+    # one attempt, no sleep.
+    if retries < 0:
+        raise ValueError(f"retries must be >= 0, got {retries}")
+    error = None
+    backoff_s = _FINALIZE_BACKOFF_S if backoff_s is None else backoff_s
+    for attempt in range(retries + 1):
+        try:
+            finalize()
+            return None
+        except Exception as e:
+            error = e
+            retrying = attempt < retries
+            # A retryable attempt gets the DIAGNOSIS ONLY (review finding): the
+            # full stale-manifest remediation would be false the moment the
+            # retry heals a throttle or a cold-start timeout — exactly the case
+            # (d) was approved for — and an operator trained to ignore this
+            # warning ignores the one that matters. The contract text lands on
+            # the terminal failure, where it is true.
+            message = (
+                f"finalize (manifest backstop) failed for {store_path}: {e}. "
+                f"Retrying in {backoff_s} s."
+                if retrying
+                else f"finalize (manifest backstop) failed for {store_path}: {e}. "
+                f"Shard outputs are written; the store's root manifest may be "
+                f"stale until finalize runs again. It is idempotent — re-run "
+                f"the dispatch (or re-dispatch finalize) to stamp the manifest. "
+                f"{reraise_note}"
+            )
+            # stacklevel=2 attributes this to the dispatch call site inside zagg,
+            # not the user's frame — deliberate: no fixed level can reach user
+            # code from every caller (``agg`` is several frames up, and the
+            # client facade's tail runs on a finisher THREAD whose stack has no
+            # user frame at all), so the message names the store and the remedy
+            # instead of relying on attribution.
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+            if retrying:
+                time.sleep(backoff_s)
+    return error
+
+
 def _run_lambda(
     config,
     catalog_data,
@@ -3566,249 +3682,298 @@ def _run_lambda(
     fanout_s = time.time() - start_time
 
     # Consolidate metadata via Lambda (same rationale as setup -- avoids
-    # requiring orchestrator-side S3 access).
+    # requiring orchestrator-side S3 access). Guarded (issue #335): a failed
+    # finalize warns + retries once, then DEFERS — the tail below (coverage,
+    # run-stats recording the failure, sweep) runs as on success and the error
+    # re-raises at the end so agg still exits nonzero.
     finalize_start = time.time()
-    executor.finalize()
+    finalize_error = _finalize_with_retry(
+        executor.finalize,
+        store_path=store_path,
+        reraise_note="This error re-raises after the post-run tail completes.",
+    )
     finalize_s = time.time() - finalize_start
     wall_time = time.time() - start_time
+    # The whole post-run tail is inside this try purely for PRECEDENCE (issue
+    # #335 fold): whatever it raises must not displace a finalize failure. The
+    # legs themselves keep their own fail-open guards; this is the blanket that
+    # keeps the unguarded code BETWEEN them (row building, statistics, the log
+    # f-strings) from swallowing the D6 error the next refactor introduces.
+    try:
+        # End-of-run root coverage.moc (issue #200 phase 3; default-on for hive,
+        # O9): the dispatcher cannot PUT to S3, so it builds + serializes the MOC
+        # and posts ONE fire-and-forget worker invoke that GET-unions-PUTs it.
+        # Transport rationale (espg-requested, plan question 3) — serialized
+        # ranges IN the event vs the completion list via the status channel:
+        #   - Ranges (chosen): the dispatcher already holds the completion list
+        #     in memory, so building the MOC costs milliseconds, and the payload
+        #     is bounded by construction — spatially coherent coverage collapses
+        #     to a few-KB range list, far under Lambda's 256 KB async-invoke cap,
+        #     which a raw ~50k-key completion list would break. One hop, and no
+        #     read-back race against status objects still landing from retried
+        #     stragglers.
+        #   - Completion list via .status/ (rejected): payload size would be
+        #     run-independent and the artifact replayable from durable state, but
+        #     it costs the worker a LIST + N GETs, races in-flight status writes,
+        #     and its replayability is already owned by the §7 sweep's
+        #     authoritative rebuild — the leaves are the durable truth (D9).
+        # Fail-open everywhere: a failed build/invoke logs and the run result is
+        # untouched (the root MOC is a regenerable cache).
+        if get_store_layout(config) == "hive" and get_coverage_moc(config):
+            try:
+                from zagg.hive import build_root_coverage
+                from zagg.windows import union_time_range
 
-    # End-of-run root coverage.moc (issue #200 phase 3; default-on for hive,
-    # O9): the dispatcher cannot PUT to S3, so it builds + serializes the MOC
-    # and posts ONE fire-and-forget worker invoke that GET-unions-PUTs it.
-    # Transport rationale (espg-requested, plan question 3) — serialized
-    # ranges IN the event vs the completion list via the status channel:
-    #   - Ranges (chosen): the dispatcher already holds the completion list
-    #     in memory, so building the MOC costs milliseconds, and the payload
-    #     is bounded by construction — spatially coherent coverage collapses
-    #     to a few-KB range list, far under Lambda's 256 KB async-invoke cap,
-    #     which a raw ~50k-key completion list would break. One hop, and no
-    #     read-back race against status objects still landing from retried
-    #     stragglers.
-    #   - Completion list via .status/ (rejected): payload size would be
-    #     run-independent and the artifact replayable from durable state, but
-    #     it costs the worker a LIST + N GETs, races in-flight status writes,
-    #     and its replayability is already owned by the §7 sweep's
-    #     authoritative rebuild — the leaves are the durable truth (D9).
-    # Fail-open everywhere: a failed build/invoke logs and the run result is
-    # untouched (the root MOC is a regenerable cache).
-    if get_store_layout(config) == "hive" and get_coverage_moc(config):
-        try:
-            from zagg.hive import build_root_coverage
-            from zagg.windows import union_time_range
-
-            # Inside the try so the fail-open claim survives result-envelope
-            # refactors (review finding, PR #208 round 3).
-            ok_results = [
-                r for r in report.results if r.get("status_code") == 200 and not r.get("error")
-            ]
-            done = [r["shard_key"] for r in ok_results]
-            if done:
-                # D15: union the windowed workers' stamped time ranges (each
-                # body mirrors its leaf stamp's ISO strings); unwindowed
-                # bodies carry none and the envelope stays byte-identical.
-                envelope = build_root_coverage(
-                    done,
-                    int(parent_order),
-                    time_range=union_time_range(
-                        *(r.get("body", {}).get("time_range") for r in ok_results)
-                    ),
-                )
-                # An OLD deployment has no coverage mode: the event falls
-                # through to its process handler, which returns a LOGGED 400
-                # (missing shard_key/granule_urls...) — no writes, no result
-                # mirror, and no async redelivery (a returned 400 is a
-                # successful invocation to Lambda's Event retry machinery).
-                # Harmless under D9, but the CloudWatch line is an ERROR, not
-                # silence — mirroring the PR #205 deploy-ordering note.
-                logger.info(
-                    f"Dispatching root coverage.moc write ({len(envelope['ranges'])} "
-                    f"ranges, fire-and-forget) — requires a redeployed function; an "
-                    f"older deployment 400s mode=coverage in its process handler "
-                    f"(logged, no writes, no retry — harmless under D9)"
-                )
-                _invoke_lambda_coverage(
-                    state["lambda_client"],
-                    function_name,
-                    store_path,
-                    envelope,
-                    output_creds_event=output_creds_event,
-                )
-        except Exception as e:
-            logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
-
-    # Cost estimate: arm64 pricing = $0.0000133334/GB-second. Compute gb_seconds
-    # and cost *once* over the summed Lambda time (the report carries only the
-    # accumulated compute_time_s) so the arithmetic order -- and thus the last
-    # ULP of estimated_cost_usd -- stays byte-identical to the pre-refactor path
-    # (summing per-cell cost_usd would diverge in FP). Runner owns presentation;
-    # the per-cell CellCost.cost_usd is for the report's structured breakdown.
-    # memory_gb resolved pre-fan-out via _worker_memory_gb (issue #298): the
-    # default function keeps 4.0 (byte-identical); a worker: variant now bills
-    # at its actual size instead of the old flat constant.
-    total_lambda_time = report.cost.compute_time_s
-    gb_seconds = total_lambda_time * memory_gb
-    price_per_gb_sec = LAMBDA_PRICE_PER_GB_SEC
-    estimated_cost = gb_seconds * price_per_gb_sec
-
-    # Structured cost block (issue #298): the pre-invoke ceiling, the deferred
-    # prior-history estimate (the estimate_cost_usd stub -- None until issues
-    # #297/#299 land the sidecar history), and the billed-duration rollup. The
-    # legacy flat ``estimated_cost_usd`` summary key keeps its pre-#298
-    # meaning (the actual-cost rollup) for existing consumers.
-    report.max_cost_usd = run_max_cost
-    report.estimated_cost_usd = estimate_cost_usd(catalog_data)
-    report.actual_cost_usd = estimated_cost
-    cost_block = {
-        "max_cost_usd": run_max_cost,
-        "estimated_cost_usd": report.estimated_cost_usd,
-        "actual_cost_usd": estimated_cost,
-    }
-
-    # Worker-runtime distribution (issue #100). Wall time on a parallel fan-out
-    # tracks the *straggler*, not the mean, so surface max / median / pstdev of
-    # the billed per-cell durations plus the max's share of the function
-    # Timeout -- the safety margin that flags a skewed shardmap (one fat cell
-    # dominating wall time). Raw material already lives in report.results.
-    function_timeout_s = state.get("function_timeout_s", _DEFAULT_FUNCTION_TIMEOUT_S)
-    durations = [r["lambda_duration"] for r in report.results if r.get("lambda_duration")]
-    if durations:
-        worker_max_s = max(durations)
-        worker_median_s = statistics.median(durations)
-        worker_pstdev_s = statistics.pstdev(durations)
-        worker_pct_timeout = worker_max_s / function_timeout_s if function_timeout_s else None
-    else:
-        worker_max_s = worker_median_s = worker_pstdev_s = worker_pct_timeout = None
-
-    # Peak worker memory (issue #120). The Lambda handler stamps body[
-    # "max_memory_mb"] (RSS high-water mark, KB->MB) on every successful
-    # invocation; roll the straggler (max) across cells, matching the wall-time
-    # framing. None when no worker reported it (e.g. local backend).
-    worker_memory = [
-        r["body"]["max_memory_mb"]
-        for r in report.results
-        if (r.get("body") or {}).get("max_memory_mb") is not None
-    ]
-    max_memory_mb = max(worker_memory) if worker_memory else None
-
-    # Container-telemetry rollup (issue #171): cold/warm counts + the ratchet
-    # view (max start-RSS per sandbox generation) from the worker envelopes.
-    container_stats = _container_telemetry_summary([r.get("body") or {} for r in report.results])
-
-    # Per-phase worker breakdown (issue #100 phase 2), only when --profile fed
-    # the workers a "profile" event so they emitted body["phase_timings"]. Roll
-    # the straggler (max) per phase across cells, matching the wall-time framing.
-    # Off by default -> no extra summary key, so the default key set is unchanged.
-    worker_phase_max = None
-    if profile:
-        worker_phase_max = {}
-        for r in report.results:
-            for phase, secs in (r.get("body", {}).get("phase_timings") or {}).items():
-                worker_phase_max[phase] = max(worker_phase_max.get(phase, 0.0), secs)
-
-    summary = {
-        "total_cells": len(cells),
-        "cells_with_data": report.cells_with_data,
-        "cells_error": report.cells_error,
-        "total_obs": report.total_obs,
-        "wall_time_s": wall_time,
-        "lambda_time_s": total_lambda_time,
-        "gb_seconds": gb_seconds,
-        "price_per_gb_sec": price_per_gb_sec,
-        "estimated_cost_usd": estimated_cost,
-        "cost": cost_block,
-        "setup_s": setup_s,
-        "fanout_s": fanout_s,
-        "finalize_s": finalize_s,
-        "function_timeout_s": function_timeout_s,
-        "worker_max_s": worker_max_s,
-        "worker_median_s": worker_median_s,
-        "worker_pstdev_s": worker_pstdev_s,
-        "worker_pct_timeout": worker_pct_timeout,
-        "max_memory_mb": max_memory_mb,
-        "store_path": store_path,
-        "backend": "lambda",
-        "function_name": function_name,
-        "results": report.results,
-        **container_stats,
-    }
-    if profile:
-        summary["worker_phase_max"] = worker_phase_max
-    # Run-level stats parquet (issue #297 phase 3; D8 worker-invoke transport,
-    # issue #313): success rows straight off the async result envelopes,
-    # failure rows from the dispatch results the RunReport accumulated. The
-    # PUT itself rides a fire-and-forget worker invoke — the dispatcher may
-    # hold an invoke-only role with no S3 write access.
-    stats_rows, stats_inline_rows = _lambda_result_rows(report.results, run_id=run_id)
-    from zagg.client_transport import TAIL_NAME, run_status_prefix
-
-    _dispatch_run_stats(
-        state["lambda_client"],
-        function_name,
-        store_path,
-        stats_rows,
-        run_id=run_id,
-        # The oversized-rows pointer: the #151 envelope prefix on async runs,
-        # the v2 status prefix on event runs (rows_from_status reads the
-        # ``stats`` record out of either object shape — issue #327).
-        result_prefix=result_prefix if result_prefix is not None else status_prefix,
-        output_creds_event=output_creds_event,
-        store_kwargs=_output_store_kwargs(output_creds_event, region),
-        summary=summary,
-        inline_rows=stats_inline_rows,
-        # Tail-completion marker (issue #327): worker-written at the v2 status
-        # prefix so Run.attach knows this run's tail was recorded.
-        tail_status_url=f"{run_status_prefix(store_path, run_id)}/{TAIL_NAME}",
-    )
-    # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
-    # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"
-    # worker Event invoke — async, retries-0, fail-open (D9: rollups are
-    # caches; `python -m zagg.sweep` is the regeneration backstop). Leaves
-    # come from the envelope stats records; a stale deployed worker's
-    # record-less envelope simply contributes no leaf.
-    if get_store_layout(config) == "hive" and get_sweep(config):
-        try:
-            from zagg.sweep import leaves_from_stats_records
-
-            leaves = leaves_from_stats_records(
-                [
-                    (r.get("body") or {}).get("stats")
-                    for r in report.results
-                    if r.get("status_code") == 200 and not r.get("error")
+                # Inside the try so the fail-open claim survives result-envelope
+                # refactors (review finding, PR #208 round 3).
+                ok_results = [
+                    r for r in report.results if r.get("status_code") == 200 and not r.get("error")
                 ]
-            )
-            if leaves:
-                _invoke_lambda_sweep(
-                    state["lambda_client"],
-                    function_name,
-                    store_path,
-                    leaves,
-                    output_creds_event=output_creds_event,
+                done = [r["shard_key"] for r in ok_results]
+                if done:
+                    # D15: union the windowed workers' stamped time ranges (each
+                    # body mirrors its leaf stamp's ISO strings); unwindowed
+                    # bodies carry none and the envelope stays byte-identical.
+                    envelope = build_root_coverage(
+                        done,
+                        int(parent_order),
+                        time_range=union_time_range(
+                            *(r.get("body", {}).get("time_range") for r in ok_results)
+                        ),
+                    )
+                    # An OLD deployment has no coverage mode: the event falls
+                    # through to its process handler, which returns a LOGGED 400
+                    # (missing shard_key/granule_urls...) — no writes, no result
+                    # mirror, and no async redelivery (a returned 400 is a
+                    # successful invocation to Lambda's Event retry machinery).
+                    # Harmless under D9, but the CloudWatch line is an ERROR, not
+                    # silence — mirroring the PR #205 deploy-ordering note.
+                    logger.info(
+                        f"Dispatching root coverage.moc write ({len(envelope['ranges'])} "
+                        f"ranges, fire-and-forget) — requires a redeployed function; an "
+                        f"older deployment 400s mode=coverage in its process handler "
+                        f"(logged, no writes, no retry — harmless under D9)"
+                    )
+                    _invoke_lambda_coverage(
+                        state["lambda_client"],
+                        function_name,
+                        store_path,
+                        envelope,
+                        output_creds_event=output_creds_event,
+                    )
+            except Exception as e:
+                logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
+
+        # Cost estimate: arm64 pricing = $0.0000133334/GB-second. Compute gb_seconds
+        # and cost *once* over the summed Lambda time (the report carries only the
+        # accumulated compute_time_s) so the arithmetic order -- and thus the last
+        # ULP of estimated_cost_usd -- stays byte-identical to the pre-refactor path
+        # (summing per-cell cost_usd would diverge in FP). Runner owns presentation;
+        # the per-cell CellCost.cost_usd is for the report's structured breakdown.
+        # memory_gb resolved pre-fan-out via _worker_memory_gb (issue #298): the
+        # default function keeps 4.0 (byte-identical); a worker: variant now bills
+        # at its actual size instead of the old flat constant.
+        total_lambda_time = report.cost.compute_time_s
+        gb_seconds = total_lambda_time * memory_gb
+        price_per_gb_sec = LAMBDA_PRICE_PER_GB_SEC
+        estimated_cost = gb_seconds * price_per_gb_sec
+
+        # Structured cost block (issue #298): the pre-invoke ceiling, the deferred
+        # prior-history estimate (the estimate_cost_usd stub -- None until issues
+        # #297/#299 land the sidecar history), and the billed-duration rollup. The
+        # legacy flat ``estimated_cost_usd`` summary key keeps its pre-#298
+        # meaning (the actual-cost rollup) for existing consumers.
+        report.max_cost_usd = run_max_cost
+        report.estimated_cost_usd = estimate_cost_usd(catalog_data)
+        report.actual_cost_usd = estimated_cost
+        cost_block = {
+            "max_cost_usd": run_max_cost,
+            "estimated_cost_usd": report.estimated_cost_usd,
+            "actual_cost_usd": estimated_cost,
+        }
+
+        # Worker-runtime distribution (issue #100). Wall time on a parallel fan-out
+        # tracks the *straggler*, not the mean, so surface max / median / pstdev of
+        # the billed per-cell durations plus the max's share of the function
+        # Timeout -- the safety margin that flags a skewed shardmap (one fat cell
+        # dominating wall time). Raw material already lives in report.results.
+        function_timeout_s = state.get("function_timeout_s", _DEFAULT_FUNCTION_TIMEOUT_S)
+        durations = [r["lambda_duration"] for r in report.results if r.get("lambda_duration")]
+        if durations:
+            worker_max_s = max(durations)
+            worker_median_s = statistics.median(durations)
+            worker_pstdev_s = statistics.pstdev(durations)
+            worker_pct_timeout = worker_max_s / function_timeout_s if function_timeout_s else None
+        else:
+            worker_max_s = worker_median_s = worker_pstdev_s = worker_pct_timeout = None
+
+        # Peak worker memory (issue #120). The Lambda handler stamps body[
+        # "max_memory_mb"] (RSS high-water mark, KB->MB) on every successful
+        # invocation; roll the straggler (max) across cells, matching the wall-time
+        # framing. None when no worker reported it (e.g. local backend).
+        worker_memory = [
+            r["body"]["max_memory_mb"]
+            for r in report.results
+            if (r.get("body") or {}).get("max_memory_mb") is not None
+        ]
+        max_memory_mb = max(worker_memory) if worker_memory else None
+
+        # Container-telemetry rollup (issue #171): cold/warm counts + the ratchet
+        # view (max start-RSS per sandbox generation) from the worker envelopes.
+        container_stats = _container_telemetry_summary(
+            [r.get("body") or {} for r in report.results]
+        )
+
+        # Per-phase worker breakdown (issue #100 phase 2), only when --profile fed
+        # the workers a "profile" event so they emitted body["phase_timings"]. Roll
+        # the straggler (max) per phase across cells, matching the wall-time framing.
+        # Off by default -> no extra summary key, so the default key set is unchanged.
+        worker_phase_max = None
+        if profile:
+            worker_phase_max = {}
+            for r in report.results:
+                for phase, secs in (r.get("body", {}).get("phase_timings") or {}).items():
+                    worker_phase_max[phase] = max(worker_phase_max.get(phase, 0.0), secs)
+
+        summary = {
+            "total_cells": len(cells),
+            "cells_with_data": report.cells_with_data,
+            "cells_error": report.cells_error,
+            "total_obs": report.total_obs,
+            "wall_time_s": wall_time,
+            "lambda_time_s": total_lambda_time,
+            "gb_seconds": gb_seconds,
+            "price_per_gb_sec": price_per_gb_sec,
+            "estimated_cost_usd": estimated_cost,
+            "cost": cost_block,
+            "setup_s": setup_s,
+            "fanout_s": fanout_s,
+            "finalize_s": finalize_s,
+            # Always-present, None on success (issue #335): the run-stats record can
+            # finally distinguish "finalize failed" from "run never happened", and
+            # the key set stays deterministic (the run_stats_path precedent).
+            "finalize_error": (
+                None
+                if finalize_error is None
+                else f"{type(finalize_error).__name__}: {finalize_error}"
+            ),
+            "function_timeout_s": function_timeout_s,
+            "worker_max_s": worker_max_s,
+            "worker_median_s": worker_median_s,
+            "worker_pstdev_s": worker_pstdev_s,
+            "worker_pct_timeout": worker_pct_timeout,
+            "max_memory_mb": max_memory_mb,
+            "store_path": store_path,
+            "backend": "lambda",
+            "function_name": function_name,
+            "results": report.results,
+            **container_stats,
+        }
+        if profile:
+            summary["worker_phase_max"] = worker_phase_max
+        # Run-level stats parquet (issue #297 phase 3; D8 worker-invoke transport,
+        # issue #313): success rows straight off the async result envelopes,
+        # failure rows from the dispatch results the RunReport accumulated. The
+        # PUT itself rides a fire-and-forget worker invoke — the dispatcher may
+        # hold an invoke-only role with no S3 write access.
+        stats_rows, stats_inline_rows = _lambda_result_rows(report.results, run_id=run_id)
+        from zagg.client_transport import TAIL_NAME, run_status_prefix
+
+        _dispatch_run_stats(
+            state["lambda_client"],
+            function_name,
+            store_path,
+            stats_rows,
+            run_id=run_id,
+            # The oversized-rows pointer: the #151 envelope prefix on async
+            # runs, the v2 status prefix on event runs (rows_from_status reads
+            # the ``stats`` record out of either object shape — issue #327).
+            result_prefix=result_prefix if result_prefix is not None else status_prefix,
+            output_creds_event=output_creds_event,
+            store_kwargs=_output_store_kwargs(output_creds_event, region),
+            summary=summary,
+            inline_rows=stats_inline_rows,
+            # The deferred finalize failure becomes DURABLE here (issue #335): the
+            # worker stamps it as the run parquet's run-level column, so the
+            # postmortem signal outlives this process's RuntimeWarning + exit code.
+            finalize_error=summary["finalize_error"],
+            # Tail-completion marker (issue #327): worker-written at the v2 status
+            # prefix so Run.attach knows this run's tail was recorded.
+            tail_status_url=f"{run_status_prefix(store_path, run_id)}/{TAIL_NAME}",
+        )
+        # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
+        # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"
+        # worker Event invoke — async, retries-0, fail-open (D9: rollups are
+        # caches; `python -m zagg.sweep` is the regeneration backstop). Leaves
+        # come from the envelope stats records; a stale deployed worker's
+        # record-less envelope simply contributes no leaf.
+        if get_store_layout(config) == "hive" and get_sweep(config):
+            try:
+                from zagg.sweep import leaves_from_stats_records
+
+                leaves = leaves_from_stats_records(
+                    [
+                        (r.get("body") or {}).get("stats")
+                        for r in report.results
+                        if r.get("status_code") == 200 and not r.get("error")
+                    ]
                 )
-                logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
-        except Exception as e:
-            logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
-    logger.info(
-        f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
-    )
-    logger.info(
-        f"Lambda compute: {total_lambda_time:.0f}s total, {gb_seconds:.0f} GB-s, ~${estimated_cost:.2f}"
-    )
-    if worker_max_s is not None:
-        pct = f"{worker_pct_timeout:.0%}" if worker_pct_timeout is not None else "n/a"
+                if leaves:
+                    _invoke_lambda_sweep(
+                        state["lambda_client"],
+                        function_name,
+                        store_path,
+                        leaves,
+                        output_creds_event=output_creds_event,
+                    )
+                    logger.info(f"Dispatched rollup sweep ({len(leaves)} leaves, fire-and-forget)")
+            except Exception as e:
+                logger.warning(f"rollup sweep dispatch failed (fail-open, D9): {e}")
         logger.info(
-            f"Workers: max {worker_max_s:.0f}s ({pct} of {function_timeout_s:.0f}s timeout), "
-            f"median {worker_median_s:.0f}s, pstdev {worker_pstdev_s:.0f}s"
+            f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
         )
-    if max_memory_mb is not None:
-        cap_mb = memory_gb * 1024.0
         logger.info(
-            f"Worker peak memory: {max_memory_mb:.0f} MB ({max_memory_mb / cap_mb:.0%} of "
-            f"{cap_mb:.0f} MB cap)"
+            f"Lambda compute: {total_lambda_time:.0f}s total, {gb_seconds:.0f} GB-s, ~${estimated_cost:.2f}"
         )
-    if profile and worker_phase_max:
-        breakdown = ", ".join(f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items())
-        logger.info(f"Worker phases (max across cells): {breakdown}")
-    _log_container_stats(container_stats)
+        if worker_max_s is not None:
+            pct = f"{worker_pct_timeout:.0%}" if worker_pct_timeout is not None else "n/a"
+            logger.info(
+                f"Workers: max {worker_max_s:.0f}s ({pct} of {function_timeout_s:.0f}s timeout), "
+                f"median {worker_median_s:.0f}s, pstdev {worker_pstdev_s:.0f}s"
+            )
+        if max_memory_mb is not None:
+            cap_mb = memory_gb * 1024.0
+            logger.info(
+                f"Worker peak memory: {max_memory_mb:.0f} MB ({max_memory_mb / cap_mb:.0%} of "
+                f"{cap_mb:.0f} MB cap)"
+            )
+        if profile and worker_phase_max:
+            breakdown = ", ".join(
+                f"{phase} {secs:.0f}s" for phase, secs in worker_phase_max.items()
+            )
+            logger.info(f"Worker phases (max across cells): {breakdown}")
+        _log_container_stats(container_stats)
+    except Exception as tail_error:
+        # D6 precedence (issue #335 fold), matching the PR #333 client facade:
+        # the manifest-backstop failure is strictly more load-bearing than a
+        # crashed tail leg, so a tail exception raised AFTER a finalize failure
+        # is logged and chained onto it, never allowed to replace it. With
+        # finalize clean the tail error propagates exactly as it always has.
+        if finalize_error is None:
+            raise
+        logger.error(
+            f"post-run tail failed after the guarded finalize failure "
+            f"({type(tail_error).__name__}: {tail_error}); raising the finalize error "
+            f"instead (D6 precedence) — the tail error rides as its __cause__",
+            exc_info=True,
+        )
+        raise finalize_error from tail_error
+    # Deferred finalize failure (issue #335): the tail above ran to completion
+    # with the error recorded in run-stats; re-raise the original exception
+    # (traceback preserved on the stored object) so agg exits nonzero — the
+    # CI/cron failure signal is unchanged, only richer in what got written first.
+    if finalize_error is not None:
+        raise finalize_error
     return summary
 
 
