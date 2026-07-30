@@ -312,6 +312,16 @@ def process_shard(
     all_reads = []
     files_processed = 0
     read_errors = 0
+    # Granule-scope failures (fold review, issue #341): a fault that kills the
+    # WHOLE granule rather than one group -- an H5Coro construction failure, a
+    # bad/expired credential, a URL-rewriter fault, a streaming flush blowing up
+    # -- is warn-and-continue by design (issue #116 semantics), but it used to
+    # leave NO trace in the result: not counted, not exemplared, so a shard whose
+    # every granule failed at granule scope returned the blind "No data after
+    # filtering". Counted separately from ``read_errors`` because the scope
+    # matters to the diagnosis (all groups vs one), and it is arguably the more
+    # likely fleet shape: credentials and endpoints kill granules, not groups.
+    granule_errors = 0
 
     # Read-error exemplars (issue #341): the counter alone made the 121-failure
     # strata run a blind "No data after filtering (N group reads raised)" —
@@ -325,7 +335,9 @@ def process_shard(
     _exemplar_lock = threading.Lock()
     read_error_exemplars: list = []
 
-    def _record_read_error(group: str, exc: Exception) -> None:
+    def _record_read_error(what: str, exc: Exception) -> None:
+        """Warn + exemplar one read failure. ``what`` is the log phrase (and so
+        the scope): ``reading track <group>`` or ``processing file <url>``."""
         msg = f"{type(exc).__name__}: {exc}"[:_EXEMPLAR_CHARS]
         with _exemplar_lock:
             fresh = msg not in read_error_exemplars and len(read_error_exemplars) < _EXEMPLAR_LIMIT
@@ -337,7 +349,7 @@ def process_shard(
         # Logging at DEBUG hid the dem_h broadcast failure behind the
         # misleading "No data after filtering"; swallowing the traceback hid
         # the strata AttributeError entirely (issue #341).
-        logger.warning(f"  Error reading track {group}: {exc}", exc_info=fresh)
+        logger.warning(f"  Error {what}: {exc}", exc_info=fresh)
 
     # Streaming buffered aggregation (issue #148 phase 4): when
     # ``aggregation.streaming`` is set, reads accumulate for ``buffer_granules``
@@ -414,7 +426,7 @@ def process_shard(
                     # Warn + collect an exemplar (see _record_read_error): the
                     # error is folded into ``read_errors`` by the main thread.
                     group_errors += 1
-                    _record_read_error(g, e)
+                    _record_read_error(f"reading track {g}", e)
                     continue
 
             # Per-granule backend hook (issue #160): side effects only (e.g.
@@ -455,15 +467,17 @@ def process_shard(
         future, so an out-of-order completion parks in its future until its
         turn — parked results are bounded by the pool width, and the fold
         (hence the aggregation output) is byte-identical to serial. A granule
-        whose read raised is warned and skipped here, same as the serial
-        except-continue.
+        whose read raised is warned, counted (``granule_errors``) and skipped
+        here, same as the serial except-continue.
         """
+        nonlocal granule_errors
         if granule_workers == 1:
             for s3_url in granule_urls:
                 try:
                     yield s3_url, *_read_granule(s3_url)
                 except Exception as e:
-                    logger.warning(f"  Error processing file {s3_url}: {e}")
+                    granule_errors += 1
+                    _record_read_error(f"processing file {s3_url}", e)
         else:
             with ThreadPoolExecutor(
                 max_workers=granule_workers, thread_name_prefix="zagg-granule"
@@ -477,7 +491,8 @@ def process_shard(
                     try:
                         reads, group_errors = future.result()
                     except Exception as e:
-                        logger.warning(f"  Error processing file {s3_url}: {e}")
+                        granule_errors += 1
+                        _record_read_error(f"processing file {s3_url}", e)
                         reads = None
                     # Top up BEFORE yielding (review): the head is done either
                     # way, so submitting its replacement here keeps the full
@@ -511,17 +526,24 @@ def process_shard(
             raise
         except Exception as e:
             # Fold-side failure (e.g. a streaming flush): same tolerated
-            # warn-and-continue the serial loop's outer ``except`` applied.
-            logger.warning(f"  Error processing file {s3_url}: {e}")
+            # warn-and-continue the serial loop's outer ``except`` applied —
+            # counted and exemplared like the read-side granule failures, since
+            # a shard that folds nothing looks identical to one that read
+            # nothing (fold review, issue #341).
+            granule_errors += 1
+            _record_read_error(f"processing file {s3_url}", e)
             continue
 
     logger.info(f"  Processed {files_processed}/{len(granule_urls)} files")
     metadata["files_processed"] = files_processed
     if read_errors:
         metadata["read_errors"] = read_errors
+    if granule_errors:
+        metadata["granule_errors"] = granule_errors
+    if read_errors or granule_errors:
         # Bounded diagnosis payload (issue #341): messages only, no tracebacks
         # on the wire — full tracebacks were logged above. Success-path
-        # payloads (read_errors == 0) are unchanged.
+        # payloads (no failures at either scope) are unchanged.
         metadata["read_error_exemplars"] = list(read_error_exemplars)
 
     if buffered is not None:
@@ -539,17 +561,21 @@ def process_shard(
         # so report it as such instead of the misleading text. Some groups may
         # have returned ``None`` (legitimately empty) rather than raised, so the
         # message is "no data AND N raised", not "all groups raised".
-        if read_errors:
-            logger.warning(
-                f"  No data after filtering for shard {label} and "
-                f"{read_errors} group read(s) raised - skipping"
+        if read_errors or granule_errors:
+            # Name the SCOPE of the failures, not just a count (fold review):
+            # "3 granule reads raised" and "3 group reads raised" point at very
+            # different causes (credentials/endpoint vs schema/variable).
+            raised = ", ".join(
+                f"{n} {scope} reads raised"
+                for n, scope in ((read_errors, "group"), (granule_errors, "granule"))
+                if n
             )
+            logger.warning(f"  No data after filtering for shard {label} and {raised} - skipping")
             # Carry the exemplars in the error text too (issue #341): this
             # string is what surfaces in the status object / run summary, so
             # it must be a one-glance diagnosis, not just a count.
             metadata["error"] = (
-                f"No data after filtering ({read_errors} group reads raised; "
-                f"e.g. {' | '.join(read_error_exemplars)})"
+                f"No data after filtering ({raised}; e.g. {' | '.join(read_error_exemplars)})"
             )
         else:
             logger.info(f"  No data after filtering for shard {label} - skipping")

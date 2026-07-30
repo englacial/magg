@@ -6049,7 +6049,91 @@ class TestReadErrorExemplars:
         )
         assert meta["error"] is None
         assert "read_errors" not in meta
+        assert "granule_errors" not in meta
         assert "read_error_exemplars" not in meta
+
+
+class TestGranuleScopeReadErrors:
+    """Fold review on issue #341: a fault that kills the WHOLE granule (H5Coro
+    open, credentials, URL rewrite, or the fold side) is warn-and-continue by
+    design, but it used to leave no trace at all in the result — no counter, no
+    exemplar, no traceback — so a shard whose every granule failed at granule
+    scope returned the blind ``"No data after filtering"``. It now counts into
+    ``granule_errors`` and feeds the same exemplar budget."""
+
+    def _patch_h5(self, monkeypatch, factory):
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", factory)
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    def test_serial_granule_failure_is_counted_and_exemplared(self, monkeypatch):
+        # The credential/endpoint shape: H5Coro construction raises for every
+        # granule. Previously: read_errors absent, error == "No data after
+        # filtering". Now: counted, exemplared, and the scope is named.
+        def factory(*a, **k):
+            raise RuntimeError("h5coro open failed: expired token")
+
+        self._patch_h5(monkeypatch, factory)
+        _df, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+        )
+        assert meta["granule_errors"] == 2
+        assert "read_errors" not in meta  # no GROUP read ever ran
+        assert meta["read_error_exemplars"] == ["RuntimeError: h5coro open failed: expired token"]
+        assert meta["error"] == (
+            "No data after filtering (2 granule reads raised; "
+            "e.g. RuntimeError: h5coro open failed: expired token)"
+        )
+
+    def test_pool_granule_failure_is_counted_and_exemplared(self, monkeypatch):
+        # Same, through the issue #180 granule pool (the failure surfaces from
+        # future.result() in the main thread rather than from the serial yield).
+        def factory(*a, **k):
+            raise RuntimeError("h5coro open failed under pool")
+
+        self._patch_h5(monkeypatch, factory)
+        cfg = _release_cfg()
+        cfg.data_source["granule_workers"] = 2
+        _df, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=cfg
+        )
+        assert meta["granule_errors"] == 2
+        assert meta["read_error_exemplars"] == ["RuntimeError: h5coro open failed under pool"]
+
+    def test_first_distinct_granule_failure_logs_traceback(self, monkeypatch, caplog):
+        # The traceback was swallowed entirely at this scope; it now behaves like
+        # the group-scope handler (first distinct message carries exc_info).
+        import logging as _logging
+
+        def factory(*a, **k):
+            raise RuntimeError("boom open")
+
+        self._patch_h5(monkeypatch, factory)
+        with caplog.at_level(_logging.WARNING, logger="zagg.processing.worker"):
+            process_shard(
+                _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+            )
+        hits = [r for r in caplog.records if "Error processing file" in r.getMessage()]
+        assert len(hits) == 2
+        assert hits[0].exc_info  # first distinct: full traceback
+        assert not hits[1].exc_info  # repeat: one-liner
+
+    def test_both_scopes_are_reported_separately(self, monkeypatch):
+        # A shard failing at BOTH scopes names both counts, because the causes
+        # differ (schema/variable vs credentials/endpoint).
+        calls = {"n": 0}
+
+        def factory(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _PerGroupRaisingH5()
+            raise RuntimeError("open failed")
+
+        self._patch_h5(monkeypatch, factory)
+        _df, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+        )
+        assert meta["read_errors"] == 1 and meta["granule_errors"] == 1
+        assert "1 group reads raised, 1 granule reads raised" in meta["error"]
 
 
 class TestGranuleReadPool:
