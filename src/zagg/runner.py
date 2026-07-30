@@ -4842,6 +4842,116 @@ def _invoke_lambda_sweep(lambda_client, function_name, store_path, leaves, outpu
     )
 
 
+def _build_cell_event(
+    chunk_idx,
+    shard_key,
+    parent_order,
+    child_order,
+    granule_urls,
+    store_path,
+    s3_credentials,
+    *,
+    config_dict,
+    output_creds_event=None,
+    handoff="arrow",
+    profile=False,
+    aoi_payload=None,
+    window=None,
+    invoked_by=None,
+    run_id=None,
+    result_url=None,
+) -> dict:
+    """One shard's worker event dict — the single construction site.
+
+    Extracted from :func:`_invoke_lambda_cell` (issue #327) so the v2 Event
+    transport builds byte-identical payloads to the sync/async paths (modulo
+    ``result_url``, which only the issue #151 channel sets). Key-presence
+    rules are load-bearing: optional keys are added only when set, so default
+    runs' events stay byte-identical to their pre-feature shapes (see the
+    per-key notes in ``_invoke_lambda_cell``'s docstring).
+    """
+    event = {
+        "chunk_idx": chunk_idx,
+        "shard_key": shard_key,
+        "parent_order": parent_order,
+        "granule_urls": granule_urls,
+        "store_path": store_path,
+        "s3_credentials": {
+            "accessKeyId": s3_credentials["accessKeyId"],
+            "secretAccessKey": s3_credentials["secretAccessKey"],
+            "sessionToken": s3_credentials["sessionToken"],
+        },
+    }
+    # child_order is HEALPix-specific; only forward it when set (non-HEALPix
+    # grids leave it None and the handler doesn't require it).
+    if child_order is not None:
+        event["child_order"] = child_order
+    if config_dict is not None:
+        event["config"] = config_dict
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    # Only add the key when profiling, so default runs stay byte-identical (#100).
+    if profile:
+        event["profile"] = True
+    # Only add the AOI key when the flag is on; flag-off runs stay byte-identical
+    # to the pre-feature event (issue #101).
+    if aoi_payload is not None:
+        event["aoi_payload"] = aoi_payload
+    # Temporal window unit (issue #246): {"label", "start", "end"} with the
+    # half-open bounds in dataset units, converted once at dispatch. Absent
+    # (schedule none) keeps the event byte-identical to pre-windowing runs.
+    if window is not None:
+        event["window"] = window
+    # Add the key for the arrow carrier (the default); an explicit pandas run omits
+    # it, staying byte-identical to the pre-handoff path (#130).
+    if handoff and handoff != "pandas":
+        event["handoff"] = handoff
+    # Caller identity for the stats record (issue #297); absent when the STS
+    # resolve failed (fail-open), keeping the event key optional.
+    if invoked_by is not None:
+        event["invoked_by"] = invoked_by
+    # Run identity, threaded like invoked_by (issue #297): the worker copies
+    # it verbatim into the stats record so leaf sidecars join the run parquet.
+    if run_id is not None:
+        event["run_id"] = run_id
+    # Async dispatch (issue #151): tell the worker where to mirror its response
+    # envelope. Absent -> the legacy synchronous / v2 status-object invoke.
+    if result_url is not None:
+        event["result_url"] = result_url
+    return event
+
+
+def _cell_payload(event, *, submap=None, async_invoke, label=None) -> str:
+    """Serialize one cell event, size-gating for the 256 KB Event cap.
+
+    json.dumps is ASCII by default, so len() is the request byte size. The
+    leaf sub-map block (issue #300) is attached only when it FITS an async
+    payload — dropped (never fatal) otherwise, since the sub-map is a
+    regenerable D9 artifact; an event still over the cap without it raises
+    with a remedy up front rather than letting every attempt fail on Lambda's
+    raw RequestEntityTooLargeException (issue #151).
+    """
+    shard_key = event.get("shard_key")
+    payload = json.dumps(event)
+    if submap is not None:
+        with_submap = json.dumps({**event, "submap": submap})
+        if not async_invoke or len(with_submap) <= _ASYNC_PAYLOAD_CAP_BYTES:
+            payload = with_submap
+        else:
+            logger.debug(
+                f"cell {label or shard_key}: dropping submap block ({len(with_submap):,} "
+                f"bytes over the async budget); leaf sub-map deferred to the sweep CLI"
+            )
+    if async_invoke and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
+        raise ValueError(
+            f"cell {label or shard_key} event payload is {len(payload):,} bytes, over the "
+            f"{_ASYNC_PAYLOAD_CAP_BYTES:,}-byte async dispatch budget (Lambda caps "
+            'Event invokes at 256 KB): pass invocation="sync" for this run, or '
+            "shrink the per-cell payload (e.g. the strict-AOI aoi_payload)"
+        )
+    return payload
+
+
 def _invoke_lambda_cell(
     lambda_client,
     chunk_idx,
@@ -4902,83 +5012,30 @@ def _invoke_lambda_cell(
     """
     wall_start = time.time()
 
-    event = {
-        "chunk_idx": chunk_idx,
-        "shard_key": shard_key,
-        "parent_order": parent_order,
-        "granule_urls": granule_urls,
-        "store_path": store_path,
-        "s3_credentials": {
-            "accessKeyId": s3_credentials["accessKeyId"],
-            "secretAccessKey": s3_credentials["secretAccessKey"],
-            "sessionToken": s3_credentials["sessionToken"],
-        },
-    }
-    # child_order is HEALPix-specific; only forward it when set (non-HEALPix
-    # grids leave it None and the handler doesn't require it).
-    if child_order is not None:
-        event["child_order"] = child_order
-    if config_dict is not None:
-        event["config"] = config_dict
-    if output_creds_event is not None:
-        event["output_credentials"] = output_creds_event
-    # Only add the key when profiling, so default runs stay byte-identical (#100).
-    if profile:
-        event["profile"] = True
-    # Only add the AOI key when the flag is on; flag-off runs stay byte-identical
-    # to the pre-feature event (issue #101).
-    if aoi_payload is not None:
-        event["aoi_payload"] = aoi_payload
-    # Temporal window unit (issue #246): {"label", "start", "end"} with the
-    # half-open bounds in dataset units, converted once at dispatch. Absent
-    # (schedule none) keeps the event byte-identical to pre-windowing runs.
-    if window is not None:
-        event["window"] = window
-    # Add the key for the arrow carrier (the default); an explicit pandas run omits
-    # it, staying byte-identical to the pre-handoff path (#130).
-    if handoff and handoff != "pandas":
-        event["handoff"] = handoff
-    # Caller identity for the stats record (issue #297); absent when the STS
-    # resolve failed (fail-open), keeping the event key optional.
-    if invoked_by is not None:
-        event["invoked_by"] = invoked_by
-    # Run identity, threaded like invoked_by (issue #297): the worker copies
-    # it verbatim into the stats record so leaf sidecars join the run parquet.
-    if run_id is not None:
-        event["run_id"] = run_id
-    # Async dispatch (issue #151): tell the worker where to mirror its response
-    # envelope and fire-and-forget. Absent -> the legacy synchronous invoke.
-    invocation_type = "RequestResponse"
-    if result_url is not None:
-        event["result_url"] = result_url
-        invocation_type = "Event"
-
-    # json.dumps is ASCII by default, so len() is the request byte size. Gate
-    # async payloads against the 256 KB Event cap with a remedy, up front,
-    # rather than letting every attempt fail on Lambda's raw
-    # RequestEntityTooLargeException (issue #151).
-    payload = json.dumps(event)
-    # Leaf sub-map block (issue #300): attached only when it FITS — a unit
-    # whose granule entries would push an async event over the cap keeps its
-    # pre-#300 payload (the sub-map is a regenerable D9 artifact; the manual
-    # sweep CLI is the backstop), so the cap gate below can never start
-    # rejecting a run that dispatched fine before.
-    if submap is not None:
-        with_submap = json.dumps({**event, "submap": submap})
-        if invocation_type != "Event" or len(with_submap) <= _ASYNC_PAYLOAD_CAP_BYTES:
-            payload = with_submap
-        else:
-            logger.debug(
-                f"cell {label or shard_key}: dropping submap block ({len(with_submap):,} "
-                f"bytes over the async budget); leaf sub-map deferred to the sweep CLI"
-            )
-    if invocation_type == "Event" and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
-        raise ValueError(
-            f"cell {label or shard_key} event payload is {len(payload):,} bytes, over the "
-            f"{_ASYNC_PAYLOAD_CAP_BYTES:,}-byte async dispatch budget (Lambda caps "
-            'Event invokes at 256 KB): pass invocation="sync" for this run, or '
-            "shrink the per-cell payload (e.g. the strict-AOI aoi_payload)"
-        )
+    event = _build_cell_event(
+        chunk_idx,
+        shard_key,
+        parent_order,
+        child_order,
+        granule_urls,
+        store_path,
+        s3_credentials,
+        config_dict=config_dict,
+        output_creds_event=output_creds_event,
+        handoff=handoff,
+        profile=profile,
+        aoi_payload=aoi_payload,
+        window=window,
+        invoked_by=invoked_by,
+        run_id=run_id,
+        result_url=result_url,
+    )
+    # Async dispatch (issue #151): result_url flips the invoke to
+    # fire-and-forget. Absent -> the legacy synchronous invoke.
+    invocation_type = "RequestResponse" if result_url is None else "Event"
+    payload = _cell_payload(
+        event, submap=submap, async_invoke=invocation_type == "Event", label=label
+    )
 
     last_error = None
     for attempt in range(max_retries):

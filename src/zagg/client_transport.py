@@ -44,12 +44,45 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import uuid
-from typing import Any
+from concurrent.futures import Future
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from zagg.dispatch import BENIGN_ERRORS
 
 logger = logging.getLogger(__name__)
+
+#: Poll cadence (issue #327, ratified fixed — not knobs): the tick interval
+#: starts at the initial value, doubles on an idle tick up to the cap, and
+#: resets on progress (a consumed status), so retries are picked up fast while
+#: a long quiet fan-out costs ~4 LISTs a minute.
+_POLL_INITIAL_INTERVAL_S = 2.0
+_POLL_MAX_INTERVAL_S = 15.0
+
+#: The fleet's ``MaximumEventAgeInSeconds`` (template.yaml EventInvokeConfig,
+#: issue #151): an Event invoke that cannot start within this window is
+#: silently discarded — the backpressure drop the failed-unknown outcome
+#: exists to catch (issue #327 amendment (a')).
+MAX_EVENT_AGE_S = 60.0
+
+#: Margin on the drop deadline past function timeout + max event age: async
+#: queue latency + the worker's status PUT. Mirrors the #151 channel's
+#: ``_ASYNC_POLL_MARGIN_S``.
+_DROP_MARGIN_S = 90.0
+
+
+def drop_timeout_s(function_timeout_s: float) -> float:
+    """Seconds after dispatch with NO status object => ``failed-unknown``.
+
+    Function timeout (the worker may run to the ceiling and still write its
+    status) + the 60 s max event age (the invoke may sit queued that long
+    before starting — or be dropped) + margin for queue/PUT latency.
+    """
+    return float(function_timeout_s) + MAX_EVENT_AGE_S + _DROP_MARGIN_S
+
 
 #: Version stamped into every status object; bump on any key change.
 STATUS_SCHEMA_VERSION = 1
@@ -133,7 +166,9 @@ def build_shard_status(event: dict, response: dict) -> tuple[str, dict] | None:
     return shard_status_key(shard_key, window=window), obj
 
 
-def build_run_manifest_block(run_id: str, shard_keys, config, *, dataset: dict | None = None) -> dict:
+def build_run_manifest_block(
+    run_id: str, shard_keys, config, *, dataset: dict | None = None
+) -> dict:
     """The dispatcher-side ``run_manifest`` block for the worker setup invoke.
 
     Rides the EXISTING setup invoke (the hive fire-and-forget manifest write /
@@ -216,3 +251,327 @@ def write_shard_status(event: dict, response: dict, store_kwargs: dict[str, Any]
         logger.info(f"Wrote shard status ({obj['status']}) to {prefix}/{key}")
     except Exception as e:
         logger.warning(f"shard status write failed (fail-open, issue #327): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Client half: the polling resolver (issue #327 phases 3-4).
+# ---------------------------------------------------------------------------
+
+
+def open_status_store(prefix: str, store_kwargs: dict[str, Any]):
+    """obstore store rooted at a run's status prefix (the poller's seam).
+
+    Module-level so tests can monkeypatch it with an in-memory store; the
+    production path is the same ``open_object_store`` factory the #151 result
+    poller uses, with the runner's short per-request retry policy riding in
+    ``store_kwargs``.
+    """
+    from zagg.store import open_object_store
+
+    return open_object_store(prefix, **store_kwargs)
+
+
+@dataclass
+class _ShardEntry:
+    """One shard's transport state, owned by the poller thread."""
+
+    shard_key: int
+    label: str
+    key: str  # status object name under the run prefix
+    future: Future
+    dispatch: Callable[[], None] | None  # fires one Event invoke; None = observe-only
+    granule_count: int = 0
+    attempts: int = 0  # dispatches so far (the v1 attempt counter)
+    queued: bool = True  # awaiting a dispatch slot
+    dispatched_at: float | None = None  # this attempt's dispatch clock
+    first_dispatched_at: float | None = None
+    consumed: set = field(default_factory=set)  # attempt_ids already acted on
+
+
+class StatusPoller:
+    """Single background thread resolving ALL shard futures from status objects.
+
+    One LIST of the run's status prefix per tick — O(1) requests per tick
+    regardless of shard count — then one GET per newly-landed (or
+    re-attempted) object. Never writes (D8: the LIST/GETs are reads; every
+    write stays worker-side).
+
+    The poller also owns Event dispatch and the migrated retry policy (issue
+    #327 amendment (b) — function errors never return to an Event caller, so
+    ``max_retries`` becomes status-driven): shards register with a zero-arg
+    ``dispatch`` closure, at most ``max_in_flight`` are dispatched-unresolved
+    at once (the concurrency preflight's clamp — load-bearing under the
+    fleet's 60 s ``MaximumEventAgeInSeconds``, which silently drops an Event
+    that cannot start in time), and a ``failed`` status re-dispatches until
+    the shard's total attempts reach ``max_retries``. ``attempt_id`` keeps the
+    accounting straight: each status object is acted on at most once, so a
+    duplicate execution's re-write (or a poll catching a stale pre-retry
+    object) never double-counts.
+
+    Resolution policy is the caller's: a terminal success/no-data sets the
+    result dict (the exact shape the sync transport returns); a terminal
+    failure goes through ``on_failed(entry, result)`` — the client raises
+    :class:`zagg.client.ShardError` there, ``agg`` records the result dict —
+    defaulting to ``set_result``.
+
+    Observe-only entries (``dispatch=None`` — :meth:`zagg.client.Run.attach`)
+    are never re-dispatched: a ``failed`` status resolves immediately and the
+    drop deadline is anchored at the manifest's ``dispatched_at``.
+    """
+
+    def __init__(
+        self,
+        store_factory: Callable[[], Any],
+        *,
+        drop_timeout_s: float,
+        max_retries: int = 3,
+        max_in_flight: int | None = None,
+        on_failed: Callable[[_ShardEntry, dict], None] | None = None,
+        initial_interval_s: float | None = None,
+        max_interval_s: float | None = None,
+        clock: Callable[[], float] = time.time,
+    ):
+        self._store_factory = store_factory
+        self._store = None
+        self._drop_timeout_s = drop_timeout_s
+        self._max_retries = max(1, int(max_retries))
+        self._max_in_flight = max_in_flight
+        self._on_failed = on_failed
+        # None -> the module constants, read at construction so tests can
+        # scale the cadence for every internally-built poller.
+        self._initial_interval_s = (
+            _POLL_INITIAL_INTERVAL_S if initial_interval_s is None else initial_interval_s
+        )
+        self._max_interval_s = _POLL_MAX_INTERVAL_S if max_interval_s is None else max_interval_s
+        self._clock = clock
+        self._entries: dict[str, _ShardEntry] = {}  # status key -> entry
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # -- registration / lifecycle -------------------------------------------
+
+    def register(
+        self,
+        shard_key,
+        label: str,
+        *,
+        dispatch: Callable[[], None] | None = None,
+        window: str | None = None,
+        granule_count: int = 0,
+        dispatched_at: float | None = None,
+    ) -> Future:
+        """Track one shard; returns the Future the poller will resolve.
+
+        ``dispatched_at`` seeds the drop deadline for observe-only entries
+        (attach: the manifest's dispatch time); live entries get stamped at
+        their own Event invoke.
+        """
+        entry = _ShardEntry(
+            shard_key=int(shard_key),
+            label=label,
+            key=shard_status_key(shard_key, window=window),
+            future=Future(),
+            dispatch=dispatch,
+            granule_count=granule_count,
+        )
+        if dispatch is None:
+            entry.queued = False
+            entry.attempts = 1
+            entry.dispatched_at = dispatched_at if dispatched_at is not None else self._clock()
+            entry.first_dispatched_at = entry.dispatched_at
+        with self._lock:
+            self._entries[entry.key] = entry
+        return entry.future
+
+    def start(self) -> "StatusPoller":
+        self._thread = threading.Thread(target=self._run, name="zagg-status-poller", daemon=True)
+        self._thread.start()
+        return self
+
+    def shutdown(self, wait: bool = False) -> None:
+        """Stop the poller thread (pool-shaped so the finisher can close it)."""
+        self._stop.set()
+        if wait and self._thread is not None:
+            self._thread.join()
+
+    # -- the loop -------------------------------------------------------------
+
+    def _run(self) -> None:
+        interval = self._initial_interval_s
+        while not self._stop.is_set():
+            try:
+                progressed = self._tick()
+            except Exception as e:
+                # A transient LIST/GET fault must not kill the resolver; a
+                # persistent one surfaces through the drop deadline instead.
+                logger.warning(f"status poll tick failed (retrying): {e}")
+                progressed = False
+            if self._all_done():
+                return
+            interval = (
+                self._initial_interval_s if progressed else min(interval * 2, self._max_interval_s)
+            )
+            self._stop.wait(interval)
+
+    def _all_done(self) -> bool:
+        with self._lock:
+            return all(e.future.done() for e in self._entries.values())
+
+    def _pending(self) -> list[_ShardEntry]:
+        with self._lock:
+            return [e for e in self._entries.values() if not e.future.done()]
+
+    def _tick(self) -> bool:
+        progressed = self._dispatch_up_to_window()
+        pending = [e for e in self._pending() if not e.queued]
+        if not pending:
+            return progressed
+        listed = self._list_keys()
+        now = self._clock()
+        for entry in pending:
+            if entry.future.done():
+                continue
+            if entry.key in listed and self._consume(entry):
+                progressed = True
+            elif (
+                entry.dispatched_at is not None
+                and now >= entry.dispatched_at + self._drop_timeout_s
+            ):
+                self._dropped(entry)
+                progressed = True
+        return progressed
+
+    def _dispatch_up_to_window(self) -> bool:
+        """Fire queued shards while the in-flight window has room (pacing)."""
+        dispatched = False
+        while True:
+            with self._lock:
+                queued = [e for e in self._entries.values() if e.queued and not e.future.done()]
+                in_flight = sum(
+                    1 for e in self._entries.values() if not e.queued and not e.future.done()
+                )
+                room = (
+                    len(queued) if self._max_in_flight is None else self._max_in_flight - in_flight
+                )
+                batch = queued[: max(room, 0)]
+                for entry in batch:
+                    entry.queued = False
+            if not batch:
+                return dispatched
+            for entry in batch:
+                self._fire(entry)
+                dispatched = True
+
+    def _fire(self, entry: _ShardEntry) -> None:
+        entry.attempts += 1
+        entry.dispatched_at = self._clock()
+        if entry.first_dispatched_at is None:
+            entry.first_dispatched_at = entry.dispatched_at
+        try:
+            entry.dispatch()
+        except Exception as e:
+            # An invoke fault burns this attempt (throttles included): the
+            # retry budget re-fires it on a later tick, mirroring the sync
+            # transport's bounded transient retry.
+            logger.warning(f"shard {entry.label}: Event invoke failed ({e})")
+            self._attempt_failed(
+                entry,
+                self._result(entry, status_code=None, body={}, error=f"Event invoke failed: {e}"),
+            )
+
+    # -- resolution -----------------------------------------------------------
+
+    def _list_keys(self) -> set:
+        import obstore
+
+        if self._store is None:
+            self._store = self._store_factory()
+        keys: set = set()
+        for batch in obstore.list(self._store):
+            for meta in batch:
+                keys.add(str(meta["path"]))
+        return keys
+
+    def _consume(self, entry: _ShardEntry) -> bool:
+        """GET one listed status object; act on it once per attempt_id."""
+        import obstore
+
+        try:
+            obj = json.loads(bytes(obstore.get(self._store, entry.key).bytes()))
+        except Exception as e:
+            logger.warning(f"shard {entry.label}: status GET failed (retrying): {e}")
+            return False
+        attempt_id = obj.get("attempt_id")
+        if attempt_id in entry.consumed:
+            return False  # already acted on (a not-yet-overwritten prior attempt)
+        entry.consumed.add(attempt_id)
+        result = self._result(
+            entry,
+            status_code=obj.get("status_code"),
+            body=obj.get("body") or {},
+            error=obj.get("error"),
+        )
+        if obj.get("status") in ("ok", "no_data"):
+            entry.future.set_result(result)
+        else:
+            self._attempt_failed(entry, result)
+        return True
+
+    def _result(self, entry: _ShardEntry, *, status_code, body, error, outcome=None) -> dict:
+        """The v1-shaped per-shard result dict (see ``_poll_lambda_result``)."""
+        start = entry.first_dispatched_at or self._clock()
+        result = {
+            "shard_key": entry.shard_key,
+            "status_code": status_code,
+            "body": body,
+            "wall_time": self._clock() - start,
+            "lambda_duration": (body or {}).get("duration_s", 0),
+            "error": error,
+            "retries": entry.attempts - 1,
+            "timeout": False,
+            "granule_count": entry.granule_count,
+        }
+        if outcome is not None:
+            result["outcome"] = outcome
+        return result
+
+    def _attempt_failed(self, entry: _ShardEntry, result: dict) -> None:
+        """Status-driven retry (issue #327 amendment (b)): re-dispatch or resolve."""
+        if entry.dispatch is not None and entry.attempts < self._max_retries:
+            logger.warning(
+                f"shard {entry.label}: attempt {entry.attempts} failed "
+                f"({result.get('error')}); re-dispatching "
+                f"({self._max_retries - entry.attempts} left)"
+            )
+            with self._lock:
+                entry.queued = True
+            return
+        if self._on_failed is not None:
+            self._on_failed(entry, result)
+        else:
+            entry.future.set_result(result)
+
+    def _dropped(self, entry: _ShardEntry) -> None:
+        """No status object by the drop deadline: the distinct failed-unknown outcome.
+
+        The deadline is function timeout + the fleet's 60 s max event age +
+        margin, so a shard reaching it either had its Event invoke silently
+        dropped under backpressure (issue #327 amendment (a')) or died before
+        its always-on status write — indistinguishable from here, hence the
+        dedicated outcome. Participates in the same re-dispatch budget as a
+        ``failed`` status.
+        """
+        result = self._result(
+            entry,
+            status_code=None,
+            body={},
+            error=(
+                f"failed-unknown: no status object within {self._drop_timeout_s:.0f}s "
+                f"(function timeout + 60s max event age + margin) — the Event invoke "
+                f"was dropped under backpressure, or the worker died before its "
+                f"status write (check CloudWatch)"
+            ),
+            outcome="failed-unknown",
+        )
+        self._attempt_failed(entry, result)
