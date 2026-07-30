@@ -378,6 +378,13 @@ def _put_object(store, key, payload):
     sync(store.set(key, default_buffer_prototype().buffer.from_bytes(payload)))
 
 
+def _del_object(store, key):
+    """DELETE one raw store object (a leaf whose sidecar went missing)."""
+    from zarr.core.sync import sync
+
+    sync(store.delete(key))
+
+
 class TestMaskChannel:
     """Issue #336 phase 4: the leaf's ``coverage.moc`` occupancy sidecar
     decodes into the deinterleaved mask channel — 0 unobserved, 1 observed
@@ -458,6 +465,28 @@ class TestMaskChannel:
         # degrades to populated/not, never a half-trusted occupancy.
         _tensor, mask = self._read_one(self._leaf([0, 5], stamp=False))
         assert set(np.unique(mask)) == {0, 2}
+
+    def test_has_exact_occupancy_discriminates_the_two_regimes(self):
+        """The yielded mask cannot tell a degraded 2-state channel from a
+        3-state one with no observed-but-empty cell — both are ``{0, 2}``.
+        ``has_exact_occupancy`` is the discriminator (fold review)."""
+        from zagg import hive
+        from zagg.readers.tdigest_tensor import has_exact_occupancy
+
+        exact = self._leaf([0, 5])
+        degraded = self._leaf([0, 5], stamp=False)
+        # Identical mask value sets, opposite semantics for `0`.
+        assert set(np.unique(self._read_one(exact)[1])) == {0, 2}
+        assert set(np.unique(self._read_one(degraded)[1])) == {0, 2}
+        assert has_exact_occupancy(exact)
+        assert not has_exact_occupancy(degraded)
+        assert has_exact_occupancy(self._leaf([3], full=True))
+        # A stamped leaf whose sidecar object is gone degrades too, and the
+        # predicate tracks the reader (it shares the same resolution path).
+        no_sidecar = self._leaf([0, 5])
+        _del_object(no_sidecar, hive.COVERAGE_SIDECAR)
+        assert not has_exact_occupancy(no_sidecar)
+        assert set(np.unique(self._read_one(no_sidecar)[1])) == {0, 2}
 
     def test_corrupt_sidecar_raises(self):
         # A wrong-size (but valid-zstd) sidecar must raise, not zero-pad — the
