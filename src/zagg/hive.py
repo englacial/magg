@@ -52,7 +52,6 @@ import json
 import logging
 import re
 import time
-import warnings
 from datetime import datetime, timezone
 
 import numpy as np
@@ -389,6 +388,9 @@ def validate_manifest(
         # already written under the OLD configuration. Their leaves are
         # stamped and walker-discoverable, so replacing just the manifest
         # would leave them masquerading as legal mixed-order data (D2).
+        # ``semantic_hash`` is a frozen key (D19), so overwrite does NOT
+        # bypass the semantic-hash refusal when both manifests carry one —
+        # a changed aggregation block over existing data refuses right here.
         listing = obstore.list_with_delimiter(store)
         children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
         if any(_is_base_component(c) for c in children):
@@ -397,6 +399,32 @@ def validate_manifest(
                 f"different orders/identity: the digit tree already has shard "
                 f"data (e.g. {children[0]!r}/), and overwrite replaces the "
                 f"manifest only — clear the store root first"
+            )
+    if (
+        overwrite
+        and existing is not None
+        and frozen_matches
+        and existing.get("semantic_hash") is None
+        and manifest.get("semantic_hash") is not None
+    ):
+        # Hash-guard coherence (issue #341): ``_frozen_matches`` EXEMPTS
+        # ``semantic_hash`` when the existing manifest predates #299 (no hash
+        # to compare — the exemption keeps old stores resumable), so this
+        # overwrite proceeds even though the existing data's semantics cannot
+        # be verified. The store it leaves IS coherent going forward — the
+        # manifest rewrite stamps the run's hash, and every re-dispatched
+        # leaf is re-templated wholesale (``emit_shard_template`` clears the
+        # leaf prefix first) — but leaves this run does not rewrite may carry
+        # the old schema, so say so when shard data already exists.
+        listing = obstore.list_with_delimiter(store)
+        children = [p.rstrip("/").split("/")[-1] for p in listing["common_prefixes"]]
+        if any(_is_base_component(c) for c in children):
+            logger.warning(
+                f"overwriting {MANIFEST_NAME} at {store_root}: the existing manifest "
+                f"predates semantic hashing (issue #299), so semantic compatibility "
+                f"of the existing shard data cannot be verified; re-dispatched leaves "
+                f"are re-templated wholesale, but leaves this run does not rewrite "
+                f"may carry the old schema"
             )
     return existing
 
@@ -1138,14 +1166,14 @@ def process_and_write_hive(
             store = open_store(leaf_path, **store_kwargs)
             # overwrite=True: any existing prefix here is either debris from a
             # torn run (D4) or a prior committed write being redone — both are
-            # replaced wholesale; per-leaf state never blocks a retry. The
-            # overwrite enumeration warns about the prior attempt's coverage
-            # sidecar — the ONE foreign key we put there ourselves — so that
-            # specific warning is expected and suppressed; anything else in
-            # the prefix stays loud (review finding, PR #208 round 2).
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
-                grid.emit_shard_template(store, overwrite=True)
+            # replaced wholesale; per-leaf state never blocks a retry. Since
+            # issue #341 the template DELETES the leaf prefix up front, so the
+            # wholesale claim is literal: retired members of a narrowed schema
+            # (and the prior attempt's coverage sidecar) are gone before the
+            # new template lands, and no enumeration ever walks stale/orphan
+            # member dirs (the pre-#341 walk warned on the sidecar and could
+            # die on an orphan array dir).
+            grid.emit_shard_template(store, overwrite=True)
             box["store"] = store
         return box["store"]
 

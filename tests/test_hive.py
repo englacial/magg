@@ -335,6 +335,56 @@ class TestSemanticManifest:
         with pytest.raises(ValueError, match="does not match this run"):
             hive.validate_manifest(root, other)
 
+    def test_overwrite_semantic_mismatch_refuses_over_existing_shards(self, cfg, tmp_path):
+        # Issue #341 hash-guard ruling: overwrite does NOT bypass the
+        # semantic-hash refusal — the hash is a frozen key, so a changed
+        # aggregation block over a data-carrying store refuses even with
+        # overwrite=True (same posture as an orders change).
+        import copy
+
+        root = tmp_path / "store"
+        hive.ensure_manifest(str(root), hive.build_manifest(self._grid(cfg)))
+        (root / "-5" / "1").mkdir(parents=True)
+        (root / "-5" / "1" / "obj").write_text("x")
+        other_cfg = copy.deepcopy(cfg)
+        other_cfg.aggregation["variables"]["count"]["dtype"] = "int64"
+        other = hive.build_manifest(self._grid(other_cfg))
+        with pytest.raises(ValueError, match="clear the store root first"):
+            hive.ensure_manifest(str(root), other, overwrite=True)
+
+    def test_overwrite_pre_hash_store_with_data_warns_and_stamps_hash(self, cfg, tmp_path, caplog):
+        # Issue #341: a pre-#299 manifest carries no hash, so the frozen
+        # comparison EXEMPTS it and overwrite proceeds — the one legitimate
+        # bypass. It must be loud (semantic compatibility of the existing data
+        # is unverifiable) and must leave a coherent manifest: the rewrite
+        # stamps the run's hash.
+        root = tmp_path / "store"
+        grid = self._grid(cfg)
+        old = hive.build_manifest(grid)
+        del old["semantic_hash"]
+        hive.ensure_manifest(str(root), old)
+        (root / "-5" / "1").mkdir(parents=True)
+        (root / "-5" / "1" / "obj").write_text("x")
+        fresh = hive.build_manifest(grid)
+        with caplog.at_level("WARNING"):
+            hive.ensure_manifest(str(root), fresh, overwrite=True)
+        assert "predates semantic hashing" in caplog.text
+        assert hive.read_manifest(str(root))["semantic_hash"] == fresh["semantic_hash"]
+
+    def test_overwrite_pre_hash_store_empty_tree_is_silent(self, cfg, tmp_path, caplog):
+        # No shard data -> nothing whose compatibility could be in question;
+        # the manifest is simply replaced (hash stamped), no warning.
+        root = str(tmp_path / "store")
+        grid = self._grid(cfg)
+        old = hive.build_manifest(grid)
+        del old["semantic_hash"]
+        hive.ensure_manifest(root, old)
+        fresh = hive.build_manifest(grid)
+        with caplog.at_level("WARNING"):
+            hive.ensure_manifest(root, fresh, overwrite=True)
+        assert "predates semantic hashing" not in caplog.text
+        assert hive.read_manifest(root)["semantic_hash"] == fresh["semantic_hash"]
+
     def test_grouping_mismatch_refuses(self, cfg, tmp_path):
         # path_grouping IS frozen (path shape): an explicit different value
         # refuses; only ABSENT normalizes to 1.
@@ -486,6 +536,87 @@ class TestLeafTemplateAndStamp:
         g = self._grid(cfg)
         g.emit_shard_template(store, overwrite=True)
         g.emit_shard_template(store, overwrite=True)  # retry over debris
+
+    @staticmethod
+    def _put(store, key, payload=b"\x00" * 16):
+        from zarr.core.buffer import default_buffer_prototype
+        from zarr.core.sync import sync
+
+        sync(store.set(key, default_buffer_prototype().buffer.from_bytes(payload)))
+
+    @staticmethod
+    def _exists(store, key):
+        from zarr.core.sync import sync
+
+        return sync(store.exists(key))
+
+    def test_overwrite_survives_orphan_member_dir(self, cfg):
+        # Issue #341 (Bug A regression): a member dir holding chunk objects but
+        # no zarr.json — the shape the post-#337 ``cell_ids`` orphan left, which
+        # the store walk died on ("No array found in store ... at path
+        # 19/cell_ids") — must never kill the re-template. The leaf prefix is
+        # cleared wholesale up front, so the walk never parses the orphan.
+        store = MemoryStore()
+        g = self._grid(cfg)
+        g.emit_shard_template(store, overwrite=True)
+        self._put(store, f"{g.group_path}/cell_ids/c/0")  # orphan: chunks, no zarr.json
+        g.emit_shard_template(store, overwrite=True)  # must not raise
+        assert not self._exists(store, f"{g.group_path}/cell_ids/c/0")  # and it is gone
+
+    def test_overwrite_clears_retired_members(self, cfg):
+        # Issue #341 (Bug A): schema narrowing over an existing leaf round-trips
+        # clean — the retired member's metadata AND chunk objects are deleted,
+        # not left masquerading as data.
+        import copy
+
+        store = MemoryStore()
+        g = self._grid(cfg)
+        g.emit_shard_template(store, overwrite=True)
+        self._put(store, f"{g.group_path}/h_max/c/0")  # data in the member being dropped
+
+        cfg2 = copy.deepcopy(cfg)
+        del cfg2.aggregation["variables"]["h_max"]
+        g2 = HealpixGrid(parent_order=6, child_order=8, layout="fullsphere", config=cfg2)
+        g2.emit_shard_template(store, overwrite=True)
+
+        assert not self._exists(store, f"{g.group_path}/h_max/zarr.json")
+        assert not self._exists(store, f"{g.group_path}/h_max/c/0")
+        grp = zarr.open_group(store, path=g2.group_path, mode="r", zarr_format=3)
+        members = dict(grp.members())
+        assert "h_max" not in members
+        for name in ("morton", *get_data_vars(cfg2)):
+            assert grp[name].shape == (g2.cells_per_shard,)
+
+    def test_overwrite_clears_coverage_sidecar_without_warning(self, cfg):
+        # The pre-#341 overwrite walked the existing prefix and warned on the
+        # coverage sidecar (suppressed at the call site); the clear-first
+        # template deletes it silently — no enumeration warning at all.
+        import warnings as _warnings
+
+        store = MemoryStore()
+        g = self._grid(cfg)
+        g.emit_shard_template(store, overwrite=True)
+        self._put(store, hive.COVERAGE_SIDECAR)
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            g.emit_shard_template(store, overwrite=True)
+        assert not self._exists(store, hive.COVERAGE_SIDECAR)
+        assert not [w for w in caught if hive.COVERAGE_SIDECAR in str(w.message)]
+
+    def test_overwrite_clear_is_scoped_to_the_leaf(self, cfg, tmp_path):
+        # The store handed to emit_shard_template is rooted AT the leaf, so the
+        # up-front clear can only touch the leaf prefix — sibling objects (the
+        # run's ``.zarr.status/`` results live outside the leaf) survive.
+        from zagg.store import open_store
+
+        leaf = tmp_path / "leaf.zarr"
+        status = tmp_path / "leaf.zarr.status"
+        status.mkdir()
+        (status / "r.json").write_text("{}")
+        g = self._grid(cfg)
+        g.emit_shard_template(open_store(str(leaf)), overwrite=True)
+        g.emit_shard_template(open_store(str(leaf)), overwrite=True)
+        assert (status / "r.json").read_text() == "{}"
 
     def test_sharded_leaf_template_shards_whole_leaf(self, cfg):
         # issue #236: a sharded grid's leaf template wraps every dense array in

@@ -489,11 +489,28 @@ class HealpixGrid:
         object spanning the whole leaf, written at leaf block 0 — the
         ShardingCodec is vanilla zarr v3, so the leaf stays self-describing
         (D3), same as the ragged field's sharded vlen array (issue #209).
+
+        ``overwrite=True`` clears the leaf prefix FIRST (issue #341, Bug A):
+        D4 says a retried/overwritten leaf is replaced WHOLESALE, but the
+        template write alone only rewrites members the NEW schema declares —
+        a schema-narrowed rerun would leave the retired members' objects
+        behind (e.g. the post-#337 ``cell_ids`` chunk orphans), masquerading
+        as data and breaking store walks. Clearing up front also means
+        pydantic-zarr's overwrite walk (``GroupSpec.like`` →
+        ``Group.members()``) never has to parse a broken/orphan member dir —
+        an unknown array dir can die with "No array found in store" instead
+        of templating. The store is rooted at the leaf, so the delete is
+        scoped to the leaf prefix; sibling prefixes (e.g. the run's
+        ``.zarr.status/`` objects) live outside it and are never touched.
         """
         spec = GroupSpec(members={self.group_path: self.shard_spec()}, attributes={})
         # Ragged vlen-array creation warns about the dtype NAME only
         # (zarr-python#3517); message-scoped suppression, see grids.base.
         with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
+            if overwrite:
+                from zarr.core.sync import sync
+
+                sync(store.delete_dir(""))
             spec.to_zarr(store, "", overwrite=overwrite)
         return store
 
