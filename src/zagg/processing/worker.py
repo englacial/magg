@@ -16,6 +16,7 @@ the same call-time way, so patching that symbol still intercepts reads.
 """
 
 import logging
+import threading
 import time
 import warnings
 from collections import deque
@@ -48,6 +49,12 @@ from zagg.processing.write import _build_output
 from zagg.schema import ProcessingMetadata
 
 logger = logging.getLogger(__name__)
+
+#: Read-error exemplars carried in the result payload (issue #341): the first
+#: N DISTINCT exception messages, each truncated — bounded by construction so
+#: the wire payload stays small; full tracebacks go to the worker log only.
+_EXEMPLAR_LIMIT = 3
+_EXEMPLAR_CHARS = 300
 
 
 def _granule_workers(data_source: dict) -> int:
@@ -306,6 +313,32 @@ def process_shard(
     files_processed = 0
     read_errors = 0
 
+    # Read-error exemplars (issue #341): the counter alone made the 121-failure
+    # strata run a blind "No data after filtering (N group reads raised)" —
+    # nothing in the log or the result carried even one message. Record the
+    # first _EXEMPLAR_LIMIT distinct messages for the result payload, and log
+    # the FULL traceback (WARNING) once per distinct message — repeats keep
+    # the existing one-line warning, so the issue #175 WorkerErrorCount metric
+    # filter (which matches "Traceback") fires at most _EXEMPLAR_LIMIT times
+    # per shard instead of once per failed group read. Lock-guarded: group
+    # errors are raised inside granule-pool threads (issue #180).
+    _exemplar_lock = threading.Lock()
+    read_error_exemplars: list = []
+
+    def _record_read_error(group: str, exc: Exception) -> None:
+        msg = f"{type(exc).__name__}: {exc}"[:_EXEMPLAR_CHARS]
+        with _exemplar_lock:
+            fresh = msg not in read_error_exemplars and len(read_error_exemplars) < _EXEMPLAR_LIMIT
+            if fresh:
+                read_error_exemplars.append(msg)
+        # A raised read error is always a real failure: a legitimately-empty
+        # group returns ``None`` (no exception), so WARNING does not get noisy
+        # on shards where many granules contribute 0 photons (issue #116).
+        # Logging at DEBUG hid the dem_h broadcast failure behind the
+        # misleading "No data after filtering"; swallowing the traceback hid
+        # the strata AttributeError entirely (issue #341).
+        logger.warning(f"  Error reading track {group}: {exc}", exc_info=fresh)
+
     # Streaming buffered aggregation (issue #148 phase 4): when
     # ``aggregation.streaming`` is set, reads accumulate for ``buffer_granules``
     # granules and are flushed instead of pooling the whole shard. ``mode:
@@ -378,14 +411,10 @@ def process_shard(
                     if chunk is not None:
                         reads.append(chunk)
                 except Exception as e:
-                    # A raised read error is always a real failure: a
-                    # legitimately-empty group returns ``None`` (no exception),
-                    # so promoting this to WARNING does not get noisy on shards
-                    # where many granules simply contribute 0 photons (issue
-                    # #116). Logging it at DEBUG hid the dem_h broadcast failure
-                    # behind the misleading "No data after filtering" below.
+                    # Warn + collect an exemplar (see _record_read_error): the
+                    # error is folded into ``read_errors`` by the main thread.
                     group_errors += 1
-                    logger.warning(f"  Error reading track {g}: {e}")
+                    _record_read_error(g, e)
                     continue
 
             # Per-granule backend hook (issue #160): side effects only (e.g.
@@ -490,6 +519,10 @@ def process_shard(
     metadata["files_processed"] = files_processed
     if read_errors:
         metadata["read_errors"] = read_errors
+        # Bounded diagnosis payload (issue #341): messages only, no tracebacks
+        # on the wire — full tracebacks were logged above. Success-path
+        # payloads (read_errors == 0) are unchanged.
+        metadata["read_error_exemplars"] = list(read_error_exemplars)
 
     if buffered is not None:
         # Drain the tail buffer (< buffer_granules granules) BEFORE the read
@@ -511,7 +544,13 @@ def process_shard(
                 f"  No data after filtering for shard {label} and "
                 f"{read_errors} group read(s) raised - skipping"
             )
-            metadata["error"] = f"No data after filtering ({read_errors} group reads raised)"
+            # Carry the exemplars in the error text too (issue #341): this
+            # string is what surfaces in the status object / run summary, so
+            # it must be a one-glance diagnosis, not just a count.
+            metadata["error"] = (
+                f"No data after filtering ({read_errors} group reads raised; "
+                f"e.g. {' | '.join(read_error_exemplars)})"
+            )
         else:
             logger.info(f"  No data after filtering for shard {label} - skipping")
             metadata["error"] = "No data after filtering"
