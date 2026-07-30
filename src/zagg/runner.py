@@ -267,8 +267,11 @@ def agg(
         underneath: fire-and-forget Event invokes (no ``result_url``),
         futures resolved from the workers' always-on per-shard status
         objects by ONE shared poller (one LIST per tick instead of per-shard
-        GETs), status-driven re-dispatch under the same ``max_retries``, a
-        distinct ``failed-unknown`` outcome for silently-dropped invokes,
+        GETs), the three-class retry policy on
+        :class:`~zagg.client_transport.StatusPoller` (a worker-reported
+        failure never re-fires; a drop re-fires once; an invoke fault retries
+        to ``max_retries`` with backoff), a distinct ``failed-unknown``
+        outcome for silently-dropped invokes,
         and the run reattachable by run id (``zagg.client.Run.attach``).
         Requires a worker deployed with the #327 status writes. The
         benchmark harness and CI stay on ``"sync"`` — their metrics come
@@ -3421,7 +3424,7 @@ def _run_lambda(
         # future resolves from its always-on status object via the run's
         # shared poller. Blocking on it here keeps the dispatch loop's
         # call-shape (accumulator, summary, tail all unchanged); the poller
-        # owns the status-driven re-dispatches, and the pool width bounds
+        # owns the fault-class-driven re-dispatches, and the pool width bounds
         # dispatched-unresolved shards — the pacing the fleet's 60 s max
         # event age makes load-bearing.
         if invocation == "event":

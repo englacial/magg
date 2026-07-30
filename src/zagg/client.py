@@ -644,9 +644,11 @@ class Run:
             tick — no held connections, and the run survives client exit
             (reattachable via :meth:`attach`). Futures, harvest iterators,
             ``status()``, and the post-run tail behave identically; the retry
-            policy migrates to status-driven re-dispatch (same
-            ``max_retries``), and a shard whose status object never lands
-            resolves ``failed-unknown``. Requires a deployed worker that
+            policy splits by fault class (see
+            :class:`~zagg.client_transport.StatusPoller`) — ``max_retries``
+            still bounds invoke-layer faults, a worker-reported failure is
+            terminal, and a shard whose status object never lands re-fires once
+            then resolves ``failed-unknown``. Requires a deployed worker that
             writes status objects (issue #327) and read access to the status
             prefix for the poll.
         """
