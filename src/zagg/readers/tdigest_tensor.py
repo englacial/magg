@@ -37,9 +37,10 @@ configs); its coverage-cell morton id is derived from the sibling ``morton``
 coordinate. A cell's 2-D position is the **bit deinterleave** of its nested
 rank within the chunk (``readers._layout.rank_to_rowcol`` — mortie spec §8 /
 gridlook orientation; issue #336), never a row-major reshape: nested order is
-a Z-order curve, so ``divmod(rank, side)`` would scramble the block spatially. Random access to one cell
-(:func:`read_cell`) indexes the vlen array directly — 2 ranged GETs on a
-sharded store (index suffix + one inner chunk), never the whole shard.
+a Z-order curve, so ``divmod(rank, side)`` would scramble the block spatially.
+Random access to one cell (:func:`read_cell`) indexes the vlen array directly
+— 2 ranged GETs on a sharded store (index suffix + one inner chunk), never the
+whole shard.
 
 **Hive products are read one leaf at a time**: a leaf zarr (issue #199) is
 exactly this layout scoped to one shard — the same ``{group}`` path, the
@@ -328,8 +329,10 @@ def _iter_populated_chunks(arr) -> Iterator[tuple[int, list]]:
     ~141 MB at the o8 t-digest scale, the same bound the hive write side
     documents and accepts (``process_and_write_hive``), and this is the
     client-side bulk reader. Chunks whose cells are all absent (the ``b""``
-    fill) are skipped; ``cell_pos`` is the cell's row-major position within
-    the chunk — the same index the writer placed it at.
+    fill) are skipped; ``cell_pos`` is the cell's chunk-local NESTED RANK —
+    the same index the writer placed it at, and the index the readers
+    deinterleave to a tensor position (``rank_to_rowcol``, issue #336); it is
+    never a row-major position (nested order is a Z-order curve).
     """
     cells_per_chunk = int(arr.chunks[0])
     for span_start, span_stop in _stored_chunk_spans(arr):
