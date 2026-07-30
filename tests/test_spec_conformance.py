@@ -245,6 +245,9 @@ class TestDigestPayload:
 
     @pytest.mark.parametrize("name", FIXTURES)
     def test_means_sorted_and_weights_are_exact_counts(self, name):
+        # §2.1 over the recorded expectations; bound to the store through
+        # test_read_cell_matches_expected above, which reads the same values
+        # back with the shipping reader.
         exp = _expected(name)
         for cell in exp["cells"]:
             counts = {"h_tdigest": cell["count"]}
@@ -285,6 +288,55 @@ class TestDigestPayload:
         got = sorted(np.concatenate([locs for _w, _rc, locs in rows]).tolist())
         want = sorted(int(w) for c in exp["cells"] for w in c["h_tdigest_signal_locations"])
         assert got == want
+
+
+class TestCoordinateAndDense:
+    """§1.1 — the `morton` coordinate and the dense `count` field, off the store.
+
+    The fixtures *record* `morton` and `count` per populated cell, and §7 tells
+    an external reader to reproduce them; without these asserts a change to the
+    coordinate (ordering, dtype, nested-vs-ring) or to a dense write would
+    leave the recorded values wrong and this suite green — while moczarr, whose
+    whole addressing path keys on `morton`, would break (review finding).
+    """
+
+    @staticmethod
+    def _open(name, exp, field):
+        return zarr.open_array(_leaf_store(name, exp), path=f"{exp['group']}/{field}", mode="r")
+
+    @pytest.mark.parametrize("name", FIXTURES)
+    def test_morton_coordinate_matches_expected(self, name):
+        exp = _expected(name)
+        words = [int(w) for w in np.asarray(self._open(name, exp, "morton")[:])]
+        assert self._open(name, exp, "morton").dtype == np.uint64
+        assert len(words) == exp["cells_per_chunk"] * exp["chunks_per_shard"]
+        for cell in exp["cells"]:
+            assert words[cell["index"]] == int(cell["morton"])
+
+    @pytest.mark.parametrize("name", FIXTURES)
+    def test_morton_ascends_per_written_chunk_and_is_fill_where_absent(self, name):
+        # The coordinate array gets the same §1.5 sub-shard sparsity as every
+        # other array: the empty inner chunk's slots hold the 0 fill, so a
+        # reader MUST NOT assume `morton` is dense across the shard.
+        exp = _expected(name)
+        per_chunk = exp["cells_per_chunk"]
+        words = [int(w) for w in np.asarray(self._open(name, exp, "morton")[:])]
+        for ordinal in range(exp["chunks_per_shard"]):
+            chunk = words[ordinal * per_chunk : (ordinal + 1) * per_chunk]
+            if ordinal == exp["empty_chunk"]:
+                assert chunk == [0] * per_chunk
+            else:
+                assert all(b > a for a, b in zip(chunk, chunk[1:], strict=False))
+
+    @pytest.mark.parametrize("name", FIXTURES)
+    def test_count_field_matches_expected(self, name):
+        exp = _expected(name)
+        arr = self._open(name, exp, "count")
+        assert arr.dtype == np.int32
+        counts = np.asarray(arr[:])
+        by_cell = {c["index"]: c["count"] for c in exp["cells"]}
+        for cell in range(counts.shape[0]):
+            assert int(counts[cell]) == by_cell.get(cell, 0)
 
 
 class TestComposition:
