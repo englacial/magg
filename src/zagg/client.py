@@ -777,10 +777,14 @@ class Run:
         flat only under ``consolidate_metadata``), then the fail-open rollups:
         root ``coverage.moc``, the run-stats record, and the sweep trigger —
         each a fire-and-forget worker invoke (D8), each swallowed on failure
-        exactly like ``_run_lambda``'s tail. A finalize failure warns
-        immediately (``RuntimeWarning`` — notebook-visible while the tail is
-        still running), is recorded on the handle, and re-raises from
-        :meth:`RunHandle.wait` / a drained harvest iterator.
+        exactly like ``_run_lambda``'s tail. A finalize failure goes through the
+        shared :func:`runner._finalize_with_retry` (issue #335 — one contract
+        for the CLI and the facade): it warns immediately (``RuntimeWarning`` —
+        notebook-visible while the tail is still running), retries once after a
+        fixed 5 s backoff, and only a still-failing finalize is recorded on the
+        handle to re-raise from :meth:`RunHandle.wait` / a drained harvest
+        iterator. The backoff costs nothing interactively — the tail already
+        runs on the finisher thread, so it delays the join, not the cell.
 
         Every shard contributes exactly one result dict, so every shard gets a
         run-stats row: a worker envelope, a :class:`ShardError` payload, or —
@@ -812,45 +816,38 @@ class Run:
                     }
                 )
         layout = get_store_layout(self.config)
-        try:
-            if layout == "hive":
-                runner._invoke_lambda_finalize(
+        # ONE warn/retry/record implementation for every dispatch path (issue
+        # #335 phase 1): agg's _run_lambda, the raster driver and this finisher
+        # all route through runner._finalize_with_retry, so the message contract
+        # and the retry cannot drift between the CLI and the facade. It warns AT
+        # the failure (espg ruling on PR #333, middle option) so a notebook sees
+        # it in-stream rather than only at the join, retries once, and RETURNS
+        # the error — the handle keeps this path's re-raise semantics.
+        finalize_kwargs: dict = {}
+        if layout == "hive":
+            finalize_kwargs = {
+                "config_dict": config_dict,
+                "dataset": dataset,
+                "parent_order": self._parent_order,
+                "overwrite": self.overwrite,
+            }
+        if layout == "hive" or get_consolidate_metadata(self.config):
+            error = runner._finalize_with_retry(
+                lambda: runner._invoke_lambda_finalize(
                     client,
                     self.function_name,
                     self.store,
                     output_creds_event=output_creds_event,
-                    config_dict=config_dict,
-                    dataset=dataset,
-                    parent_order=self._parent_order,
-                    overwrite=self.overwrite,
-                )
-            elif get_consolidate_metadata(self.config):
-                runner._invoke_lambda_finalize(
-                    client,
-                    self.function_name,
-                    self.store,
-                    output_creds_event=output_creds_event,
-                )
-        except Exception as e:
-            handle._finalize_error = e
-            logger.warning(f"finalize invoke failed (surfaced via handle.wait()): {e}")
-            # Warn AT THE FAILURE, not only when the harvest loop finally joins
-            # (espg ruling on PR #333, middle option): the tail goes on and the
-            # error still re-raises from wait()/drain, but a notebook shows this
-            # in-stream immediately instead of leaving the window between
-            # finalize and the join silent. Every shard's data is written — only
-            # the root manifest is stale — and the backstop is idempotent, so
-            # the remedy is a re-run, not a re-compute.
-            warnings.warn(
-                f"finalize (manifest backstop) failed for {self.store}: {e}. "
-                f"Shard outputs are written; the store's root manifest may be "
-                f"stale until finalize runs again. It is idempotent — re-run "
-                f"the dispatch (or re-dispatch finalize) to stamp the manifest. "
-                f"This error also re-raises from handle.wait() / draining the "
-                f"harvest iterator.",
-                RuntimeWarning,
-                stacklevel=2,
+                    **finalize_kwargs,
+                ),
+                store_path=self.store,
+                reraise_note=(
+                    "This error also re-raises from handle.wait() / draining the harvest iterator."
+                ),
             )
+            if error is not None:
+                handle._finalize_error = error
+                logger.warning(f"finalize invoke failed (surfaced via handle.wait()): {error}")
 
         ok_results = [r for r in results if r.get("status_code") == 200 and not r.get("error")]
         if layout == "hive" and get_coverage_moc(self.config):
