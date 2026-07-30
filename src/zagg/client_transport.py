@@ -54,6 +54,9 @@ logger = logging.getLogger(__name__)
 #: Version stamped into every status object; bump on any key change.
 STATUS_SCHEMA_VERSION = 1
 
+#: Dispatch-manifest object name under the run prefix (issue #327 phase 2).
+MANIFEST_NAME = "manifest.json"
+
 
 def run_status_prefix(store_path: str, run_id: str) -> str:
     """The run's status prefix: ``<store>.status/run-<run_id>`` (a store SIBLING)."""
@@ -128,6 +131,64 @@ def build_shard_status(event: dict, response: dict) -> tuple[str, dict] | None:
         "body": body,
     }
     return shard_status_key(shard_key, window=window), obj
+
+
+def build_run_manifest_block(run_id: str, shard_keys, config, *, dataset: dict | None = None) -> dict:
+    """The dispatcher-side ``run_manifest`` block for the worker setup invoke.
+
+    Rides the EXISTING setup invoke (the hive fire-and-forget manifest write /
+    the flat synchronous template write) so the WORKER records the run's
+    dispatch manifest — the dispatcher never writes (D8). ``shards`` is the
+    dispatched shard-key set as decimal strings (deduped, order-preserving —
+    windowed fan-outs repeat a shard per window), ``semantic_hash`` the run
+    config's D19 identity, ``dispatched_at`` the dispatcher's clock at
+    dispatch, and ``dataset`` the ShardMap identity block (``short_name`` /
+    ``version``) a reattached tail needs for the hive finalize backstop. The
+    worker folds the setup event's own ``config`` into the written manifest,
+    so it is not duplicated here on the wire.
+    """
+    from datetime import datetime, timezone
+
+    from zagg.semantics import semantic_hash
+
+    return {
+        "run_id": run_id,
+        "shards": list(dict.fromkeys(str(int(k)) for k in shard_keys)),
+        "semantic_hash": semantic_hash(config),
+        "dispatched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "dataset": dataset,
+    }
+
+
+def write_dispatch_manifest(event: dict, store_kwargs: dict[str, Any]) -> None:
+    """PUT the run's dispatch manifest from a setup event — fail-open, worker-side.
+
+    Called from the Lambda handler's setup seam on a successful setup. The
+    ``run_manifest`` block (see :func:`build_run_manifest_block`) plus the
+    setup event's ``config`` land at ``<run prefix>/manifest.json`` — what
+    ``Run.attach`` rebuilds a handle from. Absent block (an old dispatcher, or
+    one dropped over the async payload cap) writes nothing, keeping the event
+    byte-identical to pre-#327; any failure logs and never fails the setup.
+    """
+    try:
+        block = event.get("run_manifest")
+        if not block or not block.get("run_id") or not event.get("store_path"):
+            return
+        manifest = {
+            "schema_version": STATUS_SCHEMA_VERSION,
+            **block,
+            "config": event.get("config"),
+        }
+        import obstore
+
+        from zagg.store import open_object_store
+
+        prefix = run_status_prefix(event["store_path"], block["run_id"])
+        store = open_object_store(prefix, **store_kwargs)
+        obstore.put(store, MANIFEST_NAME, json.dumps(manifest).encode())
+        logger.info(f"Wrote dispatch manifest to {prefix}/{MANIFEST_NAME}")
+    except Exception as e:
+        logger.warning(f"dispatch manifest write failed (fail-open, issue #327): {e}")
 
 
 def write_shard_status(event: dict, response: dict, store_kwargs: dict[str, Any]) -> None:

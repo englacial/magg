@@ -1366,6 +1366,83 @@ class TestSetupHive:
         assert json.loads(resp["body"]) == {"ok": True, "mode": "setup", "layout": "hive"}
 
 
+class TestDispatchManifest:
+    """Issue #327 phase 2: a setup event carrying ``run_manifest`` has the
+    WORKER write ``<store>.status/run-<id>/manifest.json`` (D8 intact) —
+    fail-open, and only on a successful setup."""
+
+    _BLOCK = {
+        "run_id": "runid2",
+        "shards": ["12345", "67890"],
+        "semantic_hash": "ab" * 32,
+        "dispatched_at": "2026-07-30T00:00:00+00:00",
+        "dataset": {"short_name": "ATL06", "version": "007"},
+    }
+
+    def _event(self, tmp_path, **extra):
+        return {
+            "mode": "setup",
+            "store_path": str(tmp_path / "hive-out"),
+            "parent_order": 6,
+            "overwrite": False,
+            "config": TestProcessHive._hive_config_dict(),
+            "dataset": {"short_name": "ATL06", "version": "007"},
+            "run_manifest": dict(self._BLOCK),
+            **extra,
+        }
+
+    @staticmethod
+    def _read_manifest(tmp_path):
+        p = tmp_path / "hive-out.status" / "run-runid2" / "manifest.json"
+        return json.loads(p.read_text()) if p.exists() else None
+
+    def test_setup_writes_dispatch_manifest_with_config(self, handler_mod, tmp_path):
+        event = self._event(tmp_path)
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        manifest = self._read_manifest(tmp_path)
+        assert manifest["schema_version"] == 1
+        assert manifest["run_id"] == "runid2"
+        assert manifest["shards"] == ["12345", "67890"]
+        assert manifest["semantic_hash"] == "ab" * 32
+        assert manifest["dispatched_at"] == "2026-07-30T00:00:00+00:00"
+        assert manifest["dataset"] == {"short_name": "ATL06", "version": "007"}
+        # The worker folds the setup event's own config in, so attach can
+        # rebuild the Run without the dispatcher duplicating it on the wire.
+        assert manifest["config"] == event["config"]
+
+    def test_absent_block_writes_nothing(self, handler_mod, tmp_path):
+        event = self._event(tmp_path)
+        del event["run_manifest"]
+        assert handler_mod.lambda_handler(event, _context())["statusCode"] == 200
+        assert not (tmp_path / "hive-out.status").exists()
+
+    def test_failed_setup_writes_no_manifest(self, handler_mod, tmp_path):
+        # Same frozen-key refusal as TestSetupHive: the 500 must not leave a
+        # dispatch manifest claiming a run that never set up.
+        assert handler_mod.lambda_handler(self._event(tmp_path), _context())["statusCode"] == 200
+        other = TestProcessHive._hive_config_dict()
+        other["output"]["grid"]["parent_order"] = 5
+        event = self._event(tmp_path, config=other, run_manifest={**self._BLOCK, "run_id": "bad"})
+        assert handler_mod.lambda_handler(event, _context())["statusCode"] == 500
+        assert not (tmp_path / "hive-out.status" / "run-bad").exists()
+
+    def test_manifest_write_failure_never_fails_setup(self, handler_mod, monkeypatch, tmp_path):
+        import zagg.store
+
+        real = zagg.store.open_object_store
+
+        def boom(prefix, **kwargs):
+            if ".status" in prefix:
+                raise RuntimeError("status channel down")
+            return real(prefix, **kwargs)
+
+        monkeypatch.setattr(zagg.store, "open_object_store", boom)
+        resp = handler_mod.lambda_handler(self._event(tmp_path), _context())
+        assert resp["statusCode"] == 200
+        assert self._read_manifest(tmp_path) is None
+
+
 class TestFinalizeHive:
     """Issue #252 (hybrid): for a hive config, finalize mode re-ensures the
     root ``morton_hive.json`` — the idempotent backstop for the async

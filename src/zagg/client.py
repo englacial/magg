@@ -594,13 +594,25 @@ class Run:
         )
         run_id = uuid.uuid4().hex
 
+        # Dispatch manifest block (issue #327): rides the setup invoke so the
+        # WORKER records the run's shard set + identity at the status prefix
+        # (D8) — what :meth:`Run.attach` rebuilds a handle from.
+        from zagg.client_transport import build_run_manifest_block
+
+        md = self.catalog_data.get("metadata") or {}
+        run_manifest = build_run_manifest_block(
+            run_id,
+            [k for k, _ in cells],
+            self.config,
+            dataset={"short_name": md.get("short_name"), "version": md.get("version")},
+        )
+
         # Setup handshake, synchronous and load-bearing (worker-side writes
         # only — D8). Hive: fail-fast ping + fire-and-forget manifest write;
         # finalize below is the idempotent backstop (issue #252 hybrid). Flat:
         # the template write itself.
         dataset = None
         if get_store_layout(self.config) == "hive":
-            md = self.catalog_data.get("metadata") or {}
             dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
             runner._invoke_lambda_ping(
                 client,
@@ -621,6 +633,7 @@ class Run:
                 parent_order=self._parent_order,
                 overwrite=self.overwrite,
                 output_creds_event=output_creds_event,
+                run_manifest=run_manifest,
             )
         else:
             runner._invoke_lambda_setup(
@@ -632,6 +645,7 @@ class Run:
                 overwrite=self.overwrite,
                 config_dict=config_dict,
                 output_creds_event=output_creds_event,
+                run_manifest=run_manifest,
             )
 
         aoi_by_shard = runner._aoi_payload_map(self.catalog_data)

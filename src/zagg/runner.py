@@ -3126,6 +3126,19 @@ def _run_lambda(
         result_prefix = f"{store_path.rstrip('/')}.status/{run_id}"
         logger.info(f"Async worker results at {result_prefix}")
 
+    # Dispatch manifest block (issue #327): rides the setup invoke so the
+    # WORKER records the run's shard set + identity at the status prefix (D8)
+    # — every lambda run becomes reattachable/observable by run id.
+    from zagg.client_transport import build_run_manifest_block
+
+    _md = catalog_data.get("metadata") or {}
+    run_manifest = build_run_manifest_block(
+        run_id,
+        [c[0] for c in cells],
+        config,
+        dataset={"short_name": _md.get("short_name"), "version": _md.get("version")},
+    )
+
     # The dispatch lambda_client is built inside preflight() (once the probe
     # has clamped the worker count, which sizes its connection pool), so the
     # per-cell / finalize closures read it from this holder rather than closing
@@ -3390,6 +3403,7 @@ def _run_lambda(
             parent_order=parent_order,
             overwrite=overwrite,
             output_creds_event=output_creds_event,
+            run_manifest=run_manifest,
         )
         # Overlap the fan-out with the client-side morton_hive.json check
         # (issue #274 Fix 2): the async setup write above typically lands
@@ -3411,6 +3425,7 @@ def _run_lambda(
             overwrite=overwrite,
             config_dict=config_dict,
             output_creds_event=output_creds_event,
+            run_manifest=run_manifest,
         )
     setup_s = time.time() - setup_start
 
@@ -4442,15 +4457,18 @@ def _invoke_lambda_setup(
     overwrite,
     config_dict,
     output_creds_event=None,
+    run_manifest=None,
 ):
     """Invoke Lambda in setup mode to create the zarr template (flat only).
 
     Hive runs no longer dispatch setup SYNCHRONOUSLY (issue #252 hybrid):
     the morton_hive.json write fires as a fire-and-forget Event invoke of
     the same setup mode instead (``_invoke_lambda_setup_async``), so nothing
-    but the ping runs ahead of the fan-out. The flat setup event is
-    byte-identical to the pre-#199-phase-3 event, so a new dispatcher keeps
-    working against old deployed functions for flat runs.
+    but the ping runs ahead of the fan-out. ``run_manifest`` (issue #327)
+    rides the event so the worker records the run's dispatch manifest at the
+    status prefix (D8); ``None`` keeps the event byte-identical to the
+    pre-#199-phase-3 one, so a new dispatcher keeps working against old
+    deployed functions for flat runs.
     """
     event = {
         "mode": "setup",
@@ -4464,6 +4482,8 @@ def _invoke_lambda_setup(
         "overwrite": overwrite,
         "config": config_dict,
     }
+    if run_manifest is not None:
+        event["run_manifest"] = run_manifest
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     response = lambda_client.invoke(
@@ -4489,6 +4509,7 @@ def _invoke_lambda_setup_async(
     parent_order=None,
     overwrite=False,
     output_creds_event=None,
+    run_manifest=None,
 ):
     """Fire-and-forget hive manifest write at init (issue #252 hybrid).
 
@@ -4506,6 +4527,8 @@ def _invoke_lambda_setup_async(
     synchronous hive setup event's shape). No response is read; a lost Event
     invoke (retries 0, issue #151 hygiene) is self-healed by finalize's
     idempotent ensure_manifest backstop — see ``_invoke_lambda_finalize``.
+    ``run_manifest`` (issue #327) additionally has the worker record the
+    run's dispatch manifest at the status prefix, size-gated below.
     """
     event = {
         "mode": "setup",
@@ -4516,6 +4539,21 @@ def _invoke_lambda_setup_async(
     }
     if dataset is not None:
         event["dataset"] = dataset
+    # Dispatch manifest (issue #327): attached only when it FITS the 256 KB
+    # Event cap — the shard list scales with the run, and this invoke
+    # dispatched fine before the block existed, so the block is dropped (never
+    # fatal) rather than failing the run; Run.attach then degrades to the
+    # status objects alone.
+    if run_manifest is not None:
+        with_block = {**event, "run_manifest": run_manifest}
+        if len(json.dumps(with_block)) <= _ASYNC_PAYLOAD_CAP_BYTES:
+            event = with_block
+        else:
+            logger.warning(
+                f"run_manifest block over the async setup budget "
+                f"({len(run_manifest.get('shards') or [])} shards); dropped — "
+                f"Run.attach for this run degrades to status objects only (issue #327)"
+            )
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     lambda_client.invoke(

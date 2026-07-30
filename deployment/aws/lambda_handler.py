@@ -84,6 +84,13 @@ writes the raster (time, cells) template instead, from a synchronous invoke):
         time coordinate, int64 microseconds since the epoch; the orchestrator
         owns the global timestep index and threads it here so the template
         write needs no S3 access from the dispatcher.
+    "run_manifest": dict (optional, issue #327) -- {"run_id", "shards"
+        (decimal shard-key strings), "semantic_hash", "dispatched_at",
+        "dataset"} dispatch identity: on a successful setup the worker writes
+        it (plus this event's "config") as
+        "<store>.status/run-<run_id>/manifest.json" -- what Run.attach
+        rebuilds a handle from (D8: the dispatcher never writes). Fail-open;
+        absent -> no write, byte-identical to pre-#327 events.
     "output_credentials": dict (optional, same shape as process mode),
 }
 
@@ -543,7 +550,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     telemetry = _container_telemetry()
     mode = event.get("mode", "process")
     if mode == "setup":
-        return _handle_setup(event)
+        response = _handle_setup(event)
+        # Dispatch manifest (issue #327 phase 2): the run's shard set +
+        # identity, recorded by the WORKER off the same setup invoke (D8) so
+        # a run is reattachable by run id. Fail-open; absent block -> no-op.
+        if response.get("statusCode") == 200:
+            _write_dispatch_manifest(event)
+        return response
     if mode == "finalize":
         return _handle_finalize(event)
     if mode == "ping":
@@ -614,6 +627,22 @@ def _write_shard_status(event: Dict[str, Any], response: Dict[str, Any]) -> None
         write_shard_status(event, response, _output_store_kwargs(event))
     except Exception as e:
         logger.warning(f"shard status write failed (fail-open, issue #327): {e}")
+
+
+def _write_dispatch_manifest(event: Dict[str, Any]) -> None:
+    """Run dispatch manifest off the setup event (issue #327), doubly fail-open.
+
+    Mirrors ``_write_shard_status``: the body lives in
+    ``zagg.client_transport.write_dispatch_manifest`` (itself fail-open); this
+    wrapper additionally swallows an import failure so a function zip missing
+    the module cannot fail the setup either.
+    """
+    try:
+        from zagg.client_transport import write_dispatch_manifest
+
+        write_dispatch_manifest(event, _output_store_kwargs(event))
+    except Exception as e:
+        logger.warning(f"dispatch manifest write failed (fail-open, issue #327): {e}")
 
 
 def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, Any]) -> bool:
