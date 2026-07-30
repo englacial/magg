@@ -17,8 +17,21 @@ import pytest
 from obstore.store import MemoryStore
 
 import zagg.client_transport as ct
-from zagg.client import Run, ShardError
+from zagg.client import Run
 from zagg.config import default_config
+
+
+def _shard_error():
+    """The CURRENT ShardError class, resolved at call time.
+
+    tests/test_client.py's tqdm test importlib.reload()s zagg.client, which
+    rebinds the class object mid-suite; an import-time reference here would
+    stop matching the exceptions the (reloaded) transport raises.
+    """
+    import zagg.client
+
+    return zagg.client.ShardError
+
 
 # Mirrors tests/test_client.py: order-6 shardmap over three packed morton words.
 _ATL06_SIG = {
@@ -236,7 +249,7 @@ class TestEventDispatch:
     def test_failed_status_redispatches_then_raises_shard_error(self, catalog, status_store):
         stub = EventStubLambdaClient(status_store, fail={_WORDS[1]})
         handle = _run(catalog, client=stub, max_retries=2).dispatch(transport="event")
-        with pytest.raises(ShardError, match="boom") as excinfo:
+        with pytest.raises(_shard_error(), match="boom") as excinfo:
             handle.futures[_WORDS[1]].result(timeout=10)
         err = excinfo.value
         assert err.shard_key == _WORDS[1]
@@ -465,7 +478,7 @@ class TestDropDetection:
         monkeypatch.setattr(ct, "drop_timeout_s", lambda timeout_s: 0.05)
         stub = EventStubLambdaClient(status_store, drop={_WORDS[0]})
         handle = _run(catalog, client=stub, max_retries=2).dispatch(transport="event")
-        with pytest.raises(ShardError, match="failed-unknown") as excinfo:
+        with pytest.raises(_shard_error(), match="failed-unknown") as excinfo:
             handle.futures[_WORDS[0]].result(timeout=10)
         assert excinfo.value.payload["outcome"] == "failed-unknown"
         handle.results(return_exceptions=True)
@@ -704,7 +717,7 @@ class TestAttach:
         _put_status(status_store, _WORDS[2], status="failed", error="boom", status_code=500)
         stub = EventStubLambdaClient(status_store)
         handle = Run.attach(_STORE, "failedrun", lambda_client=stub)
-        with pytest.raises(ShardError, match="boom"):
+        with pytest.raises(_shard_error(), match="boom"):
             handle.futures[_WORDS[2]].result(timeout=10)
         handle.results(return_exceptions=True)
         assert handle.status() == {"pending": 0, "ok": 2, "failed": 1}
@@ -721,7 +734,7 @@ class TestAttach:
         _put_status(status_store, _WORDS[1], body=dict(body))
         stub = EventStubLambdaClient(status_store)
         handle = Run.attach(_STORE, "stale", lambda_client=stub)
-        with pytest.raises(ShardError, match="failed-unknown") as excinfo:
+        with pytest.raises(_shard_error(), match="failed-unknown") as excinfo:
             handle.futures[_WORDS[2]].result(timeout=10)
         assert excinfo.value.payload["outcome"] == "failed-unknown"
 
