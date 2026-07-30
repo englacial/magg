@@ -99,6 +99,8 @@ for SUFFIX in $VARIANTS; do
     echo "WARN: could not probe variant $VARIANT (skipping; it may now be STALE" \
       "relative to $FUNCTION): $PROBE_ERR" >&2
     echo "WARN: the deploy role likely needs lambda:GetFunctionConfiguration +" \
-      "Update* on the ${FUNCTION}-* family (see issue #341)" >&2
+      "Update* on this variant's exact ARN -- see the enumerated" \
+      "UpdateTestFunction/UpdateProdFunction Resource lists in" \
+      "deployment/aws/benchmark_cicd.yaml (issue #341; wildcards declined)" >&2
   fi
 done

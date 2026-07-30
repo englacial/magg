@@ -11,6 +11,7 @@ skipped with a note, probe failures (IAM) warn loudly and skip.
 """
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -217,3 +218,129 @@ def test_variants_override(tmp_path):
     result2, log2 = _run_deploy(tmp_path / "sub2", extra_args=["--variants", ""])
     assert result2.returncode == 0
     assert _deployed(log2) == ["process-shard-test"]
+
+
+# --- IAM drift guard (issue #341) -------------------------------------------
+# The CI/CD roles' Update statements enumerate exact function ARNs (a
+# ${...FunctionName}* wildcard was proposed and declined), so every variant
+# suffix the deploy_lambda.sh family loop can target must have a matching
+# enumerated ARN in deployment/aws/benchmark_cicd.yaml or the deploy
+# WARN-and-skips it as stale.
+
+TEMPLATE = REPO / "deployment" / "aws" / "template.yaml"
+CICD = REPO / "deployment" / "aws" / "benchmark_cicd.yaml"
+
+
+def _load_cfn(path):
+    """Parse a CFN template, mapping short-form intrinsics (!Sub, !Ref, ...)
+    to {TagSuffix: value} dicts (same pattern as tests/test_lambda_build.py)."""
+    import yaml
+
+    class _CfnLoader(yaml.SafeLoader):
+        pass
+
+    def _cfn_multi(loader, tag_suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return {tag_suffix: loader.construct_scalar(node)}
+        if isinstance(node, yaml.SequenceNode):
+            return {tag_suffix: loader.construct_sequence(node)}
+        return {tag_suffix: loader.construct_mapping(node)}
+
+    _CfnLoader.add_multi_constructor("!", _cfn_multi)
+    return yaml.load(path.read_text(), Loader=_CfnLoader)
+
+
+def _template_variant_suffixes():
+    """(test_suffixes, prod_suffixes) stamped by template.yaml's Fn::ForEach
+    loops over the WorkerMemorySizes matrix; test suffixes are relative to
+    TestFunctionName (= ``${FunctionName}-test``, the deploy target)."""
+    tpl = _load_cfn(TEMPLATE)
+    sizes = tpl["Parameters"]["WorkerMemorySizes"]["Default"].split(",")
+    test, prod = set(), set()
+    for key, val in tpl["Resources"].items():
+        if not key.startswith("Fn::ForEach::"):
+            continue
+        for resource in val[2].values():
+            fn = resource.get("Properties", {}).get("FunctionName")
+            pattern = fn.get("Sub", "") if isinstance(fn, dict) else ""
+            if "${WorkerMemory}" not in pattern:
+                continue
+            suffix = pattern.removeprefix("${FunctionName}")
+            for size in sizes:
+                stamped = suffix.replace("${WorkerMemory}", size)
+                if stamped.startswith("-test"):
+                    test.add(stamped.removeprefix("-test"))
+                else:
+                    prod.add(stamped)
+    assert test and prod, f"no Fn::ForEach variant loops found in {TEMPLATE}"
+    return test, prod
+
+
+def _update_statement_arns(role, sid):
+    """The !Sub ARN strings of the role's Sid=<sid> policy statement."""
+    tpl = _load_cfn(CICD)
+    statements = tpl["Resources"][role]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+    stmt = next(s for s in statements if s.get("Sid") == sid)
+    resource = stmt["Resource"]
+    items = resource if isinstance(resource, list) else [resource]
+    return [item["Sub"] if isinstance(item, dict) else item for item in items]
+
+
+def _script_default_variants():
+    match = re.search(r'^DEFAULT_VARIANTS="([^"]*)"', SCRIPT.read_text(), re.MULTILINE)
+    assert match, f"DEFAULT_VARIANTS not found in {SCRIPT}"
+    return set(match.group(1).split())
+
+
+def test_deploy_role_enumerates_test_stack_variants():
+    # Test-stack shape: base + every WorkerTestDiskVariants function.
+    test_suffixes, _ = _template_variant_suffixes()
+    arns = _update_statement_arns("DeployRole", "UpdateTestFunction")
+    assert any(a.endswith("function:${TestFunctionName}") for a in arns), (
+        f"DeployRole.UpdateTestFunction in {CICD} must keep the base "
+        "function:${TestFunctionName} ARN"
+    )
+    for suffix in sorted(test_suffixes):
+        want = "function:${TestFunctionName}" + suffix
+        assert any(a.endswith(want) for a in arns), (
+            f"deploy_lambda.sh targets test variant '{suffix}' but "
+            f"DeployRole.UpdateTestFunction in {CICD} has no ARN ending "
+            f"'{want}' -- add the enumerated ARN (wildcards declined, issue #341)"
+        )
+
+
+def test_release_role_enumerates_prod_variant_family():
+    # Prod family: base + plain and -disk variants for every memory size.
+    _, prod_suffixes = _template_variant_suffixes()
+    arns = _update_statement_arns("ReleaseRole", "UpdateProdFunction")
+    assert any(a.endswith("function:${BenchmarkFunctionName}") for a in arns), (
+        f"ReleaseRole.UpdateProdFunction in {CICD} must keep the base "
+        "function:${BenchmarkFunctionName} ARN"
+    )
+    for suffix in sorted(prod_suffixes | _script_default_variants()):
+        want = "function:${BenchmarkFunctionName}" + suffix
+        assert any(a.endswith(want) for a in arns), (
+            f"deploy_lambda.sh targets prod variant '{suffix}' but "
+            f"ReleaseRole.UpdateProdFunction in {CICD} has no ARN ending "
+            f"'{want}' -- add the enumerated ARN (wildcards declined, issue #341)"
+        )
+
+
+def test_script_default_family_matches_template_matrix():
+    # The script's DEFAULT_VARIANTS and template.yaml's prod variant loops are
+    # two copies of the same matrix; a size added to one must land in both.
+    _, prod_suffixes = _template_variant_suffixes()
+    assert _script_default_variants() == prod_suffixes, (
+        f"DEFAULT_VARIANTS in {SCRIPT} and the WorkerMemorySizes variant loops "
+        f"in {TEMPLATE} disagree -- update whichever is stale (issue #341)"
+    )
+
+
+def test_update_statements_enumerate_exact_arns():
+    # The issue #341 ruling: enumerated exact ARNs, no wildcard, in both
+    # Update statements (the invoke role's wildcard is a separate question).
+    for role, sid in (("DeployRole", "UpdateTestFunction"), ("ReleaseRole", "UpdateProdFunction")):
+        for arn in _update_statement_arns(role, sid):
+            assert "*" not in arn, (
+                f"{role}.{sid} in {CICD} must enumerate exact ARNs, found wildcard: {arn}"
+            )
