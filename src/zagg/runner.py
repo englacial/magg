@@ -3073,6 +3073,13 @@ def _finalize_with_retry(
     for :meth:`~zagg.client.RunHandle.wait`). Sharing it is the issue #335
     phase-1 acceptance criterion — ``agg`` and the client cannot drift.
     """
+    # Validated, not clamped (review finding): a negative ``retries`` would make
+    # ``range(0)`` empty — finalize NEVER called and None returned, which every
+    # call site reads as success. The helper is deliberately importable for
+    # other paths to adopt, so a computed value must fail loudly. 0 is legal:
+    # one attempt, no sleep.
+    if retries < 0:
+        raise ValueError(f"retries must be >= 0, got {retries}")
     error = None
     backoff_s = _FINALIZE_BACKOFF_S if backoff_s is None else backoff_s
     for attempt in range(retries + 1):

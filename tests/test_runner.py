@@ -4409,6 +4409,30 @@ class TestFinalizeGuard:
         # CLI and the client facade can share the rest verbatim (issue #335).
         assert "RE-RAISES LATER." in str(caught[-1].message)
 
+    def test_retries_validated_not_silently_open(self, monkeypatch):
+        """Review finding: a negative ``retries`` would leave ``range(0)`` empty
+        — finalize never called, None returned, read as SUCCESS by every call
+        site. It raises instead; 0 stays legal (one attempt, no sleep)."""
+        from unittest.mock import MagicMock
+
+        from zagg import runner
+
+        finalize = MagicMock(side_effect=RuntimeError("nope"))
+        with pytest.raises(ValueError, match="retries must be >= 0"):
+            runner._finalize_with_retry(
+                finalize, store_path="s3://out/x.zarr", reraise_note="x", retries=-1
+            )
+        assert finalize.call_count == 0
+
+        sleeps = []
+        monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+        with pytest.warns(RuntimeWarning):
+            err = runner._finalize_with_retry(
+                finalize, store_path="s3://out/x.zarr", reraise_note="x", retries=0
+            )
+        assert finalize.call_count == 1 and sleeps == []  # one attempt, no backoff
+        assert isinstance(err, RuntimeError)  # ...and the error still comes back
+
 
 class TestResolveSourceCredentials:
     """Provider-selected source credentials, both pipelines (issue #213 Phase 6)."""
