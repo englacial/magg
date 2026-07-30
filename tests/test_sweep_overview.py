@@ -255,6 +255,25 @@ class TestFoldDense:
             expect = np.array([direct(vals[i : i + 4]) for i in range(0, 64, 4)], np.float32)
             np.testing.assert_array_equal(out, expect)
 
+    def test_nan_datum_is_skipped_not_propagated(self):
+        # The DECLARED premise behind the §8.3 exactness claim (review finding,
+        # issue #201, EXACT_NAN_POLICY): a stored NaN is the fill sentinel and a
+        # NaN datum at once — same bytes — so the fold is nanmin/nansum, never
+        # the NaN-propagating min/sum a direct coarse aggregation would return.
+        from zagg.sweep_overview import EXACT_NAN_POLICY
+
+        assert EXACT_NAN_POLICY == "skip"
+        vals = np.array([1.0, np.nan, 3.0, 4.0], dtype=np.float32)
+        np.testing.assert_array_equal(fold_dense(vals, 4, "min", "NaN"), [np.nanmin(vals)])
+        np.testing.assert_array_equal(fold_dense(vals, 4, "sum", "NaN"), [np.nansum(vals)])
+        assert np.isnan(np.min(vals)) and np.isnan(np.sum(vals))  # the divergence
+
+    def test_nan_datum_skipped_even_under_a_numeric_fill(self):
+        # Uniform policy: even where the fill is NOT NaN — so a NaN datum could
+        # in principle be told apart — NaN still counts as missing.
+        vals = np.array([2.0, np.nan], dtype=np.float32)
+        np.testing.assert_array_equal(fold_dense(vals, 2, "min", -9999.0), [2.0])
+
     def test_fold_is_composable_two_hops(self):
         # fold(16x) == fold(4x) then fold(4x): the associativity that lets a
         # spacing-2 schedule read leaves directly at every declared order.
@@ -339,12 +358,17 @@ class TestPyramidBlock:
         assert overview["fields"]["count"] == {
             "class": "exact",
             "method": "sum",
+            "nan_policy": "skip",
             "dtype": "int32",
             "fill_value": 0,
         }
         assert overview["fields"]["h_min"] == {
             "class": "exact",
             "method": "min",
+            # The declared premise (issue #201 review): a stored NaN is the fill
+            # sentinel and a NaN datum at once, so the fold skips both — this is
+            # nanmin, not min. h_min's fill IS NaN in the shipped atl06 config.
+            "nan_policy": "skip",
             "dtype": "float32",
             "fill_value": "NaN",  # JSON-safe token, not float nan
         }
@@ -483,8 +507,13 @@ class TestOverviewWriter:
         assert info["order"] == 1 and info["cell_order"] == 3
         assert info["source_shard_order"] == SHARD_ORDER
         assert info["source_cell_order"] == CELL_ORDER
-        assert info["fields"]["count"] == {"class": "exact", "method": "sum"}
+        assert info["fields"]["count"] == {
+            "class": "exact",
+            "method": "sum",
+            "nan_policy": "skip",
+        }
         assert info["fields"]["h_tdigest"]["method"] == "tdigest_kway"
+        assert "nan_policy" not in info["fields"]["h_tdigest"]
         assert info["generation"]["n_leaves"] == 1
         # The overview is a stamped, committed zarr (D4 semantics apply).
         stamp = read_commit(open_store(str(tmp_path / "-3" / "1" / "all.zarr")))

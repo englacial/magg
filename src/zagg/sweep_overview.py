@@ -11,8 +11,9 @@ materialized — D24).
 
 Field inclusion is gated by the D24 composability class
 (:func:`zagg.semantics.field_composability`): ``exact`` fields fold by their
-merge law (count/sum by addition, min/max by extremum — byte-equal to direct
-aggregation at the coarser order), ``approximate`` fields (t-digests) merge
+merge law (count/sum by addition, min/max by extremum — byte-equal to a direct
+**nan-skipping** aggregation at the coarser order; see
+:data:`EXACT_NAN_POLICY`), ``approximate`` fields (t-digests) merge
 via the order-independent k-way fold (``np.isclose`` equality class), and
 ``none`` fields are **excluded** — they exist only at native resolution, with
 the absence declared in the manifest's pyramid block (the ruled D24 default;
@@ -53,6 +54,17 @@ PYRAMID_SPEC = "zagg-pyramid/1"
 #: Default overview-order spacing (espg-ratified on the issue #201 thread:
 #: display schedule is every 2 orders — 16x per step, ~1/15 extra storage).
 DEFAULT_SPACING = 2
+
+#: NaN policy the exact fold actually implements, recorded per field in the
+#: pyramid declaration and in every overview's attrs (review finding, issue
+#: #201). A leaf's stored NaN is the same bytes whether it is the fill sentinel
+#: or a NaN datum, so :func:`fold_dense` cannot distinguish them and skips
+#: both: the exact-class fold is byte-equal to a direct ``nansum``/``nanmin``/
+#: ``nanmax`` at the coarser order, NOT to a NaN-propagating ``sum``/``min``/
+#: ``max`` (which the store encoding makes unrecoverable either way — the plain
+#: and nan-aware aggregators share one law in
+#: :data:`zagg.semantics.EXACT_MERGE_LAWS`).
+EXACT_NAN_POLICY = "skip"
 
 #: Fold law name recorded for approximate (t-digest) fields: the
 #: order-independent k-way merge (issue #279 — deterministic under
@@ -101,7 +113,9 @@ def fold_dense(values: np.ndarray, factor: int, law: str, fill_value) -> np.ndar
     NaN for float fields) are excluded from the reduce; an all-missing group
     folds back to the fill. Exact by construction for the D24 exact class:
     addition/extremum over the same values in the same ascending order a
-    direct coarser aggregation would visit.
+    direct coarser aggregation would visit — with the one premise
+    :data:`EXACT_NAN_POLICY` names: NaN is ALWAYS missing (fill and datum are
+    the same bytes), so the match is against the nan-skipping reduction.
     """
     if law not in _LAW_REDUCERS:
         raise ValueError(f"unknown exact fold law {law!r}; known: {sorted(_LAW_REDUCERS)}")
@@ -209,6 +223,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
             fields[name] = {
                 "class": "exact",
                 "method": EXACT_MERGE_LAWS[_fold_function_name(meta.get("function")) or ""],
+                "nan_policy": EXACT_NAN_POLICY,
                 "dtype": meta.get("dtype", "float32"),
                 "fill_value": _json_fill(meta.get("fill_value", "NaN")),
             }
@@ -842,10 +857,7 @@ def _write_overview(
                 "source_shard_order": int(shard_order),
                 "source_cell_order": int(cell_order),
                 "window": key,
-                "fields": {
-                    n: {"class": m["class"], "method": m.get("method", TDIGEST_LAW)}
-                    for n, m in fields.items()
-                },
+                "fields": {n: _field_provenance(m) for n, m in fields.items()},
                 "generation": fold["generation"],
                 "content_hash": fold["content_hash"],
                 "generated_at": _utcnow(),
@@ -861,6 +873,19 @@ def _write_overview(
         time_range=fold["time_range"] if stamp_window is not None else None,
     )
     return basename
+
+
+def _field_provenance(meta: dict) -> dict:
+    """One field's per-field entry in the overview attrs: class + fold law.
+
+    Exact fields also carry :data:`EXACT_NAN_POLICY`, so a reader of the
+    overview knows the reduction it actually got — nan-skipping, never
+    NaN-propagating (review finding, issue #201).
+    """
+    entry = {"class": meta["class"], "method": meta.get("method", TDIGEST_LAW)}
+    if meta["class"] == "exact":
+        entry["nan_policy"] = EXACT_NAN_POLICY
+    return entry
 
 
 def _populated_mask(slabs: dict, fields: dict) -> np.ndarray:

@@ -80,6 +80,15 @@ GRID_SPATIAL_KEYS = ("crs", "resolution", "bounds")
 #: direct aggregation at the coarser order, byte for byte (§8.3). Names are
 #: matched after :func:`_fold_function_name` normalization, so ``min``,
 #: ``np.min`` and ``numpy.min`` all key the same law.
+#:
+#: The plain and nan-aware variants share a law ON PURPOSE, and the exactness
+#: claim is against the **nan-skipping** reduction for both (review finding,
+#: issue #201): a leaf's stored NaN is the same bytes whether it is the fill
+#: sentinel or a NaN datum, so nothing downstream can tell them apart —
+#: :func:`zagg.sweep_overview.fold_dense` skips both, and the overview records
+#: :data:`zagg.sweep_overview.EXACT_NAN_POLICY` per field so a reader knows
+#: which reduction it actually got. A NaN-propagating ``min``/``max``/``sum``
+#: is unrecoverable at this seam, not merely unimplemented.
 EXACT_MERGE_LAWS = {
     "len": "sum",
     "count": "sum",
