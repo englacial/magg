@@ -81,6 +81,15 @@ _DROP_MARGIN_S = 90.0
 #: reintroduce an unbounded version of it from the outside).
 _MAX_DROP_REFIRES = 1
 
+#: Class-(c) backoff cap. A faulted invoke is re-armed with a NOT-BEFORE stamp
+#: at ``2**attempts`` seconds out (2, 4, 8, ... capped here) — the sync
+#: transport's ``time.sleep((2**attempt) + jitter)`` schedule expressed as a
+#: timestamp, because this runs on the single poller thread: sleeping there
+#: would stall every other shard's LIST. No jitter is needed since the poller
+#: re-fires serially anyway, so a synchronized throttle can't produce a
+#: simultaneous burst.
+_RETRY_BACKOFF_CAP_S = 30.0
+
 
 def drop_timeout_s(function_timeout_s: float) -> float:
     """Seconds after dispatch with NO status object => ``failed-unknown``.
@@ -570,6 +579,7 @@ class _ShardEntry:
     attempts: int = 0  # dispatches so far (the v1 attempt counter)
     queued: bool = True  # awaiting a dispatch slot
     drop_refires: int = 0  # class-(b) re-fires spent (see StatusPoller)
+    retry_not_before: float = 0.0  # class-(c) backoff: don't re-fire before this
     dispatched_at: float | None = None  # this attempt's dispatch clock
     first_dispatched_at: float | None = None
     consumed: set = field(default_factory=set)  # attempt_ids already acted on
@@ -613,7 +623,15 @@ class StatusPoller:
     (c) **Invoke-layer fault** — the ``client.invoke`` call itself raised
         (throttle, read timeout, connection reset). This is v1's ``max_retries``
         in its original meaning, and it retries up to that budget with
-        exponential backoff.
+        **exponential backoff** — ``2**attempts`` seconds, capped at
+        :data:`_RETRY_BACKOFF_CAP_S`, recorded as a not-before timestamp on the
+        entry rather than a ``time.sleep``. Sleeping is not available here: one
+        thread serves every shard, so a sleep would stall the LISTs. Without a
+        stamp a throttled shard's whole budget burns in the same pass (the
+        ``while True`` in :meth:`_dispatch_up_to_window` re-reads ``queued``
+        immediately), turning a transient ``TooManyRequestsException`` — the
+        canonical fleet-scale fault, and the exact condition the pacing window
+        exists to manage — into a wholesale run failure in milliseconds.
 
     ``attempt_id`` keeps the accounting straight across all three: each status
     object is acted on at most once, so a duplicate execution's re-write (or a
@@ -726,7 +744,22 @@ class StatusPoller:
             interval = (
                 self._initial_interval_s if progressed else min(interval * 2, self._max_interval_s)
             )
+            # Never oversleep a class-(c) backoff: the idle-tick doubling would
+            # otherwise add up to _POLL_MAX_INTERVAL_S to every re-fire.
+            wait = self._next_retry_wait()
+            if wait is not None:
+                interval = min(interval, max(wait, 0.01))
             self._stop.wait(interval)
+
+    def _next_retry_wait(self) -> float | None:
+        """Seconds until the soonest backoff-armed re-fire, or ``None`` if none."""
+        with self._lock:
+            stamps = [
+                e.retry_not_before
+                for e in self._entries.values()
+                if e.queued and e.retry_not_before and not e.future.done()
+            ]
+        return min(stamps) - self._clock() if stamps else None
 
     def _pending(self) -> list[_ShardEntry]:
         with self._lock:
@@ -753,11 +786,22 @@ class StatusPoller:
         return progressed
 
     def _dispatch_up_to_window(self) -> bool:
-        """Fire queued shards while the in-flight window has room (pacing)."""
+        """Fire queued shards while the in-flight window has room (pacing).
+
+        A queued entry still inside its class-(c) backoff is skipped (not
+        counted against the window either — a parked shard holds no slot), so
+        the loop terminates on a faulting dispatch instead of spinning the whole
+        retry budget in one pass.
+        """
         dispatched = False
         while True:
+            now = self._clock()
             with self._lock:
-                queued = [e for e in self._entries.values() if e.queued and not e.future.done()]
+                queued = [
+                    e
+                    for e in self._entries.values()
+                    if e.queued and not e.future.done() and e.retry_not_before <= now
+                ]
                 in_flight = sum(
                     1 for e in self._entries.values() if not e.queued and not e.future.done()
                 )
@@ -778,6 +822,7 @@ class StatusPoller:
         if dispatch is None:  # observe-only entries are never queued (attach)
             return
         entry.attempts += 1
+        entry.retry_not_before = 0.0  # this attempt cleared any armed backoff
         entry.dispatched_at = self._clock()
         if entry.first_dispatched_at is None:
             entry.first_dispatched_at = entry.dispatched_at
@@ -886,14 +931,22 @@ class StatusPoller:
         self._resolve_failure(entry, result)
 
     def _invoke_faulted(self, entry: _ShardEntry, result: dict) -> None:
-        """Class (c): the invoke call itself faulted — retry within ``max_retries``."""
+        """Class (c): the invoke call itself faulted — backed-off retry.
+
+        Re-arms the entry with a not-before stamp ``2**attempts`` seconds out
+        (capped) instead of sleeping: the poller thread has to stay free for
+        LISTs, and an unstamped re-queue would spend the whole budget in the
+        same ``_dispatch_up_to_window`` pass.
+        """
         if entry.dispatch is not None and entry.attempts < self._max_retries:
+            delay = min(2.0**entry.attempts, _RETRY_BACKOFF_CAP_S)
             logger.warning(
                 f"shard {entry.label}: attempt {entry.attempts} failed "
-                f"({result.get('error')}); re-dispatching "
+                f"({result.get('error')}); re-dispatching in {delay:.0f}s "
                 f"({self._max_retries - entry.attempts} left)"
             )
             with self._lock:
+                entry.retry_not_before = self._clock() + delay
                 entry.queued = True
             return
         self._resolve_failure(entry, result)

@@ -372,6 +372,7 @@ class TestStatusPoller:
 
     def test_invoke_fault_burns_an_attempt_and_retries(self):
         store = MemoryStore()
+        now = {"t": 1000.0}
         calls = {"n": 0}
 
         def flaky():
@@ -379,15 +380,54 @@ class TestStatusPoller:
             if calls["n"] == 1:
                 raise RuntimeError("TooManyRequestsException")
 
-        poller = self._poller(store, max_retries=3)
+        poller = ct.StatusPoller(
+            lambda: store, drop_timeout_s=1e6, max_retries=3, clock=lambda: now["t"]
+        )
         fut = poller.register(1, "1", dispatch=flaky)
         poller.start()
+        deadline = time.time() + 5
+        while calls["n"] < 1 and time.time() < deadline:
+            time.sleep(0.005)
+        now["t"] = 1002.0  # the 2 s class-(c) backoff expires
         deadline = time.time() + 5
         while calls["n"] < 2 and time.time() < deadline:
             time.sleep(0.005)
         assert calls["n"] == 2
         _put_status(store, 1)
         assert fut.result(timeout=5)["retries"] == 1
+        poller.shutdown(wait=True)
+
+    def test_throttled_invoke_backs_off_instead_of_bursting(self):
+        # The medium-high from the PR #343 review: re-queueing without a
+        # not-before stamp spent the WHOLE retry budget in ~0.3 ms, because
+        # _dispatch_up_to_window's `while True` re-reads `queued` in the same
+        # pass. Each re-fire now waits 2**attempts seconds — enforced by the
+        # clock, not by sleeping on the poller thread.
+        store = MemoryStore()
+        now = {"t": 1000.0}
+        fired: list[float] = []
+
+        def always_throttled():
+            fired.append(now["t"])
+            raise RuntimeError("TooManyRequestsException: Rate exceeded")
+
+        poller = ct.StatusPoller(
+            lambda: store, drop_timeout_s=1e6, max_retries=4, clock=lambda: now["t"]
+        )
+        fut = poller.register(1, "1", dispatch=always_throttled)
+        poller.start()
+        # 2 s, then 4 s, then 8 s: no re-fire until the clock passes the stamp.
+        for expected, t in ((1, 1002.0), (2, 1006.0), (3, 1014.0)):
+            deadline = time.time() + 5
+            while len(fired) < expected and time.time() < deadline:
+                time.sleep(0.005)
+            time.sleep(0.05)  # several ticks INSIDE the backoff
+            assert len(fired) == expected, fired
+            now["t"] = t
+        result = fut.result(timeout=5)  # attempt 4 == max_retries: terminal
+        assert "TooManyRequestsException" in result["error"]
+        assert result["retries"] == 3
+        assert fired == [1000.0, 1002.0, 1006.0, 1014.0]
         poller.shutdown(wait=True)
 
     def test_default_failure_resolution_is_a_result_dict(self):
