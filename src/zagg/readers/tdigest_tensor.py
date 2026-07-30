@@ -536,7 +536,7 @@ def read_tensors(
     the block's coverage-cell morton id (``side`` is 64 for the production
     ``chunk_inner`` configs at the default per-chunk block). Cell placement is
     the spatially faithful bit deinterleave of the cell's nested rank
-    (issue #336): ``tensor[row, col] = rank_to_rowcol(rank, depth)`` per the
+    (issue #336): ``row, col = rank_to_rowcol(rank, depth)`` per the
     :mod:`zagg.readers._layout` orientation contract (mortie spec §8; row 0 /
     col 0 at the block subtree's south corner, gridlook texture convention).
 
