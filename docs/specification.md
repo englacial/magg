@@ -458,7 +458,7 @@ regionally heterogeneous resolution).
   "source_shard_order": 5,
   "source_cell_order": 13,
   "window": "2019",
-  "fields": {"count": {"class": "exact", "method": "sum"},
+  "fields": {"count": {"class": "exact", "method": "sum", "nan_policy": "skip"},
              "h_tdigest": {"class": "approximate", "method": "tdigest_kway"}},
   "generation": {"n_leaves": 16, "max_leaf_timestamp": "2026-07-20T00:00:00Z"},
   "content_hash": "…",
@@ -474,10 +474,21 @@ regionally heterogeneous resolution).
   is not a digit); `cell_order` the overview's own cell order
   (`source_cell_order - (source_shard_order - order)` — constant tree depth,
   §4.4); `window` the §4.2 window key (`"all"` for the all-time fold);
-  `fields` the per-field composability class + fold method actually applied;
   `generation` the D22 staleness stamp (merged-leaf count + max leaf commit
   timestamp); `content_hash` a sweep-internal skip-if-current digest
   (informative — not the §5 O11 recipe and not part of the reader contract).
+
+  **`fields` enumerates the materialized fields only** — exactly the fields
+  present as arrays in *this* overview, each recording the fold that was
+  actually applied. A `none`-class field is absent from the zarr (§4.4) and so
+  MUST be absent from this map: its recorded absence lives in the manifest's
+  `pyramid.overview.fields` (§4.5), which is the map that enumerates **every**
+  declared field. Consequently a reader MAY treat this map as the overview's
+  variable list and MUST be able to open every array it names; cross-checking
+  it against the arrays present is a valid integrity check. Each entry carries
+  at least `class` and `method`, and MAY carry further fold provenance — an
+  `exact` entry records the reduction's `nan_policy` (`"skip"`: nan-skipping,
+  never NaN-propagating) — so readers MUST tolerate additional keys.
 
 An overview also carries the standard D4 **commit stamp** as its final
 write: an unstamped overview prefix is debris, exactly as for leaves.
@@ -524,7 +535,8 @@ overview family under the versioned `pyramid` block:
     "orders": [3, 1],
     "all_time": false,
     "fields": {
-      "count":     {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0},
+      "count":     {"class": "exact", "method": "sum", "nan_policy": "skip",
+                    "dtype": "int32", "fill_value": 0},
       "h_tdigest": {"class": "approximate", "method": "tdigest_kway",
                     "dtype": "float32", "inner_shape": [2], "delta": 512},
       "photon_ids": {"class": "none"}
@@ -557,8 +569,14 @@ overview family under the versioned `pyramid` block:
   (non-composable). A `"class": "none"` entry is the **recorded absence**
   (the ruled D24 default, option A): the field exists only at native
   resolution, and this declaration is how a reader knows without opening
-  anything. `exact`/`approximate` entries carry the fold `method` and enough
-  dtype/shape metadata to know the overview array's form up front.
+  anything. A `none` entry carries **`class` only** — no `method`, no
+  dtype/shape metadata: there is no fold to name, and stamping a default fold
+  method on an excluded field would declare a t-digest array that does not
+  exist. `exact`/`approximate` entries carry the fold `method`, any further
+  fold provenance (an `exact` fold's `nan_policy`), and enough dtype/shape
+  metadata to know the overview array's form up front. This map is the
+  **all-fields** view; the per-overview `zagg_overview.fields` attrs map
+  (§4.3) is the materialized subset.
 - **`all_time`** — whether the `all.zarr` all-time fold is materialized at
   the declared orders (windowed stores only; a `schedule: none` store's
   single fold is already all-time).
