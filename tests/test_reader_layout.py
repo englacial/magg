@@ -332,6 +332,18 @@ class TestBlockAssembly:
         # Nothing outside the shard's tile (every other order-6 child is empty).
         assert block.sum() == shard_tensor.sum()
 
+    def test_block_tensor_over_max_block_bytes_raises(self):
+        """The ``block_order`` memory footgun fails with a pointed error naming
+        the size and the limit, not a bare ``MemoryError`` from the allocator."""
+        store, _shard6 = self._store({0})
+        with pytest.raises(ValueError) as exc:
+            list(read_tensors(store, "12/h_tdigest", block_order=4, max_block_bytes=1024))
+        msg = str(exc.value)
+        assert "block_order=4" in msg and "256×256×128 uint32" in msg
+        assert "33554432 bytes" in msg and "1024-byte max_block_bytes limit" in msg
+        # The same block is admitted under the (generous) default cap.
+        assert len(list(read_tensors(store, "12/h_tdigest", block_order=4))) == 1
+
     def test_morton_not_in_nested_order_raises(self):
         """The corrected guard in ``_chunk_word``: a span whose ``morton``
         coordinate is NOT nested-ordered (cells from two subtrees) cannot be

@@ -326,10 +326,12 @@ def _iter_populated_chunks(arr) -> Iterator[tuple[int, list]]:
     index suffix on every ``__getitem__`` (~K redundant GETs per shard at the
     production K=256 — review, PR #211), while the full-span slice fetches
     the stored object ONCE (zarr reads a whole outer chunk in a single GET
-    and splits it locally). The held cost is one span's decoded payload —
-    ~141 MB at the o8 t-digest scale, the same bound the hive write side
-    documents and accepts (``process_and_write_hive``), and this is the
-    client-side bulk reader. Chunks whose cells are all absent (the ``b""``
+    and splits it locally). THIS generator's held cost is one span's decoded
+    payload — ~141 MB at the o8 t-digest scale, the same bound the hive write
+    side documents and accepts (``process_and_write_hive``), and this is the
+    client-side bulk reader. Callers that group the yielded chunks into a
+    coarser block hold one BLOCK's payload instead, which is that bound times
+    the number of spans the block covers (see :func:`read_tensors`). Chunks whose cells are all absent (the ``b""``
     fill) are skipped; ``cell_pos`` is the cell's chunk-local NESTED RANK —
     the same index the writer placed it at, and the index the readers
     deinterleave to a tensor position (``rank_to_rowcol``, issue #336); it is
@@ -527,6 +529,7 @@ def read_tensors(
     fit: FitMode = "raise",
     dtype: TensorDtype = "uint32",
     block_order: int | None = None,
+    max_block_bytes: int = 2 * 1024**3,
     zarr_format: Literal[2, 3] = 3,
 ) -> Iterator[tuple[np.ndarray, np.ndarray, tuple[float, float], int]]:
     """Yield ``(tensor, mask, (offset, gain), morton_index)`` per coverage block.
@@ -555,6 +558,19 @@ def read_tensors(
     offset/gain per block, with degrade/collapse decisions made over all of
     the block's populated cells, not per chunk.
 
+    **The memory bound is per BLOCK, not per stored object.** Two terms are
+    held while a block is assembled: (1) the block's decoded digests — the
+    block-wide z-window needs all of them before any cell can be rasterized —
+    which is ``4**(span_order - block_order)`` times one span's payload
+    (~141 MB at the o8 t-digest scale, :func:`_iter_populated_chunks`); and
+    (2) the emitted ``4**block_depth * n_bins`` tensor, which grows 4× per
+    coarser order — an order-6 block on the production order-19 geometry is a
+    34 TB allocation. ``max_block_bytes`` (2 GiB default) refuses term (2)
+    with a pointed error naming the size instead of dying in the allocator;
+    it is checked against the REQUESTED ``n_bins`` (``fit`` only ever shrinks
+    it) and bounds the tensor only — term (1) follows the block order asked
+    for. Raise it deliberately when a large block really is intended.
+
     Parameters
     ----------
     store : Store
@@ -580,6 +596,10 @@ def read_tensors(
         HEALPix order of the emitted blocks (default ``None`` — one block per
         read chunk). Must be at or coarser than the chunk order; a block is
         assembled from whole read chunks with one shared z-window.
+    max_block_bytes : int, optional
+        Refuse a block whose emitted tensor would exceed this many bytes
+        (default 2 GiB) — the guard on the ``block_order`` footgun. Raise it
+        explicitly to allow a bigger block.
     zarr_format : int, optional
         Zarr format version (default 3).
 
@@ -608,8 +628,9 @@ def read_tensors(
     ValueError
         On an unknown ``dtype``/``fit``, a store missing the ragged element
         attrs or the ``morton`` sibling, an out-of-range ``block_order``, a
-        corrupt/misaligned occupancy sidecar, or (with ``fit="raise"``) a
-        block whose trimmed range overflows the fixed window.
+        block tensor over ``max_block_bytes``, a corrupt/misaligned occupancy
+        sidecar, or (with ``fit="raise"``) a block whose trimmed range
+        overflows the fixed window.
     """
     if dtype not in _TENSOR_DTYPES:
         raise ValueError(f"unknown dtype {dtype!r}; expected one of {sorted(_TENSOR_DTYPES)}")
@@ -649,6 +670,22 @@ def read_tensors(
                 f"axis cannot assemble at this block order"
             )
     block_side = 1 << block_depth
+    # Bound the emitted tensor BEFORE allocating it: 4**block_depth grows 4× per
+    # coarser block order, so an unbounded block_order dies in the allocator
+    # (34 TB at order 6 on the production order-19 geometry) with a bare
+    # MemoryError instead of naming its cause. n_bins is the requested count —
+    # the fit policy only ever shrinks it, so this is the upper bound.
+    block_bytes = 4**block_depth * int(n_bins) * out_dtype.itemsize
+    if block_bytes > int(max_block_bytes):
+        asked = (
+            f"block_order={block_order}" if block_order is not None else "the read chunk geometry"
+        )
+        raise ValueError(
+            f"{asked} emits a {block_side}×{block_side}×{n_bins} {dtype} block tensor "
+            f"= {block_bytes} bytes ({block_bytes / 1024**3:.2f} GiB), over the "
+            f"{int(max_block_bytes)}-byte max_block_bytes limit; use a finer "
+            f"block_order, fewer n_bins, or raise max_block_bytes deliberately"
+        )
 
     for block, group in groupby(chain([first], chunks), key=lambda c: c[0] // block_cells):
         bstart = block * block_cells
