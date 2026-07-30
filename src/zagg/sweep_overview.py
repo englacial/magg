@@ -691,7 +691,8 @@ def _fold_node(
                     raise ValueError(
                         f"morton shape {morton.shape} is not the manifest cell_order "
                         f"{cell_order} subtree ({leaf_cells} cells); mixed-order source "
-                        f"leaves are unsupported this round (D24 reader gate)"
+                        f"leaves are unsupported this round (issue #347: sweep fold "
+                        f"semantics + the writer-side append guard)"
                     )
                 partials: dict = {}
                 cell_digests: dict = {}
