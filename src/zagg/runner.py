@@ -3060,6 +3060,11 @@ def _finalize_with_retry(
     ``reraise_note``, the one clause of the warning that differs between
     callers. The success path is untouched: no sleep, no warning.
 
+    Two warning shapes, one per attempt kind: a retryable failure warns the
+    diagnosis only (the remediation is not yet true — the retry may heal it),
+    and the terminal failure carries the full stale-manifest contract plus
+    ``reraise_note``.
+
     ``finalize`` is any zero-arg callable, so this is the ONE implementation of
     the warn/retry/record contract for every dispatch path: ``_run_lambda``
     (``executor.finalize``, then the full tail with the error recorded in
@@ -3077,15 +3082,29 @@ def _finalize_with_retry(
         except Exception as e:
             error = e
             retrying = attempt < retries
-            warnings.warn(
+            # A retryable attempt gets the DIAGNOSIS ONLY (review finding): the
+            # full stale-manifest remediation would be false the moment the
+            # retry heals a throttle or a cold-start timeout — exactly the case
+            # (d) was approved for — and an operator trained to ignore this
+            # warning ignores the one that matters. The contract text lands on
+            # the terminal failure, where it is true.
+            message = (
                 f"finalize (manifest backstop) failed for {store_path}: {e}. "
+                f"Retrying in {backoff_s} s."
+                if retrying
+                else f"finalize (manifest backstop) failed for {store_path}: {e}. "
                 f"Shard outputs are written; the store's root manifest may be "
                 f"stale until finalize runs again. It is idempotent — re-run "
                 f"the dispatch (or re-dispatch finalize) to stamp the manifest. "
-                + (f"Retrying once in {backoff_s} s." if retrying else reraise_note),
-                RuntimeWarning,
-                stacklevel=2,
+                f"{reraise_note}"
             )
+            # stacklevel=2 attributes this to the dispatch call site inside zagg,
+            # not the user's frame — deliberate: no fixed level can reach user
+            # code from every caller (``agg`` is several frames up, and the
+            # client facade's tail runs on a finisher THREAD whose stack has no
+            # user frame at all), so the message names the store and the remedy
+            # instead of relying on attribution.
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
             if retrying:
                 time.sleep(backoff_s)
     return error
