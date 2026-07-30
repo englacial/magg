@@ -146,6 +146,20 @@ def _resolve_target(manifest: dict, name: str) -> dict:
     raise KeyError(f"unknown target '{name}'; have {known}")
 
 
+def resolve_variant(function_name: str, worker: dict | None) -> str:
+    """The pre-provisioned worker variant a target's ``worker:`` block names.
+
+    ``-<memory>`` plus ``-disk`` when ``extra_disk``, appended to the base
+    function — the same rule as ``zagg.runner._resolve_function_name``. No
+    ``worker:`` block resolves the base function itself. Shared by
+    ``run_target`` and ``main``'s pre-dispatch staleness guard so the two
+    cannot drift.
+    """
+    if not worker:
+        return function_name
+    return function_name + f"-{worker['memory']}" + ("-disk" if worker.get("extra_disk") else "")
+
+
 def check_variant_current(client, function_name: str, resolved: str) -> None:
     """Refuse to dispatch onto a stale pre-provisioned worker variant (issue #341).
 
@@ -245,8 +259,7 @@ def run_target(
     resolved_function_name = function_name
     if worker:
         config.worker = dict(worker)
-        suffix = f"-{worker['memory']}" + ("-disk" if worker.get("extra_disk") else "")
-        resolved_function_name = function_name + suffix
+        resolved_function_name = resolve_variant(function_name, worker)
         tmp_mb = worker["memory"] + 2048 if worker.get("extra_disk") else 512
     # parent_order lives in the config grid for HEALPix; the kwarg is just a
     # legacy fallback. Rect grids ignore it. ``from_config`` gives us the grid
@@ -288,18 +301,9 @@ def run_target(
     else:
         from zagg.runner import agg
 
-        # Staleness guard (issue #341): a target whose ``worker:`` block resolved
-        # a pre-provisioned variant must run the same code as the base function
-        # the deploy path just updated — hard-fail before paying for a dispatch
-        # that benchmarks the wrong build.
-        if resolved_function_name != function_name:
-            import boto3
-
-            check_variant_current(
-                boto3.client("lambda", region_name=region),
-                function_name,
-                resolved_function_name,
-            )
+        # NOTE: the issue #341 CodeSha256 staleness guard runs in ``main``,
+        # BEFORE the dispatch pool spins up (fold review) — a stale variant
+        # must refuse without the sibling targets' dispatches being billed.
 
         # AOI-mask arm (issue #202): the committed map is the plain o9 map; build
         # the strict-AOI per-cell mask on the fly (mortie, no spherely) and
@@ -342,6 +346,33 @@ def run_target(
         zagg_version=zagg_version,
         objects=objects,
     )
+
+
+def check_requested_variants(manifest: dict, names: list[str], function_name: str, *, region: str):
+    """Probe every distinct worker variant the requested targets resolve (#341).
+
+    Called from ``main`` BEFORE the dispatch pool (fold review): running the
+    guard inside ``run_target`` meant a stale variant only raised after its
+    sibling targets had already been launched — the pool's ``shutdown(wait=True)``
+    then billed every one of them to completion (up to 900 s each) and the
+    exception escaped ``main`` before ``metrics.json`` was written, so the run
+    paid in full and recorded nothing. Up here the refusal costs two
+    ``GetFunctionConfiguration`` calls and zero dispatches.
+
+    Distinct variants are probed once, not once per target that shares them.
+    """
+    import boto3
+
+    client = None
+    seen: set[str] = set()
+    for name in names:
+        resolved = resolve_variant(function_name, _resolve_target(manifest, name).get("worker"))
+        if resolved == function_name or resolved in seen:
+            continue
+        seen.add(resolved)
+        if client is None:
+            client = boto3.client("lambda", region_name=region)
+        check_variant_current(client, function_name, resolved)
 
 
 def _utc_now_iso() -> str:
@@ -425,6 +456,13 @@ def main(argv: list[str] | None = None) -> int:
     for name in names:
         if name not in known:
             raise SystemExit(f"unknown target '{name}'; have {sorted(known)}")
+
+    # Worker-variant staleness guard (issue #341), in the same pre-dispatch slot
+    # as the name validation above: a target whose ``worker:`` block resolves a
+    # pre-provisioned variant must run the same code as the base function the
+    # deploy path just updated. Read-only probes, no dispatch, no auth yet.
+    if not args.dry_run:
+        check_requested_variants(manifest, names, args.function_name, region=args.region)
 
     # Authenticate once up front so the concurrent targets below don't race to
     # initialize earthaccess's process-global auth singleton (issue #137). Skipped

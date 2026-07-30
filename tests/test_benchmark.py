@@ -412,11 +412,26 @@ class _StubLambdaClient:
     def __init__(self, shas, raises=None):
         self._shas = shas
         self._raises = raises
+        self.probed: list = []
 
     def get_function_configuration(self, FunctionName):  # noqa: N803 (boto3 API)
+        self.probed.append(FunctionName)
         if self._raises is not None:
             raise self._raises
         return {"CodeSha256": self._shas[FunctionName]}
+
+
+def test_resolve_variant_matches_the_runner_rule():
+    # One suffix rule, shared by run_target and the pre-dispatch guard (so the
+    # name probed is always the name dispatched). Mirrors
+    # zagg.runner._resolve_function_name.
+    assert run_benchmark.resolve_variant("process-shard", None) == "process-shard"
+    assert run_benchmark.resolve_variant("process-shard", {}) == "process-shard"
+    assert run_benchmark.resolve_variant("process-shard", {"memory": 4096}) == "process-shard-4096"
+    assert (
+        run_benchmark.resolve_variant("process-shard", {"memory": 4096, "extra_disk": True})
+        == "process-shard-4096-disk"
+    )
 
 
 def test_variant_guard_passes_on_matching_sha():
@@ -445,6 +460,102 @@ def test_variant_guard_degrades_on_probe_failure(capsys):
     err = capsys.readouterr().err
     assert "WARN: could not compare CodeSha256" in err
     assert "without the staleness guard" in err
+
+
+def _stub_boto3(monkeypatch, client):
+    """Make ``boto3.client("lambda", ...)`` inside run_benchmark return ``client``."""
+    import boto3
+
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: client)
+    return client
+
+
+def test_variant_guard_refuses_before_any_dispatch(tmp_path, monkeypatch):
+    # Fold review: the guard used to live inside run_target, so a stale variant
+    # only raised after the pool had launched every sibling — shutdown(wait=True)
+    # then billed them all and the exception escaped main() before metrics.json
+    # was written. It now runs pre-pool: ZERO dispatches, and the two hive
+    # targets share one variant so it probes once, not twice.
+    client = _stub_boto3(
+        monkeypatch,
+        _StubLambdaClient({"process-shard": "newsha", "process-shard-4096-disk": "oldsha"}),
+    )
+    dispatched: list = []
+
+    def _record(name, *a, **k):
+        dispatched.append(name)
+        return _fake_record(name, total_obs=1, max_memory_mb=1)
+
+    monkeypatch.setattr(run_benchmark, "run_target", _record)
+    out = tmp_path / "metrics.json"
+    with pytest.raises(RuntimeError, match="STALE"):
+        run_benchmark.main(
+            [
+                "--targets",
+                str(BENCH / "targets.json"),
+                "--target",
+                "tdigest_healpix_o9_hive",
+                "--target",
+                "tdigest_healpix_o9_hive_sidecar",
+                "--commit",
+                "cafe123",
+                "--out-json",
+                str(out),
+            ]
+        )
+    assert dispatched == []  # nothing billed
+    assert client.probed == ["process-shard", "process-shard-4096-disk"]  # one probe pair
+
+
+def test_variant_guard_probes_each_distinct_variant_once(tmp_path, monkeypatch):
+    # Two targets, one shared variant -> one probe pair total (not one per
+    # target), and the run proceeds to dispatch normally.
+    client = _stub_boto3(
+        monkeypatch,
+        _StubLambdaClient({"process-shard": "same", "process-shard-4096-disk": "same"}),
+    )
+    monkeypatch.setattr(
+        run_benchmark,
+        "run_target",
+        lambda name, *a, **k: _fake_record(name, total_obs=1, max_memory_mb=1),
+    )
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o9_hive",
+            "--target",
+            "tdigest_healpix_o9_hive_sidecar",
+            "--commit",
+            "cafe123",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+            "--no-fail-on-object-mismatch",
+        ]
+    )
+    assert rc == 0
+    assert client.probed == ["process-shard", "process-shard-4096-disk"]
+
+
+def test_variant_guard_skipped_under_dry_run(tmp_path, monkeypatch):
+    # --dry-run does no dispatch, so it must not need (or make) AWS calls.
+    client = _stub_boto3(monkeypatch, _StubLambdaClient({}, raises=AssertionError("no AWS")))
+    rc = run_benchmark.main(
+        [
+            "--targets",
+            str(BENCH / "targets.json"),
+            "--target",
+            "tdigest_healpix_o9_hive",
+            "--commit",
+            "cafe123",
+            "--dry-run",
+            "--out-json",
+            str(tmp_path / "metrics.json"),
+        ]
+    )
+    assert rc == 0
+    assert client.probed == []
 
 
 def _fake_record(target, *, total_obs, max_memory_mb):
