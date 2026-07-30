@@ -499,6 +499,14 @@ def _stub_boto3(monkeypatch, client):
     return client
 
 
+def _no_login(monkeypatch):
+    """Stub the multi-target auth warm-up (issue #137) -- it would otherwise
+    prompt for Earthdata credentials on a runner with no netrc."""
+    import zagg.auth as zauth
+
+    monkeypatch.setattr(zauth, "ensure_logged_in", lambda: None)
+
+
 def test_variant_guard_refuses_before_any_dispatch(tmp_path, monkeypatch):
     # Fold review: the guard used to live inside run_target, so a stale variant
     # only raised after the pool had launched every sibling — shutdown(wait=True)
@@ -516,6 +524,16 @@ def test_variant_guard_refuses_before_any_dispatch(tmp_path, monkeypatch):
         return _fake_record(name, total_obs=1, max_memory_mb=1)
 
     monkeypatch.setattr(run_benchmark, "run_target", _record)
+    # The guard must also precede the multi-target auth warm-up (issue #137), so
+    # a refusal costs no Earthdata login either -- assert it by making a login
+    # attempt fail the test rather than by stubbing it out.
+    import zagg.auth as zauth
+
+    monkeypatch.setattr(
+        zauth,
+        "ensure_logged_in",
+        lambda: pytest.fail("guard must refuse before ensure_logged_in()"),
+    )
     out = tmp_path / "metrics.json"
     with pytest.raises(RuntimeError, match="STALE"):
         run_benchmark.main(
@@ -543,6 +561,7 @@ def test_variant_guard_probes_each_distinct_variant_once(tmp_path, monkeypatch):
         monkeypatch,
         _StubLambdaClient({"process-shard": "same", "process-shard-4096-disk": "same"}),
     )
+    _no_login(monkeypatch)
     monkeypatch.setattr(
         run_benchmark,
         "run_target",
@@ -614,6 +633,7 @@ def test_variant_guard_status_verified_and_base(tmp_path, monkeypatch):
         monkeypatch,
         _StubLambdaClient({"process-shard": "same", "process-shard-4096-disk": "same"}),
     )
+    _no_login(monkeypatch)
     monkeypatch.setattr(run_benchmark, "run_target", _guard_stamping_run_target)
     out = tmp_path / "metrics.json"
     rc = run_benchmark.main(
