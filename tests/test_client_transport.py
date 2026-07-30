@@ -374,6 +374,95 @@ class TestStatusPoller:
         poller.shutdown(wait=True)
 
 
+# -- drop detection (issue #327 phase 4) ------------------------------------------
+
+
+class TestDropDetection:
+    """A shard with no status object after (function timeout + 60 s max event
+    age + margin) resolves ``failed-unknown`` — the silent-drop outcome the
+    fleet's ``MaximumEventAgeInSeconds: 60`` makes possible under
+    backpressure — instead of hanging; it spends the same re-dispatch budget."""
+
+    def test_drop_resolves_failed_unknown_after_deadline(self):
+        store = MemoryStore()
+        now = {"t": 1000.0}
+        poller = ct.StatusPoller(
+            lambda: store,
+            drop_timeout_s=100.0,
+            max_retries=1,
+            clock=lambda: now["t"],
+        )
+        fut = poller.register(1, "1", dispatch=lambda: None)
+        poller.start()
+        time.sleep(0.06)  # several ticks inside the deadline
+        assert not fut.done()  # not classified early
+        now["t"] = 1101.0  # past dispatch (t=1000) + drop_timeout (100)
+        result = fut.result(timeout=5)
+        assert result["outcome"] == "failed-unknown"
+        assert "failed-unknown" in result["error"]
+        assert "60s max event age" in result["error"]
+        assert result["status_code"] is None
+        assert result["body"] == {}
+        poller.shutdown(wait=True)
+
+    def test_drop_participates_in_the_redispatch_budget(self):
+        store = MemoryStore()
+        now = {"t": 0.0}
+        fired: list[float] = []
+        poller = ct.StatusPoller(
+            lambda: store,
+            drop_timeout_s=10.0,
+            max_retries=2,
+            clock=lambda: now["t"],
+        )
+        fut = poller.register(5, "5", dispatch=lambda: fired.append(now["t"]))
+        poller.start()
+        deadline = time.time() + 5
+        while len(fired) < 1 and time.time() < deadline:
+            time.sleep(0.005)
+        now["t"] = 11.0  # first attempt drops -> re-dispatch, not resolution
+        deadline = time.time() + 5
+        while len(fired) < 2 and time.time() < deadline:
+            time.sleep(0.005)
+        assert len(fired) == 2 and not fut.done()
+        # The retry's execution lands its status: the shard recovers.
+        self._late_status(store, 5)
+        result = fut.result(timeout=5)
+        assert result["retries"] == 1
+        assert "outcome" not in result
+        poller.shutdown(wait=True)
+
+    @staticmethod
+    def _late_status(store, shard_key):
+        obj = {
+            "schema_version": 1,
+            "status": "ok",
+            "attempt_id": "late",
+            "shard": str(shard_key),
+            "timings": None,
+            "error": None,
+            "status_code": 200,
+            "body": {"duration_s": 2.0},
+        }
+        obstore.put(store, ct.shard_status_key(shard_key), json.dumps(obj).encode())
+
+    def test_client_event_run_counts_a_drop_failed(self, catalog, status_store, monkeypatch):
+        # End-to-end: the invoke is accepted (202) but no status ever lands;
+        # the shard's future raises ShardError with the DISTINCT outcome in
+        # the payload, status() buckets it failed, and the drop burned the
+        # whole re-dispatch budget.
+        monkeypatch.setattr(ct, "drop_timeout_s", lambda timeout_s: 0.05)
+        stub = EventStubLambdaClient(status_store, drop={_WORDS[0]})
+        handle = _run(catalog, client=stub, max_retries=2).dispatch(transport="event")
+        with pytest.raises(ShardError, match="failed-unknown") as excinfo:
+            handle.futures[_WORDS[0]].result(timeout=10)
+        assert excinfo.value.payload["outcome"] == "failed-unknown"
+        handle.results(return_exceptions=True)
+        assert handle.status() == {"pending": 0, "ok": 2, "failed": 1}
+        attempts = [e for _, _, e in stub.cell_events() if e["shard_key"] == _WORDS[0]]
+        assert len(attempts) == 2  # the budget was spent on re-dispatches
+
+
 # -- keys / prefix ---------------------------------------------------------------
 
 
