@@ -95,7 +95,7 @@ def _tensor_for(cell_to_values, **kwargs):
     store, _grid, _words = _build_store({_KEY_A: cell_to_values})
     out = list(read_tensors(store, "12/h_tdigest", dtype="float32", **kwargs))
     assert len(out) == 1
-    tensor, morton = out[0]
+    tensor, _mask, _scale, morton = out[0]
     assert morton == morton_word(_KEY_A)
     return tensor
 
@@ -184,12 +184,12 @@ class TestBlockAssembly:
 
         per_chunk = list(read_tensors(store, "12/h_tdigest"))
         assert len(per_chunk) == len(populate)
-        ((block, word),) = read_tensors(store, "12/h_tdigest", block_order=6)
+        ((block, _mask, _scale, word),) = read_tensors(store, "12/h_tdigest", block_order=6)
         assert word == shard6
         assert block.shape == (64, 64, 128)
 
         seen = np.zeros((4, 4), dtype=bool)
-        for local, (chunk_t, _cw) in zip(sorted(populate), per_chunk):
+        for local, (chunk_t, _cm, _cs, _cw) in zip(sorted(populate), per_chunk):
             trow, tcol = rank_to_rowcol(local, 2)  # tile position at depth 2
             tile = block[trow * 16 : (trow + 1) * 16, tcol * 16 : (tcol + 1) * 16, :]
             np.testing.assert_array_equal(tile, chunk_t)
@@ -207,10 +207,10 @@ class TestBlockAssembly:
 
         store, shard6 = self._store({0, 1, 2, 3, 5})
         out = list(read_tensors(store, "12/h_tdigest", block_order=7))
-        assert [t.shape for t, _m in out] == [(32, 32, 128)] * 2
+        assert [o[0].shape for o in out] == [(32, 32, 128)] * 2
         # Block ids are the order-7 children of the shard, in nested order.
         kids = [int(k) for k in np.asarray(generate_morton_children(shard6, 7))]
-        assert [m for _t, m in out] == kids[:2]
+        assert [m for *_o, m in out] == kids[:2]
         # Block 0: chunks 0..3 populated at cell rank 11 → tile (r, c) of the
         # 2x2 chunk grid, cell (3, 1) within each 16x16 tile.
         mass0 = out[0][0].sum(axis=2)
@@ -230,9 +230,11 @@ class TestBlockAssembly:
         # at the global floor: [0, 20] and [40, 60].
         values = {0: rng.uniform(0.0, 20.0, 300), 1: rng.uniform(40.0, 60.0, 300)}
         store, _shard6 = self._store({0, 1}, values=values)
-        ((block, _w),) = read_tensors(
+        ((block, _mask, (offset, gain), _w),) = read_tensors(
             store, "12/h_tdigest", block_order=7, bottom=0.0, top=1.0, dtype="float32"
         )
+        # One shared offset/gain for the whole block, anchored at the global floor.
+        assert offset == 0.0 and gain == 0.5
         mass = block.sum(axis=2)
         # Both cells' full populations are in the one shared window.
         assert mass[3, 1] == pytest.approx(300, rel=0.01)
@@ -258,6 +260,115 @@ class TestBlockAssembly:
         store, _shard6 = self._store({0, 5})
         default = list(read_tensors(store, "12/h_tdigest"))
         explicit = list(read_tensors(store, "12/h_tdigest", block_order=8))
-        assert [m for _t, m in default] == [m for _t, m in explicit]
-        for (t_d, _m1), (t_e, _m2) in zip(default, explicit):
+        assert [m for *_o, m in default] == [m for *_o, m in explicit]
+        for (t_d, m_d, s_d, _w1), (t_e, m_e, s_e, _w2) in zip(default, explicit):
             np.testing.assert_array_equal(t_d, t_e)
+            np.testing.assert_array_equal(m_d, m_e)
+            assert s_d == s_e
+
+
+def _put_object(store, key, payload):
+    """PUT raw bytes into a zarr store (the MemoryStore sidecar write)."""
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    sync(store.set(key, default_buffer_prototype().buffer.from_bytes(payload)))
+
+
+class TestMaskChannel:
+    """Issue #336 phase 4: the leaf's ``coverage.moc`` occupancy sidecar
+    decodes into the deinterleaved mask channel — 0 unobserved, 1 observed
+    with no stored digest, 2 observed with data — reusing the frozen bitmap
+    convention (``hive.decode_coverage_bitmap``), one small sidecar object
+    and no digest bytes."""
+
+    def _leaf(self, digest_ranks, extra_occupied=(), *, full=False, stamp=True, cell_order=12):
+        """A committed hive leaf (K==1 order-6 shard, 64×64 cells) with
+        digests at ``digest_ranks``; occupancy = digests + ``extra_occupied``."""
+        import zarr
+        from test_readers import _cfg
+
+        from zagg import hive
+        from zagg.grids import HealpixGrid
+        from zagg.processing import write_ragged_leaf_to_zarr
+        from zagg.stats.tdigest import build_tdigest
+
+        rng = np.random.default_rng(6)
+        grid = HealpixGrid(6, 12, layout="fullsphere", config=_cfg(), sharded=False)
+        word = morton_word(_KEY_A)
+        store = MemoryStore()
+        grid.emit_shard_template(store)
+        children = np.asarray(grid.children(word), dtype=np.uint64)
+        zarr.open_array(store, path="12/morton", mode="r+")[:] = children
+        ranks = sorted(digest_ranks)
+        payloads = [build_tdigest(rng.uniform(10.0, 30.0, 50), delta=512) for _ in ranks]
+        write_ragged_leaf_to_zarr([((0,), {"h_tdigest": (payloads, ranks)})], store, grid=grid)
+        occupied = np.sort(children[sorted(set(ranks) | set(extra_occupied))])
+        bitmap = None if full else hive.encode_coverage_bitmap(word, occupied, 12)
+        if bitmap is not None:
+            _put_object(store, hive.COVERAGE_SIDECAR, bitmap)
+        if stamp:
+            hive.stamp_commit(
+                store,
+                cells_with_data=len(ranks),
+                granule_count=1,
+                coverage=hive.build_coverage(word, occupied, cell_order, bitmap=bitmap, full=full),
+            )
+        return store
+
+    @staticmethod
+    def _read_one(store):
+        ((tensor, mask, _scale, _word),) = read_tensors(store, "12/h_tdigest")
+        return tensor, mask
+
+    def test_mask_aligns_with_digest_coverage(self):
+        digest_ranks = [0, 5, 11, 4095]
+        tensor, mask = self._read_one(self._leaf(digest_ranks))
+        expected2 = {tuple(map(int, rank_to_rowcol(r, 6))) for r in digest_ranks}
+        assert {tuple(map(int, p)) for p in zip(*np.nonzero(mask == 2))} == expected2
+        # Pre-#334 leaf: occupancy == digest coverage, so no state-1 cells,
+        # and the mask aligns with the tensor's per-cell mass exactly.
+        assert not np.any(mask == 1)
+        np.testing.assert_array_equal(mask == 2, tensor.sum(axis=2) > 0)
+
+    def test_noise_occupied_reads_as_observed_no_signal(self):
+        # An occupied cell WITHOUT a stored digest (the #334 noise stratum
+        # shape) reads as state 1 with no reader change — data-driven upgrade.
+        store = self._leaf([0, 5], extra_occupied=[7, 335])
+        _tensor, mask = self._read_one(store)
+        assert {tuple(map(int, p)) for p in zip(*np.nonzero(mask == 1))} == {
+            tuple(map(int, rank_to_rowcol(r, 6))) for r in (7, 335)
+        }
+        assert {tuple(map(int, p)) for p in zip(*np.nonzero(mask == 2))} == {
+            tuple(map(int, rank_to_rowcol(r, 6))) for r in (0, 5)
+        }
+
+    def test_full_encoding_marks_whole_block_observed(self):
+        _tensor, mask = self._read_one(self._leaf([3], full=True))
+        assert mask.min() == 1  # D14: the shard id IS the exact MOC
+        assert {tuple(map(int, p)) for p in zip(*np.nonzero(mask == 2))} == {
+            tuple(map(int, rank_to_rowcol(3, 6)))
+        }
+
+    def test_unstamped_store_degrades_to_two_state(self):
+        # Sidecar bytes without a commit stamp are debris (D4): the mask
+        # degrades to populated/not, never a half-trusted occupancy.
+        _tensor, mask = self._read_one(self._leaf([0, 5], stamp=False))
+        assert set(np.unique(mask)) == {0, 2}
+
+    def test_corrupt_sidecar_raises(self):
+        # A wrong-size (but valid-zstd) sidecar must raise, not zero-pad — the
+        # decode_coverage_bitmap posture, surfaced through the reader.
+        from numcodecs import Zstd
+
+        from zagg import hive
+
+        store = self._leaf([0])
+        _put_object(store, hive.COVERAGE_SIDECAR, bytes(Zstd().encode(b"\x00")))
+        with pytest.raises(ValueError, match="refusing to zero-pad"):
+            list(read_tensors(store, "12/h_tdigest"))
+
+    def test_cell_order_mismatch_raises_pointed(self):
+        store = self._leaf([0], cell_order=11)
+        with pytest.raises(ValueError, match="cannot be aligned"):
+            list(read_tensors(store, "12/h_tdigest"))

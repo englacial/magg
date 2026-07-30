@@ -51,11 +51,15 @@ walker's/coverage MOC's job, issue #200).
 
 The reader (generator)
 ----------------------
-:func:`read_tensors` yields ``(tensor, morton_index)`` one chunk at a time.
-Per chunk it derives a tail-trimmed z-range from the cells' ``bottom``/``top``
-quantiles, anchors a fixed ``n_bins * resolution`` window at the floor of that
-range, and rasterizes each cell's digest into per-bin counts via
-:func:`zagg.stats.tdigest.cdf_from_tdigest`.
+:func:`read_tensors` yields ``(tensor, mask, (offset, gain), morton_index)``
+— the issue #336 reader contract — one block at a time (a block is one read
+chunk by default, or a ``block_order`` subtree of whole chunks). Per block it
+derives a tail-trimmed z-range from the cells' ``bottom``/``top`` quantiles,
+anchors a fixed ``n_bins * resolution`` window at the floor of that range
+(the shared ``(offset, gain)``), rasterizes each cell's digest into per-bin
+counts via :func:`zagg.stats.tdigest.cdf_from_tdigest`, and decodes the hive
+leaf's ``coverage.moc`` occupancy sidecar (when present) into the uint8
+``mask`` channel on the same deinterleaved layout.
 """
 
 from __future__ import annotations
@@ -395,6 +399,92 @@ def _chunk_word(words: np.ndarray, field: str, start: int) -> int:
     return int(ancestors[0])
 
 
+def _read_store_object(store: Store, key: str) -> bytes | None:
+    """Raw bytes of one store object (e.g. the ``coverage.moc`` sidecar), or None."""
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    buf = sync(store.get(key, prototype=default_buffer_prototype()))
+    return None if buf is None else buf.to_bytes()
+
+
+def _load_occupancy(store: Store, arr, words: np.ndarray, field: str) -> tuple | None:
+    """The leaf's exact cell occupancy for the mask channel, or ``None``.
+
+    Reads the hive leaf's coverage envelope (the commit stamp) and its
+    ``coverage.moc`` occupancy sidecar (issue #200) — one small GET, no digest
+    bytes. Returns ``("full", None)`` for a fully occupied subtree (issue
+    #246, D14), ``("bitmap", sorted_words)`` with the decoded occupied cell
+    words (:func:`zagg.hive.decode_coverage_bitmap` — the frozen bitmap
+    convention is reused, never reimplemented), or ``None`` when the store
+    carries no exact occupancy (no stamp — every flat store — or a box-only
+    envelope, or a missing sidecar; the D9 degrade). A PRESENT-but-corrupt
+    sidecar raises (see ``decode_coverage_bitmap``).
+
+    ``words`` are a populated chunk's written morton words: the shard id is
+    their ancestor at ``cell_order - log4(n_cells)`` — a leaf's cells axis is
+    exactly one shard subtree, which is also what binds the bitmap's bit
+    positions to the axis.
+    """
+    from zagg import hive
+
+    coverage = hive.read_coverage(store)
+    if not coverage:
+        return None
+    encoding = coverage.get("encoding")
+    if encoding == "full":
+        return "full", None
+    if encoding != "bitmap" or not coverage.get("sidecar"):
+        return None
+    payload = _read_store_object(store, str(coverage["sidecar"]))
+    if payload is None:
+        return None
+    cell_order = _cells_order(words, field, 0)
+    if int(coverage.get("cell_order", -1)) != cell_order:
+        raise ValueError(
+            f"{field!r} coverage envelope measured occupancy at order "
+            f"{coverage.get('cell_order')} but the cells axis is order {cell_order} — "
+            f"the occupancy bitmap cannot be aligned to the tensor cells"
+        )
+    n = int(arr.shape[0])
+    depth = (n.bit_length() - 1) // 2
+    if 4**depth != n:
+        raise ValueError(
+            f"{field!r} carries a leaf coverage stamp but its {n}-cell axis is not a "
+            f"power-of-four shard subtree — the occupancy bitmap cannot be bound to "
+            f"a shard"
+        )
+    from mortie import clip2order
+
+    written = words[words != 0]
+    shard = int(clip2order(cell_order - depth, written[:1])[0])
+    return "bitmap", hive.decode_coverage_bitmap(payload, shard, cell_order)
+
+
+def _block_mask(words: np.ndarray, occupancy: tuple | None, block_depth: int) -> np.ndarray:
+    """The block's ``(side, side)`` uint8 occupancy base (values 0/1).
+
+    ``1`` marks a cell the leaf's occupancy sidecar records as observed;
+    the caller upgrades digest-bearing cells to ``2``. Without occupancy
+    truth the base stays ``0`` everywhere (mask degrades to the 2-state
+    populated/not — never a wrong answer).
+    """
+    side = 1 << block_depth
+    mask = np.zeros((side, side), dtype=np.uint8)
+    if occupancy is None:
+        return mask
+    kind, occupied = occupancy
+    if kind == "full":
+        mask[:] = 1
+        return mask
+    if occupied.size:
+        idx = np.searchsorted(occupied, words)
+        hit = (occupied[np.minimum(idx, occupied.size - 1)] == words) & (words != 0)
+        rows, cols = rank_to_rowcol(np.flatnonzero(hit), block_depth)
+        mask[rows, cols] = 1
+    return mask
+
+
 def _tensor_side(arr, field: str) -> tuple[int, int]:
     """``(side, depth)`` of one read chunk's square block (64, 6 in production).
 
@@ -429,8 +519,11 @@ def read_tensors(
     dtype: TensorDtype = "uint32",
     block_order: int | None = None,
     zarr_format: Literal[2, 3] = 3,
-) -> Iterator[tuple[np.ndarray, int]]:
-    """Yield ``(tensor, morton_index)`` per coverage block of a t-digest field.
+) -> Iterator[tuple[np.ndarray, np.ndarray, tuple[float, float], int]]:
+    """Yield ``(tensor, mask, (offset, gain), morton_index)`` per coverage block.
+
+    The ratified reader contract (issue #336): one tuple per populated block
+    of a t-digest field.
 
     Sweeps the field's vlen array one read chunk (one square cell block) at a
     time, visiting only the STORED objects. For each populated block it trims
@@ -483,17 +576,31 @@ def read_tensors(
 
     Yields
     ------
-    (tensor, morton_index) : (ndarray, int)
+    (tensor, mask, (offset, gain), morton_index) : (ndarray, ndarray, tuple, int)
         ``tensor`` has shape ``(side, side, n_bins_out)`` and the requested
-        dtype; ``morton_index`` is the block's coverage-cell morton id.
+        dtype. ``mask`` is the block's ``(side, side)`` uint8 occupancy
+        channel: ``0`` = unobserved, ``1`` = observed but no stored digest,
+        ``2`` = observed with data (a stored digest — the cells the tensor
+        rasterizes). The observed states come from the hive leaf's
+        ``coverage.moc`` occupancy sidecar (issue #200), read WITHOUT
+        touching digest bytes; a store without one (every flat store)
+        degrades to the 2-state ``{0, 2}`` populated/not mask. Today a
+        pre-#334 leaf's occupancy equals its digest coverage, so ``1`` does
+        not occur; once the issue #334 signal strata land, noise-occupied
+        cells (observed, no signal digest) appear as ``1`` automatically —
+        the upgrade is data-driven, not a reader flag. ``(offset, gain)`` is
+        the block's shared z-window ``(z_lo, resolution)``: bin ``i`` of
+        every cell in the block covers ``[offset + i*gain, offset +
+        (i+1)*gain)``. ``morton_index`` is the block's coverage-cell morton
+        id.
 
     Raises
     ------
     ValueError
         On an unknown ``dtype``/``fit``, a store missing the ragged element
-        attrs or the ``morton`` sibling, an out-of-range ``block_order``, or
-        (with ``fit="raise"``) a block whose trimmed range overflows the
-        fixed window.
+        attrs or the ``morton`` sibling, an out-of-range ``block_order``, a
+        corrupt/misaligned occupancy sidecar, or (with ``fit="raise"``) a
+        block whose trimmed range overflows the fixed window.
     """
     if dtype not in _TENSOR_DTYPES:
         raise ValueError(f"unknown dtype {dtype!r}; expected one of {sorted(_TENSOR_DTYPES)}")
@@ -509,12 +616,14 @@ def read_tensors(
     first = next(chunks, None)
     if first is None:
         return
+    first_words = morton[first[0] : first[0] + cells_per_chunk]
+    occupancy = _load_occupancy(store, arr, first_words, field)
     if block_order is None:
         block_cells, block_depth = cells_per_chunk, depth
     else:
         # The cells-axis order comes from the first populated chunk's words;
         # the block subtree must be whole read chunks (coarser or equal).
-        cell_order = _cells_order(morton[first[0] : first[0] + cells_per_chunk], field, first[0])
+        cell_order = _cells_order(first_words, field, first[0])
         chunk_order = cell_order - depth
         if not 0 <= int(block_order) <= chunk_order:
             raise ValueError(
@@ -548,15 +657,18 @@ def read_tensors(
             fit=fit,
         )
 
+        words = morton[bstart : bstart + block_cells]
         tensor = np.zeros((block_side, block_side, n_bins_c), dtype=out_dtype)
+        mask = _block_mask(words, occupancy, block_depth)
         for rank, digest in cells:
             counts = rasterize_cell(digest, z_lo, resolution_c, n_bins_c)
             if not is_float:
                 counts = np.rint(counts)
             row, col = rank_to_rowcol(rank, block_depth)
             tensor[row, col, :] = counts.astype(out_dtype)
+            mask[row, col] = 2
 
-        yield tensor, _chunk_word(morton[bstart : bstart + block_cells], field, bstart)
+        yield tensor, mask, (float(z_lo), float(resolution_c)), _chunk_word(words, field, bstart)
 
 
 def read_raw_values(
