@@ -225,7 +225,8 @@ class RunHandle:
         """Block until every shard AND the post-run tail finish.
 
         Re-raises a failed finalize backstop (the manifest is required
-        reader-facing schema, D6); the coverage/stats/sweep rollups are
+        reader-facing schema, D6 — also warned at the moment it fails, so it is
+        visible before this join); the coverage/stats/sweep rollups are
         fail-open by design and never raise here, but an exception in the
         tail's own plumbing does surface (it would otherwise vanish into the
         finisher thread). Raises ``TimeoutError`` when the tail is still
@@ -776,8 +777,10 @@ class Run:
         flat only under ``consolidate_metadata``), then the fail-open rollups:
         root ``coverage.moc``, the run-stats record, and the sweep trigger —
         each a fire-and-forget worker invoke (D8), each swallowed on failure
-        exactly like ``_run_lambda``'s tail. A finalize failure is recorded on
-        the handle and re-raised from :meth:`RunHandle.wait`.
+        exactly like ``_run_lambda``'s tail. A finalize failure warns
+        immediately (``RuntimeWarning`` — notebook-visible while the tail is
+        still running), is recorded on the handle, and re-raises from
+        :meth:`RunHandle.wait` / a drained harvest iterator.
 
         Every shard contributes exactly one result dict, so every shard gets a
         run-stats row: a worker envelope, a :class:`ShardError` payload, or —
@@ -831,6 +834,23 @@ class Run:
         except Exception as e:
             handle._finalize_error = e
             logger.warning(f"finalize invoke failed (surfaced via handle.wait()): {e}")
+            # Warn AT THE FAILURE, not only when the harvest loop finally joins
+            # (espg ruling on PR #333, middle option): the tail goes on and the
+            # error still re-raises from wait()/drain, but a notebook shows this
+            # in-stream immediately instead of leaving the window between
+            # finalize and the join silent. Every shard's data is written — only
+            # the root manifest is stale — and the backstop is idempotent, so
+            # the remedy is a re-run, not a re-compute.
+            warnings.warn(
+                f"finalize (manifest backstop) failed for {self.store}: {e}. "
+                f"Shard outputs are written; the store's root manifest may be "
+                f"stale until finalize runs again. It is idempotent — re-run "
+                f"the dispatch (or re-dispatch finalize) to stamp the manifest. "
+                f"This error also re-raises from handle.wait() / draining the "
+                f"harvest iterator.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         ok_results = [r for r in results if r.get("status_code") == 200 and not r.get("error")]
         if layout == "hive" and get_coverage_moc(self.config):

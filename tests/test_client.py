@@ -12,6 +12,7 @@ import json
 import sys
 import threading
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -626,6 +627,40 @@ class TestFutures:
         (bad,) = [r for r in rows if r["shard_key"] == _WORDS[0]]
         assert bad["success"] is False
         assert "Too many open files" in bad["error"]
+
+    def test_finalize_failure_warns_immediately(self, catalog, monkeypatch):
+        # espg ruling on PR #333 (middle option): the failure is warned the
+        # moment it happens — not only when the harvest loop finally joins — so
+        # a notebook shows it in-stream; the tail still runs and the error still
+        # re-raises. The stats leg is gated open so the assertion lands while
+        # the tail is demonstrably still in flight.
+        from zagg import runner
+
+        gate = threading.Event()
+
+        def _fail(*a, **k):
+            raise RuntimeError("finalize down")
+
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", _fail)
+        monkeypatch.setattr(runner, "_dispatch_run_stats", lambda *a, **k: gate.wait(10))
+
+        def _finalize_warnings(caught):
+            return [str(w.message) for w in caught if "finalize" in str(w.message)]
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            handle = _run(catalog, client=StubLambdaClient()).dispatch()
+            deadline = time.time() + 10
+            while not _finalize_warnings(caught):
+                assert time.time() < deadline, "no finalize warning while the tail ran"
+                time.sleep(0.01)
+            assert handle._finisher.is_alive()  # warned before the join, not at it
+            (msg,) = _finalize_warnings(caught)
+            assert _STORE in msg and "idempotent" in msg
+            gate.set()
+        # Re-raise semantics unchanged.
+        with pytest.raises(RuntimeError, match="finalize down"):
+            handle.wait(timeout=10)
 
     def test_finalize_failure_wins_over_a_tail_crash(self, catalog, monkeypatch):
         # Two distinct channels: the D6 manifest backstop failure is the one
