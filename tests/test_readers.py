@@ -116,10 +116,11 @@ class _CountingStore(MemoryStore):
         return r
 
 
-def _sharded_store(store, *, populate):
+def _sharded_store(store, *, populate, values=None):
     """A K=16 ShardingCodec'd store with one populated cell per chunk in
     ``populate`` (local chunk ordinals); returns ``(grid, shard_word,
-    {local: global_cell})``."""
+    {local: global_cell})``. ``values`` optionally maps a local chunk ordinal
+    to that chunk's sample vector (default: 300 uniform draws per chunk)."""
     rng = np.random.default_rng(21)
     cfg = _cfg()
     cfg.output["grid"]["chunk_inner"] = 8
@@ -137,7 +138,8 @@ def _sharded_store(store, *, populate):
         if local not in populate:
             chunk_results.append((block, pd.DataFrame(), {}))
             continue
-        payloads = [build_tdigest(rng.uniform(0.0, 30.0, 300), delta=512)]
+        vals = rng.uniform(0.0, 30.0, 300) if values is None else np.asarray(values[local])
+        payloads = [build_tdigest(vals, delta=512)]
         chunk_results.append((block, pd.DataFrame(), {"h_tdigest": (payloads, [11])}))
         targets[local] = base + 11
     write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard6)

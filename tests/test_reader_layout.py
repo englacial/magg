@@ -11,7 +11,8 @@ so zagg cannot drift from the spec by construction.
 
 import numpy as np
 import pytest
-from test_readers import _KEY_A, _build_store
+from test_readers import _KEY_A, _build_store, _sharded_store
+from zarr.storage import MemoryStore
 
 from zagg.grids.morton import morton_word
 from zagg.readers._layout import rank_to_rowcol, rowcol_to_rank
@@ -159,3 +160,104 @@ class TestTensorPlacement:
         # Values identify the cell: rank recovered from (row, col) round-trips.
         for _m, (row, col), v in read_raw_values(store, "12/h_tdigest"):
             assert v[0] == float(rowcol_to_rank(row, col, 6))
+
+
+class TestBlockAssembly:
+    """``block_order=`` assembles inner-chunk tensors into one block tensor
+    (issue #336 phase 3). Geometry: order-6 shard of K=16 order-8 chunks
+    (16×16 cells each, cell order 12), so block_order 7 = 4 chunks (32×32)
+    and block_order 6 = the whole shard (64×64). Each populated chunk holds
+    one digest at cell rank 11 → (row, col) = (3, 1) within its tile."""
+
+    def _store(self, populate, values=None):
+        store = MemoryStore()
+        _grid, shard6, _targets = _sharded_store(store, populate=populate, values=values)
+        return store, shard6
+
+    def test_block_bit_identical_to_per_chunk_tiles(self):
+        # Identical values in every populated chunk → each chunk's window ==
+        # the shared block window → block tiles are bit-identical to the
+        # per-chunk tensors (the acceptance pin for the assembly path).
+        vals = np.random.default_rng(3).uniform(5.0, 25.0, 400)
+        populate = {0, 3, 7, 12}
+        store, shard6 = self._store(populate, values={k: vals for k in populate})
+
+        per_chunk = list(read_tensors(store, "12/h_tdigest"))
+        assert len(per_chunk) == len(populate)
+        ((block, word),) = read_tensors(store, "12/h_tdigest", block_order=6)
+        assert word == shard6
+        assert block.shape == (64, 64, 128)
+
+        seen = np.zeros((4, 4), dtype=bool)
+        for local, (chunk_t, _cw) in zip(sorted(populate), per_chunk):
+            trow, tcol = rank_to_rowcol(local, 2)  # tile position at depth 2
+            tile = block[trow * 16 : (trow + 1) * 16, tcol * 16 : (tcol + 1) * 16, :]
+            np.testing.assert_array_equal(tile, chunk_t)
+            seen[trow, tcol] = True
+        # Every other tile is all zero (unpopulated chunks contribute nothing).
+        for trow in range(4):
+            for tcol in range(4):
+                if not seen[trow, tcol]:
+                    assert (
+                        block[trow * 16 : (trow + 1) * 16, tcol * 16 : (tcol + 1) * 16].sum() == 0
+                    )
+
+    def test_block_order_7_groups_and_coarsens_morton(self):
+        from mortie import generate_morton_children
+
+        store, shard6 = self._store({0, 1, 2, 3, 5})
+        out = list(read_tensors(store, "12/h_tdigest", block_order=7))
+        assert [t.shape for t, _m in out] == [(32, 32, 128)] * 2
+        # Block ids are the order-7 children of the shard, in nested order.
+        kids = [int(k) for k in np.asarray(generate_morton_children(shard6, 7))]
+        assert [m for _t, m in out] == kids[:2]
+        # Block 0: chunks 0..3 populated at cell rank 11 → tile (r, c) of the
+        # 2x2 chunk grid, cell (3, 1) within each 16x16 tile.
+        mass0 = out[0][0].sum(axis=2)
+        assert {tuple(map(int, p)) for p in zip(*np.nonzero(mass0))} == {
+            (3, 1),
+            (3, 17),
+            (19, 1),
+            (19, 17),
+        }
+        # Block 1: only chunk 5 (local rank 1 within the block → tile (0, 1)).
+        mass1 = out[1][0].sum(axis=2)
+        assert {tuple(map(int, p)) for p in zip(*np.nonzero(mass1))} == {(3, 17)}
+
+    def test_window_reconciled_block_wide(self):
+        rng = np.random.default_rng(4)
+        # Two chunks whose ranges only fit ONE 64 m window jointly anchored
+        # at the global floor: [0, 20] and [40, 60].
+        values = {0: rng.uniform(0.0, 20.0, 300), 1: rng.uniform(40.0, 60.0, 300)}
+        store, _shard6 = self._store({0, 1}, values=values)
+        ((block, _w),) = read_tensors(
+            store, "12/h_tdigest", block_order=7, bottom=0.0, top=1.0, dtype="float32"
+        )
+        mass = block.sum(axis=2)
+        # Both cells' full populations are in the one shared window.
+        assert mass[3, 1] == pytest.approx(300, rel=0.01)
+        assert mass[3, 17] == pytest.approx(300, rel=0.01)
+
+    def test_fit_raise_decided_block_wide(self):
+        rng = np.random.default_rng(5)
+        # Each chunk fits a 64 m window alone, but jointly they span ~100 m —
+        # the block-wide decision must raise where per-chunk reads pass.
+        values = {0: rng.uniform(0.0, 20.0, 300), 1: rng.uniform(80.0, 100.0, 300)}
+        store, _shard6 = self._store({0, 1}, values=values)
+        assert len(list(read_tensors(store, "12/h_tdigest", bottom=0.0, top=1.0))) == 2
+        with pytest.raises(ValueError, match="exceeds the fixed window"):
+            list(read_tensors(store, "12/h_tdigest", block_order=7, bottom=0.0, top=1.0))
+
+    def test_block_order_out_of_range_raises(self):
+        store, _shard6 = self._store({0})
+        for bad in (9, -1):  # chunk order is 8
+            with pytest.raises(ValueError, match="block_order .* out of range"):
+                list(read_tensors(store, "12/h_tdigest", block_order=bad))
+
+    def test_chunk_order_block_matches_default(self):
+        store, _shard6 = self._store({0, 5})
+        default = list(read_tensors(store, "12/h_tdigest"))
+        explicit = list(read_tensors(store, "12/h_tdigest", block_order=8))
+        assert [m for _t, m in default] == [m for _t, m in explicit]
+        for (t_d, _m1), (t_e, _m2) in zip(default, explicit):
+            np.testing.assert_array_equal(t_d, t_e)
