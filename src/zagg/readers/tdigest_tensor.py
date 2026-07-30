@@ -31,10 +31,13 @@ The read plan honors the layout the writer chose: a whole-store sweep LISTs the
 array's stored chunk objects (one object per shard under the ShardingCodec, or
 one per inner chunk on the unsharded flat layout — both self-describing in the
 array metadata, so one code path reads either), then decodes per read chunk.
-Each read chunk is a square ``(side, side)`` block of cells (row-major
-``cell_id`` within the chunk, ``side = isqrt(cells_per_chunk)`` — 64 for the
-production ``chunk_inner`` configs); its coverage-cell morton id is derived
-from the sibling ``morton`` coordinate. Random access to one cell
+Each read chunk is a square ``(side, side)`` block of cells
+(``side = isqrt(cells_per_chunk)`` — 64 for the production ``chunk_inner``
+configs); its coverage-cell morton id is derived from the sibling ``morton``
+coordinate. A cell's 2-D position is the **bit deinterleave** of its nested
+rank within the chunk (``readers._layout.rank_to_rowcol`` — mortie spec §8 /
+gridlook orientation; issue #336), never a row-major reshape: nested order is
+a Z-order curve, so ``divmod(rank, side)`` would scramble the block spatially. Random access to one cell
 (:func:`read_cell`) indexes the vlen array directly — 2 ranged GETs on a
 sharded store (index suffix + one inner chunk), never the whole shard.
 
@@ -66,6 +69,7 @@ import zarr
 from zarr.abc.store import Store
 
 from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC
+from zagg.readers._layout import rank_to_rowcol
 from zagg.stats.tdigest import cdf_from_tdigest, quantile_from_tdigest
 
 __all__ = [
@@ -371,16 +375,21 @@ def _chunk_word(words: np.ndarray, field: str, start: int) -> int:
     return int(clip2order(cell_order - depth, written[:1])[0])
 
 
-def _tensor_side(arr, field: str) -> int:
-    """Row-major square side of one read chunk (64 for the production configs)."""
+def _tensor_side(arr, field: str) -> tuple[int, int]:
+    """``(side, depth)`` of one read chunk's square block (64, 6 in production).
+
+    ``side = 2**depth``: the deinterleave (mortie spec §8) is defined over
+    power-of-four subtrees, so a chunk that is not one cannot form a spatially
+    faithful ``(side, side)`` block.
+    """
     cells_per_chunk = int(arr.chunks[0])
     side = math.isqrt(cells_per_chunk)
-    if side * side != cells_per_chunk:
+    if side * side != cells_per_chunk or side & (side - 1):
         raise ValueError(
-            f"{field!r} read chunk holds {cells_per_chunk} cells — not a square "
-            f"block, so it cannot rasterize to a (side, side, n_bins) tensor"
+            f"{field!r} read chunk holds {cells_per_chunk} cells — not a power-of-"
+            f"four subtree, so it cannot deinterleave to a (side, side, n_bins) tensor"
         )
-    return side
+    return side, side.bit_length() - 1
 
 
 # --------------------------------------------------------------------------- #
@@ -408,7 +417,11 @@ def read_tensors(
     rasterizes every populated cell's digest into ``n_bins`` counts (see
     :func:`rasterize_cell`), and emits the ``(side, side, n_bins)`` tensor with
     the chunk's coverage-cell morton id (``side`` is 64 for the production
-    ``chunk_inner`` configs).
+    ``chunk_inner`` configs). Cell placement is the spatially faithful bit
+    deinterleave of the cell's nested rank (issue #336):
+    ``tensor[row, col] = rank_to_rowcol(rank, depth)`` per the
+    :mod:`zagg.readers._layout` orientation contract (mortie spec §8; row 0 /
+    col 0 at the chunk subtree's south corner, gridlook texture convention).
 
     Parameters
     ----------
@@ -454,7 +467,7 @@ def read_tensors(
 
     arr, elem_dtype, elem_shape, _meta = _open_ragged(store, field, zarr_format)
     morton = _open_morton(store, field, zarr_format)
-    side = _tensor_side(arr, field)
+    side, depth = _tensor_side(arr, field)
 
     for start, populated in _iter_populated_chunks(arr):
         cells = [(pos, _decode_cell(raw, elem_dtype, elem_shape)) for pos, raw in populated]
@@ -468,11 +481,11 @@ def read_tensors(
         )
 
         tensor = np.zeros((side, side, n_bins_c), dtype=out_dtype)
-        for cell_id, digest in cells:
+        for rank, digest in cells:
             counts = rasterize_cell(digest, z_lo, resolution_c, n_bins_c)
             if not is_float:
                 counts = np.rint(counts)
-            row, col = divmod(cell_id, side)
+            row, col = rank_to_rowcol(rank, depth)
             tensor[row, col, :] = counts.astype(out_dtype)
 
         yield tensor, _chunk_word(morton[start : start + side * side], field, start)
@@ -483,8 +496,8 @@ def read_raw_values(
     field: str,
     *,
     zarr_format: Literal[2, 3] = 3,
-) -> Iterator[tuple[int, int, np.ndarray]]:
-    """Yield ``(morton_index, cell_id, values)`` raw samples per populated cell.
+) -> Iterator[tuple[int, tuple[int, int], np.ndarray]]:
+    """Yield ``(morton_index, (row, col), values)`` raw samples per populated cell.
 
     The companion lossless reader (issue #79 follow-up): when a digest was built
     with no merges (every centroid weight 1) its centroid means *are* the
@@ -503,10 +516,12 @@ def read_raw_values(
 
     Yields
     ------
-    (morton_index, cell_id, values) : (int, int, ndarray)
+    (morton_index, (row, col), values) : (int, (int, int), ndarray)
         ``values`` is the cell's recovered 1-D sample vector (sorted ascending,
-        as the digest stores centroids by mean); ``cell_id`` its row-major
-        position within the chunk.
+        as the digest stores centroids by mean); ``(row, col)`` its
+        deinterleaved 2-D position within the chunk — the same tensor position
+        :func:`read_tensors` places the cell at (issue #336; invert with
+        :func:`zagg.readers._layout.rowcol_to_rank`).
 
     Raises
     ------
@@ -516,19 +531,21 @@ def read_raw_values(
     """
     arr, elem_dtype, elem_shape, _meta = _open_ragged(store, field, zarr_format)
     morton = _open_morton(store, field, zarr_format)
-    cells_per_chunk = int(arr.chunks[0])
+    side, depth = _tensor_side(arr, field)
+    cells_per_chunk = side * side
 
     for start, populated in _iter_populated_chunks(arr):
         word = _chunk_word(morton[start : start + cells_per_chunk], field, start)
-        for cell_id, raw in populated:
+        for rank, raw in populated:
             digest = _decode_cell(raw, elem_dtype, elem_shape)
             weights = np.asarray(digest[:, 1], dtype=np.float64)
             if np.any(weights > 1.0):
                 raise ValueError(
-                    f"cell {cell_id} (chunk {word}) has merged centroids "
+                    f"cell rank {rank} (chunk {word}) has merged centroids "
                     "(weight > 1); raw values are not losslessly recoverable"
                 )
-            yield word, int(cell_id), np.asarray(digest[:, 0], dtype=np.float64)
+            row, col = rank_to_rowcol(rank, depth)
+            yield word, (int(row), int(col)), np.asarray(digest[:, 0], dtype=np.float64)
 
 
 def read_locations(
@@ -536,8 +553,8 @@ def read_locations(
     field: str,
     *,
     zarr_format: Literal[2, 3] = 3,
-) -> Iterator[tuple[int, int, np.ndarray]]:
-    """Yield ``(morton_index, cell_id, locations)`` per populated cell.
+) -> Iterator[tuple[int, tuple[int, int], np.ndarray]]:
+    """Yield ``(morton_index, (row, col), locations)`` per populated cell.
 
     The location-channel reader (issue #87): a located ragged field stores a
     per-centroid ``uint64`` morton location vector in a sibling vlen array,
@@ -561,10 +578,12 @@ def read_locations(
 
     Yields
     ------
-    (morton_index, cell_id, locations) : (int, int, ndarray)
+    (morton_index, (row, col), locations) : (int, (int, int), ndarray)
         ``locations`` is the cell's ``(k,)`` uint64 per-centroid location
         vector, aligned with the digest rows :func:`read_tensors` /
-        :func:`read_raw_values` see for the same cell.
+        :func:`read_raw_values` see for the same cell; ``(row, col)`` is the
+        cell's deinterleaved 2-D position within the chunk (issue #336),
+        matching the other readers' reporting.
 
     Raises
     ------
@@ -586,12 +605,14 @@ def read_locations(
     # read for a locations-only pass (the digest payload is not consumed here).
     loc_arr, loc_dtype, loc_shape, _loc_meta = _open_ragged(store, loc_field, zarr_format)
     morton = _open_morton(store, field, zarr_format)
-    cells_per_chunk = int(loc_arr.chunks[0])
+    side, depth = _tensor_side(loc_arr, loc_field)
+    cells_per_chunk = side * side
 
     for start, populated in _iter_populated_chunks(loc_arr):
         word = _chunk_word(morton[start : start + cells_per_chunk], loc_field, start)
-        for cell_id, raw in populated:
-            yield word, int(cell_id), _decode_cell(raw, loc_dtype, loc_shape)
+        for rank, raw in populated:
+            row, col = rank_to_rowcol(rank, depth)
+            yield word, (int(row), int(col)), _decode_cell(raw, loc_dtype, loc_shape)
 
 
 def read_cell(

@@ -309,13 +309,16 @@ class TestReadTensors:
         mortons = sorted(m for _, m in read_tensors(self._store(), "12/h_tdigest"))
         assert mortons == sorted(morton_word(k) for k in (_KEY_A, _KEY_B))
 
-    def test_populated_cell_placement_rowmajor(self):
+    def test_populated_cell_placement_deinterleaved(self):
         out = dict((m, t) for t, m in read_tensors(self._store(), "12/h_tdigest"))
         t = out[morton_word(_KEY_A)]
-        # cell 5 → row 0, col 5; cell 4095 → row 63, col 63.
-        assert t[0, 5].sum() > 0
+        # Deinterleave (issue #336): rank 5 = 0b101 → (row, col) = (y, x) =
+        # (0, 3); rank 4095 → (63, 63); rank 0 → (0, 0).
+        assert t[0, 0].sum() > 0
+        assert t[0, 3].sum() > 0
         assert t[63, 63].sum() > 0
-        # An unpopulated cell stays zero.
+        # The old row-major position of rank 5 is now an unpopulated zero.
+        assert t[0, 5].sum() == 0
         assert t[10, 10].sum() == 0
 
     def test_counts_match_population(self):
@@ -483,9 +486,10 @@ class TestReadRawValues:
         store, _g, words = _build_store({_KEY_A: {7: vals}})
         out = list(read_raw_values(store, "12/h_tdigest"))
         assert len(out) == 1
-        morton, cell_id, recovered = out[0]
+        morton, rowcol, recovered = out[0]
         assert morton == words[_KEY_A]
-        assert cell_id == 7
+        # Rank 7 = 0b111 deinterleaves to (row, col) = (y, x) = (1, 3).
+        assert rowcol == (1, 3)
         # Digest stores centroids sorted by mean → sorted samples.
         np.testing.assert_allclose(recovered, np.sort(vals))
 
@@ -521,9 +525,11 @@ class TestReadLocations:
 
     def test_yields_per_cell_uint64_vectors(self):
         store, vals, locs_in, word = self._located_store()
-        out = {(m, c): locs for m, c, locs in read_locations(store, "12/h_tdigest")}
-        assert set(out) == {(word, 3), (word, 9)}
-        for (_, cid), locs in out.items():
+        out = {(m, rc): locs for m, rc, locs in read_locations(store, "12/h_tdigest")}
+        # Cell ranks 3 and 9 deinterleave to (row, col) = (1, 1) and (2, 1).
+        assert set(out) == {(word, (1, 1)), (word, (2, 1))}
+        for cid, rc in [(3, (1, 1)), (9, (2, 1))]:
+            locs = out[(word, rc)]
             assert locs.dtype == np.uint64
             # Loss-free regime: locations are the cell's point words co-sorted
             # with the values (digest rows sort by mean).
@@ -656,10 +662,11 @@ class TestReadParityWithoutConsolidation:
         assert root.metadata.consolidated_metadata is None
 
         tensors_plain, raw_plain, locs_plain = self._read_all(store)
-        # Sanity: the readers actually reached the data.
+        # Sanity: the readers actually reached the data. Ranks 0 and 63
+        # deinterleave to (row, col) = (0, 0) and (7, 7).
         word_a, word_b = morton_word(_KEY_A), morton_word(_KEY_B)
         assert set(tensors_plain) == {word_a, word_b}
-        assert (word_a, 0) in raw_plain and (word_b, 63) in raw_plain
+        assert (word_a, (0, 0)) in raw_plain and (word_b, (7, 7)) in raw_plain
 
         # Consolidate the SAME store and re-read: consolidation only adds a
         # metadata blob no reader consults, so every byte must match.
