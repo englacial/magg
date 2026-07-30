@@ -35,11 +35,20 @@ text marked *informative* explains or motivates and binds nothing.
 
 ## Conformance
 
-- Every versioned convention on this page is signaled in store metadata by a
-  `spec` marker (`"zagg-ragged/1"`, `"zagg-composition/1"`, …) — the
-  coverage-envelope discipline. A conforming reader MUST strict-check the
-  marker and **fail loudly on an unknown or future revision**, never
-  half-parse under a guessed layout.
+- Every versioned convention on this page is signaled in store metadata — by a
+  `spec` marker (`"zagg-ragged/1"`, `"zagg-composition/1"`, …), the
+  coverage-envelope discipline, **or, where a section names it, by the array's
+  registered zarr data type**. A conforming reader MUST strict-check whichever
+  signal the owning section names and **fail loudly on an unknown or future
+  revision**, never half-parse under a guessed layout.
+- Marker-*absence* is legal only where a section names the data type that
+  replaces the marker. Today there is exactly one such carve-out: the typed
+  `vlen-ndarray` dtype **is** the `zagg-ragged/2` signal, and the `ragged`
+  attrs marker is deliberately retired (not written) on those arrays
+  (§1.6/§6.1) — so a reader MUST NOT treat a missing marker there as an
+  unknown revision. Everywhere else absence is a hard failure: a
+  `variable_length_bytes` array with no `ragged` block is not signaled at all
+  and MUST be refused (§1.2).
 - A revision, once published here, is **frozen**: its text never changes
   semantics, and stores written under it remain valid indefinitely. New
   behavior is a new revision (`/2`, `/3`, …) with its own section and an
