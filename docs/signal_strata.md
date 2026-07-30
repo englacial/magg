@@ -15,19 +15,19 @@ is **committed at ingest** and carried through the store in three pieces:
 2. **One packed `uint64` composition word** per cell
    (`zagg.stats.composition`, spec `zagg-composition/1`): eight 8-bit lanes
    of quantized fractions of the signal stratum — five per-surface lanes
-   (`signal_conf_ph` column order: land, ocean, sea_ice, land_ice,
-   inland_water) and three low/med/high lanes (a signal photon's *strongest*
-   per-surface confidence, 2/3/4). The level lanes are **absolute** — always
-   `conf == 2/3/4`, never renumbered against the threshold — so a product
-   committing a higher threshold ships empty lower lanes rather than shifted
-   ones, and one lane layout serves every product.
+   (`signal_conf_ph` column order) and three low/med/high lanes.
 3. **Store attrs** recording the commitment: each stratum's *payload* array
-   carries `stratum` + `signal_threshold`, and the composition array carries the
-   versioned `composition` block (`spec`, `lanes`, `of` — the digest whose
-   total weight is `N_signal` — and `threshold`). Readers bind to these,
-   never to config conventions. The located sibling
-   (`{field}_locations`) carries no user attrs: it is addressed through its
-   payload array, which holds the pair's provenance.
+   carries `stratum` + `signal_threshold`, and the composition array carries
+   the versioned `composition` block. Readers bind to these, never to config
+   conventions. The located sibling (`{field}_locations`) carries no user
+   attrs: it is addressed through its payload array, which holds the pair's
+   provenance.
+
+> **Normative home.** The composition word's byte layout, lane order,
+> presence-floor quantization, attrs block, and merge law are
+> [`specification.md` §3](specification.md#3-zagg-composition1). This page is
+> the narrative companion — why the strata exist and how the pieces compose.
+> Where the two disagree, the spec wins.
 
 The shipped template is `zagg/configs/atl03_tdigest_strata_healpix.yaml` —
 **located strata is the default**: both digest fields carry `location:
@@ -38,31 +38,29 @@ via the per-variable `column` selector (`{path: ..., column: k}` — the
 variable analogue of the structured-filter `column`); the shared path is
 still read once.
 
-## Quantization: the presence floor
+## Why the presence floor
 
-Lanes quantize as `k = round(255 * c / N)` **except any nonzero count
-quantizes to at least 1**. Consequences:
-
-- `lane > 0` means "this flag occurred" **exactly, at every N**, through
-  arbitrary merge chains.
-- Count recovery `round(k * N / 255)` is exact whenever `N <= 254` — the
-  entire below-compression-knee regime (measured 99.56% of non-empty cells
-  on the live NEON store, full-mission pooling).
-- Above that, counts are within `±N/510` (plus `O(N/510)` per
-  re-quantizing merge); presence stays exact.
-- A cell with one signal photon has lanes in `{0, 255}` — the lanes *are*
-  that photon's flags.
-
-The per-surface lanes are overlapping marginals (`surf_type` is multi-hot):
-they do not sum to 255, and they cannot split the height distribution per
-surface (decision D: strata stay signal/noise, never per-surface).
+The [spec §3.2 quantization](specification.md#32-quantization-the-presence-floor)
+floors any nonzero lane count at 1 so `lane > 0` means "this flag occurred"
+**exactly, at every N**, through arbitrary merge chains — a rare surface flag
+never rounds away. Count recovery is exact whenever `N <= 254`, which is the
+entire below-compression-knee regime: measured 99.56% of non-empty cells on
+the live NEON store, full-mission pooling. The per-surface lanes are
+overlapping marginals (`surf_type` is multi-hot): they do not sum to 255, and
+they cannot split the height distribution per surface (decision D: strata
+stay signal/noise, never per-surface). The level lanes are **absolute** —
+always `conf == 2/3/4`, never renumbered against the threshold — so a product
+committing a higher threshold ships empty lower lanes rather than shifted
+ones, and one lane layout serves every product.
 
 ## Merge law
 
 `merge_composition(word_a, n_a, word_b, n_b)` folds lanes as the
-digest-weighted mean `(n_a·lane_a + n_b·lane_b)/(n_a + n_b)`, re-quantized
-with the same presence floor — an order-independent monoid whose `n` inputs
-come from the signal digests' total weights.
+digest-weighted mean, re-quantized with the same presence floor — an
+order-independent monoid whose `n` inputs come from the signal digests' total
+weights. The law is normative in
+[spec §3.4](specification.md#34-merge-law) (a reader may fold views, so it is
+part of the store contract, not a zagg implementation detail).
 
 ## Operational caveat
 
