@@ -5935,9 +5935,121 @@ class TestProcessShardCacheRelease:
         assert len(closes) == 1
         # A raised read is a real error, NOT a legitimately-empty read (issue
         # #116): the shard reports the read-error path and counts the failure,
-        # rather than the misleading "No data after filtering".
-        assert meta["error"] == "No data after filtering (1 group reads raised)"
+        # rather than the misleading "No data after filtering". The error text
+        # carries the first distinct exception message (issue #341).
+        assert meta["error"] == (
+            "No data after filtering (1 group reads raised; "
+            "e.g. RuntimeError: byte-range read failed)"
+        )
         assert meta["read_errors"] == 1
+        assert meta["read_error_exemplars"] == ["RuntimeError: byte-range read failed"]
+
+
+class _PerGroupRaisingH5:
+    """Stub whose every group read raises, message keyed on the group name."""
+
+    def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+        d = datasets[0]
+        path = d["dataset"] if isinstance(d, dict) else d
+        raise RuntimeError(f"boom {path.split('/')[1]}")
+
+    def close(self):
+        pass
+
+
+class TestReadErrorExemplars:
+    """Issue #341: the first N distinct group-read exception messages ride the
+    result payload (``read_error_exemplars``) and the no-data error text, and
+    the FIRST occurrence of each distinct message logs its full traceback at
+    WARNING (repeats keep the one-line warning). Bounded: N=3 distinct, ~300
+    chars each, no tracebacks on the wire."""
+
+    def _patch_h5(self, monkeypatch, factory):
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", factory)
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    @staticmethod
+    def _multi_group_cfg(groups):
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={
+                "groups": list(groups),
+                "coordinates": {"latitude": "/{group}/lat", "longitude": "/{group}/lon"},
+                "variables": {"h_li": "/{group}/h_li"},
+            },
+            aggregation={
+                "variables": {"count": {"function": "len", "dtype": "int32", "fill_value": 0}}
+            },
+        )
+
+    def test_exemplars_capped_distinct_and_in_error_text(self, monkeypatch):
+        # 5 groups -> 5 distinct failures; the payload carries the FIRST 3
+        # (group order — the serial loop is deterministic), the counter all 5.
+        self._patch_h5(monkeypatch, lambda *a, **k: _PerGroupRaisingH5())
+        cfg = self._multi_group_cfg(["gt1l", "gt1r", "gt2l", "gt2r", "gt3l"])
+        _df, meta = process_shard(_ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=cfg)
+        assert meta["read_errors"] == 5
+        assert meta["read_error_exemplars"] == [
+            "RuntimeError: boom gt1l",
+            "RuntimeError: boom gt1r",
+            "RuntimeError: boom gt2l",
+        ]
+        assert meta["error"] == (
+            "No data after filtering (5 group reads raised; "
+            "e.g. RuntimeError: boom gt1l | RuntimeError: boom gt1r | RuntimeError: boom gt2l)"
+        )
+
+    def test_exemplars_dedupe_by_message(self, monkeypatch):
+        # Two granules failing the same group with the same message: counted
+        # twice, exemplared once (the strata run's 121-identical-failures shape).
+        self._patch_h5(monkeypatch, lambda *a, **k: _PerGroupRaisingH5())
+        cfg = self._multi_group_cfg(["gt1l"])
+        _df, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=cfg
+        )
+        assert meta["read_errors"] == 2
+        assert meta["read_error_exemplars"] == ["RuntimeError: boom gt1l"]
+
+    def test_exemplar_messages_truncated(self, monkeypatch):
+        class _LongRaisingH5:
+            def readDatasets(self, datasets):  # noqa: N802
+                raise RuntimeError("x" * 1000)
+
+            def close(self):
+                pass
+
+        self._patch_h5(monkeypatch, lambda *a, **k: _LongRaisingH5())
+        cfg = self._multi_group_cfg(["gt1l"])
+        _df, meta = process_shard(_ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=cfg)
+        (msg,) = meta["read_error_exemplars"]
+        assert len(msg) == 300
+        assert msg.startswith("RuntimeError: xxx")
+
+    def test_first_distinct_failure_logs_traceback(self, monkeypatch, caplog):
+        # The full traceback was previously swallowed entirely (issue #341):
+        # the first occurrence of each distinct message now logs exc_info at
+        # WARNING; repeats keep the one-line warning (so the issue #175 metric
+        # filter fires at most N times per shard).
+        import logging as _logging
+
+        self._patch_h5(monkeypatch, lambda *a, **k: _PerGroupRaisingH5())
+        cfg = self._multi_group_cfg(["gt1l"])
+        with caplog.at_level(_logging.WARNING, logger="zagg.processing.worker"):
+            process_shard(_ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=cfg)
+        records = [r for r in caplog.records if "Error reading track" in r.getMessage()]
+        assert len(records) == 2
+        assert records[0].exc_info  # first distinct: full traceback
+        assert not records[1].exc_info  # repeat: one-liner, no traceback
+
+    def test_success_path_payload_unchanged(self, monkeypatch):
+        self._patch_h5(monkeypatch, lambda *a, **k: _CloseRecordingH5(_canned_arrays(), []))
+        _df, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a"], s3_credentials={}, config=_release_cfg()
+        )
+        assert meta["error"] is None
+        assert "read_errors" not in meta
+        assert "read_error_exemplars" not in meta
 
 
 class TestGranuleReadPool:

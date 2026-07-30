@@ -35,6 +35,10 @@ class ProcessingMetadata(TypedDict):
     # read is always a real error, so this surfaces a shard whose "no data"
     # result is actually a read failure rather than a legitimately-empty read.
     read_errors: NotRequired[int]
+    # First N distinct group-read exception messages, truncated (issue #341):
+    # the bounded diagnosis payload for ``read_errors`` — present exactly when
+    # ``read_errors`` is. Messages only; tracebacks stay in the worker log.
+    read_error_exemplars: NotRequired[list[str]]
     # Container telemetry (issue #171), stamped by the Lambda handler's
     # dispatcher into every per-unit envelope (all status branches) so the
     # runner can surface the warm-container RSS ratchet (#169). Absent on the
