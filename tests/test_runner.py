@@ -4331,14 +4331,17 @@ class TestFinalizeGuard:
         # worker stamps it into the parquet, which is the durable record a
         # postmortem reads — this summary dict never leaves the raising call.
         assert captured["stats_finalize_error"] == "RuntimeError: invoke failed"
-        # Message contract mirrors the PR #333 client facade: store path +
-        # shard-outputs-written + stale-manifest + idempotent re-invoke.
         msgs = [str(w.message) for w in caught if "manifest backstop" in str(w.message)]
         assert len(msgs) == 2  # warned at BOTH failures
         for m in msgs:
-            assert "s3://out/x.zarr" in m
-            assert "Shard outputs are written" in m
-            assert "idempotent" in m
+            assert "s3://out/x.zarr" in m and "invoke failed" in m  # store + diagnosis
+        # The retryable attempt says only that a retry is imminent (review
+        # finding): the stale-manifest contract would be FALSE if the retry
+        # healed it. The terminal warning carries the full remediation.
+        assert msgs[0].endswith("Retrying in 5 s.")
+        assert "Shard outputs are written" not in msgs[0]
+        assert "Shard outputs are written" in msgs[1] and "idempotent" in msgs[1]
+        assert msgs[1].endswith("This error re-raises after the post-run tail completes.")
 
     def test_finalize_error_wins_over_a_later_tail_crash(self, monkeypatch, atl06_config, caplog):
         """D6 precedence (fold of the review finding), matching PR #333's
