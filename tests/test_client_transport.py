@@ -349,6 +349,22 @@ class TestStatusPoller:
         kwargs.setdefault("drop_timeout_s", 1050.0)
         return ct.StatusPoller(lambda: store, **kwargs)
 
+    def test_a_freed_slot_refills_in_the_same_tick(self):
+        # _tick consumed AFTER dispatching, so a slot freed by a resolution sat
+        # idle until the NEXT tick — up to _POLL_MAX_INTERVAL_S of dead window
+        # (review, PR #343). Driven tick by tick, no threads.
+        store = MemoryStore()
+        fired: list[int] = []
+        poller = self._poller(store, max_in_flight=1)
+        f1 = poller.register(1, "1", dispatch=lambda: fired.append(1))
+        poller.register(2, "2", dispatch=lambda: fired.append(2))
+        poller._tick()
+        assert fired == [1]  # the window holds shard 2 back
+        _put_status(store, 1)
+        poller._tick()  # ONE tick: resolve shard 1 AND fire shard 2
+        assert f1.done()
+        assert fired == [1, 2]
+
     def test_unknown_schema_version_warns_and_still_resolves(self, caplog):
         # A newer worker against an older client is the normal fleet state
         # during a layer roll: the object is honored (a shard whose data landed

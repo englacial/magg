@@ -19,7 +19,9 @@ home:
   as every other worker write, so the dispatcher-never-writes rule (D8) is
   preserved by construction.
 - **Client half** (later phases of issue #327): the polling resolver that
-  turns one LIST of the run prefix per tick into future resolutions.
+  turns one LIST of the run prefix per tick into future resolutions (one LIST
+  *call*, which is O(N/1000) requests — see :class:`StatusPoller` for the real
+  per-tick cost).
 
 Naming: the shard component is the shard key's plain decimal rendering
 (``str(int(shard_key))``) — derivable on every handler branch including the
@@ -610,10 +612,28 @@ class _ShardEntry:
 class StatusPoller:
     """Single background thread resolving ALL shard futures from status objects.
 
-    One LIST of the run's status prefix per tick — O(1) requests per tick
-    regardless of shard count — then one GET per newly-landed (or
-    re-attempted) object. Never writes (D8: the LIST/GETs are reads; every
+    One LIST of the run's status prefix per tick, then one GET per newly-landed
+    (or re-attempted) object. Never writes (D8: the LIST/GETs are reads; every
     write stays worker-side).
+
+    **What "one LIST per tick" actually costs** (review finding, PR #343 —
+    issue #327's acceptance criterion says *O(1) LIST per tick regardless of
+    shard count*, and that is not literally true): :meth:`_list_keys` re-lists
+    the WHOLE run prefix and materializes every key, so a tick is O(N/1000)
+    requests (``obstore.list``'s internal pagination) and O(N) key parsing —
+    ~5 pages and 5k parsed paths per tick at 5k shards, in perpetuity. It is
+    one *call site*, not one request. Trimming it would mean a lexicographic
+    offset past the highest consumed key (``list_with_offset``); at the orders
+    zagg dispatches today the LIST is not the cost that matters, but nobody
+    should size a 50k-shard run off an O(1) claim. Two smaller notes on the
+    same seam: a shard awaiting a re-fire keeps its stale object listed, so it
+    is re-GET and re-parsed every tick until the new attempt lands (bounded by
+    the failed-shard count); and :meth:`_dispatch_up_to_window` fires its whole
+    batch SERIALLY on this thread, where v1 invoked from ``workers`` threads —
+    so a ``max_in_flight``-wide opening burst is one thread's sequential invoke
+    round-trips (order 10 ms each, i.e. tens of seconds at a 1000-wide window)
+    during which no LIST runs. Fine for 900 s shards; it is a real ramp, not a
+    mystery.
 
     The poller also owns Event dispatch: shards register with a zero-arg
     ``dispatch`` closure and at most ``max_in_flight`` are
@@ -822,10 +842,20 @@ class StatusPoller:
             return [e for e in self._entries.values() if not e.future.done()]
 
     def _tick(self) -> bool:
-        progressed = self._dispatch_up_to_window()
+        # Resolve BEFORE dispatching so a slot freed by a resolution refills in
+        # the SAME tick (review finding, PR #343: dispatching first left the
+        # slot idle until the next tick — up to _POLL_MAX_INTERVAL_S of dead
+        # window). Harmless on the opening tick: every entry is still queued, so
+        # _resolve_landed finds no pending entry and skips the LIST entirely.
+        progressed = self._resolve_landed()
+        return self._dispatch_up_to_window() or progressed
+
+    def _resolve_landed(self) -> bool:
+        """Consume newly-landed status objects; classify past-deadline shards."""
         pending = [e for e in self._pending() if not e.queued]
         if not pending:
-            return progressed
+            return False
+        progressed = False
         listed = self._list_keys()
         now = self._clock()
         for entry in pending:
