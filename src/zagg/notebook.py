@@ -115,9 +115,7 @@ class StageTimer:
         for name, calls, seconds, pct in self._rows():
             lines.append(f"{name:<{width}}  {calls:>5d}  {seconds:>9.3f}  {pct:>5.1f}%")
         lines.append("-" * len(head))
-        lines.append(
-            f"{'total':<{width}}  {'':>5}  {self.total_s:>9.3f}  {100.0 if self.stages else 0:>5.1f}%"
-        )
+        lines.append(f"{'total':<{width}}  {'':>5}  {self.total_s:>9.3f}  {100.0:>5.1f}%")
         return "\n".join(lines)
 
     def _repr_html_(self) -> str:
