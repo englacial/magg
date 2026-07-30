@@ -667,6 +667,22 @@ sha256( for each cell:  u64_le(len(payload)) || payload )
   digest injective (`[b"ab", b"c"]` and `[b"a", b"bc"]` must not collide),
   and it covers the cell *grid*, not just the payloads.
 
+  The **element → bytes** normalization is itself normative, because a `/2`
+  (§6) cell decodes to an ndarray rather than to bytes:
+
+  | decoded element | payload bytes |
+  |---|---|
+  | `None` — an unwritten vlen cell may decode as `None`, not `b""` | zero-length |
+  | `bytes` / `bytearray` / `memoryview` (a `/1` cell) | as-is |
+  | `str` (a vlen-utf8 future) | UTF-8 encoded |
+  | ndarray (a typed `/2` cell) | **C-contiguous, little-endian** bytes at the declared element dtype |
+  | anything else | the recipe **does not apply**: a verifier MUST raise rather than hash |
+
+  The last row is deliberate: a digest that is silently wrong is worse than no
+  digest, so hashing a `repr` or a pointer buffer is forbidden. `None` and
+  `b""` hash identically by construction — a `b""` fill is distinguishable
+  from a missing cell only by position, which is the intent.
+
 ### 5.3 Combined hash and sidecar record
 
 **Contract.** The combined hash is sha256 over the **sorted** per-array hex
@@ -741,7 +757,9 @@ point of the revision):
 - the §7 conformance fixtures serve both revisions — a `/1` fixture's chunk
   objects re-labeled `/2` MUST decode identically through the typed path;
 - the §5 O11 vlen recipe is unaffected (it hashes decoded payload bytes,
-  which are identical by construction).
+  which are identical by construction) — this is exactly what §5.2's
+  element→bytes normalization buys: a `/2` cell decodes to an ndarray, whose
+  C-contiguous little-endian bytes are the `/1` cell's bytes.
 
 ### 6.3 Revision signaling
 

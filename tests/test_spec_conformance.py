@@ -353,6 +353,28 @@ class TestContentHashes:
     """
 
     @staticmethod
+    def _element_bytes(element) -> bytes:
+        """The §5.2 element→bytes normalization, from the spec table.
+
+        ``None`` (an unwritten vlen cell may decode as ``None``) is
+        zero-length; a `/1` cell is bytes as-is; a typed `/2` ndarray cell is
+        C-contiguous little-endian bytes at its dtype; anything else raises
+        rather than hashing something wrong.
+        """
+        if element is None:
+            return b""
+        if isinstance(element, bytes | bytearray | memoryview):
+            return bytes(element)
+        if isinstance(element, str):
+            return element.encode()
+        if isinstance(element, np.ndarray):
+            values = np.ascontiguousarray(element)
+            if values.dtype.byteorder == ">":
+                values = values.astype(values.dtype.newbyteorder("<"))
+            return values.tobytes()
+        raise ValueError(f"vlen element of type {type(element).__name__} has no O11 recipe")
+
+    @staticmethod
     def _hash_leaf(leaf: Path) -> dict:
         group = zarr.open_group(LocalStore(str(leaf)), mode="r", zarr_format=3)
         hashes = {}
@@ -363,7 +385,7 @@ class TestContentHashes:
             if values.dtype.kind == "O":
                 digest = hashlib.sha256()
                 for element in values.ravel(order="C"):
-                    payload = b"" if element is None else bytes(element)
+                    payload = TestContentHashes._element_bytes(element)
                     digest.update(len(payload).to_bytes(8, "little"))
                     digest.update(payload)
                 hashes[key] = digest.hexdigest()
@@ -416,6 +438,19 @@ class TestContentHashes:
         arrays = exp["content_hashes"]["arrays"]
         combined = hashlib.sha256("\n".join(sorted(arrays.values())).encode()).hexdigest()
         assert combined == exp["content_hashes"]["combined"]
+
+    def test_element_bytes_normalization(self):
+        # §5.2's table: None ≡ b"", a typed /2 ndarray cell normalizes to
+        # C-contiguous little-endian bytes, anything else raises.
+        norm = TestContentHashes._element_bytes
+        assert norm(None) == b""
+        assert norm(bytearray(b"ab")) == b"ab"
+        assert norm(memoryview(b"ab")) == b"ab"
+        assert norm("ab") == b"ab"
+        little = np.array([[1.5, 2.0]], dtype="<f4")
+        assert norm(np.asfortranarray(little.astype(">f4"))) == little.tobytes()
+        with pytest.raises(ValueError, match="no O11 recipe"):
+            norm(3.5)
 
     @pytest.mark.parametrize("name", FIXTURES)
     def test_frozen_digests_pin_the_recipe(self, name):
