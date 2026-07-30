@@ -143,12 +143,21 @@ jobs:
           set -euo pipefail
           KEY="lambda-test/${SHA}/lambda_layer_arm64.zip"
           aws s3 cp deployment/layers/lambda_layer_arm64.zip "s3://${STAGE_BUCKET}/${KEY}" --region "$REGION"
+          # --variants is pinned to the TEST-stack shape (issue #341): template.yaml
+          # provisions only ${FunctionName}-test-<size>-disk (WorkerTestDiskVariants
+          # — there is no test analogue of WorkerSizeVariants), and the deploy role
+          # enumerates exactly those ARNs. Without this, the script's prod default
+          # would probe the plain-memory trio, get AccessDenied (not 404) from the
+          # enumerated role, and print three "it may now be STALE" warnings on every
+          # green deploy — naming functions that will never exist. Kept in sync with
+          # the template by tests/test_deploy_lambda.py.
           .github/scripts/deploy_lambda.sh \
             --function "$FUNCTION_NAME" \
             --layer-bucket "$STAGE_BUCKET" \
             --layer-key "$KEY" \
             --function-zip "$(ls deployment/builds/lambda_function_arm64_*.zip)" \
-            --region "$REGION"
+            --region "$REGION" \
+            --variants "-2048-disk -4096-disk -8192-disk"
 
   merge-publish:
     needs: [detect, deploy-test]
