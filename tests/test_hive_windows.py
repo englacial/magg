@@ -12,6 +12,7 @@ import pytest
 from zagg import hive
 from zagg.config import default_config, get_windowing, validate_config
 from zagg.grids import HealpixGrid
+from zagg.windows import union_time_range
 
 
 @pytest.fixture
@@ -850,9 +851,12 @@ class TestCoverageFull:
 
 
 class TestRootTimeUnion:
+    # The helper is ``zagg.windows``' own (the hive root union just calls it);
+    # reached through its true home since the issue #330 phase-1 split, which
+    # ended the incidental ``zagg.hive.union_time_range`` re-export.
     def test_union_time_range(self):
-        assert hive.union_time_range(None, None) is None
-        got = hive.union_time_range(
+        assert union_time_range(None, None) is None
+        got = union_time_range(
             ["2024-06-01T00:00:00+00:00", "2024-09-01T00:00:00+00:00"],
             None,
             ["2024-01-01T00:00:00+00:00", "2024-07-01T00:00:00+00:00"],
@@ -863,7 +867,7 @@ class TestRootTimeUnion:
         import logging
 
         with caplog.at_level(logging.WARNING, logger="zagg.windows"):
-            got = hive.union_time_range(
+            got = union_time_range(
                 ["garbage", "2024-01-01"],
                 ["2024-06-01T00:00:00+00:00", "2024-07-01T00:00:00+00:00"],
             )
