@@ -104,8 +104,11 @@ A ragged field `{field}` under a product group is up to three sibling arrays:
   a t-digest whose `inner_shape` is `(2,)`), C-order, in the declared element
   dtype, independent of the producing machine.
 - Empty cells keep the `b""` fill (`fill_value: ""`); an inner chunk with no
-  ragged data MUST be omitted from disk entirely — the same sub-shard
-  sparsity the dense arrays get.
+  ragged data MUST be **absent from the store** — omitted as an object in the
+  per-inner-chunk geometry, and marked absent with the §1.5 sentinel inside
+  the shard object when sharded (the default). Either way object size scales
+  with populated chunks only — the same sub-shard sparsity the dense arrays
+  get.
 - A **located** field's sibling `{field}_locations` array is itself a
   `zagg-ragged/1` vlen array (element dtype `uint64`, empty `inner_shape`)
   with the same shape and chunk geometry as the payload array, and MUST be
