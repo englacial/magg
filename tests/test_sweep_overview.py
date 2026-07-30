@@ -809,6 +809,40 @@ class TestSection83Obligations:
         for p, digest in hashes.items():
             assert json.loads(p.read_text())["windows"]["all"]["content_hash"] == digest
 
+    def test_deleting_only_the_zarrs_regenerates_them(self, tmp_path):
+        # Review finding, issue #201: the envelope and the zarr are two objects,
+        # so skip-if-current must probe the ARTIFACT — deleting only the zarrs
+        # used to read back as `current` with nothing on disk (no D9 self-heal).
+        import shutil
+
+        refs = self._populate(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("moc", "overview"))
+        hashes = {
+            p: json.loads(p.read_text())["windows"]["all"]["content_hash"]
+            for p in tmp_path.rglob("overview.rollup.json")
+        }
+        zarrs = sorted(tmp_path.rglob("all.zarr"))
+        assert len(zarrs) == 2 and len(hashes) == 2
+        for p in zarrs:
+            shutil.rmtree(p)
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 2 and counts["current"] == 0
+        for p in zarrs:
+            assert read_commit(open_store(str(p))) is not None
+        # ...and the regenerated folds are byte-identical (same content hashes).
+        for p, digest in hashes.items():
+            assert json.loads(p.read_text())["windows"]["all"]["content_hash"] == digest
+
+    def test_torn_overview_write_is_not_current(self, tmp_path):
+        # The same probe covers a torn prior write: the zarr is there but the
+        # commit stamp never landed, so the entry must not read as `current`.
+        refs = self._populate(tmp_path, orders=(0,))
+        run_sweep(str(tmp_path), refs, families=("moc", "overview"))
+        (tmp_path / "-3" / "all.zarr" / "zarr.json").unlink()
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 1 and counts["current"] == 0
+        assert read_commit(open_store(str(tmp_path / "-3" / "all.zarr"))) is not None
+
     def test_repair_walk_ignores_overviews(self, tmp_path):
         # Review finding, issue #201: overview basenames collide with the leaf
         # grammar, so the D9 repair walk must classify them out by the D11 role

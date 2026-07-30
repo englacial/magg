@@ -304,8 +304,10 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
 
     Idempotent: a (node, window) whose stored generation stamp (merged-leaf
     count + max leaf stamp timestamp) AND content hash both match the freshly
-    folded payload is skipped — the hash is the same-second backstop the
-    engine's payload compare provides for JSON families. Returns the standard
+    folded payload — and whose zarr is confirmed present and stamped, since the
+    envelope and the artifact are two objects (D9) — is skipped; the hash is
+    the same-second backstop the engine's payload compare provides for JSON
+    families. Returns the standard
     ``written``/``current``/``empty``/``failed`` counts plus ``declared``.
     """
     from zagg.store import open_object_store
@@ -548,6 +550,7 @@ def _roll_node(
         isinstance(existing_entry, dict)
         and existing_entry.get("generation") == fold["generation"]
         and existing_entry.get("content_hash") == fold["content_hash"]
+        and _overview_committed(store_root, node, existing_entry.get("object"), store_kwargs)
     ):
         counts["current"] += 1
         return existing_entry
@@ -565,6 +568,29 @@ def _roll_node(
         "generation": fold["generation"],
         "content_hash": fold["content_hash"],
     }
+
+
+def _overview_committed(store_root, node, basename, store_kwargs) -> bool:
+    """Whether the entry's overview zarr is really present AND stamped (D9).
+
+    Unlike the JSON families — whose bookkeeping IS the artifact, so they
+    self-heal for free — the overview's envelope entry and its zarr are two
+    objects: a generation+hash match proves nothing about the zarr surviving.
+    One commit-stamp GET makes skip-if-current self-healing (a deleted
+    overview regenerates) and doubles as proof the D4 stamp landed, so a torn
+    prior write no longer reads as ``current`` (review finding, issue #201).
+    """
+    from zagg.hive import read_commit
+    from zagg.store import open_store
+
+    if not basename:
+        return False
+    try:
+        leaf = open_store(f"{store_root}/{_node_rel(node)}/{basename}", **store_kwargs)
+        return read_commit(leaf) is not None
+    except Exception as e:  # an unreadable object is not a current one
+        logger.debug(f"sweep[overview]: cannot confirm {node}/{basename} ({e})")
+        return False
 
 
 def _fold_node(
