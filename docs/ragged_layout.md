@@ -157,13 +157,64 @@ cannot drift.
   not re-fetched per inner chunk). Each read chunk is a square `(side, side)`
   block of cells (`side = isqrt(cells_per_chunk)`, 64 for the production
   `chunk_inner` configs), and its coverage-cell morton id is derived from the
-  sibling `morton` coordinate coarsened to the chunk order.
+  sibling `morton` coordinate coarsened to the chunk order. Cell placement
+  within the block is the spec-pinned bit deinterleave — see
+  [the tensor section below](#spatially-faithful-tensors-deinterleave-blocks-mask).
 - **Single-cell random access** (`read_cell`) — indexes the vlen array directly.
   On a sharded store that is exactly **2 ranged GETs** (the shard-index suffix,
   then the one inner chunk holding the cell), never the whole shard object. An
   out-of-range index raises `IndexError` naming the valid range (no negative-index
   wrap); an absent cell returns the zero-length `(0, *inner_shape)` array. Works
   on the `{field}_locations` sibling too.
+
+## Spatially faithful tensors (deinterleave, blocks, mask)
+
+The nested cells axis traces a **Z-order curve** within each chunk subtree, so
+a row-major reshape of the 1-D axis scrambles the 2-D block spatially beyond
+2-cell runs. The readers instead place each cell at the **bit deinterleave**
+of its chunk-local nested rank
+([issue #336](https://github.com/englacial/zagg/issues/336)):
+`mortie.rank_to_xy` / `xy_to_rank` (mortie ≥ 0.9.3), whose contract is
+normative in mortie's `docs/specification.md` **§8** and frozen for mortie 1.x
+— `x` gathers the rank's even bits, `y` its odd bits, origin `(0, 0)` at the
+subtree's south corner, equal to healpy's face-local `pix2xyf` (nest)
+convention. zagg pins **row = y, col = x** (`readers/_layout.py`), matching
+gridlook's `bit_combine(j, i)` texture convention
+(`gridlook/src/ui/grids/Healpix.vue`), so an emitted tensor uploads to a
+gridlook texture with no further shuffle. The golden placement vectors in
+`tests/test_reader_layout.py` are imported from mortie's spec-pinned test
+suite, never re-derived.
+
+`read_tensors` yields the full reader contract per block:
+
+```python
+for tensor, mask, (offset, gain), morton in read_tensors(store, field):
+    ...  # tensor: (side, side, n_bins); mask: (side, side) uint8
+```
+
+- **Blocks** — by default one block per read chunk; `block_order=` assembles
+  the `4**(chunk_order - block_order)` chunks of one block-order subtree into
+  a single `(2**d, 2**d, n_bins)` tensor (`d = cell_order - block_order`; an
+  order-12 block on production geometry is 128×128 from 4 inner chunks). The
+  z-window and `fit` policy are reconciled **block-wide**: one shared
+  `(offset, gain) = (z_lo, resolution)` per block, so bin `i` covers
+  `[offset + i*gain, offset + (i+1)*gain)` for every cell in the block.
+- **Mask** — the block's occupancy channel on the same deinterleaved layout:
+  `0` unobserved, `1` observed with no stored digest, `2` observed with data.
+  States 1/2 come from the hive leaf's `coverage.moc` occupancy sidecar
+  ([issue #200](https://github.com/englacial/zagg/issues/200); decoded by the
+  frozen `hive.decode_coverage_bitmap` convention, one small sidecar object,
+  no digest bytes). A store without exact occupancy (every flat store, or a
+  box-only/`full`-less missing sidecar) degrades to the 2-state `{0, 2}`
+  populated/not mask. Today occupancy equals digest coverage, so state `1`
+  does not occur; once the
+  [issue #334](https://github.com/englacial/zagg/issues/334) signal strata
+  land, noise-occupied cells appear as `1` automatically — the 3-state
+  upgrade is data-driven, not a reader flag.
+
+`read_raw_values` / `read_locations` report the same deinterleaved
+`(row, col)` per cell (invert with `readers._layout.rowcol_to_rank` to get a
+cells-axis index for `read_cell`).
 
 ## Issue #210 typed-dtype migration
 
