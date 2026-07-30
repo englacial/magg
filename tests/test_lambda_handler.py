@@ -1366,6 +1366,83 @@ class TestSetupHive:
         assert json.loads(resp["body"]) == {"ok": True, "mode": "setup", "layout": "hive"}
 
 
+class TestDispatchManifest:
+    """Issue #327 phase 2: a setup event carrying ``run_manifest`` has the
+    WORKER write ``<store>.status/run-<id>/manifest.json`` (D8 intact) —
+    fail-open, and only on a successful setup."""
+
+    _BLOCK = {
+        "run_id": "runid2",
+        "shards": ["12345", "67890"],
+        "semantic_hash": "ab" * 32,
+        "dispatched_at": "2026-07-30T00:00:00+00:00",
+        "dataset": {"short_name": "ATL06", "version": "007"},
+    }
+
+    def _event(self, tmp_path, **extra):
+        return {
+            "mode": "setup",
+            "store_path": str(tmp_path / "hive-out"),
+            "parent_order": 6,
+            "overwrite": False,
+            "config": TestProcessHive._hive_config_dict(),
+            "dataset": {"short_name": "ATL06", "version": "007"},
+            "run_manifest": dict(self._BLOCK),
+            **extra,
+        }
+
+    @staticmethod
+    def _read_manifest(tmp_path):
+        p = tmp_path / "hive-out.status" / "run-runid2" / "manifest.json"
+        return json.loads(p.read_text()) if p.exists() else None
+
+    def test_setup_writes_dispatch_manifest_with_config(self, handler_mod, tmp_path):
+        event = self._event(tmp_path)
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200, resp["body"]
+        manifest = self._read_manifest(tmp_path)
+        assert manifest["schema_version"] == 1
+        assert manifest["run_id"] == "runid2"
+        assert manifest["shards"] == ["12345", "67890"]
+        assert manifest["semantic_hash"] == "ab" * 32
+        assert manifest["dispatched_at"] == "2026-07-30T00:00:00+00:00"
+        assert manifest["dataset"] == {"short_name": "ATL06", "version": "007"}
+        # The worker folds the setup event's own config in, so attach can
+        # rebuild the Run without the dispatcher duplicating it on the wire.
+        assert manifest["config"] == event["config"]
+
+    def test_absent_block_writes_nothing(self, handler_mod, tmp_path):
+        event = self._event(tmp_path)
+        del event["run_manifest"]
+        assert handler_mod.lambda_handler(event, _context())["statusCode"] == 200
+        assert not (tmp_path / "hive-out.status").exists()
+
+    def test_failed_setup_writes_no_manifest(self, handler_mod, tmp_path):
+        # Same frozen-key refusal as TestSetupHive: the 500 must not leave a
+        # dispatch manifest claiming a run that never set up.
+        assert handler_mod.lambda_handler(self._event(tmp_path), _context())["statusCode"] == 200
+        other = TestProcessHive._hive_config_dict()
+        other["output"]["grid"]["parent_order"] = 5
+        event = self._event(tmp_path, config=other, run_manifest={**self._BLOCK, "run_id": "bad"})
+        assert handler_mod.lambda_handler(event, _context())["statusCode"] == 500
+        assert not (tmp_path / "hive-out.status" / "run-bad").exists()
+
+    def test_manifest_write_failure_never_fails_setup(self, handler_mod, monkeypatch, tmp_path):
+        import zagg.store
+
+        real = zagg.store.open_object_store
+
+        def boom(prefix, **kwargs):
+            if ".status" in prefix:
+                raise RuntimeError("status channel down")
+            return real(prefix, **kwargs)
+
+        monkeypatch.setattr(zagg.store, "open_object_store", boom)
+        resp = handler_mod.lambda_handler(self._event(tmp_path), _context())
+        assert resp["statusCode"] == 200
+        assert self._read_manifest(tmp_path) is None
+
+
 class TestFinalizeHive:
     """Issue #252 (hybrid): for a hive config, finalize mode re-ensures the
     root ``morton_hive.json`` — the idempotent backstop for the async
@@ -1555,6 +1632,90 @@ class TestStatsMode:
             {"mode": "stats", "run_id": "r", "rows": [{}]}, MagicMock()
         )
         assert resp["statusCode"] == 500
+
+    def test_tail_status_url_writes_the_marker(self, handler_mod, tmp_path):
+        # Issue #327 phase 5: the stats leg is the recorded end of the
+        # post-run tail; the marker lets Run.attach skip a tail that ran.
+        root = str(tmp_path / "out")
+        url = str(tmp_path / "out.zarr.status" / "run-runid1" / "tail.json")
+        event = {
+            "mode": "stats",
+            "store_path": root,
+            "run_id": "runid1",
+            "timestamp": "20260720T010203Z",
+            "rows": self._rows(),
+            "tail_status_url": url,
+        }
+        assert handler_mod.lambda_handler(event, MagicMock())["statusCode"] == 200
+        marker = json.loads(Path(url).read_text())
+        assert marker["status"] == "tail_done"
+        assert marker["run_id"] == "runid1"
+        # The 0-row path records the marker too (nothing to persist != no tail).
+        url2 = str(tmp_path / "out.zarr.status" / "run-runid2" / "tail.json")
+        resp = handler_mod.lambda_handler(
+            {"mode": "stats", "store_path": root, "run_id": "runid2", "tail_status_url": url2},
+            MagicMock(),
+        )
+        assert resp["statusCode"] == 200
+        assert json.loads(Path(url2).read_text())["run_id"] == "runid2"
+
+    def test_marker_failure_never_fails_the_stats_write(self, handler_mod, monkeypatch, tmp_path):
+        import zagg.client_transport
+
+        def boom(*a, **k):
+            raise RuntimeError("marker down")
+
+        monkeypatch.setattr(zagg.client_transport, "write_tail_status", boom)
+        root = str(tmp_path / "out")
+        event = {
+            "mode": "stats",
+            "store_path": root,
+            "run_id": "runid1",
+            "timestamp": "20260720T010203Z",
+            "rows": self._rows(),
+            "tail_status_url": str(tmp_path / "t.json"),
+        }
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["rows"] == 2
+
+    def test_finalize_error_withholds_the_marker(self, handler_mod, tmp_path):
+        # Review finding, PR #343: the marker means "the tail RAN", and
+        # Run.attach reads it as "skip the whole tail" — including the
+        # idempotent finalize backstop a failed-finalize run is exactly the one
+        # that needs. So a stats event carrying #335's finalize_error writes
+        # the run parquet (the durable failure column) but NOT the marker.
+        root = str(tmp_path / "out")
+        url = str(tmp_path / "out.zarr.status" / "run-runid1" / "tail.json")
+        event = {
+            "mode": "stats",
+            "store_path": root,
+            "run_id": "runid1",
+            "timestamp": "20260720T010203Z",
+            "rows": self._rows(),
+            "tail_status_url": url,
+            "finalize_error": "finalize down",
+        }
+        resp = handler_mod.lambda_handler(event, MagicMock())
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["rows"] == 2  # the record still lands
+        assert not Path(url).exists()
+        # ... and a successful finalize (None on the wire) still writes it.
+        event["finalize_error"] = None
+        assert handler_mod.lambda_handler(event, MagicMock())["statusCode"] == 200
+        assert json.loads(Path(url).read_text())["status"] == "tail_done"
+
+    def test_no_tail_status_url_writes_no_marker(self, handler_mod, tmp_path):
+        root = str(tmp_path / "out")
+        event = {
+            "mode": "stats",
+            "store_path": root,
+            "run_id": "runid1",
+            "timestamp": "20260720T010203Z",
+            "rows": self._rows(),
+        }
+        assert handler_mod.lambda_handler(event, MagicMock())["statusCode"] == 200
+        assert not (tmp_path / "out.zarr.status").exists()
 
 
 class TestPingMode:
@@ -2658,3 +2819,155 @@ class TestAsyncResultWrite:
         resp = handler_mod.lambda_handler({"mode": "extract", "result_url": url}, _context())
         assert resp["statusCode"] == 200
         assert not Path(url).exists()
+
+
+class TestShardStatusObject:
+    """Per-shard status objects (issue #327): always-on, every per-unit status
+    branch, written through the worker's own store factory to the run's
+    ``<store>.status/run-<id>/shard-<key>.json`` — and emphatically fail-open:
+    a status write failure never affects the shard result."""
+
+    def _event(self, monkeypatch, tmp_path, *, meta_error=None, run_id="runid1", **extra):
+        import zagg.grids as grids
+        import zagg.processing as processing
+
+        def fake_process_shard(grid, shard_key, granule_urls, **kwargs):
+            meta = {
+                "shard_key": shard_key,
+                "cells_with_data": 3,
+                "total_obs": 7,
+                "granule_count": len(granule_urls),
+                "files_processed": 1,
+                "duration_s": 0.5,
+                "error": meta_error,
+                "phase_timings": {"read": 1.0, "aggregate": 0.5},
+            }
+            return pd.DataFrame(), meta
+
+        monkeypatch.setattr(processing, "process_shard", fake_process_shard)
+        monkeypatch.setattr(grids, "from_config", lambda *a, **k: MagicMock())
+        event = _base_event(_healpix_config_dict())
+        event["child_order"] = 12
+        event["store_path"] = str(tmp_path / "x.zarr")
+        if run_id is not None:
+            event["run_id"] = run_id
+        event.update(extra)
+        return event
+
+    @staticmethod
+    def _read_status(tmp_path, key="shard-12345.json", run_id="runid1"):
+        p = tmp_path / "x.zarr.status" / f"run-{run_id}" / key
+        return json.loads(p.read_text()) if p.exists() else None
+
+    def test_ok_shard_writes_ok_status(self, handler_mod, monkeypatch, tmp_path):
+        event = self._event(monkeypatch, tmp_path)
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200
+        obj = self._read_status(tmp_path)
+        assert obj["status"] == "ok"
+        assert obj["schema_version"] == 1
+        assert obj["run_id"] == "runid1"
+        assert obj["shard"] == "12345"
+        assert obj["window"] is None
+        assert obj["error"] is None
+        assert obj["status_code"] == 200
+        assert len(obj["attempt_id"]) == 32  # a fresh uuid per execution
+        # The phase dict is the SAME one the response envelope carries.
+        assert obj["timings"] == json.loads(resp["body"])["phase_timings"]
+        # ... and the full body rides along so the poller can synthesize the
+        # sync transport's result dict (stats record, counters).
+        assert obj["body"]["total_obs"] == 7
+        assert obj["body"]["stats"]["run_id"] == "runid1"
+
+    def test_benign_no_work_is_no_data(self, handler_mod, monkeypatch, tmp_path):
+        event = self._event(monkeypatch, tmp_path, meta_error="No granules found")
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 500  # the envelope shape is unchanged
+        obj = self._read_status(tmp_path)
+        assert obj["status"] == "no_data"
+        assert obj["error"] == "No granules found"
+
+    def test_gate_400_writes_failed_status(self, handler_mod, monkeypatch, tmp_path):
+        # The caught-error path: a 400/500 envelope still records a status, so
+        # the poller learns fast instead of waiting out the drop deadline.
+        event = self._event(monkeypatch, tmp_path)
+        del event["granule_urls"]
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 400
+        obj = self._read_status(tmp_path)
+        assert obj["status"] == "failed"
+        assert "granule_urls" in obj["error"]
+        assert obj["status_code"] == 400
+
+    def test_unhandled_exception_writes_failed_status(self, handler_mod, monkeypatch, tmp_path):
+        import zagg.processing as processing
+
+        event = self._event(monkeypatch, tmp_path)
+
+        def boom(*a, **k):
+            raise RuntimeError("worker blew up")
+
+        monkeypatch.setattr(processing, "process_shard", boom)
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 500
+        obj = self._read_status(tmp_path)
+        assert obj["status"] == "failed"
+        assert "worker blew up" in obj["error"]
+
+    def test_windowed_unit_suffixes_the_window_label(self, handler_mod, monkeypatch, tmp_path):
+        event = self._event(
+            monkeypatch, tmp_path, window={"label": "2020", "start": 0.0, "end": 1.0}
+        )
+        handler_mod.lambda_handler(event, _context())
+        obj = self._read_status(tmp_path, key="shard-12345_2020.json")
+        assert obj["status"] == "ok"
+        assert obj["window"] == "2020"
+
+    def test_no_run_id_writes_nothing(self, handler_mod, monkeypatch, tmp_path):
+        # Old dispatcher: no run identity -> no status prefix to name, and the
+        # event/behavior stay byte-identical to pre-#327.
+        event = self._event(monkeypatch, tmp_path, run_id=None)
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200
+        assert not (tmp_path / "x.zarr.status").exists()
+
+    def test_raising_store_never_affects_the_shard_result(self, handler_mod, monkeypatch, tmp_path):
+        # The espg-ratified fail-open contract (issue #327): ANY exception in
+        # the status write logs and the shard's normal result stands.
+        import zagg.store
+
+        def boom(*a, **k):
+            raise RuntimeError("status channel down")
+
+        monkeypatch.setattr(zagg.store, "open_object_store", boom)
+        event = self._event(monkeypatch, tmp_path)
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"])["total_obs"] == 7
+        assert not (tmp_path / "x.zarr.status").exists()
+
+    def test_transport_module_failure_is_also_swallowed(self, handler_mod, monkeypatch, tmp_path):
+        # Belt-and-braces: even the transport helper itself raising (or a
+        # function zip missing the module) must not fail the shard.
+        import zagg.client_transport
+
+        def boom(*a, **k):
+            raise RuntimeError("no transport")
+
+        monkeypatch.setattr(zagg.client_transport, "write_shard_status", boom)
+        event = self._event(monkeypatch, tmp_path)
+        resp = handler_mod.lambda_handler(event, _context())
+        assert resp["statusCode"] == 200
+
+    def test_duplicate_execution_overwrites_with_fresh_attempt_id(
+        self, handler_mod, monkeypatch, tmp_path
+    ):
+        # MaximumRetryAttempts is 0 fleet-wide, so a duplicate execution is a
+        # client re-dispatch; last-writer-wins with a NEW attempt_id is what
+        # keeps the poller's retry accounting straight (issue #327).
+        event = self._event(monkeypatch, tmp_path)
+        handler_mod.lambda_handler(event, _context())
+        first = self._read_status(tmp_path)["attempt_id"]
+        handler_mod.lambda_handler(event, _context())
+        second = self._read_status(tmp_path)["attempt_id"]
+        assert first != second

@@ -261,8 +261,21 @@ def agg(
         caller to have read access to the output bucket for the poll. Note the
         async request payload cap is 256 KB (vs 6 MB synchronous); pass
         ``"sync"`` for older deployed workers or extreme per-cell payloads
-        (granule-dense shards with large AOI masks). Ignored by the
-        ``"local"`` backend.
+        (granule-dense shards with large AOI masks). ``"event"`` (issue #327,
+        spatial point path only) keeps the same blocking call-shape, return
+        value, and exceptions, with the v2 status-object transport
+        underneath: fire-and-forget Event invokes (no ``result_url``),
+        futures resolved from the workers' always-on per-shard status
+        objects by ONE shared poller (one LIST per tick instead of per-shard
+        GETs), the three-class retry policy on
+        :class:`~zagg.client_transport.StatusPoller` (a worker-reported
+        failure never re-fires; a drop re-fires once; an invoke fault retries
+        to ``max_retries`` with backoff), a distinct ``failed-unknown``
+        outcome for silently-dropped invokes,
+        and the run reattachable by run id (``zagg.client.Run.attach``).
+        Requires a worker deployed with the #327 status writes. The
+        benchmark harness and CI stay on ``"sync"`` — their metrics come
+        from invoke responses. Ignored by the ``"local"`` backend.
     force_cold : bool
         Lambda-only (issue #171), default ``False``. The explicit big-hammer
         for certification runs -- benchmark baselines, memory forensics, or
@@ -446,8 +459,10 @@ class SpatialStrategy:
             max_workers = min(max_workers, n_cells)
             if not store_path.startswith("s3://"):
                 raise ValueError(f"Lambda backend requires s3:// store path, got: {store_path}")
-            if invocation not in ("async", "sync"):
-                raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
+            if invocation not in ("async", "sync", "event"):
+                raise ValueError(
+                    f"Unknown invocation: {invocation!r} (expected 'async', 'sync', or 'event')"
+                )
             function_name = _resolve_function_name(config, function_name)
             return _run_lambda(
                 config,
@@ -1196,6 +1211,8 @@ class RasterStrategy:
         from botocore.config import Config
 
         if invocation not in ("async", "sync"):
+            # invocation="event" (issue #327) covers the spatial point path;
+            # the raster fan-out keeps the #286 async envelope channel.
             raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
         function_name = _resolve_function_name(config, function_name)
         max_workers = min(max_workers or 64, len(cells)) or 1
@@ -1710,6 +1727,8 @@ def _run_lambda_events(
             "the config so the collected rows are written"
         )
     if invocation not in ("async", "sync"):
+        # invocation="event" (issue #327) covers the spatial point path; the
+        # temporal fan-out keeps the #151 async envelope channel.
         raise ValueError(f"Unknown invocation: {invocation!r} (expected 'async' or 'sync')")
     function_name = _resolve_function_name(config, function_name)
 
@@ -2344,6 +2363,7 @@ def _dispatch_run_stats(
     summary=None,
     inline_rows=None,
     finalize_error=None,
+    tail_status_url=None,
 ) -> str | None:
     """Fire-and-forget worker-invoke run-record write (issue #313, D8).
 
@@ -2369,6 +2389,10 @@ def _dispatch_run_stats(
     defers its failure through the tail, and this is the durable record a
     postmortem reads — the alternative is a signal that lives only in the
     orchestrator's ``RuntimeWarning``. The write stays worker-side (D8).
+    ``tail_status_url`` (issue #327) has the worker additionally PUT the
+    run's tail-completion marker at that url when the write completes, so a
+    reattached handle knows the tail was recorded; ``None`` keeps the event
+    byte-identical.
     """
     from datetime import datetime, timezone
 
@@ -2390,6 +2414,8 @@ def _dispatch_run_stats(
             # parquet's column set does not vary run to run.
             "finalize_error": finalize_error,
         }
+        if tail_status_url is not None:
+            event["tail_status_url"] = tail_status_url
         if output_creds_event is not None:
             event["output_credentials"] = output_creds_event
         if len(json.dumps(rows)) <= _RUN_STATS_INLINE_CAP_BYTES:
@@ -3238,9 +3264,31 @@ def _run_lambda(
     run_id = uuid.uuid4().hex
     result_prefix = None
     result_box: dict = {}
+    status_prefix = None
     if invocation == "async":
         result_prefix = f"{store_path.rstrip('/')}.status/{run_id}"
         logger.info(f"Async worker results at {result_prefix}")
+    elif invocation == "event":
+        # v2 Event transport (issue #327): no per-shard result_url — futures
+        # resolve from the ALWAYS-ON per-shard status objects, one LIST of
+        # this prefix per poll tick.
+        from zagg.client_transport import run_status_prefix
+
+        status_prefix = run_status_prefix(store_path, run_id)
+        logger.info(f"Event-transport statuses at {status_prefix}")
+
+    # Dispatch manifest block (issue #327): rides the setup invoke so the
+    # WORKER records the run's shard set + identity at the status prefix (D8)
+    # — every lambda run becomes reattachable/observable by run id.
+    from zagg.client_transport import build_run_manifest_block
+
+    _md = catalog_data.get("metadata") or {}
+    run_manifest = build_run_manifest_block(
+        run_id,
+        [c[0] for c in cells],
+        config,
+        dataset={"short_name": _md.get("short_name"), "version": _md.get("version")},
+    )
 
     # The dispatch lambda_client is built inside preflight() (once the probe
     # has clamped the worker count, which sizes its connection pool), so the
@@ -3371,6 +3419,47 @@ def _run_lambda(
             "metadata": catalog_data.get("metadata"),
             "granules": records,
         }
+        # v2 Event transport (issue #327): the SAME event construction as the
+        # sync/async paths (no result_url) fired fire-and-forget; the shard's
+        # future resolves from its always-on status object via the run's
+        # shared poller. Blocking on it here keeps the dispatch loop's
+        # call-shape (accumulator, summary, tail all unchanged); the poller
+        # owns the fault-class-driven re-dispatches, and the pool width bounds
+        # dispatched-unresolved shards — the pacing the fleet's 60 s max
+        # event age makes load-bearing.
+        if invocation == "event":
+            cell_event = _build_cell_event(
+                grid.block_index(int(shard_key)),
+                int(shard_key),
+                parent_order,
+                child_order,
+                granule_urls,
+                store_path,
+                s3_creds,
+                config_dict=cell_config_dict,
+                output_creds_event=output_creds_event,
+                handoff=handoff,
+                profile=profile,
+                aoi_payload=extra.get("aoi_payload"),
+                window=window,
+                invoked_by=invoked_by,
+                run_id=run_id,
+            )
+            cell_payload = _cell_payload(cell_event, submap=submap, async_invoke=True, label=label)
+
+            def _fire(p=cell_payload):
+                state["lambda_client"].invoke(
+                    FunctionName=function_name, InvocationType="Event", Payload=p
+                )
+
+            fut = state["event_poller"].register(
+                int(shard_key),
+                label,
+                dispatch=_fire,
+                window=window["label"] if window is not None else None,
+                granule_count=len(granule_urls),
+            )
+            return fut.result()
         return _invoke_lambda_cell(
             state["lambda_client"],
             grid.block_index(int(shard_key)),
@@ -3465,6 +3554,21 @@ def _run_lambda(
     executor.preflight(len(cells))
     max_workers = state["workers"]
 
+    # v2 status poller (issue #327): one background thread resolving every
+    # in-flight shard from one LIST of the run's status prefix per tick.
+    # Default failure resolution (result dicts, never exceptions) keeps the
+    # accumulator's error counting identical to the sync/async paths; the
+    # drop deadline is function timeout + 60 s max event age + margin.
+    if invocation == "event":
+        from zagg.client_transport import StatusPoller, drop_timeout_s, open_status_store
+
+        _status_kwargs = _output_store_kwargs(output_creds_event, region)
+        state["event_poller"] = StatusPoller(
+            lambda: open_status_store(status_prefix, _status_kwargs),
+            drop_timeout_s=drop_timeout_s(state["function_timeout_s"]),
+            max_retries=max_retries,
+        ).start()
+
     # Create template via Lambda (flat only). The template write happens
     # inside the function so the orchestrator only needs
     # lambda:InvokeFunction; no direct S3 access to the output bucket is
@@ -3506,6 +3610,7 @@ def _run_lambda(
             parent_order=parent_order,
             overwrite=overwrite,
             output_creds_event=output_creds_event,
+            run_manifest=run_manifest,
         )
         # Overlap the fan-out with the client-side morton_hive.json check
         # (issue #274 Fix 2): the async setup write above typically lands
@@ -3527,6 +3632,7 @@ def _run_lambda(
             overwrite=overwrite,
             config_dict=config_dict,
             output_creds_event=output_creds_event,
+            run_manifest=run_manifest,
         )
     setup_s = time.time() - setup_start
 
@@ -3567,6 +3673,8 @@ def _run_lambda(
         )
     finally:
         executor.shutdown()
+        if state.get("event_poller") is not None:
+            state["event_poller"].shutdown()
         # Stop the overlapped manifest checker and read its verdict (#274 Fix 2).
         # It ran the whole fan-out; stopping now wakes it from its interval wait
         # and joins cleanly (a final check already ran), leaving manifest_found
@@ -3772,13 +3880,18 @@ def _run_lambda(
         # PUT itself rides a fire-and-forget worker invoke — the dispatcher may
         # hold an invoke-only role with no S3 write access.
         stats_rows, stats_inline_rows = _lambda_result_rows(report.results, run_id=run_id)
+        from zagg.client_transport import TAIL_NAME, run_status_prefix
+
         _dispatch_run_stats(
             state["lambda_client"],
             function_name,
             store_path,
             stats_rows,
             run_id=run_id,
-            result_prefix=result_prefix,
+            # The oversized-rows pointer: the #151 envelope prefix on async
+            # runs, the v2 status prefix on event runs (rows_from_status reads
+            # the ``stats`` record out of either object shape — issue #327).
+            result_prefix=result_prefix if result_prefix is not None else status_prefix,
             output_creds_event=output_creds_event,
             store_kwargs=_output_store_kwargs(output_creds_event, region),
             summary=summary,
@@ -3787,6 +3900,9 @@ def _run_lambda(
             # worker stamps it as the run parquet's run-level column, so the
             # postmortem signal outlives this process's RuntimeWarning + exit code.
             finalize_error=summary["finalize_error"],
+            # Tail-completion marker (issue #327): worker-written at the v2 status
+            # prefix so Run.attach knows this run's tail was recorded.
+            tail_status_url=f"{run_status_prefix(store_path, run_id)}/{TAIL_NAME}",
         )
         # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
         # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"
@@ -4607,15 +4723,18 @@ def _invoke_lambda_setup(
     overwrite,
     config_dict,
     output_creds_event=None,
+    run_manifest=None,
 ):
     """Invoke Lambda in setup mode to create the zarr template (flat only).
 
     Hive runs no longer dispatch setup SYNCHRONOUSLY (issue #252 hybrid):
     the morton_hive.json write fires as a fire-and-forget Event invoke of
     the same setup mode instead (``_invoke_lambda_setup_async``), so nothing
-    but the ping runs ahead of the fan-out. The flat setup event is
-    byte-identical to the pre-#199-phase-3 event, so a new dispatcher keeps
-    working against old deployed functions for flat runs.
+    but the ping runs ahead of the fan-out. ``run_manifest`` (issue #327)
+    rides the event so the worker records the run's dispatch manifest at the
+    status prefix (D8); ``None`` keeps the event byte-identical to the
+    pre-#199-phase-3 one, so a new dispatcher keeps working against old
+    deployed functions for flat runs.
     """
     event = {
         "mode": "setup",
@@ -4629,6 +4748,8 @@ def _invoke_lambda_setup(
         "overwrite": overwrite,
         "config": config_dict,
     }
+    if run_manifest is not None:
+        event["run_manifest"] = run_manifest
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     response = lambda_client.invoke(
@@ -4654,6 +4775,7 @@ def _invoke_lambda_setup_async(
     parent_order=None,
     overwrite=False,
     output_creds_event=None,
+    run_manifest=None,
 ):
     """Fire-and-forget hive manifest write at init (issue #252 hybrid).
 
@@ -4671,6 +4793,8 @@ def _invoke_lambda_setup_async(
     synchronous hive setup event's shape). No response is read; a lost Event
     invoke (retries 0, issue #151 hygiene) is self-healed by finalize's
     idempotent ensure_manifest backstop — see ``_invoke_lambda_finalize``.
+    ``run_manifest`` (issue #327) additionally has the worker record the
+    run's dispatch manifest at the status prefix, size-gated below.
     """
     event = {
         "mode": "setup",
@@ -4681,6 +4805,21 @@ def _invoke_lambda_setup_async(
     }
     if dataset is not None:
         event["dataset"] = dataset
+    # Dispatch manifest (issue #327): attached only when it FITS the 256 KB
+    # Event cap — the shard list scales with the run, and this invoke
+    # dispatched fine before the block existed, so the block is dropped (never
+    # fatal) rather than failing the run; Run.attach then degrades to the
+    # status objects alone.
+    if run_manifest is not None:
+        with_block = {**event, "run_manifest": run_manifest}
+        if len(json.dumps(with_block)) <= _ASYNC_PAYLOAD_CAP_BYTES:
+            event = with_block
+        else:
+            logger.warning(
+                f"run_manifest block over the async setup budget "
+                f"({len(run_manifest.get('shards') or [])} shards); dropped — "
+                f"Run.attach for this run degrades to status objects only (issue #327)"
+            )
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
     lambda_client.invoke(
@@ -4969,6 +5108,116 @@ def _invoke_lambda_sweep(lambda_client, function_name, store_path, leaves, outpu
     )
 
 
+def _build_cell_event(
+    chunk_idx,
+    shard_key,
+    parent_order,
+    child_order,
+    granule_urls,
+    store_path,
+    s3_credentials,
+    *,
+    config_dict,
+    output_creds_event=None,
+    handoff="arrow",
+    profile=False,
+    aoi_payload=None,
+    window=None,
+    invoked_by=None,
+    run_id=None,
+    result_url=None,
+) -> dict:
+    """One shard's worker event dict — the single construction site.
+
+    Extracted from :func:`_invoke_lambda_cell` (issue #327) so the v2 Event
+    transport builds byte-identical payloads to the sync/async paths (modulo
+    ``result_url``, which only the issue #151 channel sets). Key-presence
+    rules are load-bearing: optional keys are added only when set, so default
+    runs' events stay byte-identical to their pre-feature shapes (see the
+    per-key notes in ``_invoke_lambda_cell``'s docstring).
+    """
+    event = {
+        "chunk_idx": chunk_idx,
+        "shard_key": shard_key,
+        "parent_order": parent_order,
+        "granule_urls": granule_urls,
+        "store_path": store_path,
+        "s3_credentials": {
+            "accessKeyId": s3_credentials["accessKeyId"],
+            "secretAccessKey": s3_credentials["secretAccessKey"],
+            "sessionToken": s3_credentials["sessionToken"],
+        },
+    }
+    # child_order is HEALPix-specific; only forward it when set (non-HEALPix
+    # grids leave it None and the handler doesn't require it).
+    if child_order is not None:
+        event["child_order"] = child_order
+    if config_dict is not None:
+        event["config"] = config_dict
+    if output_creds_event is not None:
+        event["output_credentials"] = output_creds_event
+    # Only add the key when profiling, so default runs stay byte-identical (#100).
+    if profile:
+        event["profile"] = True
+    # Only add the AOI key when the flag is on; flag-off runs stay byte-identical
+    # to the pre-feature event (issue #101).
+    if aoi_payload is not None:
+        event["aoi_payload"] = aoi_payload
+    # Temporal window unit (issue #246): {"label", "start", "end"} with the
+    # half-open bounds in dataset units, converted once at dispatch. Absent
+    # (schedule none) keeps the event byte-identical to pre-windowing runs.
+    if window is not None:
+        event["window"] = window
+    # Add the key for the arrow carrier (the default); an explicit pandas run omits
+    # it, staying byte-identical to the pre-handoff path (#130).
+    if handoff and handoff != "pandas":
+        event["handoff"] = handoff
+    # Caller identity for the stats record (issue #297); absent when the STS
+    # resolve failed (fail-open), keeping the event key optional.
+    if invoked_by is not None:
+        event["invoked_by"] = invoked_by
+    # Run identity, threaded like invoked_by (issue #297): the worker copies
+    # it verbatim into the stats record so leaf sidecars join the run parquet.
+    if run_id is not None:
+        event["run_id"] = run_id
+    # Async dispatch (issue #151): tell the worker where to mirror its response
+    # envelope. Absent -> the legacy synchronous / v2 status-object invoke.
+    if result_url is not None:
+        event["result_url"] = result_url
+    return event
+
+
+def _cell_payload(event, *, submap=None, async_invoke, label=None) -> str:
+    """Serialize one cell event, size-gating for the 256 KB Event cap.
+
+    json.dumps is ASCII by default, so len() is the request byte size. The
+    leaf sub-map block (issue #300) is attached only when it FITS an async
+    payload — dropped (never fatal) otherwise, since the sub-map is a
+    regenerable D9 artifact; an event still over the cap without it raises
+    with a remedy up front rather than letting every attempt fail on Lambda's
+    raw RequestEntityTooLargeException (issue #151).
+    """
+    shard_key = event.get("shard_key")
+    payload = json.dumps(event)
+    if submap is not None:
+        with_submap = json.dumps({**event, "submap": submap})
+        if not async_invoke or len(with_submap) <= _ASYNC_PAYLOAD_CAP_BYTES:
+            payload = with_submap
+        else:
+            logger.debug(
+                f"cell {label or shard_key}: dropping submap block ({len(with_submap):,} "
+                f"bytes over the async budget); leaf sub-map deferred to the sweep CLI"
+            )
+    if async_invoke and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
+        raise ValueError(
+            f"cell {label or shard_key} event payload is {len(payload):,} bytes, over the "
+            f"{_ASYNC_PAYLOAD_CAP_BYTES:,}-byte async dispatch budget (Lambda caps "
+            'Event invokes at 256 KB): pass invocation="sync" for this run, or '
+            "shrink the per-cell payload (e.g. the strict-AOI aoi_payload)"
+        )
+    return payload
+
+
 def _invoke_lambda_cell(
     lambda_client,
     chunk_idx,
@@ -5029,83 +5278,30 @@ def _invoke_lambda_cell(
     """
     wall_start = time.time()
 
-    event = {
-        "chunk_idx": chunk_idx,
-        "shard_key": shard_key,
-        "parent_order": parent_order,
-        "granule_urls": granule_urls,
-        "store_path": store_path,
-        "s3_credentials": {
-            "accessKeyId": s3_credentials["accessKeyId"],
-            "secretAccessKey": s3_credentials["secretAccessKey"],
-            "sessionToken": s3_credentials["sessionToken"],
-        },
-    }
-    # child_order is HEALPix-specific; only forward it when set (non-HEALPix
-    # grids leave it None and the handler doesn't require it).
-    if child_order is not None:
-        event["child_order"] = child_order
-    if config_dict is not None:
-        event["config"] = config_dict
-    if output_creds_event is not None:
-        event["output_credentials"] = output_creds_event
-    # Only add the key when profiling, so default runs stay byte-identical (#100).
-    if profile:
-        event["profile"] = True
-    # Only add the AOI key when the flag is on; flag-off runs stay byte-identical
-    # to the pre-feature event (issue #101).
-    if aoi_payload is not None:
-        event["aoi_payload"] = aoi_payload
-    # Temporal window unit (issue #246): {"label", "start", "end"} with the
-    # half-open bounds in dataset units, converted once at dispatch. Absent
-    # (schedule none) keeps the event byte-identical to pre-windowing runs.
-    if window is not None:
-        event["window"] = window
-    # Add the key for the arrow carrier (the default); an explicit pandas run omits
-    # it, staying byte-identical to the pre-handoff path (#130).
-    if handoff and handoff != "pandas":
-        event["handoff"] = handoff
-    # Caller identity for the stats record (issue #297); absent when the STS
-    # resolve failed (fail-open), keeping the event key optional.
-    if invoked_by is not None:
-        event["invoked_by"] = invoked_by
-    # Run identity, threaded like invoked_by (issue #297): the worker copies
-    # it verbatim into the stats record so leaf sidecars join the run parquet.
-    if run_id is not None:
-        event["run_id"] = run_id
-    # Async dispatch (issue #151): tell the worker where to mirror its response
-    # envelope and fire-and-forget. Absent -> the legacy synchronous invoke.
-    invocation_type = "RequestResponse"
-    if result_url is not None:
-        event["result_url"] = result_url
-        invocation_type = "Event"
-
-    # json.dumps is ASCII by default, so len() is the request byte size. Gate
-    # async payloads against the 256 KB Event cap with a remedy, up front,
-    # rather than letting every attempt fail on Lambda's raw
-    # RequestEntityTooLargeException (issue #151).
-    payload = json.dumps(event)
-    # Leaf sub-map block (issue #300): attached only when it FITS — a unit
-    # whose granule entries would push an async event over the cap keeps its
-    # pre-#300 payload (the sub-map is a regenerable D9 artifact; the manual
-    # sweep CLI is the backstop), so the cap gate below can never start
-    # rejecting a run that dispatched fine before.
-    if submap is not None:
-        with_submap = json.dumps({**event, "submap": submap})
-        if invocation_type != "Event" or len(with_submap) <= _ASYNC_PAYLOAD_CAP_BYTES:
-            payload = with_submap
-        else:
-            logger.debug(
-                f"cell {label or shard_key}: dropping submap block ({len(with_submap):,} "
-                f"bytes over the async budget); leaf sub-map deferred to the sweep CLI"
-            )
-    if invocation_type == "Event" and len(payload) > _ASYNC_PAYLOAD_CAP_BYTES:
-        raise ValueError(
-            f"cell {label or shard_key} event payload is {len(payload):,} bytes, over the "
-            f"{_ASYNC_PAYLOAD_CAP_BYTES:,}-byte async dispatch budget (Lambda caps "
-            'Event invokes at 256 KB): pass invocation="sync" for this run, or '
-            "shrink the per-cell payload (e.g. the strict-AOI aoi_payload)"
-        )
+    event = _build_cell_event(
+        chunk_idx,
+        shard_key,
+        parent_order,
+        child_order,
+        granule_urls,
+        store_path,
+        s3_credentials,
+        config_dict=config_dict,
+        output_creds_event=output_creds_event,
+        handoff=handoff,
+        profile=profile,
+        aoi_payload=aoi_payload,
+        window=window,
+        invoked_by=invoked_by,
+        run_id=run_id,
+        result_url=result_url,
+    )
+    # Async dispatch (issue #151): result_url flips the invoke to
+    # fire-and-forget. Absent -> the legacy synchronous invoke.
+    invocation_type = "RequestResponse" if result_url is None else "Event"
+    payload = _cell_payload(
+        event, submap=submap, async_invoke=invocation_type == "Event", label=label
+    )
 
     last_error = None
     for attempt in range(max_retries):

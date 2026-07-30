@@ -22,14 +22,20 @@ without draining it is the one flow that truncates the tail: the finisher is a
 daemon thread, so an undrained handle cannot wedge interpreter exit (review
 finding, PR #333).
 
-**v1 transport** (ratified on issue #265): a ``ThreadPoolExecutor`` over the
-existing synchronous ``RequestResponse`` invokes — each shard is one
-:func:`zagg.runner._invoke_lambda_cell` call and its pool future is the
-shard's :class:`concurrent.futures.Future`, wrapping exactly what the worker
-returns today (timings, error payloads). Zero worker-side change; the cost is
-one held connection per in-flight shard and the client staying alive. The v2
-transport (``Event`` invoke + status-object resolver, issue #327) swaps the
-resolver under this same public surface.
+**v1 transport** (ratified on issue #265, the default): a
+``ThreadPoolExecutor`` over the existing synchronous ``RequestResponse``
+invokes — each shard is one :func:`zagg.runner._invoke_lambda_cell` call and
+its pool future is the shard's :class:`concurrent.futures.Future`, wrapping
+exactly what the worker returns today (timings, error payloads). Zero
+worker-side change; the cost is one held connection per in-flight shard and
+the client staying alive.
+
+**v2 transport** (issue #327, ``dispatch(transport="event")``): fire-and-forget
+``InvocationType="Event"`` invokes resolved by a single poller thread over the
+run's status-object prefix (:mod:`zagg.client_transport`) — no held
+connections, status-driven retries under the same ``max_retries``, a distinct
+``failed-unknown`` outcome for silently-dropped invokes, and the run is
+reattachable by run id (:meth:`Run.attach`). Same public surface.
 
 The dispatcher-never-writes invariant (D8) is untouched: every store write —
 template setup, shard output, finalize, coverage/stats/sweep rollups — rides a
@@ -104,6 +110,26 @@ class ShardError(RuntimeError):
         self.shard_key = shard_key
         self.label = label
         self.payload = payload
+
+
+def _fail_with_shard_error(entry, result: dict) -> None:
+    """v2 poller ``on_failed``: a terminal failure raises :class:`ShardError`.
+
+    Shared by :meth:`Run.dispatch` (event transport) and :meth:`Run.attach` so
+    a failed status, a spent retry budget, and the ``failed-unknown`` drop
+    outcome all surface from ``future.result()`` exactly like the v1 transport
+    — the payload is the same per-shard result dict, with ``outcome`` marking
+    a drop.
+    """
+    detail = result.get("error") or f"status {result.get('status_code')}"
+    entry.future.set_exception(
+        ShardError(
+            f"shard {entry.label}: {detail}",
+            shard_key=entry.shard_key,
+            label=entry.label,
+            payload=result,
+        )
+    )
 
 
 class RunHandle:
@@ -455,6 +481,63 @@ class Run:
             source_credentials=source_credentials,
         )
 
+    @classmethod
+    def attach(
+        cls,
+        store: str,
+        run_id: str,
+        *,
+        function_name: str | None = None,
+        region: str = "us-west-2",
+        lambda_client=None,
+        output_credentials: dict | None = None,
+        output_endpoint_url: str | None = None,
+    ) -> RunHandle:
+        """Reattach to a dispatched run by id (issue #327 phase 5).
+
+        Rebuilds a :class:`RunHandle` from the run's dispatch manifest
+        (``<store>.status/run-<run_id>/manifest.json`` — the config, shard
+        set, and identity the setup invoke recorded worker-side) plus the
+        current status objects: shards already settled resolve on the first
+        poll tick, the rest resolve as their statuses land. A notebook kernel
+        restart or a second machine can adopt a running fleet this way — the
+        Event invokes are already in flight and owe the client nothing.
+
+        Observe-only by design: the manifest carries no granule records, so a
+        ``failed`` status resolves that shard's :class:`ShardError`
+        immediately (no re-dispatch), and a shard with no status object by
+        the drop deadline — anchored at the manifest's ``dispatched_at`` —
+        resolves ``failed-unknown``. The post-run tail runs only if not
+        already recorded (the run's ``tail.json`` marker, checked read-only);
+        when it does run it is the same worker-invoke tail as a live handle
+        (D8 intact — this method's own store traffic is reads).
+
+        Parameters
+        ----------
+        store : str
+            The run's effective store root exactly as dispatched
+            (``handle.store_path`` / the summary's ``store_path``).
+        run_id : str
+            The dispatch's run id (``manifest.json`` names it; it is also in
+            every cell event and stats record).
+        function_name, region, lambda_client, output_credentials,
+        output_endpoint_url
+            Same semantics as :meth:`from_config`; the function/client are
+            only used for the tail invokes when the tail is not yet recorded.
+        """
+        from zagg.client_transport import attach_run
+
+        return attach_run(
+            cls,
+            store,
+            run_id,
+            function_name=function_name,
+            region=region,
+            lambda_client=lambda_client,
+            output_credentials=output_credentials,
+            output_endpoint_url=output_endpoint_url,
+        )
+
     # -- shard selection ----------------------------------------------------
 
     def _resolve_key(self, key) -> int:
@@ -524,13 +607,18 @@ class Run:
             )
             return _DEFAULT_MAX_WORKERS
 
-    def dispatch(self, shard_keys=None, max_workers: int | None = None) -> RunHandle:
+    def dispatch(
+        self,
+        shard_keys=None,
+        max_workers: int | None = None,
+        transport: str = "sync",
+    ) -> RunHandle:
         """Fan the shards out; return a :class:`RunHandle` of per-shard futures.
 
         Returns as soon as the setup handshake completes (worker-side template
         / manifest write — one short synchronous invoke; hive additionally
-        fail-fast-pings first): the fan-out itself runs on a background pool
-        and each shard's outcome arrives through its future.
+        fail-fast-pings first): the fan-out itself runs in the background and
+        each shard's outcome arrives through its future.
 
         Parameters
         ----------
@@ -538,13 +626,36 @@ class Run:
             Subset of shards to dispatch — raw int shardmap keys or external
             string labels (decimal morton for HEALPix). Default all shards.
         max_workers : int, optional
-            Pool width, clamped to the shard count. An explicit value wins
+            Fan-out width, clamped to the shard count. An explicit value wins
             verbatim and skips the preflight probe; omitted, the account
-            concurrency probe sizes the pool (see :meth:`_probe_workers`) and
+            concurrency probe sizes it (see :meth:`_probe_workers`) and
             :data:`_DEFAULT_MAX_WORKERS` is the fallback when it cannot run.
+            Under ``transport="sync"`` this is the invoke thread-pool width;
+            under ``"event"`` it is the dispatch **pacing window** — how many
+            shards may be dispatched-but-unresolved at once, load-bearing
+            because the fleet's 60 s ``MaximumEventAgeInSeconds`` silently
+            drops an Event invoke the account has no concurrency to start.
+        transport : str
+            ``"sync"`` (default, the v1 transport): a thread pool over
+            synchronous ``RequestResponse`` invokes — one held connection per
+            in-flight shard. ``"event"`` (the v2 transport, issue #327):
+            fire-and-forget ``InvocationType="Event"`` invokes resolved by a
+            single poller thread from one LIST of the run's status prefix per
+            tick — no held connections, and the run survives client exit
+            (reattachable via :meth:`attach`). Futures, harvest iterators,
+            ``status()``, and the post-run tail behave identically; the retry
+            policy splits by fault class (see
+            :class:`~zagg.client_transport.StatusPoller`) — ``max_retries``
+            still bounds invoke-layer faults, a worker-reported failure is
+            terminal, and a shard whose status object never lands re-fires once
+            then resolves ``failed-unknown``. Requires a deployed worker that
+            writes status objects (issue #327) and read access to the status
+            prefix for the poll.
         """
         from zagg import runner
 
+        if transport not in ("sync", "event"):
+            raise ValueError(f'transport must be "sync" or "event", got {transport!r}')
         cells = self._select(shard_keys)
         if not cells:
             raise ValueError("no shards selected")
@@ -594,13 +705,25 @@ class Run:
         )
         run_id = uuid.uuid4().hex
 
+        # Dispatch manifest block (issue #327): rides the setup invoke so the
+        # WORKER records the run's shard set + identity at the status prefix
+        # (D8) — what :meth:`Run.attach` rebuilds a handle from.
+        from zagg.client_transport import build_run_manifest_block
+
+        md = self.catalog_data.get("metadata") or {}
+        run_manifest = build_run_manifest_block(
+            run_id,
+            [k for k, _ in cells],
+            self.config,
+            dataset={"short_name": md.get("short_name"), "version": md.get("version")},
+        )
+
         # Setup handshake, synchronous and load-bearing (worker-side writes
         # only — D8). Hive: fail-fast ping + fire-and-forget manifest write;
         # finalize below is the idempotent backstop (issue #252 hybrid). Flat:
         # the template write itself.
         dataset = None
         if get_store_layout(self.config) == "hive":
-            md = self.catalog_data.get("metadata") or {}
             dataset = {"short_name": md.get("short_name"), "version": md.get("version")}
             runner._invoke_lambda_ping(
                 client,
@@ -621,6 +744,7 @@ class Run:
                 parent_order=self._parent_order,
                 overwrite=self.overwrite,
                 output_creds_event=output_creds_event,
+                run_manifest=run_manifest,
             )
         else:
             runner._invoke_lambda_setup(
@@ -632,36 +756,103 @@ class Run:
                 overwrite=self.overwrite,
                 config_dict=config_dict,
                 output_creds_event=output_creds_event,
+                run_manifest=run_manifest,
             )
 
         aoi_by_shard = runner._aoi_payload_map(self.catalog_data)
-        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="zagg-client")
-        futures: dict[int, Future] = {}
-        for key, records in cells:
-            futures[int(key)] = pool.submit(
-                self._shard_work,
+        result_prefix = None
+        if transport == "event":
+            from zagg.client_transport import run_status_prefix
+
+            # The tail's oversized-run-record pointer (issue #327): only the
+            # event transport has a per-run prefix to point at.
+            result_prefix = run_status_prefix(self.store, run_id)
+            futures, closer = self._dispatch_event(
                 client,
-                int(key),
-                records,
+                cells,
+                run_id=run_id,
+                workers=workers,
                 config_dict=config_dict,
                 s3_creds=s3_creds,
                 output_creds_event=output_creds_event,
-                aoi_payload=aoi_by_shard.get(int(key)),
+                aoi_by_shard=aoi_by_shard,
                 invoked_by=invoked_by,
-                run_id=run_id,
-                max_workers=workers,
             )
+        else:
+            pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="zagg-client")
+            futures = {}
+            for key, records in cells:
+                futures[int(key)] = pool.submit(
+                    self._shard_work,
+                    client,
+                    int(key),
+                    records,
+                    config_dict=config_dict,
+                    s3_creds=s3_creds,
+                    output_creds_event=output_creds_event,
+                    aoi_payload=aoi_by_shard.get(int(key)),
+                    invoked_by=invoked_by,
+                    run_id=run_id,
+                    max_workers=workers,
+                )
+            closer = pool
 
         handle = RunHandle(futures, store_path=self.store)
         finisher = threading.Thread(
             target=self._post_run,
-            args=(handle, client, pool, config_dict, dataset, output_creds_event, run_id),
+            args=(handle, client, closer, config_dict, dataset, output_creds_event, run_id),
+            kwargs={"result_prefix": result_prefix},
             name="zagg-client-finish",
             daemon=True,
         )
         handle._finisher = finisher
         finisher.start()
         return handle
+
+    def _dispatch_event(
+        self,
+        client,
+        cells,
+        *,
+        run_id: str,
+        workers: int,
+        config_dict: dict,
+        s3_creds: dict,
+        output_creds_event: dict | None,
+        aoi_by_shard: dict,
+        invoked_by: dict | None,
+    ) -> tuple[dict[int, Future], Any]:
+        """v2 Event transport (issue #327): fire-and-forget invokes + one poller.
+
+        Builds each shard's event through the SAME construction the sync/agg
+        paths use (``runner._build_cell_event`` — payloads are byte-identical
+        modulo InvocationType), registers it with a
+        :class:`~zagg.client_transport.StatusPoller` that paces dispatch to
+        the ``workers`` window and resolves every future from one LIST of the
+        run's status prefix per tick, and returns ``(futures, poller)`` — the
+        poller is the finisher's ``closer``. D8 audit: this path's only store
+        traffic is the poller's LIST/GETs (reads); every write stays behind a
+        worker invoke. A terminal failure (a ``failed`` status, or the
+        ``failed-unknown`` drop outcome past its one re-fire — see the
+        three-class retry policy on
+        :class:`~zagg.client_transport.StatusPoller`) raises
+        :class:`ShardError` from the shard's future, exactly like v1.
+        """
+        from zagg.client_transport import dispatch_event_shards
+
+        return dispatch_event_shards(
+            self,
+            client,
+            cells,
+            run_id=run_id,
+            workers=workers,
+            config_dict=config_dict,
+            s3_creds=s3_creds,
+            output_creds_event=output_creds_event,
+            aoi_by_shard=aoi_by_shard,
+            invoked_by=invoked_by,
+            on_failed=_fail_with_shard_error,
+        )
 
     def _shard_work(
         self,
@@ -740,27 +931,49 @@ class Run:
         self,
         handle: RunHandle,
         client,
-        pool: ThreadPoolExecutor,
+        closer,
         config_dict: dict,
         dataset: dict | None,
         output_creds_event: dict | None,
         run_id: str,
+        tail_done_check=None,
+        result_prefix=None,
     ) -> None:
         """Finisher-thread entry point: run the tail, never lose its failure.
 
         Anything the tail raises outside its own fail-open guards would
         otherwise die in ``threading.excepthook`` while ``wait()`` reported a
         clean run, so it is recorded on the handle as ``_tail_error`` (kept
-        distinct from the D6-load-bearing ``_finalize_error``) and the pool is
-        shut down either way (review finding, PR #333).
+        distinct from the D6-load-bearing ``_finalize_error``) and ``closer``
+        — the v1 invoke pool or the v2 status poller, both
+        ``shutdown(wait=False)``-shaped — is shut down either way (review
+        finding, PR #333). ``tail_done_check`` (issue #327, the attach path):
+        a zero-arg read-only predicate consulted AFTER every shard settles —
+        True means the tail was already recorded (the run's ``tail.json``
+        marker), so a reattached handle never re-runs it. ``result_prefix``
+        (also #327) is the oversized-run-record pointer — see
+        :meth:`_run_tail`.
         """
         try:
-            self._run_tail(handle, client, config_dict, dataset, output_creds_event, run_id)
+            if tail_done_check is not None:
+                futures_wait(list(handle.futures.values()))
+                if tail_done_check():
+                    logger.info(f"post-run tail already recorded for run {run_id}; skipping")
+                    return
+            self._run_tail(
+                handle,
+                client,
+                config_dict,
+                dataset,
+                output_creds_event,
+                run_id,
+                result_prefix=result_prefix,
+            )
         except BaseException as e:
             handle._tail_error = e
             logger.warning(f"post-run tail failed (surfaced via handle.wait()): {e}")
         finally:
-            pool.shutdown(wait=False)
+            closer.shutdown(wait=False)
 
     def _run_tail(
         self,
@@ -770,6 +983,7 @@ class Run:
         dataset: dict | None,
         output_creds_event: dict | None,
         run_id: str,
+        result_prefix=None,
     ) -> None:
         """After every shard settles: the same worker-invoke tail as ``agg``.
 
@@ -793,6 +1007,16 @@ class Run:
         escaping the retry loop) — a synthesized failure dict, which
         ``_lambda_result_rows`` turns into a ``failure_record`` row rather than
         dropping the shard from telemetry (review finding, PR #333).
+
+        ``result_prefix`` is the pointer ``_dispatch_run_stats`` falls back to
+        when the row set exceeds the inline payload cap. The v1 sync transport
+        has none (no #151 envelope mirror), so an oversized sync run skips its
+        record; the v2 event transport DOES — the run's status prefix, which
+        ``telemetry.rows_from_status`` reads (issue #327) — and fleet-scale
+        runs are exactly the ones that hit the cap, so passing it is what keeps
+        ``Run.dispatch(transport="event")`` from silently dropping the run
+        record that the byte-identical ``agg(invocation="event")`` keeps
+        (``runner.py`` does the same fallback at its own stats dispatch).
         """
         from zagg import runner
 
@@ -823,6 +1047,7 @@ class Run:
         # the failure (espg ruling on PR #333, middle option) so a notebook sees
         # it in-stream rather than only at the join, retries once, and RETURNS
         # the error — the handle keeps this path's re-raise semantics.
+        finalize_error = None
         finalize_kwargs: dict = {}
         if layout == "hive":
             finalize_kwargs = {
@@ -846,6 +1071,7 @@ class Run:
                 ),
             )
             if error is not None:
+                finalize_error = str(error)
                 handle._finalize_error = error
                 logger.warning(f"finalize invoke failed (surfaced via handle.wait()): {error}")
 
@@ -875,9 +1101,15 @@ class Run:
             except Exception as e:
                 logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
 
-        # Run-record + sweep, both fail-open (issues #297/#313/#300): sync
-        # transport -> no status prefix, so oversized row sets skip inside
-        # _dispatch_run_stats exactly like agg's invocation="sync" path.
+        # Run-record + sweep, both fail-open (issues #297/#313/#300). The
+        # oversized-rows pointer is the run's v2 status prefix on an event
+        # run (rows_from_status reads that object shape — issue #327) and
+        # None on the sync transport, which has no #151 envelope mirror to
+        # point at; the same fallback runner.py applies. The worker also
+        # records the tail-completion marker (issue #327) so a reattached
+        # handle knows this tail ran.
+        from zagg.client_transport import TAIL_NAME, run_status_prefix
+
         stats_rows, stats_inline = runner._lambda_result_rows(results, run_id=run_id)
         runner._dispatch_run_stats(
             client,
@@ -885,10 +1117,17 @@ class Run:
             self.store,
             stats_rows,
             run_id=run_id,
-            result_prefix=None,
+            result_prefix=result_prefix,
             output_creds_event=output_creds_event,
             store_kwargs=runner._output_store_kwargs(output_creds_event, self.region),
             inline_rows=stats_inline,
+            # Same wire contract as runner's tail (issue #335): always present,
+            # None on success, so the parquet's column set does not vary — and
+            # it is what makes the worker WITHHOLD the tail marker on a failed
+            # finalize, so a reattached handle re-runs the idempotent backstop
+            # instead of reading "recorded" as "succeeded" (review, PR #343).
+            finalize_error=finalize_error,
+            tail_status_url=f"{run_status_prefix(self.store, run_id)}/{TAIL_NAME}",
         )
         if layout == "hive" and get_sweep(self.config):
             try:
