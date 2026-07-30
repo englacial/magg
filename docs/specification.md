@@ -370,16 +370,244 @@ within `O(n/510)`. The `n` inputs come from the `of` digests' total weights
 ## 4. Pyramid / overview declarations
 
 **Status: ratified design; implementation in flight
-([#201](https://github.com/englacial/zagg/issues/201)).**
+([#201](https://github.com/englacial/zagg/issues/201)).** The decisions this
+section records are ratified (D11/D22–D24 in
+[`design/sparse_coverage.md`](design/sparse_coverage.md) and the
+[#201 rulings](https://github.com/englacial/zagg/issues/201)); the grammar
+below is what the #201 implementation lands and what moczarr's level-node
+reader plans against (espg/moczarr#15, the 8b seam). Any divergence
+discovered while landing #201 is resolved **on this section first** — the
+implementation conforms to the spec, never the reverse.
 
-*Populated in phase 5 of the #340 PR.*
+### 4.1 Overview zarrs at ancestor nodes
+
+An **overview zarr** is a sweep-built coarse materialization of a subtree's
+committed leaves, written at an **ancestor digit node** of the hive tree
+(tree layout and path grammar: mortie's specification). It has the same
+structure as a leaf (§4.4), one basename dialect (§4.2), and is classified by
+attrs alone (§4.3).
+
+Overviews are **regenerable caches**, never load-bearing: deleting every
+overview MUST leave all leaf reads intact, and a reader MUST NOT require
+them. They are stale-detectable, not stale-proof — after a leaf re-run an
+ancestor overview may lag until the sweep regenerates it; the generation
+stamp (§4.3) is what makes that detectable.
+
+### 4.2 Naming
+
+Overviews inherit the leaf window-naming dialect (D23; grammar frozen on the
+mortie spec page): at an ancestor node an overview for time window `{window}`
+is `{window}.zarr`, and the reserved token **`all`** names the all-time fold
+(`all.zarr` — the same token that names a `schedule: none` store's leaves;
+excluded from the window grammar forever). Nothing about the *name*
+distinguishes an overview from a leaf — classification is §4.3's job.
+
+### 4.3 The `role` and `zagg_overview` attrs
+
+**Contract.** Classification is carried in the zarr's **root-group attrs**,
+never inferred from tree position or depth — a shallow zarr may equally be
+*coarse source* in a sparse region (D24: one product tree may carry
+regionally heterogeneous resolution).
+
+- **`role`** — `"overview"` on every sweep-built overview. **Source leaves
+  carry no `role` key: absence means source.** A reader MUST check `role` on
+  every zarr it opens at an overview-carrying order; analysis readers reject
+  or skip `role: overview` zarrs, display readers MAY stop at one.
+- **`zagg_overview`** — the versioned provenance block, present exactly when
+  `role` is `"overview"`:
+
+```json
+"zagg_overview": {
+  "spec": "zagg-overview/1",
+  "node": "-311",
+  "order": 3,
+  "cell_order": 11,
+  "source_shard_order": 5,
+  "source_cell_order": 13,
+  "window": "2019",
+  "fields": {"count": {"class": "exact", "method": "sum"},
+             "h_tdigest": {"class": "approximate", "method": "tdigest_kway"}},
+  "generation": {"n_leaves": 16, "max_leaf_timestamp": "2026-07-20T00:00:00Z"},
+  "content_hash": "…",
+  "generated_at": "2026-07-21T00:00:00Z"
+}
+```
+
+  `spec` follows the conformance rule (strict-check, fail loudly on an
+  unknown revision). `node` is the ancestor's morton decimal string; `order`
+  its order; `cell_order` the overview's own cell order
+  (`source_cell_order - (source_shard_order - order)` — constant tree depth,
+  §4.4); `window` the §4.2 window key (`"all"` for the all-time fold);
+  `fields` the per-field composability class + fold method actually applied;
+  `generation` the D22 staleness stamp (merged-leaf count + max leaf commit
+  timestamp); `content_hash` a sweep-internal skip-if-current digest
+  (informative — not the §5 O11 recipe and not part of the reader contract).
+
+An overview also carries the standard D4 **commit stamp** as its final
+write: an unstamped overview prefix is debris, exactly as for leaves.
+Write order is pinned — template, arrays, `role`/provenance attrs, stamp
+LAST — so presence of the stamp certifies the `role` attr landed; a reader
+MUST ignore unstamped overview prefixes.
+
+### 4.4 Structure
+
+**Contract.** An overview at ancestor order `k` of a product with shard
+order `s` and cell order `c` is the leaf structure "one order family up":
+the same group layout as a source leaf, holding cells at order
+`k_cell = c - (s - k)` (cells coarsen 4× per order of ascent — the pyramid
+is the store's resolution axis, partially materialized). Concretely:
+
+- the `morton` coordinate array holds the `4^(k_cell - k)` order-`k_cell`
+  descendant words of the node, in canonical nested order;
+- each **included** field is the same array kind as at the leaves: dense
+  fields as dense arrays, digest fields as `zagg-ragged/1` (or `/2`) vlen
+  arrays — §1–§3 of this page apply to overview arrays unchanged;
+- field inclusion is gated by the field's **composability class** (§4.5):
+  `exact` and `approximate` fields appear, `none` fields are **absent**.
+
+An overview's variable set may therefore be a *subset* of the leaf's —
+heterogeneous variable sets across level nodes are in contract, and a reader
+MUST NOT assume every leaf field exists at every overview order (the
+manifest declaration below is the zero-open way to know).
+
+### 4.5 The manifest `pyramid` block
+
+**Contract.** The product manifest (`morton_hive.json`; manifest bootstrap
+semantics: mortie's specification and
+[`design/sparse_coverage.md`](design/sparse_coverage.md) §3) declares the
+overview family under the versioned `pyramid` block:
+
+```json
+"pyramid": {
+  "spec": "zagg-pyramid/1",
+  "overview": {
+    "spacing": 2,
+    "orders": [3, 1],
+    "all_time": false,
+    "fields": {
+      "count":     {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0},
+      "h_tdigest": {"class": "approximate", "method": "tdigest_kway",
+                    "dtype": "float32", "inner_shape": [2], "delta": 512},
+      "photon_ids": {"class": "none"}
+    }
+  }
+}
+```
+
+- **`orders`** — the ancestor orders that carry overviews (descending; empty
+  = pyramid declared off). `spacing` records the schedule step (default 2 —
+  the ratified display schedule). Schedules are per artifact family and
+  deliberately decoupled from the tree's `path_grouping`.
+- **`fields`** — every aggregation field, keyed by name, with its
+  **composability class**: `exact` (folds byte-equal — count/sum/min/max),
+  `approximate` (t-digest merge — `np.isclose` equality class), or `none`
+  (non-composable). A `"class": "none"` entry is the **recorded absence**
+  (the ruled D24 default, option A): the field exists only at native
+  resolution, and this declaration is how a reader knows without opening
+  anything. `exact`/`approximate` entries carry the fold `method` and enough
+  dtype/shape metadata to know the overview array's form up front.
+- **`all_time`** — whether the `all.zarr` all-time fold is materialized at
+  the declared orders (windowed stores only; a `schedule: none` store's
+  single fold is already all-time).
+- **`summarize`** (optional) — the opt-in **declared derived summary** for
+  `none`-class fields: a mapping from a new, *different* field name to its
+  derivation (e.g. an auto-digest of a roster field's raw values), living in
+  the pyramid block and **never** in the semantic core — leaf truth is
+  unchanged, and overview schema never silently differs from source except
+  by declaration. (Ruled on the
+  [#201 thread](https://github.com/englacial/zagg/issues/201); deterministic
+  seeded subsampling is deferred; roster concatenation is rejected.)
+- The sweep MAY additionally record materialized-actuals bookkeeping in the
+  block; the template-time declaration above is never rewritten by the
+  sweep, and the `pyramid` block is excluded from the manifest's frozen
+  append-guard keys.
+
+### 4.6 What §4 does not cover (informative)
+
+The sweep's *other* derived-artifact families (MOC regeneration, stats and
+sub-shardmap rollups, debris collection) are operational concerns recorded
+in [`design/sparse_coverage.md`](design/sparse_coverage.md) D22 — they add
+no new byte layouts (the stats rollup reuses the D20 sidecar schema; the
+sub-shardmap is ShardMap JSON). The fold *algebra* for overview contents is
+zagg-owned per §2.3; a reader consumes overview arrays exactly as it
+consumes leaf arrays.
 
 ## 5. O11 content hashes
 
 **Status: contract — frozen on
-[#342](https://github.com/englacial/zagg/issues/342).**
+[#342](https://github.com/englacial/zagg/issues/342).** The recipe was
+pinned by the moczarr verify reader
+([espg/moczarr PR #23](https://github.com/espg/moczarr/pull/23),
+`moczarr.stats.hash_arrays` / `combined_hash`); zagg's writer, when it lands
+(#342), MUST adopt it verbatim. The O11 decision record (scope, compute-at-
+write, exact-bytes rationale) is
+[`design/sparse_coverage.md`](design/sparse_coverage.md) §8.2 O11.
 
-*Populated in phase 5 of the #340 PR.*
+The **logical content hash** of a leaf is per-array sha256 over *decoded*
+values — never stored object bytes, so codec and packaging changes
+(ShardingCodec inner chunks, compressor upgrades, §1.5 geometry) are
+invisible by construction, while any value change flips the hash (exact
+bytes, no float tolerance — interpretation pairs the hash with the recorded
+zagg version).
+
+### 5.1 Scope and keys
+
+**Contract.** The hash set covers **every named zarr array beneath the leaf
+root** — data fields, the ragged vlen payload arrays and their
+`{field}_locations` siblings, `morton`, every coordinate — keyed by the
+array's **path relative to the leaf root** (e.g. `"8/morton"`).
+
+### 5.2 Per-array recipe
+
+**Contract.**
+
+- **Fixed-width arrays**: sha256 over the array's full decoded contents as
+  raw **C-order little-endian** bytes at the declared dtype (a big-endian
+  dtype is byte-swapped to little-endian before hashing).
+- **Vlen (ragged) arrays**: an object-dtype array has no flat buffer
+  (`ndarray.tobytes()` on it would serialize per-process pointer
+  addresses). It is hashed instead as, over cells in flat C order:
+
+```text
+sha256( for each cell:  u64_le(len(payload)) || payload )
+```
+
+  where `payload` is the cell's decoded bytes — exactly the §1.4
+  `payload_bytes` for a `zagg-ragged/1` array (an empty or unwritten cell
+  contributes its zero length; a locations sibling's payload is its raw
+  little-endian `uint64` words). The 8-byte length prefix is what makes the
+  digest injective (`[b"ab", b"c"]` and `[b"a", b"bc"]` must not collide),
+  and it covers the cell *grid*, not just the payloads.
+
+### 5.3 Combined hash and sidecar record
+
+**Contract.** The combined hash is sha256 over the **sorted** per-array hex
+digests joined by `"\n"`, hashed as ASCII — array names deliberately
+excluded ("hash of the sorted per-array hashes").
+
+The hashes are recorded in the leaf's D20 stats sidecar under
+`content_hashes`, in the structured shape:
+
+```json
+"content_hashes": {
+  "arrays": {"8/count": "…", "8/h_tdigest": "…", "8/morton": "…"},
+  "combined": "…"
+}
+```
+
+A writer MUST emit the structured shape. A reader SHOULD also accept the
+flat shape (`{array_key: hash, "combined": hash}` — `combined` is reserved
+and is not a legal zagg array name). A leaf with no recorded
+`content_hashes` is **unverifiable, not tampered**: verification MUST
+report "nothing recorded" as a distinct outcome from a mismatch (the
+conservative dedup posture — an unverifiable leaf is never a hit).
+
+*(Informative.)* The O11 hash is the verification half of the D19 identity
+split — the `semantic_hash` says two leaves were *intended* identical; O11
+says they *are* byte-identical — and doubles as the mismatch localizer
+("only `h_tdigest` differs in this leaf") and the detection mechanism for
+stamped-but-torn leaves under the concurrency contract's out-of-contract
+case.
 
 ## 6. `zagg-ragged/2`
 
