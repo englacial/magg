@@ -382,10 +382,15 @@ def _chunk_word(words: np.ndarray, field: str, start: int) -> int:
 
     The id is the written cells' common ancestor at ``cell_order -
     log4(len(words))`` — the same parent cell the CSR layout named its
-    subgroups by. Raises when the written cells do NOT share that ancestor:
-    the cells axis is then not nested-aligned over this span (a dense
-    multi-shard axis assembled at a block order coarser than the shard
-    order), and index arithmetic would place cells in the wrong subtree.
+    subgroups by. Any span of a nested-ordered cells axis shares that
+    ancestor by construction, INCLUDING a block coarser than the stored
+    shard: the block-local index is then still the nested rank
+    (``rank_to_xy(R*4**d2 + r, d1+d2) == (X*2**d2 + x, Y*2**d2 + y)``), and
+    the axis-length check in :func:`read_tensors` is what rejects a block
+    order the axis cannot tile. This raises only when the written cells do
+    NOT share the ancestor — the span's ``morton`` coordinate is not
+    nested-ordered (not a zagg-written axis), where index arithmetic would
+    place cells in the wrong subtree.
     """
     from mortie import clip2order
 
@@ -396,9 +401,9 @@ def _chunk_word(words: np.ndarray, field: str, start: int) -> int:
     if np.any(ancestors != ancestors[0]):
         raise ValueError(
             f"cells of the block at {start} of {field!r} span more than one "
-            f"order-{order} ancestor — the cells axis is not nested-aligned over "
-            f"this span (a dense multi-shard axis assembles only at block orders "
-            f"at or finer than the shard order)"
+            f"order-{order} ancestor — the 'morton' coordinate is not in nested "
+            f"order over this span, so a cells-axis index does not name a "
+            f"position in the block's subtree"
         )
     return int(ancestors[0])
 
