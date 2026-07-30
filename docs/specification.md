@@ -612,9 +612,74 @@ case.
 ## 6. `zagg-ragged/2`
 
 **Status: specified, implementation pending
-([#210](https://github.com/englacial/zagg/issues/210)).**
+([#210](https://github.com/englacial/zagg/issues/210); timing ratified —
+the dtype package ships on its own release train, the zagg writer knob and
+reader dispatch are gated on 1.0).** `/2` **adds to** `/1`, it does not
+replace it: `/1` is the pinned 1.0 wire contract (§1), existing stores keep
+it forever, and every conforming reader supports `/1` unconditionally.
 
-*Populated in phase 6 of the #340 PR.*
+`/2` moves the element declaration out of the §1.2 attrs block and into the
+zarr **data type itself**: a parameterized typed vlen dtype, so a generic
+zarr stack knows the element interpretation without zagg's attrs convention.
+
+### 6.1 The typed dtype
+
+**Contract.** The `/2` data type is the registered zarr v3 extension
+**`vlen-ndarray`** (espg-ratified name; reference implementation: the
+`zarr-vlen-ndarray` package under `github.com/espg`), parameterized by the
+element dtype and trailing inner shape — exactly the pair the `/1` attrs
+block declares:
+
+- element dtype `float32`, inner shape `(2,)` for a digest payload array;
+- element dtype `uint64`, inner shape `()` for a locations sibling.
+
+A cell's logical value is the `(n, *inner_shape)` array itself rather than
+its raw bytes; everything else about the array — shape, cells axis,
+`fill_value` (the empty cell), located sibling alignment (§1.1), storage
+geometries (§1.5) — is unchanged from §1.
+
+### 6.2 Byte identity
+
+**Contract.** The `/2` codec chain MUST produce chunk bytes **byte-identical
+to `/1`'s**: the §1.4 wire framing and the §1.3
+`[…, zstd(level=3, checksum=false)]` chain are unchanged, with the typed
+array↔bytes codec serializing each cell as the same
+`np.ascontiguousarray(value).tobytes()` little-endian payload. The typed
+dtype changes *interpretation only*, never stored bytes. Consequences (the
+point of the revision):
+
+- migrating an existing `/1` store to `/2` is a **metadata-only** rewrite
+  (`zarr.json` objects; no data object is touched);
+- the §7 conformance fixtures serve both revisions — a `/1` fixture's chunk
+  objects re-labeled `/2` MUST decode identically through the typed path;
+- the §5 O11 vlen recipe is unaffected (it hashes decoded payload bytes,
+  which are identical by construction).
+
+### 6.3 Revision signaling
+
+**Contract** (restating §1.6 from the `/2` side):
+
+- An array whose zarr data type is `vlen-ndarray` **is** `zagg-ragged/2`;
+  the `ragged` attrs marker is retired on such arrays (not written). The
+  element declaration lives in the dtype configuration alone — a reader
+  MUST NOT require the attrs block on a `/2` array.
+- A located `/2` payload array still declares its sibling binding in
+  **metadata, never by naming convention** (the §1.2 rule survives the
+  revision); the exact attrs key is reserved for the `/2` implementation PR
+  to pin *in this section* before any `/2` store exists. The
+  sibling-alignment semantics of §1.1 are unchanged.
+- An array with the `variable_length_bytes`/`bytes` dtype and a
+  `spec: "zagg-ragged/1"` attrs block **is** `zagg-ragged/1`.
+- A reader without the `vlen-ndarray` extension installed MUST surface an
+  actionable "install `zarr-vlen-ndarray` to read this store" failure, not
+  a silent mis-decode (and cannot half-parse: the dtype is unknown to its
+  zarr stack by construction).
+
+*(Informative.)* Writing `/2` will be a per-product opt-in
+(`output.ragged_encoding: typed`), which shifts the product's
+`semantic_hash` — a new product identity, by design. The default stays `/1`;
+flipping it is a schema epoch deferred to its own ruling (public/interop
+stores may deliberately stay `/1` for vanilla-zarr openability).
 
 ## 7. Conformance fixtures
 
