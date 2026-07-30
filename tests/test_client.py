@@ -643,24 +643,52 @@ class TestFutures:
 
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", _fail)
         monkeypatch.setattr(runner, "_dispatch_run_stats", lambda *a, **k: gate.wait(10))
+        # Shared helper's fixed backoff (issue #335), collapsed for the test.
+        monkeypatch.setattr(runner, "_FINALIZE_BACKOFF_S", 0)
 
         def _finalize_warnings(caught):
-            return [str(w.message) for w in caught if "finalize" in str(w.message)]
+            return [str(w.message) for w in caught if "manifest backstop" in str(w.message)]
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             handle = _run(catalog, client=StubLambdaClient()).dispatch()
             deadline = time.time() + 10
-            while not _finalize_warnings(caught):
+            # Two: one per attempt of the shared retry (issue #335).
+            while len(_finalize_warnings(caught)) < 2:
                 assert time.time() < deadline, "no finalize warning while the tail ran"
                 time.sleep(0.01)
             assert handle._finisher.is_alive()  # warned before the join, not at it
-            (msg,) = _finalize_warnings(caught)
+            msg = _finalize_warnings(caught)[-1]  # the terminal warning
             assert _STORE in msg and "idempotent" in msg
+            assert "handle.wait()" in msg  # this path's re-raise note
             gate.set()
         # Re-raise semantics unchanged.
         with pytest.raises(RuntimeError, match="finalize down"):
             handle.wait(timeout=10)
+
+    def test_finalize_retry_heals_and_stays_clean(self, catalog, monkeypatch):
+        """Issue #335: the facade shares agg's retry, so a transient finalize
+        failure (throttle, cold-start timeout) leaves a CLEAN handle — warned,
+        but nothing recorded and nothing re-raised from wait()."""
+        from zagg import runner
+
+        outcomes = iter([RuntimeError("throttled"), None])
+        real = runner._invoke_lambda_finalize
+
+        def _flaky(*a, **k):
+            e = next(outcomes, None)
+            if e is not None:
+                raise e
+            return real(*a, **k)
+
+        monkeypatch.setattr(runner, "_invoke_lambda_finalize", _flaky)
+        monkeypatch.setattr(runner, "_FINALIZE_BACKOFF_S", 0)
+        stub = StubLambdaClient()
+        with pytest.warns(RuntimeWarning, match=r"finalize \(manifest backstop\) failed"):
+            handle = _run(catalog, client=stub).dispatch()
+            handle.wait(timeout=10)  # no raise: the retry healed it
+        assert handle._finalize_error is None and handle._tail_error is None
+        assert "finalize" in stub.modes()  # the retry's invoke really landed
 
     def test_finalize_failure_wins_over_a_tail_crash(self, catalog, monkeypatch):
         # Two distinct channels: the D6 manifest backstop failure is the one
@@ -675,6 +703,7 @@ class TestFutures:
 
         monkeypatch.setattr(runner, "_invoke_lambda_finalize", _fail)
         monkeypatch.setattr(runner, "_lambda_result_rows", _boom)
+        monkeypatch.setattr(runner, "_FINALIZE_BACKOFF_S", 0)
         handle = _run(catalog, client=StubLambdaClient()).dispatch()
         with pytest.raises(RuntimeError, match="finalize down"):
             handle.wait(timeout=10)

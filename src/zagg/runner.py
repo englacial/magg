@@ -3013,39 +3013,48 @@ def _run_local(
     return summary
 
 
-def _finalize_with_retry(executor, *, store_path, retries=1, backoff_s=5) -> Exception | None:
-    """Guarded ``executor.finalize()``: warn at failure, retry, return the error.
+#: Fixed backoff between the finalize attempts (issue #335): not a user knob
+#: (espg ruling), a module constant so tests can collapse the wait.
+_FINALIZE_BACKOFF_S = 5
+
+
+def _finalize_with_retry(
+    finalize, *, store_path, reraise_note, retries=1, backoff_s=None
+) -> Exception | None:
+    """Guarded finalize backstop: warn at failure, retry, return the error.
 
     Issue #335 ((d)+(c), espg-ratified): the finalize backstop is an idempotent
     worker invoke — nothing is corrupted on failure (every shard's outputs are
     already written; only the root manifest may be stale), so a failure warns
-    immediately (same message contract as the PR #333 client facade, so the two
-    paths read identically) and retries once after a fixed 5 s backoff —
-    deliberately not knobs (espg ruling on issue #335). Returns ``None`` on
-    success or the last exception; the caller owns failure semantics
-    (``_run_lambda`` runs the full post-run tail with the error recorded in
-    run-stats, then re-raises so ``agg`` still exits nonzero). The success path
-    is untouched: no sleep, no warning.
+    immediately and retries once after a fixed 5 s backoff — deliberately not
+    knobs (espg ruling on issue #335). Returns ``None`` on success or the last
+    exception; the caller owns failure semantics and describes them in
+    ``reraise_note``, the one clause of the warning that differs between
+    callers. The success path is untouched: no sleep, no warning.
+
+    ``finalize`` is any zero-arg callable, so this is the ONE implementation of
+    the warn/retry/record contract for every dispatch path: ``_run_lambda``
+    (``executor.finalize``, then the full tail with the error recorded in
+    run-stats before it re-raises), ``RasterStrategy``'s Lambda driver, and the
+    :class:`zagg.client.Run` facade's finisher thread (records it on the handle
+    for :meth:`~zagg.client.RunHandle.wait`). Sharing it is the issue #335
+    phase-1 acceptance criterion — ``agg`` and the client cannot drift.
     """
     error = None
+    backoff_s = _FINALIZE_BACKOFF_S if backoff_s is None else backoff_s
     for attempt in range(retries + 1):
         try:
-            executor.finalize()
+            finalize()
             return None
         except Exception as e:
             error = e
             retrying = attempt < retries
-            tail = (
-                f"Retrying once in {backoff_s} s."
-                if retrying
-                else "This error re-raises after the post-run tail completes."
-            )
             warnings.warn(
                 f"finalize (manifest backstop) failed for {store_path}: {e}. "
                 f"Shard outputs are written; the store's root manifest may be "
                 f"stale until finalize runs again. It is idempotent — re-run "
                 f"the dispatch (or re-dispatch finalize) to stamp the manifest. "
-                f"{tail}",
+                + (f"Retrying once in {backoff_s} s." if retrying else reraise_note),
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -3519,7 +3528,11 @@ def _run_lambda(
     # run-stats recording the failure, sweep) runs as on success and the error
     # re-raises at the end so agg still exits nonzero.
     finalize_start = time.time()
-    finalize_error = _finalize_with_retry(executor, store_path=store_path)
+    finalize_error = _finalize_with_retry(
+        executor.finalize,
+        store_path=store_path,
+        reraise_note="This error re-raises after the post-run tail completes.",
+    )
     finalize_s = time.time() - finalize_start
     wall_time = time.time() - start_time
 

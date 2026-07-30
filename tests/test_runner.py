@@ -4347,13 +4347,17 @@ class TestFinalizeGuard:
 
         sleeps = []
         monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
-        executor = MagicMock()
-        executor.finalize.side_effect = RuntimeError("nope")
-        with pytest.warns(RuntimeWarning):
-            err = runner._finalize_with_retry(executor, store_path="s3://out/x.zarr")
-        assert executor.finalize.call_count == 2  # initial + exactly one retry
+        finalize = MagicMock(side_effect=RuntimeError("nope"))
+        with pytest.warns(RuntimeWarning) as caught:
+            err = runner._finalize_with_retry(
+                finalize, store_path="s3://out/x.zarr", reraise_note="RE-RAISES LATER."
+            )
+        assert finalize.call_count == 2  # initial + exactly one retry
         assert sleeps == [5]
         assert isinstance(err, RuntimeError)  # returned, not raised: caller defers
+        # The caller's re-raise semantics are the one clause that varies, so the
+        # CLI and the client facade can share the rest verbatim (issue #335).
+        assert "RE-RAISES LATER." in str(caught[-1].message)
 
 
 class TestResolveSourceCredentials:
