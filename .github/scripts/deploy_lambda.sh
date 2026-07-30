@@ -34,9 +34,18 @@
 # Requires: aws CLI (creds in env). arm64 / python3.12 only (the deployed target).
 set -euo pipefail
 
-# Default variant family: the template.yaml WorkerMemorySizes matrix
-# ("2048,4096,8192"), plain + -disk. Keep in sync with the template.
-DEFAULT_VARIANTS="-2048 -4096 -8192 -2048-disk -4096-disk -8192-disk"
+# Default update set: the template.yaml WorkerMemorySizes matrix
+# ("2048,4096,8192"), plain + -disk, PLUS the -extract twin. Keep in sync with
+# the template (tests/test_deploy_lambda.py guards the drift).
+#
+# -extract is not a worker-size variant — it is template.yaml's ExtractFn, a
+# separately-named function running the SAME code zip, layer, role and timeout
+# so full-archive extraction (issue #148) gets its own concurrency pool. It sat
+# on standup-time code permanently, which is issue #341's failure mode verbatim,
+# so it joins the loop: the probe-and-skip below covers the stacks that do not
+# provision it (the test stack has no -test-extract twin, and its deploy pins
+# --variants to the -disk trio, so it never probes this name).
+DEFAULT_VARIANTS="-2048 -4096 -8192 -2048-disk -4096-disk -8192-disk -extract"
 
 FUNCTION="" LAYER_BUCKET="" LAYER_KEY="" FUNCTION_ZIP="" REGION=""
 VARIANTS="$DEFAULT_VARIANTS"
@@ -90,7 +99,8 @@ deploy_one() {
 }
 
 # Base function first (hard-required, unchanged failure semantics), then every
-# provisioned worker-size variant from the same layer version + zip (issue #341).
+# provisioned sibling that runs the same zip — the worker-size variants and the
+# -extract twin — from the same layer version + zip (issue #341).
 deploy_one "$FUNCTION"
 
 for SUFFIX in $VARIANTS; do
