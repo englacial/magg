@@ -24,6 +24,11 @@ SCRIPT = REPO / ".github" / "scripts" / "deploy_lambda.sh"
 #: The template.yaml WorkerMemorySizes matrix the script defaults to (issue #341).
 FAMILY = ["-2048", "-4096", "-8192", "-2048-disk", "-4096-disk", "-8192-disk"]
 
+#: The subset the TEST stack provisions (template.yaml's WorkerTestDiskVariants
+#: loop, -disk only), which lambda-benchmark.yml pins via --variants so the
+#: enumerated deploy role never AccessDenies a probe (fold review, issue #341).
+TEST_STACK_VARIANTS = ["-2048-disk", "-4096-disk", "-8192-disk"]
+
 # Stub `aws`: log the full arg line; emit a LayerVersionArn on stdout for the
 # publish-layer-version call (the script captures it). get-function-configuration
 # probes succeed only for functions listed in $AWS_EXISTING (space-separated;
@@ -176,9 +181,9 @@ def _deployed(log):
 
 
 def test_variant_family_deployed_when_present(tmp_path):
-    # Issue #341: the whole worker-size family updates from the same zip. The
-    # test stack shape: only the -disk trio exists (template.yaml's
-    # WorkerTestDiskVariants loop); the plain-memory trio 404s and is skipped.
+    # Issue #341: the whole worker-size family updates from the same zip. On a
+    # stack that provisions a subset of the DEFAULT_VARIANTS list, the absent
+    # ones 404 and are skipped quietly.
     existing = [f"process-shard-test{s}" for s in ("-2048-disk", "-4096-disk", "-8192-disk")]
     result, log = _run_deploy(tmp_path, existing=existing)
     assert result.returncode == 0
@@ -191,6 +196,57 @@ def test_variant_family_deployed_when_present(tmp_path):
     assert len(probed) == len(FAMILY)
     for missing in ("-2048", "-4096", "-8192"):
         assert f"variant process-shard-test{missing} does not exist; skipping" in result.stdout
+
+
+def test_test_deploy_variant_set_probes_nothing_absent(tmp_path):
+    # Fold review: the workflow now pins --variants to the test-stack shape, so
+    # the plain-memory trio is never probed. Before, the enumerated deploy role
+    # AccessDenied those three probes (not 404), landing on the WARN branch and
+    # printing "it may now be STALE" on EVERY green deploy for functions that
+    # will never exist -- the one channel whose job is to make real staleness
+    # visible, crying wolf 3x per deploy.
+    existing = [f"process-shard-test{s}" for s in TEST_STACK_VARIANTS]
+    stub = STUB_AWS.replace(
+        'echo "An error occurred (ResourceNotFoundException) when calling the '
+        'GetFunctionConfiguration operation: Function not found: $4" >&2; exit 254',
+        'echo "An error occurred (AccessDeniedException) ..." >&2; exit 254',
+    )
+    result, log = _run_deploy(
+        tmp_path,
+        stub=stub,
+        existing=existing,
+        extra_args=["--variants", " ".join(TEST_STACK_VARIANTS)],
+    )
+    assert result.returncode == 0
+    assert _deployed(log) == ["process-shard-test", *existing]
+    assert len([line for line in log if "get-function-configuration" in line]) == len(
+        TEST_STACK_VARIANTS
+    )
+    assert "STALE" not in result.stderr
+    assert "does not exist; skipping" not in result.stdout
+
+
+def test_denied_update_aborts_the_family_loop(tmp_path):
+    # The granted-Get/denied-Update shape: the probe succeeds, the update does
+    # not. `set -e` aborts mid-family (base plus some variants updated, the rest
+    # stale) and the job goes red -- deliberate, and documented in the script:
+    # a red deploy is recoverable and the CodeSha256 guard refuses to benchmark
+    # the half-updated family.
+    stub = STUB_AWS.replace(
+        "exit 0\n",
+        'if [ "$2" = "update-function-code" ] && [ "$4" = "process-shard-test-4096-disk" ]; then\n'
+        '  echo "An error occurred (AccessDeniedException) ..." >&2; exit 254\nfi\nexit 0\n',
+        1,
+    )
+    result, log = _run_deploy(
+        tmp_path,
+        stub=stub,
+        existing=None,
+        extra_args=["--variants", " ".join(TEST_STACK_VARIANTS)],
+    )
+    assert result.returncode != 0
+    # The loop stopped at the denied variant: -8192-disk was never attempted.
+    assert "process-shard-test-8192-disk" not in "\n".join(log)
 
 
 def test_variant_probe_failure_warns_and_skips(tmp_path):
@@ -229,6 +285,7 @@ def test_variants_override(tmp_path):
 
 TEMPLATE = REPO / "deployment" / "aws" / "template.yaml"
 CICD = REPO / "deployment" / "aws" / "benchmark_cicd.yaml"
+BENCH_WORKFLOW = REPO / ".github" / "workflows" / "lambda-benchmark.yml"
 
 
 def _load_cfn(path):
@@ -290,6 +347,37 @@ def _script_default_variants():
     match = re.search(r'^DEFAULT_VARIANTS="([^"]*)"', SCRIPT.read_text(), re.MULTILINE)
     assert match, f"DEFAULT_VARIANTS not found in {SCRIPT}"
     return set(match.group(1).split())
+
+
+def _workflow_variants():
+    """The ``--variants`` suffix set lambda-benchmark.yml's deploy step pins."""
+    match = re.search(r'--variants "([^"]*)"', BENCH_WORKFLOW.read_text())
+    assert match, f"deploy step in {BENCH_WORKFLOW} passes no --variants"
+    return set(match.group(1).split())
+
+
+def test_test_deploy_workflow_pins_the_test_stack_variant_set():
+    # Fold review: the per-merge deploy must probe EXACTLY what the test stack
+    # provisions. Probing the prod default meant three AccessDenied probes (the
+    # deploy role enumerates only the -disk trio) landing on the loud
+    # "may now be STALE" branch on every green deploy, for functions that will
+    # never exist -- the same "nobody reads the warning" failure as issue #341.
+    test_suffixes, _ = _template_variant_suffixes()
+    assert _workflow_variants() == test_suffixes, (
+        f"the --variants list in {BENCH_WORKFLOW}'s deploy step and the "
+        f"WorkerTestDiskVariants loop in {TEMPLATE} disagree -- update whichever "
+        f"is stale, or the deploy either skips a provisioned variant (leaving it "
+        f"STALE, issue #341) or warns about one that does not exist"
+    )
+    # ...and every pinned suffix is enumerated on the deploy role, so no probe
+    # in the pinned set can AccessDeny.
+    arns = _statement_arns("DeployRole", "UpdateTestFunction")
+    for suffix in sorted(_workflow_variants()):
+        want = "function:${TestFunctionName}" + suffix
+        assert any(a.endswith(want) for a in arns), (
+            f"{BENCH_WORKFLOW} deploys test variant '{suffix}' but "
+            f"DeployRole.UpdateTestFunction in {CICD} has no ARN ending '{want}'"
+        )
 
 
 def test_deploy_role_enumerates_test_stack_variants():

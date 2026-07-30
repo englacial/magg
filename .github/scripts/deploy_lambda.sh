@@ -12,9 +12,17 @@
 # only the base left ${FN}-4096-disk on standup-time code, so every -disk arm
 # ran stale. The script now updates the WHOLE family from the same zip: each
 # default-matrix variant is probed (get-function-configuration) and updated if
-# it exists; a missing variant is skipped with a note (e.g. the test stack only
-# provisions the -disk trio). Pass --variants to override the suffix list
-# (--variants "" deploys the base only).
+# it exists; a missing variant is skipped with a note. Pass --variants to
+# override the suffix list (--variants "" deploys the base only) — the
+# test-deploy path DOES, because the test stack provisions only the -disk trio
+# and its role enumerates exactly those ARNs, so probing the prod default would
+# AccessDeny (not 404) and cry STALE on every green deploy.
+#
+# Probe-succeeds-then-update-fails (granted Get, denied Update) is NOT tolerated:
+# under `set -e` it aborts the loop, leaving the base plus some variants updated
+# and the rest stale, and the job goes red. That is deliberate — a red deploy is
+# recoverable, and the run_benchmark CodeSha256 guard refuses the benchmark that
+# would otherwise measure the half-updated family (issue #341).
 #
 # Shared by the release path (publish.yml -> production) and the benchmark
 # test-deploy path (lambda-benchmark.yml -> process-shard-test).
