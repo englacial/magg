@@ -2315,6 +2315,7 @@ def _dispatch_run_stats(
     store_kwargs=None,
     summary=None,
     inline_rows=None,
+    finalize_error=None,
 ) -> str | None:
     """Fire-and-forget worker-invoke run-record write (issue #313, D8).
 
@@ -2334,6 +2335,12 @@ def _dispatch_run_stats(
     ``run_stats_path`` names the real object — best-effort: the invoke is
     fire-and-forget, mirroring the root MOC's semantics. Fail-open
     everywhere: telemetry must never fail a run whose data landed.
+
+    ``finalize_error`` rides the event (always present, ``None`` on success)
+    and lands as a run-level parquet column (issue #335): the guarded finalize
+    defers its failure through the tail, and this is the durable record a
+    postmortem reads — the alternative is a signal that lives only in the
+    orchestrator's ``RuntimeWarning``. The write stays worker-side (D8).
     """
     from datetime import datetime, timezone
 
@@ -2350,6 +2357,10 @@ def _dispatch_run_stats(
             "store_path": store_path,
             "run_id": run_id,
             "timestamp": timestamp,
+            # Always on the wire, None on success (issue #335) — same
+            # determinism rule as summary["run_stats_path"] below, so the
+            # parquet's column set does not vary run to run.
+            "finalize_error": finalize_error,
         }
         if output_creds_event is not None:
             event["output_credentials"] = output_creds_event
@@ -3696,6 +3707,10 @@ def _run_lambda(
         store_kwargs=_output_store_kwargs(output_creds_event, region),
         summary=summary,
         inline_rows=stats_inline_rows,
+        # The deferred finalize failure becomes DURABLE here (issue #335): the
+        # worker stamps it as the run parquet's run-level column, so the
+        # postmortem signal outlives this process's RuntimeWarning + exit code.
+        finalize_error=summary["finalize_error"],
     )
     # End-of-run rollup sweep (issue #300): the Lambda dispatcher never PUTs
     # (D8 standing rule), so the sweep rides ONE fire-and-forget mode="sweep"

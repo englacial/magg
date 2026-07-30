@@ -474,6 +474,28 @@ class TestRunParquet:
         with pytest.raises(ValueError, match="at least one"):
             write_run_parquet(str(tmp_path), [], run_id="x")
 
+    def test_finalize_error_is_a_run_level_column(self, tmp_path):
+        """Issue #335: the guarded finalize's failure is DURABLE here — one
+        run-level column, constant down the rows, always present (None on a
+        clean run) so the column set does not vary run to run."""
+        import pandas as pd
+
+        rows = [flatten_record(_record(1)), flatten_record(_record(2))]
+        clean = write_run_parquet(str(tmp_path / "ok"), rows, run_id="aa01")
+        df = pd.read_parquet(clean, engine="fastparquet")
+        assert "finalize_error" in df.columns and df["finalize_error"].isna().all()
+
+        failed = write_run_parquet(
+            str(tmp_path / "bad"),
+            rows,
+            run_id="aa02",
+            finalize_error="RuntimeError: invoke failed",
+        )
+        df = pd.read_parquet(failed, engine="fastparquet")
+        # Every row carries it (the run-level broadcast), so any row answers
+        # "did finalize fail?" without a second object.
+        assert list(df["finalize_error"]) == ["RuntimeError: invoke failed"] * 2
+
 
 class TestWindowColumn:
     """The per-shard record's ``window`` label (issue #300): threaded like
