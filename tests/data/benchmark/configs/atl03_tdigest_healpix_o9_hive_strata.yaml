@@ -1,9 +1,9 @@
 # ATL03 t-digest, SIGNAL/NOISE STRATIFIED epoch config -- o9 HIVE benchmark arm.
 #
 # The issue #321/#265 schema-epoch candidate at benchmark geometry: identical to
-# atl03_tdigest_healpix_o9_hive.yaml in data_source read shape and output grid,
-# with the aggregation replaced by the ratified strata trio (PR #334, mirroring
-# the shipped atl03_tdigest_strata_healpix.yaml at o9 instead of o11):
+# atl03_tdigest_healpix_o9_hive.yaml in HDF5 reads and output grid, with the
+# aggregation replaced by the ratified strata trio (PR #334, mirroring the
+# shipped atl03_tdigest_strata_healpix.yaml at o9 instead of o11):
 #
 #   - h_tdigest_signal / h_tdigest_noise -- disjoint located digests split at
 #     ingest by the ATBD union predicate (any signal_conf_ph column >= 2), each
@@ -12,7 +12,13 @@
 #   - composition -- one packed uint64/cell (zagg-composition/1)
 #
 # The five conf columns ride the per-variable ``column`` selector off the same
-# 2-D dataset the TEP filter already reads (path deduped -- no extra read).
+# 2-D dataset the TEP filter already reads, and the read paths are deduped
+# (_read_paths_pooled is fed dict.fromkeys over the variable+filter union), so
+# signal_conf_ph is fetched exactly once -- no extra bytes off S3. What does grow
+# is the carrier: the five int8 columns materialize into data_dict and ride the
+# spill block, taking it from cells(8) + leaf_id(8) + h_ph(4) = 20 B/photon to
+# 25 B/photon -- ~17 MB at this shard's recorded 3.33M photons against a
+# ~2.7 GB block_bytes budget, i.e. cosmetic, but the ladder attributes it here.
 #
 # A/B ladder on the pinned densest NEON o9 shard (all sidecar/spill/4GB-disk):
 #   tdigest_healpix_o9_hive_sidecar  (live baseline)
