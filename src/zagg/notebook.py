@@ -57,6 +57,11 @@ class StageTimer:
     recorded (the exception propagates unchanged). :meth:`as_dict` is the
     machine-comparable form — the shape a later run-over-run series would key
     on (wiring that up is out of scope here, issue #328 phase 4).
+
+    Value types in :attr:`stages` (and so in :meth:`as_dict`): ``seconds`` is a
+    ``float``, ``calls`` an ``int``. They share one mapping whose annotation
+    widens to ``float`` — mypy promotes ``int`` — so a consumer serializing the
+    snapshot should read ``calls`` as the integer count it is.
     """
 
     def __init__(self, label: str = "run"):
@@ -82,7 +87,7 @@ class StageTimer:
         return sum(e["seconds"] for e in self.stages.values())
 
     def as_dict(self) -> dict:
-        """``{"label", "stages": {name: {seconds, calls}}, "total_s"}``."""
+        """``{"label", "stages": {name: {seconds: float, calls: int}}, "total_s"}``."""
         return {
             "label": self.label,
             "stages": {k: dict(v) for k, v in self.stages.items()},
