@@ -758,7 +758,13 @@ class Run:
             )
 
         aoi_by_shard = runner._aoi_payload_map(self.catalog_data)
+        result_prefix = None
         if transport == "event":
+            from zagg.client_transport import run_status_prefix
+
+            # The tail's oversized-run-record pointer (issue #327): only the
+            # event transport has a per-run prefix to point at.
+            result_prefix = run_status_prefix(self.store, run_id)
             futures, closer = self._dispatch_event(
                 client,
                 cells,
@@ -793,6 +799,7 @@ class Run:
         finisher = threading.Thread(
             target=self._post_run,
             args=(handle, client, closer, config_dict, dataset, output_creds_event, run_id),
+            kwargs={"result_prefix": result_prefix},
             name="zagg-client-finish",
             daemon=True,
         )
@@ -823,8 +830,10 @@ class Run:
         run's status prefix per tick, and returns ``(futures, poller)`` — the
         poller is the finisher's ``closer``. D8 audit: this path's only store
         traffic is the poller's LIST/GETs (reads); every write stays behind a
-        worker invoke. A terminal failure (a ``failed`` status past the retry
-        budget, or the ``failed-unknown`` drop outcome) raises
+        worker invoke. A terminal failure (a ``failed`` status, or the
+        ``failed-unknown`` drop outcome past its one re-fire — see the
+        three-class retry policy on
+        :class:`~zagg.client_transport.StatusPoller`) raises
         :class:`ShardError` from the shard's future, exactly like v1.
         """
         from zagg.client_transport import dispatch_event_shards
@@ -926,6 +935,7 @@ class Run:
         output_creds_event: dict | None,
         run_id: str,
         tail_done_check=None,
+        result_prefix=None,
     ) -> None:
         """Finisher-thread entry point: run the tail, never lose its failure.
 
@@ -938,7 +948,9 @@ class Run:
         finding, PR #333). ``tail_done_check`` (issue #327, the attach path):
         a zero-arg read-only predicate consulted AFTER every shard settles —
         True means the tail was already recorded (the run's ``tail.json``
-        marker), so a reattached handle never re-runs it.
+        marker), so a reattached handle never re-runs it. ``result_prefix``
+        (also #327) is the oversized-run-record pointer — see
+        :meth:`_run_tail`.
         """
         try:
             if tail_done_check is not None:
@@ -946,7 +958,15 @@ class Run:
                 if tail_done_check():
                     logger.info(f"post-run tail already recorded for run {run_id}; skipping")
                     return
-            self._run_tail(handle, client, config_dict, dataset, output_creds_event, run_id)
+            self._run_tail(
+                handle,
+                client,
+                config_dict,
+                dataset,
+                output_creds_event,
+                run_id,
+                result_prefix=result_prefix,
+            )
         except BaseException as e:
             handle._tail_error = e
             logger.warning(f"post-run tail failed (surfaced via handle.wait()): {e}")
@@ -961,6 +981,7 @@ class Run:
         dataset: dict | None,
         output_creds_event: dict | None,
         run_id: str,
+        result_prefix=None,
     ) -> None:
         """After every shard settles: the same worker-invoke tail as ``agg``.
 
@@ -984,6 +1005,16 @@ class Run:
         escaping the retry loop) — a synthesized failure dict, which
         ``_lambda_result_rows`` turns into a ``failure_record`` row rather than
         dropping the shard from telemetry (review finding, PR #333).
+
+        ``result_prefix`` is the pointer ``_dispatch_run_stats`` falls back to
+        when the row set exceeds the inline payload cap. The v1 sync transport
+        has none (no #151 envelope mirror), so an oversized sync run skips its
+        record; the v2 event transport DOES — the run's status prefix, which
+        ``telemetry.rows_from_status`` reads (issue #327) — and fleet-scale
+        runs are exactly the ones that hit the cap, so passing it is what keeps
+        ``Run.dispatch(transport="event")`` from silently dropping the run
+        record that the byte-identical ``agg(invocation="event")`` keeps
+        (``runner.py`` does the same fallback at its own stats dispatch).
         """
         from zagg import runner
 
@@ -1066,11 +1097,13 @@ class Run:
             except Exception as e:
                 logger.warning(f"root coverage.moc dispatch failed (fail-open, D9): {e}")
 
-        # Run-record + sweep, both fail-open (issues #297/#313/#300): no #151
-        # envelope-mirror prefix on either transport, so oversized row sets
-        # skip inside _dispatch_run_stats exactly like agg's sync path. The
-        # worker also records the tail-completion marker (issue #327) so a
-        # reattached handle knows this tail ran.
+        # Run-record + sweep, both fail-open (issues #297/#313/#300). The
+        # oversized-rows pointer is the run's v2 status prefix on an event
+        # run (rows_from_status reads that object shape — issue #327) and
+        # None on the sync transport, which has no #151 envelope mirror to
+        # point at; the same fallback runner.py applies. The worker also
+        # records the tail-completion marker (issue #327) so a reattached
+        # handle knows this tail ran.
         from zagg.client_transport import TAIL_NAME, run_status_prefix
 
         stats_rows, stats_inline = runner._lambda_result_rows(results, run_id=run_id)
@@ -1080,7 +1113,7 @@ class Run:
             self.store,
             stats_rows,
             run_id=run_id,
-            result_prefix=None,
+            result_prefix=result_prefix,
             output_creds_event=output_creds_event,
             store_kwargs=runner._output_store_kwargs(output_creds_event, self.region),
             inline_rows=stats_inline,

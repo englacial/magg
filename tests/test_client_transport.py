@@ -96,9 +96,18 @@ class EventStubLambdaClient:
     """
 
     def __init__(
-        self, status_store, *, fail=(), benign=(), drop=(), fail_times=None, drop_times=None
+        self,
+        status_store,
+        *,
+        fail=(),
+        benign=(),
+        drop=(),
+        fail_times=None,
+        drop_times=None,
+        record=False,
     ):
         self.status_store = status_store
+        self._record = record  # deployed workers ride a stats record; stale ones don't
         self.events: list[tuple[str, str, dict]] = []
         self._lock = threading.Lock()
         self._fail = set(fail)  # deterministic failures (every attempt)
@@ -153,7 +162,12 @@ class EventStubLambdaClient:
         else:
             # Same canned ok body as tests/test_client.py's v1 stub, so agg
             # sync/event parity compares identical worker outputs.
-            response = _envelope({"total_obs": 7, "duration_s": 1.5})
+            body = {"total_obs": 7, "duration_s": 1.5}
+            if self._record:
+                from zagg.telemetry import build_record
+
+                body["stats"] = build_record(shard_key=int(key), metadata=dict(body))
+            response = _envelope(body)
         self._write_status(event, response)
         return {"StatusCode": 202}
 
@@ -291,6 +305,24 @@ class TestEventDispatch:
         first_cell = modes.index(None)
         assert modes[:first_cell] == ["ping", "setup"]
         assert "finalize" in modes and "coverage" in modes and "stats" in modes
+
+    def test_oversized_rows_point_at_the_status_prefix(self, catalog, status_store, monkeypatch):
+        # An oversized row set on an EVENT run keeps its run record: the tail
+        # points rows_from at the run's status prefix (which rows_from_status
+        # reads — issue #327). The facade hardcoded result_prefix=None, so a
+        # fleet-scale event run — the only kind that hits the cap — dropped
+        # the record its byte-identical agg(invocation="event") twin keeps.
+        from zagg import runner
+
+        monkeypatch.setattr(runner, "_RUN_STATS_INLINE_CAP_BYTES", 10)
+        stub = EventStubLambdaClient(status_store, record=True)
+        handle = _run(catalog, client=stub).dispatch(transport="event")
+        handle.results()
+        handle.wait(timeout=10)
+        run_id = stub.cell_events()[0][2]["run_id"]
+        (stats,) = [e for _, _, e in stub.events if e.get("mode") == "stats"]
+        assert stats["rows_from"] == ct.run_status_prefix(_STORE, run_id)
+        assert stats["rows"] == []  # every row is re-derivable from the prefix
 
     def test_unknown_transport_refused(self, catalog, status_store):
         run = _run(catalog, client=EventStubLambdaClient(status_store))

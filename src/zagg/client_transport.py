@@ -544,7 +544,12 @@ def attach_run(
             output_creds_event,
             run_id,
         ),
-        kwargs={"tail_done_check": lambda: tail_recorded(prefix, store_kwargs)},
+        kwargs={
+            "tail_done_check": lambda: tail_recorded(prefix, store_kwargs),
+            # An attached run's rows are the same status objects, so an
+            # oversized row set has the same pointer to fall back to.
+            "result_prefix": prefix,
+        },
         name="zagg-client-finish",
         daemon=True,
     )
