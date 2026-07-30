@@ -58,7 +58,13 @@ path (`grids.base.ragged_array_spec`, `shard_shape` argument). The streaming
 write path (`write_ragged_to_zarr`, the runner / Lambda streaming callback)
 writes each chunk independently as it is produced, then frees it — the
 [issue #91](https://github.com/englacial/zagg/issues/91) stream-and-free
-bound. Folding all K chunks into one sharded object would force a
+bound. "Streaming" here is the **output-side** write discipline, which the
+production runner uses on every path — including the default pooled-input
+aggregation (the shard's reads are pooled once, then each chunk's output
+carrier is built, written through the callback, and freed). It is distinct
+from the buffered/streaming *input* path (issue #148 phase 4); input pooling
+and output stream-and-free are orthogonal, and a pooled-input production run
+still writes chunk-at-a-time through this path. Folding all K chunks into one sharded object would force a
 read-modify-write of that shared object on every chunk, defeating
 stream-and-free and re-introducing the memory the sharded slab pass is careful
 to bound. So the regular-chunked (one object per inner chunk) layout is
