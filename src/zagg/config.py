@@ -2,6 +2,7 @@
 
 import importlib
 import inspect
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ import numpy as np
 import yaml
 
 import zagg.configs
+
+logger = logging.getLogger(__name__)
 
 
 class LinkDict(TypedDict):
@@ -858,8 +861,11 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
         )
     # Overview pyramid declaration (issue #201): explicit blocks are grammar-
     # checked here; the D24 none-field warning fires at manifest build time
-    # (template time for the store), not per config validation.
+    # (template time for the store), not per config validation. The NaN-fill
+    # reduction warning below IS per config validation (espg ruling on the
+    # PR #344 nan-policy finding): it concerns the store encoding itself.
     _validate_pyramid(config)
+    _warn_nan_ambiguous_reductions(config)
 
 
 def _validate_windowing(config: PipelineConfig) -> None:
@@ -2395,6 +2401,55 @@ def _validate_pyramid(config: PipelineConfig) -> None:
                 f"declared field: derived summaries must use a DIFFERENT name so overview "
                 f"schema never silently differs from source (D24)"
             )
+
+
+#: Exact-law reductions whose plain (NaN-propagating) forms cannot round-trip
+#: through a NaN fill: at read, a NaN datum and the fill are the same bytes.
+_NAN_AMBIGUOUS_REDUCTIONS = ("min", "max", "sum")
+
+
+def _warn_nan_ambiguous_reductions(config: PipelineConfig) -> None:
+    """Warn when a plain ``min``/``max``/``sum`` pairs with a NaN fill (#201).
+
+    Warning, not error — the pairing is legal (the shipped atl06 config uses
+    it by design), but the store encoding has a consequence the author should
+    have chosen knowingly: a NaN datum and the fill sentinel are the same
+    bytes, so downstream the reduction behaves as its nan-skipping form (the
+    pyramid block declares this as ``nan_policy: "skip"``) and a
+    NaN-propagating result is unrecoverable. Declaring ``nanmin``/``nanmax``/
+    ``nansum`` states the same semantics explicitly and silences this.
+    """
+    from zagg.semantics import _fold_function_name, field_composability
+
+    for name, meta in get_agg_fields(config).items():
+        fn = _fold_function_name(meta.get("function"))
+        if fn not in _NAN_AMBIGUOUS_REDUCTIONS or not _is_nan_fill(meta):
+            continue
+        try:
+            if field_composability(meta) != "exact":
+                continue
+        except Exception:
+            continue  # malformed meta: the kind/shape validators own the error
+        logger.warning(
+            f"aggregation.variables.{name}: {meta.get('function')!r} with a NaN fill_value — "
+            f"NaN data is indistinguishable from fill at read; the reduction behaves as "
+            f'nan{fn} in overviews (declared in the pyramid block as nan_policy: "skip") '
+            f"and any NaN-carrying result is unrecoverable — use nan{fn} explicitly to "
+            f"silence this (issue #201)"
+        )
+
+
+def _is_nan_fill(meta: dict) -> bool:
+    """Whether a field's fill sentinel is NaN (explicitly, or by float default)."""
+    fill = meta.get("fill_value")
+    if fill is None:
+        try:
+            return np.issubdtype(np.dtype(meta.get("dtype", "float32")), np.floating)
+        except TypeError:
+            return False
+    if isinstance(fill, str):
+        return fill.strip().lower() == "nan"
+    return isinstance(fill, float) and np.isnan(fill)
 
 
 def get_windowing(config: PipelineConfig) -> dict | None:
