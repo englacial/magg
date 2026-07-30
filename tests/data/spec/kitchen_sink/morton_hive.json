@@ -1,0 +1,22 @@
+{
+ "spec": "morton-hive/1",
+ "dataset": {
+  "short_name": "SPEC_FIXTURE",
+  "version": "1"
+ },
+ "semantic_hash": "b2b818c8cce477b2d9d09984bddc37dc255a4bef9ed98c7ca830518bacd95708",
+ "cell_order": 6,
+ "shard_order": 4,
+ "split_schedule": [
+  1,
+  1,
+  1,
+  1
+ ],
+ "path_grouping": 1,
+ "pyramid": {
+  "orders": [],
+  "aggregation": {}
+ },
+ "generated_at": "2026-07-30T06:38:23+00:00"
+}
