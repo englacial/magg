@@ -127,11 +127,68 @@ RASTER_NAMES = (
     "write_raster_slab",
 )
 
+#: Top-level names ``src/zagg/sweep.py`` defined before the phase-3 split (the
+#: module was 1,034 lines). Split into SIBLING modules rather than a package:
+#: ``zagg.sweep`` is a CLI entry point (``python -m zagg.sweep``), which a
+#: package ``__init__`` would not serve, and ``zagg.sweep_overview`` is the
+#: tree's existing precedent for splitting this module family.
+SWEEP_NAMES = (
+    "DEFAULT_FAMILIES",
+    "DebrisFamily",
+    "FAMILIES",
+    "MocFamily",
+    "OverviewFamily",
+    "SUBMAP_NAME",
+    "SWEEP_SPEC",
+    "StatsFamily",
+    "SubmapFamily",
+    "SweepFamily",
+    "_NO_SIDECAR",
+    "_ReprojectTarget",
+    "_ancestor",
+    "_generation",
+    "_merged",
+    "_moc_payload",
+    "_node_rel",
+    "_normalize_leaves",
+    "_put_rollup",
+    "_read_rollup",
+    "_rollup_interior",
+    "_rollup_key",
+    "_rollup_shard_node",
+    "_sidecar_window",
+    "_sweep_family",
+    "_warn_unsupported_submap",
+    "_warned_unsupported_submap",
+    "discover_leaves",
+    "get_family",
+    "leaves_from_stats_records",
+    "main",
+    "run_sweep",
+    "submap_emittable",
+    "submap_key",
+    "sweep_after_run",
+    "write_leaf_submap",
+)
+
 #: ``{facade module: (pre-split names, submodules it re-exports from)}``.
 SPLITS = {
     "zagg.hive": (HIVE_NAMES, ("layout", "manifest", "coverage")),
     "zagg.processing.raster": (RASTER_NAMES, ("decode", "template", "write")),
+    "zagg.sweep": (SWEEP_NAMES, ("zagg.sweep_families", "zagg.sweep_rollup")),
 }
+
+
+def _submodules(facade):
+    """Import every module the facade re-exports from.
+
+    A split is either a PACKAGE (``zagg.hive`` -> ``zagg.hive.layout``, named
+    relatively) or SIBLING modules (``zagg.sweep`` -> ``zagg.sweep_families``,
+    named absolutely because ``zagg.sweep`` must stay a module to keep working
+    as ``python -m zagg.sweep``).
+    """
+    for sub in SPLITS[facade][1]:
+        yield importlib.import_module(sub if "." in sub else f"{facade}.{sub}")
 
 
 @pytest.mark.parametrize("facade", sorted(SPLITS))
@@ -151,6 +208,8 @@ class TestSplitFacade:
 
     def test_all_stays_within_the_pre_split_surface(self, facade):
         module = importlib.import_module(facade)
+        if not hasattr(module, "__all__"):
+            pytest.skip(f"{facade} declared no __all__ before the split either")
         assert set(module.__all__) <= set(SPLITS[facade][0])
         assert [name for name in module.__all__ if not hasattr(module, name)] == []
 
@@ -158,19 +217,22 @@ class TestSplitFacade:
         """Re-export, not a copy — identity, so ``is`` comparisons still hold."""
         module = importlib.import_module(facade)
         seen = 0
-        for sub in SPLITS[facade][1]:
-            submodule = importlib.import_module(f"{facade}.{sub}")
+        for submodule in _submodules(facade):
             for name in SPLITS[facade][0]:
-                if hasattr(submodule, name) and name in vars(submodule):
+                if name in vars(submodule):
                     assert getattr(module, name) is getattr(submodule, name)
                     seen += 1
         assert seen, f"{facade} re-exports nothing from {SPLITS[facade][1]}"
 
     def test_every_split_module_is_under_the_line_limit(self, facade):
-        package = pathlib.Path(importlib.import_module(facade).__file__).parent
+        paths = [pathlib.Path(m.__file__) for m in _submodules(facade)]
+        facade_path = pathlib.Path(importlib.import_module(facade).__file__)
+        paths.append(facade_path)
+        if facade_path.name == "__init__.py":  # a package: catch stragglers too
+            paths.extend(facade_path.parent.glob("*.py"))
         oversize = {
             path.name: len(path.read_text().splitlines())
-            for path in sorted(package.glob("*.py"))
+            for path in sorted(set(paths))
             if len(path.read_text().splitlines()) > LINE_LIMIT
         }
         assert oversize == {}, f"{facade} modules over {LINE_LIMIT} lines: {oversize}"
