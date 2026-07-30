@@ -213,7 +213,13 @@ for tensor, mask, (offset, gain), morton in read_tensors(store, field):
   frozen `hive.decode_coverage_bitmap` convention, one small sidecar object,
   no digest bytes). A store without exact occupancy (every flat store, or a
   box-only/`full`-less missing sidecar) degrades to the 2-state `{0, 2}`
-  populated/not mask. Today occupancy equals digest coverage, so state `1`
+  populated/not mask, where `0` means only "no stored digest" and asserts
+  nothing about whether the cell was observed. **The mask does not carry which
+  regime it is in** — a degraded mask and a 3-state mask over a block with no
+  observed-but-empty cell are both `{0, 2}` — so check
+  `has_exact_occupancy(store)` before keying on `mask == 1`; without it, an
+  empty noise stratum on a degraded store reads as a genuine absence. Today
+  occupancy equals digest coverage, so state `1`
   does not occur; once the
   [issue #334](https://github.com/englacial/zagg/issues/334) signal strata
   land, noise-occupied cells appear as `1` automatically — the 3-state

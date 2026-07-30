@@ -82,6 +82,7 @@ __all__ = [
     "rasterize_cell",
     "chunk_z_range",
     "read_tensors",
+    "has_exact_occupancy",
     "read_raw_values",
     "read_locations",
     "read_cell",
@@ -419,6 +420,31 @@ def _read_store_object(store: Store, key: str) -> bytes | None:
     return None if buf is None else buf.to_bytes()
 
 
+def _coverage_occupancy(store: Store) -> tuple[str, dict, bytes] | None:
+    """``(encoding, coverage, sidecar_bytes)`` when the store has EXACT occupancy.
+
+    ``None`` for every store whose mask must degrade to the 2-state
+    populated/not channel (the D9 degrade): no commit stamp (every flat
+    store), a box-only envelope, or a bitmap envelope whose sidecar object is
+    gone. Shared by :func:`_load_occupancy` and :func:`has_exact_occupancy`,
+    so the public predicate cannot drift from the mask the reader builds.
+    """
+    from zagg import hive
+
+    coverage = hive.read_coverage(store)
+    if not coverage:
+        return None
+    encoding = coverage.get("encoding")
+    if encoding == "full":
+        return "full", coverage, b""  # a full subtree needs no sidecar (D14)
+    if encoding != "bitmap" or not coverage.get("sidecar"):
+        return None
+    payload = _read_store_object(store, str(coverage["sidecar"]))
+    if payload is None:
+        return None
+    return "bitmap", coverage, payload
+
+
 def _load_occupancy(store: Store, arr, words: np.ndarray, field: str) -> tuple | None:
     """The leaf's exact cell occupancy for the mask channel, or ``None``.
 
@@ -439,17 +465,12 @@ def _load_occupancy(store: Store, arr, words: np.ndarray, field: str) -> tuple |
     """
     from zagg import hive
 
-    coverage = hive.read_coverage(store)
-    if not coverage:
+    found = _coverage_occupancy(store)
+    if found is None:
         return None
-    encoding = coverage.get("encoding")
+    encoding, coverage, payload = found
     if encoding == "full":
         return "full", None
-    if encoding != "bitmap" or not coverage.get("sidecar"):
-        return None
-    payload = _read_store_object(store, str(coverage["sidecar"]))
-    if payload is None:
-        return None
     cell_order = _cells_order(words, field, 0)
     if int(coverage.get("cell_order", -1)) != cell_order:
         raise ValueError(
@@ -476,9 +497,11 @@ def _block_mask(words: np.ndarray, occupancy: tuple | None, block_depth: int) ->
     """The block's ``(side, side)`` uint8 occupancy base (values 0/1).
 
     ``1`` marks a cell the leaf's occupancy sidecar records as observed;
-    the caller upgrades digest-bearing cells to ``2``. Without occupancy
-    truth the base stays ``0`` everywhere (mask degrades to the 2-state
-    populated/not — never a wrong answer).
+    the caller upgrades digest-bearing cells to ``2``. Without occupancy truth
+    the base stays ``0`` everywhere: the mask degrades to the 2-state
+    populated/not channel, where ``0`` means "no stored digest" and asserts
+    NOTHING about whether the cell was observed. That degrade is not visible
+    in the mask itself — :func:`has_exact_occupancy` is the discriminator.
     """
     side = 1 << block_depth
     mask = np.zeros((side, side), dtype=np.uint8)
@@ -613,11 +636,18 @@ def read_tensors(
         rasterizes). The observed states come from the hive leaf's
         ``coverage.moc`` occupancy sidecar (issue #200), read WITHOUT
         touching digest bytes; a store without one (every flat store)
-        degrades to the 2-state ``{0, 2}`` populated/not mask. Today a
-        pre-#334 leaf's occupancy equals its digest coverage, so ``1`` does
-        not occur; once the issue #334 signal strata land, noise-occupied
-        cells (observed, no signal digest) appear as ``1`` automatically —
-        the upgrade is data-driven, not a reader flag. ``(offset, gain)`` is
+        degrades to the 2-state ``{0, 2}`` populated/not mask, where ``0``
+        means only "no stored digest" and does NOT assert that the cell was
+        unobserved. **The yielded mask does not say which regime it is in** —
+        a degraded mask and a 3-state mask over a block with no
+        observed-but-empty cell are both ``{0, 2}`` — so a consumer keying on
+        the 3-state semantics (``mask == 1``, the issue #334 noise stratum)
+        must check :func:`has_exact_occupancy` first, or it reads an empty
+        stratum on a degraded store as a genuine absence. Today a pre-#334
+        leaf's occupancy equals its digest coverage, so ``1`` does not occur;
+        once the issue #334 signal strata land, noise-occupied cells
+        (observed, no signal digest) appear as ``1`` automatically — the
+        upgrade is data-driven, not a reader flag. ``(offset, gain)`` is
         the block's shared z-window ``(z_lo, resolution)``: bin ``i`` of
         every cell in the block covers ``[offset + i*gain, offset +
         (i+1)*gain)``. ``morton_index`` is the block's coverage-cell morton
@@ -715,6 +745,30 @@ def read_tensors(
             mask[row, col] = 2
 
         yield tensor, mask, (float(z_lo), float(resolution_c)), _chunk_word(words, field, bstart)
+
+
+def has_exact_occupancy(store: Store) -> bool:
+    """Whether this store's :func:`read_tensors` mask is the 3-state channel.
+
+    The mask's two regimes are indistinguishable from the yielded array (a
+    degraded mask is ``{0, 2}``, and so is a 3-state mask over a block with no
+    observed-but-empty cell), so this is the discriminator — call it once per
+    store before keying on the mask's semantics:
+
+    - ``True`` — the leaf carries exact ``coverage.moc`` occupancy (issue
+      #200), so ``0`` really means *unobserved* and ``1`` (observed, no stored
+      digest — the issue #334 noise stratum) is reported wherever it occurs.
+    - ``False`` — no exact occupancy (no commit stamp, i.e. every flat store;
+      a box-only envelope; or a bitmap envelope whose sidecar is gone), the
+      mask degrades to 2-state populated/not, and ``0`` means only "no stored
+      digest here". Reading ``mask == 1`` as "no noise-occupied cells" would
+      be a false negative.
+
+    One attrs read plus (for a bitmap envelope) the small sidecar object; no
+    digest bytes. Shares :func:`_coverage_occupancy` with the mask build, so
+    it cannot report a regime the reader does not produce.
+    """
+    return _coverage_occupancy(store) is not None
 
 
 def read_raw_values(
