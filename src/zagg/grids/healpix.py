@@ -499,9 +499,17 @@ class HealpixGrid:
         pydantic-zarr's overwrite walk (``GroupSpec.like`` →
         ``Group.members()``) never has to parse a broken/orphan member dir —
         an unknown array dir can die with "No array found in store" instead
-        of templating. The store is rooted at the leaf, so the delete is
-        scoped to the leaf prefix; sibling prefixes (e.g. the run's
-        ``.zarr.status/`` objects) live outside it and are never touched.
+        of templating.
+
+        Scoping: the store is rooted AT the leaf, so ``delete_dir("")`` can only
+        reach the leaf prefix — sibling prefixes (e.g. the run's
+        ``<root>.zarr.status/`` objects, which live beside the store root) are
+        outside it. On the fleet backend that is not quite "by construction":
+        zarr's ``ObjectStore.delete_dir`` leaves the empty prefix un-slashed, so
+        the delimiter is re-added by obstore's prefix store. It does re-add it
+        (verified, and pinned by ``test_overwrite_clear_is_scoped_on_an_obstore_
+        prefix_store``), which is what makes a name-prefix twin like
+        ``<leaf>.status`` safe rather than merely unlikely.
         """
         spec = GroupSpec(members={self.group_path: self.shard_spec()}, attributes={})
         # Ragged vlen-array creation warns about the dtype NAME only
