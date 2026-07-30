@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator
+from itertools import chain, groupby
 from typing import Literal
 
 import numpy as np
@@ -350,17 +351,12 @@ def _open_morton(store: Store, field: str, zarr_format):
         ) from e
 
 
-def _chunk_word(words: np.ndarray, field: str, start: int) -> int:
-    """A read chunk's coverage-cell morton id from its cells' morton words.
+def _cells_order(words: np.ndarray, field: str, start: int) -> int:
+    """HEALPix order of a chunk's written cell words (the cells-axis order).
 
-    ``words`` are the chunk's per-cell morton coordinates (packed uint64 area
-    words at the cell order; ``0`` is the unwritten fill). The chunk id is any
-    written cell's word coarsened to the chunk order — ``cell_order -
-    log4(cells_per_chunk)`` — the same parent cell the CSR layout named its
-    subgroups by.
+    ``words`` are per-cell morton coordinates (packed uint64 area words at the
+    cell order; ``0`` is the unwritten fill).
     """
-    from mortie import clip2order
-
     from zagg.grids.morton import morton_decimal
 
     written = words[words != 0]
@@ -370,9 +366,33 @@ def _chunk_word(words: np.ndarray, field: str, start: int) -> int:
             f"'morton' coordinate — the dense coordinate write did not cover it"
         )
     decimal = morton_decimal(int(written[0]))
-    cell_order = len(decimal) - (2 if decimal.startswith("-") else 1)
-    depth = (int(len(words)).bit_length() - 1) // 2  # log4(cells_per_chunk)
-    return int(clip2order(cell_order - depth, written[:1])[0])
+    return len(decimal) - (2 if decimal.startswith("-") else 1)
+
+
+def _chunk_word(words: np.ndarray, field: str, start: int) -> int:
+    """A read chunk's/block's coverage-cell morton id from its cells' words.
+
+    The id is the written cells' common ancestor at ``cell_order -
+    log4(len(words))`` — the same parent cell the CSR layout named its
+    subgroups by. Raises when the written cells do NOT share that ancestor:
+    the cells axis is then not nested-aligned over this span (a dense
+    multi-shard axis assembled at a block order coarser than the shard
+    order), and index arithmetic would place cells in the wrong subtree.
+    """
+    from mortie import clip2order
+
+    written = words[words != 0]
+    cell_order = _cells_order(words, field, start)
+    order = cell_order - (int(len(words)).bit_length() - 1) // 2  # log4(len)
+    ancestors = clip2order(order, written)
+    if np.any(ancestors != ancestors[0]):
+        raise ValueError(
+            f"cells of the block at {start} of {field!r} span more than one "
+            f"order-{order} ancestor — the cells axis is not nested-aligned over "
+            f"this span (a dense multi-shard axis assembles only at block orders "
+            f"at or finer than the shard order)"
+        )
+    return int(ancestors[0])
 
 
 def _tensor_side(arr, field: str) -> tuple[int, int]:
@@ -407,21 +427,31 @@ def read_tensors(
     top: float = 0.95,
     fit: FitMode = "raise",
     dtype: TensorDtype = "uint32",
+    block_order: int | None = None,
     zarr_format: Literal[2, 3] = 3,
 ) -> Iterator[tuple[np.ndarray, int]]:
-    """Yield ``(tensor, morton_index)`` per coverage chunk of a t-digest field.
+    """Yield ``(tensor, morton_index)`` per coverage block of a t-digest field.
 
     Sweeps the field's vlen array one read chunk (one square cell block) at a
-    time, visiting only the STORED objects. For each populated chunk it trims
+    time, visiting only the STORED objects. For each populated block it trims
     the per-cell tails, derives a fixed z-window (see :func:`chunk_z_range`),
     rasterizes every populated cell's digest into ``n_bins`` counts (see
     :func:`rasterize_cell`), and emits the ``(side, side, n_bins)`` tensor with
-    the chunk's coverage-cell morton id (``side`` is 64 for the production
-    ``chunk_inner`` configs). Cell placement is the spatially faithful bit
-    deinterleave of the cell's nested rank (issue #336):
-    ``tensor[row, col] = rank_to_rowcol(rank, depth)`` per the
+    the block's coverage-cell morton id (``side`` is 64 for the production
+    ``chunk_inner`` configs at the default per-chunk block). Cell placement is
+    the spatially faithful bit deinterleave of the cell's nested rank
+    (issue #336): ``tensor[row, col] = rank_to_rowcol(rank, depth)`` per the
     :mod:`zagg.readers._layout` orientation contract (mortie spec §8; row 0 /
-    col 0 at the chunk subtree's south corner, gridlook texture convention).
+    col 0 at the block subtree's south corner, gridlook texture convention).
+
+    ``block_order`` assembles the ``4**(chunk_order - block_order)`` read
+    chunks of one block-order subtree into a single
+    ``(2**d, 2**d, n_bins)`` tensor (``d = cell_order - block_order``) — e.g.
+    an order-12 block on the production geometry (order-19 cells, 64×64
+    chunks) is a 128×128 tensor assembled from 4 inner chunks. The z-window
+    and the ``fit`` policy are reconciled **block-wide**: one shared
+    offset/gain per block, with degrade/collapse decisions made over all of
+    the block's populated cells, not per chunk.
 
     Parameters
     ----------
@@ -444,6 +474,10 @@ def read_tensors(
         counts to the nearest integer; ``float32`` keeps fractional counts.  A
         per-bin count exceeding the dtype's max (65535 for ``uint16``) wraps on
         cast — keep ``uint32`` for dense cells with many observations per bin.
+    block_order : int, optional
+        HEALPix order of the emitted blocks (default ``None`` — one block per
+        read chunk). Must be at or coarser than the chunk order; a block is
+        assembled from whole read chunks with one shared z-window.
     zarr_format : int, optional
         Zarr format version (default 3).
 
@@ -451,14 +485,15 @@ def read_tensors(
     ------
     (tensor, morton_index) : (ndarray, int)
         ``tensor`` has shape ``(side, side, n_bins_out)`` and the requested
-        dtype; ``morton_index`` is the chunk's coverage-cell morton id.
+        dtype; ``morton_index`` is the block's coverage-cell morton id.
 
     Raises
     ------
     ValueError
         On an unknown ``dtype``/``fit``, a store missing the ragged element
-        attrs or the ``morton`` sibling, or (with ``fit="raise"``) a chunk
-        whose trimmed range overflows the fixed window.
+        attrs or the ``morton`` sibling, an out-of-range ``block_order``, or
+        (with ``fit="raise"``) a block whose trimmed range overflows the
+        fixed window.
     """
     if dtype not in _TENSOR_DTYPES:
         raise ValueError(f"unknown dtype {dtype!r}; expected one of {sorted(_TENSOR_DTYPES)}")
@@ -468,11 +503,44 @@ def read_tensors(
     arr, elem_dtype, elem_shape, _meta = _open_ragged(store, field, zarr_format)
     morton = _open_morton(store, field, zarr_format)
     side, depth = _tensor_side(arr, field)
+    cells_per_chunk = side * side
 
-    for start, populated in _iter_populated_chunks(arr):
-        cells = [(pos, _decode_cell(raw, elem_dtype, elem_shape)) for pos, raw in populated]
+    chunks = _iter_populated_chunks(arr)
+    first = next(chunks, None)
+    if first is None:
+        return
+    if block_order is None:
+        block_cells, block_depth = cells_per_chunk, depth
+    else:
+        # The cells-axis order comes from the first populated chunk's words;
+        # the block subtree must be whole read chunks (coarser or equal).
+        cell_order = _cells_order(morton[first[0] : first[0] + cells_per_chunk], field, first[0])
+        chunk_order = cell_order - depth
+        if not 0 <= int(block_order) <= chunk_order:
+            raise ValueError(
+                f"block_order {block_order} is out of range: a block assembles whole "
+                f"read chunks, so it must be between 0 and the chunk order "
+                f"{chunk_order} (block_order=None reads per chunk)"
+            )
+        block_depth = cell_order - int(block_order)
+        block_cells = 4**block_depth
+        if int(arr.shape[0]) % block_cells:
+            raise ValueError(
+                f"{field!r} has {int(arr.shape[0])} cells — not a whole number of "
+                f"order-{block_order} blocks ({block_cells} cells each), so the cells "
+                f"axis cannot assemble at this block order"
+            )
+    block_side = 1 << block_depth
+
+    for block, group in groupby(chain([first], chunks), key=lambda c: c[0] // block_cells):
+        bstart = block * block_cells
+        cells = [
+            (start - bstart + pos, _decode_cell(raw, elem_dtype, elem_shape))
+            for start, populated in group
+            for pos, raw in populated
+        ]
         z_lo, n_bins_c, resolution_c = chunk_z_range(
-            [digest for _pos, digest in cells],
+            [digest for _rank, digest in cells],
             n_bins=n_bins,
             resolution=resolution,
             bottom=bottom,
@@ -480,15 +548,15 @@ def read_tensors(
             fit=fit,
         )
 
-        tensor = np.zeros((side, side, n_bins_c), dtype=out_dtype)
+        tensor = np.zeros((block_side, block_side, n_bins_c), dtype=out_dtype)
         for rank, digest in cells:
             counts = rasterize_cell(digest, z_lo, resolution_c, n_bins_c)
             if not is_float:
                 counts = np.rint(counts)
-            row, col = rank_to_rowcol(rank, depth)
+            row, col = rank_to_rowcol(rank, block_depth)
             tensor[row, col, :] = counts.astype(out_dtype)
 
-        yield tensor, _chunk_word(morton[start : start + side * side], field, start)
+        yield tensor, _chunk_word(morton[bstart : bstart + block_cells], field, bstart)
 
 
 def read_raw_values(
