@@ -639,6 +639,13 @@ class TestLeafTemplateAndStamp:
         # The store handed to emit_shard_template is rooted AT the leaf, so the
         # up-front clear can only touch the leaf prefix — sibling objects (the
         # run's ``.zarr.status/`` results live outside the leaf) survive.
+        #
+        # NOTE (fold review): ``open_store`` on a non-s3 path returns a zarr
+        # ``LocalStore``, whose ``delete_dir("")`` is ``shutil.rmtree(root)`` —
+        # so on THIS backend the sibling is safe by filesystem semantics and this
+        # assertion cannot fail whatever the code does. It pins the local/debug
+        # path only; the prefix-string hazard lives on the fleet's obstore-backed
+        # store and is pinned by the test below.
         from zagg.store import open_store
 
         leaf = tmp_path / "leaf.zarr"
@@ -649,6 +656,49 @@ class TestLeafTemplateAndStamp:
         g.emit_shard_template(open_store(str(leaf)), overwrite=True)
         g.emit_shard_template(open_store(str(leaf)), overwrite=True)
         assert (status / "r.json").read_text() == "{}"
+
+    def test_overwrite_clear_is_scoped_on_an_obstore_prefix_store(self, cfg, tmp_path):
+        # Fold review: the real hazard is STRING-prefix, and it only exists on the
+        # fleet backend — ``open_store("s3://…")`` builds
+        # ``zarr.storage.ObjectStore(store=S3Store(bucket, prefix=…))``, and
+        # zarr's ``ObjectStore.delete_dir`` deliberately leaves the EMPTY prefix
+        # un-slashed, so scoping rests entirely on obstore's prefix store
+        # re-adding the delimiter. It does (obstore's ``PrefixStore`` resolves
+        # ``list(None)`` to the store's own prefix path and object_store's
+        # ``format_prefix`` appends DELIMITER), but that is a property of two
+        # third-party layers and no test here could regress it: every other
+        # delete_dir test uses MemoryStore or zarr LocalStore, neither of which
+        # can. This pins it against an obstore/zarr bump, using obstore's own
+        # LocalStore in prefix mode — the same ``ObjectStore`` + prefix-store
+        # composition the S3 path uses.
+        import obstore
+        from zarr.storage import ObjectStore
+
+        root = tmp_path / "root"
+        leaf = root / "12" / "34.zarr"
+        leaf.mkdir(parents=True)
+        # (a) a name-prefix sibling of the leaf: the adversarial shape a missing
+        # delimiter would sweep up.
+        twin = root / "12" / "34.zarr.status"
+        twin.mkdir()
+        (twin / "r.json").write_text("{}")
+        # (b) the REAL geometry: status objects live beside the store ROOT,
+        # several digit-tree levels above any leaf.
+        real_status = tmp_path / "root.zarr.status" / "run-1"
+        real_status.mkdir(parents=True)
+        (real_status / "34.json").write_text("{}")
+
+        store = ObjectStore(store=obstore.store.LocalStore(prefix=str(leaf)))
+        g = self._grid(cfg)
+        g.emit_shard_template(store, overwrite=True)
+        self._put(store, f"{g.group_path}/h_max/c/0")  # in-leaf debris
+        g.emit_shard_template(store, overwrite=True)
+
+        # The clear really ran (otherwise the survival assertions are vacuous)...
+        assert not self._exists(store, f"{g.group_path}/h_max/c/0")
+        # ...and touched nothing outside the leaf prefix.
+        assert (twin / "r.json").read_text() == "{}"
+        assert (real_status / "34.json").read_text() == "{}"
 
     def test_sharded_leaf_template_shards_whole_leaf(self, cfg):
         # issue #236: a sharded grid's leaf template wraps every dense array in
