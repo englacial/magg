@@ -349,6 +349,45 @@ def test_hive_misplaced_rollup_counts_into_shard(monkeypatch):
     assert not any(k.endswith("stats.rollup.json") for k in measured["other_keys"])
 
 
+def test_status_prefix_objects_excluded_everywhere(monkeypatch):
+    # Issue #327 (ratified amendment): the per-run status channel — per-shard
+    # status objects, the dispatch manifest, the issue #151 result envelopes —
+    # is run telemetry, never write-path store objects. It must not land in
+    # ANY bucket (total, metadata, per-shard, other), so the #215/#240
+    # tripwire keeps its exact assertions with the channel active.
+    from zagg import hive
+
+    grid = from_config(_cfg())
+    word = int(morton_word(_KEY_A))
+    label = grid.shard_label(word)
+    leaf = hive.shard_leaf_path("", word).lstrip("/")
+    data = [hive.MANIFEST_NAME, f"{leaf}/count/c/0"]
+    telemetry = [
+        "out.zarr.status/run-abc123/shard-42.json",
+        "out.zarr.status/run-abc123/manifest.json",
+        "out.zarr.status/deadbeef/-4211324.json",  # a #151 result envelope
+    ]
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: data + telemetry)
+    measured = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[word], store_layout="hive"
+    )
+    assert measured["objects_total"] == 2
+    assert measured["objects_metadata"] == 1
+    assert measured["objects_per_shard"] == {label: 1}
+    assert measured["objects_other"] == 0
+
+
+def test_is_status_object_classification():
+    assert bench_objects._is_status_object("out.zarr.status/run-a/shard-1.json")
+    assert bench_objects._is_status_object("parent/out.zarr.status/run-a/manifest.json")
+    # The run parquet stays store-root METADATA (issue #297), not a status key...
+    assert not bench_objects._is_status_object("stats_20260101T000000Z_ab.parquet")
+    # ...an in-store data object is never telemetry, and a bare file whose NAME
+    # ends in .status is not under a status prefix.
+    assert not bench_objects._is_status_object("0/012/x.zarr/count/c/0")
+    assert not bench_objects._is_status_object("shard-1.status")
+
+
 # --- mismatch helper (pure) --------------------------------------------------
 
 

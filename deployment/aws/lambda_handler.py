@@ -568,6 +568,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # setup/finalize/extract bodies stay byte-identical (their consumers don't
     # aggregate container state).
     response = _attach_container_telemetry(response, telemetry)
+    # Per-shard status object (issue #327): always-on for every per-unit
+    # response carrying a run identity, every status branch (200/400/500,
+    # including the caught-error envelope) -- the v2 Event transport resolves
+    # futures from these instead of the invoke response. Fail-open by
+    # ratification: never affects the shard result.
+    _write_shard_status(event, response)
     # Async result channel (issue #151): on an Event invoke the return value is
     # discarded, so mirror the response envelope to the orchestrator-supplied
     # result_url for it to poll. Covers every branch (200 / 400 / 500) of both
@@ -592,6 +598,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if mirrored:
             _maybe_self_recycle()
     return response
+
+
+def _write_shard_status(event: Dict[str, Any], response: Dict[str, Any]) -> None:
+    """Always-on per-shard status object (issue #327), doubly fail-open.
+
+    The body lives in ``zagg.client_transport.write_shard_status`` (itself
+    fail-open); this wrapper additionally swallows an import/lookup failure so
+    a function zip missing the module cannot fail a shard either. Uses the
+    same output-store resolution as every other worker write.
+    """
+    try:
+        from zagg.client_transport import write_shard_status
+
+        write_shard_status(event, response, _output_store_kwargs(event))
+    except Exception as e:
+        logger.warning(f"shard status write failed (fail-open, issue #327): {e}")
 
 
 def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, Any]) -> bool:
