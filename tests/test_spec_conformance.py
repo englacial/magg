@@ -491,6 +491,13 @@ class TestContentHashes:
         combined = hashlib.sha256("\n".join(sorted(arrays.values())).encode()).hexdigest()
         assert combined == exp["content_hashes"]["combined"]
 
+    @pytest.mark.parametrize("name", FIXTURES)
+    def test_recorded_arrays_map_is_key_sorted(self, name):
+        # Regeneration must be diff-clean: member enumeration yields
+        # concurrently, so the generator sorts the map before recording it.
+        arrays = _expected(name)["content_hashes"]["arrays"]
+        assert list(arrays) == sorted(arrays)
+
     def test_element_bytes_normalization(self):
         # §5.2's table: None ≡ b"", a typed /2 ndarray cell normalizes to
         # C-contiguous little-endian bytes, anything else raises.

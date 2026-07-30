@@ -689,6 +689,12 @@ sha256( for each cell:  u64_le(len(payload)) || payload )
 digests joined by `"\n"`, hashed as ASCII — array names deliberately
 excluded ("hash of the sorted per-array hashes").
 
+*(Informative.)* Because it sorts the *digests*, `combined` is immune to the
+order in which the §5.1 enumeration happened to yield arrays — a real
+robustness property, and the reason two implementations agree without agreeing
+on traversal order. The recorded `arrays` map is a different matter: a writer
+SHOULD record it key-sorted so a regenerated record diffs cleanly.
+
 The hashes are recorded in the leaf's D20 stats sidecar under
 `content_hashes`, in the structured shape:
 
