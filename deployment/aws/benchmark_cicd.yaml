@@ -265,8 +265,14 @@ Resources:
               # wildcard was proposed and declined -- enumeration keeps least
               # privilege. Base function plus the full prod worker-size family
               # (template.yaml's WorkerSizeVariants + WorkerDiskVariants loops
-              # over WorkerMemorySizes: plain + -disk). Drift against that
-              # matrix is guarded by tests/test_deploy_lambda.py.
+              # over WorkerMemorySizes: plain + -disk), plus the -extract twin
+              # (template.yaml's ExtractFn -- same code zip, so the release must
+              # redeploy it or it stays on standup-time code, issue #341's
+              # failure mode; it is dispatched by explicit name for full-archive
+              # extraction, issue #148, and never by suffix resolution, so the
+              # INVOKE role deliberately does not enumerate it -- the benchmark
+              # harness never touches it). Drift against that matrix is guarded
+              # by tests/test_deploy_lambda.py.
               - Sid: UpdateProdFunction
                 Effect: Allow
                 Action:
@@ -284,6 +290,7 @@ Resources:
                   - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-2048-disk"
                   - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-4096-disk"
                   - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-8192-disk"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BenchmarkFunctionName}-extract"
               - Sid: PublishProdLayer
                 Effect: Allow
                 # GetLayerVersion: update-function-configuration --layers validates

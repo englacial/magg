@@ -21,8 +21,9 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / ".github" / "scripts" / "deploy_lambda.sh"
 
-#: The template.yaml WorkerMemorySizes matrix the script defaults to (issue #341).
-FAMILY = ["-2048", "-4096", "-8192", "-2048-disk", "-4096-disk", "-8192-disk"]
+#: The script's default update set (issue #341): the template.yaml
+#: WorkerMemorySizes matrix plus the same-zip ``-extract`` twin (ExtractFn).
+FAMILY = ["-2048", "-4096", "-8192", "-2048-disk", "-4096-disk", "-8192-disk", "-extract"]
 
 #: The subset the TEST stack provisions (template.yaml's WorkerTestDiskVariants
 #: loop, -disk only), which lambda-benchmark.yml pins via --variants so the
@@ -194,8 +195,18 @@ def test_variant_family_deployed_when_present(tmp_path):
     # Every default-family variant was probed.
     probed = [line for line in log if "get-function-configuration" in line]
     assert len(probed) == len(FAMILY)
-    for missing in ("-2048", "-4096", "-8192"):
+    for missing in ("-2048", "-4096", "-8192", "-extract"):
         assert f"variant process-shard-test{missing} does not exist; skipping" in result.stdout
+
+
+def test_extract_twin_deployed_when_present(tmp_path):
+    # The prod shape: the -extract twin exists and gets the same layer + zip as
+    # the base. Before this it was updated only at standup (issue #341).
+    existing = ["process-shard-test", "process-shard-test-extract"]
+    result, log = _run_deploy(tmp_path, existing=existing)
+    assert result.returncode == 0
+    assert "process-shard-test-extract" in _deployed(log)
+    assert "STALE" not in result.stderr
 
 
 def test_test_deploy_variant_set_probes_nothing_absent(tmp_path):
@@ -333,6 +344,25 @@ def _template_variant_suffixes():
     return test, prod
 
 
+def _template_named_twins():
+    """Suffixes of the separately-NAMED functions template.yaml stamps off the
+    same code zip (not worker-size variants): today just ``-extract``
+    (``ExtractFn``, issue #148). These run the deployed zip, so #341's rule
+    ("deploy every function that runs the code zip") covers them."""
+    tpl = _load_cfn(TEMPLATE)
+    twins = set()
+    for key, val in tpl["Resources"].items():
+        if key.startswith("Fn::ForEach::") or val.get("Type") != "AWS::Lambda::Function":
+            continue
+        fn = val.get("Properties", {}).get("FunctionName")
+        pattern = fn.get("Sub", "") if isinstance(fn, dict) else ""
+        if not pattern.startswith("${FunctionName}-") or "${WorkerMemory}" in pattern:
+            continue
+        twins.add(pattern.removeprefix("${FunctionName}"))
+    assert twins, f"no same-zip named twins found in {TEMPLATE}"
+    return twins
+
+
 def _statement_arns(role, sid):
     """The !Sub ARN strings of the role's Sid=<sid> policy statement."""
     tpl = _load_cfn(CICD)
@@ -415,13 +445,45 @@ def test_release_role_enumerates_prod_variant_family():
 
 
 def test_script_default_family_matches_template_matrix():
-    # The script's DEFAULT_VARIANTS and template.yaml's prod variant loops are
-    # two copies of the same matrix; a size added to one must land in both.
+    # The script's DEFAULT_VARIANTS and template.yaml's same-zip functions are
+    # two copies of one list: the prod worker-size loops PLUS the separately
+    # named twins (-extract). A size or a twin added to one must land in both.
     _, prod_suffixes = _template_variant_suffixes()
-    assert _script_default_variants() == prod_suffixes, (
-        f"DEFAULT_VARIANTS in {SCRIPT} and the WorkerMemorySizes variant loops "
-        f"in {TEMPLATE} disagree -- update whichever is stale (issue #341)"
+    assert _script_default_variants() == prod_suffixes | _template_named_twins(), (
+        f"DEFAULT_VARIANTS in {SCRIPT} and the same-zip functions in {TEMPLATE} "
+        f"(WorkerMemorySizes variant loops + named twins like ExtractFn) disagree "
+        f"-- update whichever is stale (issue #341)"
     )
+
+
+def test_extract_twin_is_deployed_and_enumerated():
+    # espg ruling on the fold review: the -extract twin runs the same code zip
+    # and was never redeployed, so `${FunctionName}-extract` sat on standup-time
+    # code permanently -- issue #341's failure mode verbatim, on the live
+    # full-archive extraction pool (issue #148). It is now in the deploy set and
+    # enumerated on the release role. The INVOKE role deliberately is NOT
+    # extended: the twin is reached by explicit function_name=, never by the
+    # benchmark harness's suffix resolution.
+    assert "-extract" in _template_named_twins()
+    assert "-extract" in _script_default_variants(), (
+        f"template.yaml stamps a -extract twin off the same code zip but {SCRIPT} "
+        f"does not deploy it -- it would stay on standup-time code (issue #341)"
+    )
+    prod = _statement_arns("ReleaseRole", "UpdateProdFunction")
+    want = "function:${BenchmarkFunctionName}-extract"
+    assert any(a.endswith(want) for a in prod), (
+        f"ReleaseRole.UpdateProdFunction in {CICD} has no ARN ending '{want}' -- "
+        f"the release deploy would WARN-and-skip the twin as STALE (issue #341)"
+    )
+    invoke = _statement_arns("BenchmarkInvokeRole", "InvokeBenchmarkFunctions")
+    assert not [a for a in invoke if a.endswith("-extract")], (
+        "the benchmark harness never invokes the -extract twin; keep it out of "
+        "InvokeBenchmarkFunctions (least privilege, issue #341)"
+    )
+    # The test stack has no -test-extract twin, so the pinned test-deploy set
+    # must not probe one (it would AccessDeny and cry STALE -- see the
+    # test-deploy variant-set guard above).
+    assert "-extract" not in _workflow_variants()
 
 
 def test_invoke_role_enumerates_both_families():
@@ -430,8 +492,12 @@ def test_invoke_role_enumerates_both_families():
     # the test base function -- so it must enumerate both full families.
     test_suffixes, prod_suffixes = _template_variant_suffixes()
     arns = _statement_arns("BenchmarkInvokeRole", "InvokeBenchmarkFunctions")
+    # The named twins in DEFAULT_VARIANTS (-extract) are DEPLOY targets, not
+    # harness-resolvable variants -- no ``worker:`` block can name one, so the
+    # invoke role must NOT enumerate them (least privilege, issue #341).
+    resolvable = _script_default_variants() - _template_named_twins()
     families = [
-        ("${BenchmarkFunctionName}", sorted(prod_suffixes | _script_default_variants())),
+        ("${BenchmarkFunctionName}", sorted(prod_suffixes | resolvable)),
         ("${TestFunctionName}", sorted(test_suffixes)),
     ]
     for base, suffixes in families:
