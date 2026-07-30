@@ -4,8 +4,8 @@ One idempotent bottom-up pass over a hive store's digit tree that folds leaf
 artifacts into interior-node rollups, per registered **artifact family**
 (D22): stats sidecars (the :func:`zagg.telemetry.merge` fold), MOC regen,
 sub-shardmap rollups (leaf ShardMap JSON folded via the #294 exact coarsen
-regroup), overview zarrs (reserved for issue #201), and optional debris
-collection (stubbed). Everything the sweep
+regroup), overview zarrs (issue #201; :mod:`zagg.sweep_overview`), and
+optional debris collection (stubbed). Everything the sweep
 writes is a **regenerable cache, never truth** (D9): deleting every rollup
 leaves all leaf reads intact, and the leaf sidecars/stamps remain the durable
 ground truth.
@@ -50,8 +50,11 @@ logger = logging.getLogger(__name__)
 #: Envelope version of every rollup object this module writes.
 SWEEP_SPEC = "zagg-sweep/1"
 
-#: Families swept when the caller does not choose (D22 phases 1-3).
-DEFAULT_FAMILIES = ("stats", "moc", "submap")
+#: Families swept when the caller does not choose (the four D22 families).
+#: ``moc`` deliberately precedes ``overview``: the overview fold discovers
+#: untouched sibling shards through the root ``coverage.moc``, which the MOC
+#: family refreshes earlier in the same pass.
+DEFAULT_FAMILIES = ("stats", "moc", "submap", "overview")
 
 #: Grid types already warned about as unsupported leaf sub-maps (once-ish, so a
 #: raster sweep does not warn-spam per shard). Never security-load-bearing.
@@ -76,8 +79,12 @@ class SweepFamily:
     staleness timestamp) and :meth:`merge` (the associative payload fold);
     :meth:`finish` is an optional post-walk hook fed the top-level (base-node)
     artifacts — the seam the MOC family uses to refresh the store-root
-    ``coverage.moc``. Families registered with ``available = False`` are
-    visible slots that :func:`get_family` refuses with their ``reason``.
+    ``coverage.moc``. A family whose artifact is not a per-node JSON rollup
+    (the overview family's zarrs, issue #201) instead defines ``sweep_store``
+    — the whole-tree hook :func:`run_sweep` dispatches to with the manifest
+    and the normalized dirty work set. Families registered with
+    ``available = False`` are visible slots that :func:`get_family` refuses
+    with their ``reason``.
     """
 
     name = ""
@@ -477,14 +484,21 @@ class _ReprojectTarget:
 
 
 class OverviewFamily(SweepFamily):
-    """Overview zarrs (D11/D22) — the reserved issue #201 slot."""
+    """Overview zarrs at ancestor nodes (D11/D22/D24 — issue #201).
+
+    Unlike the JSON-rollup families, the artifact is a ZARR at manifest-
+    declared orders only, folded from leaf DATA (per-field D24 merge laws),
+    so this family overrides :attr:`sweep_store` — the whole-tree hook the
+    engine dispatches to instead of the generic bottom-up JSON fold. The
+    implementation lives in :mod:`zagg.sweep_overview`.
+    """
 
     name = "overview"
-    available = False
-    reason = (
-        "overview zarr aggregation is issue #201's follow-on PR; this slot "
-        "reserves the family registration (D22)"
-    )
+
+    def sweep_store(self, store_root, manifest, by_shard, store_kwargs) -> dict:
+        from zagg.sweep_overview import sweep_overviews
+
+        return sweep_overviews(store_root, manifest, by_shard, store_kwargs=store_kwargs)
 
 
 class DebrisFamily(SweepFamily):
@@ -552,9 +566,13 @@ def run_sweep(store_root: str, leaves, *, families=None, store_kwargs: dict | No
         "families": {},
     }
     for fam in fams:
-        summary["families"][fam.name] = _sweep_family(
-            store_root, store, fam, by_shard, shard_order, manifest.get("spec"), store_kwargs
-        )
+        runner = getattr(fam, "sweep_store", None)
+        if runner is not None:
+            summary["families"][fam.name] = runner(store_root, manifest, by_shard, store_kwargs)
+        else:
+            summary["families"][fam.name] = _sweep_family(
+                store_root, store, fam, by_shard, shard_order, manifest.get("spec"), store_kwargs
+            )
     return summary
 
 

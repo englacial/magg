@@ -33,6 +33,8 @@ work set plus the root coverage MOC — never a recursive LIST.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 
 import numpy as np
@@ -168,3 +170,541 @@ def fold_digests(cell_digests: list, *, delta: int, dtype="float32") -> bytes:
     if len(digests) == 1:
         return encode_digest(digests[0], dtype)
     return encode_digest(merge_tdigests_kway(digests, delta=int(delta)), dtype)
+
+
+# ---------------------------------------------------------------------------
+# Phase B: the overview writer — the family's whole-tree sweep.
+# ---------------------------------------------------------------------------
+
+#: Per-node overview bookkeeping object (window inventory + skip-if-current
+#: stamps), sibling to the other families' ``{family}.rollup.json`` — the same
+#: closed name grammar, so the §5 walker's child classification is unaffected.
+ENVELOPE_NAME = "overview.rollup.json"
+
+
+def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kwargs=None) -> dict:
+    """Generate/refresh overview zarrs at the manifest-declared orders (D22).
+
+    ``by_shard`` is the engine's normalized dirty work set
+    (``{shard_decimal: {window, ...}}``); the walk visits ONLY ancestor nodes
+    of those shards at each declared order. The full descendant leaf set per
+    node comes from the dirty set unioned with the root ``coverage.moc``
+    (run record + MOC — never a LIST); with the default family order the MOC
+    family has just refreshed that root in the same pass.
+
+    Idempotent: a (node, window) whose stored generation stamp (merged-leaf
+    count + max leaf stamp timestamp) AND content hash both match the freshly
+    folded payload is skipped — the hash is the same-second backstop the
+    engine's payload compare provides for JSON families. Returns the standard
+    ``written``/``current``/``empty``/``failed`` counts plus ``declared``.
+    """
+    from zagg.store import open_object_store
+
+    store_kwargs = dict(store_kwargs or {})
+    counts: dict = {"written": 0, "current": 0, "empty": 0, "failed": 0, "declared": True}
+    decl = (manifest.get("pyramid") or {}).get("overview")
+    if not isinstance(decl, dict) or not decl.get("orders"):
+        counts["declared"] = False
+        logger.info(
+            "sweep[overview]: no pyramid overview declaration in the manifest "
+            "(template-time, D22); nothing to generate"
+        )
+        return counts
+    if decl.get("summarize"):
+        logger.warning(
+            f"sweep[overview]: declared derived summaries {sorted(decl['summarize'])} are not "
+            f"generated yet — no roster-kind ragged field ships (D24 opt-in, issue #265); skipping"
+        )
+    fields = {
+        n: dict(m)
+        for n, m in (decl.get("fields") or {}).items()
+        if isinstance(m, dict) and m.get("class") in ("exact", "approximate")
+    }
+    if not fields:
+        logger.info("sweep[overview]: no composable fields declared; nothing to generate")
+        return counts
+    shard_order = int(manifest["shard_order"])
+    cell_order = int(manifest["cell_order"])
+    windowed = manifest.get("temporal") is not None
+    orders = sorted({int(k) for k in decl["orders"]}, reverse=True)
+    bad = [k for k in orders if not (0 <= k < shard_order)]
+    if bad:
+        logger.warning(
+            f"sweep[overview]: declared orders {bad} are not ancestor orders of "
+            f"shard_order {shard_order}; skipping them"
+        )
+        orders = [k for k in orders if k not in bad]
+    candidates = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
+    store = open_object_store(store_root, **store_kwargs)
+    for k in orders:
+        nodes = sorted({_node_at(d, k) for d in by_shard})
+        for node in nodes:
+            node_shards = sorted(d for d in candidates if d.startswith(node))
+            dirty_windows = set()
+            for d in by_shard:
+                if d.startswith(node):
+                    dirty_windows |= by_shard[d]
+            envelope = _read_envelope(store, node)
+            entries = dict((envelope or {}).get("windows") or {})
+            for key, fold_windows in _window_work(decl, windowed, dirty_windows, entries):
+                entry = _roll_node(
+                    store_root,
+                    node,
+                    k,
+                    key,
+                    fold_windows,
+                    node_shards,
+                    fields,
+                    cell_order,
+                    shard_order,
+                    windowed,
+                    entries.get(key),
+                    counts,
+                    store_kwargs,
+                )
+                if entry is not None:
+                    entries[key] = entry
+            fresh = {
+                "spec": _sweep().SWEEP_SPEC,
+                "family": "overview",
+                "node": node,
+                "order": k,
+                "windows": entries,
+            }
+            if entries and fresh != envelope:
+                import obstore
+
+                obstore.put(
+                    store, f"{_node_rel(node)}/{ENVELOPE_NAME}", json.dumps(fresh, indent=1).encode()
+                )
+    return counts
+
+
+def _sweep():
+    """The engine module (lazy: sweep.py registers this module's family)."""
+    import zagg.sweep
+
+    return zagg.sweep
+
+
+def _node_rel(decimal: str) -> str:
+    return _sweep()._node_rel(decimal)
+
+
+def _node_at(decimal: str, order: int) -> str:
+    """The ancestor prefix of a shard decimal at ``order`` (0 = base)."""
+    from zagg.hive import _decimal_base
+
+    return decimal[: len(_decimal_base(decimal)) + order]
+
+
+def _rel_rank(decimal: str, node: str) -> int:
+    """Base-4 rank of ``decimal``'s digit tail beyond the ``node`` prefix."""
+    rank = 0
+    for ch in decimal[len(node) :]:
+        rank = rank * 4 + (int(ch) - 1)
+    return rank
+
+
+def _candidate_decimals(store_root, shard_order, by_shard, store_kwargs) -> set:
+    """Descendant-leaf candidates: the dirty set unioned with the root MOC.
+
+    Discovery stays LIST-free (D22): untouched sibling shards contribute via
+    the root ``coverage.moc`` (default-on for hive; refreshed by the MOC
+    family earlier in the same default pass). A missing/unusable root MOC
+    degrades to the dirty set with a loud warning — the overview then covers
+    only the given leaves until a full sweep repairs it (D9: regenerable).
+    """
+    from zagg.grids.morton import morton_decimal
+    from zagg.hive import read_root_coverage, root_coverage_words
+
+    decimals = set(by_shard)
+    try:
+        env = read_root_coverage(store_root, **store_kwargs)
+    except ValueError:
+        env = None
+    if isinstance(env, dict) and env.get("order") == shard_order:
+        try:
+            decimals |= {morton_decimal(int(w)) for w in root_coverage_words(env)}
+            return decimals
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning(f"sweep[overview]: unusable root coverage.moc ({e})")
+    if decimals:
+        logger.warning(
+            "sweep[overview]: no usable root coverage.moc — overviews will fold ONLY "
+            "the run's own leaves; sweep the moc family (or the default set) to repair"
+        )
+    return decimals
+
+
+def _window_work(decl, windowed, dirty_windows, entries) -> list:
+    """``(envelope key, [windows to fold])`` work items for one node.
+
+    Per-window overviews inherit window naming (D23); the reserved ``all``
+    token is the unwindowed leaf AND the opt-in all-time fold on a windowed
+    store (``all_time`` in the declaration; a preexisting all-time entry stays
+    maintained even if the declaration later drops the flag).
+    """
+    from zagg.windows import SCHEDULE_NONE_TOKEN
+
+    if not windowed:
+        return [(SCHEDULE_NONE_TOKEN, [None])]
+    labels = sorted(
+        {w for w in dirty_windows if w is not None}
+        | {key for key in entries if key != SCHEDULE_NONE_TOKEN}
+    )
+    work = [(w, [w]) for w in labels]
+    if decl.get("all_time") or SCHEDULE_NONE_TOKEN in entries:
+        work.append((SCHEDULE_NONE_TOKEN, labels))
+    return work
+
+
+def _read_envelope(store, node: str) -> dict | None:
+    """The node's stored overview envelope, or ``None`` (strict, D9 cache)."""
+    import obstore
+    from obstore.exceptions import NotFoundError
+
+    try:
+        data = obstore.get(store, f"{_node_rel(node)}/{ENVELOPE_NAME}").bytes()
+    except (FileNotFoundError, NotFoundError):
+        return None
+    try:
+        envelope = json.loads(bytes(data))
+    except ValueError:
+        envelope = None
+    usable = (
+        isinstance(envelope, dict)
+        and envelope.get("family") == "overview"
+        and isinstance(envelope.get("windows"), dict)
+    )
+    if not usable:
+        logger.debug(f"sweep[overview]: unusable envelope at node {node}; ignoring")
+        return None
+    return envelope
+
+
+def _roll_node(
+    store_root,
+    node,
+    k,
+    key,
+    fold_windows,
+    node_shards,
+    fields,
+    cell_order,
+    shard_order,
+    windowed,
+    existing_entry,
+    counts,
+    store_kwargs,
+):
+    """Fold one (node, window) overview; write its zarr unless current.
+
+    Returns the fresh envelope entry, the existing one when current (or when
+    no leaf contributed — an emptied window keeps its prior overview, the
+    same append-only posture as the engine's interior fallback), or ``None``.
+    """
+    try:
+        fold = _fold_node(
+            store_root,
+            node,
+            k,
+            fold_windows,
+            node_shards,
+            fields,
+            cell_order,
+            shard_order,
+            counts,
+            store_kwargs,
+        )
+    except Exception as e:
+        logger.warning(f"sweep[overview]: fold failed at node {node} window {key!r}; ({e})")
+        counts["failed"] += 1
+        return None
+    if fold is None:
+        counts["empty"] += 1
+        return existing_entry
+    if (
+        isinstance(existing_entry, dict)
+        and existing_entry.get("generation") == fold["generation"]
+        and existing_entry.get("content_hash") == fold["content_hash"]
+    ):
+        counts["current"] += 1
+        return existing_entry
+    try:
+        basename = _write_overview(
+            store_root, node, k, key, fold, fields, cell_order, shard_order, windowed, store_kwargs
+        )
+    except Exception as e:
+        logger.warning(f"sweep[overview]: write failed at node {node} window {key!r}; ({e})")
+        counts["failed"] += 1
+        return None
+    counts["written"] += 1
+    return {
+        "object": basename,
+        "generation": fold["generation"],
+        "content_hash": fold["content_hash"],
+    }
+
+
+def _fold_node(
+    store_root,
+    node,
+    k,
+    fold_windows,
+    node_shards,
+    fields,
+    cell_order,
+    shard_order,
+    counts,
+    store_kwargs,
+):
+    """Fold the node's committed descendant leaves into per-field slabs.
+
+    Reads leaf DATA by declared array name only — never a member enumeration
+    — so orphan array prefixes from schema evolution (issue #341 Bug A) and
+    foreign objects (status prefixes, #327) cannot crash the fold. A leaf
+    missing one declared field contributes fill for it (schema evolution:
+    the field postdates the leaf); a leaf at an unexpected cell order or with
+    an unreadable group is skipped loudly (``failed``), never fatal.
+    """
+    import zarr
+
+    from zagg.grids.morton import morton_word
+    from zagg.hive import read_commit, shard_leaf_path
+    from zagg.store import open_store
+    from zagg.windows import union_time_range
+
+    target_order = cell_order - (shard_order - k)
+    n_cells = 4 ** (target_order - k)
+    leaf_cells = 4 ** (cell_order - shard_order)
+    slabs: dict = {}
+    digests: dict = {}
+    for name, meta in fields.items():
+        if meta["class"] == "exact":
+            dtype = np.dtype(meta.get("dtype") or "float32")
+            slabs[name] = np.full(n_cells, _fill_scalar(meta.get("fill_value", "NaN"), dtype), dtype)
+        else:
+            digests[name] = [[] for _ in range(n_cells)]
+    if target_order >= shard_order:
+        span = 4 ** (target_order - shard_order)
+        fold_factor = 4 ** (shard_order - k)
+    else:
+        span = 1
+        fold_factor = leaf_cells
+    n_leaves, timestamps, granules, ranges = 0, [], 0, []
+    for dec in node_shards:
+        if target_order >= shard_order:
+            start = _rel_rank(dec, node) * span
+        else:
+            start = _rel_rank(_node_at(dec, target_order), node)
+        for window in fold_windows:
+            leaf = shard_leaf_path(store_root, morton_word(dec), window=window)
+            leaf_store = open_store(leaf, **store_kwargs)
+            stamp = read_commit(leaf_store)
+            if stamp is None:
+                continue  # absent leaf or unstamped debris (D4)
+            # Fold the whole leaf's contribution BEFORE touching the slabs, so
+            # a corrupt leaf skips cleanly instead of half-applying.
+            try:
+                group = zarr.open_group(leaf_store, path=str(cell_order), mode="r", zarr_format=3)
+                morton = group["morton"]
+                if morton.shape != (leaf_cells,):
+                    raise ValueError(
+                        f"morton shape {morton.shape} is not the manifest cell_order "
+                        f"{cell_order} subtree ({leaf_cells} cells); mixed-order source "
+                        f"leaves are unsupported this round (D24 reader gate)"
+                    )
+                partials: dict = {}
+                cell_digests: dict = {}
+                for name, meta in fields.items():
+                    try:
+                        values = group[name][:]
+                    except KeyError:
+                        # Schema evolution: the field postdates this leaf — it
+                        # contributes fill, exactly what re-running would write.
+                        logger.debug(f"sweep[overview]: leaf {leaf} lacks field {name!r}")
+                        continue
+                    if meta["class"] == "exact":
+                        partials[name] = fold_dense(
+                            values, fold_factor, meta.get("method"), meta.get("fill_value", "NaN")
+                        )
+                    else:
+                        dtype = meta.get("dtype") or "float32"
+                        inner = tuple(meta.get("inner_shape") or (2,))
+                        cell_digests[name] = [
+                            (start + i // fold_factor, decode_digest(payload, dtype, inner))
+                            for i, payload in enumerate(values)
+                            if payload is not None and len(payload)
+                        ]
+            except Exception as e:
+                logger.warning(f"sweep[overview]: skipping unreadable leaf {leaf} ({e})")
+                counts["failed"] += 1
+                continue
+            seg = slice(start, start + span)
+            for name, partial in partials.items():
+                meta = fields[name]
+                slabs[name][seg] = combine_dense(
+                    slabs[name][seg], partial, meta.get("method"), meta.get("fill_value", "NaN")
+                )
+            for name, decoded in cell_digests.items():
+                for j, digest in decoded:
+                    digests[name][j].append(digest)
+            n_leaves += 1
+            timestamps.append(stamp.get("written_at"))
+            granules += int(stamp.get("granule_count") or 0)
+            if stamp.get("time_range") is not None:
+                ranges.append(stamp["time_range"])
+    if n_leaves == 0:
+        return None
+    for name, acc in digests.items():
+        meta = fields[name]
+        slab = np.full(n_cells, b"", dtype=object)
+        for j, cell in enumerate(acc):
+            if cell:
+                slab[j] = fold_digests(
+                    cell, delta=int(meta.get("delta") or 512), dtype=meta.get("dtype") or "float32"
+                )
+        slabs[name] = slab
+    stamps = [t for t in timestamps if t is not None]
+    return {
+        "slabs": slabs,
+        "generation": {
+            "n_leaves": int(n_leaves),
+            "max_leaf_timestamp": max(stamps) if stamps else None,
+        },
+        "content_hash": _content_hash(node, k, target_order, fields, slabs),
+        "granule_count": granules,
+        "time_range": union_time_range(*ranges) if ranges else None,
+    }
+
+
+def _content_hash(node, k, target_order, fields, slabs) -> str:
+    """sha256 over the folded per-field values (decoded bytes, O11-style).
+
+    The skip-if-current backstop: leaf stamps resolve to whole seconds, so a
+    same-second leaf re-run carries an unchanged generation stamp; the hash
+    catches the content change without re-reading the written overview.
+    """
+    h = hashlib.sha256(f"{OVERVIEW_SPEC}:{node}:{k}:{target_order}".encode())
+    for name in sorted(slabs):
+        h.update(name.encode())
+        slab = slabs[name]
+        if slab.dtype == object:
+            for payload in slab:
+                h.update(len(payload).to_bytes(4, "little"))
+                h.update(payload)
+        else:
+            h.update(np.ascontiguousarray(slab).tobytes())
+    return h.hexdigest()
+
+
+def _overview_config(fields):
+    """A minimal PipelineConfig whose leaf template matches the overview.
+
+    The overview zarr reuses the leaf template machinery
+    (``HealpixGrid.emit_shard_template``) so structure — dtypes, fills, the
+    D18 ragged attrs, the D16 dggs attrs — cannot drift from source leaves.
+    """
+    from zagg.config import PipelineConfig
+
+    variables = {}
+    for name, meta in fields.items():
+        if meta["class"] == "exact":
+            variables[name] = {
+                "function": meta.get("method"),
+                "dtype": meta.get("dtype", "float32"),
+                "fill_value": meta.get("fill_value", "NaN"),
+            }
+        else:
+            variables[name] = {
+                "kind": "ragged",
+                "function": "zagg.stats.tdigest.build_tdigest",
+                "inner_shape": list(meta.get("inner_shape") or [2]),
+                "dtype": meta.get("dtype", "float32"),
+                "fill_value": 0,
+            }
+    return PipelineConfig(
+        aggregation={
+            "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+            "variables": variables,
+        }
+    )
+
+
+def _write_overview(
+    store_root, node, k, key, fold, fields, cell_order, shard_order, windowed, store_kwargs
+) -> str:
+    """Write one overview zarr at its ancestor node; returns the basename.
+
+    D23 naming: overviews inherit window naming — ``{window}.zarr``, with the
+    reserved ``all`` token for the unwindowed / all-time fold. Write order is
+    pinned like a leaf's: template (wholesale overwrite — a prior overview or
+    torn debris is replaced, D4 retry semantics) -> arrays -> role/provenance
+    attrs -> commit stamp LAST, so an interrupted writer leaves ignorable
+    debris and presence certifies the ``role`` attr landed (D11).
+    """
+    import zarr
+    from mortie import generate_morton_children
+
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.grids.morton import morton_word
+    from zagg.hive import _utcnow, stamp_commit
+    from zagg.store import open_store
+    from zagg.windows import SCHEDULE_NONE_TOKEN, leaf_name_v3
+
+    target_order = cell_order - (shard_order - k)
+    basename = leaf_name_v3(None if key == SCHEDULE_NONE_TOKEN else key)
+    path = f"{store_root}/{_node_rel(node)}/{basename}"
+    grid = HealpixGrid(k, target_order, config=_overview_config(fields), sharded=True)
+    store = open_store(path, **store_kwargs)
+    grid.emit_shard_template(store, overwrite=True)
+    group = zarr.open_group(store, path=str(target_order), mode="r+", zarr_format=3)
+    words = np.asarray(generate_morton_children(morton_word(node), target_order), dtype=np.uint64)
+    group["morton"][:] = words
+    for name, slab in fold["slabs"].items():
+        group[name][:] = slab
+    populated = _populated_mask(fold["slabs"], fields)
+    root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
+    root.attrs.update(
+        {
+            ROLE_ATTR: "overview",
+            OVERVIEW_ATTR: {
+                "spec": OVERVIEW_SPEC,
+                "node": node,
+                "order": int(k),
+                "cell_order": int(target_order),
+                "source_shard_order": int(shard_order),
+                "source_cell_order": int(cell_order),
+                "window": key,
+                "fields": {
+                    n: {"class": m["class"], "method": m.get("method", TDIGEST_LAW)}
+                    for n, m in fields.items()
+                },
+                "generation": fold["generation"],
+                "content_hash": fold["content_hash"],
+                "generated_at": _utcnow(),
+            },
+        }
+    )
+    stamp_window = key if windowed else None
+    stamp_commit(
+        store,
+        cells_with_data=int(populated.sum()),
+        granule_count=int(fold["granule_count"]),
+        window=stamp_window,
+        time_range=fold["time_range"] if stamp_window is not None else None,
+    )
+    return basename
+
+
+def _populated_mask(slabs: dict, fields: dict) -> np.ndarray:
+    """Cells carrying any non-fill value in any included field."""
+    populated = None
+    for name, slab in slabs.items():
+        if slab.dtype == object:
+            mask = np.fromiter((len(p) > 0 for p in slab), dtype=bool, count=len(slab))
+        else:
+            mask = ~_is_missing(slab, fields[name].get("fill_value", "NaN"))
+        populated = mask if populated is None else (populated | mask)
+    return populated if populated is not None else np.zeros(0, dtype=bool)
