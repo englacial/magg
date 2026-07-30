@@ -318,12 +318,42 @@ def _load_cfn(path):
     return yaml.load(path.read_text(), Loader=_CfnLoader)
 
 
+def _effective_worker_memory_sizes():
+    """The memory sizes the DEPLOYED stacks actually provision.
+
+    ``WorkerMemorySizes`` is a ``CommaDelimitedList`` *parameter*, so reading its
+    ``Default`` is only the effective matrix while nothing overrides it. It is
+    determinable here rather than assumed: ``stand_up.sh`` is the one in-repo
+    standup path and its ``--parameter-overrides`` list does not name the
+    parameter, which
+    :func:`test_standup_does_not_override_the_worker_memory_matrix` pins. A stack
+    stood up BY HAND with a different list is the stated residual — it would
+    provision variants nothing here probes or enumerates (the template's own
+    comment makes it a non-free-form knob: each size needs a matching
+    ``WorkerDiskTmp`` entry and memory+2048 <= 10240).
+    """
+    tpl = _load_cfn(TEMPLATE)
+    return [s.strip() for s in tpl["Parameters"]["WorkerMemorySizes"]["Default"].split(",")]
+
+
+def test_standup_does_not_override_the_worker_memory_matrix():
+    # Fold review: the drift guard compares against the parameter DEFAULT. That
+    # is the effective deployed matrix only while no standup path overrides it --
+    # assert that, so the boundary is guarded instead of assumed.
+    standup = (REPO / "deployment" / "aws" / "stand_up.sh").read_text()
+    assert "WorkerMemorySizes" not in standup, (
+        "stand_up.sh now sets WorkerMemorySizes, so the deployed variant matrix "
+        "no longer equals template.yaml's parameter Default -- point "
+        "_effective_worker_memory_sizes() at the override (issue #341)"
+    )
+
+
 def _template_variant_suffixes():
     """(test_suffixes, prod_suffixes) stamped by template.yaml's Fn::ForEach
     loops over the WorkerMemorySizes matrix; test suffixes are relative to
     TestFunctionName (= ``${FunctionName}-test``, the deploy target)."""
     tpl = _load_cfn(TEMPLATE)
-    sizes = tpl["Parameters"]["WorkerMemorySizes"]["Default"].split(",")
+    sizes = _effective_worker_memory_sizes()
     test, prod = set(), set()
     for key, val in tpl["Resources"].items():
         if not key.startswith("Fn::ForEach::"):
