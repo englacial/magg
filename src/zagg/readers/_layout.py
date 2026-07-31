@@ -78,7 +78,14 @@ def normalize_subtree(subtree) -> tuple[int, str, int]:
 
 
 def subtree_cell_span(
-    subtree, anchor: int, anchor_index: int, cell_order: int, n_cells: int, field: str
+    subtree,
+    anchor: int,
+    anchor_index: int,
+    cell_order: int,
+    n_cells: int,
+    field: str,
+    *,
+    stacklevel: int = 2,
 ) -> tuple[int, int]:
     """Cell-index span ``[start, stop)`` of ``subtree`` on a nested cells axis.
 
@@ -102,11 +109,17 @@ def subtree_cell_span(
 
     The span is returned intersected with the axis: a word at or above the
     axis root clips to the whole axis (every stored cell is its
-    descendant), and a well-formed word DISJOINT from the axis warns once —
-    naming the word and the axis root — and returns the empty span
-    ``(0, 0)``. Out-of-domain is a data answer (the ratified issue #351
-    fork (3)), so an empty read is ambiguous between "in-domain, nothing
-    stored" and "outside the domain" unless the warning is observed.
+    descendant), and a well-formed word DISJOINT from the axis warns — naming
+    the word and the axis root — and returns the empty span ``(0, 0)``.
+    Out-of-domain is a data answer (the ratified issue #351 fork (3)), so an
+    empty read is ambiguous between "in-domain, nothing stored" and "outside
+    the domain" unless the warning is observed — and DELIVERY of that warning
+    is the caller's ``warnings`` filter's call: the default ``default`` action
+    dedups on (message, category, module, lineno), so a second call with the
+    same word is silent in the same process. The guarantee is "at most once
+    per call" (never per cell or per chunk). ``stacklevel`` is the caller's
+    depth from here — the readers pass the depth that attributes the warning
+    to THEIR caller rather than to zagg's own frames.
     Raises ``ValueError`` for a malformed word, or one deeper than the
     cells-axis order (grammatically impossible — nothing stored could be
     its descendant).
@@ -153,7 +166,7 @@ def subtree_cell_span(
         warnings.warn(
             f"subtree {decimal} is outside this axis' order-{root_order} root "
             f"{morton_decimal(root)} — yielding nothing",
-            stacklevel=2,
+            stacklevel=stacklevel,
         )
         return 0, 0
     return start, stop

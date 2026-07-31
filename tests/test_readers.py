@@ -777,6 +777,20 @@ class TestSubtreePerCellReaders:
             f"subtree {_KEY_B} is outside this axis' order-6 root {_KEY_A} — yielding nothing"
         ]
 
+    @pytest.mark.parametrize("reader", [read_raw_values, read_locations, read_tensors])
+    def test_out_of_domain_warning_is_attributed_to_the_caller(self, reader):
+        import warnings
+
+        store, _word, _vals = _leaf_store([0, 5], located=True)
+        # The readers are generators, so the warning fires on the consumer's
+        # first next() — the stacklevel must reach THIS frame, not a zagg one
+        # (review, PR #357).
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            list(reader(store, "12/h_tdigest", subtree=morton_word(_KEY_B)))
+        (w,) = [r for r in rec if "outside this axis" in str(r.message)]
+        assert w.filename == __file__
+
     def test_ancestor_of_the_axis_root_clips_to_the_whole_axis(self):
         from mortie import clip2order
 
