@@ -1043,6 +1043,11 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
                     "mode": "sweep",
                     "n_leaves": summary["n_leaves"],
                     "families": summary["families"],
+                    # issue #353: a synchronous benchmark invoke reads timings
+                    # straight off the response; the store-root record is the
+                    # durable copy (fail-open -> null).
+                    "duration_s": summary["duration_s"],
+                    "record": summary.get("record"),
                 }
             ),
         }
