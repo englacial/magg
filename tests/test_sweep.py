@@ -1106,6 +1106,23 @@ class TestHandlerSweepResponse:
         assert body["families"]["stats"]["duration_s"] >= 0.0
         # The record key round-trips: the object the handler names exists.
         assert (tmp_path / body["record"]).exists()
+        # The leaves rode inline: no work set was derived to charge for.
+        assert body["discover_s"] is None
+
+    def test_discovery_path_reports_its_own_span(self, tmp_path):
+        # discover_leaves is a LIST + a parquet read per run record; it is not
+        # inside run_sweep's span, so it gets its own field rather than being
+        # folded into (or dropped from) duration_s.
+        mod = _handler_module()
+
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        _run_record(tmp_path, [_row("-311")])
+        response = mod._handle_sweep({"mode": "sweep", "store_path": str(tmp_path)})
+        body = json.loads(response["body"])
+        assert body["n_leaves"] == 1
+        assert body["discover_s"] >= 0.0
+        assert body["duration_s"] >= 0.0
 
     def test_no_work_response_carries_the_same_keys(self, tmp_path):
         # A no-work invoke (nothing swept, or discovery over a store with no
@@ -1113,9 +1130,9 @@ class TestHandlerSweepResponse:
         mod = _handler_module()
 
         _write_manifest(tmp_path)
-        for event in (
-            {"mode": "sweep", "store_path": str(tmp_path), "leaves": []},
-            {"mode": "sweep", "store_path": str(tmp_path), "discover": True},
+        for event, derived in (
+            ({"mode": "sweep", "store_path": str(tmp_path), "leaves": []}, False),
+            ({"mode": "sweep", "store_path": str(tmp_path), "discover": True}, True),
         ):
             response = mod._handle_sweep(event)
             assert response["statusCode"] == 200
@@ -1123,3 +1140,4 @@ class TestHandlerSweepResponse:
             assert body["ok"] is True and body["n_leaves"] == 0
             assert body["duration_s"] >= 0.0
             assert body["record"] is None
+            assert (body["discover_s"] >= 0.0) if derived else (body["discover_s"] is None)

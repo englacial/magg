@@ -1028,8 +1028,10 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
         t0 = time.perf_counter()
         if event.get("leaves") is not None:
             leaves = [(int(key), window) for key, window in event["leaves"]]
+            discover_s = None  # the work set rode inline; nothing was derived
         else:
             leaves = discover_leaves(event["store_path"], store_kwargs=store_kwargs)
+            discover_s = time.perf_counter() - t0
         if not leaves:
             # Same key set as the swept response: a benchmark driver reading
             # body["duration_s"] must not KeyError on a no-work invoke (#353).
@@ -1041,6 +1043,7 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
                         "mode": "sweep",
                         "n_leaves": 0,
                         "duration_s": time.perf_counter() - t0,
+                        "discover_s": discover_s,
                         "record": None,
                     }
                 ),
@@ -1056,8 +1059,13 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
                     "families": summary["families"],
                     # issue #353: a synchronous benchmark invoke reads timings
                     # straight off the response; the store-root record is the
-                    # durable copy (fail-open -> null).
+                    # durable copy (fail-open -> null). ``duration_s`` is the
+                    # fold alone -- run_sweep's own span, which is exactly what
+                    # the store-root record carries -- and ``discover_s`` the
+                    # work-set derivation, null when the leaves rode inline.
+                    # Invoke wall-clock is their sum, not duration_s.
                     "duration_s": summary["duration_s"],
+                    "discover_s": discover_s,
                     "record": summary.get("record"),
                 }
             ),
