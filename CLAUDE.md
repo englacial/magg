@@ -36,7 +36,7 @@ These conventions govern both interactive sessions and **unattended routine runs
 
 - **Match the surrounding code.** Read neighboring files first; mirror their structure, naming, and patterns rather than introducing new ones.
 - **Write terse, reviewable code.** Favor clarity and brevity over cleverness — the reviewer's time is the constraint. No dead code, no speculative abstraction.
-- **A module should not exceed ~1000 lines without prior discussion.** If a file is heading past that, stop and raise it (issue comment) before splitting it or continuing.
+- **A module should not exceed ~1,200 lines without prior discussion.** ~1,000 remains the aim, but overages below 1,200 are pre-approved (espg standing ruling, 2026-07-31 — issues #351/#358) and need no raise. If a file is heading past 1,200, stop and raise it (issue comment) before splitting it or continuing.
 - Every behavioral change needs tests. Add or update tests in the same PR.
 - A PR is not "done" until it is green locally (zagg is pure Python — no build step): `ruff check src tests`, `ruff format --check src tests`, and `pytest -v` (commands and tooling per §7). `pre-commit run --all-files` covers ruff + mypy + codespell in one pass and mirrors CI. If you cannot get to green, open the draft PR anyway and explain what's blocking under "Questions for review." Do not "fix" pre-existing CI failures unrelated to your change; flag them instead.
 - Do not disable, skip, or weaken tests to make CI pass. Do not add broad lint-ignore / `# noqa` / `# type: ignore` blocks to silence ruff or mypy — fix the cause or flag it.
