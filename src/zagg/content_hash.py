@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from typing import Any, Mapping
 
 import numpy as np
@@ -38,6 +39,16 @@ logger = logging.getLogger(__name__)
 
 #: Width of the §5.2 vlen recipe's per-cell length prefix (uint64, LE).
 VLEN_LENGTH_PREFIX = 8
+
+#: Byte budget for out-of-order rows ONE :class:`StreamingArrayHash` may hold
+#: (issue #342 phase 5). The raster sink receives timesteps in *completion*
+#: order (``asyncio.as_completed``), so a row arriving before its predecessors
+#: must be parked until its turn. The budget bounds that parking — at typical
+#: raster leaf geometry (tens of acquisitions x a shard's cells) the whole
+#: array is well under it, while a pathological leaf degrades to "no recorded
+#: hash" (§5.3 unverifiable, not tampered) instead of eating the streaming
+#: write path's memory bound (issues #231/#232).
+STREAM_PENDING_MAX_BYTES = 64 * 1024 * 1024
 
 
 def _element_bytes(element: object) -> bytes:
@@ -124,6 +135,130 @@ def hash_arrays(group: Any, *, staged: Mapping[str, np.ndarray] | None = None) -
             sorted(unused),
         )
     return hashes
+
+
+#: Sentinel for "the fill row has not been materialized yet".
+_UNSET = object()
+
+
+class StreamingArrayHash:
+    """§5.2 digest of an array assembled from leading-axis rows as they are written.
+
+    The incremental hash source for write paths that never hold the whole
+    array (issue #342 phase 5, the raster hive leaf): a ``(time, cells)``
+    band is written one timestep at a time, and the concatenation of those
+    rows' decoded C-order little-endian bytes IS the array's full decoded
+    byte sequence — so a live ``sha256`` fed row by row finalizes to exactly
+    the digest :func:`hash_array` would compute over the assembled array. No
+    read-back, no whole-array staging.
+
+    Two things the identity depends on, both ENFORCED here rather than
+    assumed — a digest that is silently wrong is worse than no digest:
+
+    - **Unwritten rows still count.** The recipe covers the array's full
+      logical contents, so a row that never gets a slab contributes its
+      **fill** bytes. Rows missing at :meth:`finalize` are filled from
+      ``fill_value``; an array with a gap and no reconstructable fill is
+      dropped instead of hashed.
+    - **Order.** Rows may arrive in any order (the raster sink runs on
+      ``asyncio.as_completed``), so out-of-order rows are parked until their
+      turn — bounded by :data:`STREAM_PENDING_MAX_BYTES`. A row written
+      twice, a row outside the declared extent, a shape/dtype mismatch, or a
+      parking overflow all **invalidate** the digest: :meth:`finalize`
+      returns ``None`` and :attr:`invalid_reason` says why.
+
+    Thread-safe: the raster sink hands slabs off to worker threads when
+    ``write_buffer > 1``.
+    """
+
+    def __init__(self, shape, dtype, fill_value=None):
+        self.shape = tuple(int(s) for s in shape)
+        self.dtype = np.dtype(dtype)
+        self.fill_value = fill_value
+        self.invalid_reason: str | None = None
+        self._row_shape = self.shape[1:]
+        self._n_rows = self.shape[0] if self.shape else 0
+        self._digest = hashlib.sha256()
+        self._next = 0
+        self._pending: dict[int, np.ndarray] = {}
+        self._pending_bytes = 0
+        self._fill_row: Any = _UNSET
+        self._lock = threading.Lock()
+
+    def _invalidate(self, reason: str) -> None:
+        if self.invalid_reason is None:
+            self.invalid_reason = reason
+        self._pending.clear()
+        self._pending_bytes = 0
+
+    def _row_bytes(self, values: np.ndarray) -> bytes:
+        values = np.ascontiguousarray(values)
+        if values.dtype.byteorder == ">":  # canonical form is little-endian
+            values = values.astype(values.dtype.newbyteorder("<"))
+        return values.tobytes()
+
+    def update(self, index: int, values) -> None:
+        """Record the row written at leading-axis ``index`` (any order)."""
+        with self._lock:
+            if self.invalid_reason is not None:
+                return
+            index = int(index)
+            values = np.asarray(values)
+            if values.shape != self._row_shape or values.dtype != self.dtype:
+                self._invalidate(
+                    f"row {index} is {values.shape}/{values.dtype}, expected "
+                    f"{self._row_shape}/{self.dtype}"
+                )
+                return
+            if not 0 <= index < self._n_rows:
+                self._invalidate(f"row {index} is outside the array's {self._n_rows} rows")
+                return
+            if index < self._next or index in self._pending:
+                self._invalidate(f"row {index} was written more than once")
+                return
+            if index > self._next:
+                self._pending[index] = values
+                self._pending_bytes += values.nbytes
+                if self._pending_bytes > STREAM_PENDING_MAX_BYTES:
+                    self._invalidate(
+                        f"out-of-order rows exceeded the {STREAM_PENDING_MAX_BYTES}-byte "
+                        f"parking budget"
+                    )
+                return
+            self._digest.update(self._row_bytes(values))
+            self._next += 1
+            while self._next in self._pending:  # drain rows this one unblocked
+                row = self._pending.pop(self._next)
+                self._pending_bytes -= row.nbytes
+                self._digest.update(self._row_bytes(row))
+                self._next += 1
+
+    def finalize(self) -> str | None:
+        """The array's §5.2 digest, or ``None`` when it cannot be stood behind."""
+        with self._lock:
+            if self.invalid_reason is not None:
+                return None
+            for index in range(self._next, self._n_rows):
+                row = self._pending.pop(index, None)
+                if row is not None:
+                    self._pending_bytes -= row.nbytes
+                    self._digest.update(self._row_bytes(row))
+                    continue
+                if self._fill_row is _UNSET:
+                    self._fill_row = (
+                        None
+                        if self.fill_value is None
+                        else np.full(self._row_shape, self.fill_value, dtype=self.dtype).tobytes()
+                    )
+                if self._fill_row is None:
+                    self._invalidate(
+                        f"row {index} was never written and the array declares no "
+                        f"fill_value to reconstruct it"
+                    )
+                    return None
+                self._digest.update(self._fill_row)
+            self._next = self._n_rows
+            return self._digest.hexdigest()
 
 
 def combined_hash(hashes: Mapping[str, str]) -> str:

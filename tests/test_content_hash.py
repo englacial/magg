@@ -21,6 +21,7 @@ import zarr
 from zarr.storage import LocalStore
 
 from zagg.content_hash import (
+    StreamingArrayHash,
     combined_hash,
     content_hashes_record,
     hash_array,
@@ -367,6 +368,115 @@ class TestCoverageCompleteness:
         # Write-read parity holds across BOTH sources: staged slabs (dense,
         # vector, ragged) and the companion's read-back fallback.
         assert recorded == hash_arrays(group)
+
+
+class TestStreamingArrayHash:
+    """Issue #342 phase 5: the incremental digest equals the whole-array one.
+
+    The identity the raster path rests on — a live sha256 fed one
+    leading-axis row at a time finalizes to exactly ``hash_array`` over the
+    assembled array — plus the two preconditions that identity needs, which
+    the accumulator ENFORCES rather than assumes.
+    """
+
+    def _array(self, n_rows=5, n_cols=4, dtype="uint16"):
+        return np.arange(n_rows * n_cols, dtype=dtype).reshape(n_rows, n_cols)
+
+    def test_in_order_rows_equal_whole_array_hash(self):
+        values = self._array()
+        stream = StreamingArrayHash(values.shape, values.dtype, 0)
+        for i, row in enumerate(values):
+            stream.update(i, row)
+        assert stream.finalize() == hash_array(values)
+
+    def test_out_of_order_rows_equal_whole_array_hash(self):
+        # The raster sink delivers timesteps in COMPLETION order, so this is
+        # the production arrival pattern, not an edge case.
+        values = self._array()
+        stream = StreamingArrayHash(values.shape, values.dtype, 0)
+        for i in (3, 0, 4, 2, 1):
+            stream.update(i, values[i])
+        assert stream.finalize() == hash_array(values)
+
+    def test_unwritten_rows_contribute_fill_bytes(self):
+        # Trap (1): the recipe covers the array's FULL contents, so a row
+        # that never gets a slab still hashes — as fill.
+        values = np.full((4, 3), 7, dtype="int32")
+        values[1] = 0  # the fill value: this row is never written
+        values[3] = 0
+        stream = StreamingArrayHash(values.shape, values.dtype, 0)
+        stream.update(0, values[0])
+        stream.update(2, values[2])
+        assert stream.finalize() == hash_array(values)
+
+    def test_float_nan_fill_matches_whole_array(self):
+        values = np.full((3, 2), np.nan, dtype="float32")
+        values[0] = [1.5, 2.5]
+        stream = StreamingArrayHash(values.shape, values.dtype, np.float32("nan"))
+        stream.update(0, values[0])
+        assert stream.finalize() == hash_array(values)
+
+    def test_no_rows_written_is_all_fill(self):
+        stream = StreamingArrayHash((2, 2), np.dtype("uint16"), 0)
+        assert stream.finalize() == hash_array(np.zeros((2, 2), dtype="uint16"))
+
+    def test_big_endian_rows_hash_little_endian(self):
+        values = self._array(dtype="<u2")
+        stream = StreamingArrayHash(values.shape, values.dtype, 0)
+        for i, row in enumerate(values):
+            stream.update(i, row.astype(">u2"))
+        # A big-endian row is byteswapped to the canonical form, so the
+        # dtype guard rejects it rather than hashing swapped bytes.
+        assert stream.finalize() is None
+        assert "expected" in stream.invalid_reason
+
+    @pytest.mark.parametrize(
+        "bad, match",
+        [
+            ("duplicate", "more than once"),
+            ("out_of_range", "outside the array"),
+            ("wrong_shape", "expected"),
+        ],
+    )
+    def test_precondition_violations_drop_the_hash(self, bad, match):
+        # Trap (2): never a digest that cannot be stood behind — finalize
+        # returns None (§5.3 unverifiable) and says why.
+        values = self._array()
+        stream = StreamingArrayHash(values.shape, values.dtype, 0)
+        stream.update(0, values[0])
+        if bad == "duplicate":
+            stream.update(0, values[0])
+        elif bad == "out_of_range":
+            stream.update(99, values[1])
+        else:
+            stream.update(1, values[1][:2])
+        assert stream.finalize() is None
+        assert match in stream.invalid_reason
+
+    def test_parking_budget_overflow_drops_the_hash(self, monkeypatch):
+        monkeypatch.setattr("zagg.content_hash.STREAM_PENDING_MAX_BYTES", 8)
+        values = self._array(n_rows=6, n_cols=8)
+        stream = StreamingArrayHash(values.shape, values.dtype, 0)
+        for i in (5, 4, 3):  # all parked behind the missing row 0
+            stream.update(i, values[i])
+        assert stream.finalize() is None
+        assert "parking budget" in stream.invalid_reason
+
+    def test_gap_without_a_fill_value_drops_the_hash(self):
+        stream = StreamingArrayHash((3, 2), np.dtype("uint16"), None)
+        stream.update(0, np.zeros(2, dtype="uint16"))
+        assert stream.finalize() is None
+        assert "fill_value" in stream.invalid_reason
+
+    def test_concurrent_updates_are_serialized(self):
+        # The sink hands slabs to worker threads at write_buffer > 1.
+        from concurrent.futures import ThreadPoolExecutor
+
+        values = self._array(n_rows=32, n_cols=8)
+        stream = StreamingArrayHash(values.shape, values.dtype, 0)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda i: stream.update(i, values[i]), range(len(values))))
+        assert stream.finalize() == hash_array(values)
 
 
 class TestDenseRecipe:

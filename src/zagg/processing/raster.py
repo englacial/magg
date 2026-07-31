@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import os
 import re
 import threading
@@ -29,6 +30,8 @@ import warnings
 from urllib.parse import urlparse
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # TIFF SampleFormat x BitsPerSample -> numpy dtype, for sizing the fill return
 # when a shard has no valid cells (no tile fetched, so no decoded buffer to
@@ -978,7 +981,14 @@ def raster_leaf_spec(grid, config, n_time: int):
 
 
 def emit_raster_leaf_template(
-    store, grid, config, shard_key: int, times_us: np.ndarray, *, overwrite: bool = False
+    store,
+    grid,
+    config,
+    shard_key: int,
+    times_us: np.ndarray,
+    *,
+    overwrite: bool = False,
+    staged_out: dict | None = None,
 ):
     """Write one leaf's template plus its ``time`` and ``morton`` coords.
 
@@ -990,6 +1000,11 @@ def emit_raster_leaf_template(
     first slab (mirroring ``process_and_write_hive``'s lazy ``_leaf``) with
     ``overwrite=True`` so a no-data shard never creates the ``.zarr/`` prefix
     and a retry replaces debris wholesale (D4).
+
+    ``staged_out`` (issue #342): when a dict is passed, the coordinate arrays
+    written here are recorded in it under their leaf-relative paths — the
+    O11 hash source for the arrays this function writes WHOLE (the band
+    arrays stream per timestep and hash incrementally instead).
     """
     from zarr import config as zarr_config
     from zarr import open_array
@@ -999,24 +1014,39 @@ def emit_raster_leaf_template(
     with zarr_config.set({"async.concurrency": 128}):
         spec.to_zarr(store, "", overwrite=overwrite)
         arr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
-        arr[:] = np.asarray(times_us, dtype=np.int64)
+        times = np.asarray(times_us, dtype=np.int64)
+        arr[:] = times
         arr = open_array(store, path=f"{grid.group_path}/morton", zarr_format=3, consolidated=False)
         arr[:] = children
+        cell_ids = None
         if grid.emit_cell_ids:
             arr = open_array(
                 store, path=f"{grid.group_path}/cell_ids", zarr_format=3, consolidated=False
             )
-            arr[:] = np.asarray(grid.encode_cell_ids(children), dtype=np.uint64)
+            cell_ids = np.asarray(grid.encode_cell_ids(children), dtype=np.uint64)
+            arr[:] = cell_ids
+    if staged_out is not None:
+        staged_out[f"{grid.group_path}/time"] = times
+        staged_out[f"{grid.group_path}/morton"] = children
+        if cell_ids is not None:
+            staged_out[f"{grid.group_path}/cell_ids"] = cell_ids
     return store
 
 
-def write_raster_leaf_slab(store, grid, t_idx: int, slab: dict):
+def write_raster_leaf_slab(store, grid, t_idx: int, slab: dict, *, streams: dict | None = None):
     """Write one timestep's slab at LEAF-LOCAL indices: ``array[t, :] = values``.
 
     The leaf's arrays span exactly one shard, so the cell axis needs no
     block offset (contrast :func:`write_raster_slab`); ``t_idx`` is the
     leaf-local timestep from the leaf's own time index. Chunk-aligned by
     construction (whole rows of ``(1, cells_per_chunk)`` chunks).
+
+    ``streams`` (issue #342) maps leaf-relative array paths to
+    :class:`~zagg.content_hash.StreamingArrayHash` accumulators: each row is
+    fed to its array's digest AS WRITTEN — after the dtype cast, so the
+    hashed bytes are exactly the stored ones. The accumulators are
+    thread-safe (this function runs on worker threads at ``write_buffer >
+    1``) and tolerate the sink's completion-order arrival.
     """
     from zarr import config as zarr_config
     from zarr import open_array
@@ -1026,7 +1056,12 @@ def write_raster_leaf_slab(store, grid, t_idx: int, slab: dict):
             arr = open_array(
                 store, path=f"{grid.group_path}/{name}", zarr_format=3, consolidated=False
             )
-            arr[int(t_idx), :] = np.asarray(values, dtype=arr.dtype)
+            cast = np.asarray(values, dtype=arr.dtype)
+            arr[int(t_idx), :] = cast
+            if streams is not None:
+                stream = streams.get(f"{grid.group_path}/{name}")
+                if stream is not None:
+                    stream.update(int(t_idx), cast)
     return store
 
 
@@ -1082,6 +1117,59 @@ def write_raster_coords(store, grid, shard_key: int):
     return store
 
 
+def _arm_leaf_hashes(store, staged: dict, streams: dict) -> None:
+    """Create one O11 accumulator per leaf array not written whole (issue #342).
+
+    Discovery-based like the §5.1 scope itself: every named array beneath the
+    freshly templated leaf root that ``staged`` does not already cover gets a
+    :class:`~zagg.content_hash.StreamingArrayHash` sized from the array's own
+    metadata — so a band that never receives a slab still finalizes (all
+    fill), and a member added to the template later is picked up without
+    touching this code. Fail-open: on any error the leaf simply records no
+    hashes (§5.3 unverifiable, not tampered).
+    """
+    try:
+        import zarr
+
+        from zagg.content_hash import StreamingArrayHash
+
+        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
+        for key, node in group.members(max_depth=None):
+            if not isinstance(node, zarr.Array) or key in staged:
+                continue
+            streams[key] = StreamingArrayHash(node.shape, node.dtype, node.metadata.fill_value)
+    except Exception as e:
+        logger.warning(f"O11 hash accumulators unavailable for this leaf (fail-open): {e}")
+        streams.clear()
+        staged.clear()
+
+
+def _finalize_leaf_hashes(staged: dict, streams: dict) -> dict | None:
+    """The leaf's §5.3 ``content_hashes`` record, or ``None`` (issue #342).
+
+    All-or-nothing by design: a partial map would read as "array missing" to
+    a §5.1 verifier and its ``combined`` would be a digest of a subset, so an
+    array whose incremental digest cannot be stood behind (out-of-order
+    write, unwritten row with no fill, parking overflow) drops the WHOLE
+    record with one warning naming the array and the reason.
+    """
+    from zagg.content_hash import content_hashes_record, hash_array
+
+    if not staged and not streams:
+        return None
+    hashes = {key: hash_array(values) for key, values in staged.items()}
+    for key, stream in streams.items():
+        digest = stream.finalize()
+        if digest is None:
+            logger.warning(
+                f"O11: no content hashes recorded for this leaf — {key} could not be "
+                f"hashed incrementally ({stream.invalid_reason})"
+            )
+            return None
+        hashes[key] = digest
+    return content_hashes_record(hashes)
+
+
 def process_and_write_raster_hive(
     shard_key,
     granules,
@@ -1126,10 +1214,20 @@ def process_and_write_raster_hive(
     sidecar PUT) -> stamp. ``cells_with_data`` counts the occupied-cell
     union; ``granule_count`` the unit's acquisitions (asset-carrying
     entries). Phase timings are always collected (issue #297):
-    ``metadata["phase_timings"] = {"sample", "write"}`` with the leaf
+    ``metadata["phase_timings"] = {"sample", "write", "hash"}`` with the leaf
     write-out (template + slabs + sidecar + stamp) as ``write``; the
     per-stage ``stages`` block (issue #249) stays gated on ``profile`` /
     a passed ``stage_stats`` (the local dispatcher's debug-logging flavor).
+
+    O11 content hashes (issue #342 phase 5) are accumulated INCREMENTALLY:
+    this path never holds a whole band array (it streams one timestep at a
+    time, issues #231/#232), so each row is folded into a live per-array
+    ``sha256`` as it is written and finalized here into
+    ``metadata["content_hashes"]`` (§5.3), which the caller's
+    ``telemetry.build_record`` rides into the leaf's D20 sidecar. Equivalent
+    to hashing the assembled array by construction — pinned against
+    ``content_hash.hash_arrays`` over a store read-back in
+    ``tests/test_content_hash.py``.
     """
     from zagg.hive import (
         COVERAGE_SIDECAR,
@@ -1152,6 +1250,15 @@ def process_and_write_raster_hive(
     time_index, times_us = raster_time_index([granules])
     box: dict = {}
     write_s = 0.0
+    # O11 incremental hashing (issue #342 phase 5). The raster leaf never
+    # holds a whole band array — it streams one timestep at a time (issues
+    # #231/#232) — so the §5 digest is accumulated row by row as each slab is
+    # written, instead of staging the array (the spatial path's source) or
+    # reading it back. ``staged`` carries the coordinate arrays this path
+    # DOES write whole (template time); ``streams`` the per-band
+    # accumulators, keyed the same way.
+    staged: dict = {}
+    streams: dict = {}
 
     def _leaf():
         if "store" not in box:
@@ -1166,15 +1273,22 @@ def process_and_write_raster_hive(
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
                 emit_raster_leaf_template(
-                    store, grid, config, int(shard_key), times_us, overwrite=True
+                    store,
+                    grid,
+                    config,
+                    int(shard_key),
+                    times_us,
+                    overwrite=True,
+                    staged_out=staged,
                 )
+            _arm_leaf_hashes(store, staged, streams)
             box["store"] = store
         return box["store"]
 
     def _write_slab(t_idx, slab):
         nonlocal write_s
         _t0 = time.time()
-        write_raster_leaf_slab(_leaf(), grid, t_idx, slab)
+        write_raster_leaf_slab(_leaf(), grid, t_idx, slab, streams=streams)
         write_s += time.time() - _t0
 
     occupied: list = []
@@ -1238,10 +1352,23 @@ def process_and_write_raster_hive(
     # actually wrote carries it, so a no-data unit stays write-less and
     # sample/write always decompose this call's wall. The per-stage ``stages``
     # block stays verbosity, gated on profiling/debug (a passed stage_stats).
+    hash_s = 0.0
+    if "store" in box:
+        # O11 finalize (issue #342 phase 5): the per-row digests close out
+        # here — no read-back, so this is a handful of hashes over bytes
+        # already consumed, not another pass over the data. The caller's
+        # ``build_record`` rides it into the leaf's D20 sidecar; ``None``
+        # leaves the record absent (§5.3 unverifiable, not tampered).
+        _t0 = time.time()
+        record = _finalize_leaf_hashes(staged, streams)
+        if record is not None:
+            meta["content_hashes"] = record
+        hash_s = time.time() - _t0
     if "store" in box:
         meta["phase_timings"] = {
-            "sample": (time.time() - t_start) - write_s,
+            "sample": (time.time() - t_start) - write_s - hash_s,
             "write": write_s,
+            "hash": hash_s,
         }
         if stage_stats is not None:
             meta["phase_timings"]["stages"] = stage_stats
