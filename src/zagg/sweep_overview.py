@@ -333,7 +333,7 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     """
     import obstore
 
-    from zagg.hive import MANIFEST_NAME, read_manifest
+    from zagg.hive import MANIFEST_NAME, _frozen_matches, read_manifest
     from zagg.store import open_object_store
 
     store_kwargs = dict(store_kwargs or {})
@@ -352,7 +352,20 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
             f"shard_order {shard_order} — the config does not match this store"
         )
     validated = _validate_block_against_store(store_root, manifest, block, store_kwargs)
-    prior = manifest.get("pyramid")
+    # Re-read immediately before the RMW, the same discipline
+    # :func:`_update_manifest_pyramid` uses: validation above is slow (run-record
+    # discovery + leaf GETs), this PUT rewrites the WHOLE manifest, and a
+    # concurrent sweep's ``materialized`` update landing in that window would be
+    # silently reverted by the pre-validation copy. Frozen keys are re-checked so
+    # the block is never installed on a manifest validation never saw.
+    fresh = read_manifest(store_root, **store_kwargs)
+    if fresh is None or not _frozen_matches(fresh, manifest):
+        raise ValueError(
+            f"the {MANIFEST_NAME} at {store_root} changed under declare_pyramid's "
+            f"validation window (frozen keys differ, or it vanished) — nothing was "
+            f"written; re-run against the settled store"
+        )
+    prior = fresh.get("pyramid")
     materialized = ((prior or {}).get("overview") or {}).get("materialized")
     if materialized is not None:
         block["overview"]["materialized"] = materialized
@@ -366,11 +379,11 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     if prior == block:
         logger.info("declare_pyramid: the manifest already carries this declaration; no write")
         return summary
-    manifest["pyramid"] = block
+    fresh["pyramid"] = block
     obstore.put(
         open_object_store(store_root, **store_kwargs),
         MANIFEST_NAME,
-        json.dumps(manifest, indent=1).encode(),
+        json.dumps(fresh, indent=1).encode(),
     )
     return summary
 

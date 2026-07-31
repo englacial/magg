@@ -1050,6 +1050,50 @@ class TestDeclarePyramid:
         assert block["orders"] == [1, 0]
         assert block["materialized"] == materialized  # actuals survive the rewrite
 
+    def test_concurrent_materialized_survives_the_validation_window(self, tmp_path, monkeypatch):
+        # The RMW re-reads immediately before its PUT: a sweep landing
+        # ``materialized`` while the (slow) validation runs must not be reverted
+        # by a manifest copy read before it.
+        from zagg import sweep_overview
+
+        self._pre_declaration_store(tmp_path)
+        declare_pyramid(str(tmp_path), _leaf_cfg())
+        real = sweep_overview._validate_block_against_store
+
+        def concurrent_sweep(*args, **kwargs):
+            out = real(*args, **kwargs)
+            sweep_overview._update_manifest_pyramid(str(tmp_path), [0], {})
+            return out
+
+        monkeypatch.setattr(sweep_overview, "_validate_block_against_store", concurrent_sweep)
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"orders": [1, 0]}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block["orders"] == [1, 0]
+        assert block["materialized"]["orders"] == [0]  # the concurrent update survives
+
+    def test_manifest_changed_under_validation_refuses(self, tmp_path, monkeypatch):
+        # Frozen keys re-checked at the PUT: the block is never installed on a
+        # manifest the validation never saw.
+        from zagg import sweep_overview
+
+        self._pre_declaration_store(tmp_path)
+        real = sweep_overview._validate_block_against_store
+
+        def clobber(*args, **kwargs):
+            out = real(*args, **kwargs)
+            m = read_manifest(str(tmp_path))
+            m["shard_order"] = SHARD_ORDER + 1
+            obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(m).encode())
+            return out
+
+        monkeypatch.setattr(sweep_overview, "_validate_block_against_store", clobber)
+        with pytest.raises(ValueError, match="changed under declare_pyramid"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert "pyramid" not in read_manifest(str(tmp_path))
+
     def test_field_dtype_drift_refuses_and_writes_nothing(self, tmp_path):
         self._pre_declaration_store(tmp_path)
         cfg = _leaf_cfg()
