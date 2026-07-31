@@ -75,7 +75,12 @@ import zarr
 from zarr.abc.store import Store
 
 from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC
-from zagg.readers._layout import rank_to_rowcol, rowcol_to_rank
+from zagg.readers._layout import (
+    normalize_subtree,
+    rank_to_rowcol,
+    rowcol_to_rank,
+    subtree_cell_span,
+)
 from zagg.stats.tdigest import cdf_from_tdigest, quantile_from_tdigest
 
 __all__ = [
@@ -319,7 +324,7 @@ def _stored_chunk_spans(arr) -> list[tuple[int, int]]:
     return [(o * span, min((o + 1) * span, int(arr.shape[0]))) for o in ordinals]
 
 
-def _iter_populated_chunks(arr) -> Iterator[tuple[int, list]]:
+def _iter_populated_chunks(arr, span: tuple[int, int] | None = None) -> Iterator[tuple[int, list]]:
     """Yield ``(chunk_start, [(cell_pos, raw_bytes), ...])`` per populated chunk.
 
     Restricted to the stored objects (:func:`_stored_chunk_spans`), each read
@@ -337,15 +342,52 @@ def _iter_populated_chunks(arr) -> Iterator[tuple[int, list]]:
     the same index the writer placed it at, and the index the readers
     deinterleave to a tensor position (``rank_to_rowcol``, issue #336); it is
     never a row-major position (nested order is a Z-order curve).
+
+    ``span`` (issue #351) restricts the sweep to the stored objects
+    overlapping the ``[start, stop)`` cell span, clipped to whole read
+    chunks — the spec §1.5 contiguous-slice read plan: only the covering
+    portion of each overlapping object is sliced (on a sharded store the
+    index suffix plus the covering inner chunks; on the flat layout the
+    covering chunk objects), and non-overlapping stored objects are skipped
+    without a fetch. A finer-than-chunk restriction is the caller's rank
+    filter — this generator always yields whole read chunks.
     """
     cells_per_chunk = int(arr.chunks[0])
     for span_start, span_stop in _stored_chunk_spans(arr):
-        span = arr[span_start:span_stop]
+        if span is not None:
+            span_start = max(span_start, span[0] - span[0] % cells_per_chunk)
+            span_stop = min(span_stop, span[1] + -span[1] % cells_per_chunk)
+            if span_start >= span_stop:
+                continue
+        data = arr[span_start:span_stop]
         for offset in range(0, span_stop - span_start, cells_per_chunk):
-            block = span[offset : offset + cells_per_chunk]
+            block = data[offset : offset + cells_per_chunk]
             populated = [(pos, block[pos]) for pos in range(len(block)) if len(block[pos])]
             if populated:
                 yield span_start + offset, populated
+
+
+def _subtree_span(arr, morton, field, subtree) -> tuple[int, int] | None:
+    """Resolve the readers' ``subtree=`` to its cell span on this axis.
+
+    ``None`` = no restriction (no ``subtree`` given); ``(0, 0)`` = visit
+    nothing (a disjoint word — :func:`~zagg.readers._layout.subtree_cell_span`
+    already warned — or an empty store, which has nothing below any word).
+    The anchor is the first stored span's first read chunk of the ``morton``
+    coordinate — one small slice, no payload bytes (the dense coordinate
+    write covers every chunk of a stored span). A malformed ``subtree``
+    raises even on an empty store.
+    """
+    if subtree is None:
+        return None
+    spans = _stored_chunk_spans(arr)
+    if not spans:
+        normalize_subtree(subtree)  # malformed still raises; nothing to visit
+        return 0, 0
+    words = morton[spans[0][0] : spans[0][0] + int(arr.chunks[0])]
+    cell_order = _cells_order(words, field, spans[0][0])
+    anchor = int(words[words != 0][0])
+    return subtree_cell_span(subtree, anchor, cell_order, int(arr.shape[0]), field)
 
 
 def _open_morton(store: Store, field: str, zarr_format):
@@ -775,6 +817,7 @@ def read_raw_values(
     store: Store,
     field: str,
     *,
+    subtree: int | str | None = None,
     zarr_format: Literal[2, 3] = 3,
 ) -> Iterator[tuple[int, tuple[int, int], np.ndarray]]:
     """Yield ``(morton_index, (row, col), values)`` raw samples per populated cell.
@@ -791,6 +834,18 @@ def read_raw_values(
         Zarr store holding the ragged vlen array (issue #209 layout).
     field : str
         Array path.
+    subtree : int or str, optional
+        Restrict the sweep to the cells below this morton ancestor — a
+        packed area word (``int``) or its decimal string (``str``), at ANY
+        order down to a single cell (issue #351; the spec §1.5 subtree-span
+        identity). Only stored objects overlapping the subtree's contiguous
+        cell span are fetched; a finer-than-chunk subtree filters ranks
+        inside its one covering read chunk. A well-formed word disjoint
+        from this axis warns once per call (naming the word and the axis
+        root) and yields nothing — so an **empty yield is ambiguous**
+        between "in-domain, nothing stored" and "outside the domain"; the
+        warning is the only discriminator. A malformed word, or one deeper
+        than the cells-axis order, raises :class:`ValueError`.
     zarr_format : int, optional
         Zarr format version (default 3).
 
@@ -809,17 +864,21 @@ def read_raw_values(
     Raises
     ------
     ValueError
-        If any cell's digest carries a merged centroid (weight > 1), so the raw
-        values cannot be recovered without loss.
+        If any swept cell's digest carries a merged centroid (weight > 1), so
+        the raw values cannot be recovered without loss; or on a malformed /
+        too-deep ``subtree``.
     """
     arr, elem_dtype, elem_shape, _meta = _open_ragged(store, field, zarr_format)
     morton = _open_morton(store, field, zarr_format)
     side, depth = _tensor_side(arr, field)
     cells_per_chunk = side * side
 
-    for start, populated in _iter_populated_chunks(arr):
+    span = _subtree_span(arr, morton, field, subtree)
+    for start, populated in _iter_populated_chunks(arr, span):
         word = _chunk_word(morton[start : start + cells_per_chunk], field, start)
         for rank, raw in populated:
+            if span is not None and not span[0] <= start + rank < span[1]:
+                continue
             digest = _decode_cell(raw, elem_dtype, elem_shape)
             weights = np.asarray(digest[:, 1], dtype=np.float64)
             if np.any(weights > 1.0):
@@ -835,6 +894,7 @@ def read_locations(
     store: Store,
     field: str,
     *,
+    subtree: int | str | None = None,
     zarr_format: Literal[2, 3] = 3,
 ) -> Iterator[tuple[int, tuple[int, int], np.ndarray]]:
     """Yield ``(morton_index, (row, col), locations)`` per populated cell.
@@ -856,6 +916,14 @@ def read_locations(
         Zarr store holding the ragged vlen arrays (issue #209 layout).
     field : str
         The PAYLOAD array's path (not the sibling's).
+    subtree : int or str, optional
+        Restrict the sweep to the cells below this morton ancestor, at any
+        order down to a single cell — packed area word or decimal string,
+        exactly as in :func:`read_raw_values` (issue #351). Same caveat: a
+        well-formed word disjoint from this axis warns once and yields
+        nothing, so an **empty yield is ambiguous** between "in-domain,
+        nothing stored" and "outside the domain" — the warning is the only
+        discriminator; malformed / too-deep words raise :class:`ValueError`.
     zarr_format : int, optional
         Zarr format version (default 3).
 
@@ -872,7 +940,7 @@ def read_locations(
     ------
     ValueError
         If the field declares no locations channel (it was not written as a
-        located ragged field).
+        located ragged field), or on a malformed / too-deep ``subtree``.
     """
     _arr, _dt, _sh, meta = _open_ragged(store, field, zarr_format)
     sibling = meta.get("locations")
@@ -891,9 +959,12 @@ def read_locations(
     side, depth = _tensor_side(loc_arr, loc_field)
     cells_per_chunk = side * side
 
-    for start, populated in _iter_populated_chunks(loc_arr):
+    span = _subtree_span(loc_arr, morton, loc_field, subtree)
+    for start, populated in _iter_populated_chunks(loc_arr, span):
         word = _chunk_word(morton[start : start + cells_per_chunk], loc_field, start)
         for rank, raw in populated:
+            if span is not None and not span[0] <= start + rank < span[1]:
+                continue
             row, col = rank_to_rowcol(rank, depth)
             yield word, (int(row), int(col)), _decode_cell(raw, loc_dtype, loc_shape)
 

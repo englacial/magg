@@ -21,6 +21,7 @@ from zagg.grids import HealpixGrid
 from zagg.grids.morton import morton_word
 from zagg.processing import write_ragged_to_zarr, write_shard_to_zarr
 from zagg.readers.tdigest_tensor import (
+    cell_index,
     chunk_z_range,
     rasterize_cell,
     read_cell,
@@ -144,6 +145,33 @@ def _sharded_store(store, *, populate, values=None):
         targets[local] = base + 11
     write_shard_to_zarr(chunk_results, store, grid=grid, shard_key=shard6)
     return grid, shard6, targets
+
+
+def _leaf_store(digest_ranks, *, located=False, seed=35):
+    """A hive-leaf store (issue #199): the vlen layout scoped to ONE shard —
+    ``_KEY_A``'s 4096-cell single-root axis (order-6 shard, order-12 cells,
+    K==1). Returns ``(store, shard_word, {rank: values})``; 5 values per cell,
+    so digests stay unmerged (losslessly recoverable)."""
+    from zagg.processing import write_ragged_leaf_to_zarr
+
+    rng = np.random.default_rng(seed)
+    grid = HealpixGrid(6, 12, layout="fullsphere", config=_cfg(located), sharded=False)
+    word = morton_word(_KEY_A)
+    store = MemoryStore()
+    grid.emit_shard_template(store)
+    children = np.asarray(grid.children(word), dtype=np.uint64)
+    zarr.open_array(store, path="12/morton", mode="r+")[:] = children
+    ranks = sorted(digest_ranks)
+    vals = {r: rng.uniform(10.0, 30.0, 5) for r in ranks}
+    if located:
+        from conftest import point_words
+
+        pairs = [build_tdigest(vals[r], delta=512, locations=point_words(5, r + 1)) for r in ranks]
+        ragged = {"h_tdigest": ([p[0] for p in pairs], ranks, [p[1] for p in pairs])}
+    else:
+        ragged = {"h_tdigest": ([build_tdigest(vals[r], delta=512) for r in ranks], ranks)}
+    write_ragged_leaf_to_zarr([((0,), ragged)], store, grid=grid)
+    return store, word, vals
 
 
 class TestRasterizeCell:
@@ -559,6 +587,202 @@ class TestReadLocations:
         store, _g, _w = _build_store({_KEY_A: {0: np.array([1.0, 2.0])}})
         with pytest.raises(ValueError, match="declares no locations channel"):
             list(read_locations(store, "12/h_tdigest"))
+
+
+class TestSubtreePerCellReaders:
+    """Issue #351 phase 1: ``subtree=`` on the per-cell sweep readers.
+
+    Golden contract (the ratified acceptance criterion): ``reader(...,
+    subtree=w)`` equals the whole-store sweep filtered to the cells that are
+    descendants of ``w``. The filter here is INDEPENDENT of the reader's span
+    arithmetic — each yielded cell's word is resolved through ``cell_index``
+    plus the stored ``morton`` coordinate, then coarsened with
+    ``mortie.clip2order`` — so the two paths cannot share a bug.
+    """
+
+    @staticmethod
+    def _filtered(store, field, out, subtree_key):
+        """Whole-sweep entries whose CELL word descends from ``subtree_key``."""
+        from mortie import clip2order
+
+        from zagg.grids.morton import morton_decimal
+
+        word = morton_word(subtree_key) if isinstance(subtree_key, str) else int(subtree_key)
+        decimal = morton_decimal(word)
+        order = len(decimal) - (2 if decimal.startswith("-") else 1)
+        morton = zarr.open_array(store, path="12/morton", mode="r")
+        kept = []
+        for m, (row, col), payload in out:
+            cell = int(morton[cell_index(store, field, m, row, col)])
+            if int(clip2order(order, np.asarray([cell], dtype=np.uint64))[0]) == word:
+                kept.append((m, (row, col), payload))
+        return kept
+
+    @staticmethod
+    def _assert_same(got, expected):
+        assert [(m, rc) for m, rc, _v in got] == [(m, rc) for m, rc, _v in expected]
+        for (_m, _rc, g), (_m2, _rc2, e) in zip(got, expected):
+            np.testing.assert_array_equal(g, e)
+
+    @staticmethod
+    def _flat():
+        """Two populated shards on the flat fullsphere store; every digest
+        unmerged so ``read_raw_values`` is lossless."""
+        vals = {
+            _KEY_A: {0: [3.0, 1.0], 5: [2.0], 100: [7.0, 4.0], 4095: [9.0]},
+            _KEY_B: {7: [5.0, 6.0], 63: [8.0]},
+        }
+        store, _grid, words = _build_store(
+            {k: {c: np.asarray(v) for c, v in cells.items()} for k, cells in vals.items()}
+        )
+        return store, words
+
+    @pytest.mark.parametrize("key", [_KEY_A, _KEY_B])
+    def test_flat_store_equals_filtered_sweep_both_currencies(self, key):
+        store, words = self._flat()
+        sweep = list(read_raw_values(store, "12/h_tdigest"))
+        expected = self._filtered(store, "12/h_tdigest", sweep, key)
+        assert len(expected) > 0
+        # Ratified fork (1): packed area word (int) and decimal string (str)
+        # are the same currency — both normalize to the packed word.
+        self._assert_same(
+            list(read_raw_values(store, "12/h_tdigest", subtree=words[key])), expected
+        )
+        self._assert_same(list(read_raw_values(store, "12/h_tdigest", subtree=key)), expected)
+
+    def test_sub_chunk_subtree_filters_ranks_inside_the_covering_chunk(self):
+        from mortie import generate_morton_children
+
+        store, words = self._flat()
+        sweep = list(read_raw_values(store, "12/h_tdigest"))
+        # The order-9 first child of shard A covers chunk-local ranks [0, 64):
+        # fixture cells 0 and 5, but not 100 or 4095. Ranks 0 and 5
+        # deinterleave to (0, 0) and (0, 3) (issue #336).
+        sub = int(np.asarray(generate_morton_children(words[_KEY_A], 9))[0])
+        got = list(read_raw_values(store, "12/h_tdigest", subtree=sub))
+        self._assert_same(got, self._filtered(store, "12/h_tdigest", sweep, sub))
+        assert [rc for _m, rc, _v in got] == [(0, 0), (0, 3)]
+
+    def test_single_cell_subtree(self):
+        from mortie import generate_morton_children
+
+        store, words = self._flat()
+        sweep = list(read_raw_values(store, "12/h_tdigest"))
+        # An order-12 subtree IS one cell: rank 100 of shard A.
+        cell_word = int(np.asarray(generate_morton_children(words[_KEY_A], 12))[100])
+        got = list(read_raw_values(store, "12/h_tdigest", subtree=cell_word))
+        assert len(got) == 1
+        self._assert_same(got, self._filtered(store, "12/h_tdigest", sweep, cell_word))
+
+    def test_sharded_store_equals_filtered_sweep(self):
+        from mortie import generate_morton_children
+
+        store = MemoryStore()
+        _grid_, shard6, _targets = _sharded_store(store, populate={0, 3, 7, 12})
+        sweep = list(read_raw_values(store, "12/h_tdigest"))
+        # The order-7 first child of the shard covers inner chunks 0..3, of
+        # which locals 0 and 3 are populated.
+        sub = int(np.asarray(generate_morton_children(shard6, 7))[0])
+        got = list(read_raw_values(store, "12/h_tdigest", subtree=sub))
+        self._assert_same(got, self._filtered(store, "12/h_tdigest", sweep, sub))
+        assert len(got) == 2
+
+    def test_leaf_store_subtree_equals_filtered_sweep(self):
+        from mortie import generate_morton_children
+
+        store, word, _vals = _leaf_store([0, 5, 100, 4095])
+        sweep = list(read_raw_values(store, "12/h_tdigest"))
+        sub = int(np.asarray(generate_morton_children(word, 9))[0])
+        got = list(read_raw_values(store, "12/h_tdigest", subtree=sub))
+        self._assert_same(got, self._filtered(store, "12/h_tdigest", sweep, sub))
+        assert len(got) == 2
+
+    def test_out_of_domain_word_warns_once_then_yields_nothing(self):
+        import warnings
+
+        store, _word, _vals = _leaf_store([0, 5])
+        # Shard B is disjoint from this leaf's single-root axis: the ratified
+        # fork (3) — ONE warning per reader call naming the word and the axis
+        # root, then an empty yield. The warning is the only discriminator vs
+        # "in-domain, nothing stored" (the docstring ambiguity).
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            out = list(read_raw_values(store, "12/h_tdigest", subtree=morton_word(_KEY_B)))
+        assert out == []
+        msgs = [str(w.message) for w in rec if "outside this axis" in str(w.message)]
+        assert msgs == [
+            f"subtree {_KEY_B} is outside this axis' order-6 root {_KEY_A} — yielding nothing"
+        ]
+
+    def test_ancestor_of_the_axis_root_clips_to_the_whole_axis(self):
+        from mortie import clip2order
+
+        store, word, _vals = _leaf_store([0, 4095])
+        # A word ABOVE the leaf's root: every stored cell is its descendant,
+        # so the subtree read equals the unrestricted sweep (the golden filter
+        # keeps everything) — no warning, not an empty yield.
+        parent = int(clip2order(3, np.asarray([word], dtype=np.uint64))[0])
+        got = list(read_raw_values(store, "12/h_tdigest", subtree=parent))
+        self._assert_same(got, list(read_raw_values(store, "12/h_tdigest")))
+        assert len(got) == 2
+
+    def test_in_domain_empty_subtree_yields_nothing_silently(self):
+        import warnings
+
+        from mortie import generate_morton_children
+
+        store, words = self._flat()
+        # Both in-domain on the fullsphere axis, both empty: an unpopulated
+        # corner INSIDE stored shard A (ranks [128, 192)), and a whole shard
+        # with no stored object at all.
+        empty_sub = int(np.asarray(generate_morton_children(words[_KEY_A], 9))[2])
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            assert list(read_raw_values(store, "12/h_tdigest", subtree=empty_sub)) == []
+            assert list(read_raw_values(store, "12/h_tdigest", subtree="3333333")) == []
+        assert [w for w in rec if "outside this axis" in str(w.message)] == []
+
+    @pytest.mark.parametrize("bad", ["", "abc", "913", 3, -5])
+    def test_malformed_subtree_raises(self, bad):
+        store, _words = self._flat()
+        with pytest.raises(ValueError):
+            list(read_raw_values(store, "12/h_tdigest", subtree=bad))
+
+    def test_deeper_than_the_cells_axis_raises(self):
+        store, _words = self._flat()
+        with pytest.raises(ValueError, match="deeper than"):
+            list(read_raw_values(store, "12/h_tdigest", subtree=_KEY_A + "1111111"))
+
+    def test_empty_store_yields_nothing_but_malformed_still_raises(self):
+        store = MemoryStore()
+        _grid().emit_template(store)
+        assert list(read_raw_values(store, "12/h_tdigest", subtree=_KEY_A)) == []
+        with pytest.raises(ValueError):
+            list(read_raw_values(store, "12/h_tdigest", subtree="abc"))
+
+    def test_subtree_none_is_the_default_sweep(self):
+        store, _words = self._flat()
+        self._assert_same(
+            list(read_raw_values(store, "12/h_tdigest", subtree=None)),
+            list(read_raw_values(store, "12/h_tdigest")),
+        )
+
+    def test_read_locations_subtree_equals_filtered_sweep(self):
+        from mortie import generate_morton_children
+
+        store, word, _vals = _leaf_store([3, 9, 300], located=True)
+        sweep = list(read_locations(store, "12/h_tdigest"))
+        # Order-9 first child: ranks [0, 64) — cells 3 and 9, not 300.
+        sub = int(np.asarray(generate_morton_children(word, 9))[0])
+        got = list(read_locations(store, "12/h_tdigest", subtree=sub))
+        self._assert_same(got, self._filtered(store, "12/h_tdigest", sweep, sub))
+        assert len(got) == 2
+
+    def test_read_locations_out_of_domain_warns_and_is_empty(self):
+        store, _word, _vals = _leaf_store([0, 7], located=True)
+        with pytest.warns(UserWarning, match="outside this axis' order-6 root"):
+            out = list(read_locations(store, "12/h_tdigest", subtree=morton_word(_KEY_B)))
+        assert out == []
 
 
 class TestReadCell:
