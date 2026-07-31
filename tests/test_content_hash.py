@@ -9,6 +9,7 @@ The recipe is not zagg's to adjust: a parity failure here is a spec/fixture
 finding to raise on issue #342, never something to patch around.
 """
 
+import importlib.util
 import json
 from pathlib import Path
 
@@ -102,6 +103,107 @@ class TestVlenRecipe:
         # The "anything else → raise" gate: never hash a repr/pointer buffer.
         with pytest.raises(ValueError, match="no O11 byte recipe"):
             hash_array(self._obj([3.5]))
+
+
+GENERATOR = Path(__file__).parent.parent / "tools" / "generate_spec_fixtures.py"
+
+
+def _generator():
+    """The spec fixture generator, loaded as a module (the tools/ precedent)."""
+    spec = importlib.util.spec_from_file_location("zagg_spec_fixture_generator", GENERATOR)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _write_kitchen_sink(root: Path):
+    """One kitchen-sink leaf through the PRODUCTION write path (generator inputs).
+
+    Returns ``(metadata, leaf_dir)`` — the worker metadata now carries the
+    staged-source ``content_hashes`` (issue #342 phase 2).
+    """
+    import zagg.processing as processing
+    from zagg import hive
+    from zagg.grids import HealpixGrid
+    from zagg.grids.morton import morton_word
+
+    gen = _generator()
+    cfg = gen._config(kitchen_sink=True)
+    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    shard = morton_word(gen.SHARD_KEY)
+    by_chunk, _cells = gen._build_cells(grid, shard, kitchen_sink=True)
+    hive.ensure_manifest(
+        str(root), hive.build_manifest(grid, dataset={"short_name": "O11_TEST", "version": "1"})
+    )
+    inner = gen._fake_process_shard(grid, by_chunk, kitchen_sink=True)
+
+    def fake(*args, **kwargs):
+        # The generator's fake seeds no phase_timings; the hash timing rides
+        # an existing dict only (the write-stamp gate), so seed one here.
+        df, meta = inner(*args, **kwargs)
+        meta["phase_timings"] = {"read": 0.0, "index": 0.0, "aggregate": 0.0}
+        return df, meta
+
+    original = processing.process_shard
+    processing.process_shard = fake
+    try:
+        meta = hive.process_and_write_hive(
+            shard, ["s3://fixture/a.h5"], grid, {}, str(root), cfg, store_kwargs={}
+        )
+    finally:
+        processing.process_shard = original
+    assert meta.get("error") is None, meta
+    leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
+    return meta, root / leaf_rel
+
+
+@pytest.fixture(scope="module")
+def kitchen_leaf(tmp_path_factory):
+    root = tmp_path_factory.mktemp("o11_store")
+    return _write_kitchen_sink(root)
+
+
+class TestWorkerWiring:
+    """Issue #342 phase 2: staged in-worker hashing on the hive leaf write."""
+
+    def test_metadata_carries_structured_record(self, kitchen_leaf):
+        meta, _leaf = kitchen_leaf
+        record = meta["content_hashes"]
+        assert set(record) == {"arrays", "combined"}
+        assert record["combined"] == combined_hash(record["arrays"])
+        assert list(record["arrays"]) == sorted(record["arrays"])
+
+    def test_write_read_parity(self, kitchen_leaf):
+        # THE acceptance gate for the ratified staged-source decision (4):
+        # hashes computed from the staged arrays must equal hashes recomputed
+        # from a full store read-back — the dtype-cast/fill drift guard.
+        meta, leaf = kitchen_leaf
+        group = zarr.open_group(LocalStore(str(leaf)), mode="r", zarr_format=3)
+        read_back = hash_arrays(group)
+        assert meta["content_hashes"]["arrays"] == read_back
+        assert meta["content_hashes"]["combined"] == combined_hash(read_back)
+
+    def test_matches_pinned_fixture_hashes(self, kitchen_leaf):
+        # Same seeded inputs as the committed kitchen_sink fixture, so the
+        # worker-recorded hashes must reproduce the PINNED values exactly.
+        meta, _leaf = kitchen_leaf
+        assert meta["content_hashes"] == _expected("kitchen_sink")["content_hashes"]
+
+    def test_hash_phase_timing_recorded(self, kitchen_leaf):
+        meta, _leaf = kitchen_leaf
+        assert meta["phase_timings"]["hash"] >= 0.0
+
+    def test_staged_values_take_priority_over_the_store(self, kitchen_leaf):
+        # Proof the staged mapping is the hash source when present: a doctored
+        # staged value flips exactly that key, everything else read-back.
+        _meta, leaf = kitchen_leaf
+        group = zarr.open_group(LocalStore(str(leaf)), mode="r", zarr_format=3)
+        honest = hash_arrays(group)
+        doctored = hash_arrays(group, staged={"6/count": np.zeros(16, dtype=np.int32)})
+        assert doctored["6/count"] != honest["6/count"]
+        assert {k: v for k, v in doctored.items() if k != "6/count"} == {
+            k: v for k, v in honest.items() if k != "6/count"
+        }
 
 
 class TestDenseRecipe:

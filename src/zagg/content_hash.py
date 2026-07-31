@@ -80,7 +80,7 @@ def hash_array(values: np.ndarray) -> str:
     return hashlib.sha256(values.tobytes()).hexdigest()
 
 
-def hash_arrays(group: Any) -> dict[str, str]:
+def hash_arrays(group: Any, *, staged: Mapping[str, np.ndarray] | None = None) -> dict[str, str]:
     """O11 per-array hashes of every named zarr array beneath ``group``.
 
     ``group`` is an open zarr v3 group at the leaf ROOT; the scope is
@@ -88,14 +88,25 @@ def hash_arrays(group: Any) -> dict[str, str]:
     whatever named arrays exist beneath the root — data fields, ragged vlen
     payloads and their locations siblings, ``morton``, every coordinate —
     keyed by the array's path relative to the leaf root (e.g. ``"8/morton"``).
+
+    ``staged`` maps array keys to the IN-MEMORY values the writer just wrote
+    (the ratified issue #342 hash source: the leaf write path already holds
+    each array's full slab, so hashing is a memory-bandwidth pass, no data
+    GETs). A staged value is hashed in place of a store read-back; enumerated
+    arrays with no staged value (e.g. ``resolution: chunk`` companions, which
+    are written per chunk-block rather than as one slab) fall back to reading
+    that array back. The two sources are pinned equal by the write-read
+    parity test in ``tests/test_content_hash.py`` — the CI guard for the
+    dtype-cast/fill drift class §5 exists to catch.
     """
     import zarr
 
+    staged = staged or {}
     hashes: dict[str, str] = {}
     for key, node in group.members(max_depth=None):
         if not isinstance(node, zarr.Array):
             continue
-        hashes[key] = hash_array(node[...])
+        hashes[key] = hash_array(staged[key] if key in staged else node[...])
     return hashes
 
 
