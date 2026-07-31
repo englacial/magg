@@ -1213,6 +1213,29 @@ class TestDeclarePyramid:
         with pytest.raises(ValueError, match="not a hive store root"):
             declare_pyramid(str(tmp_path), _leaf_cfg())
 
+    @pytest.mark.parametrize("drop", ["shard_order", "cell_order"])
+    def test_malformed_manifest_raises_pointedly(self, tmp_path, drop):
+        # A JSON blob that parses but is not a hive manifest gets the pointed
+        # refusal, not a KeyError — and cell_order refuses up front rather than
+        # after the whole leaf-discovery cost.
+        self._pre_declaration_store(tmp_path)
+        manifest = read_manifest(str(tmp_path))
+        del manifest[drop]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        with pytest.raises(ValueError, match="declares no shard_order/cell_order"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+
+    def test_non_dict_prior_pyramid_is_replaced(self, tmp_path):
+        # A hand-edited ``"pyramid": "off"`` is not this module's grammar: it
+        # carries no actuals to preserve and is replaced, never AttributeErrors.
+        self._pre_declaration_store(tmp_path)
+        manifest = read_manifest(str(tmp_path))
+        manifest["pyramid"] = "off"
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        summary = declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert summary["previous"] == "replaced" and summary["updated"] is True
+        assert read_manifest(str(tmp_path))["pyramid"]["overview"]["orders"] == [0]
+
     def test_no_committed_leaf_still_declarable(self, tmp_path, caplog):
         _write_manifest(tmp_path)
         manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())

@@ -343,6 +343,16 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
             f"no {MANIFEST_NAME} at {store_root} — not a hive store root; "
             f"declare_pyramid retrofits existing hive stores only"
         )
+    # Both order keys up front: ``cell_order`` is only consumed by the leaf probe,
+    # and a manifest that parses without it should refuse HERE rather than
+    # KeyError after the whole discovery cost has been paid.
+    if not isinstance(manifest, dict) or any(
+        manifest.get(k) is None for k in ("shard_order", "cell_order")
+    ):
+        raise ValueError(
+            f"the {MANIFEST_NAME} at {store_root} declares no shard_order/cell_order — "
+            f"not a hive store manifest; declare_pyramid retrofits existing hive stores only"
+        )
     shard_order = int(manifest["shard_order"])
     block = build_pyramid_block(config, shard_order)
     # Compare (and write) canonical JSON: ``prior`` came back through
@@ -374,7 +384,11 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
             f"written; re-run against the settled store"
         )
     prior = fresh.get("pyramid")
-    materialized = ((prior or {}).get("overview") or {}).get("materialized")
+    # A non-dict prior (hand-edited ``"pyramid": "off"``) is not an error: it is
+    # not this module's grammar, so it carries no actuals to preserve and is
+    # simply replaced — but it must not AttributeError on the way there.
+    prior_overview = prior.get("overview") if isinstance(prior, dict) else None
+    materialized = prior_overview.get("materialized") if isinstance(prior_overview, dict) else None
     if materialized is not None:
         block["overview"]["materialized"] = materialized
     summary = {
