@@ -499,6 +499,43 @@ def test_hive_node_stats_sidecars_classified(monkeypatch):
     assert measured["other_keys"] == []
 
 
+def test_hive_stray_stats_json_stays_a_loud_other(monkeypatch):
+    # The D23 overview-sidecar branch is ANCHORED to nodes that actually hold
+    # an overview zarr (``_overview_node``), not to the ``.stats.json`` suffix
+    # alone: a sidecar at the store ROOT, under an arbitrary deep prefix, or at
+    # an UNDISPATCHED leaf's node is not an overview sidecar and must stay a
+    # loud ``other`` — ``objects_other`` is the "the model knows every object
+    # the run writes" contract. A dispatched leaf's sidecar still attributes to
+    # its shard (leaf-prefix membership runs first, issue #215).
+    from zagg import hive
+
+    grid = from_config(_cfg())
+    word = int(morton_word(_KEY_A))
+    label = grid.shard_label(word)
+    leaf = hive.shard_leaf_path("", word).lstrip("/")
+    node = leaf.rsplit("/", 1)[0]  # the dispatched leaf's node dir
+    base = node.split("/", 1)[0]  # an ancestor node (overviews fold here)
+    stray = hive.shard_leaf_path("", int(morton_word(_KEY_B))).lstrip("/").rsplit("/", 1)[0]
+    strays = ["all.stats.json", "random/deep/path/x.stats.json", f"{stray}/2019.stats.json"]
+    keys = [
+        hive.MANIFEST_NAME,
+        f"{leaf}/count/c/0",  # in-leaf data -> this shard
+        f"{node}/2019.stats.json",  # dispatched leaf's D23 sidecar -> this shard
+        f"{base}/all.zarr/zarr.json",  # a real overview zarr -> overviews
+        f"{base}/all.stats.json",  # its sidecar, anchored to that node
+        *strays,
+    ]
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: keys)
+    measured = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[word], store_layout="hive"
+    )
+    assert measured["objects_overviews"] == 2  # the overview zarr + its sidecar
+    assert measured["objects_per_shard"] == {label: 2}
+    assert measured["objects_metadata"] == 1
+    assert measured["objects_other"] == 3
+    assert sorted(measured["other_keys"]) == sorted(strays)
+
+
 def test_status_prefix_objects_excluded_everywhere(monkeypatch):
     # Issue #327 (ratified amendment): the per-run status channel — per-shard
     # status objects, the dispatch manifest, the issue #151 result envelopes —

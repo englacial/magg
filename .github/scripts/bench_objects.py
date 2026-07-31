@@ -60,6 +60,26 @@ import re
 _MORTON_ID_RE = re.compile(r"-?[1-6][1-4]*")
 
 
+def _overview_node(key: str) -> str | None:
+    """The node dir holding ``key``'s sweep overview zarr, or ``None``.
+
+    A key belongs to an overview (issue #201) when its FIRST ``.zarr`` segment
+    has a stem that does not parse as a morton id — window labels carry 0/5-9
+    digits or letters and ``all`` is the reserved token, so ``{window}.zarr`` /
+    ``all.zarr`` can never collide with a source leaf's ``{id}[_{window}].zarr``
+    (see :data:`_MORTON_ID_RE`). Taking the FIRST segment keeps the hive walk's
+    leaf-membership-first ordering: anything nested under a real leaf's zarr is
+    that shard's object, never an overview.
+    """
+    parts = key.split("/")
+    for i, part in enumerate(parts):
+        if not part.endswith(".zarr"):
+            continue
+        stem = part.removesuffix(".zarr").split("_", 1)[0]
+        return None if _MORTON_ID_RE.fullmatch(stem) else "/".join(parts[:i])
+    return None
+
+
 def _require_fullsphere(grid) -> None:
     """Fence the flat model/attribution to its assumption (review, PR #242).
 
@@ -345,6 +365,15 @@ def store_object_counts(
         stats_of = {
             prefix.rstrip("/").rsplit("/", 1)[0] + "/": label for prefix, label in leaf_of.items()
         }
+        # Pre-pass: the nodes that actually hold a sweep overview zarr. These
+        # are the ONLY places a D23 ``{window}.stats.json`` overview sidecar
+        # can legitimately sit (PR #356 writes one beside each overview leaf,
+        # at the ancestor node the pyramid folds to), so they anchor the
+        # sidecar branch below instead of it matching on the suffix alone —
+        # a ``.stats.json`` at the store root, at an arbitrary deep path, or
+        # at an UNDISPATCHED leaf's node stays a loud ``other``, which is the
+        # "the model knows every object the run writes" contract.
+        overview_nodes = {n for n in map(_overview_node, keys) if n is not None}
         for key in keys:
             if _is_root_telemetry(key):
                 telemetry += 1
@@ -384,10 +413,7 @@ def store_object_counts(
                 # excluded from the audited write-path total) while a stray
                 # id-named `.zarr` outside the dispatched leaf set stays a
                 # loud ``other`` finding.
-                seg = next((p for p in key.split("/") if p.endswith(".zarr")), None)
-                if seg is not None and not _MORTON_ID_RE.fullmatch(
-                    seg.removesuffix(".zarr").split("_", 1)[0]
-                ):
+                if _overview_node(key) is not None:
                     overviews += 1
                     continue
                 node, _, name = key.rpartition("/")
@@ -405,16 +431,18 @@ def store_object_counts(
                 )
                 if is_sibling and node + "/" in stats_of:
                     per_shard[stats_of[node + "/"]] = per_shard.get(stats_of[node + "/"], 0) + 1
-                elif name.endswith(".stats.json"):
-                    # A D23-named stats sidecar at a NON-leaf node is the
-                    # sidecar of an overview zarr (PR #356 writes one per
-                    # overview leaf, at the ANCESTOR node the pyramid folds
-                    # to), so it rides the same second-pass D9 bucket as the
-                    # overview it describes. Reached only after the
+                elif name.endswith(".stats.json") and node in overview_nodes:
+                    # A D23-named stats sidecar at a node that HOLDS an
+                    # overview zarr is that overview's sidecar (PR #356 writes
+                    # one per overview leaf, at the ANCESTOR node the pyramid
+                    # folds to), so it rides the same second-pass D9 bucket as
+                    # the overview it describes. Reached only after the
                     # leaf-prefix-membership check above has failed AND the
                     # node is not a dispatched leaf's, so it can neither
                     # swallow a misplaced in-leaf object (issue #215 tripwire)
-                    # nor steal a real leaf sidecar's attribution.
+                    # nor steal a real leaf sidecar's attribution; the
+                    # ``overview_nodes`` anchor keeps every OTHER ``.stats.json``
+                    # (store root, stray prefix, undispatched leaf) loud.
                     overviews += 1
                 else:
                     other.append(key)
