@@ -265,13 +265,19 @@ class TestRecordAndTimings:
 
     def test_record_name_is_outside_the_run_parquet_glob(self, tmp_path):
         # discover_leaves scans ``stats_.+\.parquet``; the sweep's own record
-        # must never read as a shard run record.
+        # must never read as a shard run record. The CLI makes this a live
+        # sequence -- main() discovers first and sweeps second, so every pass
+        # discovers over the previous pass's record.
         import re
+
+        from zagg.sweep import discover_leaves
 
         _write_manifest(tmp_path)
         _put_leaf(tmp_path, "-311")
+        _run_record(tmp_path, [_row("-311")])
         summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
-        assert not re.fullmatch(r"stats_.+\.parquet", summary["record"])
+        # The record now sits at the root the NEXT pass discovers from.
+        assert discover_leaves(str(tmp_path)) == [(morton_word("-311"), None)]
         assert re.fullmatch(r"sweep_stats_[0-9]{8}T[0-9]{6}Z\.json", summary["record"])
 
 
