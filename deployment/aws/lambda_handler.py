@@ -1025,14 +1025,25 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Sweep mode: folding rollups at {event.get('store_path')}")
     try:
         store_kwargs = _output_store_kwargs(event)
+        t0 = time.perf_counter()
         if event.get("leaves") is not None:
             leaves = [(int(key), window) for key, window in event["leaves"]]
         else:
             leaves = discover_leaves(event["store_path"], store_kwargs=store_kwargs)
         if not leaves:
+            # Same key set as the swept response: a benchmark driver reading
+            # body["duration_s"] must not KeyError on a no-work invoke (#353).
             return {
                 "statusCode": 200,
-                "body": json.dumps({"ok": True, "mode": "sweep", "n_leaves": 0}),
+                "body": json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "sweep",
+                        "n_leaves": 0,
+                        "duration_s": time.perf_counter() - t0,
+                        "record": None,
+                    }
+                ),
             }
         summary = run_sweep(event["store_path"], leaves, store_kwargs=store_kwargs)
         return {
