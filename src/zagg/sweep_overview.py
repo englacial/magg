@@ -535,11 +535,14 @@ def _field_drift(group, name, meta) -> str | None:
                 f"array carries no ragged element declaration"
             )
         declared_dt = np.dtype(meta.get("dtype") or "float32")
-        if np.dtype(element.get("dtype")) != declared_dt:
-            return (
-                f"field {name!r}: ragged element dtype {element.get('dtype')} "
-                f"!= declared {declared_dt}"
-            )
+        # Explicit, because ``np.dtype(None)`` is float64: an element block that
+        # declares no dtype would otherwise silently VALIDATE a float64
+        # declaration against a store that says nothing.
+        stored_dt = element.get("dtype")
+        if stored_dt is None:
+            return f"field {name!r}: the stored ragged element declaration carries no dtype"
+        if np.dtype(stored_dt) != declared_dt:
+            return f"field {name!r}: ragged element dtype {stored_dt} != declared {declared_dt}"
         stored_inner = [int(s) for s in (element.get("shape") or [-1])[1:]]
         declared_inner = [int(s) for s in meta.get("inner_shape") or [2]]
         if stored_inner != declared_inner:
