@@ -1588,17 +1588,23 @@ class TestRunnerWiring:
         # (issue #299, D19 — rides the manifest write), the root coverage.moc
         # (issue #200 phase 3, default-on for hive), plus the successful
         # shard's node dir carrying its stats sidecar (issue #297; the mocked
-        # worker wrote no leaf, so the node holds only stats.json).
+        # worker wrote no leaf, so the node holds only stats.json), plus the
+        # end-of-run sweep's own run record (issue #353 — the local dispatcher
+        # sweeps in-process, so one lands at the root on every default hive
+        # run; part of the contract, hence enumerated rather than filtered).
         listing = sorted(os.listdir(root))
         node = listing[0]
         parquets = [n for n in listing if n.startswith("stats_") and n.endswith(".parquet")]
         assert len(parquets) == 1  # run-level stats parquet (issue #297 phase 3)
+        records = [n for n in listing if n.startswith("sweep_stats_") and n.endswith(".json")]
+        assert len(records) == 1  # sweep run record (issue #353)
         assert listing == [
             node,
             hive.AGGREGATION_CORE_NAME,
             hive.ROOT_COVERAGE_NAME,
             hive.MANIFEST_NAME,
             parquets[0],
+            records[0],
         ]
         from zagg.telemetry import read_sidecar
 
