@@ -100,8 +100,10 @@ def test_neon_catalog_builds_full_aoi_shardmap(tmp_path):
     run = runs[0]
     assert run["n_shards"] == 4  # the NEON AOI fans to 4 o9 shards
     assert run["apriori_estimate"]["est_cost_usd"] > 0
-    # Dry-run writes no store -> object-count columns stay null (issue #240).
+    # Dry-run writes no store -> object-count columns stay null (issue #240),
+    # including the per-run root-telemetry tally (issue #362).
     assert run["objects_total"] is None and run["objects_mismatch"] is None
+    assert run["objects_telemetry"] is None
 
 
 # --- pure helpers ----------------------------------------------------------

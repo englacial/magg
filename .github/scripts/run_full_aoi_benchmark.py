@@ -49,6 +49,7 @@ Two JSON files. ``--out-json`` is one **run record** per target::
       "worker_max_s", "worker_median_s", "worker_pct_timeout", "max_memory_mb",
       "worker_phase_max": {"read", "index", "aggregate", "write"},  # straggler (max) s/phase (#250/#256)
       "objects_total", "objects_expected", "objects_mismatch",  # store object counts (issue #240), record-only
+      "objects_telemetry",  # per-run root telemetry, netted out of the audited total (issue #362)
       "write_throughput": {                                    # leg-5 acceptance signal
         "invoke_retries_total", "invoke_throttle_shards",
         "s3_slowdown_shards", "cells_timeout"
@@ -565,6 +566,7 @@ def run_target(
             cost_usd=None,
             objects_total=None,
             objects_expected=None,
+            objects_telemetry=None,
             objects_mismatch=None,
             parity_ok=None,
             parity=None,
@@ -655,6 +657,11 @@ def run_target(
     run.update(
         objects_total=objects.get("objects_total"),
         objects_expected=objects.get("objects_expected"),
+        # Per-run root telemetry (issue #362): carried JSON-only, exactly as
+        # bench_metrics.build_record does for the per-merge harness, so the
+        # release row's total is netted the same way instead of dropping the
+        # key on the floor.
+        objects_telemetry=objects.get("objects_telemetry"),
         objects_mismatch=objects.get("objects_mismatch"),
         parity_ok=(parity or {}).get("parity_ok"),
         parity=parity,
