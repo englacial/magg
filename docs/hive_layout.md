@@ -244,12 +244,26 @@ python -m zagg.sweep s3://bucket/store --declare-pyramid config.yaml
 
 (declaration-only: no sweep pass runs in the same invocation). The tool
 derives the block through the same code path template time uses, then
-**validates it against store truth before writing**: every declared field
-must exist in a committed leaf with the declared dtype (dense fields) or
-ragged element declaration (t-digests), so a wrong config cannot install a
-fold recipe the store contradicts — drift refuses loudly, naming the field
-and the mismatch, and nothing is half-written. A store with no committed
-leaf yet is still declarable; the field checks are then skipped, loudly.
+**validates it against store truth before writing**, in two layers:
+
+- **Semantics** — the config's D19 `semantic_hash` must equal the manifest's
+  frozen one, so a config that did not build this store cannot install its
+  fold laws. This is the layer that covers *reducers*: no leaf records which
+  function produced a field, so nothing downstream could catch a config
+  declaring `max` over a store of minima. `output.*` is not in the semantic
+  core, so adding `output.pyramid` to the original config hashes identically.
+  A pre-#299 manifest carries no hash; the comparison is then skipped, loudly.
+- **Typing** — every declared field must exist in a committed leaf with the
+  declared dtype (dense fields), or the declared ragged element dtype and
+  `inner_shape` at a ragged spec revision this zagg understands (t-digests).
+
+Drift in either layer refuses loudly, naming the field and the mismatch, and
+nothing is half-written. What is *not* cross-checked: the config's `dataset`
+identity and its grid `parent_order`/`child_order` against the manifest's
+orders — the declared overview orders are checked only for being ancestor
+orders of the store's own `shard_order`. A store with no committed leaf yet
+is still declarable; the field checks are then skipped, loudly, and the
+summary says which case it was.
 The rewrite is idempotent (an identical declaration is not re-PUT) and
 preserves any `materialized` actuals the sweep has recorded.
 `output.pyramid: false` installs the declared-off block — recording absence
