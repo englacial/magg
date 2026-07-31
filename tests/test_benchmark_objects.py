@@ -463,9 +463,12 @@ def test_hive_node_stats_sidecars_classified(monkeypatch):
     # ``{stem}.stats.json`` sidecar (``telemetry.sidecar_key``, morton-hive/3)
     # at the ANCESTOR node they fold to — an overview object, not an
     # unclassifiable one. A dispatched LEAF node's sidecars keep attributing to
-    # their shard in either grammar, and a sidecar-named object misplaced
-    # INSIDE a leaf prefix still counts as that shard's data object (the
-    # issue #215 tripwire's leaf-membership-first ordering is untouched).
+    # their shard across BOTH stems of BOTH grammars — legacy ``stats.json`` /
+    # ``shardmap.json`` and D23 ``{window}.stats.json`` /
+    # ``{window}.shardmap.json`` (``zagg.sweep.submap_key``) — and a
+    # sidecar-named object misplaced INSIDE a leaf prefix still counts as that
+    # shard's data object (the issue #215 tripwire's leaf-membership-first
+    # ordering is untouched).
     from zagg import hive
 
     grid = from_config(_cfg())
@@ -480,6 +483,7 @@ def test_hive_node_stats_sidecars_classified(monkeypatch):
         f"{node}/stats.json",  # legacy leaf sidecar -> this shard
         f"{node}/shardmap.json",  # leaf sub-map (issue #300) -> this shard
         f"{node}/2019.stats.json",  # D23-named leaf sidecar -> this shard
+        f"{node}/2019.shardmap.json",  # D23-named leaf sub-map -> this shard
         f"{leaf}/2019.stats.json",  # MISPLACED in-leaf sidecar -> this shard
         f"{base}/all.zarr/zarr.json",  # the overview zarr itself
         f"{base}/all.stats.json",  # its D23 sidecar -> overviews
@@ -491,7 +495,7 @@ def test_hive_node_stats_sidecars_classified(monkeypatch):
         "unused", grid=grid, shard_keys=[word], store_layout="hive"
     )
     assert measured["objects_overviews"] == 3  # the zarr + its two sidecars
-    assert measured["objects_per_shard"] == {label: 5}
+    assert measured["objects_per_shard"] == {label: 6}
     assert measured["objects_metadata"] == 1
     assert measured["objects_telemetry"] == 1
     # Everything above is classified: no unrecognized keys anywhere.
