@@ -118,11 +118,13 @@ def _generator():
     return mod
 
 
-def _write_kitchen_sink(root: Path):
+def _write_kitchen_sink(root: Path, *, sharded: bool = True):
     """One kitchen-sink leaf through the PRODUCTION write path (generator inputs).
 
     Returns ``(metadata, leaf_dir)`` — the worker metadata now carries the
-    staged-source ``content_hashes`` (issue #342 phase 2).
+    staged-source ``content_hashes`` (issue #342 phase 2). ``sharded=False``
+    drives the same inputs through the per-chunk STREAMING leaf write (the
+    path a ``chunk_inner``-unset grid always takes).
     """
     import zagg.processing as processing
     from zagg import hive
@@ -131,7 +133,7 @@ def _write_kitchen_sink(root: Path):
 
     gen = _generator()
     cfg = gen._config(kitchen_sink=True)
-    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=sharded)
     shard = morton_word(gen.SHARD_KEY)
     by_chunk, _cells = gen._build_cells(grid, shard, kitchen_sink=True)
     hive.ensure_manifest(
@@ -140,9 +142,18 @@ def _write_kitchen_sink(root: Path):
     inner = gen._fake_process_shard(grid, by_chunk, kitchen_sink=True)
 
     def fake(*args, **kwargs):
+        # The generator's fake only knows the ``chunk_results`` sink; the
+        # streaming path passes ``write_chunk`` instead, so collect the chunks
+        # locally and replay them through the callback.
+        write_chunk = kwargs.get("write_chunk")
+        if kwargs.get("chunk_results") is None:
+            kwargs["chunk_results"] = []
+        df, meta = inner(*args, **kwargs)
+        if write_chunk is not None:
+            for block, carrier, ragged in kwargs["chunk_results"]:
+                write_chunk(block, carrier, ragged)
         # The generator's fake seeds no phase_timings; the hash timing rides
         # an existing dict only (the write-stamp gate), so seed one here.
-        df, meta = inner(*args, **kwargs)
         meta["phase_timings"] = {"read": 0.0, "index": 0.0, "aggregate": 0.0}
         return df, meta
 
@@ -217,6 +228,29 @@ class TestWorkerWiring:
         assert {k: v for k, v in doctored.items() if k != "6/count"} == {
             k: v for k, v in honest.items() if k != "6/count"
         }
+
+
+class TestStreamingLeafStaging:
+    """The UNSHARDED (streaming) hive leaf stages its dense arrays too.
+
+    ``sharded`` is forced off whenever a leaf holds one inner chunk — the
+    ``chunk_inner``-unset default — so this is the common hive config, not a
+    corner. Decision (4) ("staged, no read-back GETs") has to hold on it.
+    """
+
+    def test_unsharded_leaf_reproduces_pinned_hashes_from_staged_values(self, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="zagg.content_hash"):
+            meta, leaf = _write_kitchen_sink(tmp_path / "unsharded", sharded=False)
+        # Decoded-value hashing is packaging-invariant (§5): the same inputs
+        # through the streaming write must reproduce the sharded fixture's
+        # PINNED hashes exactly, despite the different object layout.
+        assert meta["content_hashes"] == _expected("kitchen_sink")["content_hashes"]
+        # ... and still equal a full read-back (the dtype-cast/fill guard).
+        group = zarr.open_group(LocalStore(str(leaf)), mode="r", zarr_format=3)
+        assert meta["content_hashes"]["arrays"] == hash_arrays(group)
+        # Every staged key landed on an enumerated array — the dense arrays
+        # (``morton`` included) came from the staged slabs, not a read-back.
+        assert "staged values for" not in caplog.text
 
 
 class TestCoverageCompleteness:

@@ -1236,8 +1236,11 @@ def process_and_write_hive(
     chunk_results: list | None = [] if sharded else None
 
     # O11 staged-array sink (issue #342): the leaf writers record each
-    # assembled slab here (refs, no copies) so the content hashes below run
-    # over the exact in-memory values written — the ratified hash source.
+    # assembled slab here (refs on the sharded path; the streaming path fills
+    # a leaf-wide slab chunk by chunk) so the content hashes below run over
+    # the exact in-memory values written — the ratified hash source. On the
+    # streaming path this re-adds the same O(dense leaf) term the sharded
+    # path's slab pass already accepts above (~1.3 MB at production geometry).
     staged: dict = {}
 
     # Ragged fields accumulate across the streamed chunks (leaf-LOCAL blocks)
@@ -1263,7 +1266,7 @@ def process_and_write_hive(
         _t0 = time.time()
         store = _leaf()
         local = leaf_block_index(grid, block_index, shard_key)
-        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local, staged_out=staged)
         if ragged:
             ragged_chunks.append((local, ragged))
         _write_elapsed += time.time() - _t0
@@ -1356,9 +1359,14 @@ def process_and_write_hive(
     if not metadata.get("error") and "store" in box:
         # O11 content hashes (issue #342, spec §5): computed in-worker at
         # write, from the STAGED arrays (the ratified source — the write path
-        # already holds every slab, so this is a memory-bandwidth pass; only
-        # per-chunk-block companions fall back to a read-back inside
-        # ``hash_arrays``). Recorded on ``metadata`` for the caller's D20
+        # already holds every slab, so this is a memory-bandwidth pass).
+        # Dense and ragged arrays are staged on BOTH leaf paths: the sharded
+        # one-object-per-array pass and the per-chunk streaming path
+        # (``sharded`` is forced off whenever a leaf holds one inner chunk —
+        # the ``chunk_inner``-unset default). ``resolution: chunk`` companions
+        # are the one read-back fallback inside ``hash_arrays``: they are
+        # written per chunk-block, never as a leaf slab.
+        # Recorded on ``metadata`` for the caller's D20
         # sidecar (``telemetry.build_record``). Hive-only by ratified decision
         # (3): flat layouts have no leaf sidecar to record into, and no flat
         # writer computes hashes — those stores stay verifiable by running

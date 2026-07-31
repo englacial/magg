@@ -133,6 +133,7 @@ def write_dataframe_to_zarr(
     *,
     grid,
     chunk_idx: tuple,
+    staged_out: dict | None = None,
 ) -> Store:
     """Write a per-shard output carrier to an existing Zarr template.
 
@@ -153,6 +154,16 @@ def write_dataframe_to_zarr(
     chunk_idx : tuple of int
         Storage block index for this shard, as returned by
         ``grid.block_index(shard_key)``.
+    staged_out : dict, optional
+        The HIVE leaf writers' staging seam (issue #342). When a dict is
+        passed, each dense per-cell array this call touches is lazily
+        allocated at the array's full shape and this chunk's values are placed
+        at the chunk's region, so the caller's O11 content hashing runs over
+        the staged values with no read-back GETs. ``resolution: chunk``
+        companions are NOT staged (the hasher's read-back fallback covers
+        them). **Flat-path callers must not pass it**: the region math assumes
+        the leaf-local chunk grid (one array per leaf, block ``chunk_idx``
+        indexing that leaf's own arrays), which only holds on the hive layout.
 
     Returns
     -------
@@ -229,6 +240,20 @@ def write_dataframe_to_zarr(
                         f"{trailing} (the payload dim must be one whole chunk)"
                     )
             array.set_block_selection(block_idx, values)
+            if staged_out is not None:
+                # Stage the leaf-wide slab (issue #342): allocate at fill on
+                # first sight of the array — mirroring write_leaf_to_zarr's
+                # slab construction — and place this chunk's values at its own
+                # region. Trailing (vector) dims span the array whole, so the
+                # leading-axis region is the whole placement.
+                key = f"{grid.group_path}/{name}"
+                if key not in staged_out:
+                    staged_out[key] = np.full(
+                        array.shape, array.metadata.fill_value, dtype=values.dtype
+                    )
+                staged_out[key][
+                    tuple(slice(b * c, (b + 1) * c) for b, c in zip(chunk_idx, grid.chunk_shape))
+                ] = values
 
     return store
 
