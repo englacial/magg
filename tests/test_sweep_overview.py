@@ -975,13 +975,17 @@ class TestSection83Obligations:
         assert _overview_root(tmp_path, "-3/1", "all.zarr").attrs[ROLE_ATTR] == "overview"
 
 
-def _run_record(root, decimals, run_id="r1"):
+def _run_record(root, decimals, run_id="r1", window=None):
     """One run-record parquet naming ``decimals`` as completed shards (D20/D22)."""
     from zagg.telemetry import build_record, flatten_record, write_run_parquet
 
     rows = [
         flatten_record(
-            build_record(shard_key=morton_word(d), metadata={"total_obs": 1, "duration_s": 1.0})
+            build_record(
+                shard_key=morton_word(d),
+                metadata={"total_obs": 1, "duration_s": 1.0},
+                window=window,
+            )
         )
         for d in decimals
     ]
@@ -1224,6 +1228,48 @@ class TestDeclarePyramid:
             "semantic_hash absent (pre-#299 store — fold methods unverified)"
         )
         assert "could NOT be verified" in caplog.text
+
+    def test_declared_off_preserves_prior_materialized(self, tmp_path):
+        # The intended shape (D24 option A): overviews already on disk are real
+        # regenerable-cache debris, so a declared-OFF block still inventories
+        # them. The sweep gates on ``orders``, so it no-ops regardless.
+        self._pre_declaration_store(tmp_path)
+        declare_pyramid(str(tmp_path), _leaf_cfg())
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        materialized = read_manifest(str(tmp_path))["pyramid"]["overview"]["materialized"]
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = False
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True and summary["orders"] == []
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block == {"orders": [], "materialized": materialized}
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["declared"] is False
+
+    def test_drift_leaves_an_existing_declaration_untouched(self, tmp_path):
+        # The dangerous half of never-half-written: a store that already carries
+        # a GOOD declaration must come out of a refused call byte-identical.
+        self._pre_declaration_store(tmp_path)
+        declare_pyramid(str(tmp_path), _leaf_cfg())
+        before = json.dumps(read_manifest(str(tmp_path)), sort_keys=True)
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_min"]["dtype"] = "float64"
+        with pytest.raises(ValueError, match="h_min.*declared float64"):
+            declare_pyramid(str(tmp_path), cfg)
+        assert json.dumps(read_manifest(str(tmp_path)), sort_keys=True) == before
+
+    def test_windowed_store_probe_resolves_the_window(self, tmp_path):
+        # The probe threads the run record's window into shard_leaf_path; on a
+        # windowed store the leaf exists ONLY under ``{window}.zarr``, so a
+        # dropped window would silently degrade to the no-committed-leaf skip.
+        _write_manifest(tmp_path, windowed=True)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        del manifest["pyramid"]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        _make_leaf(tmp_path, "-311", self.CELLS["-311"], window="2411")
+        _run_record(tmp_path, ("-311",), window="2411")
+        summary = declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert summary["validated"].startswith("leaf ") and "2411.zarr" in summary["validated"]
 
     def test_missing_manifest_raises(self, tmp_path):
         with pytest.raises(ValueError, match="not a hive store root"):
