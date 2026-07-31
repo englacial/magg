@@ -114,10 +114,11 @@ def test_build_record_cost_per_100km2():
     assert rec["n_granules"] == 44
     assert rec["zagg_version"] == "9.9.9"
     assert rec["max_memory_mb"] == 1963.0  # threaded from the summary (issue #120)
-    # The record is the series schema plus the two JSON-only object-count keys
-    # (issue #240) that update_series's reindex deliberately drops.
+    # The record is the series schema plus the JSON-only object-count keys
+    # (issues #240/#362) that update_series's reindex deliberately drops.
     assert set(rec) == set(bench_metrics.RECORD_COLUMNS) | {
         "objects_per_shard",
+        "objects_telemetry",
         "objects_mismatch",
     }
 
@@ -2340,11 +2341,13 @@ def test_hive_config_expected_counts_root_moc_optional():
     # The committed hive arm's model: per-shard DATA is exact (11 objects/leaf,
     # the sharded-write-bypass tripwire), but the store-root coverage.moc is a
     # fail-open, regenerable D9 cache (runner.write_root_coverage) that may be
-    # present OR absent -- so store-root metadata is a [1, 5] window (the
-    # morton_hive.json manifest always; +coverage.moc, the run stats parquet,
-    # aggregation.yaml, and the sweep run record when they land) and the total
-    # is [12, 16]. A real bypass still fails on
-    # the exact per-shard count.
+    # present OR absent -- so store-root metadata is a [1, 3] window (the
+    # morton_hive.json manifest always; +coverage.moc and aggregation.yaml when
+    # they land) and the total is [12, 14]. Per-run root telemetry (the run
+    # stats parquet, the sweep run record) is NOT in the window since issue
+    # #362 -- per-run-unique names accumulate in a reused store, so they ride
+    # the unbounded objects_telemetry bucket instead. A real bypass still fails
+    # on the exact per-shard count.
     import bench_objects
 
     from zagg.config import get_coverage_moc, get_store_layout, load_config
@@ -2360,18 +2363,15 @@ def test_hive_config_expected_counts_root_moc_optional():
     # flip, issue #304): leaf root+group zarr.json (2) + 3 array zarr.json +
     # 3 sharded data objects + coverage sidecar + stats.json AND
     # shardmap.json siblings (issues #297/#300) = 11.
-    # Store root: morton_hive.json (always) + coverage.moc (optional) + the
-    # run stats parquet (optional, issue #297) + aggregation.yaml (optional,
-    # issue #299) + the sweep run record (optional, issue #353 — one per
-    # end-of-run sweep pass; fire-and-forget on the Lambda path, so it may not
-    # have landed by measurement time) -> [1, 5].
+    # Store root: morton_hive.json (always) + coverage.moc (optional) +
+    # aggregation.yaml (optional, issue #299) -> [1, 3].
     assert exp == {
-        "metadata": 5,
+        "metadata": 3,
         "metadata_min": 1,
         "per_shard_min": 11,
         "per_shard_max": 11,
         "total_min": 12,
-        "total_max": 16,
+        "total_max": 14,
         "exact": True,
     }
 

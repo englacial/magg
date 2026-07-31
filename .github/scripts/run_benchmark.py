@@ -92,7 +92,8 @@ def _measure_objects(config, grid, store: str, shard_key: int, *, region: str) -
 
     Returns the ``objects`` payload ``bench_metrics.build_record`` threads into
     the record: measured total, the exact expectation (null when the layout's
-    count is data-dependent), the per-shard attribution, and the mismatch
+    count is data-dependent), the per-shard attribution, the per-run root
+    telemetry tally (issue #362 — reported, never audited), and the mismatch
     description (null when clean) that ``main`` hard-fails on. Uses the same
     store factory (and credentials) the dispatch just wrote through, so a LIST
     failure is a real run failure, not a swallowed warning.
@@ -558,7 +559,8 @@ def main(argv: list[str] | None = None) -> int:
             f"cost/shard=${record['cost_per_shard_usd']} "
             f"cost/100km2=${record['cost_per_100km2_usd']} "
             f"max_memory_mb={record['max_memory_mb']} "
-            f"objects={record.get('objects_total')} (expected {record.get('objects_expected')})"
+            f"objects={record.get('objects_total')} (expected {record.get('objects_expected')}, "
+            f"telemetry {record.get('objects_telemetry')})"
         )
 
     Path(args.out_json).write_text(json.dumps(records, indent=2))

@@ -126,11 +126,11 @@ def expected_object_counts(
     if store_layout == "flat":
         _require_fullsphere(grid)
         members = _member_layouts(grid)
-        # Root zarr.json + group zarr.json + one zarr.json per array (exact),
-        # plus the OPTIONAL run-level stats parquet (issue #297) — fail-open,
-        # absent when the dispatcher role cannot PUT (the CI OIDC role).
-        metadata_min = 2 + len(members)
-        metadata_max = metadata_min + 1
+        # Root zarr.json + group zarr.json + one zarr.json per array — EXACT.
+        # Per-run root telemetry (the issue #297 stats parquet) is not modeled
+        # here: it rides the unbounded ``objects_telemetry`` bucket instead
+        # (see the hive comment below and :func:`_is_root_telemetry`).
+        metadata_min = metadata_max = 2 + len(members)
         lo = hi = 0
         for m in members:
             blocks = m["blocks_per_shard"]
@@ -151,17 +151,23 @@ def expected_object_counts(
         # the floor is the manifest alone, the ceiling adds the MOC. A real
         # sharded-write bypass lands in the per-shard DATA counts (asserted
         # exactly in object_count_mismatch), never in this metadata window.
-        # ... plus the OPTIONAL run-level stats parquet (issue #297) and the
-        # OPTIONAL aggregation.yaml semantic core (issue #299, D19 — a
-        # fail-open derived convenience riding the manifest write), same
+        # ... plus the OPTIONAL aggregation.yaml semantic core (issue #299, D19
+        # — a fail-open derived convenience riding the manifest write), same
         # fail-open posture as the root MOC.
-        # ... plus the OPTIONAL sweep run record (issue #353): the end-of-run
-        # sweep PUTs one ``sweep_stats_{ts}.json`` at the root per pass. Same
-        # fail-open posture again (telemetry, D9 — one warning and None), and
-        # on the Lambda path the sweep is fire-and-forget, so it may legitimately
-        # be absent at measurement time. Ceiling only; the floor stays 1.
+        # Per-run ROOT TELEMETRY is deliberately NOT in this window (issue
+        # #362): the run stats parquet (``stats_{ts}_{run_id}.parquet``, issue
+        # #297) and the sweep run record (``sweep_stats_{ts}.json``, issue #353)
+        # are per-run UNIQUE names, so in a store that more than one run writes
+        # they ACCUMULATE — a fixed ceiling can never be right for them (it held
+        # only while every run got a fresh store, and went red on main the day
+        # twelve runs shared one). They ride the unbounded ``objects_telemetry``
+        # bucket instead (:func:`_is_root_telemetry`), counted and reported but
+        # excluded from the audited write-path total — the same posture the D9
+        # rollup/overview buckets already take. This window therefore stays
+        # TIGHT (manifest + optional root MOC + optional aggregation.yaml), so
+        # real root-metadata drift still trips it.
         metadata_min = 1
-        metadata_max = 1 + (1 if coverage_moc else 0) + 1 + 1 + 1
+        metadata_max = 1 + (1 if coverage_moc else 0) + 1
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
         # zarr.json per array, plus the in-leaf coverage.moc sidecar (written
         # for any populated leaf when the leaf has depth, i.e. child_order >
@@ -205,10 +211,21 @@ def _is_sweep_record(key: str) -> bool:
     run (``sweep_after_run``, default on for hive) — so a hive run lands
     exactly one of these at the root alongside the run parquet. Deliberately
     outside the :func:`_is_run_parquet` grammar (a sweep record must never read
-    as a shard run record); counted as metadata for the same reason the run
-    parquet is — fixed, shard-independent, one object per run.
+    as a shard run record).
     """
     return "/" not in key and key.startswith("sweep_stats_") and key.endswith(".json")
+
+
+def _is_root_telemetry(key: str) -> bool:
+    """A store-root PER-RUN telemetry object (issue #362): parquet or sweep record.
+
+    Both names embed the run's own timestamp/id, so a store that more than one
+    run writes accumulates one of each PER RUN — never a fixed count. They are
+    tallied in their own unbounded ``objects_telemetry`` bucket (like the D9
+    rollups/overviews) and excluded from the audited write-path total, rather
+    than widening the metadata window by a number that can only ever be wrong.
+    """
+    return _is_run_parquet(key) or _is_sweep_record(key)
 
 
 def _is_status_object(key: str) -> bool:
@@ -263,6 +280,7 @@ def store_object_counts(
     """LIST a run's output store and attribute its objects per shard.
 
     Returns ``{"objects_total", "objects_metadata", "objects_per_shard",
+    "objects_rollups", "objects_overviews", "objects_telemetry",
     "objects_other", "other_keys"}``. ``objects_per_shard`` keys are the
     dispatched shards' external labels (``grid.shard_label``); a data object
     whose block resolves to an undispatched shard is keyed ``"block:<n>"`` so
@@ -275,6 +293,7 @@ def store_object_counts(
     metadata = 0
     rollups = 0
     overviews = 0
+    telemetry = 0
 
     if store_layout == "flat":
         _require_fullsphere(grid)
@@ -282,7 +301,10 @@ def store_object_counts(
         label_of = {int(grid.block_index(int(k))[0]): grid.shard_label(int(k)) for k in shard_keys}
         group = grid.group_path
         for key in keys:
-            if key == "zarr.json" or key.endswith("/zarr.json") or _is_run_parquet(key):
+            if _is_root_telemetry(key):
+                telemetry += 1
+                continue
+            if key == "zarr.json" or key.endswith("/zarr.json"):
                 metadata += 1
                 continue
             parts = key.split("/")
@@ -318,15 +340,13 @@ def store_object_counts(
             prefix.rstrip("/").rsplit("/", 1)[0] + "/": label for prefix, label in leaf_of.items()
         }
         for key in keys:
-            if (
-                key
-                in (
-                    hive.MANIFEST_NAME,
-                    hive.ROOT_COVERAGE_NAME,
-                    hive.AGGREGATION_CORE_NAME,
-                )
-                or _is_run_parquet(key)
-                or _is_sweep_record(key)
+            if _is_root_telemetry(key):
+                telemetry += 1
+                continue
+            if key in (
+                hive.MANIFEST_NAME,
+                hive.ROOT_COVERAGE_NAME,
+                hive.AGGREGATION_CORE_NAME,
             ):
                 metadata += 1
                 continue
@@ -365,13 +385,31 @@ def store_object_counts(
                     overviews += 1
                     continue
                 node, _, name = key.rpartition("/")
+                # Sidecar grammars, both naming generations
+                # (``zagg.telemetry.sidecar_key``): the legacy
+                # ``stats.json`` / ``stats_{window}.json`` every current writer
+                # emits, and the D23 window-only ``{stem}.stats.json``
+                # (``morton-hive/3``, PR #356). The two are disjoint by
+                # construction ("stats.json" cannot end in ".stats.json").
                 is_sibling = any(
                     name == f"{stem}.json"
                     or (name.startswith(f"{stem}_") and name.endswith(".json"))
+                    or name.endswith(f".{stem}.json")
                     for stem in ("stats", "shardmap")
                 )
                 if is_sibling and node + "/" in stats_of:
                     per_shard[stats_of[node + "/"]] = per_shard.get(stats_of[node + "/"], 0) + 1
+                elif name.endswith(".stats.json"):
+                    # A D23-named stats sidecar at a NON-leaf node is the
+                    # sidecar of an overview zarr (PR #356 writes one per
+                    # overview leaf, at the ANCESTOR node the pyramid folds
+                    # to), so it rides the same second-pass D9 bucket as the
+                    # overview it describes. Reached only after the
+                    # leaf-prefix-membership check above has failed AND the
+                    # node is not a dispatched leaf's, so it can neither
+                    # swallow a misplaced in-leaf object (issue #215 tripwire)
+                    # nor steal a real leaf sidecar's attribution.
+                    overviews += 1
                 else:
                     other.append(key)
     else:
@@ -383,6 +421,7 @@ def store_object_counts(
         "objects_per_shard": per_shard,
         "objects_rollups": rollups,
         "objects_overviews": overviews,
+        "objects_telemetry": telemetry,
         "objects_other": len(other),
         "other_keys": other[:20],
     }
@@ -422,6 +461,10 @@ def measure_objects(
         "objects_total": measured["objects_total"],
         "objects_expected": expected["total_max"] if expected["exact"] else None,
         "objects_per_shard": measured["objects_per_shard"],
+        # Per-run root telemetry (issue #362): reported so an accumulating
+        # shared store is legible in metrics.json / the run log, never audited
+        # (``object_count_mismatch`` nets it out of the total).
+        "objects_telemetry": measured["objects_telemetry"],
         "objects_mismatch": object_count_mismatch(measured, expected),
     }
 
@@ -444,11 +487,15 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     # or may not have landed them by measurement time (fire-and-forget on
     # Lambda), so they are tallied in their own buckets and excluded from the
     # write-path total this model audits (the #215 bypass guard below is
-    # untouched — neither ever lives inside a leaf prefix).
+    # untouched — neither ever lives inside a leaf prefix). Per-run root
+    # telemetry (issue #362) nets out for the same reason plus one of its own:
+    # its names are per-run unique, so a reused store accumulates them without
+    # bound and no fixed expectation could hold.
     total = (
         measured["objects_total"]
         - measured.get("objects_rollups", 0)
         - measured.get("objects_overviews", 0)
+        - measured.get("objects_telemetry", 0)
     )
     meta = measured["objects_metadata"]
     meta_lo, meta_hi = expected["metadata_min"], expected["metadata"]

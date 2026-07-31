@@ -110,8 +110,9 @@ RECORD_COLUMNS = [
     # count is data-dependent, i.e. not exact) -- the sharded-write-bypass
     # tripwire (issue #215). Null on rows recorded before the metric existed.
     # The per-run record additionally carries the JSON-only
-    # ``objects_per_shard`` / ``objects_mismatch`` keys, which the reindex to
-    # these columns deliberately drops from the parquet series.
+    # ``objects_per_shard`` / ``objects_telemetry`` / ``objects_mismatch``
+    # keys, which the reindex to these columns deliberately drops from the
+    # parquet series.
     "objects_total",
     "objects_expected",
     # Store-layout axis (issue #240 phase 4): "flat" | "hive". Null on rows
@@ -292,6 +293,9 @@ def build_record(
     record["objects_total"] = o.get("objects_total")
     record["objects_expected"] = o.get("objects_expected")
     record["objects_per_shard"] = o.get("objects_per_shard")
+    # Per-run root telemetry (issue #362): JSON-only like per_shard/mismatch —
+    # reported so an accumulating shared store is legible, never audited.
+    record["objects_telemetry"] = o.get("objects_telemetry")
     record["objects_mismatch"] = o.get("objects_mismatch")
     # Streaming-mode + ephemeral axis (issue #272): threaded from the target by
     # run_benchmark. ``ephemeral_cost_usd`` is the /tmp component already folded
