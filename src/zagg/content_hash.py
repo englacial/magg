@@ -125,7 +125,8 @@ def hash_arrays(group: Any, *, staged: Mapping[str, np.ndarray] | None = None) -
     for key, node in group.members(max_depth=None):
         if not isinstance(node, zarr.Array):
             continue
-        hashes[key] = hash_array(staged[key] if key in staged else node[...])
+        values = staged[key] if key in staged else node[...]
+        hashes[key] = hash_array(np.asarray(values))
     unused = set(staged) - set(hashes)
     if unused:
         logger.warning(
