@@ -115,6 +115,15 @@ and hive-leaf writers are pinned to store byte-identical per-cell payloads
   out-of-range index raises `IndexError` naming the valid range (no negative-index
   wrap); an absent cell returns the zero-length `(0, *inner_shape)` array. Works
   on the `{field}_locations` sibling too.
+- **Sub-leaf subtree read** *(planned —
+  [issue #351](https://github.com/englacial/zagg/issues/351))* — the nested
+  cells axis makes the subtree below any ancestor one **contiguous cell span**
+  (normative in the spec's §1.5 subtree-spans clause), so "everything below
+  this morton node" is a contiguous slice: the shard-index suffix plus only
+  the covering inner chunks — `read_cell`'s 2-GET pattern generalized to a
+  span, never the whole-array sweep. Until it lands, region granularity is the
+  hive leaf: coverage-MOC/AOI selection picks leaves (issue #200), each swept
+  whole.
 
 ## Spatially faithful tensors (deinterleave, blocks, mask)
 

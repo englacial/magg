@@ -200,6 +200,20 @@ only. The 2-GET random-access recipe follows: fetch the
 `16*K + 4`-byte index suffix, then the one ranged inner chunk holding the
 cell.
 
+**Subtree spans.** The cells axis MUST be in canonical nested order — the
+per-cell `morton` coordinate ascending, every aligned power-of-four span
+sharing its ancestor cell (the ordering every §1 identity derivation and the
+rank-space deinterleave already presuppose; a zagg writer has never produced
+anything else, this sentence makes it citable). Consequently the order-`k`
+subtree below an ancestor at nested rank `r` on an order-`c` cells axis
+occupies exactly the contiguous index span `[r·4^(c−k), (r+1)·4^(c−k))`, and
+a reader MAY serve "everything below one morton node" as a contiguous-slice
+read: on the sharded geometry the index suffix plus only the covering inner
+chunks (the 2-GET recipe generalized to a span), on the per-inner-chunk
+geometry only the covering chunk objects — never a whole-array sweep. The
+span property is normative; a dedicated subtree reader is implementation
+(zagg: [issue #351](https://github.com/englacial/zagg/issues/351)).
+
 ### 1.6 Succession
 
 The `ragged` attrs block is `/1`'s element contract. The candidate successor
