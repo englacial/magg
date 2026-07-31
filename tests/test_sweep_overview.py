@@ -1036,6 +1036,23 @@ class TestDeclarePyramid:
         assert summary["updated"] is False and summary["previous"] == "identical"
         assert puts == []  # identical declaration -> no PUT at all
 
+    def test_non_json_primitive_declaration_stays_idempotent(self, tmp_path, monkeypatch):
+        # The block is normalized to canonical JSON before the compare, so a
+        # config value that is not a JSON primitive (here a tuple, which comes
+        # back out of the manifest as a list) cannot re-PUT on every call.
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"summarize": {"h_tdigest": {"as": "p50", "quantiles": (0.5,)}}}
+        declare_pyramid(str(tmp_path), cfg)
+        assert read_manifest(str(tmp_path))["pyramid"]["overview"]["summarize"] == {
+            "h_tdigest": {"as": "p50", "quantiles": [0.5]}
+        }
+        puts = []
+        real_put = obstore.put
+        monkeypatch.setattr(obstore, "put", lambda *a, **k: (puts.append(a), real_put(*a, **k))[1])
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["previous"] == "identical" and puts == []
+
     def test_redeclaration_preserves_materialized(self, tmp_path):
         self._pre_declaration_store(tmp_path)
         declare_pyramid(str(tmp_path), _leaf_cfg())

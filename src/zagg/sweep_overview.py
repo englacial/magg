@@ -345,6 +345,13 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
         )
     shard_order = int(manifest["shard_order"])
     block = build_pyramid_block(config, shard_order)
+    # Compare (and write) canonical JSON: ``prior`` came back through
+    # ``json.loads``, so any non-JSON-primitive surviving the derivation (a tuple
+    # in a ``summarize`` declaration, say) would differ from its round-tripped
+    # self and re-PUT on every call — against the headline idempotency property.
+    # It also surfaces an unserializable block HERE rather than at the PUT,
+    # after the whole store-truth probe has been paid for.
+    block = json.loads(json.dumps(block))
     bad = [k for k in block["overview"].get("orders") or [] if not 0 <= int(k) < shard_order]
     if bad:
         raise ValueError(
