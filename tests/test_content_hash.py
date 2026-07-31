@@ -11,6 +11,7 @@ finding to raise on issue #342, never something to patch around.
 
 import importlib.util
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -194,6 +195,17 @@ class TestWorkerWiring:
         meta, _leaf = kitchen_leaf
         assert meta["phase_timings"]["hash"] >= 0.0
 
+    def test_unused_staged_key_warns(self, kitchen_leaf, caplog):
+        # A staged key matching no enumerated array is a broken writer seam,
+        # not a correctness bug: the hashes still equal the unstaged call, but
+        # it has to be LOUD or a totally dead staging pipeline is invisible.
+        _meta, leaf = kitchen_leaf
+        group = zarr.open_group(LocalStore(str(leaf)), mode="r", zarr_format=3)
+        with caplog.at_level(logging.WARNING, logger="zagg.content_hash"):
+            hashes = hash_arrays(group, staged={"nonexistent/key": np.zeros(1)})
+        assert hashes == hash_arrays(group)
+        assert "staged values for ['nonexistent/key']" in caplog.text
+
     def test_staged_values_take_priority_over_the_store(self, kitchen_leaf):
         # Proof the staged mapping is the hash source when present: a doctored
         # staged value flips exactly that key, everything else read-back.
@@ -233,7 +245,9 @@ class TestCoverageCompleteness:
             "6/h_tdigest_noise_locations",
         }
 
-    def test_companion_field_enters_hash_set_via_readback_fallback(self, monkeypatch, tmp_path):
+    def test_companion_field_enters_hash_set_via_readback_fallback(
+        self, monkeypatch, tmp_path, caplog
+    ):
         # A ``resolution: chunk`` companion is written per chunk-block, never
         # as one staged slab — the one production case where ``hash_arrays``
         # falls back to reading the (tiny) array back. Driven through the
@@ -295,17 +309,21 @@ class TestCoverageCompleteness:
         monkeypatch.setattr(
             "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
         )
-        meta = hive.process_and_write_hive(
-            shard_key,
-            ["s3://x"],
-            grid,
-            {},
-            str(tmp_path / "store"),
-            cfg,
-            store_kwargs={},
-            handoff="pandas",  # the one_shot stub yields pandas carriers
-        )
+        with caplog.at_level(logging.WARNING, logger="zagg.content_hash"):
+            meta = hive.process_and_write_hive(
+                shard_key,
+                ["s3://x"],
+                grid,
+                {},
+                str(tmp_path / "store"),
+                cfg,
+                store_kwargs={},
+                handoff="pandas",  # the one_shot stub yields pandas carriers
+            )
         assert meta.get("error") is None, meta
+        # The writer's staged keys all land on enumerated arrays — no silent
+        # key-composition drift between write.py and the members() walk.
+        assert "staged values for" not in caplog.text
         leaf = hive.shard_leaf_path(str(tmp_path / "store"), shard_key)
         group = zarr.open_group(LocalStore(leaf), mode="r", zarr_format=3)
         inventory = {k for k, node in group.members(max_depth=None) if isinstance(node, zarr.Array)}

@@ -29,9 +29,12 @@ as *unverifiable, not tampered*.
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any, Mapping
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 #: Width of the §5.2 vlen recipe's per-cell length prefix (uint64, LE).
 VLEN_LENGTH_PREFIX = 8
@@ -98,6 +101,11 @@ def hash_arrays(group: Any, *, staged: Mapping[str, np.ndarray] | None = None) -
     that array back. The two sources are pinned equal by the write-read
     parity test in ``tests/test_content_hash.py`` — the CI guard for the
     dtype-cast/fill drift class §5 exists to catch.
+
+    A staged key matching NO enumerated array warns: the digests stay correct
+    (that array was read back) but the staged seam is broken — silent
+    key-composition drift between writer and enumeration would otherwise turn
+    every hash into a read-back with no observable symptom.
     """
     import zarr
 
@@ -107,6 +115,14 @@ def hash_arrays(group: Any, *, staged: Mapping[str, np.ndarray] | None = None) -
         if not isinstance(node, zarr.Array):
             continue
         hashes[key] = hash_array(staged[key] if key in staged else node[...])
+    unused = set(staged) - set(hashes)
+    if unused:
+        logger.warning(
+            "staged values for %s match no array beneath the leaf root; those arrays "
+            "were hashed from a store read-back instead (staged keys must be array "
+            "paths relative to the leaf root, e.g. '8/morton')",
+            sorted(unused),
+        )
     return hashes
 
 
