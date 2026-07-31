@@ -2340,10 +2340,10 @@ def test_hive_config_expected_counts_root_moc_optional():
     # The committed hive arm's model: per-shard DATA is exact (11 objects/leaf,
     # the sharded-write-bypass tripwire), but the store-root coverage.moc is a
     # fail-open, regenerable D9 cache (runner.write_root_coverage) that may be
-    # present OR absent -- so store-root metadata is a [1, 4] window (the
+    # present OR absent -- so store-root metadata is a [1, 5] window (the
     # morton_hive.json manifest always; +coverage.moc, the run stats parquet,
-    # and aggregation.yaml when they land) and the total is [12, 15]. A real
-    # bypass still fails on
+    # aggregation.yaml, and the sweep run record when they land) and the total
+    # is [12, 16]. A real bypass still fails on
     # the exact per-shard count.
     import bench_objects
 
@@ -2362,14 +2362,16 @@ def test_hive_config_expected_counts_root_moc_optional():
     # shardmap.json siblings (issues #297/#300) = 11.
     # Store root: morton_hive.json (always) + coverage.moc (optional) + the
     # run stats parquet (optional, issue #297) + aggregation.yaml (optional,
-    # issue #299) -> [1, 4].
+    # issue #299) + the sweep run record (optional, issue #353 — one per
+    # end-of-run sweep pass; fire-and-forget on the Lambda path, so it may not
+    # have landed by measurement time) -> [1, 5].
     assert exp == {
-        "metadata": 4,
+        "metadata": 5,
         "metadata_min": 1,
         "per_shard_min": 11,
         "per_shard_max": 11,
         "total_min": 12,
-        "total_max": 15,
+        "total_max": 16,
         "exact": True,
     }
 
