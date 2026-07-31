@@ -990,6 +990,23 @@ class TestSweepCli:
         summary = json.loads(capsys.readouterr().out)
         assert summary["updated"] is False and summary["previous"] == "identical"
 
+    def test_declare_pyramid_failures_surface_not_swallowed(self, tmp_path):
+        # The CLI wrapper deliberately has no error handling: a refusal escapes
+        # main() and the process exits non-zero through the interpreter, the
+        # same shape as ``python -m zagg``. Pinned so a future try/except that
+        # swallows a refusal to ``return 0`` — the flag's whole promise is that
+        # a wrong config does NOT get installed — is caught (issue #358).
+        from zagg.sweep import main
+
+        config_path = self._config_yaml(tmp_path)
+        store = tmp_path / "not_a_hive_root"
+        store.mkdir()
+        with pytest.raises(ValueError, match="not a hive store root"):
+            main([str(store), "--declare-pyramid", str(config_path)])
+        _write_manifest(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            main([str(tmp_path), "--declare-pyramid", str(tmp_path / "missing.yaml")])
+
 
 class TestSweepConfig:
     """output.sweep (issue #300): default on for hive, boolean, hive-only —
