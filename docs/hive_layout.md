@@ -218,6 +218,37 @@ while the digit tree has any `{sign+base}` children (one delimiter-LIST):
 clear the store root, or pick a new one, before writing with a different
 configuration.
 
+### Retrofitting the pyramid declaration
+
+The `pyramid` block is normally written at template time
+(`build_pyramid_block`, issue #201), but declaration is not birth-only: a
+store templated without it — any pre-#344 store — can gain (or change) the
+declaration later, because the block is a pure function of the pipeline
+config plus the manifest's own `shard_order`, and `pyramid` is already the
+one manifest key legally rewritten after templating (D11). The retrofit is
+`zagg.sweep_overview.declare_pyramid(store_root, config)`, or from the
+shell:
+
+```
+python -m zagg.sweep s3://bucket/store --declare-pyramid config.yaml
+```
+
+(declaration-only: no sweep pass runs in the same invocation). The tool
+derives the block through the same code path template time uses, then
+**validates it against store truth before writing**: every declared field
+must exist in a committed leaf with the declared dtype (dense fields) or
+ragged element declaration (t-digests), so a wrong config cannot install a
+fold recipe the store contradicts — drift refuses loudly, naming the field
+and the mismatch, and nothing is half-written. A store with no committed
+leaf yet is still declarable; the field checks are then skipped, loudly.
+The rewrite is idempotent (an identical declaration is not re-PUT) and
+preserves any `materialized` actuals the sweep has recorded.
+`output.pyramid: false` installs the declared-off block — recording absence
+is a valid retrofit (readers then never probe for overviews), and overviews
+at now-undeclared orders are left in place as regenerable-cache debris
+(D24). After a retrofit, the next overview sweep materializes the declared
+orders (issue #358).
+
 ## The commit stamp
 
 S3 has no empty directories and LIST is strongly consistent, so **absence is
