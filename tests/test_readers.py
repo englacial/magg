@@ -926,6 +926,44 @@ class TestSubtreeReadTensors:
         for sub in (words[_KEY_A], _KEY_A):
             self._assert_same(list(read_tensors(store, "12/h_tdigest", subtree=sub)), expected)
 
+    def test_span_covering_two_stored_objects(self):
+        """A span wider than ONE stored object (review, PR #357): the order-5
+        parent of two populated sibling order-6 shards. The clip loop skips a
+        disjoint object AND clips two covered ones in the same read, and
+        ``block_order=5`` assembles a single block ACROSS the two objects."""
+        sibling = "1121122"  # _KEY_A's order-6 sibling; parent "112112"
+        parent = "112112"
+        store, _grid_, words = _build_store(
+            {
+                _KEY_A: {0: np.asarray([3.0, 1.0]), 4095: np.asarray([9.0])},
+                sibling: {9: np.asarray([5.0, 6.0]), 200: np.asarray([7.0])},
+                _KEY_B: {7: np.asarray([8.0])},  # disjoint: never fetched
+            }
+        )
+        word = morton_word(parent)
+        # Per-cell: every cell of BOTH objects, none of shard B's.
+        sweep = list(read_raw_values(store, "12/h_tdigest"))
+        got_cells = list(read_raw_values(store, "12/h_tdigest", subtree=parent))
+        TestSubtreePerCellReaders._assert_same(
+            got_cells,
+            TestSubtreePerCellReaders._filtered(store, "12/h_tdigest", sweep, parent),
+        )
+        assert len(got_cells) == 4
+        # Per chunk: one block per stored object, both yielded.
+        per_chunk = list(read_tensors(store, "12/h_tdigest", subtree=parent))
+        assert [o[3] for o in per_chunk] == [words[_KEY_A], words[sibling]]
+        self._assert_same(
+            per_chunk, self._filtered(list(read_tensors(store, "12/h_tdigest")), word, 5)
+        )
+        # And ONE order-5 block assembled across the two stored objects, equal
+        # to the same block from the unrestricted block_order=5 sweep.
+        assembled = self._filtered(
+            list(read_tensors(store, "12/h_tdigest", block_order=5)), word, 5
+        )
+        got = list(read_tensors(store, "12/h_tdigest", subtree=parent, block_order=5))
+        assert len(got) == len(assembled) == 1 and got[0][0].shape == (128, 128, 128)
+        self._assert_same(got, assembled)
+
     def test_sharded_store_per_chunk_and_block_assembly(self):
         from mortie import generate_morton_children
 
