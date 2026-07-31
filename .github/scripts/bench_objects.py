@@ -20,8 +20,8 @@ so it cannot drift from what the template actually emits:
   array at K>1 gives 1..K objects (zarr's default ``write_empty_chunks=False``
   omits all-fill chunks, so empty inner chunks write nothing).
 - **hive** (per-shard leaf zarrs): store-root objects (``morton_hive.json``,
-  plus ``coverage.moc`` when ``output.coverage_moc`` is on — the hive default —
-  plus the fail-open ``aggregation.yaml`` semantic core, issue #299)
+  plus the optional ``coverage.moc``, plus the fail-open ``aggregation.yaml``
+  semantic core, issue #299)
   plus, per populated leaf, the leaf metadata (root + group + per-array
   ``zarr.json``), the in-leaf ``coverage.moc`` sidecar (depth > 0), one
   whole-leaf ragged object per ragged field, and — since issue #236 — one
@@ -113,7 +113,6 @@ def expected_object_counts(
     *,
     n_shards: int,
     store_layout: str = "flat",
-    coverage_moc: bool = False,
 ) -> dict:
     """Expected store object counts for ``n_shards`` populated shards.
 
@@ -144,13 +143,20 @@ def expected_object_counts(
     elif store_layout == "hive":
         members = _member_layouts(grid, leaf=True)
         # Store root: the morton_hive.json manifest (always written) PLUS the
-        # root coverage.moc when output.coverage_moc is on (the hive default).
-        # The root MOC is a fail-open, regenerable D9 cache
-        # (runner.write_root_coverage) — it may legitimately be ABSENT (e.g. the
-        # orchestrator role can't PUT it), so it is an OPTIONAL metadata object:
-        # the floor is the manifest alone, the ceiling adds the MOC. A real
-        # sharded-write bypass lands in the per-shard DATA counts (asserted
-        # exactly in object_count_mismatch), never in this metadata window.
+        # root coverage.moc. The MOC is a fail-open, regenerable D9 cache that
+        # may legitimately be ABSENT (e.g. the orchestrator role can't PUT it),
+        # so it is an OPTIONAL metadata object: the floor is the manifest
+        # alone, the ceiling adds the MOC. The ceiling counts it
+        # UNCONDITIONALLY — not off ``output.coverage_moc`` — because it has
+        # TWO independent writers and only one honours that knob: the
+        # end-of-run write in ``runner.agg`` (gated on ``get_coverage_moc``)
+        # and ``zagg.sweep.MocFamily.finish`` -> ``hive.write_root_coverage``,
+        # reached from ``sweep_after_run`` with ``DEFAULT_FAMILIES`` (which
+        # includes ``"moc"``) and gated only on ``get_sweep``. A hive target
+        # with ``coverage_moc: false`` and the default sweep still lands the
+        # object, so a knob-gated ceiling would hard-fail a correct store. A
+        # real sharded-write bypass lands in the per-shard DATA counts
+        # (asserted exactly in object_count_mismatch), never in this window.
         # ... plus the OPTIONAL aggregation.yaml semantic core (issue #299, D19
         # — a fail-open derived convenience riding the manifest write), same
         # fail-open posture as the root MOC.
@@ -167,7 +173,7 @@ def expected_object_counts(
         # TIGHT (manifest + optional root MOC + optional aggregation.yaml), so
         # real root-metadata drift still trips it.
         metadata_min = 1
-        metadata_max = 1 + (1 if coverage_moc else 0) + 1
+        metadata_max = 1 + 1 + 1
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
         # zarr.json per array, plus the in-leaf coverage.moc sidecar (written
         # for any populated leaf when the leaf has depth, i.e. child_order >
@@ -188,7 +194,7 @@ def expected_object_counts(
         raise ValueError(f"unknown store_layout: {store_layout!r} (expected 'flat' or 'hive')")
     return {
         # ``metadata`` is the CEILING (kept for back-compat / display); the floor
-        # is ``metadata_min`` — equal on flat (exact), a [1, 1+moc] window on hive.
+        # is ``metadata_min`` — equal on flat (exact), a [1, 3] window on hive.
         "metadata": metadata_max,
         "metadata_min": metadata_min,
         "per_shard_min": lo,
@@ -434,7 +440,6 @@ def measure_objects(
     shard_keys,
     n_shards: int,
     store_layout: str = "flat",
-    coverage_moc: bool = False,
     **store_kwargs,
 ) -> dict:
     """Measure a run's store objects and compare against the expected model.
@@ -447,9 +452,7 @@ def measure_objects(
     of shards expected to have written (the dispatch count for the per-merge
     harness, the completed-with-data count for the full-AOI fan-out).
     """
-    expected = expected_object_counts(
-        grid, n_shards=n_shards, store_layout=store_layout, coverage_moc=coverage_moc
-    )
+    expected = expected_object_counts(grid, n_shards=n_shards, store_layout=store_layout)
     measured = store_object_counts(
         store_path,
         grid=grid,
@@ -476,10 +479,10 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     per-inner-chunk objects instead of one sharded object) is the PER-SHARD DATA
     count, asserted exactly whenever the per-shard count is deterministic
     (``exact``). Metadata and total are checked as **windows**: on flat they
-    collapse to an exact assertion (``min == max``); on hive they widen by one
-    for the optional, fail-open D9 root ``coverage.moc`` (present or absent are
-    both valid). Unclassifiable keys are always a finding: the model claims to
-    know every object the run writes.
+    collapse to an exact assertion (``min == max``); on hive they widen for the
+    optional, fail-open D9 root objects (``coverage.moc``, ``aggregation.yaml``
+    — present or absent are both valid). Unclassifiable keys are always a
+    finding: the model claims to know every object the run writes.
     """
     problems = []
     # Sweep rollups (issue #300) and overview zarrs (issue #201) are

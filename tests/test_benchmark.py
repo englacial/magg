@@ -2410,15 +2410,13 @@ def test_hive_config_expected_counts_root_moc_optional():
     # on the exact per-shard count.
     import bench_objects
 
-    from zagg.config import get_coverage_moc, get_store_layout, load_config
+    from zagg.config import get_store_layout, load_config
     from zagg.grids import from_config
 
     cfg = load_config(str(BENCH / "configs" / "atl03_tdigest_healpix_o9_hive.yaml"))
-    assert get_store_layout(cfg) == "hive" and get_coverage_moc(cfg) is True
+    assert get_store_layout(cfg) == "hive"
     grid = from_config(cfg)
-    exp = bench_objects.expected_object_counts(
-        grid, n_shards=1, store_layout="hive", coverage_moc=True
-    )
+    exp = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
     # 3 arrays (morton/count/h_tdigest — no legacy cell_ids since the D16
     # flip, issue #304): leaf root+group zarr.json (2) + 3 array zarr.json +
     # 3 sharded data objects + coverage sidecar + stats.json AND

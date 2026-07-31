@@ -141,6 +141,37 @@ def test_expected_counts_unsharded_is_bounded_not_exact():
     assert exp["per_shard_max"] == 3 * k
 
 
+def test_hive_metadata_ceiling_covers_sweep_written_root_moc():
+    # The store-root coverage.moc has TWO writers and only ONE honours
+    # ``output.coverage_moc``: the end-of-run write in ``runner.agg`` (gated on
+    # ``get_coverage_moc``) and ``zagg.sweep.MocFamily.finish`` ->
+    # ``hive.write_root_coverage``, reached from ``sweep_after_run`` with
+    # ``DEFAULT_FAMILIES`` (which carries "moc") and gated only on
+    # ``get_sweep``. So ``coverage_moc: false`` plus the default sweep still
+    # lands manifest + aggregation.yaml + coverage.moc = 3 root metadata
+    # objects; a knob-gated ceiling of 2 would hard-fail that correct store.
+    # The ceiling counts the MOC unconditionally; the floor stays the manifest.
+    from zagg.config import default_config, get_coverage_moc, get_sweep
+    from zagg.sweep import DEFAULT_FAMILIES
+
+    cfg = default_config("atl06")
+    cfg.output["store_layout"] = "hive"
+    cfg.output["coverage_moc"] = False
+    assert get_coverage_moc(cfg) is False  # writer one is OFF...
+    assert get_sweep(cfg) is True and "moc" in DEFAULT_FAMILIES  # ...writer two is ON
+
+    exp = bench_objects.expected_object_counts(from_config(cfg), n_shards=1, store_layout="hive")
+    assert exp["metadata"] == 3 and exp["metadata_min"] == 1
+    measured = {
+        "objects_total": 3 + exp["per_shard_max"],
+        "objects_metadata": 3,  # manifest + aggregation.yaml + the sweep's MOC
+        "objects_per_shard": {_KEY_A: exp["per_shard_max"]},
+        "objects_other": 0,
+        "other_keys": [],
+    }
+    assert bench_objects.object_count_mismatch(measured, exp) is None
+
+
 def test_expected_counts_unknown_layout_raises():
     with pytest.raises(ValueError, match="store_layout"):
         bench_objects.expected_object_counts(_grid(), n_shards=1, store_layout="tree")
@@ -231,7 +262,6 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     from zagg.config import (
         default_config,
         get_agg_fields,
-        get_coverage_moc,
         get_data_vars,
         get_output_signature,
     )
@@ -301,9 +331,7 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     measured = bench_objects.store_object_counts(
         root, grid=grid, shard_keys=[word], store_layout="hive"
     )
-    expected = bench_objects.expected_object_counts(
-        grid, n_shards=1, store_layout="hive", coverage_moc=get_coverage_moc(cfg)
-    )
+    expected = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
     # K == 1 leaf: every per-array count is deterministic, so the hive model
     # is exact here and the real store matches it object-for-object.
     assert expected["exact"] is True
@@ -704,7 +732,7 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
 
     import zagg.processing as processing
     from zagg import runner
-    from zagg.config import default_config, get_coverage_moc
+    from zagg.config import default_config
     from zagg.runner import agg
 
     cfg = default_config("atl06")
@@ -741,9 +769,7 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     root = str(tmp_path / "out")
     agg(cfg, catalog=str(cat_path), store=root, backend="local")
 
-    expected = bench_objects.expected_object_counts(
-        grid, n_shards=1, store_layout="hive", coverage_moc=get_coverage_moc(cfg)
-    )
+    expected = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
     measured = bench_objects.store_object_counts(
         root, grid=grid, shard_keys=[shard], store_layout="hive"
     )

@@ -44,7 +44,6 @@ import bench_objects  # noqa: E402
 
 from zagg.config import (  # noqa: E402
     get_aoi_mask,
-    get_coverage_moc,
     get_handoff,
     get_store_layout,
     load_config,
@@ -104,7 +103,6 @@ def _measure_objects(config, grid, store: str, shard_key: int, *, region: str) -
         shard_keys=[shard_key],
         n_shards=1,
         store_layout=get_store_layout(config),
-        coverage_moc=get_coverage_moc(config),
         region=region,
     )
 

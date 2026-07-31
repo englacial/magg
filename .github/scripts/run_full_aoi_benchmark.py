@@ -98,7 +98,6 @@ import bench_metrics  # noqa: E402
 import bench_objects  # noqa: E402
 
 from zagg.config import (  # noqa: E402
-    get_coverage_moc,
     get_handoff,
     get_store_layout,
     load_config,
@@ -437,7 +436,6 @@ def _measure_objects_recorded(
             shard_keys=shard_keys,
             n_shards=n_ok,
             store_layout=get_store_layout(config),
-            coverage_moc=get_coverage_moc(config),
             region=region,
         )
     except Exception as exc:  # record-only: never fail the release run
