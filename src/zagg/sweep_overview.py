@@ -821,7 +821,10 @@ def _write_overview(
     pinned like a leaf's: template (wholesale overwrite — a prior overview or
     torn debris is replaced, D4 retry semantics) -> arrays -> role/provenance
     attrs -> commit stamp LAST, so an interrupted writer leaves ignorable
-    debris and presence certifies the ``role`` attr landed (D11).
+    debris and presence certifies the ``role`` attr landed (D11). The D20
+    stats sidecar (§5 ``content_hashes``, issue #342) is a SIBLING object PUT
+    after the stamp — outside the leaf, so the stamp stays the leaf's own
+    final write, exactly as source-leaf sidecars land post-stamp.
     """
     import zarr
     from mortie import generate_morton_children
@@ -873,6 +876,36 @@ def _write_overview(
         window=stamp_window,
         time_range=fold["time_range"] if stamp_window is not None else None,
     )
+    # O11 content hashes (issue #342 phase 4): an overview leaf gets the same
+    # §5 D20 sidecar record as a source leaf, computed from the folded arrays
+    # already in memory (the ratified overview-scope decision (1)); the
+    # envelope's sweep-internal skip digest (``_content_hash`` above) is a
+    # DIFFERENT recipe with a different job and stays untouched (decision
+    # (2)). Sidecar naming follows the leaf basename's D23 window-only
+    # grammar (``{stem}.stats.json``) regardless of the store's manifest
+    # spec: overview basenames are v3-named unconditionally, and the legacy
+    # grammar would key every window's sidecar to one ``stats.json`` at the
+    # node. Fail-open (D9 telemetry posture; §5.3 reads absence as
+    # unverifiable, never tampered).
+    try:
+        from zagg.content_hash import content_hashes_record, hash_arrays
+        from zagg.telemetry import SPEC_V3, build_record, write_sidecar
+
+        staged = {f"{target_order}/morton": words}
+        staged.update({f"{target_order}/{name}": slab for name, slab in fold["slabs"].items()})
+        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
+        record = build_record(
+            shard_key=morton_word(node),
+            metadata={
+                "cells_with_data": int(populated.sum()),
+                "granule_count": int(fold["granule_count"]),
+                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+            },
+            window=stamp_window,
+        )
+        write_sidecar(path, record, spec=SPEC_V3, **store_kwargs)
+    except Exception as e:
+        logger.warning(f"sweep[overview]: O11 sidecar failed at {node}/{basename} ({e})")
     return basename
 
 
