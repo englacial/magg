@@ -929,17 +929,54 @@ class TestSweepCli:
         from zagg.hive import read_manifest
         from zagg.sweep import main
 
-        _write_manifest(tmp_path)  # legacy pyramid block, no run records
+        _write_manifest(tmp_path)  # legacy pyramid block
+        # Real sweepable work, so the no-rollup assertion below DISCRIMINATES:
+        # without it the fallthrough path writes nothing either (an empty store
+        # is a no-op — see test_empty_store_is_a_noop), and the
+        # declaration-only claim would go untested (review finding, issue #358).
+        # The sidecars carry no commit stamp, so validation still takes the
+        # no-committed-leaf branch.
+        _put_leaf(tmp_path, "-311")
+        _put_leaf(tmp_path, "-312")
+        _run_record(tmp_path, [_row("-311"), _row("-312")])
         config_path = self._config_yaml(tmp_path)
         assert main([str(tmp_path), "--declare-pyramid", str(config_path)]) == 0
         summary = json.loads(capsys.readouterr().out)
         assert summary["updated"] is True and summary["orders"] == [0]
-        # No committed leaf on this store: validation records the loud skip.
+        # Uncommitted refs on this store: validation records the loud skip.
         assert summary["validated"].startswith("manifest only")
         block = read_manifest(str(tmp_path))["pyramid"]["overview"]
         assert block["orders"] == [0]  # manifest shard_order 2, spacing 2
         assert block["fields"]["count"]["class"] == "exact"
-        # Declaration-only semantics: no sweep pass ran in the invocation.
+        # Declaration-only semantics: no sweep pass ran in the invocation —
+        # the same store swept normally writes four stats rollups.
+        assert not list(tmp_path.rglob("*.rollup.json"))
+
+    def test_declare_pyramid_flag_does_not_sweep_a_sweepable_store(self, tmp_path, capsys):
+        # The positive control for the assertion above: the SAME fixture, swept
+        # without the flag, writes rollups — so their absence really is the
+        # flag's doing (issue #358).
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        _put_leaf(tmp_path, "-312")
+        _run_record(tmp_path, [_row("-311"), _row("-312")])
+        assert main([str(tmp_path), "--families", "stats"]) == 0
+        assert json.loads(capsys.readouterr().out)["families"]["stats"]["written"] == 4
+        assert list(tmp_path.rglob("*.rollup.json"))
+
+    def test_empty_declare_pyramid_value_never_sweeps(self, tmp_path):
+        # An unset shell variable expands to --declare-pyramid="": the flag must
+        # fail loudly on the empty path, never fall through to the WRITING sweep
+        # pass it advertises it will not run (review finding, issue #358).
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        _run_record(tmp_path, [_row("-311")])
+        with pytest.raises((FileNotFoundError, IsADirectoryError, OSError)):
+            main([str(tmp_path), "--declare-pyramid", ""])
         assert not list(tmp_path.rglob("*.rollup.json"))
 
     def test_declare_pyramid_flag_is_idempotent(self, tmp_path, capsys):
