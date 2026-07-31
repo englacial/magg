@@ -310,18 +310,36 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     # end-of-run sweep PUTs one per pass, root-level and shard-independent,
     # so it is accounted exactly like the run parquet).
     assert measured["objects_metadata"] == expected["metadata"] == 5
-    assert measured["objects_other"] == 0
     assert list(measured["objects_per_shard"]) == [_KEY_A]
     # The end-of-run sweep lands its rollups (issue #300) and overview zarrs
     # (issue #201) in their own buckets (second-pass D9 caches); the
-    # write-path total excludes both.
+    # write-path total excludes both. Overview leaves additionally carry a
+    # D20 stats sidecar (`{window}.stats.json` at the digit node, issue
+    # #342); the classifier in `.github/scripts/bench_objects.py` (CI infra,
+    # out of the #342 PR's scope — flagged there) does not bucket them yet,
+    # so pin them as the ONLY unclassified keys and fold them out with the
+    # other second-pass artifacts.
     assert measured["objects_rollups"] > 0
     assert measured["objects_overviews"] > 0
+    overview_sidecars = [k for k in measured["other_keys"] if k.endswith("/all.stats.json")]
+    assert measured["other_keys"] == overview_sidecars
+    assert measured["objects_other"] == len(overview_sidecars) > 0
     write_path = (
-        measured["objects_total"] - measured["objects_rollups"] - measured["objects_overviews"]
+        measured["objects_total"]
+        - measured["objects_rollups"]
+        - measured["objects_overviews"]
+        - len(overview_sidecars)
     )
     assert write_path == expected["total_max"]
-    assert bench_objects.object_count_mismatch(measured, expected) is None
+    # The mismatch guard, with the pinned sidecars folded out (they are
+    # asserted to be the exact residue above, so nothing is masked).
+    adjusted = dict(
+        measured,
+        objects_total=measured["objects_total"] - len(overview_sidecars),
+        objects_other=0,
+        other_keys=[],
+    )
+    assert bench_objects.object_count_mismatch(adjusted, expected) is None
     # Attribution really is the leaf prefix.
     leaf = hive.shard_leaf_path("", word).lstrip("/")
     assert any(k.startswith(leaf) for k in bench_objects.list_store_keys(root))
@@ -673,10 +691,29 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 2
     assert expected["metadata"] == 5
     # Sweep rollups (issue #300) and overview zarrs (issue #201) ride their
-    # own buckets, outside the write-path total this model audits.
+    # own buckets, outside the write-path total this model audits. Overview
+    # leaves additionally carry a D20 stats sidecar (`{window}.stats.json` at
+    # the digit node, issue #342); the classifier in
+    # `.github/scripts/bench_objects.py` (CI infra, out of the #342 PR's
+    # scope — flagged there) does not bucket them yet, so pin them as the
+    # ONLY unclassified keys and fold them out with the other second-pass
+    # artifacts. Everything else stays under the exact-zero guard.
+    overview_sidecars = [k for k in measured["other_keys"] if k.endswith("/all.stats.json")]
+    assert measured["other_keys"] == overview_sidecars
+    assert measured["objects_other"] == len(overview_sidecars) > 0
     write_path = (
-        measured["objects_total"] - measured["objects_rollups"] - measured["objects_overviews"]
+        measured["objects_total"]
+        - measured["objects_rollups"]
+        - measured["objects_overviews"]
+        - len(overview_sidecars)
     )
     assert write_path == expected["total_max"]
-    assert measured["objects_other"] == 0
-    assert bench_objects.object_count_mismatch(measured, expected) is None
+    # The mismatch guard, with the pinned sidecars folded out (they are
+    # asserted to be the exact residue above, so nothing is masked).
+    adjusted = dict(
+        measured,
+        objects_total=measured["objects_total"] - len(overview_sidecars),
+        objects_other=0,
+        other_keys=[],
+    )
+    assert bench_objects.object_count_mismatch(adjusted, expected) is None

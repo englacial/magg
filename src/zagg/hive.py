@@ -1149,7 +1149,10 @@ def process_and_write_hive(
     lazy leaf template emission counts as write: in hive the worker owns its
     leaf's template PUTs (there is no dispatcher-side template), so excluding
     them would hide real write-out cost. ``profile`` is retained and
-    forwarded (it still gates dispatcher-side rollup verbosity).
+    forwarded (it still gates dispatcher-side rollup verbosity). On success
+    the O11 content hashes (issue #342, spec §5) are computed from the staged
+    arrays, returned as ``metadata["content_hashes"]`` for the caller's D20
+    sidecar, and timed as the ``hash`` phase.
 
     ``window`` (issue #246, D13/D15) is one dispatch unit's time window:
     ``{"label", "start", "end"}``, bounds half-open in DATASET units
@@ -1232,6 +1235,14 @@ def process_and_write_hive(
     sharded = getattr(grid, "sharded", False)
     chunk_results: list | None = [] if sharded else None
 
+    # O11 staged-array sink (issue #342): the leaf writers record each
+    # assembled slab here (refs on the sharded path; the streaming path fills
+    # a leaf-wide slab chunk by chunk) so the content hashes below run over
+    # the exact in-memory values written — the ratified hash source. On the
+    # streaming path this re-adds the same O(dense leaf) term the sharded
+    # path's slab pass already accepts above (~1.3 MB at production geometry).
+    staged: dict = {}
+
     # Ragged fields accumulate across the streamed chunks (leaf-LOCAL blocks)
     # and are written ONCE after the stream (issue #209): the leaf's ragged
     # vlen array is a single ShardingCodec object spanning the shard, so a
@@ -1255,7 +1266,7 @@ def process_and_write_hive(
         _t0 = time.time()
         store = _leaf()
         local = leaf_block_index(grid, block_index, shard_key)
-        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local)
+        write_dataframe_to_zarr(carrier, store, grid=grid, chunk_idx=local, staged_out=staged)
         if ragged:
             ragged_chunks.append((local, ragged))
         _write_elapsed += time.time() - _t0
@@ -1294,7 +1305,9 @@ def process_and_write_hive(
     # ``_write_chunk``.
     if sharded and chunk_results and not metadata.get("error"):
         _t0 = time.time()
-        write_leaf_to_zarr(chunk_results, _leaf(), grid=grid, shard_key=int(shard_key))
+        write_leaf_to_zarr(
+            chunk_results, _leaf(), grid=grid, shard_key=int(shard_key), staged_out=staged
+        )
         _write_elapsed += time.time() - _t0
     # Stamp ONLY a fully-written leaf: an errored shard (or one that streamed
     # no chunks) stays unstamped — debris by definition (D4). The stamp is the
@@ -1307,7 +1320,7 @@ def process_and_write_hive(
     if "store" in box and not metadata.get("error"):
         _t0 = time.time()
         if not sharded:
-            write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid)
+            write_ragged_leaf_to_zarr(ragged_chunks, box["store"], grid=grid, staged_out=staged)
         words = np.concatenate(occupied) if occupied else None
         if words is not None and words.size == 0:
             words = None
@@ -1343,6 +1356,46 @@ def process_and_write_hive(
     # and a no-data shard (no leaf) stays write-less.
     if not metadata.get("error") and "phase_timings" in metadata and "store" in box:
         metadata["phase_timings"]["write"] = _write_elapsed
+    if not metadata.get("error") and "store" in box:
+        # O11 content hashes (issue #342, spec §5): computed in-worker at
+        # write, from the STAGED arrays (the ratified source — the write path
+        # already holds every slab, so this is a memory-bandwidth pass).
+        # Dense and ragged arrays are staged on BOTH leaf paths: the sharded
+        # one-object-per-array pass and the per-chunk streaming path
+        # (``sharded`` is forced off whenever a leaf holds one inner chunk —
+        # the ``chunk_inner``-unset default). ``resolution: chunk`` companions
+        # are the one read-back fallback inside ``hash_arrays``: they are
+        # written per chunk-block, never as a leaf slab.
+        # Recorded on ``metadata`` for the caller's D20
+        # sidecar (``telemetry.build_record``). Hive-only by ratified decision
+        # (3): flat layouts have no leaf sidecar to record into, and no flat
+        # writer computes hashes — those stores stay verifiable by running
+        # the §5 recipe manually. Fail-open: the record is telemetry-class
+        # (D9), and §5.3 reads absence as unverifiable, never tampered — a
+        # dropped record is strictly safer than a wrong one (the §5.2 raise
+        # gate lands here as a warning + no record).
+        _t0 = time.time()
+        try:
+            import warnings
+
+            from zagg.content_hash import content_hashes_record, hash_arrays
+
+            group = zarr.open_group(box["store"], path="", mode="r", zarr_format=3)
+            with warnings.catch_warnings():
+                # The leaf's own coverage sidecar is the one known non-zarr
+                # object under the prefix; ``members()`` warn-skips it (the
+                # ``process_and_write_raster_hive`` suppression precedent).
+                warnings.filterwarnings("ignore", message=f"Object at {COVERAGE_SIDECAR}")
+                metadata["content_hashes"] = content_hashes_record(
+                    hash_arrays(group, staged=staged)
+                )
+        except Exception as e:
+            logger.warning(f"O11 content hashing failed (fail-open, issue #342): {e}")
+        else:
+            # Same "populated phase_timings" gate as the write stamp above:
+            # the timing rides an existing dict, never seeds one.
+            if "phase_timings" in metadata:
+                metadata["phase_timings"]["hash"] = time.time() - _t0
     return metadata
 
 

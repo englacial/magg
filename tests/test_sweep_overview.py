@@ -731,6 +731,66 @@ class TestOverviewWriter:
         assert g["h_min"][0] == 1.0
 
 
+class TestOverviewContentHashes:
+    """Issue #342 phase 4: overview leaves get §5 ``content_hashes`` sidecars,
+    computed from the folded arrays in memory; the envelope's sweep-internal
+    skip digest is a different recipe and stays untouched."""
+
+    def test_sidecar_records_section5_hashes_with_parity(self, tmp_path):
+        from zagg.content_hash import combined_hash, hash_arrays
+        from zagg.telemetry import SPEC_V3, read_sidecar
+
+        _write_manifest(tmp_path, orders=(1,))
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0], 5: [10.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        leaf = str(tmp_path / "-3" / "1" / "all.zarr")
+        record = read_sidecar(leaf, spec=SPEC_V3)
+        assert record is not None and record["window"] is None
+        # Write-read parity, overview edition: the staged-source hashes must
+        # equal a full read-back of the written overview zarr.
+        group = zarr.open_group(open_store(leaf), mode="r", zarr_format=3)
+        read_back = hash_arrays(group)
+        assert record["content_hashes"]["arrays"] == read_back
+        assert record["content_hashes"]["combined"] == combined_hash(read_back)
+        # Discovery-based scope: morton + every composable field, none extra.
+        assert set(read_back) == {"3/morton", "3/count", "3/h_min", "3/h_tdigest"}
+
+    def test_stamp_skip_digest_stays_separate_and_untouched(self, tmp_path):
+        from zagg.telemetry import SPEC_V3, read_sidecar
+
+        _write_manifest(tmp_path, orders=(1,))
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        envelope = json.loads((tmp_path / "-3" / "1" / "overview.rollup.json").read_text())
+        entry = envelope["windows"]["all"]
+        root = _overview_root(tmp_path, "-3/1", "all.zarr")
+        # The sweep-internal skip digest still rides envelope + attrs...
+        assert entry["content_hash"] == root.attrs[OVERVIEW_ATTR]["content_hash"]
+        # ...and is NOT the §5 combined hash (different recipe, different job).
+        record = read_sidecar(str(tmp_path / "-3" / "1" / "all.zarr"), spec=SPEC_V3)
+        assert entry["content_hash"] != record["content_hashes"]["combined"]
+
+    def test_windowed_overviews_get_per_window_sidecars(self, tmp_path):
+        from zagg.telemetry import SPEC_V3, read_sidecar
+
+        _write_manifest(tmp_path, orders=(1,), windowed=True, all_time=True)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]}, window="2019")
+        _make_leaf(tmp_path, "-311", {0: [10.0]}, window="2020")
+        word = morton_word("-311")
+        run_sweep(str(tmp_path), [(word, "2019"), (word, "2020")], families=("overview",))
+        node = tmp_path / "-3" / "1"
+        # D23 window-only naming keys one sidecar per window basename — the
+        # legacy grammar would have keyed them all to one stats.json.
+        assert (node / "2019.stats.json").exists()
+        assert (node / "2020.stats.json").exists()
+        assert (node / "all.stats.json").exists()
+        r2019 = read_sidecar(str(node / "2019.zarr"), spec=SPEC_V3)
+        rall = read_sidecar(str(node / "all.zarr"), spec=SPEC_V3)
+        assert r2019["window"] == "2019"
+        assert rall["window"] == "all"
+        assert r2019["content_hashes"]["combined"] != rall["content_hashes"]["combined"]
+
+
 class TestSection83Obligations:
     """The standing D22 test claims for the overview family (§8.3)."""
 
