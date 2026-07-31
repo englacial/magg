@@ -306,18 +306,25 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     the manifest's own ``shard_order``, validated against store truth, and
     RMW'd into the manifest. Unlike the sweep's fail-open ``materialized``
     update (:func:`_update_manifest_pyramid`), this is the user's explicit
-    operation: every failure raises — a missing manifest, a declaration the
-    store contradicts — and nothing is half-written (the one PUT is the
-    whole write).
+    operation: every failure raises — a missing or malformed manifest, a config
+    whose semantics the store's frozen hash denies, a declaration the store
+    contradicts — and nothing is half-written (the one PUT is the whole write).
 
-    Validation source: ONE committed leaf, found through the store's run
-    records (:func:`zagg.sweep.discover_leaves` — the sweep's own LIST-free
-    discovery), read at the manifest ``cell_order``. Leaves are the layer
-    the overview fold actually reads, so they are the store truth that can
-    contradict a fold recipe; the D19 ``aggregation.yaml`` core is NOT used
-    (it is itself config-derived and written fail-open). A store with no
-    committed leaf yet is still declarable: field-level checks are then
-    skipped and the summary says so.
+    Two validation sources, covering the two halves of the recipe:
+
+    * **Typing** — ONE committed leaf, found through the store's run records
+      (:func:`zagg.sweep.discover_leaves`, the sweep's own tree-enumeration-free
+      discovery: one shallow root LIST of the run records, never a recursive
+      LIST), read at the manifest ``cell_order``. Leaves are the layer the
+      overview fold actually reads, so they are what can falsify the declared
+      **presence, dtype, and D18 ragged element shape** of each field. They
+      cannot falsify more than that: no leaf records which reducer produced it.
+      A store with no committed leaf yet is still declarable — field-level
+      checks are then skipped and the summary says which skip it was.
+    * **Semantics** — the manifest's own frozen ``semantic_hash``
+      (:func:`_semantic_guard`), which is what covers the ``method``/
+      ``nan_policy`` half the leaf is silent on. The D19 ``aggregation.yaml``
+      core is NOT used (it is itself config-derived and written fail-open).
 
     Idempotent RMW: an identical existing declaration is not re-PUT; a
     changed one is rewritten PRESERVING any ``materialized`` actuals (they
@@ -474,7 +481,14 @@ def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> 
 
     fields = block["overview"].get("fields") or {}
     if not fields:
-        return "nothing to check (declared off)"
+        # The declared-off block carries no ``fields`` key at all; an ON
+        # declaration over an empty aggregation carries an empty one. Reporting
+        # both as "declared off" would read as a lie in the summary.
+        return (
+            "nothing to check (declared off)"
+            if "fields" not in block["overview"]
+            else "nothing to check (no aggregation variables to declare)"
+        )
     # Un-capped on purpose: ``discover_leaves`` has ALREADY paid the whole cost
     # (a root LIST plus a GET + parse of every run record), so truncating its
     # result bounds nothing — it only risks giving up while committed leaves
