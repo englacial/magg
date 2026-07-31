@@ -32,6 +32,10 @@ chain (shard nodes re-read their leaf sidecars each pass; interior nodes fold
 the freshly computed child payloads, so the rewrite cascades up). A second
 sweep over an unchanged tree recomputes but PUTs nothing.
 
+Each pass also PUTs its own small run record at the store root
+(``sweep_stats_{ts}.json`` — per-family durations + counts, issue #353); like
+every other sweep artifact it is regenerable telemetry, never truth.
+
 Rollup objects are JSON sidecars at digit nodes, named ``{family}.rollup.json``
 — deliberately DISTINCT from the leaf sidecar names (``stats.json`` /
 ``coverage.moc``): under D24 mixed-order stores a node can be leaf and
@@ -529,7 +533,14 @@ def get_family(name: str) -> SweepFamily:
     return cls()
 
 
-def run_sweep(store_root: str, leaves, *, families=None, store_kwargs: dict | None = None) -> dict:
+def run_sweep(
+    store_root: str,
+    leaves,
+    *,
+    families=None,
+    store_kwargs: dict | None = None,
+    record: bool = True,
+) -> dict:
     """One sweep pass: fold leaf artifacts up-tree for each family (D22).
 
     ``leaves`` is the run-record-derived work set — an iterable of
@@ -545,11 +556,20 @@ def run_sweep(store_root: str, leaves, *, families=None, store_kwargs: dict | No
     payload compare is the same-second backstop the generation stamp cannot see
     (module docstring). Returns a summary with
     per-family ``written`` / ``current`` (skip-if-current) / ``empty`` (no
-    artifact found) / ``failed`` (unmergeable, logged) counts.
+    artifact found) / ``failed`` (unmergeable, logged) counts, each carrying
+    its wall-clock ``duration_s`` (issue #353) plus a pass total — the sweep's
+    analogue of the workers' ``phase_timings``, so benchmark runs are not
+    limited to billed-duration inference.
+
+    Unless ``record=False``, the summary is also PUT at the store root as the
+    sweep's own run record (:func:`_write_sweep_record`, fail-open).
     """
+    import time
+
     from zagg.hive import MANIFEST_NAME, read_manifest
     from zagg.store import open_object_store
 
+    t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
     manifest = read_manifest(store_root, **store_kwargs)
     if manifest is None:
@@ -566,14 +586,46 @@ def run_sweep(store_root: str, leaves, *, families=None, store_kwargs: dict | No
         "families": {},
     }
     for fam in fams:
+        fam_t0 = time.perf_counter()
         runner = getattr(fam, "sweep_store", None)
         if runner is not None:
-            summary["families"][fam.name] = runner(store_root, manifest, by_shard, store_kwargs)
+            result = runner(store_root, manifest, by_shard, store_kwargs)
         else:
-            summary["families"][fam.name] = _sweep_family(
+            result = _sweep_family(
                 store_root, store, fam, by_shard, shard_order, manifest.get("spec"), store_kwargs
             )
+        result["duration_s"] = time.perf_counter() - fam_t0
+        summary["families"][fam.name] = result
+    summary["duration_s"] = time.perf_counter() - t0
+    if record:
+        summary["record"] = _write_sweep_record(store, summary)
     return summary
+
+
+def _write_sweep_record(store, summary: dict) -> str | None:
+    """PUT the sweep's run record at the store root; its key, or ``None`` (#353).
+
+    One small JSON object per sweep pass — ``sweep_stats_{ts}.json``,
+    timestamp-first like the run parquets (D20) so a lexicographic listing is
+    chronological, and deliberately OUTSIDE the ``stats_*.parquet`` glob the
+    sweep's own run-record discovery scans (a sweep record must never read as
+    a shard run record). A second pass within the same wall-clock second
+    overwrites the first — acceptable for telemetry, which this is: fail-open
+    (one warning, ``None``), never truth, exactly like every other sweep
+    artifact (D9).
+    """
+    from datetime import datetime, timezone
+
+    import obstore
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    key = f"sweep_stats_{ts}.json"
+    try:
+        obstore.put(store, key, json.dumps({"spec": SWEEP_SPEC, **summary}, indent=1).encode())
+    except Exception as e:
+        logger.warning(f"sweep: run record write failed (fail-open, D9 — telemetry): {e}")
+        return None
+    return key
 
 
 def _normalize_leaves(leaves, shard_order: int):

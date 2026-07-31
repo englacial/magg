@@ -212,6 +212,69 @@ class TestNothingLoadBearing:
         assert _rollup(tmp_path, "-3")["payload"] == merge(list(recs.values()))
 
 
+class TestRecordAndTimings:
+    """The sweep's own telemetry (issue #353): durations + store-root record."""
+
+    def test_families_and_total_carry_durations(self, tmp_path):
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
+        for result in summary["families"].values():
+            assert result["duration_s"] >= 0.0
+        # The pass total spans every family (and the pre-walk setup).
+        assert summary["duration_s"] >= max(r["duration_s"] for r in summary["families"].values())
+
+    def test_record_written_at_root(self, tmp_path):
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
+        records = sorted(tmp_path.glob("sweep_stats_*.json"))
+        assert [r.name for r in records] == [summary["record"]]
+        payload = json.loads(records[0].read_text())
+        assert payload["spec"] == SWEEP_SPEC
+        assert payload["n_leaves"] == 1
+        assert set(payload["families"]) == set(summary["families"])
+        assert payload["duration_s"] >= 0.0
+        # The record is the summary itself; its own key is set only after the PUT.
+        assert "record" not in payload
+
+    def test_record_false_writes_nothing(self, tmp_path):
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        summary = run_sweep(str(tmp_path), _leaf_refs("-311"), record=False)
+        assert "record" not in summary
+        assert list(tmp_path.glob("sweep_stats_*.json")) == []
+
+    def test_record_write_failure_is_fail_open(self, tmp_path, monkeypatch, caplog):
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        real_put = obstore.put
+
+        def flaky_put(store, key, *args, **kwargs):
+            if str(key).startswith("sweep_stats_"):
+                raise RuntimeError("boom")
+            return real_put(store, key, *args, **kwargs)
+
+        monkeypatch.setattr(obstore, "put", flaky_put)
+        with caplog.at_level("WARNING"):
+            summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
+        # The record is telemetry: its failure never touches the fold result.
+        assert summary["record"] is None
+        assert summary["families"]["stats"]["written"] > 0
+        assert any("run record write failed" in m for m in caplog.messages)
+
+    def test_record_name_is_outside_the_run_parquet_glob(self, tmp_path):
+        # discover_leaves scans ``stats_.+\.parquet``; the sweep's own record
+        # must never read as a shard run record.
+        import re
+
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
+        assert not re.fullmatch(r"stats_.+\.parquet", summary["record"])
+        assert re.fullmatch(r"sweep_stats_[0-9]{8}T[0-9]{6}Z\.json", summary["record"])
+
+
 class TestWorkSetEdges:
     def test_missing_sidecar_leaf_is_skipped_not_fatal(self, tmp_path):
         _write_manifest(tmp_path)
