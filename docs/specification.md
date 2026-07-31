@@ -737,6 +737,16 @@ and is not a legal zagg array name). A leaf with no recorded
 report "nothing recorded" as a distinct outcome from a mismatch (the
 conservative dedup posture — an unverifiable leaf is never a hit).
 
+**Contract.** A sweep-built **overview** (§4) records its hashes in a sidecar
+the same way, and that sidecar is named from the overview's own basename —
+the stem plus `.stats.json` (`all.zarr` → `all.stats.json`, `2019.zarr` →
+`2019.stats.json`), a sibling object at the ancestor node. Unlike a source
+leaf's sidecar name, which is keyed to the store's `spec` revision, the stem
+grammar applies to an overview sidecar **unconditionally, at every
+revision**: one ancestor node holds every window's overview (§4.2), so a
+revision-keyed bare name would resolve all of them to a single `stats.json`
+at that node.
+
 *(Informative.)* The O11 hash is the verification half of the D19 identity
 split — the `semantic_hash` says two leaves were *intended* identical; O11
 says they *are* byte-identical — and doubles as the mismatch localizer
