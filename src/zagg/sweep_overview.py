@@ -358,6 +358,7 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
             f"declared orders {bad} are not ancestor orders of the manifest "
             f"shard_order {shard_order} — the config does not match this store"
         )
+    semantic = _semantic_guard(manifest, config)
     validated = _validate_block_against_store(store_root, manifest, block, store_kwargs)
     # Re-read immediately before the RMW, the same discipline
     # :func:`_update_manifest_pyramid` uses: validation above is slow (run-record
@@ -379,7 +380,7 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     summary = {
         "orders": list(block["overview"].get("orders") or []),
         "fields": {n: m.get("class") for n, m in (block["overview"].get("fields") or {}).items()},
-        "validated": validated,
+        "validated": f"{validated}; {semantic}",
         "previous": "absent" if prior is None else "identical" if prior == block else "replaced",
         "updated": prior != block,
     }
@@ -393,6 +394,49 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
         json.dumps(fresh, indent=1).encode(),
     )
     return summary
+
+
+def _semantic_guard(manifest: dict, config) -> str:
+    """Refuse a config whose semantics the store's frozen ``semantic_hash`` denies.
+
+    The leaf probe (:func:`_field_drift`) can falsify TYPING only — no leaf
+    records which reducer produced a field — so nothing there contradicts a
+    declaration of ``method: "max"`` over a store holding minima, and
+    :func:`build_pyramid_block` puts exactly that fold law into the block. The
+    store does record its reducers, in the one place the repo calls
+    authoritative: the D19 frozen ``semantic_hash`` (issue #299), a digest over
+    the whole ``aggregation`` block. Comparing it here is what makes the issue
+    #358 contract ("a wrong config cannot install a fold recipe the store
+    contradicts") true of the fold LAW and not just of dtypes.
+
+    ``output.*`` is not in the semantic core, so the intended retrofit config —
+    the original plus ``output.pyramid`` — hashes identically; the guard cannot
+    false-refuse on the pyramid edit itself. It compares only when the manifest
+    declares the key, the same both-sides-present exemption
+    :func:`zagg.hive._frozen_matches` gives pre-#299 stores (a pre-#344 retrofit
+    target may well be one). Returns the note recorded in the summary.
+    """
+    from zagg.semantics import semantic_fingerprint, semantic_hash
+
+    stored = manifest.get("semantic_hash")
+    if not stored:
+        logger.warning(
+            "declare_pyramid: the manifest carries no semantic_hash (pre-#299 store) — "
+            "the config's aggregation semantics could NOT be verified against the store; "
+            "the declared fold methods are taken on trust"
+        )
+        return "semantic_hash absent (pre-#299 store — fold methods unverified)"
+    supplied = semantic_hash(config)
+    if supplied != stored:
+        raise ValueError(
+            f"config semantics {semantic_fingerprint(supplied)} != the store's frozen "
+            f"semantic_hash {semantic_fingerprint(stored)} — this config did not build this "
+            f"store, so the fold methods it declares (which no leaf records, and which the "
+            f"field checks cannot falsify) are not the store's; declare_pyramid refuses. "
+            f"Retrofit with the ORIGINAL config: output.* is not in the semantic core, so "
+            f"adding output.pyramid to it hashes identically"
+        )
+    return f"semantic_hash {semantic_fingerprint(stored)}"
 
 
 def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> str:

@@ -994,11 +994,19 @@ class TestDeclarePyramid:
     #: Per-leaf observations the retrofit fixtures write.
     CELLS = {"-311": {0: [1.0, 2.0]}, "-312": {0: [3.0]}}
 
-    def _pre_declaration_store(self, root, decimals=("-311",)):
-        """A pre-#344-style store: manifest WITHOUT a pyramid key + committed leaves."""
+    def _pre_declaration_store(self, root, decimals=("-311",), semantic_config=None):
+        """A pre-#344-style store: manifest WITHOUT a pyramid key + committed leaves.
+
+        ``semantic_config`` stamps the D19 frozen ``semantic_hash`` the config
+        guard compares against; omitted leaves the pre-#299 (hash-less) shape.
+        """
         _write_manifest(root)
         manifest = json.loads((root / MANIFEST_NAME).read_text())
         del manifest["pyramid"]
+        if semantic_config is not None:
+            from zagg.semantics import semantic_hash
+
+            manifest["semantic_hash"] = semantic_hash(semantic_config)
         obstore.put(open_object_store(str(root)), MANIFEST_NAME, json.dumps(manifest).encode())
         for d in decimals:
             _make_leaf(root, d, self.CELLS[d])
@@ -1162,6 +1170,44 @@ class TestDeclarePyramid:
         # Recorded absence: the sweep sees the declared-off block and no-ops.
         result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
         assert result["families"]["overview"]["declared"] is False
+
+    def test_wrong_reducer_refuses_via_semantic_hash(self, tmp_path):
+        # The failure the leaf probe structurally cannot catch: no leaf records
+        # which reducer produced a field, so a config declaring h_min as a MAX
+        # over a store of minima passes every dtype check. The store's frozen
+        # semantic_hash is what refuses it.
+        self._pre_declaration_store(tmp_path, semantic_config=_leaf_cfg())
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_min"]["function"] = "max"
+        with pytest.raises(ValueError, match="config semantics .* != the store's frozen"):
+            declare_pyramid(str(tmp_path), cfg)
+        assert "pyramid" not in read_manifest(str(tmp_path))
+
+    def test_pyramid_only_edit_hashes_identically(self, tmp_path):
+        # The intended retrofit — the ORIGINAL config plus output.pyramid —
+        # must not false-refuse: output.* is not in the semantic core.
+        from zagg.semantics import semantic_fingerprint, semantic_hash
+
+        self._pre_declaration_store(tmp_path, semantic_config=_leaf_cfg())
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"orders": [1, 0]}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True and summary["orders"] == [1, 0]
+        fp = semantic_fingerprint(semantic_hash(_leaf_cfg()))
+        assert summary["validated"].endswith(f"semantic_hash {fp}")
+
+    def test_hashless_manifest_skips_the_semantic_check(self, tmp_path, caplog):
+        # Pre-#299 stores carry no hash; the check is skipped (the _frozen_matches
+        # both-sides-present exemption) but loudly, and the summary says so.
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_min"]["function"] = "max"  # unverifiable here
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True
+        assert summary["validated"].endswith(
+            "semantic_hash absent (pre-#299 store — fold methods unverified)"
+        )
+        assert "could NOT be verified" in caplog.text
 
     def test_missing_manifest_raises(self, tmp_path):
         with pytest.raises(ValueError, match="not a hive store root"):
