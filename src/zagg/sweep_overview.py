@@ -534,19 +534,41 @@ def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> 
 
 
 def _field_drift(group, name, meta) -> str | None:
-    """One declared field's mismatch against its stored leaf array, or ``None``."""
-    from zagg.grids.base import RAGGED_ELEMENT_ATTR
+    """One declared field's mismatch against its stored leaf array, or ``None``.
+
+    The ragged branch also gates the D18 attrs' **spec revision** against
+    :data:`zagg.grids.base.RAGGED_SPEC`, mirroring the readers' posture
+    (``readers.tdigest_tensor._open_ragged`` raises on mismatch) rather than
+    inventing a second policy. A store whose ragged layout this zagg cannot
+    read is the purest instance of the tool's contract — a fold recipe the
+    store contradicts: without the gate the retrofit installs a declaration
+    promising overviews the sweep then fails to read at FOLD time, later and
+    with a worse error. ``zagg-ragged/2`` is a live migration path (issue
+    #210 moves the element declaration into the zarr data type), so this is
+    not hypothetical (espg-ruled, issue #358).
+    """
+    from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC
 
     try:
         arr = group[name]
     except KeyError:
         return f"field {name!r} is declared but absent from the leaf"
     if meta["class"] == "approximate":
-        element = ((arr.attrs.get(RAGGED_ELEMENT_ATTR) or {}).get("element")) or {}
+        raw = arr.attrs.get(RAGGED_ELEMENT_ATTR)
+        ragged = dict(raw) if isinstance(raw, dict) else {}
+        element = ragged.get("element") or {}
         if not element:
             return (
                 f"field {name!r}: declared approximate (ragged) but the stored "
                 f"array carries no ragged element declaration"
+            )
+        if ragged.get("spec") != RAGGED_SPEC:
+            return (
+                f"field {name!r}: the stored array declares ragged spec "
+                f"{ragged.get('spec')!r}; this zagg understands {RAGGED_SPEC!r} only — "
+                f"a newer writer's layout must be adopted deliberately, not folded "
+                f"blind (declaring overviews over it would promise a fold that fails "
+                f"at sweep time)"
             )
         declared_dt = np.dtype(meta.get("dtype") or "float32")
         # Explicit, because ``np.dtype(None)`` is float64: an element block that

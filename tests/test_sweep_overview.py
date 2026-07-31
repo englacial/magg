@@ -1176,6 +1176,25 @@ class TestDeclarePyramid:
         with pytest.raises(ValueError, match="h_tdigest.*inner_shape"):
             declare_pyramid(str(tmp_path), _leaf_cfg())
 
+    def test_unreadable_ragged_spec_revision_refuses(self, tmp_path):
+        # espg-ruled (issue #358): a store whose ragged layout THIS zagg cannot
+        # read must be refused at declaration, not discovered at fold time.
+        # Same posture as the reader (readers.tdigest_tensor._open_ragged).
+        from zarr import open_array
+
+        from zagg.grids.base import RAGGED_SPEC
+
+        self._pre_declaration_store(tmp_path)
+        leaf = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        arr = open_array(leaf, path=f"{CELL_ORDER}/h_tdigest", mode="r+", zarr_format=3)
+        rag = dict(arr.attrs["ragged"])
+        assert rag["spec"] == RAGGED_SPEC  # the fixture is a current-spec store
+        rag["spec"] = "zagg-ragged/2"  # the live migration path (issue #210)
+        arr.attrs["ragged"] = rag
+        with pytest.raises(ValueError, match="h_tdigest.*zagg-ragged/2"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert "pyramid" not in read_manifest(str(tmp_path))  # nothing written
+
     def test_declared_off_retrofit(self, tmp_path):
         self._pre_declaration_store(tmp_path)
         cfg = _leaf_cfg()
