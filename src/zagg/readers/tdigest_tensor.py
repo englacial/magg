@@ -694,8 +694,12 @@ def read_tensors(
         HEALPix order of the emitted blocks (default ``None`` — one block per
         read chunk). Must be at or coarser than the chunk order; a block is
         assembled from whole read chunks with one shared z-window. With a
-        ``subtree`` the composed bound is ``subtree_order <= block_order <=
-        chunk_order``, so blocks tile the subtree.
+        ``subtree`` the floor is the order of the span actually VISITED — the
+        subtree CLIPPED to this axis — so the composed bound is
+        ``max(subtree_order, axis_root_order) <= block_order <= chunk_order``:
+        blocks tile the visited span, and a word above the axis root (which
+        clips to the whole axis) takes the ROOT's order as its floor, not its
+        own.
     subtree : int or str, optional
         Restrict the sweep to the read chunks below this morton ancestor —
         packed area word or decimal string, as in :func:`read_raw_values`
