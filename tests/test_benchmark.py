@@ -967,6 +967,66 @@ def test_main_unknown_target_fails_before_any_dispatch(tmp_path, monkeypatch):
     assert called["n"] == 0  # no dispatch happened
 
 
+# --- per-commit store scoping (issue #362) --------------------------------
+
+
+def test_store_path_scopes_by_commit():
+    # The store carries the commit under test as a path component, so a run
+    # measures a store only it wrote (issue #362): a shared
+    # {prefix}/{target}.zarr accumulated every prior run's root telemetry.
+    assert (
+        bench_metrics.store_path("s3://b/zagg-bench", "t", commit="5e35e2c9f1a2b3c4d5e6")
+        == "s3://b/zagg-bench/5e35e2c9f1a2/t.zarr"
+    )
+    # Deterministic sanitization: non-alphanumerics dropped, lowercased,
+    # shortened -- and a trailing prefix slash never doubles.
+    assert (
+        bench_metrics.store_path("s3://b/zagg-bench/", "t", commit="refs/AB-12")
+        == "s3://b/zagg-bench/refsab12/t.zarr"
+    )
+    assert bench_metrics.store_path("s3://b/p", "t", commit="ABC123") == "s3://b/p/abc123/t.zarr"
+
+
+def test_store_path_empty_commit_falls_back_to_unscoped():
+    # A local run / --dry-run wiring check plumbs no commit: fall back to the
+    # historical unscoped path rather than emitting an empty path segment
+    # ("s3://b/p//t.zarr", which s3 would take literally).
+    assert bench_metrics.store_path("s3://b/p", "t") == "s3://b/p/t.zarr"
+    assert bench_metrics.store_path("s3://b/p", "t", commit="") == "s3://b/p/t.zarr"
+    assert bench_metrics.store_path("s3://b/p/", "t", commit="   ") == "s3://b/p/t.zarr"
+
+
+def test_main_store_path_is_commit_scoped(tmp_path, monkeypatch):
+    # The per-merge runner threads --commit into the store path it dispatches.
+    seen = {}
+
+    def fake(name, *a, **k):
+        seen[name] = k["store"]
+        return _fake_record(name, total_obs=1, max_memory_mb=100.0)
+
+    monkeypatch.setattr(run_benchmark, "run_target", fake)
+    argv = [
+        "--targets",
+        str(BENCH / "targets.json"),
+        "--target",
+        "tdigest_healpix_o10_inline",
+        "--store-prefix",
+        "s3://bucket/zagg-bench",
+        "--out-json",
+        str(tmp_path / "metrics.json"),
+    ]
+    run_benchmark.main([*argv, "--commit", "5e35e2c9f1a2b3c4"])
+    assert seen == {
+        "tdigest_healpix_o10_inline": "s3://bucket/zagg-bench/5e35e2c9f1a2/"
+        "tdigest_healpix_o10_inline.zarr"
+    }
+    seen.clear()
+    run_benchmark.main([*argv, "--commit", ""])
+    assert seen == {
+        "tdigest_healpix_o10_inline": "s3://bucket/zagg-bench/tdigest_healpix_o10_inline.zarr"
+    }
+
+
 # --- manifest integrity (the pin is internally consistent) ----------------
 
 

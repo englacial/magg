@@ -165,6 +165,43 @@ def test_sidecar_cache_probe_graceful():
     )
 
 
+# --- per-commit store scoping (issue #362) ----------------------------------
+
+
+def test_store_path_is_commit_scoped(tmp_path, monkeypatch):
+    # The full-AOI runner scopes its store by the commit under test, through
+    # the one shared helper -- and falls back to the unscoped path when no
+    # commit is plumbed (issue #362).
+    seen = []
+    monkeypatch.setattr(
+        rfab, "run_target", lambda name, *a, **k: (seen.append(k["store"]) or {}, [])
+    )
+    argv = [
+        "--targets",
+        str(BENCH / "targets_full_aoi_neon.json"),
+        "--target",
+        "full_aoi_neon_o9_hive_mask",
+        "--catalog",
+        str(BENCH / "catalogs" / "cat_neon.parquet"),
+        "--store-prefix",
+        "s3://bucket/zagg-bench/full-aoi",
+        "--dry-run",
+        "--event",
+        "release",
+        "--out-json",
+        str(tmp_path / "m.json"),
+        "--out-shards-json",
+        str(tmp_path / "s.json"),
+        "--artifacts-dir",
+        str(tmp_path / "art"),
+    ]
+    assert rfab.main([*argv, "--commit", "5e35e2c9f1a2b3c4"]) == 0
+    assert seen == ["s3://bucket/zagg-bench/full-aoi/5e35e2c9f1a2/full_aoi_neon_o9_hive_mask.zarr"]
+    seen.clear()
+    assert rfab.main([*argv, "--commit", ""]) == 0
+    assert seen == ["s3://bucket/zagg-bench/full-aoi/full_aoi_neon_o9_hive_mask.zarr"]
+
+
 # --- store object-count metric (issue #240, record-only) --------------------
 
 

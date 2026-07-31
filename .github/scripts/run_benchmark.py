@@ -438,7 +438,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--store-prefix",
         default=None,
-        help="Output store prefix; each target writes <prefix>/<target>.zarr",
+        help="Output store prefix; each target writes <prefix>/<commit>/<target>.zarr "
+        "(<prefix>/<target>.zarr when --commit is empty)",
     )
     parser.add_argument("--region", default="us-west-2", help="AWS region")
     parser.add_argument(
@@ -526,7 +527,8 @@ def main(argv: list[str] | None = None) -> int:
     def _dispatch(name: str) -> dict:
         store = None
         if args.store_prefix:
-            store = f"{args.store_prefix.rstrip('/')}/{name}.zarr"
+            # Per-commit scoping (issue #362): see bench_metrics.store_path.
+            store = bench_metrics.store_path(args.store_prefix, name, commit=args.commit)
         return run_target(
             name,
             manifest,

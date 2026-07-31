@@ -14,6 +14,7 @@ stats collapse to that single worker: ``worker_max_s`` is the shard's runtime an
 from __future__ import annotations
 
 import math
+import re
 
 # Cost model and grid types come straight from the package so the benchmark can
 # never drift from what production actually bills/uses (arm64, 4 GB -- issue #110/#193).
@@ -29,6 +30,11 @@ from zagg.grids.rectilinear import RectilinearGrid
 # 512 MB /tmp function, so its ephemeral cost is $0 (all free-tier). Cost per
 # shard = compute (runtime * memory_gb * price) + ephemeral (runtime *
 # billable_gb * ephemeral_price).
+#: Characters of the commit sha the benchmark store path carries (issue #362).
+#: A short sha: collision-free at this repo's scale, and the store is scoped by
+#: prefix anyway -- the component only has to separate runs, not identify them.
+_COMMIT_COMPONENT_LEN = 12
+
 LAMBDA_EPHEMERAL_PRICE_PER_GB_SEC = 0.0000000309
 FREE_EPHEMERAL_MB = 512  # the always-free /tmp allotment; only the excess bills
 
@@ -154,6 +160,32 @@ PHASE_MAP = {
     "aggregate": "phase_aggregate_s",
     "write": "phase_write_s",
 }
+
+
+def store_path(store_prefix: str, name: str, *, commit: str = "") -> str:
+    """One target's output store, scoped to the commit under test (issue #362).
+
+    ``{prefix}/{commit}/{name}.zarr``. Keyed only by target name, the store was
+    shared by every run of every branch, so per-run-unique root telemetry (the
+    issue #297 run parquet, the issue #353 sweep record) accumulated there and
+    eventually pushed the object-count model past its ceiling. Scoping by commit
+    means a run measures a store only IT wrote, so the counts are deterministic
+    again.
+
+    The component is the commit sha stripped of everything outside ``[0-9a-zA-Z]``
+    and shortened to :data:`_COMMIT_COMPONENT_LEN` characters -- deterministic,
+    path-safe on S3 and local paths alike, and short enough to keep keys legible.
+    An EMPTY ``commit`` (a local invocation, a ``--dry-run`` wiring check, a
+    workflow that does not plumb one) falls back to the historical UNSCOPED
+    ``{prefix}/{name}.zarr`` rather than emitting a ``{prefix}//{name}.zarr``
+    double slash -- which s3 would take literally, as an empty path segment.
+
+    Shared by all three runners (``run_benchmark``, ``run_full_aoi_benchmark``,
+    ``run_raster_benchmark``) so the layout has ONE definition.
+    """
+    prefix = store_prefix.rstrip("/")
+    short = re.sub(r"[^0-9a-zA-Z]", "", commit)[:_COMMIT_COMPONENT_LEN].lower()
+    return f"{prefix}/{short}/{name}.zarr" if short else f"{prefix}/{name}.zarr"
 
 
 def select_densest_shard(shardmap: dict) -> tuple[int, int]:

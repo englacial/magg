@@ -95,6 +95,31 @@ def test_dry_run_builds_shardmap_offline(tmp_path):
     assert df.iloc[0]["stage_fetch_s"] is None or str(df.iloc[0]["stage_fetch_s"]) == "nan"
 
 
+def test_store_path_is_commit_scoped(tmp_path, monkeypatch):
+    # The raster runner scopes its store by the commit under test, through the
+    # one shared helper (issue #362) -- and falls back to the unscoped path
+    # when no commit is plumbed.
+    seen = []
+    monkeypatch.setattr(rrb, "run_target", lambda name, *a, **k: seen.append(k["store"]) or {})
+    argv = [
+        "--targets",
+        str(BENCH / "targets_raster_neon.json"),
+        "--store-prefix",
+        "s3://bucket/zagg-bench/raster/",
+        "--event",
+        "release",
+        "--out-json",
+        str(tmp_path / "m.json"),
+        "--artifacts-dir",
+        str(tmp_path / "art"),
+    ]
+    assert rrb.main([*argv, "--commit", "5e35e2c9f1a2b3c4"]) == 0
+    assert seen == ["s3://bucket/zagg-bench/raster/5e35e2c9f1a2/raster_s2_neon_2025.zarr"]
+    seen.clear()
+    assert rrb.main([*argv, "--commit", ""]) == 0
+    assert seen == ["s3://bucket/zagg-bench/raster/raster_s2_neon_2025.zarr"]
+
+
 def test_live_dispatch_requires_store_prefix(tmp_path):
     with pytest.raises(SystemExit, match="store-prefix"):
         rrb.main(

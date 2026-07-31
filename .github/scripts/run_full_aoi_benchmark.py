@@ -681,7 +681,11 @@ def main(argv: list[str] | None = None) -> int:
         "--target", action="append", default=[], help="Target name (repeatable; omit for all)"
     )
     ap.add_argument("--catalog", required=True, help="Local full ATL03 stac-geoparquet catalog")
-    ap.add_argument("--store-prefix", default=None, help="<prefix>/<target>.zarr output store")
+    ap.add_argument(
+        "--store-prefix",
+        default=None,
+        help="<prefix>/<commit>/<target>.zarr output store (unscoped when --commit is empty)",
+    )
     ap.add_argument("--region", default="us-west-2")
     ap.add_argument("--function-name", default="process-shard")
     ap.add_argument(
@@ -731,7 +735,12 @@ def main(argv: list[str] | None = None) -> int:
 
     runs, shards = [], []
     for name in names:
-        store = f"{args.store_prefix.rstrip('/')}/{name}.zarr" if args.store_prefix else None
+        # Per-commit scoping (issue #362): see bench_metrics.store_path.
+        store = (
+            bench_metrics.store_path(args.store_prefix, name, commit=args.commit)
+            if args.store_prefix
+            else None
+        )
         run, shard_rows = run_target(
             name,
             manifest,
