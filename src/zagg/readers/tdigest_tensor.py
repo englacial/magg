@@ -418,6 +418,11 @@ def _subtree_span(arr, morton, field, subtree) -> tuple[tuple[int, int] | None, 
         cell_order,
         int(arr.shape[0]),
         field,
+        # The disjoint-word warning belongs to the READER's caller: from
+        # subtree_cell_span that is here (2), the reader's own frame (3) —
+        # a generator, so it runs on the consumer's first next() — and the
+        # consumer (4). Anything less points inside zagg.
+        stacklevel=4,
     )
     return span, spans
 
@@ -711,10 +716,13 @@ def read_tensors(
         (the ratified v1 refusal; recover a sub-chunk region client-side as
         a corner slice of the chunk tensor instead, keeping its shared
         ``(offset, gain)``). A well-formed word disjoint from this axis
-        warns once per call (naming the word and the axis root) and yields
-        nothing — so an **empty yield is ambiguous** between "in-domain,
-        nothing stored" and "outside the domain"; the warning is the only
-        discriminator. Malformed / too-deep words raise ``ValueError``.
+        warns at most once per call (naming the word and the axis root) and
+        yields nothing — so an **empty yield is ambiguous** between
+        "in-domain, nothing stored" and "outside the domain"; the warning is
+        the only discriminator, and whether it is DELIVERED is the caller's
+        ``warnings`` filter's call (the default action dedups a repeat of the
+        same warning in the same process). Malformed / too-deep words raise
+        ``ValueError``.
     max_block_bytes : int, optional
         Refuse a block whose emitted tensor would exceed this many bytes
         (default 2 GiB) — the guard on the ``block_order`` footgun. Raise it
@@ -915,10 +923,12 @@ def read_raw_values(
         identity). Only stored objects overlapping the subtree's contiguous
         cell span are fetched; a finer-than-chunk subtree filters ranks
         inside its one covering read chunk. A well-formed word disjoint
-        from this axis warns once per call (naming the word and the axis
-        root) and yields nothing — so an **empty yield is ambiguous**
+        from this axis warns at most once per call (naming the word and the
+        axis root) and yields nothing — so an **empty yield is ambiguous**
         between "in-domain, nothing stored" and "outside the domain"; the
-        warning is the only discriminator. A malformed word, or one deeper
+        warning is the only discriminator, and its DELIVERY is the caller's
+        ``warnings`` filter's call (the default action dedups a repeat of the
+        same warning in the same process). A malformed word, or one deeper
         than the cells-axis order, raises :class:`ValueError`.
     zarr_format : int, optional
         Zarr format version (default 3).
@@ -994,7 +1004,8 @@ def read_locations(
         Restrict the sweep to the cells below this morton ancestor, at any
         order down to a single cell — packed area word or decimal string,
         exactly as in :func:`read_raw_values` (issue #351). Same caveat: a
-        well-formed word disjoint from this axis warns once and yields
+        well-formed word disjoint from this axis warns at most once per call
+        (delivery subject to the caller's ``warnings`` filter) and yields
         nothing, so an **empty yield is ambiguous** between "in-domain,
         nothing stored" and "outside the domain" — the warning is the only
         discriminator; malformed / too-deep words raise :class:`ValueError`.

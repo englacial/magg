@@ -127,9 +127,12 @@ and hive-leaf writers are pinned to store byte-identical per-cell payloads
   (`max(subtree_order, axis_root_order) ≤ block_order ≤ chunk_order` — the
   floor is the order of the span actually *visited*, i.e. the subtree clipped
   to the axis, so a word above the axis root takes the root's order) and
-  refuses finer words, pointing at the per-cell readers. A well-formed word disjoint from the axis
-  warns once and yields nothing — so an empty yield is ambiguous without the
-  warning — while malformed or too-deep words raise.
+  refuses finer words, pointing at the per-cell readers. A well-formed word
+  disjoint from the axis warns at most once per call and yields nothing — so an
+  empty yield is ambiguous without the warning, and whether the warning is
+  *delivered* is the caller's `warnings` filter's call (the default action
+  dedups a repeat of the same warning in one process) — while malformed or
+  too-deep words raise.
 
 ## Spatially faithful tensors (deinterleave, blocks, mask)
 
