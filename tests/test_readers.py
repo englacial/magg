@@ -99,15 +99,19 @@ def _build_store(shards, *, delta=512, located_locs=None):
 
 
 class _CountingStore(MemoryStore):
-    """MemoryStore recording every satisfied GET as ``(key, byte_range, nbytes)``."""
+    """MemoryStore recording every satisfied GET as ``(key, byte_range, nbytes)``
+    and every LIST as its prefix (a LIST is not a GET, so the two accountings
+    are separate — review, PR #357)."""
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.gets: list = []
+        self.lists: list = []
 
     def with_read_only(self, read_only=True):
         s = _CountingStore(store_dict=self._store_dict, read_only=read_only)
         s.gets = self.gets
+        s.lists = self.lists
         return s
 
     async def get(self, key, prototype, byte_range=None):
@@ -115,6 +119,10 @@ class _CountingStore(MemoryStore):
         if r is not None:
             self.gets.append((key, byte_range, len(r)))
         return r
+
+    def list_prefix(self, prefix):
+        self.lists.append(prefix)
+        return super().list_prefix(prefix)
 
 
 def _sharded_store(store, *, populate, values=None):
@@ -943,6 +951,21 @@ class TestSubtreeReadTensors:
         b_block = grid.block_index(morton_word(_KEY_B))[0]
         assert len(data_gets) == 1
         assert not data_gets[0][0].endswith(f"c/{b_block}")
+
+    @pytest.mark.parametrize("reader", [read_tensors, read_raw_values])
+    def test_subtree_read_lists_the_data_keys_once(self, reader):
+        from mortie import generate_morton_children
+
+        store = _CountingStore()
+        _grid_, shard6, _t = _sharded_store(store, populate={0, 3, 7, 12})
+        sub = int(np.asarray(generate_morton_children(shard6, 7))[0])
+        store.lists.clear()
+        assert len(list(reader(store, "12/h_tdigest", subtree=sub))) >= 1
+        # The span resolution and the sweep share ONE listing: on the flat
+        # fullsphere layout this is a paginated LIST per ~1000 objects, so a
+        # second one would double the only whole-array-scale operation left on
+        # a read path framed as "never a whole-array sweep" (review, PR #357).
+        assert store.lists.count("12/h_tdigest/c/") == 1
 
     def test_sub_chunk_subtree_refused_pointing_at_per_cell_readers(self):
         from mortie import generate_morton_children

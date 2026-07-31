@@ -330,7 +330,11 @@ def _stored_chunk_spans(arr) -> list[tuple[int, int]]:
     return [(o * span, min((o + 1) * span, int(arr.shape[0]))) for o in ordinals]
 
 
-def _iter_populated_chunks(arr, span: tuple[int, int] | None = None) -> Iterator[tuple[int, list]]:
+def _iter_populated_chunks(
+    arr,
+    span: tuple[int, int] | None = None,
+    spans: list[tuple[int, int]] | None = None,
+) -> Iterator[tuple[int, list]]:
     """Yield ``(chunk_start, [(cell_pos, raw_bytes), ...])`` per populated chunk.
 
     Restricted to the stored objects (:func:`_stored_chunk_spans`), each read
@@ -357,9 +361,16 @@ def _iter_populated_chunks(arr, span: tuple[int, int] | None = None) -> Iterator
     covering chunk objects), and non-overlapping stored objects are skipped
     without a fetch. A finer-than-chunk restriction is the caller's rank
     filter — this generator always yields whole read chunks.
+
+    ``spans`` passes in an ALREADY-LISTED :func:`_stored_chunk_spans` result,
+    so a ``subtree=`` read (whose span :func:`_subtree_span` resolved against
+    that same listing) LISTs the array's data keys once instead of twice — the
+    only whole-array-scale operation left on a read path framed as "never a
+    whole-array sweep", and a paginated LIST per ~1000 objects on the flat
+    fullsphere layout (review, PR #357). ``None`` lists here.
     """
     cells_per_chunk = int(arr.chunks[0])
-    for span_start, span_stop in _stored_chunk_spans(arr):
+    for span_start, span_stop in _stored_chunk_spans(arr) if spans is None else spans:
         if span is not None:
             span_start = max(span_start, span[0] - span[0] % cells_per_chunk)
             span_stop = min(span_stop, span[1] + -span[1] % cells_per_chunk)
@@ -373,27 +384,32 @@ def _iter_populated_chunks(arr, span: tuple[int, int] | None = None) -> Iterator
                 yield span_start + offset, populated
 
 
-def _subtree_span(arr, morton, field, subtree) -> tuple[int, int] | None:
-    """Resolve the readers' ``subtree=`` to its cell span on this axis.
+def _subtree_span(arr, morton, field, subtree) -> tuple[tuple[int, int] | None, list | None]:
+    """Resolve the readers' ``subtree=`` to ``(span, spans)`` on this axis.
 
-    ``None`` = no restriction (no ``subtree`` given); ``(0, 0)`` = visit
-    nothing (a disjoint word — :func:`~zagg.readers._layout.subtree_cell_span`
+    ``span`` is ``None`` = no restriction (no ``subtree`` given); ``(0, 0)`` =
+    visit nothing (a disjoint word — :func:`~zagg.readers._layout.subtree_cell_span`
     already warned — or an empty store, which has nothing below any word).
     The anchor is the first stored span's first read chunk of the ``morton``
     coordinate — one small slice, no payload bytes (the dense coordinate
     write covers every chunk of a stored span). A malformed ``subtree``
     raises even on an empty store.
+
+    ``spans`` is the :func:`_stored_chunk_spans` listing the span was resolved
+    against (``None`` when there was no ``subtree`` and nothing was listed):
+    the caller threads it straight into :func:`_iter_populated_chunks` so the
+    restricted read LISTs the array once, not twice.
     """
     if subtree is None:
-        return None
+        return None, None
     spans = _stored_chunk_spans(arr)
     if not spans:
         normalize_subtree(subtree)  # malformed still raises; nothing to visit
-        return 0, 0
+        return (0, 0), spans
     words = morton[spans[0][0] : spans[0][0] + int(arr.chunks[0])]
     cell_order = _cells_order(words, field, spans[0][0])
     anchor = int(words[words != 0][0])
-    return subtree_cell_span(subtree, anchor, cell_order, int(arr.shape[0]), field)
+    return subtree_cell_span(subtree, anchor, cell_order, int(arr.shape[0]), field), spans
 
 
 def _open_morton(store: Store, field: str, zarr_format):
@@ -739,7 +755,7 @@ def read_tensors(
     side, depth = _tensor_side(arr, field)
     cells_per_chunk = side * side
 
-    span = _subtree_span(arr, morton, field, subtree)
+    span, spans = _subtree_span(arr, morton, field, subtree)
     if span is not None and span != (0, 0) and span[1] - span[0] < cells_per_chunk:
         # The ratified issue #351 v1 refusal: the store's smallest fetch unit
         # is the inner chunk (no I/O win), and a sub-chunk block would
@@ -751,7 +767,7 @@ def read_tensors(
             f"only; use read_raw_values / read_locations / read_cell, which "
             f"accept any subtree order down to a single cell"
         )
-    chunks = _iter_populated_chunks(arr, span)
+    chunks = _iter_populated_chunks(arr, span, spans)
     first = next(chunks, None)
     if first is None:
         return
@@ -917,8 +933,8 @@ def read_raw_values(
     side, depth = _tensor_side(arr, field)
     cells_per_chunk = side * side
 
-    span = _subtree_span(arr, morton, field, subtree)
-    for start, populated in _iter_populated_chunks(arr, span):
+    span, spans = _subtree_span(arr, morton, field, subtree)
+    for start, populated in _iter_populated_chunks(arr, span, spans):
         word = _chunk_word(morton[start : start + cells_per_chunk], field, start)
         for rank, raw in populated:
             if span is not None and not span[0] <= start + rank < span[1]:
@@ -1003,8 +1019,8 @@ def read_locations(
     side, depth = _tensor_side(loc_arr, loc_field)
     cells_per_chunk = side * side
 
-    span = _subtree_span(loc_arr, morton, loc_field, subtree)
-    for start, populated in _iter_populated_chunks(loc_arr, span):
+    span, spans = _subtree_span(loc_arr, morton, loc_field, subtree)
+    for start, populated in _iter_populated_chunks(loc_arr, span, spans):
         word = _chunk_word(morton[start : start + cells_per_chunk], loc_field, start)
         for rank, raw in populated:
             if span is not None and not span[0] <= start + rank < span[1]:
