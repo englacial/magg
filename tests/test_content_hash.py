@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 import zarr
 from zarr.storage import LocalStore
@@ -204,6 +205,116 @@ class TestWorkerWiring:
         assert {k: v for k, v in doctored.items() if k != "6/count"} == {
             k: v for k, v in honest.items() if k != "6/count"
         }
+
+
+class TestCoverageCompleteness:
+    """Issue #342 phase 3: the hash set is the leaf's OWN array inventory.
+
+    Enumeration is discovery-based (§5.1, ``group.members``) — never a
+    hardcoded field list — so a new array cannot silently drop out of the
+    hash set. The literal key sets below are the anti-circularity pin (the
+    implementation and the inventory walk would otherwise agree trivially).
+    """
+
+    def test_kitchen_sink_hash_set_equals_inventory(self, kitchen_leaf):
+        meta, leaf = kitchen_leaf
+        group = zarr.open_group(LocalStore(str(leaf)), mode="r", zarr_format=3)
+        inventory = {k for k, node in group.members(max_depth=None) if isinstance(node, zarr.Array)}
+        assert set(meta["content_hashes"]["arrays"]) == inventory
+        # The full stratified surface, by name: the morton coordinate, dense
+        # fields, ragged payloads AND their locations siblings.
+        assert inventory == {
+            "6/morton",
+            "6/count",
+            "6/composition",
+            "6/h_tdigest_signal",
+            "6/h_tdigest_signal_locations",
+            "6/h_tdigest_noise",
+            "6/h_tdigest_noise_locations",
+        }
+
+    def test_companion_field_enters_hash_set_via_readback_fallback(self, monkeypatch, tmp_path):
+        # A ``resolution: chunk`` companion is written per chunk-block, never
+        # as one staged slab — the one production case where ``hash_arrays``
+        # falls back to reading the (tiny) array back. Driven through the
+        # REAL process_shard + hive leaf write (the TestShardedMixedFieldKinds
+        # config: scalar + vector + companion + ragged).
+        import zagg.processing as processing  # noqa: F401  (patch target)
+        from zagg import hive
+        from zagg.config import default_config
+        from zagg.grids import HealpixGrid
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        cfg = default_config()
+        agg = cfg.aggregation
+        agg.setdefault("chunk_precompute", {})["chunk_base"] = {
+            "expression": "np.float32(np.mean(h_li))",
+            "source": "h_li",
+        }
+        agg["variables"]["h_edges"] = {
+            "expression": "np.array([np.min(h_li), np.max(h_li)])",
+            "source": "h_li",
+            "kind": "vector",
+            "trailing_shape": 2,
+            "dtype": "float32",
+        }
+        agg["variables"]["h_chunk_base"] = {
+            "expression": "chunk_base",
+            "resolution": "chunk",
+            "dtype": "float32",
+        }
+        agg["variables"]["h_ragged"] = {
+            "function": "np.sort",
+            "source": "h_li",
+            "kind": "ragged",
+            "inner_shape": [1],
+            "dtype": "float32",
+        }
+        grid = HealpixGrid(4, 7, layout="fullsphere", config=cfg, chunk_inner=6, sharded=True)
+        from mortie import geo2mort
+
+        shard_key = int(geo2mort(-78.5, -132.0, order=4)[0])
+        children = grid.children(shard_key)
+        idx = [0, len(children) // 2, len(children) - 1]
+        df = pd.DataFrame(
+            {
+                "h_li": np.array([3.0, 7.0, 2.0], dtype=np.float32),
+                "s_li": np.array([0.1, 0.1, 0.1], dtype=np.float32),
+                "leaf_id": np.array([int(children[i]) for i in idx], dtype=np.uint64),
+            }
+        )
+        calls = {"n": 0}
+
+        def one_shot(*args, **kwargs):
+            calls["n"] += 1
+            return df.copy() if calls["n"] == 1 else None
+
+        monkeypatch.setattr("zagg.processing._read_group", one_shot)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
+        meta = hive.process_and_write_hive(
+            shard_key,
+            ["s3://x"],
+            grid,
+            {},
+            str(tmp_path / "store"),
+            cfg,
+            store_kwargs={},
+            handoff="pandas",  # the one_shot stub yields pandas carriers
+        )
+        assert meta.get("error") is None, meta
+        leaf = hive.shard_leaf_path(str(tmp_path / "store"), shard_key)
+        group = zarr.open_group(LocalStore(leaf), mode="r", zarr_format=3)
+        inventory = {k for k, node in group.members(max_depth=None) if isinstance(node, zarr.Array)}
+        recorded = meta["content_hashes"]["arrays"]
+        assert set(recorded) == inventory
+        assert {"7/h_chunk_base", "7/h_edges", "7/h_ragged", "7/morton"} <= inventory
+        # Write-read parity holds across BOTH sources: staged slabs (dense,
+        # vector, ragged) and the companion's read-back fallback.
+        assert recorded == hash_arrays(group)
 
 
 class TestDenseRecipe:
