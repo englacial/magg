@@ -155,8 +155,13 @@ def expected_object_counts(
         # OPTIONAL aggregation.yaml semantic core (issue #299, D19 — a
         # fail-open derived convenience riding the manifest write), same
         # fail-open posture as the root MOC.
+        # ... plus the OPTIONAL sweep run record (issue #353): the end-of-run
+        # sweep PUTs one ``sweep_stats_{ts}.json`` at the root per pass. Same
+        # fail-open posture again (telemetry, D9 — one warning and None), and
+        # on the Lambda path the sweep is fire-and-forget, so it may legitimately
+        # be absent at measurement time. Ceiling only; the floor stays 1.
         metadata_min = 1
-        metadata_max = 1 + (1 if coverage_moc else 0) + 1 + 1
+        metadata_max = 1 + (1 if coverage_moc else 0) + 1 + 1 + 1
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
         # zarr.json per array, plus the in-leaf coverage.moc sidecar (written
         # for any populated leaf when the leaf has depth, i.e. child_order >
@@ -191,6 +196,19 @@ def expected_object_counts(
 def _is_run_parquet(key: str) -> bool:
     """A store-root run-level stats parquet (issue #297): ``stats_*.parquet``."""
     return "/" not in key and key.startswith("stats_") and key.endswith(".parquet")
+
+
+def _is_sweep_record(key: str) -> bool:
+    """A store-root sweep run record (issue #353): ``sweep_stats_*.json``.
+
+    One per sweep pass, and the local dispatcher sweeps in-process at end of
+    run (``sweep_after_run``, default on for hive) — so a hive run lands
+    exactly one of these at the root alongside the run parquet. Deliberately
+    outside the :func:`_is_run_parquet` grammar (a sweep record must never read
+    as a shard run record); counted as metadata for the same reason the run
+    parquet is — fixed, shard-independent, one object per run.
+    """
+    return "/" not in key and key.startswith("sweep_stats_") and key.endswith(".json")
 
 
 def _is_status_object(key: str) -> bool:
@@ -300,11 +318,16 @@ def store_object_counts(
             prefix.rstrip("/").rsplit("/", 1)[0] + "/": label for prefix, label in leaf_of.items()
         }
         for key in keys:
-            if key in (
-                hive.MANIFEST_NAME,
-                hive.ROOT_COVERAGE_NAME,
-                hive.AGGREGATION_CORE_NAME,
-            ) or _is_run_parquet(key):
+            if (
+                key
+                in (
+                    hive.MANIFEST_NAME,
+                    hive.ROOT_COVERAGE_NAME,
+                    hive.AGGREGATION_CORE_NAME,
+                )
+                or _is_run_parquet(key)
+                or _is_sweep_record(key)
+            ):
                 metadata += 1
                 continue
             # Leaf-prefix membership FIRST (issue #300 review): an object that

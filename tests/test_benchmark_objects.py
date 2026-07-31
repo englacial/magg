@@ -306,8 +306,10 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     # is exact here and the real store matches it object-for-object.
     assert expected["exact"] is True
     # Through the runner: manifest + aggregation.yaml (issue #299) + root
-    # MOC + the run stats parquet (#297).
-    assert measured["objects_metadata"] == expected["metadata"] == 4
+    # MOC + the run stats parquet (#297) + the sweep run record (#353 — the
+    # end-of-run sweep PUTs one per pass, root-level and shard-independent,
+    # so it is accounted exactly like the run parquet).
+    assert measured["objects_metadata"] == expected["metadata"] == 5
     assert measured["objects_other"] == 0
     assert list(measured["objects_per_shard"]) == [_KEY_A]
     # The end-of-run sweep lands its rollups (issue #300) and overview zarrs
@@ -664,12 +666,12 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     # Exact: per leaf = root+group zarr.json (2) + one zarr.json AND one data
     # object per array + the coverage sidecar + the stats.json sibling
     # (issue #297); store root = manifest + aggregation.yaml (issue #299)
-    # + MOC + the run stats parquet.
+    # + MOC + the run stats parquet + the sweep run record (issue #353).
     n_arrays = len(grid.shard_spec().members)
     assert expected["exact"] is True
     # ... + the stats.json AND shardmap.json siblings (issues #297/#300).
     assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 2
-    assert expected["metadata"] == 4
+    assert expected["metadata"] == 5
     # Sweep rollups (issue #300) and overview zarrs (issue #201) ride their
     # own buckets, outside the write-path total this model audits.
     write_path = (
