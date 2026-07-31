@@ -456,8 +456,9 @@ def _semantic_guard(manifest: dict, config) -> str:
 def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> str:
     """The pre-write store-truth check: refuse a recipe the store contradicts.
 
-    Probes the run records for a committed leaf (bounded — the first hit
-    among the first few refs) and checks every declared field against the
+    Probes the run records for a committed leaf (the first hit wins — discovery
+    has already parsed every record, so the scan costs one GET per ref until it
+    lands) and checks every declared field against the
     leaf's stored array: presence, dense dtype for the exact class, the D18
     ragged element declaration (element dtype + ``inner_shape``) for the
     approximate class. Returns the "what was checked" summary string;
@@ -474,18 +475,36 @@ def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> 
     fields = block["overview"].get("fields") or {}
     if not fields:
         return "nothing to check (declared off)"
+    # Un-capped on purpose: ``discover_leaves`` has ALREADY paid the whole cost
+    # (a root LIST plus a GET + parse of every run record), so truncating its
+    # result bounds nothing — it only risks giving up while committed leaves
+    # remain. Each extra ref costs one ``read_commit`` GET, and the loop stops at
+    # the first hit; the read is read-only, which on S3 also picks the shorter
+    # readonly retry policy (issue #186).
+    refs = discover_leaves(store_root, store_kwargs=store_kwargs)
     leaf = None
-    for key, window in discover_leaves(store_root, store_kwargs=store_kwargs)[:8]:
+    for key, window in refs:
         path = shard_leaf_path(store_root, key, window=window)
-        if read_commit(open_store(path, **store_kwargs)) is not None:
+        if read_commit(open_store(path, read_only=True, **store_kwargs)) is not None:
             leaf = path
             break
     if leaf is None:
-        logger.warning(
-            "declare_pyramid: no committed leaf found via the run records — "
-            "field-level validation skipped; only the manifest root was checked"
+        # Two very different stores that must not report the same thing: no run
+        # records at all is a genuinely pre-commit store, while refs that are all
+        # torn/rolled-back debris is a store whose validation was skipped over
+        # real work. Neither refuses — a store with no committed leaf stays
+        # declarable, which is the point of the retrofit — but the skip is loud
+        # and says which case it was.
+        detail = (
+            "no run records at the product root"
+            if not refs
+            else f"none of the {len(refs)} run-record refs is a committed leaf"
         )
-        return "manifest only (no committed leaf to validate fields against)"
+        logger.warning(
+            f"declare_pyramid: no committed leaf to probe ({detail}) — field-level "
+            f"validation skipped; only the manifest root was checked"
+        )
+        return f"manifest only ({detail}; fields unvalidated)"
     group = zarr.open_group(
         open_store(leaf, **store_kwargs),
         path=str(int(manifest["cell_order"])),

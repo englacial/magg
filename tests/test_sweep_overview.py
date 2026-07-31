@@ -1243,9 +1243,23 @@ class TestDeclarePyramid:
         obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
         summary = declare_pyramid(str(tmp_path), _leaf_cfg())
         assert summary["updated"] is True
-        assert summary["validated"].startswith("manifest only")
+        assert summary["validated"].startswith("manifest only (no run records")
         assert "field-level validation skipped" in caplog.text
         assert read_manifest(str(tmp_path))["pyramid"]["overview"]["orders"] == [0]
+
+    def test_uncommitted_refs_are_not_reported_as_no_records(self, tmp_path, caplog):
+        # A store whose refs are all debris is a different animal from one that
+        # has never run: both stay declarable (the probe never refuses), but the
+        # operator must be able to tell which skip they got.
+        _write_manifest(tmp_path)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        del manifest["pyramid"]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        _run_record(tmp_path, ("-311", "-312"))  # refs whose leaves never committed
+        summary = declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert summary["updated"] is True
+        assert summary["validated"].startswith("manifest only (none of the 2 run-record refs")
+        assert "field-level validation skipped" in caplog.text
 
     def test_orders_outside_the_store_refuse(self, tmp_path):
         self._pre_declaration_store(tmp_path)
