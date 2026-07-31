@@ -212,6 +212,75 @@ class TestNothingLoadBearing:
         assert _rollup(tmp_path, "-3")["payload"] == merge(list(recs.values()))
 
 
+class TestRecordAndTimings:
+    """The sweep's own telemetry (issue #353): durations + store-root record."""
+
+    def test_families_and_total_carry_durations(self, tmp_path):
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
+        for result in summary["families"].values():
+            assert result["duration_s"] >= 0.0
+        # The pass total spans every family (and the pre-walk setup).
+        assert summary["duration_s"] >= max(r["duration_s"] for r in summary["families"].values())
+
+    def test_record_written_at_root(self, tmp_path):
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
+        records = sorted(tmp_path.glob("sweep_stats_*.json"))
+        assert [r.name for r in records] == [summary["record"]]
+        payload = json.loads(records[0].read_text())
+        assert payload["spec"] == SWEEP_SPEC
+        assert payload["n_leaves"] == 1
+        assert set(payload["families"]) == set(summary["families"])
+        assert payload["duration_s"] >= 0.0
+        # The record is the summary itself; its own key is set only after the PUT.
+        assert "record" not in payload
+
+    def test_record_false_writes_nothing(self, tmp_path):
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        summary = run_sweep(str(tmp_path), _leaf_refs("-311"), record=False)
+        assert "record" not in summary
+        assert list(tmp_path.glob("sweep_stats_*.json")) == []
+
+    def test_record_write_failure_is_fail_open(self, tmp_path, monkeypatch, caplog):
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        real_put = obstore.put
+
+        def flaky_put(store, key, *args, **kwargs):
+            if str(key).startswith("sweep_stats_"):
+                raise RuntimeError("boom")
+            return real_put(store, key, *args, **kwargs)
+
+        monkeypatch.setattr(obstore, "put", flaky_put)
+        with caplog.at_level("WARNING"):
+            summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
+        # The record is telemetry: its failure never touches the fold result.
+        assert summary["record"] is None
+        assert summary["families"]["stats"]["written"] > 0
+        assert any("run record write failed" in m for m in caplog.messages)
+
+    def test_record_name_is_outside_the_run_parquet_glob(self, tmp_path):
+        # discover_leaves scans ``stats_.+\.parquet``; the sweep's own record
+        # must never read as a shard run record. The CLI makes this a live
+        # sequence -- main() discovers first and sweeps second, so every pass
+        # discovers over the previous pass's record.
+        import re
+
+        from zagg.sweep import discover_leaves
+
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        _run_record(tmp_path, [_row("-311")])
+        summary = run_sweep(str(tmp_path), _leaf_refs("-311"))
+        # The record now sits at the root the NEXT pass discovers from.
+        assert discover_leaves(str(tmp_path)) == [(morton_word("-311"), None)]
+        assert re.fullmatch(r"sweep_stats_[0-9]{8}T[0-9]{6}Z\.json", summary["record"])
+
+
 class TestWorkSetEdges:
     def test_missing_sidecar_leaf_is_skipped_not_fatal(self, tmp_path):
         _write_manifest(tmp_path)
@@ -1010,3 +1079,71 @@ class TestInvokeLambdaSweep:
         event = json.loads(client.invoke.call_args.kwargs["Payload"])
         assert "leaves" not in event
         assert event["discover"] is True
+
+
+def _handler_module():
+    import importlib.util
+
+    handler_path = Path(__file__).parent.parent / "deployment" / "aws" / "lambda_handler.py"
+    spec = importlib.util.spec_from_file_location("zagg_lambda_handler_sweep", handler_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestHandlerSweepResponse:
+    """``mode="sweep"`` returns the pass timings + record key (issue #353)."""
+
+    def test_response_carries_durations_and_record(self, tmp_path):
+        mod = _handler_module()
+
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        event = {
+            "mode": "sweep",
+            "store_path": str(tmp_path),
+            "leaves": [[morton_word("-311"), None]],
+        }
+        response = mod._handle_sweep(event)
+        assert response["statusCode"] == 200
+        body = json.loads(response["body"])
+        assert body["ok"] is True and body["n_leaves"] == 1
+        assert body["duration_s"] >= 0.0
+        assert body["families"]["stats"]["duration_s"] >= 0.0
+        # The record key round-trips: the object the handler names exists.
+        assert (tmp_path / body["record"]).exists()
+        # The leaves rode inline: no work set was derived to charge for.
+        assert body["discover_s"] is None
+
+    def test_discovery_path_reports_its_own_span(self, tmp_path):
+        # discover_leaves is a LIST + a parquet read per run record; it is not
+        # inside run_sweep's span, so it gets its own field rather than being
+        # folded into (or dropped from) duration_s.
+        mod = _handler_module()
+
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        _run_record(tmp_path, [_row("-311")])
+        response = mod._handle_sweep({"mode": "sweep", "store_path": str(tmp_path)})
+        body = json.loads(response["body"])
+        assert body["n_leaves"] == 1
+        assert body["discover_s"] >= 0.0
+        assert body["duration_s"] >= 0.0
+
+    def test_no_work_response_carries_the_same_keys(self, tmp_path):
+        # A no-work invoke (nothing swept, or discovery over a store with no
+        # run records) must not change the response shape a driver reads.
+        mod = _handler_module()
+
+        _write_manifest(tmp_path)
+        for event, derived in (
+            ({"mode": "sweep", "store_path": str(tmp_path), "leaves": []}, False),
+            ({"mode": "sweep", "store_path": str(tmp_path), "discover": True}, True),
+        ):
+            response = mod._handle_sweep(event)
+            assert response["statusCode"] == 200
+            body = json.loads(response["body"])
+            assert body["ok"] is True and body["n_leaves"] == 0
+            assert body["duration_s"] >= 0.0
+            assert body["record"] is None
+            assert (body["discover_s"] >= 0.0) if derived else (body["discover_s"] is None)
