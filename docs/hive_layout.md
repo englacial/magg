@@ -267,10 +267,13 @@ summary says which case it was.
 The rewrite is idempotent (an identical declaration is not re-PUT) and
 preserves any `materialized` actuals the sweep has recorded.
 `output.pyramid: false` installs the declared-off block — recording absence
-is a valid retrofit (readers then never probe for overviews), and overviews
-at now-undeclared orders are left in place as regenerable-cache debris
-(D24). After a retrofit, the next overview sweep materializes the declared
-orders (issue #358).
+is a valid retrofit, so a reader can skip probing for overviews entirely
+(the D24 option-A posture the block enables; no reader in this repo consumes
+the declaration yet), and overviews at now-undeclared orders are left in
+place as regenerable-cache debris (D24). After a retrofit, the overview
+family materializes the declared orders on the next sweep — it is in
+`DEFAULT_FAMILIES`, so a plain `python -m zagg.sweep <root>` picks it up
+(the fold itself is issue #201 / PR #344; the retrofit is issue #358).
 
 ## The commit stamp
 
