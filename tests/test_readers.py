@@ -174,6 +174,61 @@ def _leaf_store(digest_ranks, *, located=False, seed=35):
     return store, word, vals
 
 
+def _put_object(store, key, payload):
+    """PUT raw bytes into a zarr store (the MemoryStore sidecar write)."""
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    sync(store.set(key, default_buffer_prototype().buffer.from_bytes(payload)))
+
+
+def _sharded_leaf_store(digest_ranks, extra_occupied=(), *, stamp=True, seed=41):
+    """A committed 16-chunk hive leaf: ``_KEY_A``'s order-6 shard, order-12
+    cells, ``chunk_inner=8`` (256-cell read chunks) under one leaf-wide
+    ShardingCodec object — with an exact ``coverage.moc`` occupancy sidecar
+    when ``stamp``. Returns ``(store, shard_word)``."""
+    from zagg import hive
+    from zagg.processing import write_ragged_leaf_to_zarr
+
+    rng = np.random.default_rng(seed)
+    cfg = _cfg()
+    cfg.output["grid"]["chunk_inner"] = 8
+    cfg.output["grid"]["sharded"] = True
+    grid = HealpixGrid(6, 12, layout="fullsphere", config=cfg, chunk_inner=8, sharded=True)
+    word = morton_word(_KEY_A)
+    store = MemoryStore()
+    grid.emit_shard_template(store)
+    children = np.asarray(grid.children(word), dtype=np.uint64)
+    zarr.open_array(store, path="12/morton", mode="r+")[:] = children
+    per_chunk: dict[int, list[int]] = {}
+    for rank in sorted(digest_ranks):
+        per_chunk.setdefault(rank // grid.cells_per_chunk, []).append(rank % grid.cells_per_chunk)
+    entries = [
+        (
+            (block,),
+            {
+                "h_tdigest": (
+                    [build_tdigest(rng.uniform(10.0, 30.0, 60), delta=512) for _ in local],
+                    local,
+                )
+            },
+        )
+        for block, local in sorted(per_chunk.items())
+    ]
+    write_ragged_leaf_to_zarr(entries, store, grid=grid)
+    if stamp:
+        occupied = np.sort(children[sorted(set(digest_ranks) | set(extra_occupied))])
+        bitmap = hive.encode_coverage_bitmap(word, occupied, 12)
+        _put_object(store, hive.COVERAGE_SIDECAR, bitmap)
+        hive.stamp_commit(
+            store,
+            cells_with_data=len(digest_ranks),
+            granule_count=1,
+            coverage=hive.build_coverage(word, occupied, 12, bitmap=bitmap),
+        )
+    return store, word
+
+
 class TestRasterizeCell:
     def test_empty_digest_all_zero(self):
         out = rasterize_cell(np.empty((0, 2), dtype=np.float32), 0.0, 0.5, 16)
@@ -783,6 +838,184 @@ class TestSubtreePerCellReaders:
         with pytest.warns(UserWarning, match="outside this axis' order-6 root"):
             out = list(read_locations(store, "12/h_tdigest", subtree=morton_word(_KEY_B)))
         assert out == []
+
+
+class TestSubtreeReadTensors:
+    """Issue #351 phase 2: ``subtree=`` on :func:`read_tensors`.
+
+    Golden contract: the subtree read equals the whole-store sweep filtered
+    to the blocks below ``w`` — and the equality is BIT-WISE because blocks
+    are whole read chunks: each emitted block derives its z-window from the
+    same populated cell set in both reads (no cell outside the span ever
+    joins a block), so tensor, mask, ``(offset, gain)``, and morton id all
+    match exactly. Sub-chunk subtrees are refused in v1 (the z-window would
+    re-derive from fewer cells — no longer a slice of the chunk tensor).
+    """
+
+    @staticmethod
+    def _filtered(out, word, order):
+        """Whole-sweep blocks whose morton id descends from ``word``."""
+        from mortie import clip2order
+
+        return [
+            o for o in out if int(clip2order(order, np.asarray([o[3]], dtype=np.uint64))[0]) == word
+        ]
+
+    @staticmethod
+    def _assert_same(got, expected):
+        assert [o[3] for o in got] == [o[3] for o in expected]
+        for (t, m, s, _w), (te, me, se, _we) in zip(got, expected):
+            np.testing.assert_array_equal(t, te)
+            np.testing.assert_array_equal(m, me)
+            assert s == se
+
+    def test_flat_store_equals_filtered_sweep_both_currencies(self):
+        rng = np.random.default_rng(40)
+        store, _grid_, words = _build_store(
+            {
+                _KEY_A: {0: rng.uniform(10, 30, 500), 4095: rng.uniform(12, 28, 400)},
+                _KEY_B: {7: rng.uniform(40, 60, 300)},
+            }
+        )
+        sweep = list(read_tensors(store, "12/h_tdigest"))
+        expected = self._filtered(sweep, words[_KEY_A], 6)
+        assert len(expected) == 1
+        for sub in (words[_KEY_A], _KEY_A):
+            self._assert_same(list(read_tensors(store, "12/h_tdigest", subtree=sub)), expected)
+
+    def test_sharded_store_per_chunk_and_block_assembly(self):
+        from mortie import generate_morton_children
+
+        store = MemoryStore()
+        _grid_, shard6, _t = _sharded_store(store, populate={0, 3, 7, 12})
+        # Order-7 first child of the shard = inner chunks 0..3 (locals 0, 3
+        # populated). Per-chunk blocks AND one assembled order-7 block must
+        # both equal the filtered whole sweep at the same block_order.
+        sub = int(np.asarray(generate_morton_children(shard6, 7))[0])
+        per_chunk = self._filtered(list(read_tensors(store, "12/h_tdigest")), sub, 7)
+        assert len(per_chunk) == 2
+        self._assert_same(list(read_tensors(store, "12/h_tdigest", subtree=sub)), per_chunk)
+        assembled = self._filtered(list(read_tensors(store, "12/h_tdigest", block_order=7)), sub, 7)
+        got = list(read_tensors(store, "12/h_tdigest", subtree=sub, block_order=7))
+        assert len(got) == len(assembled) == 1 and got[0][0].shape == (32, 32, 128)
+        self._assert_same(got, assembled)
+
+    def test_sharded_get_accounting_fetches_only_the_covering_span(self):
+        from mortie import generate_morton_children
+
+        store = _CountingStore()
+        grid, shard6, _t = _sharded_store(store, populate={0, 3, 7, 12})
+        sub = int(np.asarray(generate_morton_children(shard6, 7))[0])
+        store.gets.clear()
+        out = list(read_tensors(store, "12/h_tdigest", subtree=sub))
+        assert len(out) == 2
+        data_gets = [g for g in store.gets if "/h_tdigest/c/" in g[0]]
+        # The §1.5 read plan on a sharded store: the shard-index suffix plus
+        # ONLY the covering inner chunks (populated locals 0 and 3 of the
+        # span's chunks 0..3; zarr may coalesce the adjacent ranges) — all
+        # ranged GETs, never the whole object.
+        assert all(rng_ is not None for _k, rng_, _n in data_gets)
+        (obj_key, _r0, n0), *chunk_gets = data_gets
+        assert n0 == 16 * grid.chunks_per_shard + 4  # the shard-index suffix
+        assert len(chunk_gets) >= 1
+        # Decode the shard index: local 7's payload starts right after locals
+        # 0 and 3, so every fetched chunk range must end BEFORE it — the
+        # out-of-span locals 7 and 12 are never touched.
+        obj = store._store_dict[obj_key].to_bytes()
+        idx = np.frombuffer(obj[-n0:-4], dtype="<u8").reshape(-1, 2)
+        chunk7_start = int(idx[7][0])
+        assert chunk7_start > 0
+        assert all(int(r.end) <= chunk7_start for _k, r, _n in chunk_gets)
+
+    def test_flat_get_accounting_skips_disjoint_objects(self):
+        rng = np.random.default_rng(42)
+        grid = _grid()
+        store = _CountingStore()
+        grid.emit_template(store)
+        for key in (_KEY_A, _KEY_B):
+            _write_shard(grid, store, key, {3: rng.uniform(10.0, 30.0, 200)})
+        store.gets.clear()
+        out = list(read_tensors(store, "12/h_tdigest", subtree=_KEY_A))
+        assert [o[3] for o in out] == [morton_word(_KEY_A)]
+        data_gets = [g for g in store.gets if "/h_tdigest/c/" in g[0]]
+        # Flat layout: one whole-object GET for the covering chunk; shard B's
+        # object is never touched.
+        b_block = grid.block_index(morton_word(_KEY_B))[0]
+        assert len(data_gets) == 1
+        assert not data_gets[0][0].endswith(f"c/{b_block}")
+
+    def test_sub_chunk_subtree_refused_pointing_at_per_cell_readers(self):
+        from mortie import generate_morton_children
+
+        store, words = TestSubtreePerCellReaders._flat()
+        sub = int(np.asarray(generate_morton_children(words[_KEY_A], 9))[0])
+        with pytest.raises(ValueError, match="read_raw_values") as excinfo:
+            list(read_tensors(store, "12/h_tdigest", subtree=sub))
+        assert "read_cell" in str(excinfo.value)
+
+    def test_block_order_coarser_than_the_subtree_raises(self):
+        from mortie import generate_morton_children
+
+        store = MemoryStore()
+        _grid_, shard6, _t = _sharded_store(store, populate={0, 3})
+        sub = int(np.asarray(generate_morton_children(shard6, 7))[0])
+        # The composed bound: subtree_order (7) ≤ block_order ≤ chunk_order (8).
+        with pytest.raises(ValueError, match="block_order .* out of range"):
+            list(read_tensors(store, "12/h_tdigest", subtree=sub, block_order=6))
+        # Both in-bound ends still read: block_order == chunk_order (8) gives
+        # per-chunk blocks (populated locals 0 and 3), block_order ==
+        # subtree_order (7) one assembled block.
+        assert len(list(read_tensors(store, "12/h_tdigest", subtree=sub, block_order=8))) == 2
+        assert len(list(read_tensors(store, "12/h_tdigest", subtree=sub, block_order=7))) == 1
+
+    def test_hive_leaf_subtree_keeps_the_occupancy_mask(self):
+        from mortie import generate_morton_children
+
+        store, word = _sharded_leaf_store([11, 300, 1000, 4000], extra_occupied=[12, 301, 2500])
+        sub = int(np.asarray(generate_morton_children(word, 7))[0])
+        # Child 0 covers leaf cells [0, 1024) = read chunks 0..3: digests
+        # 11/300/1000 (chunks 0, 1, 3) and occupancy-only cells 12/301 — but
+        # not 4000 (chunk 15) or 2500 (chunk 9, which has no digest at all).
+        per_chunk = self._filtered(list(read_tensors(store, "12/h_tdigest")), sub, 7)
+        got = list(read_tensors(store, "12/h_tdigest", subtree=sub))
+        assert len(got) == 3
+        self._assert_same(got, per_chunk)
+        # The 3-state mask machinery is untouched: the occupancy-only cells
+        # inside the span still read as state 1.
+        assert sum(int((m == 1).sum()) for _t, m, _s, _w in got) == 2
+        # And the assembled subtree block agrees with the filtered assembly.
+        assembled = self._filtered(list(read_tensors(store, "12/h_tdigest", block_order=7)), sub, 7)
+        self._assert_same(
+            list(read_tensors(store, "12/h_tdigest", subtree=sub, block_order=7)), assembled
+        )
+
+    def test_out_of_domain_warns_once_and_empty_in_domain_is_silent(self):
+        import warnings
+
+        from mortie import generate_morton_children
+
+        store, word = _sharded_leaf_store([11])
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            assert list(read_tensors(store, "12/h_tdigest", subtree=morton_word(_KEY_B))) == []
+        msgs = [str(w.message) for w in rec if "outside this axis" in str(w.message)]
+        assert msgs == [
+            f"subtree {_KEY_B} is outside this axis' order-6 root {_KEY_A} — yielding nothing"
+        ]
+        # In-domain child with nothing stored (chunks 12..15): silent empty —
+        # the docstring ambiguity; the absent warning is the in-domain signal.
+        empty_sub = int(np.asarray(generate_morton_children(word, 7))[3])
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            assert list(read_tensors(store, "12/h_tdigest", subtree=empty_sub)) == []
+        assert [w for w in rec if "outside this axis" in str(w.message)] == []
+
+    def test_malformed_and_too_deep_raise(self):
+        store, _words = TestSubtreePerCellReaders._flat()
+        with pytest.raises(ValueError):
+            list(read_tensors(store, "12/h_tdigest", subtree="abc"))
+        with pytest.raises(ValueError, match="deeper than"):
+            list(read_tensors(store, "12/h_tdigest", subtree=_KEY_A + "1111111"))
 
 
 class TestReadCell:
