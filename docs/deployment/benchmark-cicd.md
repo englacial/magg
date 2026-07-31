@@ -192,8 +192,8 @@ Two consequences worth planning for: stores now **accumulate one directory per
 benchmarked commit** rather than being overwritten, so set an S3 lifecycle
 expiration on the prefix (they are regenerable); and the harness's `ListBucket`
 grant is conditioned on `s3:prefix` `zagg-bench/*` in
-[`deployment/aws/benchmark_cicd.yaml`](../../deployment/aws/benchmark_cicd.yaml),
-which matches the deeper key unchanged.
+`deployment/aws/benchmark_cicd.yaml` (the section-2 template), which matches the
+deeper key unchanged.
 
 ```bash
 aws s3 mb s3://BUCKET --region REGION   # if it doesn't exist
