@@ -124,8 +124,10 @@ and hive-leaf writers are pinned to store byte-identical per-cell payloads
   the covering inner chunks — `read_cell`'s 2-GET pattern generalized to a
   span, never the whole-array sweep. The per-cell readers accept any order
   down to a single cell; `read_tensors` emits whole read chunks only
-  (`subtree_order ≤ block_order ≤ chunk_order`) and refuses finer words,
-  pointing at the per-cell readers. A well-formed word disjoint from the axis
+  (`max(subtree_order, axis_root_order) ≤ block_order ≤ chunk_order` — the
+  floor is the order of the span actually *visited*, i.e. the subtree clipped
+  to the axis, so a word above the axis root takes the root's order) and
+  refuses finer words, pointing at the per-cell readers. A well-formed word disjoint from the axis
   warns once and yields nothing — so an empty yield is ambiguous without the
   warning — while malformed or too-deep words raise.
 

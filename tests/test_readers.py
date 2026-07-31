@@ -1012,6 +1012,19 @@ class TestSubtreeReadTensors:
         assert len(list(read_tensors(store, "12/h_tdigest", subtree=sub, block_order=8))) == 2
         assert len(list(read_tensors(store, "12/h_tdigest", subtree=sub, block_order=7))) == 1
 
+    def test_ancestor_word_block_order_floor_is_the_axis_root(self):
+        from mortie import clip2order
+
+        store, word = _sharded_leaf_store([11, 300])
+        # A word ABOVE the leaf's order-6 root clips to the whole axis, so the
+        # block_order floor is the ROOT's order — not the subtree's. That is
+        # the documented bound max(subtree_order, axis_root_order) ≤
+        # block_order ≤ chunk_order (review, PR #357).
+        above = int(clip2order(4, np.asarray([word], dtype=np.uint64))[0])
+        with pytest.raises(ValueError, match="must be between 6 and the chunk order 8"):
+            list(read_tensors(store, "12/h_tdigest", subtree=above, block_order=5))
+        assert len(list(read_tensors(store, "12/h_tdigest", subtree=above, block_order=6))) == 1
+
     def test_hive_leaf_subtree_keeps_the_occupancy_mask(self):
         from mortie import generate_morton_children
 
