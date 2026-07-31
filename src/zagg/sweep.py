@@ -1086,7 +1086,11 @@ def main(argv=None) -> int:
             credentials = normalize_output_credentials(json.load(f))
         store_kwargs["credentials"] = credentials
         store_kwargs["endpoint_url"] = credentials.get("endpointUrl")
-    if args.declare_pyramid:
+    # ``is not None``, never truthiness: an empty value (an unset shell
+    # variable expanding to --declare-pyramid="") must reach load_config and
+    # fail loudly, not fall through to the sweep pass the flag advertises it
+    # will not run — that path WRITES (review finding, issue #358).
+    if args.declare_pyramid is not None:
         from zagg.config import load_config
         from zagg.sweep_overview import declare_pyramid
 
