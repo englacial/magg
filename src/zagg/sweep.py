@@ -605,6 +605,14 @@ def run_sweep(
 def _write_sweep_record(store, summary: dict) -> str | None:
     """PUT the sweep's run record at the store root; its key, or ``None`` (#353).
 
+    The return is deliberately the bare store-root-relative key, NOT the joined
+    ``{store_root}/{key}`` that ``telemetry.write_run_parquet`` hands back: it
+    is the same currency as every other key this sweep writes (the rollups), so
+    it is what you hand straight back to ``obstore`` against this same store.
+    Joining would mean plumbing ``store_root`` in here, where only the store
+    handle is held. Callers holding the response body alone re-join it with the
+    ``store_path`` they invoked with.
+
     One small JSON object per sweep pass — ``sweep_stats_{ts}.json``,
     timestamp-first like the run parquets (D20) so a lexicographic listing is
     chronological, and deliberately OUTSIDE the ``stats_*.parquet`` glob the
