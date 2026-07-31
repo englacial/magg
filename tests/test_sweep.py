@@ -1075,17 +1075,21 @@ class TestInvokeLambdaSweep:
         assert event["discover"] is True
 
 
+def _handler_module():
+    import importlib.util
+
+    handler_path = Path(__file__).parent.parent / "deployment" / "aws" / "lambda_handler.py"
+    spec = importlib.util.spec_from_file_location("zagg_lambda_handler_sweep", handler_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class TestHandlerSweepResponse:
     """``mode="sweep"`` returns the pass timings + record key (issue #353)."""
 
     def test_response_carries_durations_and_record(self, tmp_path):
-        import importlib.util
-        from pathlib import Path as _Path
-
-        handler_path = _Path(__file__).parent.parent / "deployment" / "aws" / "lambda_handler.py"
-        spec = importlib.util.spec_from_file_location("zagg_lambda_handler_sweep", handler_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        mod = _handler_module()
 
         _write_manifest(tmp_path)
         _put_leaf(tmp_path, "-311")
@@ -1102,3 +1106,20 @@ class TestHandlerSweepResponse:
         assert body["families"]["stats"]["duration_s"] >= 0.0
         # The record key round-trips: the object the handler names exists.
         assert (tmp_path / body["record"]).exists()
+
+    def test_no_work_response_carries_the_same_keys(self, tmp_path):
+        # A no-work invoke (nothing swept, or discovery over a store with no
+        # run records) must not change the response shape a driver reads.
+        mod = _handler_module()
+
+        _write_manifest(tmp_path)
+        for event in (
+            {"mode": "sweep", "store_path": str(tmp_path), "leaves": []},
+            {"mode": "sweep", "store_path": str(tmp_path), "discover": True},
+        ):
+            response = mod._handle_sweep(event)
+            assert response["statusCode"] == 200
+            body = json.loads(response["body"])
+            assert body["ok"] is True and body["n_leaves"] == 0
+            assert body["duration_s"] >= 0.0
+            assert body["record"] is None
