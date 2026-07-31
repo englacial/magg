@@ -291,14 +291,19 @@ class TestLocalRootCoverage:
         root, _shard = self._agg(monkeypatch, tmp_path, coverage_moc=False)
         assert hive.read_root_coverage(root) is None
         # Root carries the manifest, the successful shard's node dir (its
-        # stats sidecar) and the run stats parquet (issue #297) — but no
-        # coverage.moc.
+        # stats sidecar), the run stats parquet (issue #297) and the sweep run
+        # record (issue #353) — but no coverage.moc.
         listing = sorted(os.listdir(root))
         assert hive.ROOT_COVERAGE_NAME not in listing
         assert hive.MANIFEST_NAME in listing
         assert any(n.startswith("stats_") and n.endswith(".parquet") for n in listing)
-        # node dir + manifest + aggregation.yaml (issue #299) + run parquet.
-        assert len(listing) == 4
+        # The end-of-run sweep runs in-process on the local dispatcher
+        # (sweep_after_run, default on for hive), so its record is part of the
+        # default-run contract — assert it IS there, not merely tolerated.
+        assert any(n.startswith("sweep_stats_") and n.endswith(".json") for n in listing)
+        # node dir + manifest + aggregation.yaml (issue #299) + run parquet
+        # + sweep record (issue #353).
+        assert len(listing) == 5
 
 
 class TestLambdaCoverageDispatch:
