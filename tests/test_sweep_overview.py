@@ -1141,6 +1141,22 @@ class TestDeclarePyramid:
         with pytest.raises(ValueError, match="h_tdigest.*ragged element dtype"):
             declare_pyramid(str(tmp_path), cfg)
 
+    def test_ragged_element_without_dtype_refuses(self, tmp_path):
+        # np.dtype(None) is float64, so a dtype-less element block would
+        # otherwise silently validate a float64 declaration.
+        from zarr import open_array
+
+        self._pre_declaration_store(tmp_path)
+        leaf = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        arr = open_array(leaf, path=f"{CELL_ORDER}/h_tdigest", mode="r+", zarr_format=3)
+        rag = dict(arr.attrs["ragged"])
+        rag["element"] = {"shape": [-1, 2]}  # a block that declares no dtype
+        arr.attrs["ragged"] = rag
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_tdigest"]["dtype"] = "float64"
+        with pytest.raises(ValueError, match="h_tdigest.*carries no dtype"):
+            declare_pyramid(str(tmp_path), cfg)
+
     def test_ragged_inner_shape_drift_refuses(self, tmp_path):
         # The declared inner shape is pinned by composability (build_tdigest is
         # approximate only at [2]), so the drift that can happen is STORE-side:
