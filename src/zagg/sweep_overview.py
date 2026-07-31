@@ -297,6 +297,163 @@ def _update_manifest_pyramid(store_root, orders, store_kwargs) -> bool:
         return False
 
 
+def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
+    """Install/refresh the manifest ``pyramid`` declaration on an EXISTING store.
+
+    The issue #358 retrofit tool: declaration is no longer birth-only. The
+    block is re-derived from the supplied pipeline config (the authoritative
+    source — the same :func:`build_pyramid_block` path template time uses) at
+    the manifest's own ``shard_order``, validated against store truth, and
+    RMW'd into the manifest. Unlike the sweep's fail-open ``materialized``
+    update (:func:`_update_manifest_pyramid`), this is the user's explicit
+    operation: every failure raises — a missing manifest, a declaration the
+    store contradicts — and nothing is half-written (the one PUT is the
+    whole write).
+
+    Validation source: ONE committed leaf, found through the store's run
+    records (:func:`zagg.sweep.discover_leaves` — the sweep's own LIST-free
+    discovery), read at the manifest ``cell_order``. Leaves are the layer
+    the overview fold actually reads, so they are the store truth that can
+    contradict a fold recipe; the D19 ``aggregation.yaml`` core is NOT used
+    (it is itself config-derived and written fail-open). A store with no
+    committed leaf yet is still declarable: field-level checks are then
+    skipped and the summary says so.
+
+    Idempotent RMW: an identical existing declaration is not re-PUT; a
+    changed one is rewritten PRESERVING any ``materialized`` actuals (they
+    inventory overview artifacts already on disk — overviews at
+    now-undeclared orders stay as regenerable-cache debris, D24 option A).
+    An ``output.pyramid: false`` config installs the declared-off block:
+    recording absence is a valid retrofit.
+
+    Returns a summary dict: ``orders`` (the declared schedule), ``fields``
+    (``{name: class}``), ``validated`` (what store truth was checked),
+    ``previous`` (``absent``/``identical``/``replaced``), and ``updated``
+    (whether a PUT happened).
+    """
+    import obstore
+
+    from zagg.hive import MANIFEST_NAME, read_manifest
+    from zagg.store import open_object_store
+
+    store_kwargs = dict(store_kwargs or {})
+    manifest = read_manifest(store_root, **store_kwargs)
+    if manifest is None:
+        raise ValueError(
+            f"no {MANIFEST_NAME} at {store_root} — not a hive store root; "
+            f"declare_pyramid retrofits existing hive stores only"
+        )
+    shard_order = int(manifest["shard_order"])
+    block = build_pyramid_block(config, shard_order)
+    bad = [k for k in block["overview"].get("orders") or [] if not 0 <= int(k) < shard_order]
+    if bad:
+        raise ValueError(
+            f"declared orders {bad} are not ancestor orders of the manifest "
+            f"shard_order {shard_order} — the config does not match this store"
+        )
+    validated = _validate_block_against_store(store_root, manifest, block, store_kwargs)
+    prior = manifest.get("pyramid")
+    materialized = ((prior or {}).get("overview") or {}).get("materialized")
+    if materialized is not None:
+        block["overview"]["materialized"] = materialized
+    summary = {
+        "orders": list(block["overview"].get("orders") or []),
+        "fields": {n: m.get("class") for n, m in (block["overview"].get("fields") or {}).items()},
+        "validated": validated,
+        "previous": "absent" if prior is None else "identical" if prior == block else "replaced",
+        "updated": prior != block,
+    }
+    if prior == block:
+        logger.info("declare_pyramid: the manifest already carries this declaration; no write")
+        return summary
+    manifest["pyramid"] = block
+    obstore.put(
+        open_object_store(store_root, **store_kwargs),
+        MANIFEST_NAME,
+        json.dumps(manifest, indent=1).encode(),
+    )
+    return summary
+
+
+def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> str:
+    """The pre-write store-truth check: refuse a recipe the store contradicts.
+
+    Probes the run records for a committed leaf (bounded — the first hit
+    among the first few refs) and checks every declared field against the
+    leaf's stored array: presence, dense dtype for the exact class, the D18
+    ragged element declaration (element dtype + ``inner_shape``) for the
+    approximate class. Returns the "what was checked" summary string;
+    raises ``ValueError`` naming every drifted field. No committed leaf is
+    not an error — the store is declarable before its first commit — but
+    the skip is loud and recorded in the summary.
+    """
+    import zarr
+
+    from zagg.hive import read_commit, shard_leaf_path
+    from zagg.store import open_store
+    from zagg.sweep import discover_leaves
+
+    fields = block["overview"].get("fields") or {}
+    if not fields:
+        return "nothing to check (declared off)"
+    leaf = None
+    for key, window in discover_leaves(store_root, store_kwargs=store_kwargs)[:8]:
+        path = shard_leaf_path(store_root, key, window=window)
+        if read_commit(open_store(path, **store_kwargs)) is not None:
+            leaf = path
+            break
+    if leaf is None:
+        logger.warning(
+            "declare_pyramid: no committed leaf found via the run records — "
+            "field-level validation skipped; only the manifest root was checked"
+        )
+        return "manifest only (no committed leaf to validate fields against)"
+    group = zarr.open_group(
+        open_store(leaf, **store_kwargs),
+        path=str(int(manifest["cell_order"])),
+        mode="r",
+        zarr_format=3,
+    )
+    drift = [e for n, m in sorted(fields.items()) if (e := _field_drift(group, n, m))]
+    if drift:
+        raise ValueError(
+            f"pyramid declaration contradicts the store (checked leaf {leaf}): " + "; ".join(drift)
+        )
+    return f"leaf {leaf}"
+
+
+def _field_drift(group, name, meta) -> str | None:
+    """One declared field's mismatch against its stored leaf array, or ``None``."""
+    from zagg.grids.base import RAGGED_ELEMENT_ATTR
+
+    try:
+        arr = group[name]
+    except KeyError:
+        return f"field {name!r} is declared but absent from the leaf"
+    if meta["class"] == "approximate":
+        element = ((arr.attrs.get(RAGGED_ELEMENT_ATTR) or {}).get("element")) or {}
+        if not element:
+            return (
+                f"field {name!r}: declared approximate (ragged) but the stored "
+                f"array carries no ragged element declaration"
+            )
+        declared_dt = np.dtype(meta.get("dtype") or "float32")
+        if np.dtype(element.get("dtype")) != declared_dt:
+            return (
+                f"field {name!r}: ragged element dtype {element.get('dtype')} "
+                f"!= declared {declared_dt}"
+            )
+        stored_inner = [int(s) for s in (element.get("shape") or [-1])[1:]]
+        declared_inner = [int(s) for s in meta.get("inner_shape") or [2]]
+        if stored_inner != declared_inner:
+            return f"field {name!r}: ragged inner_shape {stored_inner} != declared {declared_inner}"
+    elif meta["class"] == "exact":
+        declared_dt = np.dtype(meta.get("dtype") or "float32")
+        if arr.dtype != declared_dt:
+            return f"field {name!r}: dtype {arr.dtype} != declared {declared_dt}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Phase B: the overview writer — the family's whole-tree sweep.
 # ---------------------------------------------------------------------------
