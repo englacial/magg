@@ -805,6 +805,27 @@ class TestSubtreePerCellReaders:
             assert list(read_raw_values(store, "12/h_tdigest", subtree="3333333")) == []
         assert [w for w in rec if "outside this axis" in str(w.message)] == []
 
+    @pytest.mark.parametrize("geometry", ["fullsphere", "leaf"])
+    def test_misplaced_morton_coordinate_raises(self, geometry):
+        """The identity the whole feature rests on — axis position == nested id
+        minus the axis root's start — is checked, not assumed (review, PR
+        #357). Rolling a stored span's morton coordinate by one cell breaks it
+        while leaving every other guard satisfied (the cells still share their
+        chunk ancestor), so without the check the span arithmetic would name
+        plausible-but-wrong cells silently."""
+        if geometry == "leaf":
+            store, sub, _vals = _leaf_store([0, 5])
+            blocks = [0]
+        else:
+            store, words = self._flat()
+            grid, sub = _grid(), words[_KEY_A]
+            blocks = [grid.block_index(w)[0] * grid.cells_per_chunk for w in words.values()]
+        arr = zarr.open_array(store, path="12/morton", mode="r+")
+        for base in blocks:
+            arr[base : base + 4096] = np.roll(arr[base : base + 4096], 1)
+        with pytest.raises(ValueError, match="not in canonical nested placement"):
+            list(read_raw_values(store, "12/h_tdigest", subtree=sub))
+
     @pytest.mark.parametrize("bad", ["", "abc", "913", 3, -5])
     def test_malformed_subtree_raises(self, bad):
         store, _words = self._flat()

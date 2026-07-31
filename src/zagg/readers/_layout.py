@@ -78,7 +78,7 @@ def normalize_subtree(subtree) -> tuple[int, str, int]:
 
 
 def subtree_cell_span(
-    subtree, anchor: int, cell_order: int, n_cells: int, field: str
+    subtree, anchor: int, anchor_index: int, cell_order: int, n_cells: int, field: str
 ) -> tuple[int, int]:
     """Cell-index span ``[start, stop)`` of ``subtree`` on a nested cells axis.
 
@@ -91,6 +91,14 @@ def subtree_cell_span(
     hive leaf's shard subtree) subtracts its root's own span start, with the
     root derived from ``anchor`` — any WRITTEN cell word (the morton anchor
     slice the caller already read); no store bytes are touched here.
+
+    That identity is CHECKED, not assumed: ``anchor`` sits at ``anchor_index``
+    on the axis, so ``nested(anchor) - root_start`` must equal ``anchor_index``
+    or the axis is not in canonical nested placement, and this arithmetic
+    would hand back plausible-but-wrong cells silently — the single-root
+    geometry is INFERRED from ``4**depth == n_cells`` alone, and this is the
+    first reader that derives absolute placement instead of searching for it
+    (review, PR #357). A mismatch raises ``ValueError``.
 
     The span is returned intersected with the axis: a word at or above the
     axis root clips to the whole axis (every stored cell is its
@@ -119,14 +127,27 @@ def subtree_cell_span(
     lo = int(h) * 4**d
     n = int(n_cells)
     depth = (n.bit_length() - 1) // 2
-    if 4**depth != n:
-        # A fullsphere axis (12·4^c cells): the nested id IS the axis
-        # position, and every well-formed word's span lies inside it.
+    # A fullsphere axis (12·4^c cells) starts at 0 — the nested id IS the axis
+    # position, and every well-formed word's span lies inside it. A single-root
+    # power-of-four axis starts at its root's own span start.
+    single_root = 4**depth == n
+    root_order, root, root_start = cell_order - depth, 0, 0
+    if single_root:
+        root = int(clip2order(root_order, np.asarray([anchor], dtype=np.uint64))[0])
+        (rh,), _ro = mort2healpix(np.asarray([root], dtype=np.uint64))
+        root_start = int(rh) * 4**depth
+    (ah,), _ao = mort2healpix(np.asarray([anchor], dtype=np.uint64))
+    if int(ah) - root_start != int(anchor_index):
+        raise ValueError(
+            f"{field!r}'s cells axis is not in canonical nested placement: cell "
+            f"{int(anchor_index)} carries morton {morton_decimal(int(anchor))}, whose "
+            f"nested id puts it at axis position {int(ah) - root_start}. A subtree "
+            f"span is derived arithmetically (cell position == nested id minus the "
+            f"axis root's start), so this axis would yield the wrong cells"
+        )
+    if not single_root:
         return lo, lo + 4**d
-    root_order = cell_order - depth
-    root = int(clip2order(root_order, np.asarray([anchor], dtype=np.uint64))[0])
-    (rh,), _ro = mort2healpix(np.asarray([root], dtype=np.uint64))
-    lo -= int(rh) * 4**depth
+    lo -= root_start
     start, stop = max(lo, 0), min(lo + 4**d, n)
     if start >= stop:
         warnings.warn(

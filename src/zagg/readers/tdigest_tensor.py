@@ -392,8 +392,10 @@ def _subtree_span(arr, morton, field, subtree) -> tuple[tuple[int, int] | None, 
     already warned — or an empty store, which has nothing below any word).
     The anchor is the first stored span's first read chunk of the ``morton``
     coordinate — one small slice, no payload bytes (the dense coordinate
-    write covers every chunk of a stored span). A malformed ``subtree``
-    raises even on an empty store.
+    write covers every chunk of a stored span); its own axis index is passed
+    alongside so :func:`~zagg.readers._layout.subtree_cell_span` can CHECK the
+    nested-placement identity it derives from. A malformed ``subtree`` raises
+    even on an empty store.
 
     ``spans`` is the :func:`_stored_chunk_spans` listing the span was resolved
     against (``None`` when there was no ``subtree`` and nothing was listed):
@@ -408,8 +410,16 @@ def _subtree_span(arr, morton, field, subtree) -> tuple[tuple[int, int] | None, 
         return (0, 0), spans
     words = morton[spans[0][0] : spans[0][0] + int(arr.chunks[0])]
     cell_order = _cells_order(words, field, spans[0][0])
-    anchor = int(words[words != 0][0])
-    return subtree_cell_span(subtree, anchor, cell_order, int(arr.shape[0]), field), spans
+    written = int(np.flatnonzero(words)[0])
+    span = subtree_cell_span(
+        subtree,
+        int(words[written]),
+        spans[0][0] + written,
+        cell_order,
+        int(arr.shape[0]),
+        field,
+    )
+    return span, spans
 
 
 def _open_morton(store: Store, field: str, zarr_format):
