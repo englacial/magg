@@ -16,7 +16,7 @@ import pytest
 import zarr
 
 from zagg.grids.morton import morton_word
-from zagg.hive import MANIFEST_NAME, read_commit, shard_leaf_path, stamp_commit
+from zagg.hive import MANIFEST_NAME, read_commit, read_manifest, shard_leaf_path, stamp_commit
 from zagg.semantics import (
     EXACT_MERGE_LAWS,
     composability_classes,
@@ -29,6 +29,7 @@ from zagg.sweep_overview import (
     PYRAMID_SPEC,
     ROLE_ATTR,
     combine_dense,
+    declare_pyramid,
     decode_digest,
     encode_digest,
     fold_dense,
@@ -730,6 +731,66 @@ class TestOverviewWriter:
         assert g["h_min"][0] == 1.0
 
 
+class TestOverviewContentHashes:
+    """Issue #342 phase 4: overview leaves get §5 ``content_hashes`` sidecars,
+    computed from the folded arrays in memory; the envelope's sweep-internal
+    skip digest is a different recipe and stays untouched."""
+
+    def test_sidecar_records_section5_hashes_with_parity(self, tmp_path):
+        from zagg.content_hash import combined_hash, hash_arrays
+        from zagg.telemetry import SPEC_V3, read_sidecar
+
+        _write_manifest(tmp_path, orders=(1,))
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0], 5: [10.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        leaf = str(tmp_path / "-3" / "1" / "all.zarr")
+        record = read_sidecar(leaf, spec=SPEC_V3)
+        assert record is not None and record["window"] is None
+        # Write-read parity, overview edition: the staged-source hashes must
+        # equal a full read-back of the written overview zarr.
+        group = zarr.open_group(open_store(leaf), mode="r", zarr_format=3)
+        read_back = hash_arrays(group)
+        assert record["content_hashes"]["arrays"] == read_back
+        assert record["content_hashes"]["combined"] == combined_hash(read_back)
+        # Discovery-based scope: morton + every composable field, none extra.
+        assert set(read_back) == {"3/morton", "3/count", "3/h_min", "3/h_tdigest"}
+
+    def test_stamp_skip_digest_stays_separate_and_untouched(self, tmp_path):
+        from zagg.telemetry import SPEC_V3, read_sidecar
+
+        _write_manifest(tmp_path, orders=(1,))
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        envelope = json.loads((tmp_path / "-3" / "1" / "overview.rollup.json").read_text())
+        entry = envelope["windows"]["all"]
+        root = _overview_root(tmp_path, "-3/1", "all.zarr")
+        # The sweep-internal skip digest still rides envelope + attrs...
+        assert entry["content_hash"] == root.attrs[OVERVIEW_ATTR]["content_hash"]
+        # ...and is NOT the §5 combined hash (different recipe, different job).
+        record = read_sidecar(str(tmp_path / "-3" / "1" / "all.zarr"), spec=SPEC_V3)
+        assert entry["content_hash"] != record["content_hashes"]["combined"]
+
+    def test_windowed_overviews_get_per_window_sidecars(self, tmp_path):
+        from zagg.telemetry import SPEC_V3, read_sidecar
+
+        _write_manifest(tmp_path, orders=(1,), windowed=True, all_time=True)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]}, window="2019")
+        _make_leaf(tmp_path, "-311", {0: [10.0]}, window="2020")
+        word = morton_word("-311")
+        run_sweep(str(tmp_path), [(word, "2019"), (word, "2020")], families=("overview",))
+        node = tmp_path / "-3" / "1"
+        # D23 window-only naming keys one sidecar per window basename — the
+        # legacy grammar would have keyed them all to one stats.json.
+        assert (node / "2019.stats.json").exists()
+        assert (node / "2020.stats.json").exists()
+        assert (node / "all.stats.json").exists()
+        r2019 = read_sidecar(str(node / "2019.zarr"), spec=SPEC_V3)
+        rall = read_sidecar(str(node / "all.zarr"), spec=SPEC_V3)
+        assert r2019["window"] == "2019"
+        assert rall["window"] == "all"
+        assert r2019["content_hashes"]["combined"] != rall["content_hashes"]["combined"]
+
+
 class TestSection83Obligations:
     """The standing D22 test claims for the overview family (§8.3)."""
 
@@ -972,3 +1033,397 @@ class TestSection83Obligations:
         )
         assert ROLE_ATTR not in leaf.attrs
         assert _overview_root(tmp_path, "-3/1", "all.zarr").attrs[ROLE_ATTR] == "overview"
+
+
+def _run_record(root, decimals, run_id="r1", window=None):
+    """One run-record parquet naming ``decimals`` as completed shards (D20/D22)."""
+    from zagg.telemetry import build_record, flatten_record, write_run_parquet
+
+    rows = [
+        flatten_record(
+            build_record(
+                shard_key=morton_word(d),
+                metadata={"total_obs": 1, "duration_s": 1.0},
+                window=window,
+            )
+        )
+        for d in decimals
+    ]
+    write_run_parquet(str(root), rows, run_id=run_id)
+
+
+class TestDeclarePyramid:
+    """The issue #358 retrofit: install/update the declaration on an existing store."""
+
+    #: Per-leaf observations the retrofit fixtures write.
+    CELLS = {"-311": {0: [1.0, 2.0]}, "-312": {0: [3.0]}}
+
+    def _pre_declaration_store(self, root, decimals=("-311",), semantic_config=None):
+        """A pre-#344-style store: manifest WITHOUT a pyramid key + committed leaves.
+
+        ``semantic_config`` stamps the D19 frozen ``semantic_hash`` the config
+        guard compares against; omitted leaves the pre-#299 (hash-less) shape.
+        """
+        _write_manifest(root)
+        manifest = json.loads((root / MANIFEST_NAME).read_text())
+        del manifest["pyramid"]
+        if semantic_config is not None:
+            from zagg.semantics import semantic_hash
+
+            manifest["semantic_hash"] = semantic_hash(semantic_config)
+        obstore.put(open_object_store(str(root)), MANIFEST_NAME, json.dumps(manifest).encode())
+        for d in decimals:
+            _make_leaf(root, d, self.CELLS[d])
+        _run_record(root, decimals)
+
+    def test_fresh_install_on_pre_declaration_store(self, tmp_path):
+        from zagg.hive import _frozen_matches
+        from zagg.sweep_overview import build_pyramid_block
+
+        self._pre_declaration_store(tmp_path)
+        before = read_manifest(str(tmp_path))
+        summary = declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert summary["updated"] is True and summary["previous"] == "absent"
+        assert summary["orders"] == [0]  # shard_order 2, default spacing 2
+        assert summary["fields"] == {
+            "count": "exact",
+            "h_min": "exact",
+            "h_mean": "none",
+            "h_tdigest": "approximate",
+        }
+        assert summary["validated"].startswith("leaf ")
+        after = read_manifest(str(tmp_path))
+        # The installed block IS the template-time derivation at the
+        # manifest's own shard order — no retrofit-specific grammar.
+        assert after["pyramid"] == build_pyramid_block(_leaf_cfg(), SHARD_ORDER)
+        assert _frozen_matches(after, before)  # only the pyramid key moved
+
+    def test_second_call_is_idempotent_no_put(self, tmp_path, monkeypatch):
+        self._pre_declaration_store(tmp_path)
+        declare_pyramid(str(tmp_path), _leaf_cfg())
+        puts = []
+        real_put = obstore.put
+        monkeypatch.setattr(obstore, "put", lambda *a, **k: (puts.append(a), real_put(*a, **k))[1])
+        summary = declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert summary["updated"] is False and summary["previous"] == "identical"
+        assert puts == []  # identical declaration -> no PUT at all
+
+    def test_non_json_primitive_declaration_stays_idempotent(self, tmp_path, monkeypatch):
+        # The block is normalized to canonical JSON before the compare, so a
+        # config value that is not a JSON primitive (here a tuple, which comes
+        # back out of the manifest as a list) cannot re-PUT on every call.
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"summarize": {"h_tdigest": {"as": "p50", "quantiles": (0.5,)}}}
+        declare_pyramid(str(tmp_path), cfg)
+        assert read_manifest(str(tmp_path))["pyramid"]["overview"]["summarize"] == {
+            "h_tdigest": {"as": "p50", "quantiles": [0.5]}
+        }
+        puts = []
+        real_put = obstore.put
+        monkeypatch.setattr(obstore, "put", lambda *a, **k: (puts.append(a), real_put(*a, **k))[1])
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["previous"] == "identical" and puts == []
+
+    def test_redeclaration_preserves_materialized(self, tmp_path):
+        self._pre_declaration_store(tmp_path)
+        declare_pyramid(str(tmp_path), _leaf_cfg())
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        materialized = read_manifest(str(tmp_path))["pyramid"]["overview"]["materialized"]
+        assert materialized["orders"] == [0]
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"orders": [1, 0]}  # the schedule changes
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True and summary["previous"] == "replaced"
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block["orders"] == [1, 0]
+        assert block["materialized"] == materialized  # actuals survive the rewrite
+
+    def test_concurrent_materialized_survives_the_validation_window(self, tmp_path, monkeypatch):
+        # The RMW re-reads immediately before its PUT: a sweep landing
+        # ``materialized`` while the (slow) validation runs must not be reverted
+        # by a manifest copy read before it.
+        from zagg import sweep_overview
+
+        self._pre_declaration_store(tmp_path)
+        declare_pyramid(str(tmp_path), _leaf_cfg())
+        real = sweep_overview._validate_block_against_store
+
+        def concurrent_sweep(*args, **kwargs):
+            out = real(*args, **kwargs)
+            sweep_overview._update_manifest_pyramid(str(tmp_path), [0], {})
+            return out
+
+        monkeypatch.setattr(sweep_overview, "_validate_block_against_store", concurrent_sweep)
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"orders": [1, 0]}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block["orders"] == [1, 0]
+        assert block["materialized"]["orders"] == [0]  # the concurrent update survives
+
+    def test_manifest_changed_under_validation_refuses(self, tmp_path, monkeypatch):
+        # Frozen keys re-checked at the PUT: the block is never installed on a
+        # manifest the validation never saw.
+        from zagg import sweep_overview
+
+        self._pre_declaration_store(tmp_path)
+        real = sweep_overview._validate_block_against_store
+
+        def clobber(*args, **kwargs):
+            out = real(*args, **kwargs)
+            m = read_manifest(str(tmp_path))
+            m["shard_order"] = SHARD_ORDER + 1
+            obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(m).encode())
+            return out
+
+        monkeypatch.setattr(sweep_overview, "_validate_block_against_store", clobber)
+        with pytest.raises(ValueError, match="changed under declare_pyramid"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert "pyramid" not in read_manifest(str(tmp_path))
+
+    def test_field_dtype_drift_refuses_and_writes_nothing(self, tmp_path):
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_min"]["dtype"] = "float64"  # store holds float32
+        with pytest.raises(ValueError, match="h_min.*declared float64"):
+            declare_pyramid(str(tmp_path), cfg)
+        assert "pyramid" not in read_manifest(str(tmp_path))  # never half-written
+
+    def test_absent_declared_field_refuses(self, tmp_path):
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["extra"] = {"function": "max", "dtype": "float32"}
+        with pytest.raises(ValueError, match="'extra' is declared but absent"):
+            declare_pyramid(str(tmp_path), cfg)
+
+    def test_ragged_element_dtype_drift_refuses(self, tmp_path):
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_tdigest"]["dtype"] = "float64"  # store: float32
+        with pytest.raises(ValueError, match="h_tdigest.*ragged element dtype"):
+            declare_pyramid(str(tmp_path), cfg)
+
+    def test_ragged_element_without_dtype_refuses(self, tmp_path):
+        # np.dtype(None) is float64, so a dtype-less element block would
+        # otherwise silently validate a float64 declaration.
+        from zarr import open_array
+
+        self._pre_declaration_store(tmp_path)
+        leaf = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        arr = open_array(leaf, path=f"{CELL_ORDER}/h_tdigest", mode="r+", zarr_format=3)
+        rag = dict(arr.attrs["ragged"])
+        rag["element"] = {"shape": [-1, 2]}  # a block that declares no dtype
+        arr.attrs["ragged"] = rag
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_tdigest"]["dtype"] = "float64"
+        with pytest.raises(ValueError, match="h_tdigest.*carries no dtype"):
+            declare_pyramid(str(tmp_path), cfg)
+
+    def test_ragged_inner_shape_drift_refuses(self, tmp_path):
+        # The declared inner shape is pinned by composability (build_tdigest is
+        # approximate only at [2]), so the drift that can happen is STORE-side:
+        # a leaf written under a different element convention.
+        from zarr import open_array
+
+        self._pre_declaration_store(tmp_path)
+        leaf = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        arr = open_array(leaf, path=f"{CELL_ORDER}/h_tdigest", mode="r+", zarr_format=3)
+        rag = dict(arr.attrs["ragged"])
+        rag["element"] = {"dtype": "float32", "shape": [-1, 3]}
+        arr.attrs["ragged"] = rag
+        with pytest.raises(ValueError, match="h_tdigest.*inner_shape"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+
+    def test_unreadable_ragged_spec_revision_refuses(self, tmp_path):
+        # espg-ruled (issue #358): a store whose ragged layout THIS zagg cannot
+        # read must be refused at declaration, not discovered at fold time.
+        # Same posture as the reader (readers.tdigest_tensor._open_ragged).
+        from zarr import open_array
+
+        from zagg.grids.base import RAGGED_SPEC
+
+        self._pre_declaration_store(tmp_path)
+        leaf = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        arr = open_array(leaf, path=f"{CELL_ORDER}/h_tdigest", mode="r+", zarr_format=3)
+        rag = dict(arr.attrs["ragged"])
+        assert rag["spec"] == RAGGED_SPEC  # the fixture is a current-spec store
+        rag["spec"] = "zagg-ragged/2"  # the live migration path (issue #210)
+        arr.attrs["ragged"] = rag
+        with pytest.raises(ValueError, match="h_tdigest.*zagg-ragged/2"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert "pyramid" not in read_manifest(str(tmp_path))  # nothing written
+
+    def test_declared_off_retrofit(self, tmp_path):
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = False
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True and summary["orders"] == []
+        assert summary["fields"] == {}
+        assert read_manifest(str(tmp_path))["pyramid"] == {
+            "spec": PYRAMID_SPEC,
+            "overview": {"orders": []},
+        }
+        # Recorded absence: the sweep sees the declared-off block and no-ops.
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["declared"] is False
+
+    def test_wrong_reducer_refuses_via_semantic_hash(self, tmp_path):
+        # The failure the leaf probe structurally cannot catch: no leaf records
+        # which reducer produced a field, so a config declaring h_min as a MAX
+        # over a store of minima passes every dtype check. The store's frozen
+        # semantic_hash is what refuses it.
+        self._pre_declaration_store(tmp_path, semantic_config=_leaf_cfg())
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_min"]["function"] = "max"
+        with pytest.raises(ValueError, match="config semantics .* != the store's frozen"):
+            declare_pyramid(str(tmp_path), cfg)
+        assert "pyramid" not in read_manifest(str(tmp_path))
+
+    def test_pyramid_only_edit_hashes_identically(self, tmp_path):
+        # The intended retrofit — the ORIGINAL config plus output.pyramid —
+        # must not false-refuse: output.* is not in the semantic core.
+        from zagg.semantics import semantic_fingerprint, semantic_hash
+
+        self._pre_declaration_store(tmp_path, semantic_config=_leaf_cfg())
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"orders": [1, 0]}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True and summary["orders"] == [1, 0]
+        fp = semantic_fingerprint(semantic_hash(_leaf_cfg()))
+        assert summary["validated"].endswith(f"semantic_hash {fp}")
+
+    def test_hashless_manifest_skips_the_semantic_check(self, tmp_path, caplog):
+        # Pre-#299 stores carry no hash; the check is skipped (the _frozen_matches
+        # both-sides-present exemption) but loudly, and the summary says so.
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_min"]["function"] = "max"  # unverifiable here
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True
+        assert summary["validated"].endswith(
+            "semantic_hash absent (pre-#299 store — fold methods unverified)"
+        )
+        assert "could NOT be verified" in caplog.text
+
+    def test_declared_off_preserves_prior_materialized(self, tmp_path):
+        # The intended shape (D24 option A): overviews already on disk are real
+        # regenerable-cache debris, so a declared-OFF block still inventories
+        # them. The sweep gates on ``orders``, so it no-ops regardless.
+        self._pre_declaration_store(tmp_path)
+        declare_pyramid(str(tmp_path), _leaf_cfg())
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        materialized = read_manifest(str(tmp_path))["pyramid"]["overview"]["materialized"]
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = False
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True and summary["orders"] == []
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block == {"orders": [], "materialized": materialized}
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["declared"] is False
+
+    def test_drift_leaves_an_existing_declaration_untouched(self, tmp_path):
+        # The dangerous half of never-half-written: a store that already carries
+        # a GOOD declaration must come out of a refused call byte-identical.
+        self._pre_declaration_store(tmp_path)
+        declare_pyramid(str(tmp_path), _leaf_cfg())
+        before = json.dumps(read_manifest(str(tmp_path)), sort_keys=True)
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_min"]["dtype"] = "float64"
+        with pytest.raises(ValueError, match="h_min.*declared float64"):
+            declare_pyramid(str(tmp_path), cfg)
+        assert json.dumps(read_manifest(str(tmp_path)), sort_keys=True) == before
+
+    def test_windowed_store_probe_resolves_the_window(self, tmp_path):
+        # The probe threads the run record's window into shard_leaf_path; on a
+        # windowed store the leaf exists ONLY under ``{window}.zarr``, so a
+        # dropped window would silently degrade to the no-committed-leaf skip.
+        _write_manifest(tmp_path, windowed=True)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        del manifest["pyramid"]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        _make_leaf(tmp_path, "-311", self.CELLS["-311"], window="2411")
+        _run_record(tmp_path, ("-311",), window="2411")
+        summary = declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert summary["validated"].startswith("leaf ") and "2411.zarr" in summary["validated"]
+
+    def test_missing_manifest_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="not a hive store root"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+
+    @pytest.mark.parametrize("drop", ["shard_order", "cell_order"])
+    def test_malformed_manifest_raises_pointedly(self, tmp_path, drop):
+        # A JSON blob that parses but is not a hive manifest gets the pointed
+        # refusal, not a KeyError — and cell_order refuses up front rather than
+        # after the whole leaf-discovery cost.
+        self._pre_declaration_store(tmp_path)
+        manifest = read_manifest(str(tmp_path))
+        del manifest[drop]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        with pytest.raises(ValueError, match="declares no shard_order/cell_order"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+
+    def test_non_dict_prior_pyramid_is_replaced(self, tmp_path):
+        # A hand-edited ``"pyramid": "off"`` is not this module's grammar: it
+        # carries no actuals to preserve and is replaced, never AttributeErrors.
+        self._pre_declaration_store(tmp_path)
+        manifest = read_manifest(str(tmp_path))
+        manifest["pyramid"] = "off"
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        summary = declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert summary["previous"] == "replaced" and summary["updated"] is True
+        assert read_manifest(str(tmp_path))["pyramid"]["overview"]["orders"] == [0]
+
+    def test_no_committed_leaf_still_declarable(self, tmp_path, caplog):
+        _write_manifest(tmp_path)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        del manifest["pyramid"]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        summary = declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert summary["updated"] is True
+        assert summary["validated"].startswith("manifest only (no run records")
+        assert "field-level validation skipped" in caplog.text
+        assert read_manifest(str(tmp_path))["pyramid"]["overview"]["orders"] == [0]
+
+    def test_uncommitted_refs_are_not_reported_as_no_records(self, tmp_path, caplog):
+        # A store whose refs are all debris is a different animal from one that
+        # has never run: both stay declarable (the probe never refuses), but the
+        # operator must be able to tell which skip they got.
+        _write_manifest(tmp_path)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        del manifest["pyramid"]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        _run_record(tmp_path, ("-311", "-312"))  # refs whose leaves never committed
+        summary = declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert summary["updated"] is True
+        assert summary["validated"].startswith("manifest only (none of the 2 run-record refs")
+        assert "field-level validation skipped" in caplog.text
+
+    def test_orders_outside_the_store_refuse(self, tmp_path):
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"orders": [4]}  # not an ancestor of shard_order 2
+        with pytest.raises(ValueError, match="not ancestor orders"):
+            declare_pyramid(str(tmp_path), cfg)
+
+    def test_retrofit_then_sweep_materializes_overviews(self, tmp_path):
+        # End-to-end (the issue #358 consumer): the sweep no-ops on the
+        # pre-#344 store, the retrofit installs the declaration, and one
+        # overview sweep then materializes real overviews.
+        from zagg.sweep import discover_leaves
+
+        self._pre_declaration_store(tmp_path, decimals=("-311", "-312"))
+        noop = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert noop["families"]["overview"]["declared"] is False  # the #358 gap
+        declare_pyramid(str(tmp_path), _leaf_cfg())
+        refs = discover_leaves(str(tmp_path))
+        result = run_sweep(str(tmp_path), refs, families=("overview",))
+        assert result["families"]["overview"]["written"] == 1  # node -3, order 0
+        g = _overview_group(tmp_path, "-3", "all.zarr", 2)
+        np.testing.assert_array_equal(g["count"][:2], [2, 1])  # per-leaf obs fold whole
+        assert g["h_min"][0] == 1.0 and g["h_min"][1] == 3.0
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block["materialized"]["orders"] == [0]

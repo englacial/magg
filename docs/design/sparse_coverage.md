@@ -982,6 +982,19 @@ rollup leaves all leaf reads intact.
   ("only `h_li_tdigest` differs in this leaf"); and the detection
   mechanism for stamped-but-torn leaves under the §2 concurrency
   contract's out-of-contract case.
+  *Writer-side addendum (espg-ratified 2026-07-31,
+  [#342](https://github.com/englacial/zagg/issues/342) — the recipe itself
+  was frozen in spec §5, pinned to the moczarr reference):* (1) sweep-written
+  **overview leaves are in scope** — the overview writer records the same §5
+  `content_hashes` sidecar, computed from the folded arrays it already holds;
+  (2) the overview envelope's sweep-internal **skip digest stays separate**
+  (different jobs: cheap pre-write idempotence check vs. verification record;
+  convergence may be revisited as a simplification later); (3) O11 recording
+  is **hive-only** — `store_layout: flat` has no leaf D20 sidecar to record
+  into, so the writer no-ops there and flat stores stay verifiable by running
+  the recipe manually; (4) the hash source is the **staged arrays** (no
+  read-back GETs), guarded in CI by a write-read parity test (staged hashes
+  == hashes recomputed from a full store read-back).
 - **O12 — retention/expiration (proposal, espg-directed to record
   2026-07-20)**: **product-level** retention is a *prefix* lifecycle rule
   (one rule per `{name}/` — delete or transition a whole product); 

@@ -114,6 +114,15 @@ class TestBuildRecord:
         rec = _record(duration=10.0, lambda_config=cfg)
         assert rec["est_cost_usd"] == pytest.approx(10.0 * 0.0000133334)
 
+    def test_content_hashes_ride_metadata(self):
+        # O11 (issue #342): the hive writer stamps metadata["content_hashes"];
+        # the record carries it verbatim, None wherever no writer recorded it
+        # (flat layouts, raster, failures) — absence = unverifiable (§5.3).
+        assert _record()["content_hashes"] is None
+        hashes = {"arrays": {"6/count": "aa"}, "combined": "bb"}
+        rec = build_record(shard_key=1, metadata={"duration_s": 1.0, "content_hashes": hashes})
+        assert rec["content_hashes"] == hashes
+
     def test_invoked_by_copied_verbatim(self):
         ident = {"arn": "arn:aws:sts::123:assumed-role/x/y", "userid": "AROA:me"}
         assert _record(invoked_by=ident)["invoked_by"] == ident
@@ -192,6 +201,28 @@ class TestMerge:
         assert m["phase_timings"]["read"] == pytest.approx(16.0)
         assert m["timestamp"] == max(a["timestamp"], b["timestamp"])
         assert m["success"] is True
+
+    def test_content_hashes_merge_equal_or_none(self):
+        # Per-leaf identity (issue #342): shared value survives a fold,
+        # differing leaves collapse to None (the absorbing identity).
+        hashes = {"arrays": {"6/count": "aa"}, "combined": "bb"}
+        a = build_record(shard_key=1, metadata={"duration_s": 1.0, "content_hashes": hashes})
+        b = build_record(shard_key=1, metadata={"duration_s": 1.0, "content_hashes": hashes})
+        assert merge([a, b])["content_hashes"] == hashes
+        other = {"arrays": {"6/count": "cc"}, "combined": "dd"}
+        c = build_record(shard_key=1, metadata={"duration_s": 1.0, "content_hashes": other})
+        assert merge([a, c])["content_hashes"] is None
+
+    def test_merge_does_not_alias_nested_content_hashes(self):
+        # The rollup's defensive copy has to reach the nested ``arrays`` map
+        # too: equal by value, never the leaf record's object (issue #342).
+        hashes = {"arrays": {"6/count": "aa"}, "combined": "bb"}
+        a = build_record(shard_key=1, metadata={"duration_s": 1.0, "content_hashes": hashes})
+        b = build_record(shard_key=1, metadata={"duration_s": 1.0, "content_hashes": hashes})
+        merged = merge([a, b])
+        assert merged["content_hashes"] == a["content_hashes"]
+        assert merged["content_hashes"] is not a["content_hashes"]
+        assert merged["content_hashes"]["arrays"] is not a["content_hashes"]["arrays"]
 
     def test_cost_fields_fold(self):
         price = 0.0000133334

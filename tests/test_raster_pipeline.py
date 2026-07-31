@@ -1205,11 +1205,11 @@ class TestRasterHiveWorker:
         real_write = raster_mod.write_raster_leaf_slab
         calls = {"n": 0}
 
-        def _tear(store, g, t, slab):
+        def _tear(store, g, t, slab, **kwargs):
             calls["n"] += 1
             if calls["n"] == 2:
                 raise RuntimeError("torn mid-shard")
-            return real_write(store, g, t, slab)
+            return real_write(store, g, t, slab, **kwargs)
 
         monkeypatch.setattr(raster_mod, "write_raster_leaf_slab", _tear)
         with pytest.raises(RuntimeError, match="torn"):
@@ -1232,6 +1232,106 @@ class TestRasterHiveWorker:
         assert stamp and stamp["complete"]
         red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape == (1, grid.cells_per_shard)
+
+
+class TestRasterHiveContentHashes:
+    """Issue #342 phase 5: O11 hashes accumulated incrementally as slabs stream.
+
+    The raster leaf never holds a whole band array, so the §5 digest is fed
+    row by row at write time. The acceptance gate is parity with the
+    canonical recipe: what the accumulator recorded must equal
+    ``content_hash.hash_arrays`` recomputed over the leaf read back from the
+    store.
+    """
+
+    def _setup(self, tmp_path, n=2):
+        cfg, grid, shard = _healpix_setup(tmp_path)
+        granules = []
+        for i in range(n):
+            _write_tiff(tmp_path / f"h{i}.tif", np.full((96, 96), 500 + i, dtype=np.uint16))
+            granules.append(
+                _entry(f"g{i}", {"red": str(tmp_path / f"h{i}.tif")}, T0, time_key=f"dt-{i}")
+            )
+        return cfg, grid, shard, granules, str(tmp_path / "hivestore")
+
+    def test_streamed_hashes_match_a_full_read_back(self, tmp_path):
+        # THE acceptance gate: incremental path == canonical recipe.
+        import zarr
+
+        from zagg import hive
+        from zagg.content_hash import combined_hash, hash_arrays
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.store import open_store
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path, n=3)
+        meta = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, window=None
+        )
+        record = meta["content_hashes"]
+        leaf = hive.shard_leaf_path(root, shard)
+        group = zarr.open_group(open_store(leaf), mode="r", zarr_format=3)
+        read_back = hash_arrays(group)
+        assert record["arrays"] == read_back
+        assert record["combined"] == combined_hash(read_back)
+        # Discovery-based scope: the band plus both coordinates, nothing else.
+        assert set(read_back) == {
+            f"{grid.group_path}/red",
+            f"{grid.group_path}/time",
+            f"{grid.group_path}/morton",
+        }
+        assert meta["phase_timings"]["hash"] >= 0.0
+
+    def test_windowed_leaf_records_hashes_in_its_sidecar_record(self, tmp_path):
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.telemetry import build_record
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        meta = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, window={"label": "20260713"}
+        )
+        # The D20 record both dispatchers build carries it verbatim (the
+        # raster sidecar seam needs no change of its own).
+        record = build_record(shard_key=shard, metadata=meta, window="20260713")
+        assert record["content_hashes"] == meta["content_hashes"]
+
+    def test_a_unit_that_writes_no_leaf_records_nothing(self, tmp_path):
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, _granules, root = self._setup(tmp_path)
+        meta = process_and_write_raster_hive(
+            shard, [], grid, root, cfg, store_kwargs={}, window=None
+        )
+        assert "content_hashes" not in meta  # unverifiable, not tampered (§5.3)
+
+    def test_a_violated_precondition_records_no_hash_at_all(self, tmp_path, caplog):
+        # Trap (2) at the integration level: a row written twice invalidates
+        # that array's digest, and the WHOLE record drops rather than
+        # recording a partial map a verifier would read as "array missing".
+        import logging
+
+        from zagg.processing.raster import (
+            _arm_leaf_hashes,
+            _finalize_leaf_hashes,
+            emit_raster_leaf_template,
+            write_raster_leaf_slab,
+        )
+        from zagg.store import open_store
+
+        cfg, grid, shard, _granules, root = self._setup(tmp_path)
+        store = open_store(f"{root}/leaf.zarr")
+        staged: dict = {}
+        streams: dict = {}
+        emit_raster_leaf_template(
+            store, grid, cfg, shard, np.array([0, 1], dtype=np.int64), staged_out=staged
+        )
+        _arm_leaf_hashes(store, staged, streams)
+        row = np.zeros(grid.cells_per_shard, dtype=np.uint16)
+        write_raster_leaf_slab(store, grid, 0, {"red": row}, streams=streams)
+        write_raster_leaf_slab(store, grid, 0, {"red": row}, streams=streams)  # same row twice
+        with caplog.at_level(logging.WARNING):
+            assert _finalize_leaf_hashes(staged, streams) is None
+        assert "no content hashes recorded" in caplog.text
+        assert "written more than once" in caplog.text
 
 
 class TestRasterHivePopcount:

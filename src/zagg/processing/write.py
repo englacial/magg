@@ -133,6 +133,7 @@ def write_dataframe_to_zarr(
     *,
     grid,
     chunk_idx: tuple,
+    staged_out: dict | None = None,
 ) -> Store:
     """Write a per-shard output carrier to an existing Zarr template.
 
@@ -153,6 +154,16 @@ def write_dataframe_to_zarr(
     chunk_idx : tuple of int
         Storage block index for this shard, as returned by
         ``grid.block_index(shard_key)``.
+    staged_out : dict, optional
+        The HIVE leaf writers' staging seam (issue #342). When a dict is
+        passed, each dense per-cell array this call touches is lazily
+        allocated at the array's full shape and this chunk's values are placed
+        at the chunk's region, so the caller's O11 content hashing runs over
+        the staged values with no read-back GETs. ``resolution: chunk``
+        companions are NOT staged (the hasher's read-back fallback covers
+        them). **Flat-path callers must not pass it**: the region math assumes
+        the leaf-local chunk grid (one array per leaf, block ``chunk_idx``
+        indexing that leaf's own arrays), which only holds on the hive layout.
 
     Returns
     -------
@@ -229,6 +240,20 @@ def write_dataframe_to_zarr(
                         f"{trailing} (the payload dim must be one whole chunk)"
                     )
             array.set_block_selection(block_idx, values)
+            if staged_out is not None:
+                # Stage the leaf-wide slab (issue #342): allocate at fill on
+                # first sight of the array — mirroring write_leaf_to_zarr's
+                # slab construction — and place this chunk's values at its own
+                # region. Trailing (vector) dims span the array whole, so the
+                # leading-axis region is the whole placement.
+                key = f"{grid.group_path}/{name}"
+                if key not in staged_out:
+                    staged_out[key] = np.full(
+                        array.shape, array.metadata.fill_value, dtype=values.dtype
+                    )
+                staged_out[key][
+                    tuple(slice(b * c, (b + 1) * c) for b, c in zip(chunk_idx, grid.chunk_shape))
+                ] = values
 
     return store
 
@@ -454,7 +479,9 @@ def write_ragged_to_zarr(
     return store
 
 
-def write_ragged_leaf_to_zarr(ragged_chunks: list, store: Store, *, grid) -> Store:
+def write_ragged_leaf_to_zarr(
+    ragged_chunks: list, store: Store, *, grid, staged_out: dict | None = None
+) -> Store:
     """Write a hive leaf's ragged fields in ONE array write each (issue #209).
 
     The hive counterpart of the sharded path's slab pass: ``ragged_chunks`` is
@@ -473,6 +500,11 @@ def write_ragged_leaf_to_zarr(ragged_chunks: list, store: Store, *, grid) -> Sto
     ``resolution: chunk`` ragged companions are written per chunk block (their
     array is one block per chunk, unsharded — same as the scalar/vector
     companions).
+
+    ``staged_out`` (issue #342): when a dict is passed, the assembled slabs
+    are recorded in it under their leaf-relative array paths — refs to the
+    exact arrays written, so the caller's O11 content hashing runs over the
+    staged values with no read-back.
     """
     if not any(ragged for _block, ragged in ragged_chunks):
         return store
@@ -487,6 +519,8 @@ def write_ragged_leaf_to_zarr(ragged_chunks: list, store: Store, *, grid) -> Sto
         _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_fields)
     for name, slab in slabs.items():
         _set_ragged_block(store, grid, name, (0,) * len(slab_shape), slab)
+    if staged_out is not None:
+        staged_out.update({f"{grid.group_path}/{name}": slab for name, slab in slabs.items()})
     return store
 
 
@@ -496,6 +530,7 @@ def write_leaf_to_zarr(
     *,
     grid,
     shard_key: int,
+    staged_out: dict | None = None,
 ) -> Store:
     """Write a SHARDED hive leaf in ONE block selection per array (issue #236).
 
@@ -520,6 +555,12 @@ def write_leaf_to_zarr(
     at leaf block 0. ``resolution: chunk`` companions stay per inner chunk at
     leaf-LOCAL blocks (their arrays are one block per chunk on the leaf's
     chunk grid, never sharded).
+
+    ``staged_out`` (issue #342): when a dict is passed, the assembled dense
+    and ragged slabs are recorded in it under their leaf-relative array paths
+    — refs to the exact arrays written, the ratified O11 hash source (staged,
+    not read back). Companions are per-chunk-block writes and are not staged;
+    the hasher's read-back fallback covers them.
     """
     chunk_res_fields = _chunk_resolution_fields(getattr(grid, "config", None))
     inner_shape = tuple(int(s) for s in grid.chunk_shape)
@@ -579,6 +620,10 @@ def write_leaf_to_zarr(
             array.set_block_selection((*leaf_block, *((0,) * len(trailing))), slab)
     for name, slab in ragged_slabs.items():
         _set_ragged_block(store, grid, name, leaf_block, slab)
+    if staged_out is not None:
+        staged_out.update(
+            {f"{grid.group_path}/{name}": slab for name, slab in {**slabs, **ragged_slabs}.items()}
+        )
     return store
 
 

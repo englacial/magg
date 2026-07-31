@@ -627,6 +627,6 @@ class TestProcessRasterHiveMode:
         resp = handler_mod.lambda_handler(event, MagicMock())
         assert resp["statusCode"] == 200, resp
         pt = json.loads(resp["body"])["phase_timings"]
-        assert set(pt) == {"sample", "write", "stages"}
+        assert set(pt) == {"sample", "write", "hash", "stages"}
         assert pt["write"] > 0.0
         assert pt["stages"]["assets"] == 1

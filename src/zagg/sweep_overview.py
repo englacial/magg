@@ -297,6 +297,299 @@ def _update_manifest_pyramid(store_root, orders, store_kwargs) -> bool:
         return False
 
 
+def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
+    """Install/refresh the manifest ``pyramid`` declaration on an EXISTING store.
+
+    The issue #358 retrofit tool: declaration is no longer birth-only. The
+    block is re-derived from the supplied pipeline config (the authoritative
+    source — the same :func:`build_pyramid_block` path template time uses) at
+    the manifest's own ``shard_order``, validated against store truth, and
+    RMW'd into the manifest. Unlike the sweep's fail-open ``materialized``
+    update (:func:`_update_manifest_pyramid`), this is the user's explicit
+    operation: every failure raises — a missing or malformed manifest, a config
+    whose semantics the store's frozen hash denies, a declaration the store
+    contradicts — and nothing is half-written (the one PUT is the whole write).
+
+    Two validation sources, covering the two halves of the recipe:
+
+    * **Typing** — ONE committed leaf, found through the store's run records
+      (:func:`zagg.sweep.discover_leaves`, the sweep's own tree-enumeration-free
+      discovery: one shallow root LIST of the run records, never a recursive
+      LIST), read at the manifest ``cell_order``. Leaves are the layer the
+      overview fold actually reads, so they are what can falsify the declared
+      **presence, dtype, and D18 ragged element shape** of each field. They
+      cannot falsify more than that: no leaf records which reducer produced it.
+      A store with no committed leaf yet is still declarable — field-level
+      checks are then skipped and the summary says which skip it was.
+    * **Semantics** — the manifest's own frozen ``semantic_hash``
+      (:func:`_semantic_guard`), which is what covers the ``method``/
+      ``nan_policy`` half the leaf is silent on. The D19 ``aggregation.yaml``
+      core is NOT used (it is itself config-derived and written fail-open).
+
+    Idempotent RMW: an identical existing declaration is not re-PUT; a
+    changed one is rewritten PRESERVING any ``materialized`` actuals (they
+    inventory overview artifacts already on disk — overviews at
+    now-undeclared orders stay as regenerable-cache debris, D24 option A).
+    An ``output.pyramid: false`` config installs the declared-off block:
+    recording absence is a valid retrofit.
+
+    Returns a summary dict: ``orders`` (the declared schedule), ``fields``
+    (``{name: class}``), ``validated`` (what store truth was checked),
+    ``previous`` (``absent``/``identical``/``replaced``), and ``updated``
+    (whether a PUT happened).
+    """
+    import obstore
+
+    from zagg.hive import MANIFEST_NAME, _frozen_matches, read_manifest
+    from zagg.store import open_object_store
+
+    store_kwargs = dict(store_kwargs or {})
+    manifest = read_manifest(store_root, **store_kwargs)
+    if manifest is None:
+        raise ValueError(
+            f"no {MANIFEST_NAME} at {store_root} — not a hive store root; "
+            f"declare_pyramid retrofits existing hive stores only"
+        )
+    # Both order keys up front: ``cell_order`` is only consumed by the leaf probe,
+    # and a manifest that parses without it should refuse HERE rather than
+    # KeyError after the whole discovery cost has been paid.
+    if not isinstance(manifest, dict) or any(
+        manifest.get(k) is None for k in ("shard_order", "cell_order")
+    ):
+        raise ValueError(
+            f"the {MANIFEST_NAME} at {store_root} declares no shard_order/cell_order — "
+            f"not a hive store manifest; declare_pyramid retrofits existing hive stores only"
+        )
+    shard_order = int(manifest["shard_order"])
+    block = build_pyramid_block(config, shard_order)
+    # Compare (and write) canonical JSON: ``prior`` came back through
+    # ``json.loads``, so any non-JSON-primitive surviving the derivation (a tuple
+    # in a ``summarize`` declaration, say) would differ from its round-tripped
+    # self and re-PUT on every call — against the headline idempotency property.
+    # It also surfaces an unserializable block HERE rather than at the PUT,
+    # after the whole store-truth probe has been paid for.
+    block = json.loads(json.dumps(block))
+    bad = [k for k in block["overview"].get("orders") or [] if not 0 <= int(k) < shard_order]
+    if bad:
+        raise ValueError(
+            f"declared orders {bad} are not ancestor orders of the manifest "
+            f"shard_order {shard_order} — the config does not match this store"
+        )
+    semantic = _semantic_guard(manifest, config)
+    validated = _validate_block_against_store(store_root, manifest, block, store_kwargs)
+    # Re-read immediately before the RMW, the same discipline
+    # :func:`_update_manifest_pyramid` uses: validation above is slow (run-record
+    # discovery + leaf GETs), this PUT rewrites the WHOLE manifest, and a
+    # concurrent sweep's ``materialized`` update landing in that window would be
+    # silently reverted by the pre-validation copy. Frozen keys are re-checked so
+    # the block is never installed on a manifest validation never saw.
+    fresh = read_manifest(store_root, **store_kwargs)
+    if fresh is None or not _frozen_matches(fresh, manifest):
+        raise ValueError(
+            f"the {MANIFEST_NAME} at {store_root} changed under declare_pyramid's "
+            f"validation window (frozen keys differ, or it vanished) — nothing was "
+            f"written; re-run against the settled store"
+        )
+    prior = fresh.get("pyramid")
+    # A non-dict prior (hand-edited ``"pyramid": "off"``) is not an error: it is
+    # not this module's grammar, so it carries no actuals to preserve and is
+    # simply replaced — but it must not AttributeError on the way there.
+    prior_overview = prior.get("overview") if isinstance(prior, dict) else None
+    materialized = prior_overview.get("materialized") if isinstance(prior_overview, dict) else None
+    if materialized is not None:
+        block["overview"]["materialized"] = materialized
+    summary = {
+        "orders": list(block["overview"].get("orders") or []),
+        "fields": {n: m.get("class") for n, m in (block["overview"].get("fields") or {}).items()},
+        "validated": f"{validated}; {semantic}",
+        "previous": "absent" if prior is None else "identical" if prior == block else "replaced",
+        "updated": prior != block,
+    }
+    if prior == block:
+        logger.info("declare_pyramid: the manifest already carries this declaration; no write")
+        return summary
+    fresh["pyramid"] = block
+    obstore.put(
+        open_object_store(store_root, **store_kwargs),
+        MANIFEST_NAME,
+        json.dumps(fresh, indent=1).encode(),
+    )
+    return summary
+
+
+def _semantic_guard(manifest: dict, config) -> str:
+    """Refuse a config whose semantics the store's frozen ``semantic_hash`` denies.
+
+    The leaf probe (:func:`_field_drift`) can falsify TYPING only — no leaf
+    records which reducer produced a field — so nothing there contradicts a
+    declaration of ``method: "max"`` over a store holding minima, and
+    :func:`build_pyramid_block` puts exactly that fold law into the block. The
+    store does record its reducers, in the one place the repo calls
+    authoritative: the D19 frozen ``semantic_hash`` (issue #299), a digest over
+    the whole ``aggregation`` block. Comparing it here is what makes the issue
+    #358 contract ("a wrong config cannot install a fold recipe the store
+    contradicts") true of the fold LAW and not just of dtypes.
+
+    ``output.*`` is not in the semantic core, so the intended retrofit config —
+    the original plus ``output.pyramid`` — hashes identically; the guard cannot
+    false-refuse on the pyramid edit itself. It compares only when the manifest
+    declares the key, the same both-sides-present exemption
+    :func:`zagg.hive._frozen_matches` gives pre-#299 stores (a pre-#344 retrofit
+    target may well be one). Returns the note recorded in the summary.
+    """
+    from zagg.semantics import semantic_fingerprint, semantic_hash
+
+    stored = manifest.get("semantic_hash")
+    if not stored:
+        logger.warning(
+            "declare_pyramid: the manifest carries no semantic_hash (pre-#299 store) — "
+            "the config's aggregation semantics could NOT be verified against the store; "
+            "the declared fold methods are taken on trust"
+        )
+        return "semantic_hash absent (pre-#299 store — fold methods unverified)"
+    supplied = semantic_hash(config)
+    if supplied != stored:
+        raise ValueError(
+            f"config semantics {semantic_fingerprint(supplied)} != the store's frozen "
+            f"semantic_hash {semantic_fingerprint(stored)} — this config did not build this "
+            f"store, so the fold methods it declares (which no leaf records, and which the "
+            f"field checks cannot falsify) are not the store's; declare_pyramid refuses. "
+            f"Retrofit with the ORIGINAL config: output.* is not in the semantic core, so "
+            f"adding output.pyramid to it hashes identically"
+        )
+    return f"semantic_hash {semantic_fingerprint(stored)}"
+
+
+def _validate_block_against_store(store_root, manifest, block, store_kwargs) -> str:
+    """The pre-write store-truth check: refuse a recipe the store contradicts.
+
+    Probes the run records for a committed leaf (the first hit wins — discovery
+    has already parsed every record, so the scan costs one GET per ref until it
+    lands) and checks every declared field against the
+    leaf's stored array: presence, dense dtype for the exact class, the D18
+    ragged element declaration (element dtype + ``inner_shape``) for the
+    approximate class. Returns the "what was checked" summary string;
+    raises ``ValueError`` naming every drifted field. No committed leaf is
+    not an error — the store is declarable before its first commit — but
+    the skip is loud and recorded in the summary.
+    """
+    import zarr
+
+    from zagg.hive import read_commit, shard_leaf_path
+    from zagg.store import open_store
+    from zagg.sweep import discover_leaves
+
+    fields = block["overview"].get("fields") or {}
+    if not fields:
+        # The declared-off block carries no ``fields`` key at all; an ON
+        # declaration over an empty aggregation carries an empty one. Reporting
+        # both as "declared off" would read as a lie in the summary.
+        return (
+            "nothing to check (declared off)"
+            if "fields" not in block["overview"]
+            else "nothing to check (no aggregation variables to declare)"
+        )
+    # Un-capped on purpose: ``discover_leaves`` has ALREADY paid the whole cost
+    # (a root LIST plus a GET + parse of every run record), so truncating its
+    # result bounds nothing — it only risks giving up while committed leaves
+    # remain. Each extra ref costs one ``read_commit`` GET, and the loop stops at
+    # the first hit; the read is read-only, which on S3 also picks the shorter
+    # readonly retry policy (issue #186).
+    refs = discover_leaves(store_root, store_kwargs=store_kwargs)
+    leaf = None
+    for key, window in refs:
+        path = shard_leaf_path(store_root, key, window=window)
+        if read_commit(open_store(path, read_only=True, **store_kwargs)) is not None:
+            leaf = path
+            break
+    if leaf is None:
+        # Two very different stores that must not report the same thing: no run
+        # records at all is a genuinely pre-commit store, while refs that are all
+        # torn/rolled-back debris is a store whose validation was skipped over
+        # real work. Neither refuses — a store with no committed leaf stays
+        # declarable, which is the point of the retrofit — but the skip is loud
+        # and says which case it was.
+        detail = (
+            "no run records at the product root"
+            if not refs
+            else f"none of the {len(refs)} run-record refs is a committed leaf"
+        )
+        logger.warning(
+            f"declare_pyramid: no committed leaf to probe ({detail}) — field-level "
+            f"validation skipped; only the manifest root was checked"
+        )
+        return f"manifest only ({detail}; fields unvalidated)"
+    group = zarr.open_group(
+        open_store(leaf, **store_kwargs),
+        path=str(int(manifest["cell_order"])),
+        mode="r",
+        zarr_format=3,
+    )
+    drift = [e for n, m in sorted(fields.items()) if (e := _field_drift(group, n, m))]
+    if drift:
+        raise ValueError(
+            f"pyramid declaration contradicts the store (checked leaf {leaf}): " + "; ".join(drift)
+        )
+    return f"leaf {leaf}"
+
+
+def _field_drift(group, name, meta) -> str | None:
+    """One declared field's mismatch against its stored leaf array, or ``None``.
+
+    The ragged branch also gates the D18 attrs' **spec revision** against
+    :data:`zagg.grids.base.RAGGED_SPEC`, mirroring the readers' posture
+    (``readers.tdigest_tensor._open_ragged`` raises on mismatch) rather than
+    inventing a second policy. A store whose ragged layout this zagg cannot
+    read is the purest instance of the tool's contract — a fold recipe the
+    store contradicts: without the gate the retrofit installs a declaration
+    promising overviews the sweep then fails to read at FOLD time, later and
+    with a worse error. ``zagg-ragged/2`` is a live migration path (issue
+    #210 moves the element declaration into the zarr data type), so this is
+    not hypothetical (espg-ruled, issue #358).
+    """
+    from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC
+
+    try:
+        arr = group[name]
+    except KeyError:
+        return f"field {name!r} is declared but absent from the leaf"
+    if meta["class"] == "approximate":
+        raw = arr.attrs.get(RAGGED_ELEMENT_ATTR)
+        ragged = dict(raw) if isinstance(raw, dict) else {}
+        element = ragged.get("element") or {}
+        if not element:
+            return (
+                f"field {name!r}: declared approximate (ragged) but the stored "
+                f"array carries no ragged element declaration"
+            )
+        if ragged.get("spec") != RAGGED_SPEC:
+            return (
+                f"field {name!r}: the stored array declares ragged spec "
+                f"{ragged.get('spec')!r}; this zagg understands {RAGGED_SPEC!r} only — "
+                f"a newer writer's layout must be adopted deliberately, not folded "
+                f"blind (declaring overviews over it would promise a fold that fails "
+                f"at sweep time)"
+            )
+        declared_dt = np.dtype(meta.get("dtype") or "float32")
+        # Explicit, because ``np.dtype(None)`` is float64: an element block that
+        # declares no dtype would otherwise silently VALIDATE a float64
+        # declaration against a store that says nothing.
+        stored_dt = element.get("dtype")
+        if stored_dt is None:
+            return f"field {name!r}: the stored ragged element declaration carries no dtype"
+        if np.dtype(stored_dt) != declared_dt:
+            return f"field {name!r}: ragged element dtype {stored_dt} != declared {declared_dt}"
+        stored_inner = [int(s) for s in (element.get("shape") or [-1])[1:]]
+        declared_inner = [int(s) for s in meta.get("inner_shape") or [2]]
+        if stored_inner != declared_inner:
+            return f"field {name!r}: ragged inner_shape {stored_inner} != declared {declared_inner}"
+    elif meta["class"] == "exact":
+        declared_dt = np.dtype(meta.get("dtype") or "float32")
+        if arr.dtype != declared_dt:
+            return f"field {name!r}: dtype {arr.dtype} != declared {declared_dt}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Phase B: the overview writer — the family's whole-tree sweep.
 # ---------------------------------------------------------------------------
@@ -821,7 +1114,10 @@ def _write_overview(
     pinned like a leaf's: template (wholesale overwrite — a prior overview or
     torn debris is replaced, D4 retry semantics) -> arrays -> role/provenance
     attrs -> commit stamp LAST, so an interrupted writer leaves ignorable
-    debris and presence certifies the ``role`` attr landed (D11).
+    debris and presence certifies the ``role`` attr landed (D11). The D20
+    stats sidecar (§5 ``content_hashes``, issue #342) is a SIBLING object PUT
+    after the stamp — outside the leaf, so the stamp stays the leaf's own
+    final write, exactly as source-leaf sidecars land post-stamp.
     """
     import zarr
     from mortie import generate_morton_children
@@ -873,6 +1169,36 @@ def _write_overview(
         window=stamp_window,
         time_range=fold["time_range"] if stamp_window is not None else None,
     )
+    # O11 content hashes (issue #342 phase 4): an overview leaf gets the same
+    # §5 D20 sidecar record as a source leaf, computed from the folded arrays
+    # already in memory (the ratified overview-scope decision (1)); the
+    # envelope's sweep-internal skip digest (``_content_hash`` above) is a
+    # DIFFERENT recipe with a different job and stays untouched (decision
+    # (2)). Sidecar naming follows the leaf basename's D23 window-only
+    # grammar (``{stem}.stats.json``) regardless of the store's manifest
+    # spec: overview basenames are v3-named unconditionally, and the legacy
+    # grammar would key every window's sidecar to one ``stats.json`` at the
+    # node. Fail-open (D9 telemetry posture; §5.3 reads absence as
+    # unverifiable, never tampered).
+    try:
+        from zagg.content_hash import content_hashes_record, hash_arrays
+        from zagg.telemetry import SPEC_V3, build_record, write_sidecar
+
+        staged = {f"{target_order}/morton": words}
+        staged.update({f"{target_order}/{name}": slab for name, slab in fold["slabs"].items()})
+        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
+        record = build_record(
+            shard_key=morton_word(node),
+            metadata={
+                "cells_with_data": int(populated.sum()),
+                "granule_count": int(fold["granule_count"]),
+                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+            },
+            window=stamp_window,
+        )
+        write_sidecar(path, record, spec=SPEC_V3, **store_kwargs)
+    except Exception as e:
+        logger.warning(f"sweep[overview]: O11 sidecar failed at {node}/{basename} ({e})")
     return basename
 
 

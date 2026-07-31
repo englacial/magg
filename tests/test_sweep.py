@@ -905,6 +905,108 @@ class TestSweepCli:
         assert node["windows"] == ["2019", "2020"]
         assert node["payload"] == merge([a, b])
 
+    def _config_yaml(self, tmp_path):
+        """A real pipeline config file (the shipped atl06, hive layout)."""
+        import yaml
+
+        from zagg.config import default_config
+
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "hive"
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "data_source": cfg.data_source,
+                    "aggregation": cfg.aggregation,
+                    "output": cfg.output,
+                }
+            )
+        )
+        return path
+
+    def test_declare_pyramid_flag_is_declaration_only(self, tmp_path, capsys):
+        from zagg.hive import read_manifest
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)  # legacy pyramid block
+        # Real sweepable work, so the no-rollup assertion below DISCRIMINATES:
+        # without it the fallthrough path writes nothing either (an empty store
+        # is a no-op — see test_empty_store_is_a_noop), and the
+        # declaration-only claim would go untested (review finding, issue #358).
+        # The sidecars carry no commit stamp, so validation still takes the
+        # no-committed-leaf branch.
+        _put_leaf(tmp_path, "-311")
+        _put_leaf(tmp_path, "-312")
+        _run_record(tmp_path, [_row("-311"), _row("-312")])
+        config_path = self._config_yaml(tmp_path)
+        assert main([str(tmp_path), "--declare-pyramid", str(config_path)]) == 0
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["updated"] is True and summary["orders"] == [0]
+        # Uncommitted refs on this store: validation records the loud skip.
+        assert summary["validated"].startswith("manifest only")
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block["orders"] == [0]  # manifest shard_order 2, spacing 2
+        assert block["fields"]["count"]["class"] == "exact"
+        # Declaration-only semantics: no sweep pass ran in the invocation —
+        # the same store swept normally writes four stats rollups.
+        assert not list(tmp_path.rglob("*.rollup.json"))
+
+    def test_declare_pyramid_flag_does_not_sweep_a_sweepable_store(self, tmp_path, capsys):
+        # The positive control for the assertion above: the SAME fixture, swept
+        # without the flag, writes rollups — so their absence really is the
+        # flag's doing (issue #358).
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        _put_leaf(tmp_path, "-312")
+        _run_record(tmp_path, [_row("-311"), _row("-312")])
+        assert main([str(tmp_path), "--families", "stats"]) == 0
+        assert json.loads(capsys.readouterr().out)["families"]["stats"]["written"] == 4
+        assert list(tmp_path.rglob("*.rollup.json"))
+
+    def test_empty_declare_pyramid_value_never_sweeps(self, tmp_path):
+        # An unset shell variable expands to --declare-pyramid="": the flag must
+        # fail loudly on the empty path, never fall through to the WRITING sweep
+        # pass it advertises it will not run (review finding, issue #358).
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)
+        _put_leaf(tmp_path, "-311")
+        _run_record(tmp_path, [_row("-311")])
+        with pytest.raises((FileNotFoundError, IsADirectoryError, OSError)):
+            main([str(tmp_path), "--declare-pyramid", ""])
+        assert not list(tmp_path.rglob("*.rollup.json"))
+
+    def test_declare_pyramid_flag_is_idempotent(self, tmp_path, capsys):
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)
+        config_path = self._config_yaml(tmp_path)
+        assert main([str(tmp_path), "--declare-pyramid", str(config_path)]) == 0
+        capsys.readouterr()
+        assert main([str(tmp_path), "--declare-pyramid", str(config_path)]) == 0
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["updated"] is False and summary["previous"] == "identical"
+
+    def test_declare_pyramid_failures_surface_not_swallowed(self, tmp_path):
+        # The CLI wrapper deliberately has no error handling: a refusal escapes
+        # main() and the process exits non-zero through the interpreter, the
+        # same shape as ``python -m zagg``. Pinned so a future try/except that
+        # swallows a refusal to ``return 0`` — the flag's whole promise is that
+        # a wrong config does NOT get installed — is caught (issue #358).
+        from zagg.sweep import main
+
+        config_path = self._config_yaml(tmp_path)
+        store = tmp_path / "not_a_hive_root"
+        store.mkdir()
+        with pytest.raises(ValueError, match="not a hive store root"):
+            main([str(store), "--declare-pyramid", str(config_path)])
+        _write_manifest(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            main([str(tmp_path), "--declare-pyramid", str(tmp_path / "missing.yaml")])
+
 
 class TestSweepConfig:
     """output.sweep (issue #300): default on for hive, boolean, hive-only —

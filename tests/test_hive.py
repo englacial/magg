@@ -1404,7 +1404,7 @@ class TestHiveProfileWritePhase:
         _grid, _shard, _root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
         timings = meta["phase_timings"]
         # Additive: the process_shard phases keep their names and values.
-        assert set(timings) == {"read", "index", "aggregate", "write"}
+        assert set(timings) == {"read", "index", "aggregate", "write", "hash"}
         assert {k: timings[k] for k in self._SHARD_PHASES} == self._SHARD_PHASES
         assert timings["write"] >= 0.0
 
@@ -1434,7 +1434,7 @@ class TestHiveProfileWritePhase:
             store_kwargs={},
         )
         assert meta["phase_timings"]["write"] >= 0.0
-        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write"}
+        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write", "hash"}
 
     def test_errored_shard_omits_write(self, monkeypatch, cfg, tmp_path):
         # Same gate as the flat handler (issue #100): a shard that wrote no
@@ -1449,7 +1449,7 @@ class TestHiveProfileWritePhase:
         # without any profile flag — the sidecar record is complete by default.
         fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
         _grid, shard, root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
-        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write"}
+        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write", "hash"}
         # The leaf still landed, fully stamped.
         from zagg.store import open_store
 

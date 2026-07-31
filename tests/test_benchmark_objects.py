@@ -337,16 +337,20 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     assert expected["exact"] is True
     # Through the runner: manifest + aggregation.yaml (issue #299) + root MOC.
     assert measured["objects_metadata"] == expected["metadata"] == 3
+    # Every object is classified — including the D20 `{window}.stats.json`
+    # sidecar each overview leaf now carries (issue #342), which the classifier
+    # buckets with its overview since issue #362.
     assert measured["objects_other"] == 0
     assert list(measured["objects_per_shard"]) == [_KEY_A]
     # The run stats parquet (#297) and the sweep run record (#353) are per-run
     # root telemetry: their own unbounded bucket since issue #362.
     assert measured["objects_telemetry"] == 2
     # The end-of-run sweep lands its rollups (issue #300) and overview zarrs
-    # (issue #201) in their own buckets (second-pass D9 caches); the
-    # write-path total excludes all three.
+    # (issue #201, with their #342 sidecars) in their own buckets (second-pass
+    # D9 caches); the write-path total excludes all three.
     assert measured["objects_rollups"] > 0
     assert measured["objects_overviews"] > 0
+    assert any(k.endswith("/all.stats.json") for k in bench_objects.list_store_keys(root))
     write_path = (
         measured["objects_total"]
         - measured["objects_rollups"]
@@ -823,9 +827,10 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     # ... + the stats.json AND shardmap.json siblings (issues #297/#300).
     assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 2
     assert expected["metadata"] == 3
-    # Sweep rollups (issue #300), overview zarrs (issue #201) and per-run root
-    # telemetry (issue #362) ride their own buckets, outside the write-path
-    # total this model audits.
+    # Sweep rollups (issue #300), overview zarrs (issue #201 — with the D20
+    # `{window}.stats.json` sidecar each overview leaf carries since issue
+    # #342) and per-run root telemetry (issue #362) ride their own buckets,
+    # outside the write-path total this model audits. Nothing is left over.
     write_path = (
         measured["objects_total"]
         - measured["objects_rollups"]

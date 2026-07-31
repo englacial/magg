@@ -64,6 +64,10 @@ _EQ_OR_NONE_KEYS = (
     "run_id",
     "semantic_hash",
     "granules_sha256",
+    # O11 (issue #342): per-leaf by definition, so a multi-leaf rollup
+    # collapses it to None (absence = unverifiable, §5.3) while merge([r])
+    # stays r.
+    "content_hashes",
     "zagg_version",
     "lambda",
     "invoked_by",
@@ -183,6 +187,12 @@ def build_record(
         "n_shards": 1,
         "n_granules": int(n_granules),
         "granules_sha256": granules_sha256(granule_ids),
+        # O11 content hashes (issue #342, spec §5.3): the verification half of
+        # the D19 identity split, computed by the hive leaf writer from the
+        # staged arrays and ridden here off ``metadata``. None wherever no
+        # writer recorded them (flat layouts, raster, failures) — absence
+        # reads as unverifiable, not tampered.
+        "content_hashes": metadata.get("content_hashes"),
         "n_obs": int(metadata.get("total_obs") or 0),
         "cells_with_data": int(metadata.get("cells_with_data") or 0),
         "phase_timings": phase_timings,
@@ -229,10 +239,17 @@ def merge(records: Iterable[dict]) -> dict:
     for key in _EQ_OR_NONE_KEYS:
         first = records[0].get(key)
         if all(r.get(key) == first for r in records):
-            # Defensively copy dict values (``lambda``/``invoked_by``) so a
-            # rolled-up record never aliases a leaf's nested dict, mirroring
-            # build_record (issue #297).
-            out[key] = dict(first) if isinstance(first, dict) else first
+            # Defensively copy dict values so a rolled-up record never
+            # aliases a leaf's nested dict, mirroring build_record (issue
+            # #297). One level deeper than a plain ``dict()``: flat values
+            # (``lambda``/``invoked_by``) are unaffected, but
+            # ``content_hashes`` nests an ``arrays`` map (issue #342) that a
+            # shallow copy would still alias.
+            out[key] = (
+                {k: dict(v) if isinstance(v, dict) else v for k, v in first.items()}
+                if isinstance(first, dict)
+                else first
+            )
         else:
             out[key] = None
     for key in _SUM_KEYS:
