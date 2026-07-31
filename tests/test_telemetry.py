@@ -213,6 +213,17 @@ class TestMerge:
         c = build_record(shard_key=1, metadata={"duration_s": 1.0, "content_hashes": other})
         assert merge([a, c])["content_hashes"] is None
 
+    def test_merge_does_not_alias_nested_content_hashes(self):
+        # The rollup's defensive copy has to reach the nested ``arrays`` map
+        # too: equal by value, never the leaf record's object (issue #342).
+        hashes = {"arrays": {"6/count": "aa"}, "combined": "bb"}
+        a = build_record(shard_key=1, metadata={"duration_s": 1.0, "content_hashes": hashes})
+        b = build_record(shard_key=1, metadata={"duration_s": 1.0, "content_hashes": hashes})
+        merged = merge([a, b])
+        assert merged["content_hashes"] == a["content_hashes"]
+        assert merged["content_hashes"] is not a["content_hashes"]
+        assert merged["content_hashes"]["arrays"] is not a["content_hashes"]["arrays"]
+
     def test_cost_fields_fold(self):
         price = 0.0000133334
         cfg_a = {"memory_mb": 4096, "arch": "aarch64", "function_variant": "zagg-process-shard"}

@@ -239,10 +239,17 @@ def merge(records: Iterable[dict]) -> dict:
     for key in _EQ_OR_NONE_KEYS:
         first = records[0].get(key)
         if all(r.get(key) == first for r in records):
-            # Defensively copy dict values (``lambda``/``invoked_by``) so a
-            # rolled-up record never aliases a leaf's nested dict, mirroring
-            # build_record (issue #297).
-            out[key] = dict(first) if isinstance(first, dict) else first
+            # Defensively copy dict values so a rolled-up record never
+            # aliases a leaf's nested dict, mirroring build_record (issue
+            # #297). One level deeper than a plain ``dict()``: flat values
+            # (``lambda``/``invoked_by``) are unaffected, but
+            # ``content_hashes`` nests an ``arrays`` map (issue #342) that a
+            # shallow copy would still alias.
+            out[key] = (
+                {k: dict(v) if isinstance(v, dict) else v for k, v in first.items()}
+                if isinstance(first, dict)
+                else first
+            )
         else:
             out[key] = None
     for key in _SUM_KEYS:
