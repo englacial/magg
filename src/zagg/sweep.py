@@ -1068,6 +1068,14 @@ def main(argv=None) -> int:
         metavar="PATH",
         help="Path to a JSON credentials file for the store (same format as python -m zagg)",
     )
+    parser.add_argument(
+        "--declare-pyramid",
+        default=None,
+        metavar="CONFIG_YAML",
+        help="Retrofit the manifest pyramid declaration from this pipeline config "
+        "(issue #358), print the summary, and exit — declaration-only: no sweep "
+        "pass runs in the same invocation (--families is ignored)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     store_kwargs: dict = {"region": args.region}
@@ -1078,6 +1086,15 @@ def main(argv=None) -> int:
             credentials = normalize_output_credentials(json.load(f))
         store_kwargs["credentials"] = credentials
         store_kwargs["endpoint_url"] = credentials.get("endpointUrl")
+    if args.declare_pyramid:
+        from zagg.config import load_config
+        from zagg.sweep_overview import declare_pyramid
+
+        summary = declare_pyramid(
+            args.store_root, load_config(args.declare_pyramid), store_kwargs=store_kwargs
+        )
+        print(json.dumps(summary, indent=2))
+        return 0
     families = [f.strip() for f in args.families.split(",")] if args.families else None
     leaves = discover_leaves(args.store_root, store_kwargs=store_kwargs)
     if not leaves:

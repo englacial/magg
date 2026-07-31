@@ -905,6 +905,54 @@ class TestSweepCli:
         assert node["windows"] == ["2019", "2020"]
         assert node["payload"] == merge([a, b])
 
+    def _config_yaml(self, tmp_path):
+        """A real pipeline config file (the shipped atl06, hive layout)."""
+        import yaml
+
+        from zagg.config import default_config
+
+        cfg = default_config("atl06")
+        cfg.output["store_layout"] = "hive"
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "data_source": cfg.data_source,
+                    "aggregation": cfg.aggregation,
+                    "output": cfg.output,
+                }
+            )
+        )
+        return path
+
+    def test_declare_pyramid_flag_is_declaration_only(self, tmp_path, capsys):
+        from zagg.hive import read_manifest
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)  # legacy pyramid block, no run records
+        config_path = self._config_yaml(tmp_path)
+        assert main([str(tmp_path), "--declare-pyramid", str(config_path)]) == 0
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["updated"] is True and summary["orders"] == [0]
+        # No committed leaf on this store: validation records the loud skip.
+        assert summary["validated"].startswith("manifest only")
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block["orders"] == [0]  # manifest shard_order 2, spacing 2
+        assert block["fields"]["count"]["class"] == "exact"
+        # Declaration-only semantics: no sweep pass ran in the invocation.
+        assert not list(tmp_path.rglob("*.rollup.json"))
+
+    def test_declare_pyramid_flag_is_idempotent(self, tmp_path, capsys):
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)
+        config_path = self._config_yaml(tmp_path)
+        assert main([str(tmp_path), "--declare-pyramid", str(config_path)]) == 0
+        capsys.readouterr()
+        assert main([str(tmp_path), "--declare-pyramid", str(config_path)]) == 0
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["updated"] is False and summary["previous"] == "identical"
+
 
 class TestSweepConfig:
     """output.sweep (issue #300): default on for hive, boolean, hive-only —
