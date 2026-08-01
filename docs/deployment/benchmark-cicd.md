@@ -188,9 +188,11 @@ the object-count tripwire below went red). A run with no commit plumbed (a local
 invocation, a `--dry-run` wiring check) falls back to the unscoped
 `<PREFIX>/<target>.zarr`.
 
-Two consequences worth planning for: stores now **accumulate one directory per
-benchmarked commit** rather than being overwritten, so set an S3 lifecycle
-expiration on the prefix (they are regenerable); and the harness's `ListBucket`
+Two consequences worth knowing: stores now **accumulate one directory per
+benchmarked commit** rather than being overwritten — the `sliderule-public`
+bucket already carries a one-month auto-delete policy, which is the retention
+these regenerable stores want, so no new lifecycle rule is needed (a different
+bucket would need one); and the harness's `ListBucket`
 grant is conditioned on `s3:prefix` `zagg-bench/*` in
 `deployment/aws/benchmark_cicd.yaml` (the section-2 template), which matches the
 deeper key unchanged.
