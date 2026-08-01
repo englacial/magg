@@ -14,6 +14,7 @@ stats collapse to that single worker: ``worker_max_s`` is the shard's runtime an
 from __future__ import annotations
 
 import math
+import re
 
 # Cost model and grid types come straight from the package so the benchmark can
 # never drift from what production actually bills/uses (arm64, 4 GB -- issue #110/#193).
@@ -29,6 +30,11 @@ from zagg.grids.rectilinear import RectilinearGrid
 # 512 MB /tmp function, so its ephemeral cost is $0 (all free-tier). Cost per
 # shard = compute (runtime * memory_gb * price) + ephemeral (runtime *
 # billable_gb * ephemeral_price).
+#: Characters of the commit sha the benchmark store path carries (issue #362).
+#: A short sha: collision-free at this repo's scale, and the store is scoped by
+#: prefix anyway -- the component only has to separate runs, not identify them.
+_COMMIT_COMPONENT_LEN = 12
+
 LAMBDA_EPHEMERAL_PRICE_PER_GB_SEC = 0.0000000309
 FREE_EPHEMERAL_MB = 512  # the always-free /tmp allotment; only the excess bills
 
@@ -110,8 +116,9 @@ RECORD_COLUMNS = [
     # count is data-dependent, i.e. not exact) -- the sharded-write-bypass
     # tripwire (issue #215). Null on rows recorded before the metric existed.
     # The per-run record additionally carries the JSON-only
-    # ``objects_per_shard`` / ``objects_mismatch`` keys, which the reindex to
-    # these columns deliberately drops from the parquet series.
+    # ``objects_per_shard`` / ``objects_telemetry`` / ``objects_mismatch``
+    # keys, which the reindex to these columns deliberately drops from the
+    # parquet series.
     "objects_total",
     "objects_expected",
     # Store-layout axis (issue #240 phase 4): "flat" | "hive". Null on rows
@@ -143,6 +150,17 @@ RECORD_COLUMNS = [
     # recorded before the guard existed -- which is exactly the window in which
     # the issue #341 stale-variant numbers were measured.
     "variant_guard",
+    # The netted, audited object count (issue #362): ``objects_total`` above is
+    # GROSS (every object under the store prefix, so a reused store's real
+    # footprint stays legible), while this subtracts the D9 rollup/overview
+    # caches and the unbounded per-run telemetry -- making it the only one
+    # comparable to ``objects_expected``. Kept as a SEPARATE column rather than
+    # redefining ``objects_total`` in place: rows recorded before issue #362
+    # would otherwise mean something different from rows after it, in the same
+    # column, across a series meant to be read over months. Null on those
+    # earlier rows. Appended last per the stable-schema rule, so it sits away
+    # from the objects columns it belongs with.
+    "objects_write_path",
 ]
 
 # summary["worker_phase_max"] key -> series column (issues #250/#256). A phase
@@ -153,6 +171,32 @@ PHASE_MAP = {
     "aggregate": "phase_aggregate_s",
     "write": "phase_write_s",
 }
+
+
+def store_path(store_prefix: str, name: str, *, commit: str = "") -> str:
+    """One target's output store, scoped to the commit under test (issue #362).
+
+    ``{prefix}/{commit}/{name}.zarr``. Keyed only by target name, the store was
+    shared by every run of every branch, so per-run-unique root telemetry (the
+    issue #297 run parquet, the issue #353 sweep record) accumulated there and
+    eventually pushed the object-count model past its ceiling. Scoping by commit
+    means a run measures a store only IT wrote, so the counts are deterministic
+    again.
+
+    The component is the commit sha stripped of everything outside ``[0-9a-zA-Z]``
+    and shortened to :data:`_COMMIT_COMPONENT_LEN` characters -- deterministic,
+    path-safe on S3 and local paths alike, and short enough to keep keys legible.
+    An EMPTY ``commit`` (a local invocation, a ``--dry-run`` wiring check, a
+    workflow that does not plumb one) falls back to the historical UNSCOPED
+    ``{prefix}/{name}.zarr`` rather than emitting a ``{prefix}//{name}.zarr``
+    double slash -- which s3 would take literally, as an empty path segment.
+
+    Shared by all three runners (``run_benchmark``, ``run_full_aoi_benchmark``,
+    ``run_raster_benchmark``) so the layout has ONE definition.
+    """
+    prefix = store_prefix.rstrip("/")
+    short = re.sub(r"[^0-9a-zA-Z]", "", commit)[:_COMMIT_COMPONENT_LEN].lower()
+    return f"{prefix}/{short}/{name}.zarr" if short else f"{prefix}/{name}.zarr"
 
 
 def select_densest_shard(shardmap: dict) -> tuple[int, int]:
@@ -290,8 +334,12 @@ def build_record(
     # (update_series's reindex drops them).
     o = objects or {}
     record["objects_total"] = o.get("objects_total")
+    record["objects_write_path"] = o.get("objects_write_path")
     record["objects_expected"] = o.get("objects_expected")
     record["objects_per_shard"] = o.get("objects_per_shard")
+    # Per-run root telemetry (issue #362): JSON-only like per_shard/mismatch —
+    # reported so an accumulating shared store is legible, never audited.
+    record["objects_telemetry"] = o.get("objects_telemetry")
     record["objects_mismatch"] = o.get("objects_mismatch")
     # Streaming-mode + ephemeral axis (issue #272): threaded from the target by
     # run_benchmark. ``ephemeral_cost_usd`` is the /tmp component already folded
@@ -347,7 +395,13 @@ def _objects_cell(record: dict) -> str:
             return None
         return int(value)
 
-    total = _num(record.get("objects_total"))
+    # The netted write-path count is what ``objects_expected`` is comparable to
+    # (issue #362), so it is what renders against it; rows recorded before that
+    # column existed fall back to the gross total, which was the audited figure
+    # at the time they were written.
+    total = _num(record.get("objects_write_path"))
+    if total is None:
+        total = _num(record.get("objects_total"))
     if total is None:
         return "n/a"
     expected = _num(record.get("objects_expected"))

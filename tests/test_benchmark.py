@@ -114,10 +114,11 @@ def test_build_record_cost_per_100km2():
     assert rec["n_granules"] == 44
     assert rec["zagg_version"] == "9.9.9"
     assert rec["max_memory_mb"] == 1963.0  # threaded from the summary (issue #120)
-    # The record is the series schema plus the two JSON-only object-count keys
-    # (issue #240) that update_series's reindex deliberately drops.
+    # The record is the series schema plus the JSON-only object-count keys
+    # (issues #240/#362) that update_series's reindex deliberately drops.
     assert set(rec) == set(bench_metrics.RECORD_COLUMNS) | {
         "objects_per_shard",
+        "objects_telemetry",
         "objects_mismatch",
     }
 
@@ -183,7 +184,7 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
     # store layout (#240 phase 4), worker phase split (#250/#256), the
     # streaming-mode/ephemeral axis (#272) and the worker-build provenance stamp
     # (#341/#296) appended in that order.
-    assert cols[-16:] == [
+    assert cols[-17:] == [
         "total_wall_s",
         "setup_s",
         "fanout_s",
@@ -200,6 +201,7 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
         "tmp_mb",
         "ephemeral_cost_usd",
         "variant_guard",
+        "objects_write_path",
     ]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
@@ -662,8 +664,9 @@ def test_variant_guard_status_verified_and_base(tmp_path, monkeypatch):
 
 def test_variant_guard_column_is_in_the_series_schema():
     # Appended to the stable RECORD_COLUMNS schema so update_series's reindex
-    # retains it (legacy rows read back null).
-    assert bench_metrics.RECORD_COLUMNS[-1] == "variant_guard"
+    # retains it (legacy rows read back null). No longer LAST: the issue #362
+    # netted-count column appended after it, per the same rule.
+    assert bench_metrics.RECORD_COLUMNS[-2] == "variant_guard"
     rec = bench_metrics.build_record(
         _summary(), grid=HealpixGrid(11, 19), context={"target": "t", "variant_guard": "verified"}
     )
@@ -964,6 +967,66 @@ def test_main_unknown_target_fails_before_any_dispatch(tmp_path, monkeypatch):
             ]
         )
     assert called["n"] == 0  # no dispatch happened
+
+
+# --- per-commit store scoping (issue #362) --------------------------------
+
+
+def test_store_path_scopes_by_commit():
+    # The store carries the commit under test as a path component, so a run
+    # measures a store only it wrote (issue #362): a shared
+    # {prefix}/{target}.zarr accumulated every prior run's root telemetry.
+    assert (
+        bench_metrics.store_path("s3://b/zagg-bench", "t", commit="5e35e2c9f1a2b3c4d5e6")
+        == "s3://b/zagg-bench/5e35e2c9f1a2/t.zarr"
+    )
+    # Deterministic sanitization: non-alphanumerics dropped, lowercased,
+    # shortened -- and a trailing prefix slash never doubles.
+    assert (
+        bench_metrics.store_path("s3://b/zagg-bench/", "t", commit="refs/AB-12")
+        == "s3://b/zagg-bench/refsab12/t.zarr"
+    )
+    assert bench_metrics.store_path("s3://b/p", "t", commit="ABC123") == "s3://b/p/abc123/t.zarr"
+
+
+def test_store_path_empty_commit_falls_back_to_unscoped():
+    # A local run / --dry-run wiring check plumbs no commit: fall back to the
+    # historical unscoped path rather than emitting an empty path segment
+    # ("s3://b/p//t.zarr", which s3 would take literally).
+    assert bench_metrics.store_path("s3://b/p", "t") == "s3://b/p/t.zarr"
+    assert bench_metrics.store_path("s3://b/p", "t", commit="") == "s3://b/p/t.zarr"
+    assert bench_metrics.store_path("s3://b/p/", "t", commit="   ") == "s3://b/p/t.zarr"
+
+
+def test_main_store_path_is_commit_scoped(tmp_path, monkeypatch):
+    # The per-merge runner threads --commit into the store path it dispatches.
+    seen = {}
+
+    def fake(name, *a, **k):
+        seen[name] = k["store"]
+        return _fake_record(name, total_obs=1, max_memory_mb=100.0)
+
+    monkeypatch.setattr(run_benchmark, "run_target", fake)
+    argv = [
+        "--targets",
+        str(BENCH / "targets.json"),
+        "--target",
+        "tdigest_healpix_o10_inline",
+        "--store-prefix",
+        "s3://bucket/zagg-bench",
+        "--out-json",
+        str(tmp_path / "metrics.json"),
+    ]
+    run_benchmark.main([*argv, "--commit", "5e35e2c9f1a2b3c4"])
+    assert seen == {
+        "tdigest_healpix_o10_inline": "s3://bucket/zagg-bench/5e35e2c9f1a2/"
+        "tdigest_healpix_o10_inline.zarr"
+    }
+    seen.clear()
+    run_benchmark.main([*argv, "--commit", ""])
+    assert seen == {
+        "tdigest_healpix_o10_inline": "s3://bucket/zagg-bench/tdigest_healpix_o10_inline.zarr"
+    }
 
 
 # --- manifest integrity (the pin is internally consistent) ----------------
@@ -2114,6 +2177,9 @@ def test_88s_nested_pin_invariant():
 def _objects_payload(mismatch=None):
     return {
         "objects_total": 10,
+        # Nothing to net out here, so gross == write-path (issue #362); the
+        # netting itself is covered in test_benchmark_objects.py.
+        "objects_write_path": 10,
         "objects_expected": 10,
         "objects_per_shard": {"1121121": 4},
         "objects_mismatch": mismatch,
@@ -2125,11 +2191,16 @@ def test_objects_columns_are_last_and_threaded():
     # appended after the object counts in phase 4; the #250/#256 phase split
     # then the #272 streaming-mode/ephemeral axis appended after those).
     cols = bench_metrics.RECORD_COLUMNS
-    assert cols[-11:-8] == ["objects_total", "objects_expected", "store_layout"]
+    assert cols[-12:-9] == ["objects_total", "objects_expected", "store_layout"]
+    # The netted audited count (issue #362) is a SEPARATE column, appended last
+    # rather than redefining ``objects_total`` -- so a row written before it
+    # cannot be misread as having been audited on the netted figure.
+    assert cols[-1] == "objects_write_path"
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={}, objects=_objects_payload())
     assert rec["objects_total"] == 10
     assert rec["objects_expected"] == 10
+    assert rec["objects_write_path"] == 10  # nothing to net out in this payload
     # per_shard/mismatch ride the metrics.json record only -- deliberately NOT
     # series columns (update_series's reindex drops them).
     assert rec["objects_per_shard"] == {"1121121": 4}
@@ -2148,8 +2219,18 @@ def test_objects_cell_rendered_in_table():
     # Bounded (non-exact) expectation records measured only.
     bounded = dict(rec, objects_expected=None)
     assert bench_metrics.format_record_cells(bounded)["objects"] == "10"
+    # Three row vintages (issue #362). A row written BEFORE the netted column
+    # existed carries only the gross total, which was the audited figure at the
+    # time, so the cell falls back to it rather than reading "n/a".
+    pre_362 = dict(rec, objects_write_path=float("nan"))
+    assert bench_metrics.format_record_cells(pre_362)["objects"] == "10/10"
+    # A row carrying both renders the NETTED count against the expectation --
+    # the only comparable pair -- so a store full of D9 caches and accumulated
+    # telemetry no longer renders as an alarming gross number on a green run.
+    netted = dict(rec, objects_total=48, objects_write_path=16, objects_expected=16)
+    assert bench_metrics.format_record_cells(netted)["objects"] == "16/16"
     # Legacy parquet rows degrade to NaN; empty records have nothing.
-    legacy = dict(rec, objects_total=float("nan"))
+    legacy = dict(rec, objects_total=float("nan"), objects_write_path=float("nan"))
     assert bench_metrics.format_record_cells(legacy)["objects"] == "n/a"
     assert bench_metrics.format_record_cells({})["objects"] == "n/a"
 
@@ -2340,38 +2421,35 @@ def test_hive_config_expected_counts_root_moc_optional():
     # The committed hive arm's model: per-shard DATA is exact (11 objects/leaf,
     # the sharded-write-bypass tripwire), but the store-root coverage.moc is a
     # fail-open, regenerable D9 cache (runner.write_root_coverage) that may be
-    # present OR absent -- so store-root metadata is a [1, 5] window (the
-    # morton_hive.json manifest always; +coverage.moc, the run stats parquet,
-    # aggregation.yaml, and the sweep run record when they land) and the total
-    # is [12, 16]. A real bypass still fails on
-    # the exact per-shard count.
+    # present OR absent -- so store-root metadata is a [1, 3] window (the
+    # morton_hive.json manifest always; +coverage.moc and aggregation.yaml when
+    # they land) and the total is [12, 14]. Per-run root telemetry (the run
+    # stats parquet, the sweep run record) is NOT in the window since issue
+    # #362 -- per-run-unique names accumulate in a reused store, so they ride
+    # the unbounded objects_telemetry bucket instead. A real bypass still fails
+    # on the exact per-shard count.
     import bench_objects
 
-    from zagg.config import get_coverage_moc, get_store_layout, load_config
+    from zagg.config import get_store_layout, load_config
     from zagg.grids import from_config
 
     cfg = load_config(str(BENCH / "configs" / "atl03_tdigest_healpix_o9_hive.yaml"))
-    assert get_store_layout(cfg) == "hive" and get_coverage_moc(cfg) is True
+    assert get_store_layout(cfg) == "hive"
     grid = from_config(cfg)
-    exp = bench_objects.expected_object_counts(
-        grid, n_shards=1, store_layout="hive", coverage_moc=True
-    )
+    exp = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
     # 3 arrays (morton/count/h_tdigest — no legacy cell_ids since the D16
     # flip, issue #304): leaf root+group zarr.json (2) + 3 array zarr.json +
     # 3 sharded data objects + coverage sidecar + stats.json AND
     # shardmap.json siblings (issues #297/#300) = 11.
-    # Store root: morton_hive.json (always) + coverage.moc (optional) + the
-    # run stats parquet (optional, issue #297) + aggregation.yaml (optional,
-    # issue #299) + the sweep run record (optional, issue #353 — one per
-    # end-of-run sweep pass; fire-and-forget on the Lambda path, so it may not
-    # have landed by measurement time) -> [1, 5].
+    # Store root: morton_hive.json (always) + coverage.moc (optional) +
+    # aggregation.yaml (optional, issue #299) -> [1, 3].
     assert exp == {
-        "metadata": 5,
+        "metadata": 3,
         "metadata_min": 1,
         "per_shard_min": 11,
         "per_shard_max": 11,
         "total_min": 12,
-        "total_max": 16,
+        "total_max": 14,
         "exact": True,
     }
 

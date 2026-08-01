@@ -106,14 +106,15 @@ def test_expected_counts_live_matrix_config():
     # gone since the D16 flip, issue #304), then one object per array per shard.
     config = load_config(str(BENCH / "configs" / "atl03_tdigest_healpix_o9.yaml"))
     exp = bench_objects.expected_object_counts(from_config(config), n_shards=1)
-    # metadata ceiling adds the optional run-level stats parquet (issue #297).
+    # Metadata is EXACT: the run-level stats parquet (issue #297) is per-run
+    # root telemetry, tallied in its own unbounded bucket since issue #362.
     assert exp == {
-        "metadata": 6,
+        "metadata": 5,
         "metadata_min": 5,
         "per_shard_min": 3,
         "per_shard_max": 3,
         "total_min": 8,
-        "total_max": 9,
+        "total_max": 8,
         "exact": True,
     }
 
@@ -123,10 +124,10 @@ def test_expected_counts_aoimask_config_adds_one_array():
     # sharded object per shard.
     config = load_config(str(BENCH / "configs" / "atl03_tdigest_healpix_o9_aoimask.yaml"))
     exp = bench_objects.expected_object_counts(from_config(config), n_shards=4)
-    assert exp["metadata"] == 7
+    assert exp["metadata"] == 6
     assert exp["per_shard_min"] == exp["per_shard_max"] == 4
     assert exp["exact"] is True
-    assert exp["total_max"] == 7 + 4 * 4
+    assert exp["total_max"] == 6 + 4 * 4
 
 
 def test_expected_counts_unsharded_is_bounded_not_exact():
@@ -134,10 +135,41 @@ def test_expected_counts_unsharded_is_bounded_not_exact():
     # chunks are omitted), ragged 0..K -- a bounded, non-exact expectation.
     exp = bench_objects.expected_object_counts(_grid(sharded=False), n_shards=1)
     k = 16
-    assert exp["metadata"] == 6
+    assert exp["metadata"] == 5
     assert exp["exact"] is False
     assert exp["per_shard_min"] == 2  # one populated chunk x 2 dense arrays
     assert exp["per_shard_max"] == 3 * k
+
+
+def test_hive_metadata_ceiling_covers_sweep_written_root_moc():
+    # The store-root coverage.moc has TWO writers and only ONE honours
+    # ``output.coverage_moc``: the end-of-run write in ``runner.agg`` (gated on
+    # ``get_coverage_moc``) and ``zagg.sweep.MocFamily.finish`` ->
+    # ``hive.write_root_coverage``, reached from ``sweep_after_run`` with
+    # ``DEFAULT_FAMILIES`` (which carries "moc") and gated only on
+    # ``get_sweep``. So ``coverage_moc: false`` plus the default sweep still
+    # lands manifest + aggregation.yaml + coverage.moc = 3 root metadata
+    # objects; a knob-gated ceiling of 2 would hard-fail that correct store.
+    # The ceiling counts the MOC unconditionally; the floor stays the manifest.
+    from zagg.config import default_config, get_coverage_moc, get_sweep
+    from zagg.sweep import DEFAULT_FAMILIES
+
+    cfg = default_config("atl06")
+    cfg.output["store_layout"] = "hive"
+    cfg.output["coverage_moc"] = False
+    assert get_coverage_moc(cfg) is False  # writer one is OFF...
+    assert get_sweep(cfg) is True and "moc" in DEFAULT_FAMILIES  # ...writer two is ON
+
+    exp = bench_objects.expected_object_counts(from_config(cfg), n_shards=1, store_layout="hive")
+    assert exp["metadata"] == 3 and exp["metadata_min"] == 1
+    measured = {
+        "objects_total": 3 + exp["per_shard_max"],
+        "objects_metadata": 3,  # manifest + aggregation.yaml + the sweep's MOC
+        "objects_per_shard": {_KEY_A: exp["per_shard_max"]},
+        "objects_other": 0,
+        "other_keys": [],
+    }
+    assert bench_objects.object_count_mismatch(measured, exp) is None
 
 
 def test_expected_counts_unknown_layout_raises():
@@ -162,10 +194,11 @@ def test_flat_sharded_store_matches_model(tmp_path):
     measured = bench_objects.store_object_counts(root, grid=grid, shard_keys=words)
     expected = bench_objects.expected_object_counts(grid, n_shards=2)
     assert expected["exact"] is True
-    # Direct writes (no runner) -> no run parquet, so the floor of the
-    # issue-#297-widened metadata window is what lands.
+    # Direct writes (no runner) -> no run parquet; the metadata window is
+    # exact either way now that root telemetry has its own bucket (#362).
     assert measured["objects_total"] == expected["total_min"] == 5 + 2 * 3
     assert measured["objects_metadata"] == expected["metadata_min"] == 5
+    assert measured["objects_telemetry"] == 0
     assert measured["objects_other"] == 0
     assert measured["objects_per_shard"] == {_KEY_A: 3, _KEY_B: 3}
     assert bench_objects.object_count_mismatch(measured, expected) is None
@@ -229,7 +262,6 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     from zagg.config import (
         default_config,
         get_agg_fields,
-        get_coverage_moc,
         get_data_vars,
         get_output_signature,
     )
@@ -299,47 +331,34 @@ def test_hive_store_matches_model(tmp_path, monkeypatch):
     measured = bench_objects.store_object_counts(
         root, grid=grid, shard_keys=[word], store_layout="hive"
     )
-    expected = bench_objects.expected_object_counts(
-        grid, n_shards=1, store_layout="hive", coverage_moc=get_coverage_moc(cfg)
-    )
+    expected = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
     # K == 1 leaf: every per-array count is deterministic, so the hive model
     # is exact here and the real store matches it object-for-object.
     assert expected["exact"] is True
-    # Through the runner: manifest + aggregation.yaml (issue #299) + root
-    # MOC + the run stats parquet (#297) + the sweep run record (#353 — the
-    # end-of-run sweep PUTs one per pass, root-level and shard-independent,
-    # so it is accounted exactly like the run parquet).
-    assert measured["objects_metadata"] == expected["metadata"] == 5
+    # Through the runner: manifest + aggregation.yaml (issue #299) + root MOC.
+    assert measured["objects_metadata"] == expected["metadata"] == 3
+    # Every object is classified — including the D20 `{window}.stats.json`
+    # sidecar each overview leaf now carries (issue #342), which the classifier
+    # buckets with its overview since issue #362.
+    assert measured["objects_other"] == 0
     assert list(measured["objects_per_shard"]) == [_KEY_A]
+    # The run stats parquet (#297) and the sweep run record (#353) are per-run
+    # root telemetry: their own unbounded bucket since issue #362.
+    assert measured["objects_telemetry"] == 2
     # The end-of-run sweep lands its rollups (issue #300) and overview zarrs
-    # (issue #201) in their own buckets (second-pass D9 caches); the
-    # write-path total excludes both. Overview leaves additionally carry a
-    # D20 stats sidecar (`{window}.stats.json` at the digit node, issue
-    # #342); the classifier in `.github/scripts/bench_objects.py` (CI infra,
-    # out of the #342 PR's scope — flagged there) does not bucket them yet,
-    # so pin them as the ONLY unclassified keys and fold them out with the
-    # other second-pass artifacts.
+    # (issue #201, with their #342 sidecars) in their own buckets (second-pass
+    # D9 caches); the write-path total excludes all three.
     assert measured["objects_rollups"] > 0
     assert measured["objects_overviews"] > 0
-    overview_sidecars = [k for k in measured["other_keys"] if k.endswith("/all.stats.json")]
-    assert measured["other_keys"] == overview_sidecars
-    assert measured["objects_other"] == len(overview_sidecars) > 0
+    assert any(k.endswith("/all.stats.json") for k in bench_objects.list_store_keys(root))
     write_path = (
         measured["objects_total"]
         - measured["objects_rollups"]
         - measured["objects_overviews"]
-        - len(overview_sidecars)
+        - measured["objects_telemetry"]
     )
     assert write_path == expected["total_max"]
-    # The mismatch guard, with the pinned sidecars folded out (they are
-    # asserted to be the exact residue above, so nothing is masked).
-    adjusted = dict(
-        measured,
-        objects_total=measured["objects_total"] - len(overview_sidecars),
-        objects_other=0,
-        other_keys=[],
-    )
-    assert bench_objects.object_count_mismatch(adjusted, expected) is None
+    assert bench_objects.object_count_mismatch(measured, expected) is None
     # Attribution really is the leaf prefix.
     leaf = hive.shard_leaf_path("", word).lstrip("/")
     assert any(k.startswith(leaf) for k in bench_objects.list_store_keys(root))
@@ -404,6 +423,125 @@ def test_hive_overview_zarrs_count_into_their_own_bucket(monkeypatch):
     assert measured["objects_per_shard"] == {label: 1}
     assert measured["objects_other"] == 1
     assert measured["other_keys"] == [f"{base}/-311.zarr/zarr.json"]
+
+
+def test_hive_root_telemetry_accumulates_without_a_finding(monkeypatch):
+    # Issue #362 (the red-main regression): a benchmark store reused across
+    # runs accumulates one ``stats_{ts}_{run_id}.parquet`` (issue #297) and one
+    # ``sweep_stats_{ts}.json`` (issue #353) PER RUN — per-run-unique names, so
+    # no fixed metadata ceiling can hold. They ride their own unbounded bucket:
+    # store-root metadata stays the tight [1, 3] window and the audited
+    # write-path total nets them out, however many have piled up.
+    from zagg import hive
+
+    grid = from_config(_cfg())
+    word = int(morton_word(_KEY_A))
+    label = grid.shard_label(word)
+    leaf = hive.shard_leaf_path("", word).lstrip("/")
+    runs = [f"{h:02d}" for h in range(12)]  # twelve runs into one store
+    keys = [hive.MANIFEST_NAME, f"{leaf}/count/c/0"]
+    keys += [f"stats_202607{r}T000000Z_run{r}.parquet" for r in runs]
+    keys += [f"sweep_stats_202607{r}T000000Z.json" for r in runs]
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: keys)
+    measured = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[word], store_layout="hive"
+    )
+    assert measured["objects_telemetry"] == 24
+    assert measured["objects_metadata"] == 1  # the manifest alone
+    assert measured["objects_per_shard"] == {label: 1}
+    assert measured["objects_other"] == 0
+    expected = {
+        "metadata": 3,
+        "metadata_min": 1,
+        "per_shard_min": 1,
+        "per_shard_max": 1,
+        "total_min": 2,
+        "total_max": 4,
+        "exact": True,
+    }
+    assert bench_objects.object_count_mismatch(measured, expected) is None
+
+
+def test_hive_node_stats_sidecars_classified(monkeypatch):
+    # The PR #356 classifier gap (issue #362): overview leaves carry a D23
+    # ``{stem}.stats.json`` sidecar (``telemetry.sidecar_key``, morton-hive/3)
+    # at the ANCESTOR node they fold to — an overview object, not an
+    # unclassifiable one. A dispatched LEAF node's sidecars keep attributing to
+    # their shard across BOTH stems of BOTH grammars — legacy ``stats.json`` /
+    # ``shardmap.json`` and D23 ``{window}.stats.json`` /
+    # ``{window}.shardmap.json`` (``zagg.sweep.submap_key``) — and a
+    # sidecar-named object misplaced INSIDE a leaf prefix still counts as that
+    # shard's data object (the issue #215 tripwire's leaf-membership-first
+    # ordering is untouched).
+    from zagg import hive
+
+    grid = from_config(_cfg())
+    word = int(morton_word(_KEY_A))
+    label = grid.shard_label(word)
+    leaf = hive.shard_leaf_path("", word).lstrip("/")
+    node = leaf.rsplit("/", 1)[0]  # the dispatched leaf's node dir
+    base = node.split("/", 1)[0]  # an ancestor node (overviews fold here)
+    keys = [
+        hive.MANIFEST_NAME,
+        f"{leaf}/count/c/0",  # in-leaf data -> this shard
+        f"{node}/stats.json",  # legacy leaf sidecar -> this shard
+        f"{node}/shardmap.json",  # leaf sub-map (issue #300) -> this shard
+        f"{node}/2019.stats.json",  # D23-named leaf sidecar -> this shard
+        f"{node}/2019.shardmap.json",  # D23-named leaf sub-map -> this shard
+        f"{leaf}/2019.stats.json",  # MISPLACED in-leaf sidecar -> this shard
+        f"{base}/all.zarr/zarr.json",  # the overview zarr itself
+        f"{base}/all.stats.json",  # its D23 sidecar -> overviews
+        f"{base}/2019.stats.json",  # a per-window overview sidecar
+        "stats_20260731T000000Z_run0.parquet",
+    ]
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: keys)
+    measured = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[word], store_layout="hive"
+    )
+    assert measured["objects_overviews"] == 3  # the zarr + its two sidecars
+    assert measured["objects_per_shard"] == {label: 6}
+    assert measured["objects_metadata"] == 1
+    assert measured["objects_telemetry"] == 1
+    # Everything above is classified: no unrecognized keys anywhere.
+    assert measured["objects_other"] == 0
+    assert measured["other_keys"] == []
+
+
+def test_hive_stray_stats_json_stays_a_loud_other(monkeypatch):
+    # The D23 overview-sidecar branch is ANCHORED to nodes that actually hold
+    # an overview zarr (``_overview_node``), not to the ``.stats.json`` suffix
+    # alone: a sidecar at the store ROOT, under an arbitrary deep prefix, or at
+    # an UNDISPATCHED leaf's node is not an overview sidecar and must stay a
+    # loud ``other`` — ``objects_other`` is the "the model knows every object
+    # the run writes" contract. A dispatched leaf's sidecar still attributes to
+    # its shard (leaf-prefix membership runs first, issue #215).
+    from zagg import hive
+
+    grid = from_config(_cfg())
+    word = int(morton_word(_KEY_A))
+    label = grid.shard_label(word)
+    leaf = hive.shard_leaf_path("", word).lstrip("/")
+    node = leaf.rsplit("/", 1)[0]  # the dispatched leaf's node dir
+    base = node.split("/", 1)[0]  # an ancestor node (overviews fold here)
+    stray = hive.shard_leaf_path("", int(morton_word(_KEY_B))).lstrip("/").rsplit("/", 1)[0]
+    strays = ["all.stats.json", "random/deep/path/x.stats.json", f"{stray}/2019.stats.json"]
+    keys = [
+        hive.MANIFEST_NAME,
+        f"{leaf}/count/c/0",  # in-leaf data -> this shard
+        f"{node}/2019.stats.json",  # dispatched leaf's D23 sidecar -> this shard
+        f"{base}/all.zarr/zarr.json",  # a real overview zarr -> overviews
+        f"{base}/all.stats.json",  # its sidecar, anchored to that node
+        *strays,
+    ]
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: keys)
+    measured = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[word], store_layout="hive"
+    )
+    assert measured["objects_overviews"] == 2  # the overview zarr + its sidecar
+    assert measured["objects_per_shard"] == {label: 2}
+    assert measured["objects_metadata"] == 1
+    assert measured["objects_other"] == 3
+    assert sorted(measured["other_keys"]) == sorted(strays)
 
 
 def test_status_prefix_objects_excluded_everywhere(monkeypatch):
@@ -513,10 +651,43 @@ def test_measure_objects_end_to_end(tmp_path):
     payload = run_benchmark._measure_objects(cfg, grid, root, word, region="us-west-2")
     assert payload == {
         "objects_total": 8,  # 5 metadata + 3 shard objects
-        "objects_expected": 9,  # ceiling includes the optional run parquet (#297)
+        # Nothing to net out on a freshly written store, so the audited
+        # write-path count equals the gross total here (issue #362).
+        "objects_write_path": 8,
+        "objects_expected": 8,  # exact: root telemetry is its own bucket (#362)
         "objects_per_shard": {_KEY_A: 3},
+        "objects_telemetry": 0,
         "objects_mismatch": None,
     }
+
+
+def test_measure_objects_reports_the_netted_count(tmp_path):
+    # The reported write-path count must be the SAME figure the mismatch check
+    # audits (issue #362) -- so a store carrying D9 caches and accumulated
+    # per-run telemetry stays green AND reports a number comparable to
+    # ``objects_expected``, instead of a gross total that reads as a blowup.
+    measured = {
+        "objects_total": 48,
+        "objects_metadata": 3,
+        "objects_per_shard": {"1121121": 13},
+        "objects_rollups": 5,
+        "objects_overviews": 3,
+        "objects_telemetry": 24,
+        "objects_other": 0,
+        "other_keys": [],
+    }
+    assert bench_objects.write_path_total(measured) == 16
+    expected = {
+        "metadata": 3,
+        "metadata_min": 1,
+        "per_shard_min": 13,
+        "per_shard_max": 13,
+        "total_min": 14,
+        "total_max": 16,
+        "exact": True,
+    }
+    # Green on the netted figure, which is 32 objects below the gross total.
+    assert bench_objects.object_count_mismatch(measured, expected) is None
 
 
 def test_measure_objects_flags_bypass(tmp_path):
@@ -539,7 +710,7 @@ def test_measure_objects_flags_bypass(tmp_path):
     )
     assert payload["objects_mismatch"] is not None
     assert payload["objects_total"] == 5 + 48  # metadata + 16 chunks x 3 arrays
-    assert payload["objects_expected"] == 9  # ceiling includes the run parquet (#297)
+    assert payload["objects_expected"] == 8  # exact metadata + 3 sharded objects
 
 
 # --- review folds (PR #242) ---------------------------------------------------
@@ -638,7 +809,7 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
 
     import zagg.processing as processing
     from zagg import runner
-    from zagg.config import default_config, get_coverage_moc
+    from zagg.config import default_config
     from zagg.runner import agg
 
     cfg = default_config("atl06")
@@ -675,45 +846,29 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     root = str(tmp_path / "out")
     agg(cfg, catalog=str(cat_path), store=root, backend="local")
 
-    expected = bench_objects.expected_object_counts(
-        grid, n_shards=1, store_layout="hive", coverage_moc=get_coverage_moc(cfg)
-    )
+    expected = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
     measured = bench_objects.store_object_counts(
         root, grid=grid, shard_keys=[shard], store_layout="hive"
     )
     # Exact: per leaf = root+group zarr.json (2) + one zarr.json AND one data
     # object per array + the coverage sidecar + the stats.json sibling
     # (issue #297); store root = manifest + aggregation.yaml (issue #299)
-    # + MOC + the run stats parquet + the sweep run record (issue #353).
+    # + MOC (the run parquet / sweep record are telemetry — issue #362).
     n_arrays = len(grid.shard_spec().members)
     assert expected["exact"] is True
     # ... + the stats.json AND shardmap.json siblings (issues #297/#300).
     assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 2
-    assert expected["metadata"] == 5
-    # Sweep rollups (issue #300) and overview zarrs (issue #201) ride their
-    # own buckets, outside the write-path total this model audits. Overview
-    # leaves additionally carry a D20 stats sidecar (`{window}.stats.json` at
-    # the digit node, issue #342); the classifier in
-    # `.github/scripts/bench_objects.py` (CI infra, out of the #342 PR's
-    # scope — flagged there) does not bucket them yet, so pin them as the
-    # ONLY unclassified keys and fold them out with the other second-pass
-    # artifacts. Everything else stays under the exact-zero guard.
-    overview_sidecars = [k for k in measured["other_keys"] if k.endswith("/all.stats.json")]
-    assert measured["other_keys"] == overview_sidecars
-    assert measured["objects_other"] == len(overview_sidecars) > 0
+    assert expected["metadata"] == 3
+    # Sweep rollups (issue #300), overview zarrs (issue #201 — with the D20
+    # `{window}.stats.json` sidecar each overview leaf carries since issue
+    # #342) and per-run root telemetry (issue #362) ride their own buckets,
+    # outside the write-path total this model audits. Nothing is left over.
     write_path = (
         measured["objects_total"]
         - measured["objects_rollups"]
         - measured["objects_overviews"]
-        - len(overview_sidecars)
+        - measured["objects_telemetry"]
     )
     assert write_path == expected["total_max"]
-    # The mismatch guard, with the pinned sidecars folded out (they are
-    # asserted to be the exact residue above, so nothing is masked).
-    adjusted = dict(
-        measured,
-        objects_total=measured["objects_total"] - len(overview_sidecars),
-        objects_other=0,
-        other_keys=[],
-    )
-    assert bench_objects.object_count_mismatch(adjusted, expected) is None
+    assert measured["objects_other"] == 0
+    assert bench_objects.object_count_mismatch(measured, expected) is None

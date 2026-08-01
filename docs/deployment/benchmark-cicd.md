@@ -174,7 +174,28 @@ aws iam put-role-policy --role-name zagg-benchmark \
 ## 3. Provision the S3 output bucket / prefix
 
 Reuse an existing bucket or make one. The store prefix is where each target's
-Zarr lands (overwritten every run — these are throwaway).
+Zarr lands — these are throwaway. Every runner (per-merge, full-AOI, raster)
+writes to
+
+```
+<BENCHMARK_STORE_PREFIX>/<commit>/<target>.zarr
+```
+
+where `<commit>` is the short (12-character) sha of the commit under test, so a
+run only ever measures a store **it** wrote (issue #362 — a store keyed by
+target name alone accumulated every prior run's per-run telemetry objects until
+the object-count tripwire below went red). A run with no commit plumbed (a local
+invocation, a `--dry-run` wiring check) falls back to the unscoped
+`<PREFIX>/<target>.zarr`.
+
+Two consequences worth knowing: stores now **accumulate one directory per
+benchmarked commit** rather than being overwritten — the `sliderule-public`
+bucket already carries a one-month auto-delete policy, which is the retention
+these regenerable stores want, so no new lifecycle rule is needed (a different
+bucket would need one); and the harness's `ListBucket`
+grant is conditioned on `s3:prefix` `zagg-bench/*` in
+`deployment/aws/benchmark_cicd.yaml` (the section-2 template), which matches the
+deeper key unchanged.
 
 ```bash
 aws s3 mb s3://BUCKET --region REGION   # if it doesn't exist

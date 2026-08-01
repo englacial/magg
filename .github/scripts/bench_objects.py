@@ -20,8 +20,8 @@ so it cannot drift from what the template actually emits:
   array at K>1 gives 1..K objects (zarr's default ``write_empty_chunks=False``
   omits all-fill chunks, so empty inner chunks write nothing).
 - **hive** (per-shard leaf zarrs): store-root objects (``morton_hive.json``,
-  plus ``coverage.moc`` when ``output.coverage_moc`` is on — the hive default —
-  plus the fail-open ``aggregation.yaml`` semantic core, issue #299)
+  plus the optional ``coverage.moc``, plus the fail-open ``aggregation.yaml``
+  semantic core, issue #299)
   plus, per populated leaf, the leaf metadata (root + group + per-array
   ``zarr.json``), the in-leaf ``coverage.moc`` sidecar (depth > 0), one
   whole-leaf ragged object per ragged field, and — since issue #236 — one
@@ -58,6 +58,26 @@ import re
 #: 0/5-9 digits or letters and ``all`` is the reserved token — which is what
 #: lets the hive walk tell an overview zarr from a stray source leaf.
 _MORTON_ID_RE = re.compile(r"-?[1-6][1-4]*")
+
+
+def _overview_node(key: str) -> str | None:
+    """The node dir holding ``key``'s sweep overview zarr, or ``None``.
+
+    A key belongs to an overview (issue #201) when its FIRST ``.zarr`` segment
+    has a stem that does not parse as a morton id — window labels carry 0/5-9
+    digits or letters and ``all`` is the reserved token, so ``{window}.zarr`` /
+    ``all.zarr`` can never collide with a source leaf's ``{id}[_{window}].zarr``
+    (see :data:`_MORTON_ID_RE`). Taking the FIRST segment keeps the hive walk's
+    leaf-membership-first ordering: anything nested under a real leaf's zarr is
+    that shard's object, never an overview.
+    """
+    parts = key.split("/")
+    for i, part in enumerate(parts):
+        if not part.endswith(".zarr"):
+            continue
+        stem = part.removesuffix(".zarr").split("_", 1)[0]
+        return None if _MORTON_ID_RE.fullmatch(stem) else "/".join(parts[:i])
+    return None
 
 
 def _require_fullsphere(grid) -> None:
@@ -113,7 +133,6 @@ def expected_object_counts(
     *,
     n_shards: int,
     store_layout: str = "flat",
-    coverage_moc: bool = False,
 ) -> dict:
     """Expected store object counts for ``n_shards`` populated shards.
 
@@ -126,11 +145,11 @@ def expected_object_counts(
     if store_layout == "flat":
         _require_fullsphere(grid)
         members = _member_layouts(grid)
-        # Root zarr.json + group zarr.json + one zarr.json per array (exact),
-        # plus the OPTIONAL run-level stats parquet (issue #297) — fail-open,
-        # absent when the dispatcher role cannot PUT (the CI OIDC role).
-        metadata_min = 2 + len(members)
-        metadata_max = metadata_min + 1
+        # Root zarr.json + group zarr.json + one zarr.json per array — EXACT.
+        # Per-run root telemetry (the issue #297 stats parquet) is not modeled
+        # here: it rides the unbounded ``objects_telemetry`` bucket instead
+        # (see the hive comment below and :func:`_is_root_telemetry`).
+        metadata_min = metadata_max = 2 + len(members)
         lo = hi = 0
         for m in members:
             blocks = m["blocks_per_shard"]
@@ -144,24 +163,37 @@ def expected_object_counts(
     elif store_layout == "hive":
         members = _member_layouts(grid, leaf=True)
         # Store root: the morton_hive.json manifest (always written) PLUS the
-        # root coverage.moc when output.coverage_moc is on (the hive default).
-        # The root MOC is a fail-open, regenerable D9 cache
-        # (runner.write_root_coverage) — it may legitimately be ABSENT (e.g. the
-        # orchestrator role can't PUT it), so it is an OPTIONAL metadata object:
-        # the floor is the manifest alone, the ceiling adds the MOC. A real
-        # sharded-write bypass lands in the per-shard DATA counts (asserted
-        # exactly in object_count_mismatch), never in this metadata window.
-        # ... plus the OPTIONAL run-level stats parquet (issue #297) and the
-        # OPTIONAL aggregation.yaml semantic core (issue #299, D19 — a
-        # fail-open derived convenience riding the manifest write), same
+        # root coverage.moc. The MOC is a fail-open, regenerable D9 cache that
+        # may legitimately be ABSENT (e.g. the orchestrator role can't PUT it),
+        # so it is an OPTIONAL metadata object: the floor is the manifest
+        # alone, the ceiling adds the MOC. The ceiling counts it
+        # UNCONDITIONALLY — not off ``output.coverage_moc`` — because it has
+        # TWO independent writers and only one honours that knob: the
+        # end-of-run write in ``runner.agg`` (gated on ``get_coverage_moc``)
+        # and ``zagg.sweep.MocFamily.finish`` -> ``hive.write_root_coverage``,
+        # reached from ``sweep_after_run`` with ``DEFAULT_FAMILIES`` (which
+        # includes ``"moc"``) and gated only on ``get_sweep``. A hive target
+        # with ``coverage_moc: false`` and the default sweep still lands the
+        # object, so a knob-gated ceiling would hard-fail a correct store. A
+        # real sharded-write bypass lands in the per-shard DATA counts
+        # (asserted exactly in object_count_mismatch), never in this window.
+        # ... plus the OPTIONAL aggregation.yaml semantic core (issue #299, D19
+        # — a fail-open derived convenience riding the manifest write), same
         # fail-open posture as the root MOC.
-        # ... plus the OPTIONAL sweep run record (issue #353): the end-of-run
-        # sweep PUTs one ``sweep_stats_{ts}.json`` at the root per pass. Same
-        # fail-open posture again (telemetry, D9 — one warning and None), and
-        # on the Lambda path the sweep is fire-and-forget, so it may legitimately
-        # be absent at measurement time. Ceiling only; the floor stays 1.
+        # Per-run ROOT TELEMETRY is deliberately NOT in this window (issue
+        # #362): the run stats parquet (``stats_{ts}_{run_id}.parquet``, issue
+        # #297) and the sweep run record (``sweep_stats_{ts}.json``, issue #353)
+        # are per-run UNIQUE names, so in a store that more than one run writes
+        # they ACCUMULATE — a fixed ceiling can never be right for them (it held
+        # only while every run got a fresh store, and went red on main the day
+        # twelve runs shared one). They ride the unbounded ``objects_telemetry``
+        # bucket instead (:func:`_is_root_telemetry`), counted and reported but
+        # excluded from the audited write-path total — the same posture the D9
+        # rollup/overview buckets already take. This window therefore stays
+        # TIGHT (manifest + optional root MOC + optional aggregation.yaml), so
+        # real root-metadata drift still trips it.
         metadata_min = 1
-        metadata_max = 1 + (1 if coverage_moc else 0) + 1 + 1 + 1
+        metadata_max = 1 + 1 + 1
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
         # zarr.json per array, plus the in-leaf coverage.moc sidecar (written
         # for any populated leaf when the leaf has depth, i.e. child_order >
@@ -182,7 +214,7 @@ def expected_object_counts(
         raise ValueError(f"unknown store_layout: {store_layout!r} (expected 'flat' or 'hive')")
     return {
         # ``metadata`` is the CEILING (kept for back-compat / display); the floor
-        # is ``metadata_min`` — equal on flat (exact), a [1, 1+moc] window on hive.
+        # is ``metadata_min`` — equal on flat (exact), a [1, 3] window on hive.
         "metadata": metadata_max,
         "metadata_min": metadata_min,
         "per_shard_min": lo,
@@ -205,10 +237,21 @@ def _is_sweep_record(key: str) -> bool:
     run (``sweep_after_run``, default on for hive) — so a hive run lands
     exactly one of these at the root alongside the run parquet. Deliberately
     outside the :func:`_is_run_parquet` grammar (a sweep record must never read
-    as a shard run record); counted as metadata for the same reason the run
-    parquet is — fixed, shard-independent, one object per run.
+    as a shard run record).
     """
     return "/" not in key and key.startswith("sweep_stats_") and key.endswith(".json")
+
+
+def _is_root_telemetry(key: str) -> bool:
+    """A store-root PER-RUN telemetry object (issue #362): parquet or sweep record.
+
+    Both names embed the run's own timestamp/id, so a store that more than one
+    run writes accumulates one of each PER RUN — never a fixed count. They are
+    tallied in their own unbounded ``objects_telemetry`` bucket (like the D9
+    rollups/overviews) and excluded from the audited write-path total, rather
+    than widening the metadata window by a number that can only ever be wrong.
+    """
+    return _is_run_parquet(key) or _is_sweep_record(key)
 
 
 def _is_status_object(key: str) -> bool:
@@ -263,6 +306,7 @@ def store_object_counts(
     """LIST a run's output store and attribute its objects per shard.
 
     Returns ``{"objects_total", "objects_metadata", "objects_per_shard",
+    "objects_rollups", "objects_overviews", "objects_telemetry",
     "objects_other", "other_keys"}``. ``objects_per_shard`` keys are the
     dispatched shards' external labels (``grid.shard_label``); a data object
     whose block resolves to an undispatched shard is keyed ``"block:<n>"`` so
@@ -275,6 +319,7 @@ def store_object_counts(
     metadata = 0
     rollups = 0
     overviews = 0
+    telemetry = 0
 
     if store_layout == "flat":
         _require_fullsphere(grid)
@@ -282,7 +327,10 @@ def store_object_counts(
         label_of = {int(grid.block_index(int(k))[0]): grid.shard_label(int(k)) for k in shard_keys}
         group = grid.group_path
         for key in keys:
-            if key == "zarr.json" or key.endswith("/zarr.json") or _is_run_parquet(key):
+            if _is_root_telemetry(key):
+                telemetry += 1
+                continue
+            if key == "zarr.json" or key.endswith("/zarr.json"):
                 metadata += 1
                 continue
             parts = key.split("/")
@@ -317,16 +365,23 @@ def store_object_counts(
         stats_of = {
             prefix.rstrip("/").rsplit("/", 1)[0] + "/": label for prefix, label in leaf_of.items()
         }
+        # Pre-pass: the nodes that actually hold a sweep overview zarr. These
+        # are the ONLY places a D23 ``{window}.stats.json`` overview sidecar
+        # can legitimately sit (PR #356 writes one beside each overview leaf,
+        # at the ancestor node the pyramid folds to), so they anchor the
+        # sidecar branch below instead of it matching on the suffix alone —
+        # a ``.stats.json`` at the store root, at an arbitrary deep path, or
+        # at an UNDISPATCHED leaf's node stays a loud ``other``, which is the
+        # "the model knows every object the run writes" contract.
+        overview_nodes = {n for n in map(_overview_node, keys) if n is not None}
         for key in keys:
-            if (
-                key
-                in (
-                    hive.MANIFEST_NAME,
-                    hive.ROOT_COVERAGE_NAME,
-                    hive.AGGREGATION_CORE_NAME,
-                )
-                or _is_run_parquet(key)
-                or _is_sweep_record(key)
+            if _is_root_telemetry(key):
+                telemetry += 1
+                continue
+            if key in (
+                hive.MANIFEST_NAME,
+                hive.ROOT_COVERAGE_NAME,
+                hive.AGGREGATION_CORE_NAME,
             ):
                 metadata += 1
                 continue
@@ -358,20 +413,37 @@ def store_object_counts(
                 # excluded from the audited write-path total) while a stray
                 # id-named `.zarr` outside the dispatched leaf set stays a
                 # loud ``other`` finding.
-                seg = next((p for p in key.split("/") if p.endswith(".zarr")), None)
-                if seg is not None and not _MORTON_ID_RE.fullmatch(
-                    seg.removesuffix(".zarr").split("_", 1)[0]
-                ):
+                if _overview_node(key) is not None:
                     overviews += 1
                     continue
                 node, _, name = key.rpartition("/")
+                # Sidecar grammars, both naming generations
+                # (``zagg.telemetry.sidecar_key``): the legacy
+                # ``stats.json`` / ``stats_{window}.json`` every current writer
+                # emits, and the D23 window-only ``{stem}.stats.json``
+                # (``morton-hive/3``, PR #356). The two are disjoint by
+                # construction ("stats.json" cannot end in ".stats.json").
                 is_sibling = any(
                     name == f"{stem}.json"
                     or (name.startswith(f"{stem}_") and name.endswith(".json"))
+                    or name.endswith(f".{stem}.json")
                     for stem in ("stats", "shardmap")
                 )
                 if is_sibling and node + "/" in stats_of:
                     per_shard[stats_of[node + "/"]] = per_shard.get(stats_of[node + "/"], 0) + 1
+                elif name.endswith(".stats.json") and node in overview_nodes:
+                    # A D23-named stats sidecar at a node that HOLDS an
+                    # overview zarr is that overview's sidecar (PR #356 writes
+                    # one per overview leaf, at the ANCESTOR node the pyramid
+                    # folds to), so it rides the same second-pass D9 bucket as
+                    # the overview it describes. Reached only after the
+                    # leaf-prefix-membership check above has failed AND the
+                    # node is not a dispatched leaf's, so it can neither
+                    # swallow a misplaced in-leaf object (issue #215 tripwire)
+                    # nor steal a real leaf sidecar's attribution; the
+                    # ``overview_nodes`` anchor keeps every OTHER ``.stats.json``
+                    # (store root, stray prefix, undispatched leaf) loud.
+                    overviews += 1
                 else:
                     other.append(key)
     else:
@@ -383,6 +455,7 @@ def store_object_counts(
         "objects_per_shard": per_shard,
         "objects_rollups": rollups,
         "objects_overviews": overviews,
+        "objects_telemetry": telemetry,
         "objects_other": len(other),
         "other_keys": other[:20],
     }
@@ -395,7 +468,6 @@ def measure_objects(
     shard_keys,
     n_shards: int,
     store_layout: str = "flat",
-    coverage_moc: bool = False,
     **store_kwargs,
 ) -> dict:
     """Measure a run's store objects and compare against the expected model.
@@ -408,9 +480,7 @@ def measure_objects(
     of shards expected to have written (the dispatch count for the per-merge
     harness, the completed-with-data count for the full-AOI fan-out).
     """
-    expected = expected_object_counts(
-        grid, n_shards=n_shards, store_layout=store_layout, coverage_moc=coverage_moc
-    )
+    expected = expected_object_counts(grid, n_shards=n_shards, store_layout=store_layout)
     measured = store_object_counts(
         store_path,
         grid=grid,
@@ -420,10 +490,44 @@ def measure_objects(
     )
     return {
         "objects_total": measured["objects_total"],
+        # The netted, audited count (issue #362) — the one directly comparable
+        # to ``objects_expected``; ``objects_total`` stays gross so a reused
+        # store's real object footprint is still legible.
+        "objects_write_path": write_path_total(measured),
         "objects_expected": expected["total_max"] if expected["exact"] else None,
         "objects_per_shard": measured["objects_per_shard"],
+        # Per-run root telemetry (issue #362): reported so an accumulating
+        # shared store is legible in metrics.json / the run log, never audited
+        # (``object_count_mismatch`` nets it out of the total).
+        "objects_telemetry": measured["objects_telemetry"],
         "objects_mismatch": object_count_mismatch(measured, expected),
     }
+
+
+def write_path_total(measured: dict) -> int:
+    """The audited WRITE-PATH object count: the gross total, netted.
+
+    ``objects_total`` is every object under the store prefix. Three buckets are
+    not write-path objects and are subtracted here:
+
+    * sweep rollups (issue #300) and overview zarrs (issue #201) — second-pass
+      D9 caches the end-of-run sweep may or may not have landed by measurement
+      time (fire-and-forget on Lambda);
+    * per-run root telemetry (issue #362) — additionally unbounded, since its
+      names are per-run unique, so a reused store accumulates it and no fixed
+      expectation could ever hold.
+
+    This is the number :func:`object_count_mismatch` audits and the one
+    ``objects_expected`` is comparable to; ``objects_total`` stays gross
+    because storage/cost questions want every object. Single-sourced so the
+    reported figure and the asserted figure cannot drift apart.
+    """
+    return (
+        measured["objects_total"]
+        - measured.get("objects_rollups", 0)
+        - measured.get("objects_overviews", 0)
+        - measured.get("objects_telemetry", 0)
+    )
 
 
 def object_count_mismatch(measured: dict, expected: dict) -> str | None:
@@ -433,23 +537,13 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     per-inner-chunk objects instead of one sharded object) is the PER-SHARD DATA
     count, asserted exactly whenever the per-shard count is deterministic
     (``exact``). Metadata and total are checked as **windows**: on flat they
-    collapse to an exact assertion (``min == max``); on hive they widen by one
-    for the optional, fail-open D9 root ``coverage.moc`` (present or absent are
-    both valid). Unclassifiable keys are always a finding: the model claims to
-    know every object the run writes.
+    collapse to an exact assertion (``min == max``); on hive they widen for the
+    optional, fail-open D9 root objects (``coverage.moc``, ``aggregation.yaml``
+    — present or absent are both valid). Unclassifiable keys are always a
+    finding: the model claims to know every object the run writes.
     """
     problems = []
-    # Sweep rollups (issue #300) and overview zarrs (issue #201) are
-    # second-pass D9 caches, not write-path objects: the end-of-run sweep may
-    # or may not have landed them by measurement time (fire-and-forget on
-    # Lambda), so they are tallied in their own buckets and excluded from the
-    # write-path total this model audits (the #215 bypass guard below is
-    # untouched — neither ever lives inside a leaf prefix).
-    total = (
-        measured["objects_total"]
-        - measured.get("objects_rollups", 0)
-        - measured.get("objects_overviews", 0)
-    )
+    total = write_path_total(measured)
     meta = measured["objects_metadata"]
     meta_lo, meta_hi = expected["metadata_min"], expected["metadata"]
     if not (meta_lo <= meta <= meta_hi):

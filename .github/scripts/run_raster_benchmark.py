@@ -44,6 +44,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import bench_metrics  # noqa: E402
+
 from zagg.config import get_store_layout, load_config, validate_config  # noqa: E402
 from zagg.dispatch import LAMBDA_MEMORY_GB, LAMBDA_PRICE_PER_GB_SEC  # noqa: E402
 from zagg.grids import from_config  # noqa: E402
@@ -179,7 +181,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--target", action="append", default=[], help="Target name (repeatable; omit for all)"
     )
-    ap.add_argument("--store-prefix", default=None, help="<prefix>/<target>.zarr output store")
+    ap.add_argument(
+        "--store-prefix",
+        default=None,
+        help="<prefix>/<commit>/<target>.zarr output store (unscoped when --commit is empty)",
+    )
     ap.add_argument("--region", default="us-west-2")
     ap.add_argument("--function-name", default="process-shard")
     ap.add_argument("--artifacts-dir", default="./raster_artifacts")
@@ -213,7 +219,12 @@ def main(argv: list[str] | None = None) -> int:
 
     runs = []
     for name in names:
-        store = f"{args.store_prefix.rstrip('/')}/{name}.zarr" if args.store_prefix else None
+        # Per-commit scoping (issue #362): see bench_metrics.store_path.
+        store = (
+            bench_metrics.store_path(args.store_prefix, name, commit=args.commit)
+            if args.store_prefix
+            else None
+        )
         runs.append(
             run_target(
                 name,

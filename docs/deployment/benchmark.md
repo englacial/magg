@@ -113,6 +113,13 @@ blow-up), so a write-path regression reads as a step here. **Record-only** on
 the release leg (a flaky release is never blocked on it); the per-merge
 harness *hard-fails* on the same mismatch.
 
+What the audited total does **not** include (issue #362): the second-pass sweep
+caches (rollups, overview zarrs) and per-run root telemetry — the run stats
+parquet and sweep run record, whose names are unique per run. Those are tallied
+in their own buckets and reported (`objects_telemetry` on the record), never
+audited; the store path is scoped by commit so the write-path objects a run
+counts are only its own.
+
 ![Store objects](https://raw.githubusercontent.com/englacial/zagg/benchmarks/site/full_aoi_objects.png)
 
 ### Cost columns

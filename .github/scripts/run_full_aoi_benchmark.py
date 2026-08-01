@@ -49,6 +49,7 @@ Two JSON files. ``--out-json`` is one **run record** per target::
       "worker_max_s", "worker_median_s", "worker_pct_timeout", "max_memory_mb",
       "worker_phase_max": {"read", "index", "aggregate", "write"},  # straggler (max) s/phase (#250/#256)
       "objects_total", "objects_expected", "objects_mismatch",  # store object counts (issue #240), record-only
+      "objects_telemetry",  # per-run root telemetry, netted out of the audited total (issue #362)
       "write_throughput": {                                    # leg-5 acceptance signal
         "invoke_retries_total", "invoke_throttle_shards",
         "s3_slowdown_shards", "cells_timeout"
@@ -98,7 +99,6 @@ import bench_metrics  # noqa: E402
 import bench_objects  # noqa: E402
 
 from zagg.config import (  # noqa: E402
-    get_coverage_moc,
     get_handoff,
     get_store_layout,
     load_config,
@@ -437,7 +437,6 @@ def _measure_objects_recorded(
             shard_keys=shard_keys,
             n_shards=n_ok,
             store_layout=get_store_layout(config),
-            coverage_moc=get_coverage_moc(config),
             region=region,
         )
     except Exception as exc:  # record-only: never fail the release run
@@ -567,6 +566,7 @@ def run_target(
             cost_usd=None,
             objects_total=None,
             objects_expected=None,
+            objects_telemetry=None,
             objects_mismatch=None,
             parity_ok=None,
             parity=None,
@@ -657,6 +657,11 @@ def run_target(
     run.update(
         objects_total=objects.get("objects_total"),
         objects_expected=objects.get("objects_expected"),
+        # Per-run root telemetry (issue #362): carried JSON-only, exactly as
+        # bench_metrics.build_record does for the per-merge harness, so the
+        # release row's total is netted the same way instead of dropping the
+        # key on the floor.
+        objects_telemetry=objects.get("objects_telemetry"),
         objects_mismatch=objects.get("objects_mismatch"),
         parity_ok=(parity or {}).get("parity_ok"),
         parity=parity,
@@ -681,7 +686,11 @@ def main(argv: list[str] | None = None) -> int:
         "--target", action="append", default=[], help="Target name (repeatable; omit for all)"
     )
     ap.add_argument("--catalog", required=True, help="Local full ATL03 stac-geoparquet catalog")
-    ap.add_argument("--store-prefix", default=None, help="<prefix>/<target>.zarr output store")
+    ap.add_argument(
+        "--store-prefix",
+        default=None,
+        help="<prefix>/<commit>/<target>.zarr output store (unscoped when --commit is empty)",
+    )
     ap.add_argument("--region", default="us-west-2")
     ap.add_argument("--function-name", default="process-shard")
     ap.add_argument(
@@ -731,7 +740,12 @@ def main(argv: list[str] | None = None) -> int:
 
     runs, shards = [], []
     for name in names:
-        store = f"{args.store_prefix.rstrip('/')}/{name}.zarr" if args.store_prefix else None
+        # Per-commit scoping (issue #362): see bench_metrics.store_path.
+        store = (
+            bench_metrics.store_path(args.store_prefix, name, commit=args.commit)
+            if args.store_prefix
+            else None
+        )
         run, shard_rows = run_target(
             name,
             manifest,

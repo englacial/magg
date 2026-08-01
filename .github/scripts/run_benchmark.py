@@ -44,7 +44,6 @@ import bench_objects  # noqa: E402
 
 from zagg.config import (  # noqa: E402
     get_aoi_mask,
-    get_coverage_moc,
     get_handoff,
     get_store_layout,
     load_config,
@@ -92,7 +91,8 @@ def _measure_objects(config, grid, store: str, shard_key: int, *, region: str) -
 
     Returns the ``objects`` payload ``bench_metrics.build_record`` threads into
     the record: measured total, the exact expectation (null when the layout's
-    count is data-dependent), the per-shard attribution, and the mismatch
+    count is data-dependent), the per-shard attribution, the per-run root
+    telemetry tally (issue #362 — reported, never audited), and the mismatch
     description (null when clean) that ``main`` hard-fails on. Uses the same
     store factory (and credentials) the dispatch just wrote through, so a LIST
     failure is a real run failure, not a swallowed warning.
@@ -103,7 +103,6 @@ def _measure_objects(config, grid, store: str, shard_key: int, *, region: str) -
         shard_keys=[shard_key],
         n_shards=1,
         store_layout=get_store_layout(config),
-        coverage_moc=get_coverage_moc(config),
         region=region,
     )
 
@@ -437,7 +436,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--store-prefix",
         default=None,
-        help="Output store prefix; each target writes <prefix>/<target>.zarr",
+        help="Output store prefix; each target writes <prefix>/<commit>/<target>.zarr "
+        "(<prefix>/<target>.zarr when --commit is empty)",
     )
     parser.add_argument("--region", default="us-west-2", help="AWS region")
     parser.add_argument(
@@ -525,7 +525,8 @@ def main(argv: list[str] | None = None) -> int:
     def _dispatch(name: str) -> dict:
         store = None
         if args.store_prefix:
-            store = f"{args.store_prefix.rstrip('/')}/{name}.zarr"
+            # Per-commit scoping (issue #362): see bench_metrics.store_path.
+            store = bench_metrics.store_path(args.store_prefix, name, commit=args.commit)
         return run_target(
             name,
             manifest,
@@ -558,7 +559,9 @@ def main(argv: list[str] | None = None) -> int:
             f"cost/shard=${record['cost_per_shard_usd']} "
             f"cost/100km2=${record['cost_per_100km2_usd']} "
             f"max_memory_mb={record['max_memory_mb']} "
-            f"objects={record.get('objects_total')} (expected {record.get('objects_expected')})"
+            f"objects={record.get('objects_write_path')} write-path "
+            f"(expected {record.get('objects_expected')}; "
+            f"{record.get('objects_total')} gross, telemetry {record.get('objects_telemetry')})"
         )
 
     Path(args.out_json).write_text(json.dumps(records, indent=2))
