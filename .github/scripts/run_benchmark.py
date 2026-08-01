@@ -559,8 +559,9 @@ def main(argv: list[str] | None = None) -> int:
             f"cost/shard=${record['cost_per_shard_usd']} "
             f"cost/100km2=${record['cost_per_100km2_usd']} "
             f"max_memory_mb={record['max_memory_mb']} "
-            f"objects={record.get('objects_total')} (expected {record.get('objects_expected')}, "
-            f"telemetry {record.get('objects_telemetry')})"
+            f"objects={record.get('objects_write_path')} write-path "
+            f"(expected {record.get('objects_expected')}; "
+            f"{record.get('objects_total')} gross, telemetry {record.get('objects_telemetry')})"
         )
 
     Path(args.out_json).write_text(json.dumps(records, indent=2))

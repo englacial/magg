@@ -490,6 +490,10 @@ def measure_objects(
     )
     return {
         "objects_total": measured["objects_total"],
+        # The netted, audited count (issue #362) — the one directly comparable
+        # to ``objects_expected``; ``objects_total`` stays gross so a reused
+        # store's real object footprint is still legible.
+        "objects_write_path": write_path_total(measured),
         "objects_expected": expected["total_max"] if expected["exact"] else None,
         "objects_per_shard": measured["objects_per_shard"],
         # Per-run root telemetry (issue #362): reported so an accumulating
@@ -498,6 +502,32 @@ def measure_objects(
         "objects_telemetry": measured["objects_telemetry"],
         "objects_mismatch": object_count_mismatch(measured, expected),
     }
+
+
+def write_path_total(measured: dict) -> int:
+    """The audited WRITE-PATH object count: the gross total, netted.
+
+    ``objects_total`` is every object under the store prefix. Three buckets are
+    not write-path objects and are subtracted here:
+
+    * sweep rollups (issue #300) and overview zarrs (issue #201) — second-pass
+      D9 caches the end-of-run sweep may or may not have landed by measurement
+      time (fire-and-forget on Lambda);
+    * per-run root telemetry (issue #362) — additionally unbounded, since its
+      names are per-run unique, so a reused store accumulates it and no fixed
+      expectation could ever hold.
+
+    This is the number :func:`object_count_mismatch` audits and the one
+    ``objects_expected`` is comparable to; ``objects_total`` stays gross
+    because storage/cost questions want every object. Single-sourced so the
+    reported figure and the asserted figure cannot drift apart.
+    """
+    return (
+        measured["objects_total"]
+        - measured.get("objects_rollups", 0)
+        - measured.get("objects_overviews", 0)
+        - measured.get("objects_telemetry", 0)
+    )
 
 
 def object_count_mismatch(measured: dict, expected: dict) -> str | None:
@@ -513,21 +543,7 @@ def object_count_mismatch(measured: dict, expected: dict) -> str | None:
     finding: the model claims to know every object the run writes.
     """
     problems = []
-    # Sweep rollups (issue #300) and overview zarrs (issue #201) are
-    # second-pass D9 caches, not write-path objects: the end-of-run sweep may
-    # or may not have landed them by measurement time (fire-and-forget on
-    # Lambda), so they are tallied in their own buckets and excluded from the
-    # write-path total this model audits (the #215 bypass guard below is
-    # untouched — neither ever lives inside a leaf prefix). Per-run root
-    # telemetry (issue #362) nets out for the same reason plus one of its own:
-    # its names are per-run unique, so a reused store accumulates them without
-    # bound and no fixed expectation could hold.
-    total = (
-        measured["objects_total"]
-        - measured.get("objects_rollups", 0)
-        - measured.get("objects_overviews", 0)
-        - measured.get("objects_telemetry", 0)
-    )
+    total = write_path_total(measured)
     meta = measured["objects_metadata"]
     meta_lo, meta_hi = expected["metadata_min"], expected["metadata"]
     if not (meta_lo <= meta <= meta_hi):

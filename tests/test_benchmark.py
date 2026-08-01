@@ -184,7 +184,7 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
     # store layout (#240 phase 4), worker phase split (#250/#256), the
     # streaming-mode/ephemeral axis (#272) and the worker-build provenance stamp
     # (#341/#296) appended in that order.
-    assert cols[-16:] == [
+    assert cols[-17:] == [
         "total_wall_s",
         "setup_s",
         "fanout_s",
@@ -201,6 +201,7 @@ def test_codec_column_is_last_and_threaded(monkeypatch):
         "tmp_mb",
         "ephemeral_cost_usd",
         "variant_guard",
+        "objects_write_path",
     ]
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={"codec": "sharded"})
@@ -663,8 +664,9 @@ def test_variant_guard_status_verified_and_base(tmp_path, monkeypatch):
 
 def test_variant_guard_column_is_in_the_series_schema():
     # Appended to the stable RECORD_COLUMNS schema so update_series's reindex
-    # retains it (legacy rows read back null).
-    assert bench_metrics.RECORD_COLUMNS[-1] == "variant_guard"
+    # retains it (legacy rows read back null). No longer LAST: the issue #362
+    # netted-count column appended after it, per the same rule.
+    assert bench_metrics.RECORD_COLUMNS[-2] == "variant_guard"
     rec = bench_metrics.build_record(
         _summary(), grid=HealpixGrid(11, 19), context={"target": "t", "variant_guard": "verified"}
     )
@@ -2175,6 +2177,9 @@ def test_88s_nested_pin_invariant():
 def _objects_payload(mismatch=None):
     return {
         "objects_total": 10,
+        # Nothing to net out here, so gross == write-path (issue #362); the
+        # netting itself is covered in test_benchmark_objects.py.
+        "objects_write_path": 10,
         "objects_expected": 10,
         "objects_per_shard": {"1121121": 4},
         "objects_mismatch": mismatch,
@@ -2186,11 +2191,16 @@ def test_objects_columns_are_last_and_threaded():
     # appended after the object counts in phase 4; the #250/#256 phase split
     # then the #272 streaming-mode/ephemeral axis appended after those).
     cols = bench_metrics.RECORD_COLUMNS
-    assert cols[-11:-8] == ["objects_total", "objects_expected", "store_layout"]
+    assert cols[-12:-9] == ["objects_total", "objects_expected", "store_layout"]
+    # The netted audited count (issue #362) is a SEPARATE column, appended last
+    # rather than redefining ``objects_total`` -- so a row written before it
+    # cannot be misread as having been audited on the netted figure.
+    assert cols[-1] == "objects_write_path"
     g = HealpixGrid(parent_order=11, child_order=19)
     rec = bench_metrics.build_record(_summary(), grid=g, context={}, objects=_objects_payload())
     assert rec["objects_total"] == 10
     assert rec["objects_expected"] == 10
+    assert rec["objects_write_path"] == 10  # nothing to net out in this payload
     # per_shard/mismatch ride the metrics.json record only -- deliberately NOT
     # series columns (update_series's reindex drops them).
     assert rec["objects_per_shard"] == {"1121121": 4}
@@ -2209,8 +2219,18 @@ def test_objects_cell_rendered_in_table():
     # Bounded (non-exact) expectation records measured only.
     bounded = dict(rec, objects_expected=None)
     assert bench_metrics.format_record_cells(bounded)["objects"] == "10"
+    # Three row vintages (issue #362). A row written BEFORE the netted column
+    # existed carries only the gross total, which was the audited figure at the
+    # time, so the cell falls back to it rather than reading "n/a".
+    pre_362 = dict(rec, objects_write_path=float("nan"))
+    assert bench_metrics.format_record_cells(pre_362)["objects"] == "10/10"
+    # A row carrying both renders the NETTED count against the expectation --
+    # the only comparable pair -- so a store full of D9 caches and accumulated
+    # telemetry no longer renders as an alarming gross number on a green run.
+    netted = dict(rec, objects_total=48, objects_write_path=16, objects_expected=16)
+    assert bench_metrics.format_record_cells(netted)["objects"] == "16/16"
     # Legacy parquet rows degrade to NaN; empty records have nothing.
-    legacy = dict(rec, objects_total=float("nan"))
+    legacy = dict(rec, objects_total=float("nan"), objects_write_path=float("nan"))
     assert bench_metrics.format_record_cells(legacy)["objects"] == "n/a"
     assert bench_metrics.format_record_cells({})["objects"] == "n/a"
 

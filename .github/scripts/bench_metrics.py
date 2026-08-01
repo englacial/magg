@@ -150,6 +150,17 @@ RECORD_COLUMNS = [
     # recorded before the guard existed -- which is exactly the window in which
     # the issue #341 stale-variant numbers were measured.
     "variant_guard",
+    # The netted, audited object count (issue #362): ``objects_total`` above is
+    # GROSS (every object under the store prefix, so a reused store's real
+    # footprint stays legible), while this subtracts the D9 rollup/overview
+    # caches and the unbounded per-run telemetry -- making it the only one
+    # comparable to ``objects_expected``. Kept as a SEPARATE column rather than
+    # redefining ``objects_total`` in place: rows recorded before issue #362
+    # would otherwise mean something different from rows after it, in the same
+    # column, across a series meant to be read over months. Null on those
+    # earlier rows. Appended last per the stable-schema rule, so it sits away
+    # from the objects columns it belongs with.
+    "objects_write_path",
 ]
 
 # summary["worker_phase_max"] key -> series column (issues #250/#256). A phase
@@ -323,6 +334,7 @@ def build_record(
     # (update_series's reindex drops them).
     o = objects or {}
     record["objects_total"] = o.get("objects_total")
+    record["objects_write_path"] = o.get("objects_write_path")
     record["objects_expected"] = o.get("objects_expected")
     record["objects_per_shard"] = o.get("objects_per_shard")
     # Per-run root telemetry (issue #362): JSON-only like per_shard/mismatch —
@@ -383,7 +395,13 @@ def _objects_cell(record: dict) -> str:
             return None
         return int(value)
 
-    total = _num(record.get("objects_total"))
+    # The netted write-path count is what ``objects_expected`` is comparable to
+    # (issue #362), so it is what renders against it; rows recorded before that
+    # column existed fall back to the gross total, which was the audited figure
+    # at the time they were written.
+    total = _num(record.get("objects_write_path"))
+    if total is None:
+        total = _num(record.get("objects_total"))
     if total is None:
         return "n/a"
     expected = _num(record.get("objects_expected"))

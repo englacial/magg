@@ -651,11 +651,43 @@ def test_measure_objects_end_to_end(tmp_path):
     payload = run_benchmark._measure_objects(cfg, grid, root, word, region="us-west-2")
     assert payload == {
         "objects_total": 8,  # 5 metadata + 3 shard objects
+        # Nothing to net out on a freshly written store, so the audited
+        # write-path count equals the gross total here (issue #362).
+        "objects_write_path": 8,
         "objects_expected": 8,  # exact: root telemetry is its own bucket (#362)
         "objects_per_shard": {_KEY_A: 3},
         "objects_telemetry": 0,
         "objects_mismatch": None,
     }
+
+
+def test_measure_objects_reports_the_netted_count(tmp_path):
+    # The reported write-path count must be the SAME figure the mismatch check
+    # audits (issue #362) -- so a store carrying D9 caches and accumulated
+    # per-run telemetry stays green AND reports a number comparable to
+    # ``objects_expected``, instead of a gross total that reads as a blowup.
+    measured = {
+        "objects_total": 48,
+        "objects_metadata": 3,
+        "objects_per_shard": {"1121121": 13},
+        "objects_rollups": 5,
+        "objects_overviews": 3,
+        "objects_telemetry": 24,
+        "objects_other": 0,
+        "other_keys": [],
+    }
+    assert bench_objects.write_path_total(measured) == 16
+    expected = {
+        "metadata": 3,
+        "metadata_min": 1,
+        "per_shard_min": 13,
+        "per_shard_max": 13,
+        "total_min": 14,
+        "total_max": 16,
+        "exact": True,
+    }
+    # Green on the netted figure, which is 32 objects below the gross total.
+    assert bench_objects.object_count_mismatch(measured, expected) is None
 
 
 def test_measure_objects_flags_bypass(tmp_path):
