@@ -812,7 +812,10 @@ class SpillAggregator:
         associative), so the result does not depend on block reduce order — the
         property #280 relies on to parallelize the reducer. A located field's
         location parts collapse in the same pass (the located
-        ``merge_tdigests_kway`` overload), keeping both channels row-aligned.
+        ``merge_tdigests_kway`` overload), keeping both channels row-aligned —
+        and the location channel is order-independent too, since the located
+        merge breaks ``(mean, weight)`` ties on the location word itself
+        (issue #370); a reducer parallelized under #280 inherits both.
         """
         for name, cell_parts in self._digest_parts.items():
             f = self._digest_fields[name]

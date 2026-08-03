@@ -664,6 +664,31 @@ class TestMergeTDigestsKway:
         for perm in ([2, 0, 4, 1, 5, 3], [5, 4, 3, 2, 1, 0], [1, 3, 5, 0, 2, 4]):
             assert np.array_equal(ref, merge_tdigests_kway([ds[i] for i in perm], delta=256))
 
+    def test_located_order_independent_with_tied_means(self):
+        """The LOCATION channel is permutation-invariant too (issue #370).
+
+        Tied ``(mean, weight)`` sub-centroids are interchangeable for the digest
+        but carry different location words; a tie straddling a compression
+        boundary used to hand the output centroid a different ancestor depending
+        on part order. The location word is now the tertiary lexsort key, so both
+        channels agree under permutation — and the digest bytes are unchanged
+        (they equal the unlocated fold of the same inputs).
+        """
+        vals = np.array([1.0, 1.0, 2.0, 2.0, 3.0, 3.0])
+        built = [
+            build_tdigest(vals, delta=4, locations=_point_words(6, seed=s)) for s in (11, 12, 13)
+        ]
+        ds = [d for d, _ in built]
+        ls = [ln for _, ln in built]
+        ref, ref_locs = merge_tdigests_kway(ds, delta=4, locations=ls)
+        assert np.array_equal(ref, merge_tdigests_kway(ds, delta=4))
+        for perm in ([2, 0, 1], [1, 2, 0], [2, 1, 0]):
+            out, out_locs = merge_tdigests_kway(
+                [ds[i] for i in perm], delta=4, locations=[ls[i] for i in perm]
+            )
+            assert np.array_equal(ref, out)
+            assert np.array_equal(ref_locs, out_locs)
+
     def test_pairwise_fold_is_order_dependent(self):
         """Contrast: the pairwise left-fold is NOT associative (issue #279)."""
         ds = self._digests(2, 6)
