@@ -126,11 +126,14 @@ def _point_leafs(grid, cell, n, rng):
     return out[:n]
 
 
-def _granule_dfs(grid, shard_key, cell_idx_lists, obs_per_cell=60, seed=0, conf=False):
+def _granule_dfs(
+    grid, shard_key, cell_idx_lists, obs_per_cell=60, seed=0, conf=False, nan_cells=()
+):
     """One DataFrame per granule; real order-29 point leafs per chosen cell.
 
     ``conf=True`` adds the five ``signal_conf_*`` columns (ATL03's ``-1..4``
-    range) for composition tests.
+    range) for composition tests. Cells in ``nan_cells`` get all-NaN heights
+    (an empty digest but a nonzero count).
     """
     rng = np.random.default_rng(seed)
     children = np.asarray(grid.children(shard_key), dtype=np.uint64)
@@ -139,7 +142,10 @@ def _granule_dfs(grid, shard_key, cell_idx_lists, obs_per_cell=60, seed=0, conf=
         n = obs_per_cell * len(idxs)
         h, leaf = [], []
         for ci in idxs:
-            h.append(rng.normal(0.0, 10.0, obs_per_cell).astype(np.float32))
+            vals = rng.normal(0.0, 10.0, obs_per_cell).astype(np.float32)
+            if ci in nan_cells:
+                vals[:] = np.nan
+            h.append(vals)
             leaf.append(_point_leafs(grid, int(children[ci]), obs_per_cell, rng))
         cols = {"h_ph": np.concatenate(h), "leaf_id": np.concatenate(leaf)}
         if conf:
@@ -558,3 +564,54 @@ class TestCompositionMultiBlock:
             for dp, ds, ls in zip(vals_p, vals_s, locs_s, strict=True):
                 assert float(dp[:, 1].sum()) == float(ds[:, 1].sum())
                 assert ls.shape == (len(ds),)
+
+
+class TestUnlocatedUnchanged:
+    """Issue #370 adds nothing to the spill record — the fold reads the
+    already-spilled read-carrier columns — so unlocated configs' spilled
+    bytes are unchanged by construction."""
+
+    def test_spill_record_schema_is_the_read_carrier(self):
+        # Same schema whether or not the config declares location: the
+        # location channel is served from the existing leaf_id column, never
+        # an appended one; an unlocated spill record gains no column.
+        df = None
+        schemas = {}
+        for located in (False, True):
+            cfg = _config(_variables(located=located), streaming=_SPILL)
+            grid = _grid(cfg)
+            if df is None:
+                df = _granule_dfs(grid, _shard_key(), [[0, 4]], obs_per_cell=5, seed=1)[0]
+            agg = SpillAggregator(cfg, grid, "pandas", 1)
+            agg.add_read(df.copy())
+            agg.flush()
+            schemas[located] = [name for name, _ in agg._block.schema]
+            agg.close()
+        assert schemas[False] == schemas[True] == ["h_ph", "leaf_id"]
+
+    def test_nan_cell_multi_block_empty_digest_real_count(self, monkeypatch):
+        # An all-NaN cell across blocks: exact count, no digest and no
+        # locations entry emitted — matching pooled behavior.
+        key = _shard_key()
+        pooled_cfg = _config(_variables(located=True))
+        spill_cfg = _config(_variables(located=True), streaming=_SPILL)
+        grid = _grid(pooled_cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=30, seed=14, nan_cells={4})
+        df_p, ragged_p, _ = _run(monkeypatch, pooled_cfg, grid, key, list(dfs))
+        _force_tiny_blocks(monkeypatch)
+        df_s, ragged_s, _ = _run(monkeypatch, spill_cfg, _grid(spill_cfg), key, list(dfs))
+        pd.testing.assert_series_equal(df_p["count"], df_s["count"])
+        vals_p, idx_p, locs_p = ragged_p["h_tdigest"]
+        vals_s, idx_s, locs_s = ragged_s["h_tdigest"]
+        assert idx_p == idx_s  # the NaN cell is absent from both
+        assert len(locs_s) == len(vals_s)
+        children = np.asarray(grid.children(key), dtype=np.uint64)
+        nan_cell = int(children[4])
+        counted = df_s["count"].values[4] if len(df_s) > 4 else None
+        # The NaN cell holds observations (count > 0) yet emits no payload.
+        nan_rows = sum(
+            int((np.asarray(grid.cells_of(df["leaf_id"].values)) == nan_cell).sum()) for df in dfs
+        )
+        assert nan_rows > 0
+        assert 4 not in idx_s
+        assert counted == nan_rows
