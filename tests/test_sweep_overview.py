@@ -511,6 +511,44 @@ class TestPyramidBlock:
         with pytest.raises(ValueError, match="fields must be a mapping"):
             validate_config(self._cfg(store_layout="hive", pyramid={"fields": ["h_min"]}))
 
+    def test_field_schedule_recorded_in_block(self):
+        """The per-field schedule is manifest-recorded — D24 option A absence."""
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"fields": {"h_min": {"orders": [4, 0]}, "h_max": False}})
+        overview = build_pyramid_block(cfg, shard_order=6)["overview"]
+        assert overview["orders"] == [4, 2, 0]
+        # Narrowed: descending, and only the block's own orders.
+        assert overview["fields"]["h_min"]["orders"] == [4, 0]
+        assert overview["fields"]["h_min"]["method"] == "min"  # fold law still declared
+        # Excluded: the empty schedule, not a dropped entry — the reader still
+        # learns the class and the fold it would have had.
+        assert overview["fields"]["h_max"]["orders"] == []
+        assert overview["fields"]["h_max"]["class"] == "exact"
+        # Unnamed fields carry NO orders key: they inherit the block schedule.
+        assert "orders" not in overview["fields"]["count"]
+        # A none-class entry stays class-only (spec §4.5) even when named.
+        assert overview["fields"]["h_mean"] == {"class": "none"}
+        json.dumps(overview)
+
+    def test_absent_field_knob_declares_identically(self):
+        """Absent ``fields:`` must be byte-identical to pre-#352 declarations."""
+        from zagg.sweep_overview import build_pyramid_block
+
+        block = build_pyramid_block(self._cfg(), shard_order=6)
+        assert all("orders" not in m for m in block["overview"]["fields"].values())
+        assert block == build_pyramid_block(self._cfg(pyramid={}), shard_order=6)
+
+    def test_field_schedule_never_widens_the_block(self):
+        """The unvalidated path (declare_pyramid) intersects, never widens."""
+        from zagg.sweep_overview import build_pyramid_block
+
+        # shard_order 4 => schedule [2, 0]; the knob asks for 5 as well.
+        cfg = self._cfg(pyramid={"fields": {"h_min": {"orders": [5, 2]}}})
+        overview = build_pyramid_block(cfg, shard_order=4)["overview"]
+        assert overview["orders"] == [2, 0]
+        assert overview["fields"]["h_min"]["orders"] == [2]
+
     def test_pyramid_orders_derivation(self):
         """The shared schedule helper config validation and the block agree on."""
         from zagg.sweep_overview import pyramid_orders

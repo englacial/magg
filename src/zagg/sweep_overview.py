@@ -218,6 +218,13 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     that gives readers zero-open filtering (option A, the ruled default) —
     and warned about loudly at template time, per the D24 ruling. The sweep
     later adds ``materialized`` actuals; it never rewrites the declaration.
+
+    A composable field named in ``output.pyramid.fields`` (issue #352) also
+    records its own ``orders`` — the narrowed schedule, ``[]`` for an outright
+    exclusion — so the per-(field, order) absence is recorded exactly as the
+    block-wide one is: zero-open filtering, never a probe. Fields not named
+    there carry no ``orders`` key and inherit the block schedule, so a config
+    without the knob declares byte-identically to pre-#352 zagg.
     """
     from zagg.config import get_agg_fields, get_pyramid
     from zagg.semantics import EXACT_MERGE_LAWS, _fold_function_name, composability_classes
@@ -228,12 +235,13 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     spacing = int(knob.get("spacing") or DEFAULT_SPACING)
     orders = pyramid_orders(knob, shard_order)
     agg = get_agg_fields(config)
+    selection = knob.get("fields") or {}
     fields: dict = {}
     excluded = []
     for name, cls in composability_classes(config).items():
         meta = agg[name]
         if cls == "exact":
-            fields[name] = {
+            entry = {
                 "class": "exact",
                 "method": EXACT_MERGE_LAWS[_fold_function_name(meta.get("function")) or ""],
                 "nan_policy": EXACT_NAN_POLICY,
@@ -242,7 +250,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
             }
         elif cls == "approximate":
             inner = meta.get("inner_shape") or (2,)
-            fields[name] = {
+            entry = {
                 "class": "approximate",
                 "method": TDIGEST_LAW,
                 "dtype": meta.get("dtype", "float32"),
@@ -250,8 +258,14 @@ def build_pyramid_block(config, shard_order: int) -> dict:
                 "delta": int((meta.get("params") or {}).get("delta", 512)),
             }
         else:
+            # A ``none`` entry carries ``class`` only (spec §4.5): it is already
+            # absent at every order, so a per-field schedule over it is moot.
             fields[name] = {"class": "none"}
             excluded.append(name)
+            continue
+        if name in selection:
+            entry["orders"] = _field_orders(selection[name], orders)
+        fields[name] = entry
     if excluded and orders:
         logger.warning(
             f"pyramid: fields {excluded} are non-composable (D24 class 'none') and will "
@@ -267,6 +281,22 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     if knob.get("summarize"):
         overview["summarize"] = {str(k): dict(v) for k, v in knob["summarize"].items()}
     return {"spec": PYRAMID_SPEC, "overview": overview}
+
+
+def _field_orders(decl, orders: list) -> list:
+    """One field's declared overview schedule (issue #352), as a subset of ``orders``.
+
+    ``false`` is the outright exclusion (the empty schedule); a mapping
+    narrows to its ``orders``. Always intersected with the block schedule and
+    kept in the block's descending order: :func:`zagg.config._validate_pyramid`
+    refuses a widening entry up front, so the intersection here only makes the
+    invariant unfalsifiable for the unvalidated caller (``declare_pyramid``
+    against a manifest whose ``shard_order`` differs from the config's).
+    """
+    if decl is False:
+        return []
+    want = {int(k) for k in ((decl or {}).get("orders") or [])}
+    return [k for k in orders if k in want]
 
 
 def _json_fill(fill_value):
