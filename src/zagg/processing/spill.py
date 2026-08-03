@@ -662,8 +662,10 @@ class SpillAggregator:
         if not self._mergeable:
             raise SpillOverflowError(
                 f"spill block hit the {self.block_bytes:,}-byte threshold but the "
-                f"config carries reducers with no merge law, so per-block results "
-                f"cannot combine (single-block spill is exact for every reducer). "
+                f"config carries reducers with no cross-block fold law, so per-block "
+                f"results cannot combine (the fold covers 'len'/'count', tdigest "
+                f"fields — located, where-strata, pairwise — and the packed "
+                f"composition word; single-block spill is exact for every reducer). "
                 f"Remedies: a bigger memory tier, a '-disk' function variant with "
                 f"more ephemeral storage, or a finer parent_order (smaller shards)."
             )
