@@ -53,6 +53,7 @@ __all__ = [
     "counts_from_composition",
     "merge_composition",
     "pack_composition",
+    "pack_composition_n",
     "unpack_composition",
 ]
 
@@ -165,6 +166,37 @@ def pack_composition(
     stayed populated — out of contract for this spec rather than defended
     against here.
     """
+    return pack_composition_n(
+        values,
+        conf_land=conf_land,
+        conf_ocean=conf_ocean,
+        conf_sea_ice=conf_sea_ice,
+        conf_land_ice=conf_land_ice,
+        conf_inland_water=conf_inland_water,
+        threshold=threshold,
+    )[0]
+
+
+def pack_composition_n(
+    values: np.ndarray,
+    *,
+    conf_land: np.ndarray,
+    conf_ocean: np.ndarray,
+    conf_sea_ice: np.ndarray,
+    conf_land_ice: np.ndarray,
+    conf_inland_water: np.ndarray,
+    threshold: int = 2,
+) -> tuple[int, int]:
+    """:func:`pack_composition` returning the ``(word, n_signal)`` pair.
+
+    The spill cross-block fold (issue #370) needs each block's stratum size
+    beside its word — :func:`merge_composition` is a fold over ``(word, n)``
+    pairs — and ``n_signal`` is computed here anyway (the signal predicate over
+    the finite rows). Exposing the pair keeps the predicate in ONE place: a
+    fold that re-derived ``n`` from the conf columns could silently drift from
+    the packing cut. ``pack_composition`` (the config-facing reducer, word
+    only) delegates here, so both entry points share the identical bytes.
+    """
     values = np.asarray(values, dtype=np.float64)
     conf = np.column_stack(
         [conf_land, conf_ocean, conf_sea_ice, conf_land_ice, conf_inland_water]
@@ -177,7 +209,7 @@ def pack_composition(
     signal = (conf >= threshold).any(axis=1)
     n = int(signal.sum())
     if n == 0:
-        return 0
+        return 0, 0
     csig = conf[signal]
 
     counts = np.empty(8, dtype=np.int64)
@@ -185,7 +217,7 @@ def pack_composition(
     strongest = csig.max(axis=1)
     for i, level in enumerate((2, 3, 4)):
         counts[_SURFACES + i] = int((strongest == level).sum())
-    return _pack(_quantize(counts, n))
+    return _pack(_quantize(counts, n)), n
 
 
 def merge_composition(word_a: int, n_a: int, word_b: int, n_b: int) -> int:

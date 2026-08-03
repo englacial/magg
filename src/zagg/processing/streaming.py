@@ -55,6 +55,15 @@ _TDIGEST_FUNCTIONS = (_TDIGEST_FUNCTION, _TDIGEST_PAIRWISE_FUNCTION)
 _TDIGEST_WHERE_FUNCTION = "zagg.stats.tdigest.build_tdigest_where"
 _TDIGEST_SPILL_FUNCTIONS = (*_TDIGEST_FUNCTIONS, _TDIGEST_WHERE_FUNCTION)
 
+#: The packed composition reducer (issue #321): the SPILL fold combines its
+#: per-block ``(word, n_signal)`` pairs via ``merge_composition`` — issue #370
+#: option (a), accepting the documented O(n/510)-per-fold lane-quantization
+#: error (presence exact via the floor). Flipping to option (b) — composition
+#: stays non-mergeable, so a strata-with-composition config fails loudly on a
+#: block close — is the one-line removal of this function from the
+#: ``validate_spill_fold`` scalar branch below.
+_COMPOSITION_FUNCTION = "zagg.stats.composition.pack_composition"
+
 
 def get_streaming(config: PipelineConfig) -> dict | None:
     """Return the ``aggregation.streaming`` block, or ``None`` (pooled path).
@@ -162,8 +171,12 @@ def validate_spill_fold(config: PipelineConfig) -> None:
     coarsen continuously, whereas spill folds only on the rare block close.
     Accepted here beyond the merge-mode set: **located** ragged fields (the
     located ``merge_tdigests``/``merge_tdigests_kway`` overloads carry the
-    channel) and **``build_tdigest_where`` strata** (row selection precedes
-    the build, so per-block stratum digests merge like any digest).
+    channel), **``build_tdigest_where`` strata** (row selection precedes
+    the build, so per-block stratum digests merge like any digest), and the
+    **packed composition word** (``merge_composition`` over per-block
+    ``(word, n_signal)`` pairs — presence exact, counts within the documented
+    O(n/510)-per-fold bound; see :data:`_COMPOSITION_FUNCTION` for the
+    option (a)/(b) flip point).
 
     A config this rejects is still accepted by ``mode: spill`` — every
     reducer is exact in the single-block regime — but cannot survive a block
@@ -198,10 +211,10 @@ def validate_spill_fold(config: PipelineConfig) -> None:
                     f"declared inner_shape {list(sig['inner_shape'])} has no cross-block fold"
                 )
         elif sig["kind"] == "scalar":
-            if meta.get("function") not in ("len", "count"):
+            if meta.get("function") not in ("len", "count", _COMPOSITION_FUNCTION):
                 problems.append(
                     f"field '{name}': scalar function {meta.get('function')!r} has no "
-                    "cross-block fold (only 'len'/'count')"
+                    f"cross-block fold (only 'len'/'count'/{_COMPOSITION_FUNCTION!r})"
                 )
         else:
             problems.append(f"field '{name}': kind '{sig['kind']}' has no cross-block fold")

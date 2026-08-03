@@ -21,12 +21,38 @@ from zagg.grids import HealpixGrid
 from zagg.processing import process_shard
 from zagg.processing.spill import SpillAggregator
 from zagg.processing.streaming import validate_spill_fold, validate_streaming
+from zagg.stats.composition import counts_from_composition, unpack_composition
 from zagg.stats.tdigest import quantile_from_tdigest
 
 _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
 _SIGNAL = "h_ph > 0"
 _NOISE = "~(h_ph > 0)"
+
+_CONF_COLS = (
+    "signal_conf_land",
+    "signal_conf_ocean",
+    "signal_conf_sea_ice",
+    "signal_conf_land_ice",
+    "signal_conf_inland_water",
+)
+
+
+def _composition_field(threshold=2):
+    return {
+        "function": "zagg.stats.composition.pack_composition",
+        "source": "h_ph",
+        "dtype": "uint64",
+        "fill_value": 0,
+        "params": {
+            "conf_land": "signal_conf_land",
+            "conf_ocean": "signal_conf_ocean",
+            "conf_sea_ice": "signal_conf_sea_ice",
+            "conf_land_ice": "signal_conf_land_ice",
+            "conf_inland_water": "signal_conf_inland_water",
+            "threshold": threshold,
+        },
+    }
 
 
 def _variables(located=False, strata=False, pairwise=False, delta=16):
@@ -100,17 +126,26 @@ def _point_leafs(grid, cell, n, rng):
     return out[:n]
 
 
-def _granule_dfs(grid, shard_key, cell_idx_lists, obs_per_cell=60, seed=0):
-    """One DataFrame per granule; real order-29 point leafs per chosen cell."""
+def _granule_dfs(grid, shard_key, cell_idx_lists, obs_per_cell=60, seed=0, conf=False):
+    """One DataFrame per granule; real order-29 point leafs per chosen cell.
+
+    ``conf=True`` adds the five ``signal_conf_*`` columns (ATL03's ``-1..4``
+    range) for composition tests.
+    """
     rng = np.random.default_rng(seed)
     children = np.asarray(grid.children(shard_key), dtype=np.uint64)
     dfs = []
     for idxs in cell_idx_lists:
+        n = obs_per_cell * len(idxs)
         h, leaf = [], []
         for ci in idxs:
             h.append(rng.normal(0.0, 10.0, obs_per_cell).astype(np.float32))
             leaf.append(_point_leafs(grid, int(children[ci]), obs_per_cell, rng))
-        dfs.append(pd.DataFrame({"h_ph": np.concatenate(h), "leaf_id": np.concatenate(leaf)}))
+        cols = {"h_ph": np.concatenate(h), "leaf_id": np.concatenate(leaf)}
+        if conf:
+            for name in _CONF_COLS:
+                cols[name] = rng.integers(-1, 5, n).astype(np.int8)
+        dfs.append(pd.DataFrame(cols))
     return dfs
 
 
@@ -359,6 +394,22 @@ class TestStrataMultiBlock:
                 # Only the stratum's own rows contribute to its locations.
                 _assert_ancestor_or_equal(cell_locs, contributors)
 
+    def test_strata_and_composition_config_is_mergeable(self):
+        # The full stratified-product shape (issue #321 exemplar): strata +
+        # composition + count, accepted by the spill fold probe (issue #370
+        # option (a)). A non-fold scalar stays rejected alongside.
+        variables = _variables(located=True, strata=True)
+        variables["composition"] = _composition_field()
+        cfg = _config(variables, streaming=_SPILL)
+        validate_spill_fold(cfg)
+        agg = SpillAggregator(cfg, _grid(cfg), "pandas", 1)
+        assert agg._mergeable
+        assert "composition" in agg._composition_fields
+        agg.close()
+        variables["h_mean"] = {"function": "mean", "source": "h_ph"}
+        with pytest.raises(ValueError, match="h_mean.*no.*cross-block fold"):
+            validate_spill_fold(_config(variables))
+
     def test_strata_invariant_to_block_placement(self, monkeypatch):
         # The same rows split into different granules (hence different block
         # boundaries under buffer_granules=1 + tiny blocks) must land the
@@ -383,3 +434,93 @@ class TestStrataMultiBlock:
                 assert float(da[:, 1].sum()) == float(db[:, 1].sum())
                 for q in (0.1, 0.5, 0.9):
                     assert abs(quantile_from_tdigest(da, q) - quantile_from_tdigest(db, q)) < 1.5
+
+
+def _true_lane_counts(dfs, grid, cell, threshold=2):
+    """Ground-truth composition lane counts + n_signal for one cell's rows."""
+    conf_rows, finite_rows = [], []
+    for df in dfs:
+        in_cell = np.asarray(grid.cells_of(df["leaf_id"].values)) == cell
+        conf_rows.append(df.loc[in_cell, list(_CONF_COLS)].to_numpy(np.int64))
+        finite_rows.append(np.isfinite(df.loc[in_cell, "h_ph"].to_numpy(np.float64)))
+    conf = np.concatenate(conf_rows)[np.concatenate(finite_rows)]
+    signal = (conf >= threshold).any(axis=1)
+    n = int(signal.sum())
+    counts = np.zeros(8, dtype=np.int64)
+    if n:
+        csig = conf[signal]
+        counts[:5] = (csig >= threshold).sum(axis=0)
+        strongest = csig.max(axis=1)
+        for i, level in enumerate((2, 3, 4)):
+            counts[5 + i] = int((strongest == level).sum())
+    return counts, n
+
+
+class TestCompositionMultiBlock:
+    """merge_composition across forced block closes (issue #370 option (a))."""
+
+    def test_presence_exact_counts_within_fold_bound(self, monkeypatch):
+        key = _shard_key()
+        variables = {
+            "count": {"function": "len", "source": "h_ph", "dtype": "int32", "fill_value": 0},
+            "composition": _composition_field(),
+        }
+        pooled_cfg = _config(dict(variables))
+        spill_cfg = _config(dict(variables), streaming=_SPILL)
+        grid = _grid(pooled_cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=60, seed=21, conf=True)
+        df_p, _, _ = _run(monkeypatch, pooled_cfg, grid, key, list(dfs))
+        _force_tiny_blocks(monkeypatch)
+        df_s, _, _ = _run(monkeypatch, spill_cfg, _grid(spill_cfg), key, list(dfs))
+        np.testing.assert_array_equal(df_p["count"].values, df_s["count"].values)
+        children = np.asarray(grid.children(key), dtype=np.uint64)
+        checked = 0
+        for i, cell in enumerate(children):
+            word_p, word_s = int(df_p["composition"].values[i]), int(df_s["composition"].values[i])
+            truth, n = _true_lane_counts(dfs, grid, int(cell))
+            if n == 0:
+                assert word_p == 0 and word_s == 0
+                continue
+            # Presence (lane > 0) survives every fold exactly — that is the
+            # spec's floor guarantee — and matches the pooled word's presence.
+            np.testing.assert_array_equal(unpack_composition(word_p) > 0, truth > 0)
+            np.testing.assert_array_equal(unpack_composition(word_s) > 0, truth > 0)
+            # Below n=254 the pooled word recovers counts exactly; the folded
+            # word stays within the documented O(n/510)-per-fold error over
+            # at most len(dfs) folds (one block per granule here).
+            assert n <= 254
+            np.testing.assert_array_equal(counts_from_composition(word_p, n), truth)
+            tol = 1 + len(dfs) * n / 510.0
+            assert np.abs(counts_from_composition(word_s, n) - truth).max() <= tol
+            checked += 1
+        assert checked >= 3
+
+    def test_full_stratified_product_survives_block_closes(self, monkeypatch):
+        # The issue #370 acceptance shape: located strata + composition +
+        # count through a forced multi-block run lands every channel.
+        key = _shard_key()
+        variables = _variables(located=True, strata=True)
+        variables["composition"] = _composition_field()
+        pooled_cfg = _config(dict(variables))
+        spill_cfg = _config(dict(variables), streaming=_SPILL)
+        grid = _grid(pooled_cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=80, seed=9, conf=True)
+        df_p, ragged_p, _ = _run(monkeypatch, pooled_cfg, grid, key, list(dfs))
+        _force_tiny_blocks(monkeypatch)
+        df_s, ragged_s, meta_s = _run(monkeypatch, spill_cfg, _grid(spill_cfg), key, list(dfs))
+        assert meta_s["total_obs"] > 0
+        np.testing.assert_array_equal(df_p["count"].values, df_s["count"].values)
+        # Composition present and presence-consistent with pooled.
+        for wp, ws in zip(df_p["composition"].values, df_s["composition"].values, strict=True):
+            np.testing.assert_array_equal(
+                unpack_composition(int(wp)) > 0, unpack_composition(int(ws)) > 0
+            )
+        # Both strata deliver the located 3-tuple with exact stratum weights.
+        for name in ("h_sig", "h_noise"):
+            vals_p, idx_p, _ = ragged_p[name]
+            vals_s, idx_s, locs_s = ragged_s[name]
+            assert idx_p == idx_s
+            assert len(locs_s) == len(vals_s)
+            for dp, ds, ls in zip(vals_p, vals_s, locs_s, strict=True):
+                assert float(dp[:, 1].sum()) == float(ds[:, 1].sum())
+                assert ls.shape == (len(ds),)

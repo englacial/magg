@@ -471,10 +471,12 @@ class TestSpillConfig:
         assert not agg._mergeable
         agg.close()
 
-    def test_stratified_config_single_block_only(self):
-        # Signal/noise strata + composition (issue #321): accepted by spill,
-        # pinned non-mergeable (single-block regime, exact via the pooled
-        # replay) — the fold surface would silently drop the ``where`` mask.
+    def test_stratified_config_is_mergeable(self):
+        # Signal/noise strata + composition (issue #321): accepted by spill
+        # AND mergeable across blocks since issue #370 — strata fold via
+        # build_tdigest_where per block, composition via merge_composition
+        # (option (a)). Cross-block behavior is pinned in
+        # test_spill_crossblock.py.
         variables = _base_variables()
         variables["h_sig"] = {
             "kind": "ragged",
@@ -493,7 +495,9 @@ class TestSpillConfig:
         }
         cfg = _config(streaming={"mode": "spill"}, variables=variables)
         agg = SpillAggregator(cfg, _grid(cfg), "pandas", 25)
-        assert not agg._mergeable
+        assert agg._mergeable
+        assert "composition" in agg._composition_fields
+        assert "count" in agg._count_fields
         agg.close()
 
     def test_guard_fires_at_construction(self, monkeypatch):
