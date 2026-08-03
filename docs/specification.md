@@ -629,6 +629,16 @@ overview family under the versioned `pyramid` block:
   here?" question with zero opens and never a probe. Values outside the
   block's `orders` are not legal; a reader MAY ignore them (they name no
   overview the family walks).
+
+  **The declaration is authoritative over the objects.** Narrowing a schedule
+  does not delete the overviews written under the previous, wider one — like
+  shrinking `orders` itself, it leaves them as regenerable-cache debris (D9) —
+  so a stamped overview whose own `zagg_overview.fields` (§4.3) names a field
+  the manifest no longer schedules at that order MAY exist. A reader
+  encountering that contradiction MUST take the manifest's schedule as truth
+  and treat the extra array as stale; it is not evidence of a torn write, and
+  the array's *contents* remain a valid fold of whatever leaves existed when
+  it was written.
 - **`all_time`** — whether the `all.zarr` all-time fold is materialized at
   the declared orders (windowed stores only; a `schedule: none` store's
   single fold is already all-time).
