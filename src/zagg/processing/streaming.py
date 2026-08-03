@@ -205,6 +205,11 @@ def validate_spill_fold(config: PipelineConfig) -> None:
     O(n/510)-per-fold bound; see :data:`_COMPOSITION_FUNCTION` for the
     option (a)/(b) flip point).
 
+    ``where`` and ``build_tdigest_where`` must be declared **together**: either
+    one alone is a config error here, mirroring the ``TypeError`` the pooled
+    replay raises for the same config, so the fold's reducer choice can never
+    diverge from the declared one.
+
     A config this rejects is still accepted by ``mode: spill`` — every
     reducer is exact in the single-block regime — but cannot survive a block
     close (:class:`~zagg.processing.spill.SpillOverflowError`).
@@ -228,6 +233,23 @@ def validate_spill_fold(config: PipelineConfig) -> None:
                 problems.append(
                     f"field '{name}': ragged function {meta.get('function')!r} has no "
                     f"fold law (only {' or '.join(_TDIGEST_SPILL_FUNCTIONS)})"
+                )
+            elif ("where" in (meta.get("params") or {})) != (
+                meta.get("function") == _TDIGEST_WHERE_FUNCTION
+            ):
+                # The declared function and the where param must agree, in both
+                # directions — the pooled path raises TypeError for each
+                # (missing / unexpected keyword argument), and the spill fold
+                # must not be quieter: without this the fold would digest the
+                # whole population under a stratum name, or mask a field the
+                # config declared unmasked.
+                problems.append(
+                    f"field '{name}': {_TDIGEST_WHERE_FUNCTION} requires a 'where' param"
+                    if meta.get("function") == _TDIGEST_WHERE_FUNCTION
+                    else (
+                        f"field '{name}': 'where' is only meaningful for "
+                        f"{_TDIGEST_WHERE_FUNCTION} (declared {meta.get('function')!r})"
+                    )
                 )
             elif tuple(sig["inner_shape"]) != (2,):
                 # Same posture as validate_streaming: the fold stores merged

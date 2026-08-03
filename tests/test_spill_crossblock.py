@@ -214,6 +214,26 @@ def _assert_ancestor_or_equal(locs, contributors):
         )
 
 
+def _pooled_build(meta, n=8):
+    """Call one ragged field's declared reducer exactly as the pooled path does.
+
+    Mirrors ``calculate_cell_statistics``: resolve the declared params over the
+    cell's columns, then call ``resolve_function(meta['function'])(values,
+    **params)``. Used to pin that a mis-declared ``where`` fails the same way on
+    both paths.
+    """
+    from zagg.config import resolve_function
+    from zagg.processing.aggregate import _compile_param_expr
+
+    cell_data = {"h_ph": np.linspace(-1.0, 1.0, n, dtype=np.float32)}
+    ns = {"__builtins__": {}, "np": np, "numpy": np, **cell_data}
+    params = {
+        k: (eval(_compile_param_expr(v), ns) if isinstance(v, str) else v)
+        for k, v in (meta.get("params") or {}).items()
+    }
+    return resolve_function(meta["function"])(cell_data["h_ph"], **params)
+
+
 class TestSpillFoldProbe:
     """The spill mergeability probe (validate_spill_fold) vs merge mode."""
 
@@ -253,6 +273,39 @@ class TestSpillFoldProbe:
         }
         with pytest.raises(ValueError, match="h_raw.*fold law"):
             validate_spill_fold(_config(variables))
+
+    def test_where_function_without_where_param_rejected(self):
+        # A stratum field that lost its `where` (copy-paste drop) must fail at
+        # the probe, not silently fold the WHOLE population into the stratum's
+        # name. The pooled replay raises TypeError for the same config.
+        variables = _variables(strata=True)
+        variables["h_sig"]["params"] = {"delta": 16}
+        with pytest.raises(ValueError, match="h_sig.*build_tdigest_where requires a 'where'"):
+            validate_spill_fold(_config(variables))
+        with pytest.raises(TypeError, match="missing 1 required keyword-only argument: 'where'"):
+            _pooled_build(variables["h_sig"])
+
+    def test_where_param_on_plain_tdigest_rejected(self):
+        # The other direction: a `where` on a non-where reducer must not make
+        # the fold silently mask — the pooled replay raises TypeError.
+        variables = _variables()
+        variables["h_tdigest"]["params"] = {"delta": 16, "where": _SIGNAL}
+        with pytest.raises(ValueError, match="h_tdigest.*'where' is only meaningful"):
+            validate_spill_fold(_config(variables))
+        with pytest.raises(TypeError, match="unexpected keyword argument 'where'"):
+            _pooled_build(variables["h_tdigest"])
+
+    def test_mis_declared_where_config_is_not_mergeable(self):
+        # Belt and braces: the probe's rejection is what keeps the fold from
+        # ever classifying such a field, so _fold_block cannot pick a reducer
+        # the config did not declare.
+        variables = _variables()
+        variables["h_tdigest"]["params"] = {"delta": 16, "where": _SIGNAL}
+        cfg = _config(variables, streaming=_SPILL)
+        agg = SpillAggregator(cfg, _grid(cfg), "pandas", 1)
+        assert not agg._mergeable
+        assert agg._digest_fields == {}
+        agg.close()
 
     def test_mode_merge_validation_unchanged(self):
         # The spill probe widening must not leak into mode: merge — its
