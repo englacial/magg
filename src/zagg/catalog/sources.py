@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -153,6 +154,42 @@ def _subset_assets(item: dict, keep: list[str]) -> dict | None:
     return item
 
 
+#: Transient upstream statuses worth retrying: public STAC gateways (Earth
+#: Search, CMR-STAC) 502/503/504 sporadically under load, and one bad response
+#: must not lose a whole paged crawl.
+_RETRY_STATUSES = (502, 503, 504)
+_RETRY_ATTEMPTS = 4
+_RETRY_BACKOFF_S = 2.0
+
+
+def _search_request(url, *, params=None, body=None, timeout=60):
+    """One item-search request, retrying transient gateway errors.
+
+    Retries ``_RETRY_STATUSES`` with exponential backoff (``_RETRY_ATTEMPTS``
+    tries total); any other status falls through to ``raise_for_status`` on
+    the first response, an exhausted retry budget on the last.
+    """
+    for attempt in range(_RETRY_ATTEMPTS):
+        if body is not None:
+            resp = requests.post(url, json=body, timeout=timeout)
+        else:
+            resp = requests.get(url, params=params, timeout=timeout)
+        if resp.status_code not in _RETRY_STATUSES or attempt == _RETRY_ATTEMPTS - 1:
+            break
+        wait = _RETRY_BACKOFF_S * 2**attempt
+        logging.warning(
+            "STAC search got %s from %s; retrying in %.0fs (%d/%d)",
+            resp.status_code,
+            url,
+            wait,
+            attempt + 1,
+            _RETRY_ATTEMPTS - 1,
+        )
+        time.sleep(wait)
+    resp.raise_for_status()
+    return resp
+
+
 def _page_search(url, *, params=None, body=None, timeout=60) -> list[dict]:
     """Page a STAC item-search, following ``rel=next`` links.
 
@@ -163,11 +200,7 @@ def _page_search(url, *, params=None, body=None, timeout=60) -> list[dict]:
     """
     items: list[dict] = []
     while True:
-        if body is not None:
-            resp = requests.post(url, json=body, timeout=timeout)
-        else:
-            resp = requests.get(url, params=params, timeout=timeout)
-        resp.raise_for_status()
+        resp = _search_request(url, params=params, body=body, timeout=timeout)
         doc = resp.json()
         feats = doc.get("features", [])
         items.extend(feats)
@@ -298,7 +331,7 @@ class STACSource:
         self.time_key = time_key
         self.timeout = timeout
 
-    def fetch(self, query: STACQuery, *, limit: int = 1000) -> "Catalog":
+    def fetch(self, query: STACQuery, *, limit: int = 250) -> "Catalog":
         """Run ``query`` against the STAC API and return a ``Catalog``.
 
         Parameters
@@ -306,7 +339,12 @@ class STACSource:
         query : STACQuery
             What/when/where to fetch.
         limit : int
-            Page size hint; servers clamp it and paging follows ``rel=next``.
+            Page size hint; paging follows ``rel=next``. Default 250: servers
+            that clamp politely allow more, but Earth Search's gateway 502s
+            outright when the response page grows too large (observed
+            2026-08-03: heavy c1 items 502 above ~300/page instead of
+            clamping), and a deterministic 502 is indistinguishable from a
+            transient one — so the default stays under the observed ceiling.
 
         Returns
         -------
@@ -424,6 +462,42 @@ class Catalog:
         raw = (table.schema.metadata or {}).get(_ZAGG_META_KEY)
         meta = json.loads(raw) if raw else {}
         return cls(table, meta)
+
+    def filter_bbox(self, boxes) -> "Catalog":
+        """Subset to granules whose bbox overlaps any of ``boxes`` (superset cut).
+
+        A columnar prefilter over the stac-geoparquet ``bbox`` column — no
+        geometry runs here. The exact footprint-vs-shard intersection happens
+        in ``ShardMap.build`` (mortie / spherely backends); this cut exists so
+        a large catalog (e.g. a full-mission clone) hands the exact backend
+        thousands of candidates instead of the whole archive.
+
+        Parameters
+        ----------
+        boxes : tuple or list of tuple
+            One ``(lon_min, lat_min, lon_max, lat_max)`` box, or a list of
+            them — one per scattered AOI part, so a multipart AOI is cut
+            per part rather than by its (possibly continental) union box.
+            Pair with ``grid.coverage_bbox`` for shard-complete cuts.
+
+        Returns
+        -------
+        Catalog
+            New catalog with the subset table; metadata carried verbatim.
+        """
+        import pyarrow.compute as pc
+
+        if boxes and isinstance(boxes[0], (int, float)):
+            boxes = [boxes]
+        bb = self.table.column("bbox")
+        lon0, lat0, lon1, lat1 = (
+            pc.struct_field(bb, f).to_numpy(zero_copy_only=False)
+            for f in ("xmin", "ymin", "xmax", "ymax")
+        )
+        keep = np.zeros(len(lon0), dtype=bool)
+        for b_lon0, b_lat0, b_lon1, b_lat1 in boxes:
+            keep |= (lon0 <= b_lon1) & (lon1 >= b_lon0) & (lat0 <= b_lat1) & (lat1 >= b_lat0)
+        return Catalog(self.table.take(np.flatnonzero(keep)), dict(self.metadata))
 
     def granule_records(self) -> list[dict]:
         """Decode the table into per-granule dicts for ShardMap building.

@@ -1585,3 +1585,41 @@ class TestFieldAttrsTemplate:
     def test_undeclared_fields_unchanged(self):
         m = self._grid().spec().members
         assert dict(m["count"].attributes) == {}
+
+
+class TestCoverageBbox:
+    """Shard-complete fetch regions (the AOI-bbox under-fetch gap)."""
+
+    # NEON SERC AOP box (Edgewater, MD), well inside single o9 cells.
+    SERC_BBOX = (-76.6211, 38.8450, -76.5058, 38.9351)
+
+    def _parts(self):
+        lon0, lat0, lon1, lat1 = self.SERC_BBOX
+        lats = np.array([lat0, lat0, lat1, lat1, lat0])
+        lons = np.array([lon0, lon1, lon1, lon0, lon0])
+        return [(lats, lons)]
+
+    def test_encloses_aoi_and_extends_past_it(self):
+        grid = HealpixGrid(parent_order=9, child_order=19, chunk_inner=13)
+        lon0, lat0, lon1, lat1 = grid.coverage_bbox(self._parts())
+        a_lon0, a_lat0, a_lon1, a_lat1 = self.SERC_BBOX
+        # Whole ~13 km cells: strictly wider than the 10x10 km AOI on every side.
+        assert lon0 < a_lon0 and lat0 < a_lat0
+        assert lon1 > a_lon1 and lat1 > a_lat1
+        # ...but by less than a couple of shard widths (~0.4 deg here).
+        assert lon1 - lon0 < (a_lon1 - a_lon0) + 0.8
+        assert lat1 - lat0 < (a_lat1 - a_lat0) + 0.8
+
+    def test_shards_bbox_matches_coverage_bbox(self):
+        grid = HealpixGrid(parent_order=9, child_order=19, chunk_inner=13)
+        parts = self._parts()
+        keys = [int(k) for k in grid.coverage(parts)]
+        assert grid.shards_bbox(keys) == grid.coverage_bbox(parts)
+
+    def test_geojson_path_accepted(self):
+        from zagg.data import demo_aoi
+
+        grid = HealpixGrid(parent_order=9, child_order=19, chunk_inner=13)
+        assert grid.coverage_bbox(demo_aoi("serc")) == pytest.approx(
+            grid.coverage_bbox(self._parts()), abs=1e-6
+        )

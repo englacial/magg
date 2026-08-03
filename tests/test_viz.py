@@ -386,8 +386,28 @@ class TestShowShardmap:
         catalog.to_geoparquet(str(cat_path))
         m = show_shardmap(str(sm_path), catalog=str(cat_path))
         assert isinstance(m, Map)
-        names = {getattr(layer, "name", None) for layer in m.layers}
+        names = [getattr(layer, "name", None) for layer in m.layers]
         assert "granule footprints" in names
+        # Shards render on top of the footprints (later layer = on top).
+        assert names.index("granule footprints") < names.index("shards")
+
+    def test_aoi_layer_on_top(self, shardmap, tmp_path):
+        pytest.importorskip("ipyleaflet")
+        from zagg.viz import show_shardmap
+
+        path = tmp_path / "sm.json"
+        shardmap.to_json(str(path))
+        aoi = {
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-76.6, 38.85], [-76.5, 38.85], [-76.5, 38.93], [-76.6, 38.85]]],
+            },
+        }
+        m = show_shardmap(str(path), aoi=aoi)
+        names = [getattr(layer, "name", None) for layer in m.layers]
+        # The AOI outline draws above the shard grid.
+        assert names.index("shards") < names.index("aoi")
 
     def test_polar_map_uses_3031_crs_and_gibs(self, antarctic_shardmap, tmp_path):
         pytest.importorskip("ipyleaflet")

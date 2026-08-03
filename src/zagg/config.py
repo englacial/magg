@@ -197,13 +197,19 @@ def load_config_from_dict(d: dict) -> PipelineConfig:
     )
 
 
-def default_config(name: str = "atl06") -> PipelineConfig:
+def default_config(name: str = "atl06", *, validate: bool = True) -> PipelineConfig:
     """Load a built-in YAML config shipped with the package.
 
     Parameters
     ----------
     name : str
         Config name (without ``.yaml`` extension). Default ``"atl06"``.
+    validate : bool
+        Run ``validate_config`` (default). Internal callers loading a packaged
+        config as a structural fallback — e.g. ``HealpixGrid``'s implicit
+        ``config`` default, where the aggregation block is irrelevant — skip
+        it so template-authoring warnings don't fire on configs the user
+        never wrote (packaged configs are validated by the test suite).
 
     Returns
     -------
@@ -220,7 +226,8 @@ def default_config(name: str = "atl06") -> PipelineConfig:
     text = ref.read_text(encoding="utf-8")
     d = yaml.safe_load(text)
     cfg = load_config_from_dict(d)
-    validate_config(cfg)
+    if validate:
+        validate_config(cfg)
     return cfg
 
 

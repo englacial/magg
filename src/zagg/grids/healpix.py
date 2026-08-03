@@ -44,9 +44,15 @@ HEALPIX_REF_ORDER: int = 29
 class HealpixGrid:
     """HEALPix DGGS output grid.
 
-    One array layout — ``"fullsphere"``: shape ``(12 · 4^child_order,)``,
-    chunks indexed directly by parent nested ID. Stateless; no shard list
-    needed. (The deprecated ``"dense"`` pack was removed — issue #88.)
+    One layout — ``"fullsphere"``: the LOGICAL address space, in which a
+    cell's array offset is pure arithmetic on its morton word over the
+    ``12 · 4^child_order`` numbering. Stateless — no shard list — which is
+    exactly what the removed stateful ``"dense"`` pack was not (issue #88).
+    Nothing full-sphere is ever materialized: physical storage is picked by
+    ``output.store_layout`` (default ``hive`` — one leaf zarr per shard,
+    shaped to that shard's cells; the flat store is interop/debug-only,
+    issue #253), and this label appears in ``spatial_signature`` purely to
+    name the addressing scheme.
 
     Parameters
     ----------
@@ -115,7 +121,7 @@ class HealpixGrid:
             sharded = False
         self.sharded = bool(sharded)
         self.layout = layout
-        self.config = config or default_config("atl06")
+        self.config = config or default_config("atl06", validate=False)
         # D16 default flip (issue #304 phase 2): the legacy cell_ids array is
         # written only under the explicit transition hatch; morton is the one
         # stored cell coordinate. Both the template member (_group_spec) and
@@ -232,6 +238,64 @@ class HealpixGrid:
         lats_parts = [p[0] for p in polygon_parts]
         lons_parts = [p[1] for p in polygon_parts]
         return morton_coverage(lats_parts, lons_parts, order=self.parent_order)
+
+    def shards_bbox(self, shard_keys) -> tuple[float, float, float, float]:
+        """Lon/lat bbox enclosing whole shard cells (sampled edge vertices).
+
+        Returns ``(lon_min, lat_min, lon_max, lat_max)`` over the cells'
+        boundary vertices. Vertices are sampled (``mort2polygon``), so the
+        bound is exact up to edge curvature — negligible at mid-latitude
+        dispatch orders (~13 km cells at o9), but do not use a bbox for AOIs
+        crossing the antimeridian or enclosing a pole, where a lon/lat box is
+        the wrong shape entirely.
+        """
+        from mortie.tools import mort2polygon
+
+        lats: list[float] = []
+        lons: list[float] = []
+        for k in shard_keys:
+            verts = mort2polygon(int(k), step=4)
+            lats.extend(float(v[0]) for v in verts)
+            lons.extend(float(v[1]) for v in verts)
+        return (min(lons), min(lats), max(lons), max(lats))
+
+    def coverage_bbox(self, region) -> tuple[float, float, float, float]:
+        """Fetch bbox for a *shard-complete* metadata query over ``region``.
+
+        Shards are processed whole: a run aggregates every granule that
+        intersects a selected shard, including the overhang outside the AOI.
+        A metadata query scoped to the AOI's own bbox under-fetches — granules
+        touching only a shard's overhang never enter the catalog, and the
+        overhung cells silently miss data. This returns the bbox of the
+        covering shard *cells* (``coverage`` + :meth:`shards_bbox`), the
+        region to hand ``Query``/``STACQuery`` when the store should honor
+        whole-shard semantics::
+
+            grid = HealpixGrid(9, 19, chunk_inner=13)
+            cat = CMRSource().fetch(Query(..., region=grid.coverage_bbox(aoi)))
+            sm = ShardMap.build(cat, grid, region=load_polygon(aoi))
+
+        Keep ``ShardMap.build``'s ``region`` pinned to the AOI itself — only
+        the fetch expands, otherwise the shard set grows by a ring.
+
+        Pitfalls: the guarantee is **order-relative**. Reprojecting a map to a
+        coarser shard order (issue #294) widens the shards, so a catalog
+        fetched shard-complete at o9 under-covers the derived o8 map's edge
+        shards — refetch at the target order's ``coverage_bbox`` if the
+        coarser store must stay shard-complete. Multipart AOIs with scattered
+        parts want one bbox (and one fetch) per part, not the global box. See
+        :meth:`shards_bbox` for the antimeridian/pole caveat.
+
+        Parameters
+        ----------
+        region : str or list of (lats, lons)
+            GeoJSON path, or polygon ring parts as ``coverage`` takes.
+        """
+        if isinstance(region, str):
+            from zagg.catalog import load_polygon
+
+            region = load_polygon(region)
+        return self.shards_bbox(int(k) for k in self.coverage(region))
 
     # ── strict-AOI cell mask (issue #101, optional) ─────────────────────────
 

@@ -65,3 +65,7 @@ site/*
 bench/drift/*.json
 # local test-run output (e.g. tests writing ./out.zarr)
 out.zarr/
+
+# demo notebook artifacts (generated at run time)
+demo/outputs/
+demo/wheels/

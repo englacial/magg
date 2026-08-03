@@ -68,30 +68,40 @@ def _page(items, next_link=None):
 
 
 class _FakeResponse:
-    def __init__(self, doc):
+    def __init__(self, doc, status_code=200):
         self._doc = doc
+        self.status_code = status_code
 
     def json(self):
         return self._doc
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            raise RuntimeError(f"status {self.status_code}")
 
 
 class _FakeRequests:
-    """Scripted page sequence; records every call."""
+    """Scripted page sequence; records every call.
+
+    Pages are FeatureCollection dicts (wrapped in a 200 ``_FakeResponse``) or
+    prebuilt ``_FakeResponse`` objects (for non-200 statuses).
+    """
 
     def __init__(self, pages):
         self.pages = list(pages)
         self.calls = []
 
+    def _next(self):
+        page = self.pages.pop(0)
+        return page if isinstance(page, _FakeResponse) else _FakeResponse(page)
+
     def post(self, url, json=None, timeout=None):
         self.calls.append(("POST", url, json))
-        return _FakeResponse(self.pages.pop(0))
+        return self._next()
 
     def get(self, url, params=None, timeout=None):
         self.calls.append(("GET", url, params))
-        return _FakeResponse(self.pages.pop(0))
+        return self._next()
 
 
 @pytest.fixture
@@ -174,6 +184,40 @@ class TestPageSearch:
         )
         assert _page_search("https://cmr/search", params={}) == []
         assert len(fake.calls) == 1
+
+    def test_retries_transient_gateway_error(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests(
+            [
+                _FakeResponse({}, status_code=502),
+                _page([_item("a", _h5_assets("a"))]),
+            ]
+        )
+        items = _page_search("https://es/search", body={"limit": 1})
+        assert [it["id"] for it in items] == ["a"]
+        assert len(fake.calls) == 2
+
+    def test_exhausted_retries_raise(self, fake_requests, monkeypatch):
+        monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+        fake = fake_requests([_FakeResponse({}, status_code=502)] * 4)
+        with pytest.raises(RuntimeError, match="status 502"):
+            _page_search("https://es/search", body={"limit": 1})
+        assert len(fake.calls) == 4
+
+    def test_non_retryable_status_raises_immediately(self, fake_requests):
+        fake = fake_requests([_FakeResponse({}, status_code=404)])
+        with pytest.raises(RuntimeError, match="status 404"):
+            _page_search("https://es/search", params={})
+        assert len(fake.calls) == 1
+
+    def test_default_page_size_stays_under_gateway_ceiling(self, fake_requests):
+        # Earth Search 502s (not clamps) above ~300 items/page; the default
+        # must stay below that ceiling.
+        fake = fake_requests([_page([_item("s2a", _s2_assets("s2a"))])])
+        STACSource("https://es/v1").fetch(
+            STACQuery(["sentinel-2-c1-l2a"], "2026-06-01", "2026-07-13", BBOX)
+        )
+        assert fake.calls[0][2]["limit"] == 250
 
 
 class TestSTACSource:
@@ -365,3 +409,32 @@ class TestGranuleEntry:
         path = str(tmp_path / "sm.parquet")
         sm.to_parquet(path)
         assert ShardMap.from_parquet(path).granules[0][0] == entry
+
+
+class TestFilterBbox:
+    def _catalog(self):
+        import stac_geoparquet.arrow as sga
+
+        far = dict(_item("far", _h5_assets("far")))
+        far["geometry"] = {
+            "type": "Polygon",
+            "coordinates": [[[10, 10], [11, 10], [11, 11], [10, 11], [10, 10]]],
+        }
+        far["bbox"] = [10, 10, 11, 11]
+        items = [_item("near", _h5_assets("near")), far]
+        return Catalog(pa.table(sga.parse_stac_items_to_arrow(items)), {"bbox": [0, 0, 1, 1]})
+
+    def test_single_box(self):
+        cat = self._catalog()
+        sub = cat.filter_bbox((-77.0, 38.0, -76.0, 39.0))
+        assert sub.table.column("id").to_pylist() == ["near"]
+        assert sub.metadata == cat.metadata
+
+    def test_multi_box_or(self):
+        cat = self._catalog()
+        sub = cat.filter_bbox([(-77.0, 38.0, -76.0, 39.0), (9.5, 9.5, 10.5, 10.5)])
+        assert sorted(sub.table.column("id").to_pylist()) == ["far", "near"]
+
+    def test_no_overlap_empty(self):
+        cat = self._catalog()
+        assert len(cat.filter_bbox((50.0, 50.0, 51.0, 51.0))) == 0

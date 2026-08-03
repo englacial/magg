@@ -17,6 +17,8 @@ widget stack. Install it with ``pip install zagg[viz]``.
 
 from __future__ import annotations
 
+import json
+
 from zagg.viz.crs import crs_info, is_polar, pick_crs
 from zagg.viz.shardmap import (
     _load_catalog,
@@ -28,6 +30,7 @@ from zagg.viz.shardmap import (
 # Layer styles (kept terse; tweakable by callers via the returned Map).
 _SHARD_STYLE = {"color": "#1f78b4", "weight": 1, "fillOpacity": 0.05}
 _FOOTPRINT_STYLE = {"color": "#e31a1c", "weight": 1, "fillOpacity": 0.10}
+_AOI_STYLE = {"color": "#33a02c", "weight": 2, "fillOpacity": 0.0, "dashArray": "6 3"}
 
 
 def _center_zoom(fc: dict):
@@ -73,6 +76,7 @@ def show_shardmap(
     shardmap_path,
     catalog=None,
     *,
+    aoi=None,
     zoom: int = 3,
     basemap=None,
     crs=None,
@@ -92,6 +96,10 @@ def show_shardmap(
     catalog : str or Catalog, optional
         A geoparquet path or a loaded ``Catalog``. When given, a toggleable
         granule-footprint layer is added.
+    aoi : str or dict, optional
+        The query AOI — a GeoJSON path or an already-loaded GeoJSON mapping.
+        Drawn as an outline on top of every layer, so the AOI/shard-overhang
+        relationship is visible.
     zoom : int
         Initial map zoom.
     basemap : ipyleaflet basemap, optional
@@ -134,15 +142,23 @@ def show_shardmap(
 
     m = Map(**map_kwargs)
 
-    shard_layer = GeoJSON(data=shards_fc, style=_SHARD_STYLE, name="shards")
-    m.add(shard_layer)
-
+    # Footprints first, shard grid last: later layers render on top, and the
+    # grid must stay legible over dense footprint fills.
     if catalog is not None:
         footprint_fc = granule_footprints(_load_catalog(catalog), split_seam=split_seam)
         footprint_layer = GeoJSON(
             data=footprint_fc, style=_FOOTPRINT_STYLE, name="granule footprints"
         )
         m.add(footprint_layer)
+
+    shard_layer = GeoJSON(data=shards_fc, style=_SHARD_STYLE, name="shards")
+    m.add(shard_layer)
+
+    if aoi is not None:
+        if isinstance(aoi, str):
+            with open(aoi) as f:
+                aoi = json.load(f)
+        m.add(GeoJSON(data=aoi, style=_AOI_STYLE, name="aoi"))
 
     m.add(LayersControl(position="topright"))
     return m
