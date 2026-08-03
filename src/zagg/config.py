@@ -6,6 +6,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from importlib import resources
 from typing import Any, NotRequired, TypedDict
 
@@ -1052,13 +1053,53 @@ def _validate_windowing(config: PipelineConfig) -> None:
     _validate_windowing_windows(block, schedule)
 
 
+#: A ``{label, timestamp}`` point entry desugars to a window this wide (issue
+#: #355). One second is the window grammar's native resolution — boundaries
+#: are whole seconds throughout (``iso_utc`` renders ``timespec="seconds"``)
+#: — so a second-wide half-open window *is* the point window at grammar
+#: resolution, without introducing float equality on observation timestamps.
+_POINT_WINDOW_WIDTH = timedelta(seconds=1)
+
+
+def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
+    """The half-open UTC ``[start, end)`` of one explicit ``windows`` entry.
+
+    Two forms, discriminated on keys and never mixed (issue #355): the range
+    form ``{label, start, end}``, and the point sugar ``{label, timestamp}``
+    which desugars to ``[t, t + 1s)`` (:data:`_POINT_WINDOW_WIDTH`). Desugaring
+    happens here, at the config layer, so everything downstream —
+    ``windows_intersecting``, the catalog time filters, ``windowed_cell_config``,
+    leaf naming, the sweep, the pyramid — only ever sees an ordinary explicit
+    range. Two acquisitions inside the same wall-clock second therefore share a
+    window; if that ever bites, the fix is an explicit ``width`` key on the
+    point form, not a guessed default.
+    """
+    from zagg import windows as _windows
+
+    ranged = sorted({"start", "end"} & set(entry))
+    if "timestamp" in entry:
+        if ranged:
+            raise ValueError(
+                f"explicit window entry carries both timestamp and {ranged[0]}; each "
+                f"entry declares exactly one of {{timestamp}} or {{start, end}} "
+                f"(got {entry!r})"
+            )
+        point = _windows.parse_utc(entry["timestamp"])
+        return point, point + _POINT_WINDOW_WIDTH
+    return _windows.parse_utc(entry["start"]), _windows.parse_utc(entry["end"])
+
+
 def _validate_windowing_windows(block: dict, schedule: str) -> None:
     """Validate the ``windows`` list half of ``output.windowing`` (issue #246).
 
     Shared by the point-pipeline and raster branches of
     :func:`_validate_windowing`: frozen label grammar, half-open
     ``start < end``, unique labels, non-overlapping ranges — required for
-    ``schedule: explicit``, rejected otherwise.
+    ``schedule: explicit``, rejected otherwise. Point entries
+    (``{label, timestamp}``, issue #355) are desugared by
+    :func:`_explicit_window_bounds` before these checks, so they compose
+    unchanged: a point landing inside another window's range is a genuine
+    overlap and rejects.
     """
     from zagg import windows as _windows
 
@@ -1073,17 +1114,20 @@ def _validate_windowing_windows(block: dict, schedule: str) -> None:
     if not isinstance(declared_windows, list) or not declared_windows:
         raise ValueError(
             "output.windowing.windows is required for schedule: explicit — a "
-            "non-empty list of {label, start, end} entries"
+            "non-empty list of {label, start, end} (or {label, timestamp}) entries"
         )
     seen: dict = {}
     for entry in declared_windows:
-        if not isinstance(entry, dict) or not {"label", "start", "end"} <= set(entry):
+        if not isinstance(entry, dict) or not (
+            "label" in entry and ({"start", "end"} <= set(entry) or "timestamp" in entry)
+        ):
             raise ValueError(
-                f"each explicit window must be a {{label, start, end}} mapping (got {entry!r})"
+                f"each explicit window must be a {{label, start, end}} or "
+                f"{{label, timestamp}} mapping (got {entry!r})"
             )
         try:
             label = _windows.validate_label(entry["label"], "explicit")
-            start, end = _windows.parse_utc(entry["start"]), _windows.parse_utc(entry["end"])
+            start, end = _explicit_window_bounds(entry)
         except ValueError as e:
             raise ValueError(f"output.windowing.windows: {e}") from e
         if label == _windows.SCHEDULE_NONE_TOKEN:
@@ -1098,6 +1142,7 @@ def _validate_windowing_windows(block: dict, schedule: str) -> None:
                 f"declare a different explicit label"
             )
         if not start < end:
+            # Range form only — a desugared point is half-open by construction.
             raise ValueError(
                 f"explicit window {label!r} is not half-open: start "
                 f"{entry['start']!r} must precede end {entry['end']!r}"
@@ -2500,7 +2545,10 @@ def get_windowing(config: PipelineConfig) -> dict | None:
         {"schedule", "time_field", "epoch", "scale", "units", "windows"}
 
     ``epoch`` and explicit-window boundaries are canonicalized to ISO-8601
-    UTC strings; ``windows`` is ``None`` except for ``schedule: explicit``.
+    UTC strings; ``windows`` is ``None`` except for ``schedule: explicit``,
+    where a ``{label, timestamp}`` point entry is desugared to its second-wide
+    range (issue #355) so the normalized list is uniformly ``{label, start,
+    end}``.
     On the raster branch (``reader: raster``) ``time_field`` is the fixed STAC
     ``datetime`` and ``epoch``/``scale``/``units`` are hardcoded to the
     Unix-epoch UTC-seconds encoding any ISO instant normalizes to, rather than
@@ -2516,14 +2564,19 @@ def get_windowing(config: PipelineConfig) -> dict | None:
         return None
     declared = None
     if block["schedule"] == "explicit":
-        declared = [
-            {
-                "label": w["label"],
-                "start": _windows.iso_utc(_windows.parse_utc(w["start"])),
-                "end": _windows.iso_utc(_windows.parse_utc(w["end"])),
-            }
-            for w in block["windows"]
-        ]
+        # Point entries desugar HERE (issue #355): the normalized list is
+        # always the {label, start, end} range form, so no consumer — manifest
+        # temporal block included — ever sees a ``timestamp`` key.
+        declared = []
+        for w in block["windows"]:
+            start, end = _explicit_window_bounds(w)
+            declared.append(
+                {
+                    "label": w["label"],
+                    "start": _windows.iso_utc(start),
+                    "end": _windows.iso_utc(end),
+                }
+            )
     if (config.data_source or {}).get("reader") == "raster":
         # Raster membership is the acquisition's STAC ``datetime`` (issue
         # #247, ratified): the manifest records the resolved field plus the
