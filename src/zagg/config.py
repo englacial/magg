@@ -1091,6 +1091,16 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
                 f"entry declares exactly one of {{timestamp}} or {{start, end}} "
                 f"(got {entry!r})"
             )
+        extra = sorted(set(entry) - {"label", "timestamp"})
+        if extra:
+            # `width` is named as the escape hatch for the same-second edge but
+            # does not exist yet — accepting it silently would hand back a
+            # one-second window and a clean validate_config (review finding).
+            raise ValueError(
+                f"explicit point window entry carries unsupported key(s) "
+                f"{', '.join(extra)}; the point form is {{label, timestamp}} "
+                f"(got {entry!r})"
+            )
         point = _windows.parse_utc(entry["timestamp"])
         return point, point + _POINT_WINDOW_WIDTH
     return _windows.parse_utc(entry["start"]), _windows.parse_utc(entry["end"])
