@@ -345,6 +345,25 @@ class TestWindowingConfig:
             },
         ]
 
+    def test_explicit_point_subsecond_normalizes_to_its_whole_second(self, cfg):
+        # The grammar renders boundaries at whole-second precision (iso_utc,
+        # timespec="seconds"), so a sub-second timestamp normalizes to the
+        # second CONTAINING it — both ends truncate together, and the declared
+        # instant still falls inside its own window.
+        _windowed(
+            cfg,
+            schedule="explicit",
+            windows=[{"label": "scene-a", "timestamp": "2019-06-01T12:00:00.75Z"}],
+        )
+        validate_config(cfg)
+        assert get_windowing(cfg)["windows"] == [
+            {
+                "label": "scene-a",
+                "start": "2019-06-01T12:00:00+00:00",
+                "end": "2019-06-01T12:00:01+00:00",
+            }
+        ]
+
     def test_explicit_entry_mixing_both_forms_rejected(self, cfg):
         # Exactly one of {timestamp} or {start, end} per entry.
         for over in (
