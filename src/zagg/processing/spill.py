@@ -350,8 +350,13 @@ class _DigestField(NamedTuple):
     stratum: bool
 
 
-def _resolve_param(param, col_arrays: dict[str, np.ndarray], start: int, end: int):
-    """Resolve one cell's param over its block rows, the pooled path's way.
+def _resolve_param(param, cell_data: dict[str, np.ndarray]):
+    """Resolve one param over one cell's rows, the pooled path's way.
+
+    ``cell_data`` is the cell's already-sliced column views — built once per
+    cell by :meth:`SpillAggregator._fold_block`, exactly as the pooled path
+    builds it once per cell before resolving every field's params
+    (``_aggregate_chunk_cells`` -> ``calculate_cell_statistics``).
 
     Mirrors ``calculate_cell_statistics``'s params resolution exactly (bare
     column name -> that column's rows; a string naming columns -> eval'd over
@@ -359,14 +364,16 @@ def _resolve_param(param, col_arrays: dict[str, np.ndarray], start: int, end: in
     through), so a stratum's per-block ``where`` membership and a composition
     field's conf columns are computed by the identical rule the pooled/
     single-block replay applies per cell — block boundaries cannot shift a
-    photon between strata or lanes.
+    photon between strata or lanes. The two namespaces are identical only
+    because ``validate_spill_fold`` rejects ``chunk_precompute`` outright: the
+    pooled namespace's one extra ingredient is its ``chunk_scalars``, which no
+    config reaching this fold can carry.
     """
     from zagg.processing.aggregate import _compile_param_expr
 
-    if isinstance(param, str) and param in col_arrays:
-        return col_arrays[param][start:end]
-    if isinstance(param, str) and any(c in param for c in col_arrays):
-        cell_data = {col: arr[start:end] for col, arr in col_arrays.items()}
+    if isinstance(param, str) and param in cell_data:
+        return cell_data[param]
+    if isinstance(param, str) and any(c in param for c in cell_data):
         ns = {"__builtins__": {}, "np": np, "numpy": np, **cell_data}
         return eval(_compile_param_expr(param), ns)  # noqa: S307
     return param
@@ -756,11 +763,16 @@ class SpillAggregator:
             del cells, cols
             for cell, (start, end) in cell_to_slice.items():
                 self._counts[cell] = self._counts.get(cell, 0) + (end - start)
+                # One namespace per cell, not per field — the pooled path's
+                # shape (`calculate_cell_statistics` gets one `cell_data`),
+                # and the strata config declares two complementary `where`
+                # fields over the same source.
+                cell_data = {col: arr[start:end] for col, arr in col_arrays.items()}
                 for name, f in self._digest_fields.items():
-                    values = col_arrays[f.source][start:end]
-                    locs = col_arrays[f.location][start:end] if f.location else None
+                    values = cell_data[f.source]
+                    locs = cell_data[f.location] if f.location else None
                     if f.stratum:
-                        where = _resolve_param(f.where, col_arrays, start, end)
+                        where = _resolve_param(f.where, cell_data)
                         built = build_tdigest_where(
                             values, delta=f.delta, where=where, locations=locs
                         )
@@ -790,10 +802,8 @@ class SpillAggregator:
                     else:
                         self._digests[name][cell] = merge_tdigests(held, fresh, delta=f.delta)
                 for name, (source, params) in self._composition_fields.items():
-                    values = col_arrays[source][start:end]
-                    kwargs = {
-                        k: _resolve_param(v, col_arrays, start, end) for k, v in params.items()
-                    }
+                    values = cell_data[source]
+                    kwargs = {k: _resolve_param(v, cell_data) for k, v in params.items()}
                     word, n = pack_composition_n(values, **kwargs)
                     held_comp = self._compositions[name].get(cell)
                     if held_comp is None:
