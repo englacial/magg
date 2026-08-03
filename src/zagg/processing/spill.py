@@ -46,6 +46,7 @@ import os
 import tempfile
 import threading
 import time
+from typing import NamedTuple
 
 import numpy as np
 
@@ -58,6 +59,7 @@ from zagg.config import (
 from zagg.stats.tdigest import (
     _DEFAULT_DELTA,
     build_tdigest,
+    build_tdigest_where,
     merge_tdigests,
     merge_tdigests_kway,
 )
@@ -319,6 +321,45 @@ class SpillBlock:
         self._partitions.clear()
 
 
+class _DigestField(NamedTuple):
+    """One ragged tdigest field's fold-relevant declaration (issues #279/#370).
+
+    ``pairwise`` selects the cross-block fold law: ``False`` — order-independent
+    k-way collapse at finalize (``build_tdigest``/``build_tdigest_where``, the
+    default); ``True`` — pairwise left-fold per block (``build_tdigest_pairwise``).
+    ``location`` is the per-observation morton column (issue #87) or ``None``;
+    ``where`` the field's raw ``where`` param (a column name or expression the
+    fold resolves per cell, exactly like the pooled path) or ``None``.
+    """
+
+    source: str
+    delta: int
+    pairwise: bool
+    location: str | None
+    where: object | None
+
+
+def _resolve_where(param, col_arrays: dict[str, np.ndarray], start: int, end: int):
+    """Resolve one cell's ``where`` param over its block rows, the pooled way.
+
+    Mirrors ``calculate_cell_statistics``'s params resolution exactly (bare
+    column name -> that column's rows; a string naming columns -> eval'd over
+    the cell's rows with the same cached code object; anything else passes
+    through), so a stratum's per-block membership is computed by the identical
+    rule the pooled/single-block replay applies per cell — block boundaries
+    cannot shift a photon between strata.
+    """
+    from zagg.processing.aggregate import _compile_param_expr
+
+    if isinstance(param, str) and param in col_arrays:
+        return col_arrays[param][start:end]
+    if isinstance(param, str) and any(c in param for c in col_arrays):
+        cell_data = {col: arr[start:end] for col, arr in col_arrays.items()}
+        ns = {"__builtins__": {}, "np": np, "numpy": np, **cell_data}
+        return eval(_compile_param_expr(param), ns)  # noqa: S307
+    return param
+
+
 def _memory_budget_bytes() -> int:
     """Worker memory budget: Lambda env, else cgroup v2 limit, else RAM."""
     mb = os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
@@ -397,11 +438,13 @@ class SpillAggregator:
     - **Multi block** (bytes hit the threshold — see
       :func:`_default_block_bytes`): each closing block is reduced
       partition-by-partition into running mergeable state (counts by
-      summation, tdigests via ``merge_tdigests`` — the StreamingAggregator
-      laws), collapsing merge rounds from N/buffer to ~spill/threshold. A
-      config with any non-mergeable reducer raises
-      :class:`SpillOverflowError` at the first crossing instead of silently
-      approximating.
+      summation, tdigests via ``merge_tdigests``/``merge_tdigests_kway`` —
+      including located fields and ``build_tdigest_where`` strata, whose
+      per-block builds fold under the located overloads, issue #370),
+      collapsing merge rounds from N/buffer to ~spill/threshold. A
+      config with any reducer outside the ``validate_spill_fold`` surface
+      raises :class:`SpillOverflowError` at the first crossing instead of
+      silently approximating.
 
     ``chunk_outputs`` returns the 5-tuple ``_aggregate_chunk_cells`` contract
     (``stats_arrays, ragged_payloads, ragged_cell_indices, ragged_locations,
@@ -426,30 +469,35 @@ class SpillAggregator:
         self.tmp_dir = tmp_dir or tempfile.gettempdir()
         agg_fields = get_agg_fields(config)
         self._data_vars = get_data_vars(config)
-        # Mergeable iff the merge-mode validator accepts the config: those are
-        # exactly the reducers with a cross-block combine law. Non-mergeable
-        # configs are still accepted — they are exact in the single-block
-        # regime — but cannot survive a block close (SpillOverflowError).
-        from zagg.processing.streaming import validate_streaming
+        # Mergeable iff the spill fold probe accepts the config (issue #370):
+        # wider than merge mode — located ragged fields and build_tdigest_where
+        # strata fold on block closes. Non-mergeable configs are still accepted
+        # — they are exact in the single-block regime — but cannot survive a
+        # block close (SpillOverflowError).
+        from zagg.processing.streaming import validate_spill_fold
 
         try:
-            validate_streaming(config)
+            validate_spill_fold(config)
             self._mergeable = True
         except ValueError:
             self._mergeable = False
         self._count_fields: list[str] = []
-        # name -> (source, delta, pairwise). ``pairwise`` selects the cross-block
-        # fold law: False -> order-independent k-way (build_tdigest, the default),
-        # True -> pairwise left-fold (build_tdigest_pairwise). See issue #279.
-        self._digest_fields: dict[str, tuple[str, int, bool]] = {}
+        self._digest_fields: dict[str, _DigestField] = {}
         if self._mergeable:
             from zagg.processing.streaming import _TDIGEST_PAIRWISE_FUNCTION
 
             for name, meta in agg_fields.items():
-                if get_output_signature(meta)["kind"] == "ragged":
-                    delta = int((meta.get("params") or {}).get("delta", _DEFAULT_DELTA))
-                    pairwise = meta.get("function") == _TDIGEST_PAIRWISE_FUNCTION
-                    self._digest_fields[name] = (meta.get("source") or "h_li", delta, pairwise)
+                sig = get_output_signature(meta)
+                if sig["kind"] == "ragged":
+                    params = meta.get("params") or {}
+                    self._digest_fields[name] = _DigestField(
+                        # Mirror the pooled path's source default (aggregate.py).
+                        source=meta.get("source") or "h_li",
+                        delta=int(params.get("delta", _DEFAULT_DELTA)),
+                        pairwise=meta.get("function") == _TDIGEST_PAIRWISE_FUNCTION,
+                        location=sig["location"],
+                        where=params.get("where"),
+                    )
                 else:
                     self._count_fields.append(name)
         if hasattr(grid, "chunk_order") and int(getattr(grid, "chunks_per_shard", 1)) > 1:
@@ -476,6 +524,14 @@ class SpillAggregator:
         # Cross-block mergeable running state (only ever fed on block close).
         self._counts: dict[int, int] = {}
         self._digests: dict[str, dict[int, np.ndarray]] = {n: {} for n in self._digest_fields}
+        # Located channel running state (issue #370): per-cell uint64 location
+        # vectors row-aligned with the running digests, for fields declaring
+        # ``location:`` only — the per-block build returns (digest, locations)
+        # pairs and the fold laws carry the channel through the located
+        # merge_tdigests / merge_tdigests_kway overloads.
+        self._digest_locs: dict[str, dict[int, np.ndarray]] = {
+            n: {} for n, f in self._digest_fields.items() if f.location
+        }
         # k-way fold accumulator: for order-independent fields, each block's
         # per-cell digest is stashed here and collapsed once at finalize
         # (merge_tdigests_kway), rather than pairwise-folded per block. Holding
@@ -489,7 +545,13 @@ class SpillAggregator:
         # reserves. Tighter memory-budget accounting against that reservation is
         # owned by the #280 parallel-reduce work.
         self._digest_parts: dict[str, dict[int, list[np.ndarray]]] = {
-            n: {} for n, (_, _, pairwise) in self._digest_fields.items() if not pairwise
+            n: {} for n, f in self._digest_fields.items() if not f.pairwise
+        }
+        # Location parts stashed alongside (issue #370), index-aligned with
+        # ``_digest_parts`` so the finalize k-way collapse folds both channels
+        # in the same order-independent pass.
+        self._digest_loc_parts: dict[str, dict[int, list[np.ndarray]]] = {
+            n: {} for n, f in self._digest_fields.items() if not f.pairwise and f.location
         }
         # Per-flush unique cell words; unioned lazily by occupied_cells().
         self._occupied: list[np.ndarray] = []
@@ -624,12 +686,20 @@ class SpillAggregator:
     def _fold_block(self, block: SpillBlock) -> None:
         """Fold one block into the running mergeable state, per partition.
 
-        Counts fold by summation (exact). tdigests are built fresh per cell and
-        then, per the field's fold law: **k-way** fields stash the block digest
-        for one order-independent collapse at finalize (:meth:`_finalize_kway`);
-        **pairwise** fields merge it into the running digest here. Either way it
-        is one build round per block instead of per buffer — the ~6x merge-CPU
-        collapse the design targets (issue #279).
+        Counts fold by summation (exact). tdigests are built fresh per cell —
+        a located field (issue #87) via the located ``build_tdigest`` (its
+        ``leaf_id`` column is a spilled read column, so the block holds the
+        exact order-29 point words), a ``where`` stratum field (issue #321)
+        via ``build_tdigest_where`` with its mask resolved per cell over the
+        block's spilled columns (:func:`_resolve_where` — row selection
+        precedes the build, so block boundaries cannot shift a photon between
+        strata, issue #370) — and then, per the field's fold law: **k-way**
+        fields stash the block digest (+ locations) for one order-independent
+        collapse at finalize (:meth:`_finalize_kway`); **pairwise** fields
+        merge it into the running digest here, the located overload carrying
+        the location channel. Either way it is one build round per block
+        instead of per buffer — the ~6x merge-CPU collapse the design targets
+        (issue #279).
         """
         from zagg.processing.aggregate import _group_columns
 
@@ -641,15 +711,39 @@ class SpillAggregator:
             del cells, cols
             for cell, (start, end) in cell_to_slice.items():
                 self._counts[cell] = self._counts.get(cell, 0) + (end - start)
-                for name, (source, delta, pairwise) in self._digest_fields.items():
-                    fresh = build_tdigest(col_arrays[source][start:end], delta=delta)
-                    if pairwise:
-                        held = self._digests[name].get(cell)
-                        self._digests[name][cell] = (
-                            fresh if held is None else merge_tdigests(held, fresh, delta=delta)
+                for name, f in self._digest_fields.items():
+                    values = col_arrays[f.source][start:end]
+                    locs = col_arrays[f.location][start:end] if f.location else None
+                    if f.where is not None:
+                        where = _resolve_where(f.where, col_arrays, start, end)
+                        built = build_tdigest_where(
+                            values, delta=f.delta, where=where, locations=locs
                         )
                     else:
+                        built = build_tdigest(values, delta=f.delta, locations=locs)
+                    fresh, fresh_locs = built if f.location else (built, None)
+                    if not f.pairwise:
                         self._digest_parts[name].setdefault(cell, []).append(fresh)
+                        if f.location:
+                            self._digest_loc_parts[name].setdefault(cell, []).append(fresh_locs)
+                        continue
+                    held = self._digests[name].get(cell)
+                    if held is None:
+                        self._digests[name][cell] = fresh
+                        if f.location:
+                            self._digest_locs[name][cell] = fresh_locs
+                    elif f.location:
+                        merged, merged_locs = merge_tdigests(
+                            held,
+                            fresh,
+                            delta=f.delta,
+                            locations1=self._digest_locs[name][cell],
+                            locations2=fresh_locs,
+                        )
+                        self._digests[name][cell] = merged
+                        self._digest_locs[name][cell] = merged_locs
+                    else:
+                        self._digests[name][cell] = merge_tdigests(held, fresh, delta=f.delta)
 
     def _finalize_kway(self) -> None:
         """Collapse each k-way field's per-block parts into one digest per cell.
@@ -657,13 +751,24 @@ class SpillAggregator:
         Runs once, after the final block is folded and before the first emission.
         The single-pass k-way merge is order-independent (t-digest merge is not
         associative), so the result does not depend on block reduce order — the
-        property #280 relies on to parallelize the reducer.
+        property #280 relies on to parallelize the reducer. A located field's
+        location parts collapse in the same pass (the located
+        ``merge_tdigests_kway`` overload), keeping both channels row-aligned.
         """
         for name, cell_parts in self._digest_parts.items():
-            delta = self._digest_fields[name][1]
+            f = self._digest_fields[name]
             dest = self._digests[name]
-            for cell, parts in cell_parts.items():
-                dest[cell] = merge_tdigests_kway(parts, delta=delta)
+            if f.location:
+                loc_parts = self._digest_loc_parts[name]
+                dest_locs = self._digest_locs[name]
+                for cell, parts in cell_parts.items():
+                    dest[cell], dest_locs[cell] = merge_tdigests_kway(
+                        parts, delta=f.delta, locations=loc_parts[cell]
+                    )
+                loc_parts.clear()
+            else:
+                for cell, parts in cell_parts.items():
+                    dest[cell] = merge_tdigests_kway(parts, delta=f.delta)
             cell_parts.clear()
 
     # -- post-read emission ----------------------------------------------------
@@ -756,6 +861,9 @@ class SpillAggregator:
                 stats_arrays[name] = np.zeros(n_cells, dtype=dtype)
         ragged_payloads: dict[str, list] = {n: [] for n in self._digest_fields}
         ragged_cell_indices: dict[str, list[int]] = {n: [] for n in self._digest_fields}
+        # Located fields only (issue #87): keyed presence tells the worker to
+        # deliver the 3-tuple ragged contract, mirroring _aggregate_chunk_cells.
+        ragged_locs: dict[str, list] = {n: [] for n, f in self._digest_fields.items() if f.location}
         cells_with_data = 0
         for i, child in enumerate(children):
             cell = int(child)
@@ -772,7 +880,9 @@ class SpillAggregator:
                 if digest is not None and digest.size > 0:
                     ragged_payloads[name].append(digest)
                     ragged_cell_indices[name].append(i)
-        return stats_arrays, ragged_payloads, ragged_cell_indices, {}, cells_with_data
+                    if name in ragged_locs:
+                        ragged_locs[name].append(self._digest_locs[name][cell])
+        return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_locs, cells_with_data
 
     def close(self) -> None:
         """Release every spill fd and the cached partition (idempotent).
