@@ -364,28 +364,37 @@ class TestWindowingConfig:
             }
         ]
 
-    def test_explicit_entry_mixing_both_forms_rejected(self, cfg):
-        # Exactly one of {timestamp} or {start, end} per entry.
-        for over in (
+    @pytest.mark.parametrize(
+        "entry",
+        [
             {"label": "w", "timestamp": "2019-06-01T12:00:00Z", "start": "2019-06-01"},
+            {"label": "w", "timestamp": "2019-06-01T12:00:00Z", "end": "2019-09-01"},
             {
                 "label": "w",
                 "timestamp": "2019-06-01T12:00:00Z",
                 "start": "2019-06-01",
                 "end": "2019-09-01",
             },
-        ):
-            _windowed(cfg, schedule="explicit", windows=[over])
-            with pytest.raises(ValueError, match="exactly one of"):
-                validate_config(cfg)
+        ],
+    )
+    def test_explicit_entry_mixing_both_forms_rejected(self, cfg, entry):
+        # Exactly one of {timestamp} or {start, end} per entry.
+        _windowed(cfg, schedule="explicit", windows=[entry])
+        with pytest.raises(ValueError, match="exactly one of"):
+            validate_config(cfg)
 
-    def test_explicit_entry_without_bounds_rejected(self, cfg):
-        # A label alone declares no range in either form; the half-range
-        # {label, start} is equally incomplete.
-        for over in ({"label": "w"}, {"label": "w", "start": "2019-06-01"}):
-            _windowed(cfg, schedule="explicit", windows=[over])
-            with pytest.raises(ValueError, match=r"\{label, timestamp\} mapping"):
-                validate_config(cfg)
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"label": "w"},  # a label alone declares no range in either form
+            {"label": "w", "start": "2019-06-01"},  # half a range is still no range
+            {"label": "w", "end": "2019-09-01"},
+        ],
+    )
+    def test_explicit_entry_without_bounds_rejected(self, cfg, entry):
+        _windowed(cfg, schedule="explicit", windows=[entry])
+        with pytest.raises(ValueError, match=r"\{label, timestamp\} mapping"):
+            validate_config(cfg)
 
     def test_explicit_point_bad_timestamp_rejected(self, cfg):
         _windowed(cfg, schedule="explicit", windows=[{"label": "w", "timestamp": "not-a-time"}])
