@@ -396,6 +396,20 @@ class TestWindowingConfig:
         with pytest.raises(ValueError, match=r"\{label, timestamp\} mapping"):
             validate_config(cfg)
 
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            # `width` is the documented future escape hatch and does not exist
+            # yet: it must fail loud, not silently yield a one-second window.
+            {"label": "w", "timestamp": "2019-06-01T12:00:00Z", "width": 3600},
+            {"label": "w", "timestamp": "2019-06-01T12:00:00Z", "duration": "1h"},
+        ],
+    )
+    def test_explicit_point_unsupported_key_rejected(self, cfg, entry):
+        _windowed(cfg, schedule="explicit", windows=[entry])
+        with pytest.raises(ValueError, match="unsupported key"):
+            validate_config(cfg)
+
     def test_explicit_point_bad_timestamp_rejected(self, cfg):
         _windowed(cfg, schedule="explicit", windows=[{"label": "w", "timestamp": "not-a-time"}])
         with pytest.raises(ValueError, match="ISO-8601"):
