@@ -1060,11 +1060,9 @@ def _validate_windowing(config: PipelineConfig) -> None:
     _validate_windowing_windows(block, schedule)
 
 
-#: A ``{label, timestamp}`` point entry desugars to a window this wide (issue
-#: #355). One second is the window grammar's native resolution — boundaries
-#: are whole seconds throughout (``iso_utc`` renders ``timespec="seconds"``)
-#: — so a second-wide half-open window *is* the point window at grammar
-#: resolution, without introducing float equality on observation timestamps.
+#: Width of the window a ``{label, timestamp}`` point entry desugars to (#355).
+#: One second is the grammar's native resolution — boundaries render at
+#: ``timespec="seconds"`` throughout — and keeps membership off float equality.
 _POINT_WINDOW_WIDTH = timedelta(seconds=1)
 
 
@@ -1072,21 +1070,13 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
     """The half-open UTC ``[start, end)`` of one explicit ``windows`` entry.
 
     Two forms, discriminated on keys and never mixed (issue #355): the range
-    form ``{label, start, end}``, and the point sugar ``{label, timestamp}``
-    which desugars to ``[t, t + 1s)`` (:data:`_POINT_WINDOW_WIDTH`). Desugaring
-    happens here, at the config layer, so everything downstream —
-    ``windows_intersecting``, the catalog time filters, ``windowed_cell_config``,
-    leaf naming, the sweep, the pyramid — only ever sees an ordinary explicit
-    range. Two acquisitions inside the same wall-clock second therefore share a
-    window; if that ever bites, the fix is an explicit ``width`` key on the
-    point form, not a guessed default.
-
-    Bounds are returned at the precision declared, but :func:`get_windowing`
+    ``{label, start, end}``, and the point sugar ``{label, timestamp}`` ->
+    ``[t, t + 1s)``. Bounds come back at declared precision; :func:`get_windowing`
     renders them through ``windows.iso_utc`` (``timespec="seconds"``), so a
-    SUB-SECOND ``timestamp`` normalizes to the whole second CONTAINING it —
-    both ends truncate by the same fraction, so ``t`` still falls inside its
-    own window, and disjointness is preserved (validated-disjoint points are
-    >= 1 s apart, hence so are their truncated bounds).
+    sub-second ``timestamp`` normalizes to the whole second containing it —
+    truncation is monotone, so it can neither move ``t`` out of its own window
+    nor manufacture an overlap. See ``docs/hive_layout.md`` for the same-second
+    collision and the silent-miss edge.
     """
     from zagg import windows as _windows
 
@@ -1098,11 +1088,11 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
                 f"entry declares exactly one of {{timestamp}} or {{start, end}} "
                 f"(got {entry!r})"
             )
+        # `width` is documented as the future escape hatch but does not exist
+        # yet: accepting it silently would hand back a 1 s window and a clean
+        # validate_config.
         extra = sorted(set(entry) - {"label", "timestamp"})
         if extra:
-            # `width` is named as the escape hatch for the same-second edge but
-            # does not exist yet — accepting it silently would hand back a
-            # one-second window and a clean validate_config (review finding).
             raise ValueError(
                 f"explicit point window entry carries unsupported key(s) "
                 f"{', '.join(extra)}; the point form is {{label, timestamp}} "
@@ -1121,9 +1111,8 @@ def _validate_windowing_windows(block: dict, schedule: str) -> None:
     ``start < end``, unique labels, non-overlapping ranges — required for
     ``schedule: explicit``, rejected otherwise. Point entries
     (``{label, timestamp}``, issue #355) are desugared by
-    :func:`_explicit_window_bounds` before these checks, so they compose
-    unchanged: a point landing inside another window's range is a genuine
-    overlap and rejects.
+    :func:`_explicit_window_bounds` first, so every check below runs on ordinary
+    bounds and composes unchanged.
     """
     from zagg import windows as _windows
 
@@ -2636,9 +2625,6 @@ def get_windowing(config: PipelineConfig) -> dict | None:
         return None
     declared = None
     if block["schedule"] == "explicit":
-        # Point entries desugar HERE (issue #355): the normalized list is
-        # always the {label, start, end} range form, so no consumer — manifest
-        # temporal block included — ever sees a ``timestamp`` key.
         declared = []
         for w in block["windows"]:
             start, end = _explicit_window_bounds(w)
