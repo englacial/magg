@@ -56,6 +56,7 @@ from zagg.config import (
     get_data_vars,
     get_output_signature,
 )
+from zagg.stats.composition import merge_composition, pack_composition_n
 from zagg.stats.tdigest import (
     _DEFAULT_DELTA,
     build_tdigest,
@@ -339,15 +340,16 @@ class _DigestField(NamedTuple):
     where: object | None
 
 
-def _resolve_where(param, col_arrays: dict[str, np.ndarray], start: int, end: int):
-    """Resolve one cell's ``where`` param over its block rows, the pooled way.
+def _resolve_param(param, col_arrays: dict[str, np.ndarray], start: int, end: int):
+    """Resolve one cell's param over its block rows, the pooled path's way.
 
     Mirrors ``calculate_cell_statistics``'s params resolution exactly (bare
     column name -> that column's rows; a string naming columns -> eval'd over
     the cell's rows with the same cached code object; anything else passes
-    through), so a stratum's per-block membership is computed by the identical
-    rule the pooled/single-block replay applies per cell — block boundaries
-    cannot shift a photon between strata.
+    through), so a stratum's per-block ``where`` membership and a composition
+    field's conf columns are computed by the identical rule the pooled/
+    single-block replay applies per cell — block boundaries cannot shift a
+    photon between strata or lanes.
     """
     from zagg.processing.aggregate import _compile_param_expr
 
@@ -440,7 +442,8 @@ class SpillAggregator:
       partition-by-partition into running mergeable state (counts by
       summation, tdigests via ``merge_tdigests``/``merge_tdigests_kway`` —
       including located fields and ``build_tdigest_where`` strata, whose
-      per-block builds fold under the located overloads, issue #370),
+      per-block builds fold under the located overloads — and composition
+      words via ``merge_composition``, issue #370),
       collapsing merge rounds from N/buffer to ~spill/threshold. A
       config with any reducer outside the ``validate_spill_fold`` surface
       raises :class:`SpillOverflowError` at the first crossing instead of
@@ -483,8 +486,12 @@ class SpillAggregator:
             self._mergeable = False
         self._count_fields: list[str] = []
         self._digest_fields: dict[str, _DigestField] = {}
+        # name -> (source, params): scalar pack_composition fields (issue #370
+        # option (a)); params carry the conf column names + threshold, resolved
+        # per cell at fold time exactly like the pooled path.
+        self._composition_fields: dict[str, tuple[str, dict]] = {}
         if self._mergeable:
-            from zagg.processing.streaming import _TDIGEST_PAIRWISE_FUNCTION
+            from zagg.processing.streaming import _COMPOSITION_FUNCTION, _TDIGEST_PAIRWISE_FUNCTION
 
             for name, meta in agg_fields.items():
                 sig = get_output_signature(meta)
@@ -497,6 +504,11 @@ class SpillAggregator:
                         pairwise=meta.get("function") == _TDIGEST_PAIRWISE_FUNCTION,
                         location=sig["location"],
                         where=params.get("where"),
+                    )
+                elif meta.get("function") == _COMPOSITION_FUNCTION:
+                    self._composition_fields[name] = (
+                        meta.get("source") or "h_li",
+                        dict(meta.get("params") or {}),
                     )
                 else:
                     self._count_fields.append(name)
@@ -531,6 +543,14 @@ class SpillAggregator:
         # merge_tdigests / merge_tdigests_kway overloads.
         self._digest_locs: dict[str, dict[int, np.ndarray]] = {
             n: {} for n, f in self._digest_fields.items() if f.location
+        }
+        # Composition running state (issue #370): per-cell (word, n_signal),
+        # folded pairwise in block-close order via merge_composition — presence
+        # exact (the floor survives re-quantization), counts within the
+        # documented O(n/510)-per-fold bound, so an overflow shard's word is
+        # NOT byte-stable against the single-block result (option (a)).
+        self._compositions: dict[str, dict[int, tuple[int, int]]] = {
+            n: {} for n in self._composition_fields
         }
         # k-way fold accumulator: for order-independent fields, each block's
         # per-cell digest is stashed here and collapsed once at finalize
@@ -691,13 +711,16 @@ class SpillAggregator:
         ``leaf_id`` column is a spilled read column, so the block holds the
         exact order-29 point words), a ``where`` stratum field (issue #321)
         via ``build_tdigest_where`` with its mask resolved per cell over the
-        block's spilled columns (:func:`_resolve_where` — row selection
+        block's spilled columns (:func:`_resolve_param` — row selection
         precedes the build, so block boundaries cannot shift a photon between
         strata, issue #370) — and then, per the field's fold law: **k-way**
         fields stash the block digest (+ locations) for one order-independent
         collapse at finalize (:meth:`_finalize_kway`); **pairwise** fields
         merge it into the running digest here, the located overload carrying
-        the location channel. Either way it is one build round per block
+        the location channel. Composition fields pack a per-block ``(word,
+        n_signal)`` pair (``pack_composition_n`` — the same predicate and
+        bytes as the pooled reducer) and fold it via ``merge_composition`` in
+        block-close order. Either way it is one build round per block
         instead of per buffer — the ~6x merge-CPU collapse the design targets
         (issue #279).
         """
@@ -715,7 +738,7 @@ class SpillAggregator:
                     values = col_arrays[f.source][start:end]
                     locs = col_arrays[f.location][start:end] if f.location else None
                     if f.where is not None:
-                        where = _resolve_where(f.where, col_arrays, start, end)
+                        where = _resolve_param(f.where, col_arrays, start, end)
                         built = build_tdigest_where(
                             values, delta=f.delta, where=where, locations=locs
                         )
@@ -744,6 +767,21 @@ class SpillAggregator:
                         self._digest_locs[name][cell] = merged_locs
                     else:
                         self._digests[name][cell] = merge_tdigests(held, fresh, delta=f.delta)
+                for name, (source, params) in self._composition_fields.items():
+                    values = col_arrays[source][start:end]
+                    kwargs = {
+                        k: _resolve_param(v, col_arrays, start, end) for k, v in params.items()
+                    }
+                    word, n = pack_composition_n(values, **kwargs)
+                    held_comp = self._compositions[name].get(cell)
+                    if held_comp is None:
+                        self._compositions[name][cell] = (word, n)
+                    else:
+                        held_word, held_n = held_comp
+                        self._compositions[name][cell] = (
+                            merge_composition(held_word, held_n, word, n),
+                            held_n + n,
+                        )
 
     def _finalize_kway(self) -> None:
         """Collapse each k-way field's per-block parts into one digest per cell.
@@ -859,6 +897,12 @@ class SpillAggregator:
                 stats_arrays[name] = np.full(n_cells, np.nan, dtype=dtype)
             else:
                 stats_arrays[name] = np.zeros(n_cells, dtype=dtype)
+        for name in self._composition_fields:
+            # The packed word (issue #321): integer dtype, numeric fill — the
+            # spec mandates fill_value 0 so unwritten cells read as "no lanes".
+            meta = agg_fields[name]
+            dtype = np.dtype(meta.get("dtype", "uint64"))
+            stats_arrays[name] = np.full(n_cells, meta.get("fill_value", 0), dtype=dtype)
         ragged_payloads: dict[str, list] = {n: [] for n in self._digest_fields}
         ragged_cell_indices: dict[str, list[int]] = {n: [] for n in self._digest_fields}
         # Located fields only (issue #87): keyed presence tells the worker to
@@ -875,6 +919,10 @@ class SpillAggregator:
             cells_with_data += 1
             for name in self._count_fields:
                 stats_arrays[name][i] = count
+            for name in self._composition_fields:
+                # Every occupied cell has an entry (the fold writes one per
+                # cell per block); the word may legitimately be 0 (no signal).
+                stats_arrays[name][i] = self._compositions[name][cell][0]
             for name in self._digest_fields:
                 digest = self._digests[name].get(cell)
                 if digest is not None and digest.size > 0:
