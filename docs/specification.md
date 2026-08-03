@@ -276,6 +276,11 @@ with the payload:
   (a fresh point word folded with an earlier merge's coarser area word)
   compose under the same rule.
 
+A writer-side spill-block close (`aggregation.streaming.mode: spill` crossing
+its block threshold, issue #370) is an additional merge source under the same
+rule: an overflow shard's centroids may carry coarser common-ancestor words,
+with the stored layout and byte-level contract above unchanged.
+
 Word semantics (bit layout, kind marking, coarsening) are mortie's
 specification §1/§4, not restated here.
 
