@@ -893,7 +893,8 @@ gates (espg/moczarr#19/#20).
 
 Two tiny single-shard hive stores, both on the same deliberately small
 geometry — shard order 4, inner-chunk order 5, cell order 6 (16 cells,
-K = 4 inner chunks of 4 cells), sharded (the hive default):
+K = 4 inner chunks of 4 cells), sharded (the hive default) — plus one
+manifest-only fixture for the §4.5 declaration:
 
 - **`minimal/`** — one *unlocated* digest field (`h_tdigest`) plus `count`.
   The smallest thing that is a conforming store.
@@ -903,8 +904,20 @@ K = 4 inner chunks of 4 cells), sharded (the hive default):
   (including a single-photon cell packing the §3.1 golden word
   `0xFF000000FF0000FF` and a noise-only cell whose signal payload is the
   empty `(0, 2)` array), and `count`.
+- **`pyramid/`** — the §4.5 overview **declaration**, and nothing else: a
+  committed `morton_hive.json` carrying all four readings of a `fields` entry
+  in one block — a field that inherits the block schedule (`count`, no
+  `orders` key), one narrowed to a subset (`h_min`, `[3, 1]` of `[3, 2, 1]`),
+  one excluded outright but still declaring its fold law (`h_tdigest`,
+  `orders: []`), and a non-composable `"class": "none"` one (`h_mean`). The
+  block is a **template-time** artifact — it exists before the first leaf is
+  written and is decodable from the manifest alone — so this fixture carries
+  no store beneath it; a third leaf would pin nothing the other two do not.
+  Its sibling `pyramid.expected.json` records the declared knob and the
+  schedule each field resolves to under §4.5, so a reader's decoding of the
+  key is checkable without running zagg.
 
-Both stores pin the layout edge cases a reader must handle: inner chunk
+Both leaf stores pin the layout edge cases a reader must handle: inner chunk
 ordinal 2 is **empty** (absent from the shard index — the §1.5 sentinel, and
 that sparsity reaches the dense arrays too: the `morton` coordinate and
 `count` hold their fill across that chunk, so a reader MUST NOT assume the
@@ -912,7 +925,7 @@ coordinate is dense across a shard), populated chunks contain empty cells
 (the `b""` fill), and one cell's digest carries merged centroids (weight > 1)
 whose location words are common ancestors (§2.2).
 
-Both fixtures are **sharded**, so §7's conformance claim is scoped to the
+Both leaf fixtures are **sharded**, so §7's conformance claim is scoped to the
 §1.5 sharded geometry. The per-inner-chunk geometry — identical §1.4 framing,
 one object per inner chunk, no shard index — has no committed golden here; it
 is pinned zagg-side by
@@ -921,8 +934,8 @@ stored span from the array's own metadata, as §1.5 requires, reads both from
 one code path; a reader that hard-codes the shard-index suffix passes §7 and
 still fails on an unsharded store.
 
-Each fixture ships a sibling **`{name}.expected.json`** recording the shard
-key, leaf path, geometry, every populated cell's decoded values (digest
+Each leaf fixture ships a sibling **`{name}.expected.json`** recording the
+shard key, leaf path, geometry, every populated cell's decoded values (digest
 centroids, location words and composition words as decimal strings — JSON
 numbers cannot carry `uint64` faithfully), the per-stratum exact counts,
 and the §5 O11 `content_hashes` (per-array + combined). The expected

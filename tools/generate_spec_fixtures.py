@@ -15,7 +15,7 @@ Run from a zagg checkout::
 
     uv run python tools/generate_spec_fixtures.py
 
-Geometry (both fixtures): parent order 4 / chunk order 5 / cell order 6 —
+Geometry (both leaf fixtures): parent order 4 / chunk order 5 / cell order 6 —
 16 cells per shard, K = 4 inner chunks of 4 cells, `sharded` (the D17 hive
 default), deliberately tiny. Chunk ordinal 2 is left EMPTY to pin the
 shard-index absence sentinel (§1.5); populated chunks carry empty cells to
@@ -29,6 +29,11 @@ conformance tests assert decoded values, never object bytes.
   (the `atl03_tdigest_strata_healpix.yaml` field shapes), including a
   single-photon cell that packs the §3.1 golden word `0xFF000000FF0000FF`
   and a noise-only cell whose signal payload is the empty ``(0, 2)`` array.
+- ``pyramid/`` — MANIFEST ONLY: the §4.5 overview declaration, including the
+  per-field schedules of issue #352 (a narrowed `orders`, an `orders: []`
+  exclusion, an inheriting field, and a `class: "none"` one). The block is a
+  template-time manifest artifact — it exists before any leaf and is decodable
+  from `morton_hive.json` alone — so this fixture writes no store beneath it.
 """
 
 from __future__ import annotations
@@ -52,6 +57,23 @@ DELTA = 16
 #: The §3.1 golden-word photon: per-surface confidences at threshold 2 pack
 #: lanes [255, 0, 0, 255, 0, 0, 0, 255] = 0xFF000000FF0000FF.
 GOLDEN_CONF = (4, -1, 0, 3, 1)
+#: The ``pyramid/`` fixture's declaration (§4.5): an explicit block schedule
+#: plus the issue #352 per-field grammar — one narrowed field, one excluded
+#: outright. ``count`` is deliberately left unnamed (it inherits the block
+#: schedule) and ``composition`` is a ``none``-class field, so one manifest
+#: carries all four readings a decoder must tell apart.
+PYRAMID_KNOB = {
+    "orders": [3, 2, 1],
+    "fields": {"h_min": {"orders": [3, 1]}, "h_tdigest": {"orders": []}},
+}
+#: Fields the ``pyramid/`` fixture declares beyond the ``minimal`` pair, so one
+#: manifest carries every §4.5 reading: an inheriting field (``count``), a
+#: narrowed one (``h_min``), an excluded one (``h_tdigest``), and a
+#: ``class: "none"`` one (``h_mean`` — no exact merge law, D24).
+PYRAMID_EXTRA_VARIABLES = {
+    "h_min": {"function": "nanmin", "source": "h", "dtype": "float32", "fill_value": 0},
+    "h_mean": {"function": "mean", "source": "h", "dtype": "float32", "fill_value": 0},
+}
 
 
 def _cell_photons(rng, n, *, signal_frac=0.6):
@@ -81,7 +103,7 @@ def _point_words(grid, cell_word, n, rng):
     return morton_words(MortonIndexArray.from_latlon(lats, lons, points=True))
 
 
-def _config(kitchen_sink: bool):
+def _config(kitchen_sink: bool, pyramid: dict | None = None):
     from zagg.config import PipelineConfig
 
     variables: dict = {
@@ -134,22 +156,25 @@ def _config(kitchen_sink: bool):
             "fill_value": 0,
             "params": {"delta": DELTA},
         }
+    output: dict = {
+        "store_layout": "hive",
+        "grid": {
+            "type": "healpix",
+            "parent_order": 4,
+            "child_order": 6,
+            "chunk_inner": 5,
+            "sharded": True,
+        },
+    }
+    if pyramid is not None:
+        output["pyramid"] = pyramid
     return PipelineConfig(
         data_source={"groups": ["g"]},
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
             "variables": variables,
         },
-        output={
-            "store_layout": "hive",
-            "grid": {
-                "type": "healpix",
-                "parent_order": 4,
-                "child_order": 6,
-                "chunk_inner": 5,
-                "sharded": True,
-            },
-        },
+        output=output,
     )
 
 
@@ -366,6 +391,69 @@ def build(out: Path, kitchen_sink: bool) -> None:
     print(f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells")
 
 
+def build_pyramid(out: Path) -> None:
+    """The manifest-only fixture: the §4.5 overview declaration grammar.
+
+    Written by the production path (``hive.build_manifest`` ->
+    ``sweep_overview.build_pyramid_block``), like the leaf fixtures. It carries
+    no store beneath it on purpose: the pyramid block is a TEMPLATE-time
+    manifest artifact — it exists before a single leaf is written — and
+    ``fields[….].orders`` is decodable from ``morton_hive.json`` alone, so a
+    third leaf would pin nothing the other two do not already pin.
+
+    The expectations are derived HERE from :data:`PYRAMID_KNOB` by the §4.5
+    rules (absent ``orders`` inherits the block schedule; a present one is
+    exact; a ``none`` class is absent everywhere and never carries the key),
+    never read back out of the written block — the same "expected values come
+    from the generator's INPUTS" discipline the cell values follow.
+    """
+    from zagg import hive
+    from zagg.grids import HealpixGrid
+
+    cfg = _config(False, pyramid=PYRAMID_KNOB)
+    cfg.aggregation["variables"].update(PYRAMID_EXTRA_VARIABLES)
+    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    hive.ensure_manifest(
+        str(out),
+        hive.build_manifest(grid, dataset={"short_name": "SPEC_FIXTURE", "version": "1"}),
+    )
+    block_orders = list(PYRAMID_KNOB["orders"])
+    # class per field is a property of the declared reducer (D24), asserted
+    # here by construction: len/nanmin fold exactly, a t-digest approximately,
+    # a mean not at all.
+    classes = {
+        "count": "exact",
+        "h_tdigest": "approximate",
+        "h_min": "exact",
+        "h_mean": "none",
+    }
+    fields = {}
+    for name, cls in classes.items():
+        decl = PYRAMID_KNOB["fields"].get(name)
+        declares = cls != "none" and decl is not None
+        wanted = set(decl["orders"]) if declares else set(block_orders)
+        fields[name] = {
+            "class": cls,
+            # Whether the manifest entry carries its own ``orders`` key...
+            "declares_orders": declares,
+            # ...and the orders at which an overview exists either way.
+            "orders": [] if cls == "none" else [k for k in block_orders if k in wanted],
+        }
+    expected = {
+        "shard_order": 4,
+        "declared": PYRAMID_KNOB,
+        "orders": block_orders,
+        "spacing": 2,  # the default step, recorded even when orders are explicit
+        "all_time": False,
+        "fields": fields,
+    }
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(f"{out.name}: manifest-only, orders {block_orders}, {len(fields)} declared fields")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -376,6 +464,7 @@ def main() -> None:
     args = parser.parse_args()
     build(args.out / "minimal", kitchen_sink=False)
     build(args.out / "kitchen_sink", kitchen_sink=True)
+    build_pyramid(args.out / "pyramid")
 
 
 if __name__ == "__main__":

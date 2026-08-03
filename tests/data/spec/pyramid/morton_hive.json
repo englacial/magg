@@ -1,0 +1,63 @@
+{
+ "spec": "morton-hive/1",
+ "dataset": {
+  "short_name": "SPEC_FIXTURE",
+  "version": "1"
+ },
+ "semantic_hash": "11351f9e8c8c79f5d0763ba026321132796948d579b21984fa82db179afce10b",
+ "cell_order": 6,
+ "shard_order": 4,
+ "split_schedule": [
+  1,
+  1,
+  1,
+  1
+ ],
+ "path_grouping": 1,
+ "pyramid": {
+  "spec": "zagg-pyramid/1",
+  "overview": {
+   "spacing": 2,
+   "orders": [
+    3,
+    2,
+    1
+   ],
+   "all_time": false,
+   "fields": {
+    "count": {
+     "class": "exact",
+     "method": "sum",
+     "nan_policy": "skip",
+     "dtype": "int32",
+     "fill_value": 0
+    },
+    "h_tdigest": {
+     "class": "approximate",
+     "method": "tdigest_kway",
+     "dtype": "float32",
+     "inner_shape": [
+      2
+     ],
+     "delta": 16,
+     "orders": []
+    },
+    "h_min": {
+     "class": "exact",
+     "method": "min",
+     "nan_policy": "skip",
+     "dtype": "float32",
+     "fill_value": 0,
+     "orders": [
+      3,
+      1
+     ]
+    },
+    "h_mean": {
+     "class": "none"
+    }
+   }
+  }
+ },
+ "generated_at": "2026-08-03T11:10:05+00:00"
+}

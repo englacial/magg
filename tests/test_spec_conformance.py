@@ -1,9 +1,10 @@
 """Spec-conformance tests against the committed golden fixtures (issue #340).
 
 ``docs/specification.md`` §7: the fixtures under ``tests/data/spec/`` (two
-tiny hive stores written by ``tools/generate_spec_fixtures.py`` through the
-production write path) are part of the store contract. Every test here binds
-one of the spec's normative claims to those committed bytes, two ways:
+tiny hive stores plus one manifest-only declaration, all written by
+``tools/generate_spec_fixtures.py`` through the production write path) are
+part of the store contract. Every test here binds one of the spec's normative
+claims to those committed bytes, two ways:
 
 - **through the shipping readers** (``zagg.readers.tdigest_tensor`` +
   ``zagg.stats.composition``), so the reader cannot drift from the fixtures;
@@ -33,6 +34,9 @@ from zagg.stats.composition import counts_from_composition, unpack_composition
 
 SPEC_DATA = Path(__file__).parent / "data" / "spec"
 FIXTURES = ("minimal", "kitchen_sink")
+#: The manifest-only fixture (§4.5 declaration grammar) — no leaf, so it is
+#: deliberately NOT in ``FIXTURES``: nothing leaf-shaped applies to it.
+PYRAMID = "pyramid"
 #: (fixture, ragged field, element dtype, inner shape) — every committed
 #: ``zagg-ragged/1`` array, payload and located siblings alike.
 RAGGED_ARRAYS = [
@@ -538,3 +542,79 @@ class TestStoreEnvelope:
     def test_manifest_spec_marker(self, name):
         manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
         assert manifest["spec"] == "morton-hive/1"
+
+
+def _pyramid_block():
+    """The ``pyramid/`` fixture's committed manifest declaration (§4.5)."""
+    manifest = json.loads((SPEC_DATA / PYRAMID / "morton_hive.json").read_text())
+    return manifest["pyramid"]
+
+
+def _declared_orders(entry: dict, block_orders: list) -> list:
+    """Decode ONE field's overview schedule from §4.5 text alone.
+
+    The three rules a reader must implement: a ``none`` class is absent
+    everywhere; an absent ``orders`` key inherits the block schedule; a present
+    one is exact (``[]`` excludes the field outright). Orders outside the
+    block's own list name no overview the family walks, so they drop.
+    """
+    if entry["class"] == "none":
+        return []
+    if "orders" not in entry:
+        return list(block_orders)
+    return [k for k in block_orders if k in set(entry["orders"])]
+
+
+class TestPyramidDeclaration:
+    """§4.5 — the manifest overview declaration, incl. per-field schedules (#352)."""
+
+    def test_block_shape_and_marker(self):
+        exp = _expected(PYRAMID)
+        block = _pyramid_block()
+        assert block["spec"] == "zagg-pyramid/1"
+        overview = block["overview"]
+        assert overview["orders"] == exp["orders"] == exp["declared"]["orders"]
+        # Non-empty orders: spacing/all_time/fields are all MUST-be-present.
+        assert overview["spacing"] == exp["spacing"]
+        assert overview["all_time"] is exp["all_time"]
+        assert set(overview["fields"]) == set(exp["fields"])
+
+    def test_field_schedules_decode_per_spec(self):
+        """Every §4.5 reading of ``fields[….].orders`` in one committed manifest."""
+        exp = _expected(PYRAMID)
+        overview = _pyramid_block()["overview"]
+        for name, want in exp["fields"].items():
+            entry = overview["fields"][name]
+            assert entry["class"] == want["class"]
+            # The key's PRESENCE is normative: absent means inherit, and a
+            # none-class entry never carries it.
+            assert ("orders" in entry) is want["declares_orders"]
+            assert _declared_orders(entry, overview["orders"]) == want["orders"]
+        # ...and the four readings really are distinct: inherit-all, narrowed,
+        # excluded-but-declared, and non-composable.
+        assert sorted(str(f["orders"]) for f in exp["fields"].values()) == sorted(
+            ["[3, 2, 1]", "[3, 1]", "[]", "[]"]
+        )
+
+    def test_declared_schedules_are_subsets_in_block_order(self):
+        overview = _pyramid_block()["overview"]
+        for entry in overview["fields"].values():
+            if "orders" in entry:
+                assert set(entry["orders"]) <= set(overview["orders"])
+                # Same descending order as the block's own list.
+                assert entry["orders"] == [k for k in overview["orders"] if k in entry["orders"]]
+
+    def test_excluded_field_still_declares_its_fold_law(self):
+        """``orders: []`` is not a dropped entry — class and fold law survive."""
+        entry = _pyramid_block()["overview"]["fields"]["h_tdigest"]
+        assert entry["orders"] == [] and entry["class"] == "approximate"
+        assert entry["method"] == "tdigest_kway" and entry["inner_shape"] == [2]
+
+    def test_none_class_entry_is_class_only(self):
+        """The recorded absence (D24 option A): no fold to name, no schedule."""
+        assert _pyramid_block()["overview"]["fields"]["h_mean"] == {"class": "none"}
+
+    def test_manifest_spec_marker(self):
+        manifest = json.loads((SPEC_DATA / PYRAMID / "morton_hive.json").read_text())
+        assert manifest["spec"] == "morton-hive/1"
+        assert manifest["shard_order"] == _expected(PYRAMID)["shard_order"]

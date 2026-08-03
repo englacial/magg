@@ -1,0 +1,57 @@
+{
+ "shard_order": 4,
+ "declared": {
+  "orders": [
+   3,
+   2,
+   1
+  ],
+  "fields": {
+   "h_min": {
+    "orders": [
+     3,
+     1
+    ]
+   },
+   "h_tdigest": {
+    "orders": []
+   }
+  }
+ },
+ "orders": [
+  3,
+  2,
+  1
+ ],
+ "spacing": 2,
+ "all_time": false,
+ "fields": {
+  "count": {
+   "class": "exact",
+   "declares_orders": false,
+   "orders": [
+    3,
+    2,
+    1
+   ]
+  },
+  "h_tdigest": {
+   "class": "approximate",
+   "declares_orders": true,
+   "orders": []
+  },
+  "h_min": {
+   "class": "exact",
+   "declares_orders": true,
+   "orders": [
+    3,
+    1
+   ]
+  },
+  "h_mean": {
+   "class": "none",
+   "declares_orders": false,
+   "orders": []
+  }
+ }
+}
