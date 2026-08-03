@@ -1094,7 +1094,7 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
     if "timestamp" in entry:
         if ranged:
             raise ValueError(
-                f"explicit window entry carries both timestamp and {ranged[0]}; each "
+                f"explicit window entry carries both timestamp and {', '.join(ranged)}; each "
                 f"entry declares exactly one of {{timestamp}} or {{start, end}} "
                 f"(got {entry!r})"
             )

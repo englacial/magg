@@ -365,22 +365,26 @@ class TestWindowingConfig:
         ]
 
     @pytest.mark.parametrize(
-        "entry",
+        "entry,named",
         [
-            {"label": "w", "timestamp": "2019-06-01T12:00:00Z", "start": "2019-06-01"},
-            {"label": "w", "timestamp": "2019-06-01T12:00:00Z", "end": "2019-09-01"},
-            {
-                "label": "w",
-                "timestamp": "2019-06-01T12:00:00Z",
-                "start": "2019-06-01",
-                "end": "2019-09-01",
-            },
+            ({"label": "w", "timestamp": "2019-06-01T12:00:00Z", "start": "2019-06-01"}, "start"),
+            ({"label": "w", "timestamp": "2019-06-01T12:00:00Z", "end": "2019-09-01"}, "end"),
+            (
+                {
+                    "label": "w",
+                    "timestamp": "2019-06-01T12:00:00Z",
+                    "start": "2019-06-01",
+                    "end": "2019-09-01",
+                },
+                # Both offending keys are named, so one edit fixes the entry.
+                "end, start",
+            ),
         ],
     )
-    def test_explicit_entry_mixing_both_forms_rejected(self, cfg, entry):
+    def test_explicit_entry_mixing_both_forms_rejected(self, cfg, entry, named):
         # Exactly one of {timestamp} or {start, end} per entry.
         _windowed(cfg, schedule="explicit", windows=[entry])
-        with pytest.raises(ValueError, match="exactly one of"):
+        with pytest.raises(ValueError, match=f"both timestamp and {named}; .*exactly one of"):
             validate_config(cfg)
 
     @pytest.mark.parametrize(
