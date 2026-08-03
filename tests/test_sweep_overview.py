@@ -553,7 +553,7 @@ class TestPyramidBlock:
         assert all("orders" not in m for m in block["overview"]["fields"].values())
         assert block == build_pyramid_block(self._cfg(pyramid={}), shard_order=6)
 
-    def test_field_schedule_never_widens_the_block(self):
+    def test_field_schedule_never_widens_the_block(self, caplog):
         """The unvalidated path (declare_pyramid) intersects, never widens."""
         from zagg.sweep_overview import build_pyramid_block
 
@@ -562,6 +562,8 @@ class TestPyramidBlock:
         overview = build_pyramid_block(cfg, shard_order=4)["overview"]
         assert overview["orders"] == [2, 0]
         assert overview["fields"]["h_min"]["orders"] == [2]
+        # The intersection is never silent: it names the field and what it dropped.
+        assert "'h_min'" in caplog.text and "[5]" in caplog.text
 
     def test_pyramid_orders_derivation(self):
         """The shared schedule helper config validation and the block agree on."""
@@ -1296,6 +1298,24 @@ class TestDeclarePyramid:
         again = declare_pyramid(str(tmp_path), cfg)
         assert again["previous"] == "identical" and again["updated"] is False
         assert puts == []
+
+    def test_retrofit_warns_when_a_field_schedule_empties(self, tmp_path, caplog):
+        """A schedule valid at the config's parent_order can empty at the store's."""
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        # Validated against a parent_order-3 config the derived schedule is [1];
+        # this store's shard_order is 2, so the block schedule is [0] and the
+        # requested order falls outside it entirely.
+        cfg.output["pyramid"] = {"spacing": 2, "fields": {"h_tdigest": {"orders": [1]}}}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["orders"] == [0]
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block["fields"]["h_tdigest"]["orders"] == []
+        # The summary reports the class only, so the warning is the ONLY signal
+        # that the field the user asked for is now in no overview at all.
+        assert summary["fields"]["h_tdigest"] == "approximate"
+        assert "'h_tdigest'" in caplog.text and "[1]" in caplog.text
+        assert "NOTHING remains" in caplog.text
 
     def test_second_call_is_idempotent_no_put(self, tmp_path, monkeypatch):
         self._pre_declaration_store(tmp_path)

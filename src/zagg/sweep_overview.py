@@ -264,7 +264,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
             excluded.append(name)
             continue
         if name in selection:
-            entry["orders"] = _field_orders(selection[name], orders)
+            entry["orders"] = _field_orders(name, selection[name], orders)
         fields[name] = entry
     if excluded and orders:
         logger.warning(
@@ -283,7 +283,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     return {"spec": PYRAMID_SPEC, "overview": overview}
 
 
-def _field_orders(decl, orders: list) -> list:
+def _field_orders(name: str, decl, orders: list) -> list:
     """One field's declared overview schedule (issue #352), as a subset of ``orders``.
 
     ``false`` is the outright exclusion (the empty schedule); a mapping
@@ -293,11 +293,29 @@ def _field_orders(decl, orders: list) -> list:
     makes the invariant unfalsifiable for the unvalidated caller
     (``declare_pyramid`` against a manifest whose ``shard_order`` differs from
     the config's).
+
+    That caller is exactly why the drop is WARNED and names the field: a
+    validated ``[6, 4]`` retrofitted onto a store whose schedule is
+    ``[7, 5, 3, 1]`` intersects to nothing, and the summary reports classes
+    only — so a field the user asked for at two orders would otherwise be
+    dropped from the whole pyramid and reported as success.
     """
     if decl is False:
         return []
     want = {int(k) for k in ((decl or {}).get("orders") or [])}
-    return [k for k in orders if k in want]
+    kept = [k for k in orders if k in want]
+    dropped = sorted(want - set(orders), reverse=True)
+    if dropped:
+        logger.warning(
+            f"pyramid: field {name!r} schedules orders {dropped} outside the block schedule "
+            f"{orders}; they are dropped"
+            + (
+                " — NOTHING remains, so the field is excluded from the entire pyramid"
+                if not kept
+                else f", leaving {kept}"
+            )
+        )
+    return kept
 
 
 def _json_fill(fill_value):
