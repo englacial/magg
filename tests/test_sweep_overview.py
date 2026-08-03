@@ -1271,6 +1271,32 @@ class TestDeclarePyramid:
         assert after["pyramid"] == build_pyramid_block(_leaf_cfg(), SHARD_ORDER)
         assert _frozen_matches(after, before)  # only the pyramid key moved
 
+    def test_retrofit_records_a_per_field_schedule(self, tmp_path, monkeypatch):
+        """The issue #352 knob through the issue #358 retrofit, round-trip included."""
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {
+            "orders": [1, 0],
+            "fields": {"h_tdigest": {"orders": [1]}, "h_min": False},
+        }
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True and summary["orders"] == [1, 0]
+        # An excluded field is still validated against the leaf: it exists at
+        # native resolution, so its typing stays declared and checkable.
+        assert summary["validated"].startswith("leaf ")
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]
+        assert block["fields"]["h_tdigest"]["orders"] == [1]
+        assert block["fields"]["h_min"]["orders"] == []
+        assert "orders" not in block["fields"]["count"]  # unnamed: block schedule
+        # The schedules survive the canonical-JSON round-trip the idempotency
+        # compare runs on, so a knob-using config does not re-PUT every call.
+        puts = []
+        real_put = obstore.put
+        monkeypatch.setattr(obstore, "put", lambda *a, **k: (puts.append(a), real_put(*a, **k))[1])
+        again = declare_pyramid(str(tmp_path), cfg)
+        assert again["previous"] == "identical" and again["updated"] is False
+        assert puts == []
+
     def test_second_call_is_idempotent_no_put(self, tmp_path, monkeypatch):
         self._pre_declaration_store(tmp_path)
         declare_pyramid(str(tmp_path), _leaf_cfg())
