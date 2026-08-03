@@ -1073,6 +1073,13 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
     range. Two acquisitions inside the same wall-clock second therefore share a
     window; if that ever bites, the fix is an explicit ``width`` key on the
     point form, not a guessed default.
+
+    Bounds are returned at the precision declared, but :func:`get_windowing`
+    renders them through ``windows.iso_utc`` (``timespec="seconds"``), so a
+    SUB-SECOND ``timestamp`` normalizes to the whole second CONTAINING it —
+    both ends truncate by the same fraction, so ``t`` still falls inside its
+    own window, and disjointness is preserved (validated-disjoint points are
+    >= 1 s apart, hence so are their truncated bounds).
     """
     from zagg import windows as _windows
 
