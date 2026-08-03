@@ -2370,7 +2370,10 @@ def get_pyramid(config: PipelineConfig) -> dict | None:
     store. An explicit mapping may carry ``spacing`` (int >= 1), ``orders``
     (explicit ancestor orders, winning over ``spacing``), ``all_time``
     (bool: also maintain the ``all.zarr`` cross-window fold on windowed
-    stores), and ``summarize`` (the D24 opt-in derived-summary declarations,
+    stores), ``fields`` (the issue #352 per-field overview schedules,
+    ``{field: {"orders": [...]}}`` or ``{field: false}`` — absent means every
+    composable field at every declared order, exactly the pre-#352 behavior),
+    and ``summarize`` (the D24 opt-in derived-summary declarations,
     ``{source_field: {"as": name, ...}}`` — recorded in the pyramid block,
     never the semantic core).
     """
@@ -2400,7 +2403,7 @@ def _validate_pyramid(config: PipelineConfig) -> None:
             "output.pyramid requires output.store_layout: hive (overviews live at "
             "hive-tree ancestor nodes; flat stores have no digit tree)"
         )
-    unknown = set(knob) - {"spacing", "orders", "all_time", "summarize"}
+    unknown = set(knob) - {"spacing", "orders", "all_time", "fields", "summarize"}
     if unknown:
         raise ValueError(f"output.pyramid has unknown keys {sorted(unknown)}")
     spacing = knob.get("spacing")
@@ -2418,6 +2421,8 @@ def _validate_pyramid(config: PipelineConfig) -> None:
     all_time = knob.get("all_time")
     if all_time is not None and not isinstance(all_time, bool):
         raise ValueError(f"output.pyramid.all_time must be a boolean (got {all_time!r})")
+    if knob.get("fields") is not None:
+        _validate_pyramid_fields(knob, get_agg_fields(config), parent_order)
     summarize = knob.get("summarize")
     if summarize is None:
         return
@@ -2438,6 +2443,52 @@ def _validate_pyramid(config: PipelineConfig) -> None:
                 f"output.pyramid.summarize.{source}.as = {target!r} collides with a "
                 f"declared field: derived summaries must use a DIFFERENT name so overview "
                 f"schema never silently differs from source (D24)"
+            )
+
+
+def _validate_pyramid_fields(knob: dict, declared: dict, parent_order: int) -> None:
+    """Validate ``output.pyramid.fields`` — the per-field schedules (issue #352).
+
+    Each entry is either ``false`` (exclude the field from every overview
+    order) or a mapping carrying ``orders``: a SUBSET of the block-wide
+    schedule, which is the cost lever the issue asks for — the t-digest fold
+    is a ragged read + k-way merge per ancestor node, while count/sum/min/max
+    are near-free dense merges, so ``h_tdigest`` may run every 4 orders while
+    ``count`` stays at every one. A per-field order outside the block schedule
+    refuses rather than widening it: the sweep only ever walks the block's own
+    orders, so a widening entry would silently do nothing.
+    """
+    from zagg.sweep_overview import pyramid_orders
+
+    fields = knob["fields"]
+    if not isinstance(fields, dict):
+        raise ValueError(f"output.pyramid.fields must be a mapping (got {fields!r})")
+    schedule = pyramid_orders(knob, parent_order)
+    for name, decl in fields.items():
+        if name not in declared:
+            raise ValueError(
+                f"output.pyramid.fields names unknown field {name!r} (declared: {sorted(declared)})"
+            )
+        if decl is False:
+            continue
+        if not isinstance(decl, dict):
+            raise ValueError(
+                f"output.pyramid.fields.{name} must be false or a mapping with 'orders' "
+                f"(got {decl!r})"
+            )
+        unknown = set(decl) - {"orders"}
+        if unknown:
+            raise ValueError(f"output.pyramid.fields.{name} has unknown keys {sorted(unknown)}")
+        orders = decl.get("orders")
+        if not isinstance(orders, list) or not all(isinstance(k, int) for k in orders):
+            raise ValueError(
+                f"output.pyramid.fields.{name}.orders must be a list of ints (got {orders!r})"
+            )
+        extra = sorted(set(orders) - set(schedule))
+        if extra:
+            raise ValueError(
+                f"output.pyramid.fields.{name}.orders {extra} are outside the pyramid "
+                f"schedule {schedule} — a per-field schedule may only narrow it"
             )
 
 

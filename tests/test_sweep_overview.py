@@ -468,6 +468,58 @@ class TestPyramidBlock:
 
         validate_config(self._cfg(store_layout="hive"))  # absent knob is legal
 
+    def test_validate_field_schedules(self):
+        """The issue #352 per-field grammar: narrow, exclude, and the refusals."""
+        from zagg.config import validate_config
+
+        # A narrowing schedule and an exclusion, both against the default [4, 2, 0].
+        validate_config(
+            self._cfg(store_layout="hive", pyramid={"fields": {"h_min": {"orders": [4]}}})
+        )
+        validate_config(self._cfg(store_layout="hive", pyramid={"fields": {"h_min": False}}))
+        # An explicit block schedule is what a per-field schedule is checked against.
+        validate_config(
+            self._cfg(
+                store_layout="hive",
+                pyramid={"orders": [5, 3], "fields": {"count": {"orders": [5]}}},
+            )
+        )
+        with pytest.raises(ValueError, match="fields names unknown field"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"fields": {"nope": False}}))
+        with pytest.raises(ValueError, match="must be false or a mapping"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"fields": {"h_min": True}}))
+        with pytest.raises(ValueError, match="fields.h_min has unknown keys"):
+            validate_config(
+                self._cfg(store_layout="hive", pyramid={"fields": {"h_min": {"spacing": 2}}})
+            )
+        with pytest.raises(ValueError, match="orders must be a list of ints"):
+            validate_config(
+                self._cfg(store_layout="hive", pyramid={"fields": {"h_min": {"orders": 4}}})
+            )
+        with pytest.raises(ValueError, match=r"outside the pyramid schedule \[4, 2, 0\]"):
+            validate_config(
+                self._cfg(store_layout="hive", pyramid={"fields": {"h_min": {"orders": [3]}}})
+            )
+        # A per-field order may not widen an explicit block schedule either.
+        with pytest.raises(ValueError, match=r"outside the pyramid schedule \[5, 3\]"):
+            validate_config(
+                self._cfg(
+                    store_layout="hive",
+                    pyramid={"orders": [5, 3], "fields": {"count": {"orders": [4]}}},
+                )
+            )
+        with pytest.raises(ValueError, match="fields must be a mapping"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"fields": ["h_min"]}))
+
+    def test_pyramid_orders_derivation(self):
+        """The shared schedule helper config validation and the block agree on."""
+        from zagg.sweep_overview import pyramid_orders
+
+        assert pyramid_orders({}, 6) == [4, 2, 0]
+        assert pyramid_orders({"spacing": 3}, 9) == [6, 3, 0]
+        assert pyramid_orders({"orders": [1, 5, 5]}, 6) == [5, 1]  # deduped, descending
+        assert pyramid_orders({"orders": [3], "spacing": 1}, 6) == [3]  # explicit wins
+
 
 class TestOverviewWriter:
     def test_folds_leaves_at_every_declared_order(self, tmp_path):

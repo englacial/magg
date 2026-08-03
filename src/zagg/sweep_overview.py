@@ -192,6 +192,22 @@ def fold_digests(cell_digests: list, *, delta: int, dtype="float32") -> bytes:
 # ---------------------------------------------------------------------------
 
 
+def pyramid_orders(knob: dict, shard_order: int) -> list:
+    """The block-wide overview schedule an ``output.pyramid`` knob declares.
+
+    Explicit ``orders`` win over ``spacing``; absent both, the default is
+    every :data:`DEFAULT_SPACING` orders below the shard order (the
+    espg-ratified display schedule). Shared with
+    :func:`zagg.config._validate_pyramid` so a per-field schedule (issue #352)
+    is checked against the very list the sweep walks, never a second
+    derivation of it.
+    """
+    if knob.get("orders") is not None:
+        return sorted({int(k) for k in knob["orders"]}, reverse=True)
+    spacing = int(knob.get("spacing") or DEFAULT_SPACING)
+    return list(range(int(shard_order) - spacing, -1, -spacing))
+
+
 def build_pyramid_block(config, shard_order: int) -> dict:
     """The manifest ``pyramid`` block: the template-time declaration (D22).
 
@@ -210,10 +226,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     if knob is None:  # output.pyramid: false — declared off
         return {"spec": PYRAMID_SPEC, "overview": {"orders": []}}
     spacing = int(knob.get("spacing") or DEFAULT_SPACING)
-    if knob.get("orders") is not None:
-        orders = sorted({int(k) for k in knob["orders"]}, reverse=True)
-    else:
-        orders = list(range(int(shard_order) - spacing, -1, -spacing))
+    orders = pyramid_orders(knob, shard_order)
     agg = get_agg_fields(config)
     fields: dict = {}
     excluded = []
