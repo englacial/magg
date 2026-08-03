@@ -288,10 +288,11 @@ def _field_orders(decl, orders: list) -> list:
 
     ``false`` is the outright exclusion (the empty schedule); a mapping
     narrows to its ``orders``. Always intersected with the block schedule and
-    kept in the block's descending order: :func:`zagg.config._validate_pyramid`
-    refuses a widening entry up front, so the intersection here only makes the
-    invariant unfalsifiable for the unvalidated caller (``declare_pyramid``
-    against a manifest whose ``shard_order`` differs from the config's).
+    kept in the block's descending order: the widening refusal lives in
+    :func:`zagg.config._validate_pyramid_fields`, so the intersection here only
+    makes the invariant unfalsifiable for the unvalidated caller
+    (``declare_pyramid`` against a manifest whose ``shard_order`` differs from
+    the config's).
     """
     if decl is False:
         return []
