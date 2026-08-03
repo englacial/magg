@@ -120,6 +120,22 @@ def test_a_dropped_record_cannot_evict_a_retained_one(tmp_path):
     assert out["total_obs"].tolist() == [5_000_000]
 
 
+def test_an_all_dropped_batch_leaves_the_series_untouched(tmp_path):
+    # ...and leaves it untouched *in dtype*, not just in values: appending an
+    # all-null frame widens every integer column to float, so an OOM'd run --
+    # which now reaches the appender with nothing to append -- would silently
+    # rewrite the whole retained history (issue #365).
+    series = tmp_path / "series.parquet"
+    update_series.save_series(update_series.records_to_frame([_rec()]), series)
+    before = update_series.load_series(series)
+    update_series.main(
+        ["--series", str(series), "--records", _write(tmp_path, [_rec(obs=0, mem=None)])]
+    )
+    after = update_series.load_series(series)
+    assert after["total_obs"].dtype == before["total_obs"].dtype
+    assert after.equals(before)
+
+
 def test_mixed_batch_keeps_the_good_records(tmp_path):
     series = tmp_path / "series.parquet"
     update_series.main(
