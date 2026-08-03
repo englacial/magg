@@ -280,6 +280,25 @@ class TestSpillFoldProbe:
         with pytest.raises(ValueError, match="h_raw.*fold law"):
             validate_spill_fold(_config(variables))
 
+    def test_chunk_precompute_still_has_no_fold(self):
+        # Chunk-scoped scalars are computed over the whole shard's pooled rows,
+        # which no per-block fold can reconstruct. Rejecting them is also what
+        # makes _resolve_param's namespace identical to the pooled one (no
+        # chunk_scalars ingredient), so the branch is load-bearing.
+        cfg = _config(_variables(), streaming=_SPILL)
+        cfg.aggregation["chunk_precompute"] = {"anchor": {"function": "mean", "source": "h_ph"}}
+        with pytest.raises(ValueError, match="chunk_precompute.*no cross-block fold"):
+            validate_spill_fold(cfg)
+
+    def test_mis_declared_inner_shape_still_has_no_fold(self):
+        # The fold stores merged (k, 2) digests directly, so a mis-declared
+        # inner_shape must fail here rather than disagree with the store schema
+        # readers key on.
+        variables = _variables()
+        variables["h_tdigest"]["inner_shape"] = [3]
+        with pytest.raises(ValueError, match="h_tdigest.*inner_shape.*no cross-block fold"):
+            validate_spill_fold(_config(variables))
+
     def test_where_function_without_where_param_rejected(self):
         # A stratum field that lost its `where` (copy-paste drop) must fail at
         # the probe, not silently fold the WHOLE population into the stratum's
