@@ -130,10 +130,13 @@ output:
   downstream consumer only ever see an ordinary `{label, start, end}` window.
   One second is the grammar's own resolution (boundaries are whole seconds
   throughout), which also keeps membership off float equality on observation
-  timestamps. *Consequence*: two acquisitions within the same wall-clock second
-  share a window, and two point entries inside one second are rejected as
-  overlapping — if that ever bites, the fix is an explicit `width` key on the
-  point form, not a guessed default.
+  timestamps (a sub-second `timestamp` normalizes to the whole second
+  containing it). *Consequence*: two acquisitions within the same wall-clock
+  second share a window, and two point entries inside one second are rejected
+  as overlapping — as is a point that lands inside an already-declared range
+  window, which is an ordinary overlap (see the validation paragraph below).
+  If that ever bites, the fix is an explicit `width` key on the point form, not
+  a guessed default.
 - **Boundaries are UTC calendar terms, half-open `[start, end)`.** Window
   bounds are converted to dataset units once at dispatch, using the declared
   `epoch`/`scale`/`units` and a fixed scale offset (`GPS−UTC = 18 s`,
