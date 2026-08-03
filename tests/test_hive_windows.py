@@ -1100,7 +1100,9 @@ def _timed_rec(n, start, end):
 
 class TestWindowedUnits:
     """``runner._windowed_units``: one work unit per (shard, window), granules
-    subset by their shardmap time spans, bounds in dataset units."""
+    subset by their shardmap time spans, bounds in dataset units — plus its
+    raster analog ``_raster_windowed_units``, which decides membership at
+    dispatch instead."""
 
     def _windowing(self, cfg, **over):
         from zagg.config import get_windowing
@@ -1195,6 +1197,43 @@ class TestWindowedUnits:
         ge, lt = unit_cfg.data_source["filters"][-2:]
         assert (ge["op"], lt["op"]) == ("ge", "lt")
         assert lt["value"] - ge["value"] == 1.0
+
+    def test_raster_point_window_membership_is_half_open(self, cfg):
+        # Issue #355 on the RASTER path (``_raster_windowed_units``): membership
+        # is decided at dispatch from the group's earliest STAC datetime, with
+        # no worker-side filter — and groups outside every declared window are
+        # DROPPED, so a missed point window is a silent empty run rather than
+        # an error. Both halves are pinned here.
+        from zagg.runner import _raster_windowed_units
+
+        w = self._windowing(
+            cfg,
+            schedule="explicit",
+            windows=[{"label": "scene-a", "timestamp": "2021-03-14T12:00:00Z"}],
+        )
+
+        def _scene(gid, dt):
+            return {"id": gid, "assets": {"red": "r.tif"}, "datetime": dt, "time_key": gid}
+
+        units = _raster_windowed_units(
+            [
+                (
+                    11,
+                    [
+                        _scene("at-t", "2021-03-14T12:00:00Z"),
+                        _scene("sub-second", "2021-03-14T12:00:00.9Z"),
+                    ],
+                )
+            ],
+            w,
+        )
+        assert [(k, w_["label"], sorted(r["id"] for r in recs)) for k, recs, w_ in units] == [
+            (11, "scene-a", ["at-t", "sub-second"])
+        ]
+        # Exactly t + 1s is OUTSIDE the half-open window, and so is a realistic
+        # non-round scene datetime — both dispatch nothing at all.
+        assert _raster_windowed_units([(11, [_scene("at-end", "2021-03-14T12:00:01Z")])], w) == []
+        assert _raster_windowed_units([(11, [_scene("s2", "2021-03-14T12:00:31.024Z")])], w) == []
 
     def test_shard_with_no_matching_granules_dispatches_nothing(self, cfg):
         from zagg.runner import _windowed_units
