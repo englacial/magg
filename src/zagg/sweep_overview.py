@@ -302,7 +302,9 @@ def _field_orders(name: str, decl, orders: list) -> list:
     """
     if decl is False:
         return []
-    want = {int(k) for k in ((decl or {}).get("orders") or [])}
+    want = _order_set(name, (decl or {}).get("orders") or [])
+    if want is None:  # unusable shape: inherit the block schedule, never narrow
+        return list(orders)
     kept = [k for k in orders if k in want]
     dropped = sorted(want - set(orders), reverse=True)
     if dropped:
@@ -316,6 +318,28 @@ def _field_orders(name: str, decl, orders: list) -> list:
             )
         )
     return kept
+
+
+def _order_set(name: str, sched) -> set | None:
+    """A declared per-field ``orders`` as a set of ints — ``None`` if unusable.
+
+    The shape is gated BEFORE iterating, because a ``str`` is iterable and its
+    digits parse: ``"13"`` would otherwise narrow the field to ``{1, 3}``, a
+    schedule nobody declared, instead of taking the fallback its callers
+    document. :func:`zagg.config._validate_pyramid_fields` refuses the same
+    shapes up front; this covers the callers that read a declaration back off
+    a manifest, which no validator has seen.
+    """
+    if isinstance(sched, list | tuple):
+        try:
+            return {int(k) for k in sched}
+        except (TypeError, ValueError):
+            pass
+    logger.warning(
+        f"pyramid: unusable per-field orders {sched!r} declared for field {name!r}; "
+        f"folding it at every declared order instead"
+    )
+    return None
 
 
 def _json_fill(fill_value):
@@ -725,7 +749,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     store = open_object_store(store_root, **store_kwargs)
     materialized: set[int] = set()
     for k in orders:
-        order_fields = {n: m for n, m in fields.items() if _scheduled(m, k)}
+        order_fields = {n: m for n, m in fields.items() if _scheduled(n, m, k)}
         if not order_fields:
             logger.info(
                 f"sweep[overview]: no field is scheduled at order {k} (every declared field "
@@ -783,25 +807,20 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     return counts
 
 
-def _scheduled(meta: dict, k: int) -> bool:
+def _scheduled(name: str, meta: dict, k: int) -> bool:
     """Whether a declared field carries an overview at order ``k`` (issue #352).
 
     No ``orders`` key is the pre-#352 default — the field runs at every order
     the block declares; a present one is its own narrowed schedule (``[]``
-    excludes it everywhere). Unparseable entries fall back to the default
-    rather than silently dropping a field the declaration promised.
+    excludes it everywhere). Unusable entries fall back to the default
+    (:func:`_order_set`) rather than silently dropping — or silently narrowing
+    — a field the declaration promised.
     """
     sched = meta.get("orders")
     if sched is None:
         return True
-    try:
-        return int(k) in {int(x) for x in sched}
-    except (TypeError, ValueError):
-        logger.warning(
-            f"sweep[overview]: unusable per-field orders {sched!r} in the pyramid "
-            f"declaration; folding the field at every declared order"
-        )
-        return True
+    want = _order_set(name, sched)
+    return True if want is None else int(k) in want
 
 
 def _sweep():

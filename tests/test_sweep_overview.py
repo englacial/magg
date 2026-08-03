@@ -496,6 +496,12 @@ class TestPyramidBlock:
             validate_config(
                 self._cfg(store_layout="hive", pyramid={"fields": {"h_min": {"orders": 4}}})
             )
+        # A string is iterable and its digits parse, so it must be refused on
+        # SHAPE — otherwise "40" would quietly mean the orders [4, 0].
+        with pytest.raises(ValueError, match="orders must be a list of ints"):
+            validate_config(
+                self._cfg(store_layout="hive", pyramid={"fields": {"h_min": {"orders": "40"}}})
+            )
         with pytest.raises(ValueError, match=r"outside the pyramid schedule \[4, 2, 0\]"):
             validate_config(
                 self._cfg(store_layout="hive", pyramid={"fields": {"h_min": {"orders": [3]}}})
@@ -564,6 +570,16 @@ class TestPyramidBlock:
         assert overview["fields"]["h_min"]["orders"] == [2]
         # The intersection is never silent: it names the field and what it dropped.
         assert "'h_min'" in caplog.text and "[5]" in caplog.text
+
+    def test_unusable_field_schedule_inherits_the_block(self, caplog):
+        """An unusable ``orders`` must not narrow: a str parses, so gate on shape."""
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"fields": {"h_min": {"orders": "40"}}})
+        overview = build_pyramid_block(cfg, shard_order=6)["overview"]
+        # NOT {4, 0} from the string's digits — the whole block schedule.
+        assert overview["fields"]["h_min"]["orders"] == [4, 2, 0]
+        assert "unusable per-field orders" in caplog.text and "'h_min'" in caplog.text
 
     def test_pyramid_orders_derivation(self):
         """The shared schedule helper config validation and the block agree on."""
@@ -690,6 +706,19 @@ class TestOverviewWriter:
         run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
         assert "h_min" in _overview_group(tmp_path, "-3/1", "all.zarr", 3)
         assert "unusable per-field orders" in caplog.text
+        assert "'h_min'" in caplog.text  # the warning names WHICH field is misdeclared
+
+    def test_string_field_schedule_folds_everywhere(self, tmp_path, caplog):
+        """A ``str`` orders iterates its digits — it must be refused on shape."""
+        fields = dict(FIELDS_DECL)
+        # "3" would parse to {3}: order 3 is not swept here, so a digit-wise
+        # reading would drop h_min from the only order that IS swept.
+        fields["h_min"] = {**FIELDS_DECL["h_min"], "orders": "3"}
+        _write_manifest(tmp_path, orders=(1,), fields=fields)
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert "h_min" in _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        assert "unusable per-field orders" in caplog.text and "'h_min'" in caplog.text
 
     def test_narrowed_schedule_regenerates_a_stale_overview(self, tmp_path):
         """Narrowing a field's schedule is a content change, not a 'current' skip."""
