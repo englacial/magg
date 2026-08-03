@@ -620,6 +620,75 @@ class TestOverviewWriter:
         assert "h_mean" not in g
         assert "count" in g and "h_tdigest" in g
 
+    def test_per_field_schedule_drops_a_field_at_one_order(self, tmp_path):
+        """Issue #352: the expensive t-digest fold runs at order 1 only."""
+        fields = dict(FIELDS_DECL)
+        fields["h_tdigest"] = {**FIELDS_DECL["h_tdigest"], "orders": [1]}
+        _write_manifest(tmp_path, orders=(1, 0), fields=fields)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["written"] == 2
+        # Order 1: scheduled -> the ragged array is materialized.
+        g1 = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        assert "h_tdigest" in g1 and "count" in g1 and "h_min" in g1
+        # Order 0: narrowed out -> absent from the zarr AND from the overview's
+        # own materialized-fields attrs (spec §4.3), while the cheap exact
+        # folds still land.
+        g0 = _overview_group(tmp_path, "-3", "all.zarr", 2)
+        assert "h_tdigest" not in g0
+        np.testing.assert_array_equal(g0["count"][:1], [2])
+        info = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert set(info["fields"]) == {"count", "h_min"}
+
+    def test_field_excluded_everywhere(self, tmp_path):
+        """``some_field: false`` — the empty schedule at every declared order."""
+        fields = dict(FIELDS_DECL)
+        fields["h_min"] = {**FIELDS_DECL["h_min"], "orders": []}
+        _write_manifest(tmp_path, orders=(1, 0), fields=fields)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        for node_rel, order in (("-3/1", 3), ("-3", 2)):
+            g = _overview_group(tmp_path, node_rel, "all.zarr", order)
+            assert "h_min" not in g and "count" in g
+
+    def test_order_with_no_scheduled_field_is_skipped(self, tmp_path):
+        """An order every field narrows out writes nothing at all."""
+        fields = {n: {**m, "orders": [1]} for n, m in FIELDS_DECL.items() if n != "h_mean"}
+        fields["h_mean"] = FIELDS_DECL["h_mean"]
+        _write_manifest(tmp_path, orders=(1, 0), fields=fields)
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["written"] == 1
+        assert (tmp_path / "-3" / "1" / "all.zarr").exists()
+        assert not (tmp_path / "-3" / "all.zarr").exists()
+        # ...and only the order that produced an artifact is recorded materialized.
+        after = read_manifest(str(tmp_path))
+        assert after["pyramid"]["overview"]["materialized"]["orders"] == [1]
+
+    def test_unparseable_field_schedule_folds_everywhere(self, tmp_path, caplog):
+        """A malformed ``orders`` must not silently drop a declared field."""
+        fields = dict(FIELDS_DECL)
+        fields["h_min"] = {**FIELDS_DECL["h_min"], "orders": 1}  # a scalar, not a list
+        _write_manifest(tmp_path, orders=(1,), fields=fields)
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert "h_min" in _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        assert "unusable per-field orders" in caplog.text
+
+    def test_narrowed_schedule_regenerates_a_stale_overview(self, tmp_path):
+        """Narrowing a field's schedule is a content change, not a 'current' skip."""
+        _write_manifest(tmp_path, orders=(1,))
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        refs = [(morton_word("-311"), None)]
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        assert "h_tdigest" in _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        fields = dict(FIELDS_DECL)
+        fields["h_tdigest"] = {**FIELDS_DECL["h_tdigest"], "orders": []}
+        _write_manifest(tmp_path, orders=(1,), fields=fields)
+        result = run_sweep(str(tmp_path), refs, families=("overview",))
+        assert result["families"]["overview"]["written"] == 1
+        assert "h_tdigest" not in _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+
     def test_no_declaration_is_a_noop(self, tmp_path):
         manifest = _write_manifest(tmp_path, orders=(1,))
         manifest["pyramid"] = {"orders": [], "aggregation": {}}  # the legacy block

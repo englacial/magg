@@ -653,6 +653,11 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     (run record + MOC — never a LIST); with the default family order the MOC
     family has just refreshed that root in the same pass.
 
+    Field inclusion is per ORDER, not per sweep: a declared field carrying its
+    own ``orders`` (the issue #352 cost lever) contributes only at those, so an
+    expensive t-digest fold can run every 4 orders while the near-free dense
+    folds run at every one. An order every field narrows out is skipped whole.
+
     Idempotent: a (node, window) whose stored generation stamp (merged-leaf
     count + max leaf stamp timestamp) AND content hash both match the freshly
     folded payload — and whose zarr is confirmed present and stamped, since the
@@ -701,6 +706,13 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     store = open_object_store(store_root, **store_kwargs)
     materialized: set[int] = set()
     for k in orders:
+        order_fields = {n: m for n, m in fields.items() if _scheduled(m, k)}
+        if not order_fields:
+            logger.info(
+                f"sweep[overview]: no field is scheduled at order {k} (every declared field "
+                f"narrows it out — output.pyramid.fields, issue #352); nothing to generate there"
+            )
+            continue
         nodes = sorted({_node_at(d, k) for d in by_shard})
         for node in nodes:
             node_shards = sorted(d for d in candidates if d.startswith(node))
@@ -718,7 +730,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
                     key,
                     fold_windows,
                     node_shards,
-                    fields,
+                    order_fields,
                     cell_order,
                     shard_order,
                     windowed,
@@ -750,6 +762,27 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
             store_root, sorted(materialized), store_kwargs
         )
     return counts
+
+
+def _scheduled(meta: dict, k: int) -> bool:
+    """Whether a declared field carries an overview at order ``k`` (issue #352).
+
+    No ``orders`` key is the pre-#352 default — the field runs at every order
+    the block declares; a present one is its own narrowed schedule (``[]``
+    excludes it everywhere). Unparseable entries fall back to the default
+    rather than silently dropping a field the declaration promised.
+    """
+    sched = meta.get("orders")
+    if sched is None:
+        return True
+    try:
+        return int(k) in {int(x) for x in sched}
+    except (TypeError, ValueError):
+        logger.warning(
+            f"sweep[overview]: unusable per-field orders {sched!r} in the pyramid "
+            f"declaration; folding the field at every declared order"
+        )
+        return True
 
 
 def _sweep():
