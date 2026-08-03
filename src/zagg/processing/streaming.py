@@ -47,6 +47,14 @@ _TDIGEST_FUNCTION = "zagg.stats.tdigest.build_tdigest"
 _TDIGEST_PAIRWISE_FUNCTION = "zagg.stats.tdigest.build_tdigest_pairwise"
 _TDIGEST_FUNCTIONS = (_TDIGEST_FUNCTION, _TDIGEST_PAIRWISE_FUNCTION)
 
+#: Ragged reducers the SPILL fold additionally accepts (issue #370): stratum
+#: membership (``build_tdigest_where``) is per-photon row selection *before*
+#: the build — independent of block boundaries — so per-block strata digests
+#: merge like any digest. It folds k-way, like the ``build_tdigest`` it
+#: delegates to.
+_TDIGEST_WHERE_FUNCTION = "zagg.stats.tdigest.build_tdigest_where"
+_TDIGEST_SPILL_FUNCTIONS = (*_TDIGEST_FUNCTIONS, _TDIGEST_WHERE_FUNCTION)
+
 
 def get_streaming(config: PipelineConfig) -> dict | None:
     """Return the ``aggregation.streaming`` block, or ``None`` (pooled path).
@@ -143,6 +151,62 @@ def validate_streaming(config: PipelineConfig) -> None:
         raise ValueError(
             "aggregation.streaming is on but the config is not streamable: " + "; ".join(problems)
         )
+
+
+def validate_spill_fold(config: PipelineConfig) -> None:
+    """Reject configs whose reducers have no CROSS-BLOCK fold law (issue #370).
+
+    The spill-path mergeability probe — deliberately wider than
+    :func:`validate_streaming` (``mode: merge``): merge mode folds every
+    ``buffer_granules`` flush, so a located field's centroid locations would
+    coarsen continuously, whereas spill folds only on the rare block close.
+    Accepted here beyond the merge-mode set: **located** ragged fields (the
+    located ``merge_tdigests``/``merge_tdigests_kway`` overloads carry the
+    channel) and **``build_tdigest_where`` strata** (row selection precedes
+    the build, so per-block stratum digests merge like any digest).
+
+    A config this rejects is still accepted by ``mode: spill`` — every
+    reducer is exact in the single-block regime — but cannot survive a block
+    close (:class:`~zagg.processing.spill.SpillOverflowError`).
+
+    Raises ``ValueError`` naming every offending field, mirroring
+    :func:`validate_streaming`.
+    """
+    problems: list[str] = []
+    if get_chunk_precompute(config):
+        problems.append("chunk_precompute is chunk-scoped and has no cross-block fold")
+    for name, meta in get_agg_fields(config).items():
+        sig = get_output_signature(meta)
+        if "expression" in meta:
+            problems.append(f"field '{name}': expression fields have no cross-block fold")
+        elif sig["resolution"] != "cell":
+            problems.append(
+                f"field '{name}': resolution '{sig['resolution']}' has no cross-block fold"
+            )
+        elif sig["kind"] == "ragged":
+            if meta.get("function") not in _TDIGEST_SPILL_FUNCTIONS:
+                problems.append(
+                    f"field '{name}': ragged function {meta.get('function')!r} has no "
+                    f"fold law (only {' or '.join(_TDIGEST_SPILL_FUNCTIONS)})"
+                )
+            elif tuple(sig["inner_shape"]) != (2,):
+                # Same posture as validate_streaming: the fold stores merged
+                # digests directly, so a mis-declared inner_shape must fail
+                # here, not silently disagree with the store schema.
+                problems.append(
+                    f"field '{name}': tdigest payloads are (k, 2) centroids; "
+                    f"declared inner_shape {list(sig['inner_shape'])} has no cross-block fold"
+                )
+        elif sig["kind"] == "scalar":
+            if meta.get("function") not in ("len", "count"):
+                problems.append(
+                    f"field '{name}': scalar function {meta.get('function')!r} has no "
+                    "cross-block fold (only 'len'/'count')"
+                )
+        else:
+            problems.append(f"field '{name}': kind '{sig['kind']}' has no cross-block fold")
+    if problems:
+        raise ValueError("spill blocks cannot cross-block fold this config: " + "; ".join(problems))
 
 
 class StreamingAggregator:
