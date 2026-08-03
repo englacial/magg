@@ -318,6 +318,117 @@ class TestWindowingConfig:
         )
         validate_config(cfg)
 
+    def test_explicit_point_entry_desugars_to_a_second(self, cfg):
+        # Issue #355: {label, timestamp} is sugar for the second-wide half-open
+        # [t, t+1s). It desugars at the config layer, so the normalized list is
+        # uniformly {label, start, end} — no downstream consumer sees a
+        # ``timestamp`` key — and both forms may sit in one list.
+        _windowed(
+            cfg,
+            schedule="explicit",
+            windows=[
+                {"label": "scene-a", "timestamp": "2019-06-01T12:00:00Z"},
+                {"label": "melt-2020", "start": "2020-06-01", "end": "2020-09-01"},
+            ],
+        )
+        validate_config(cfg)
+        assert get_windowing(cfg)["windows"] == [
+            {
+                "label": "scene-a",
+                "start": "2019-06-01T12:00:00+00:00",
+                "end": "2019-06-01T12:00:01+00:00",
+            },
+            {
+                "label": "melt-2020",
+                "start": "2020-06-01T00:00:00+00:00",
+                "end": "2020-09-01T00:00:00+00:00",
+            },
+        ]
+
+    def test_explicit_entry_mixing_both_forms_rejected(self, cfg):
+        # Exactly one of {timestamp} or {start, end} per entry.
+        for over in (
+            {"label": "w", "timestamp": "2019-06-01T12:00:00Z", "start": "2019-06-01"},
+            {
+                "label": "w",
+                "timestamp": "2019-06-01T12:00:00Z",
+                "start": "2019-06-01",
+                "end": "2019-09-01",
+            },
+        ):
+            _windowed(cfg, schedule="explicit", windows=[over])
+            with pytest.raises(ValueError, match="exactly one of"):
+                validate_config(cfg)
+
+    def test_explicit_entry_without_bounds_rejected(self, cfg):
+        # A label alone declares no range in either form; the half-range
+        # {label, start} is equally incomplete.
+        for over in ({"label": "w"}, {"label": "w", "start": "2019-06-01"}):
+            _windowed(cfg, schedule="explicit", windows=[over])
+            with pytest.raises(ValueError, match=r"\{label, timestamp\} mapping"):
+                validate_config(cfg)
+
+    def test_explicit_point_bad_timestamp_rejected(self, cfg):
+        _windowed(cfg, schedule="explicit", windows=[{"label": "w", "timestamp": "not-a-time"}])
+        with pytest.raises(ValueError, match="ISO-8601"):
+            validate_config(cfg)
+
+    def test_explicit_point_reserved_all_label(self, cfg):
+        # The reserved-token check composes with the point form unchanged.
+        _windowed(cfg, schedule="explicit", windows=[{"label": "all", "timestamp": "2019-06-01"}])
+        with pytest.raises(ValueError, match="reserved schedule:none token"):
+            validate_config(cfg)
+
+    def test_explicit_point_inside_a_range_overlaps(self, cfg):
+        # A desugared point sitting inside another window's range is a genuine
+        # overlap — disjointness composes over both forms.
+        _windowed(
+            cfg,
+            schedule="explicit",
+            windows=[
+                {"label": "melt-2019", "start": "2019-06-01", "end": "2019-09-01"},
+                {"label": "scene-a", "timestamp": "2019-07-01T00:00:00Z"},
+            ],
+        )
+        with pytest.raises(ValueError, match="overlap"):
+            validate_config(cfg)
+
+    def test_explicit_points_in_the_same_second_overlap(self, cfg):
+        # The documented edge (issue #355): the point form's resolution is one
+        # second, so two labels inside the same wall-clock second collide and
+        # are rejected as overlapping. One second apart they merely touch.
+        _windowed(
+            cfg,
+            schedule="explicit",
+            windows=[
+                {"label": "scene-a", "timestamp": "2019-06-01T12:00:00Z"},
+                {"label": "scene-b", "timestamp": "2019-06-01T12:00:00.5Z"},
+            ],
+        )
+        with pytest.raises(ValueError, match="overlap"):
+            validate_config(cfg)
+        _windowed(
+            cfg,
+            schedule="explicit",
+            windows=[
+                {"label": "scene-a", "timestamp": "2019-06-01T12:00:00Z"},
+                {"label": "scene-b", "timestamp": "2019-06-01T12:00:01Z"},
+            ],
+        )
+        validate_config(cfg)
+
+    def test_explicit_point_duplicate_label(self, cfg):
+        _windowed(
+            cfg,
+            schedule="explicit",
+            windows=[
+                {"label": "scene", "timestamp": "2019-06-01T12:00:00Z"},
+                {"label": "scene", "timestamp": "2020-06-01T12:00:00Z"},
+            ],
+        )
+        with pytest.raises(ValueError, match="twice"):
+            validate_config(cfg)
+
     def test_raster_windowing_validates_on_hive(self):
         # Issue #247: raster + hive + windowing is legal; membership is the
         # acquisition's STAC datetime, so no time_field is required. The full
@@ -1031,6 +1142,31 @@ class TestWindowedUnits:
         assert [(w_["label"], [r["id"] for r in recs]) for _k, recs, w_ in units] == [
             ("melt-2019", ["g1"])
         ]
+
+    def test_point_window_dispatches_and_filters_one_second(self, cfg):
+        # Issue #355 round trip: a desugared point window rides the ordinary
+        # explicit path — granule subsetting, dataset-unit bounds, and the
+        # observation-level ge/lt filter pair are all one second wide.
+        from zagg.config import windowed_cell_config
+        from zagg.runner import _windowed_units
+
+        w = self._windowing(
+            cfg,
+            schedule="explicit",
+            windows=[{"label": "scene-a", "timestamp": "2019-06-01T12:00:00Z"}],
+        )
+        hit = _timed_rec(1, "2019-06-01T11:59:00Z", "2019-06-01T12:01:00Z")
+        miss = _timed_rec(2, "2019-06-02T00:00:00Z", "2019-06-02T00:05:00Z")
+        units = _windowed_units([(11, [hit, miss])], w, None)
+        assert [(w_["label"], [r["id"] for r in recs]) for _k, recs, w_ in units] == [
+            ("scene-a", ["g1"])
+        ]
+        window = units[0][2]
+        assert window["end"] - window["start"] == 1.0
+        unit_cfg, _windowing_out = windowed_cell_config(cfg, window)
+        ge, lt = unit_cfg.data_source["filters"][-2:]
+        assert (ge["op"], lt["op"]) == ("ge", "lt")
+        assert lt["value"] - ge["value"] == 1.0
 
     def test_shard_with_no_matching_granules_dispatches_nothing(self, cfg):
         from zagg.runner import _windowed_units
