@@ -240,6 +240,16 @@ def _runtime_s(summary: dict) -> float | None:
     return None
 
 
+def _is_nan(value) -> bool:
+    """Is this the float NaN a missing number degrades to off parquet or JSON?
+
+    A legacy parquet row reads a missing number back as NaN rather than None
+    after the reindex, and ``json.dumps``/``json.loads`` round-trip the bare
+    ``NaN`` token, so a metrics JSON can carry one too.
+    """
+    return isinstance(value, float) and math.isnan(value)
+
+
 def memory_pct_of_cap(max_memory_mb, memory_gb) -> float | None:
     """Fraction of the Lambda memory cap a shard peaked at (issue #120).
 
@@ -251,8 +261,7 @@ def memory_pct_of_cap(max_memory_mb, memory_gb) -> float | None:
     """
     if max_memory_mb is None or memory_gb is None:
         return None
-    # A legacy parquet row reads back as NaN, not None, after the reindex.
-    if isinstance(max_memory_mb, float) and math.isnan(max_memory_mb):
+    if _is_nan(max_memory_mb):
         return None
     cap_mb = memory_gb * 1024.0
     if cap_mb <= 0:
@@ -265,6 +274,9 @@ def has_empty_metrics(record: dict) -> bool:
 
     ``total_obs`` 0/missing or a null ``max_memory_mb`` is the signature of a
     silent OOM -- there is no measurement in the row, only the shape of one.
+    NaN counts as missing on either field, same as in :func:`memory_pct_of_cap`:
+    a metrics JSON round-trips the bare ``NaN`` token, and ``not float("nan")``
+    is ``False``, so an unguarded predicate would retain that row as a real point.
 
     ONE definition, shared by ``run_benchmark``'s ``--fail-on-empty`` tripwire and
     ``update_series``'s retention filter (issue #365). The two used to be the same
@@ -273,7 +285,9 @@ def has_empty_metrics(record: dict) -> bool:
     appender has to recognise exactly the junk row the tripwire names -- otherwise
     record-before-assert would retain the obs=0 point it was meant to reject.
     """
-    return not record.get("total_obs") or record.get("max_memory_mb") is None
+    max_memory_mb = record.get("max_memory_mb")
+    total_obs = record.get("total_obs")
+    return not total_obs or _is_nan(total_obs) or max_memory_mb is None or _is_nan(max_memory_mb)
 
 
 def build_record(

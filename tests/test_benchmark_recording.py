@@ -90,6 +90,22 @@ def test_has_empty_metrics_is_the_one_definition():
     assert not bench_metrics.has_empty_metrics({"total_obs": 1, "max_memory_mb": 1.0})
 
 
+def test_has_empty_metrics_treats_nan_as_missing(tmp_path):
+    # NaN, not None, is how a missing number arrives off parquet -- and json.dumps
+    # emits the bare ``NaN`` token, which json.loads reads straight back, so a
+    # metrics.json can carry one into the filter. ``not float("nan")`` is False,
+    # so an unguarded predicate would retain that row as a real measurement.
+    nan = float("nan")
+    assert bench_metrics.has_empty_metrics({"total_obs": 5_000_000, "max_memory_mb": nan})
+    assert bench_metrics.has_empty_metrics({"total_obs": nan, "max_memory_mb": 1200.0})
+    # End to end: the token survives the JSON round-trip and the row is dropped.
+    series = tmp_path / "series.parquet"
+    records = json.loads(json.dumps([_rec(mem=nan)]))
+    assert records[0]["max_memory_mb"] != records[0]["max_memory_mb"]  # NaN survived
+    update_series.main(["--series", str(series), "--records", _write(tmp_path, [_rec(mem=nan)])])
+    assert update_series.load_series(series).empty
+
+
 @pytest.mark.parametrize(
     ("record", "why"),
     [
