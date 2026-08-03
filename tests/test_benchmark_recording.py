@@ -35,7 +35,7 @@ def _rec(commit="c1", target="t1", *, event="merge", obs=5_000_000, mem=1200.0, 
         "max_memory_mb": mem,
         "objects_total": 12,
         "objects_write_path": 12,
-        "objects_expected": 10,
+        "objects_expected": 12,
         "objects_mismatch": mismatch,
     }
 
@@ -195,7 +195,14 @@ def test_appending_to_a_series_that_predates_the_column(tmp_path):
 
 
 def test_mixed_batch_keeps_the_good_records(tmp_path):
+    # A PARTIALLY dropped batch takes the concat branch, not the ``not records``
+    # early return -- so the dtype guarantee pinned above for an all-dropped batch
+    # has to hold on this path too: the surviving records must not widen the
+    # retained history's integer columns to float.
     series = tmp_path / "series.parquet"
+    seed = update_series.records_to_frame([_rec(commit="c0", target="t0")])
+    update_series.save_series(seed, series)
+    before = update_series.load_series(series)
     update_series.main(
         [
             "--series",
@@ -212,4 +219,6 @@ def test_mixed_batch_keeps_the_good_records(tmp_path):
         ]
     )
     out = update_series.load_series(series)
-    assert sorted(out["target"]) == ["t1", "t3"]
+    assert sorted(out["target"]) == ["t0", "t1", "t3"]
+    assert out["total_obs"].dtype == before["total_obs"].dtype
+    assert out["objects_total"].dtype == before["objects_total"].dtype
