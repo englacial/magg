@@ -224,7 +224,11 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     exclusion — so the per-(field, order) absence is recorded exactly as the
     block-wide one is: zero-open filtering, never a probe. Fields not named
     there carry no ``orders`` key and inherit the block schedule, so a config
-    without the knob declares byte-identically to pre-#352 zagg.
+    without the knob declares byte-identically to pre-#352 zagg. An empty
+    per-field schedule is warned about on the same footing as the D24 ``none``
+    exclusion below it — structurally the same outcome (a declared field that
+    is absent everywhere) — and excluding EVERY composable field says so
+    loudly: that declares a pyramid the sweep would never write.
     """
     from zagg.config import get_agg_fields, get_pyramid
     from zagg.semantics import EXACT_MERGE_LAWS, _fold_function_name, composability_classes
@@ -237,7 +241,8 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     agg = get_agg_fields(config)
     selection = knob.get("fields") or {}
     fields: dict = {}
-    excluded = []
+    excluded: list = []
+    deselected: list = []
     for name, cls in composability_classes(config).items():
         meta = agg[name]
         if cls == "exact":
@@ -265,7 +270,22 @@ def build_pyramid_block(config, shard_order: int) -> dict:
             continue
         if name in selection:
             entry["orders"] = _field_orders(name, selection[name], orders)
+            if not entry["orders"]:
+                deselected.append(name)
         fields[name] = entry
+    if deselected and orders:
+        every = len(deselected) == len([e for e in fields.values() if e.get("class") != "none"])
+        logger.warning(
+            f"pyramid: fields {deselected} are excluded from every declared order by "
+            f"output.pyramid.fields — recorded absence (issue #352), not a missing sweep"
+            + (
+                f"; that is EVERY composable field, so the declared orders {orders} would "
+                f"materialize nothing — `output.pyramid: false` is how a store declares no "
+                f"pyramid at all"
+                if every
+                else ""
+            )
+        )
     if excluded and orders:
         logger.warning(
             f"pyramid: fields {excluded} are non-composable (D24 class 'none') and will "

@@ -571,6 +571,28 @@ class TestPyramidBlock:
         # The intersection is never silent: it names the field and what it dropped.
         assert "'h_min'" in caplog.text and "[5]" in caplog.text
 
+    def test_excluded_fields_warn_like_the_none_class_ones(self, caplog):
+        """An empty schedule is the same outcome as a ``none`` class — warn alike."""
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"fields": {"h_min": False}})
+        overview = build_pyramid_block(cfg, shard_order=6)["overview"]
+        assert overview["fields"]["h_min"]["orders"] == []
+        assert "excluded from every declared order" in caplog.text and "h_min" in caplog.text
+        # Some composable fields remain, so this is NOT the whole-pyramid case.
+        assert "EVERY composable field" not in caplog.text
+
+    def test_excluding_every_composable_field_warns(self, caplog):
+        """`fields: {a: false, ...}` over the whole set declares a pyramid that writes nothing."""
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"fields": {"count": False, "h_min": False, "h_max": False}})
+        overview = build_pyramid_block(cfg, shard_order=6)["overview"]
+        assert overview["orders"] == [4, 2, 0]  # declared...
+        assert all(overview["fields"][n]["orders"] == [] for n in ("count", "h_min", "h_max"))
+        assert "EVERY composable field" in caplog.text
+        assert "output.pyramid: false" in caplog.text  # the spelling that means this
+
     def test_unusable_field_schedule_inherits_the_block(self, caplog):
         """An unusable ``orders`` must not narrow: a str parses, so gate on shape."""
         from zagg.sweep_overview import build_pyramid_block
