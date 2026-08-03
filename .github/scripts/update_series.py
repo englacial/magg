@@ -6,9 +6,12 @@ pre-merge PR runs are reported as an ephemeral comment and dropped (too noisy
 while chasing a regression). This module is the read/append/write core plus a
 thin CLI; ``plot_series.py`` renders the GitHub Pages charts from the same file.
 
-This is also where a run's records are judged RETAINABLE (issue #365): the merge
-job appends whatever the benchmark's tripwires concluded, so rejecting a junk
-measurement is this module's job, not the job ordering's.
+This is also where a run's records are judged RETAINABLE (issue #365): once the
+merge job appends whatever the benchmark's tripwires concluded, rejecting a junk
+measurement becomes this module's job rather than the job ordering's. That
+workflow gate is a later phase and is NOT on this branch -- today the append
+still only runs when the tripwires passed, so the filter in :func:`main` is the
+precondition for that change, inert until the gate lands.
 
 Re-running a merge (a re-dispatch of the same commit) replaces that commit's rows
 rather than double-counting, so the series stays one row per (commit, target).
@@ -49,12 +52,14 @@ def append_records(existing: pd.DataFrame, records: list[dict]) -> pd.DataFrame:
     Keeping the last write makes a merge re-run idempotent instead of duplicating
     a point in the plotted history.
 
-    Appending NOTHING leaves the series byte-identical rather than rewriting it:
-    concat against an all-null frame widens every integer column to float (issue
-    #365). That path is no longer rare -- the retention filter in :func:`main`
-    drops an unusable run's records, so a silently OOM'd merge now arrives here
-    with an empty list, and a run that measured nothing must not be able to
-    change the dtypes of every point that came before it.
+    Appending NOTHING returns the series unchanged, so the unconditional
+    :func:`save_series` that follows rewrites it byte-identically and the data
+    branch sees no commit: concat against an all-null frame would instead widen
+    every integer column to float (issue #365). That path stops being rare once
+    the workflow gate lands -- the retention filter in :func:`main` drops an
+    unusable run's records, so a silently OOM'd merge will arrive here with an
+    empty list, and a run that measured nothing must not be able to change the
+    dtypes of every point that came before it.
     """
     if not records:
         return existing.reset_index(drop=True)
@@ -84,9 +89,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("records JSON must be a list of record objects")
 
     # What may be retained is decided HERE, at the retention boundary, rather than
-    # by whether the benchmark job got this far (issue #365): the merge workflow now
-    # appends even when a tripwire fired, so a run whose metrics are junk must be
-    # rejected by this filter instead of by the job aborting before the append.
+    # by whether the benchmark job got this far (issue #365): once the merge workflow
+    # appends even when a tripwire fired, a run whose metrics are junk has to be
+    # rejected by this filter instead of by the job aborting before the append. The
+    # workflow gate is a later phase, so until it lands this filter only ever sees
+    # runs that already passed their tripwires.
     #   - non-merge (the locked design): a stray PR record must never evict a
     #     retained merge point via the (commit, target) dedup.
     #   - empty metrics (issue #145): obs=0 / null peak memory is a silent OOM, a

@@ -279,11 +279,12 @@ def has_empty_metrics(record: dict) -> bool:
     is ``False``, so an unguarded predicate would retain that row as a real point.
 
     ONE definition, shared by ``run_benchmark``'s ``--fail-on-empty`` tripwire and
-    ``update_series``'s retention filter (issue #365). The two used to be the same
-    predicate by construction: an empty run aborted the job, so the append step
-    never ran. Now that the append runs regardless of the tripwire verdict, the
-    appender has to recognise exactly the junk row the tripwire names -- otherwise
-    record-before-assert would retain the obs=0 point it was meant to reject.
+    ``update_series``'s retention filter (issue #365). The two are still the same
+    predicate by construction today: an empty run aborts the job, so the append
+    step never runs. Once the append runs regardless of the tripwire verdict (the
+    workflow gate, a later phase), the appender has to recognise exactly the junk
+    row the tripwire names -- otherwise record-before-assert would retain the
+    obs=0 point it was meant to reject.
     """
     max_memory_mb = record.get("max_memory_mb")
     total_obs = record.get("total_obs")

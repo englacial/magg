@@ -81,8 +81,10 @@ FULL_AOI_COLUMNS = [
     # when the layout's count is data-dependent). The run record's
     # ``objects_mismatch`` description stays JSON-only (dropped by the
     # reindex) on this leg: the release harness never fails on a mismatch, so
-    # its point is retained either way -- unlike the per-merge series, where a
-    # mismatch turns the job red and the row has to carry the reason (#365).
+    # its point is retained either way. The per-merge series takes the other
+    # route: a mismatch there turns the job red and today the row is discarded
+    # with it, and once the workflow gate of issue #365 lets that run reach the
+    # append, the row will carry the reason in its ``objects_mismatch`` column.
     "objects_total",
     "objects_expected",
     # Store-layout axis + flat<->hive parity verdict (issue #240 phase 4).
