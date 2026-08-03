@@ -451,6 +451,10 @@ def merge_tdigests_kway(
     standard ``build_tdigest`` reducer on the spill path, where each input is a
     saturated per-block digest and the block count is small.
 
+    Order-independence covers **both** channels: with ``locations``, the sort
+    breaks ``(mean, weight)`` ties on the location word, so a permutation of the
+    inputs returns the same location vector as well as the same digest.
+
     Parameters
     ----------
     digests : list of ndarray
@@ -507,16 +511,25 @@ def merge_tdigests_kway(
     # digest order. A stable argsort on mean alone breaks ties by concatenation
     # position (i.e. input order), which makes the k-way fold permutation-
     # dependent when means tie across digests (discrete/quantized sources).
-    # Sub-centroids with identical (mean, weight) are interchangeable, so their
-    # residual order does not affect the result (issue #279).
-    order = np.lexsort((combined[:, 1], combined[:, 0]))
+    # Sub-centroids with identical (mean, weight) are interchangeable *for the
+    # digest*, but not for the location channel: a tie straddling a compression
+    # boundary would send different location words into different output
+    # centroids depending on input order. So the located branch adds the
+    # location word as a tertiary (least-significant) key — it changes no digest
+    # byte (the tied rows carry identical means and weights) and makes the
+    # companion channel permutation-independent too (issues #279/#370).
+    if located:
+        combined_locs = np.concatenate(locs)
+        order = np.lexsort((combined_locs, combined[:, 1], combined[:, 0]))
+        combined_locs = combined_locs[order]
+    else:
+        order = np.lexsort((combined[:, 1], combined[:, 0]))
     combined = combined[order]
     out_means, out_weights, starts = _compress(combined[:, 0], combined[:, 1], float(delta))
     out = np.empty((len(out_means), 2), dtype=np.float32)
     out[:, 0] = out_means
     out[:, 1] = out_weights
     if located:
-        combined_locs = np.concatenate(locs)[order]
         return out, _centroid_ancestors(combined_locs, starts, len(combined))
     return out
 
