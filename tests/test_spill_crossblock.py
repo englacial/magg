@@ -250,11 +250,45 @@ class TestSpillFoldProbe:
 
     def test_mode_merge_validation_unchanged(self):
         # The spill probe widening must not leak into mode: merge — its
-        # per-flush fold degrades locations continuously and ignores where.
+        # per-flush fold degrades locations continuously, ignores where, and
+        # would re-quantize composition lanes every flush.
         with pytest.raises(ValueError, match="located ragged"):
             validate_streaming(_config(_variables(located=True)))
         with pytest.raises(ValueError, match="h_sig"):
             validate_streaming(_config(_variables(strata=True)))
+        variables = _variables()
+        variables["composition"] = _composition_field()
+        with pytest.raises(ValueError, match="composition.*not.*mergeable"):
+            validate_streaming(_config(variables))
+
+    def test_merge_mode_messages_route_to_spill(self):
+        # Phase 3 (issue #370): the merge-mode rejections keep their
+        # strictness but now name the fold behavior and the mode: spill
+        # remedy, so a config author lands on the working mode in one read.
+        for variables in (
+            _variables(located=True),
+            _variables(strata=True),
+        ):
+            with pytest.raises(ValueError, match="mode: spill"):
+                validate_streaming(_config(variables))
+        variables = _variables()
+        variables["composition"] = _composition_field()
+        with pytest.raises(ValueError, match="mode: spill"):
+            validate_streaming(_config(variables))
+
+    def test_overflow_message_names_the_fold_surface(self, monkeypatch):
+        # A genuinely non-foldable config crossing the threshold names what
+        # the fold DOES cover (and still names the remedies).
+        from zagg.processing.spill import SpillOverflowError
+
+        _force_tiny_blocks(monkeypatch)
+        variables = _variables()
+        variables["h_spread"] = {"expression": "np.nanmax(h_ph) - np.nanmin(h_ph)"}
+        cfg = _config(variables, streaming=_SPILL)
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, _shard_key(), _CELL_LISTS[:2], obs_per_cell=10, seed=1)
+        with pytest.raises(SpillOverflowError, match="cross-block fold law.*memory tier"):
+            _run(monkeypatch, cfg, grid, _shard_key(), dfs)
 
 
 class TestLocatedMultiBlock:

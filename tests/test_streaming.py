@@ -109,10 +109,10 @@ class TestStreamingConfig:
             validate_streaming(cfg)
 
     def test_stratified_where_reducer_rejected(self):
-        # Streaming/spill-fold rebuilds digests from the raw source column
-        # ((source, delta) only), so the ``where`` mask would be silently
-        # ignored — the merge surface must reject it until a masked fold law
-        # exists (issue #321).
+        # The merge-mode fold rebuilds digests from the raw source column
+        # ((source, delta) only) and has no ``where`` state — it must keep
+        # rejecting strata even though the spill fold now evaluates the mask
+        # per block (issue #370); the message routes authors to mode: spill.
         cfg = _config()
         cfg.aggregation["variables"]["h_sig"] = {
             "kind": "ragged",
@@ -125,8 +125,9 @@ class TestStreamingConfig:
             validate_streaming(cfg)
 
     def test_composition_scalar_rejected(self):
-        # The packed composition word's fold (digest-weighted lane mean, issue
-        # #321) is not wired into the streaming state — reject, don't corrupt.
+        # The packed composition word folds only on the spill path (issue
+        # #370): a per-flush merge-mode fold would re-quantize the lanes on
+        # every flush, compounding the O(n/510) error — reject, don't corrupt.
         cfg = _config()
         cfg.aggregation["variables"]["composition"] = {
             "function": "zagg.stats.composition.pack_composition",
@@ -159,8 +160,9 @@ class TestStreamingConfig:
         validate_streaming(cfg)
 
     def test_located_ragged_rejected(self):
-        # The located channel (issue #87) is not threaded through the
-        # streaming state yet; reject rather than silently drop it.
+        # The located channel (issue #87) folds on the spill path's block
+        # closes (issue #370); merge mode folds every flush, which would
+        # coarsen centroid locations continuously — keep rejecting it here.
         cfg = _config()
         cfg.aggregation["variables"]["h_tdigest"]["location"] = "leaf_id"
         with pytest.raises(ValueError, match="located ragged fields .* cannot stream"):

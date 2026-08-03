@@ -20,7 +20,11 @@ validated up front (:func:`validate_streaming`):
   the shard fits in a single buffer, since one flush == one pooled build).
 
 Everything else (expressions, vector fields, ``resolution: chunk`` companions,
-``chunk_precompute``) has no incremental-merge story and raises. A fixed-size
+``chunk_precompute``) has no incremental-merge story and raises. Located
+ragged fields, ``build_tdigest_where`` strata, and the packed composition word
+also raise **here** (per-flush folding would degrade locations continuously /
+re-quantize lanes per flush) but fold on the spill path's rare block closes —
+:func:`validate_spill_fold`, issue #370. A fixed-size
 buffer is used rather than pure granule-by-granule updates because each flush
 costs one merge round over the touched cells (~10 µs/cell, see
 ``zagg/stats/tdigest.py``): near 88S a tangent-running granule touches most of
@@ -124,13 +128,27 @@ def validate_streaming(config: PipelineConfig) -> None:
             problems.append(f"field '{name}': resolution '{sig['resolution']}' cannot stream")
         elif sig["kind"] == "ragged":
             if sig["location"] is not None:
-                # The located channel (issue #87) has a merge law (located
-                # merge_tdigests), but the streaming state does not thread
-                # per-cell locations yet — reject rather than silently dropping
-                # the channel from the store.
+                # The located channel (issue #87) has a merge law (the located
+                # merge_tdigests overloads), but merge mode folds every
+                # buffer_granules flush — each fold coarsens merged centroids'
+                # locations toward common ancestors, so per-flush folding
+                # degrades the channel continuously. Spill folds only on the
+                # rare block close (issue #370), so route located configs there.
                 problems.append(
                     f"field '{name}': located ragged fields (location: "
-                    f"{sig['location']!r}) cannot stream yet"
+                    f"{sig['location']!r}) cannot stream under mode: merge — every "
+                    f"flush folds the running digest, coarsening centroid locations "
+                    f"continuously; use mode: spill, which folds only on block "
+                    f"closes (issue #370)"
+                )
+            elif meta.get("function") == _TDIGEST_WHERE_FUNCTION:
+                # Stratum membership needs the raw rows at build time; merge
+                # mode has no where state, but the spill fold evaluates the
+                # mask per block before each build (issue #370).
+                problems.append(
+                    f"field '{name}': build_tdigest_where has no per-flush merge law "
+                    f"(the where stratum folds only on the spill path — use "
+                    f"mode: spill, issue #370)"
                 )
             elif meta.get("function") not in _TDIGEST_FUNCTIONS:
                 problems.append(
@@ -149,7 +167,16 @@ def validate_streaming(config: PipelineConfig) -> None:
         elif sig["kind"] == "scalar":
             # ``count`` is the pooled path's alias of ``len`` (aggregate.py);
             # both merge by summation.
-            if meta.get("function") not in ("len", "count"):
+            if meta.get("function") == _COMPOSITION_FUNCTION:
+                # The packed word folds via merge_composition on the spill
+                # path (issue #370 option (a)); merge mode would re-quantize
+                # the lanes on every flush, compounding the O(n/510) error.
+                problems.append(
+                    f"field '{name}': the packed composition word is not per-flush "
+                    f"mergeable (each fold re-quantizes the lanes); it folds only on "
+                    f"the spill path — use mode: spill, issue #370"
+                )
+            elif meta.get("function") not in ("len", "count"):
                 problems.append(
                     f"field '{name}': scalar function {meta.get('function')!r} is not "
                     "mergeable (only 'len'/'count')"
