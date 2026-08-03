@@ -179,16 +179,22 @@ def _force_tiny_blocks(monkeypatch):
 _CELL_LISTS = [[0, 4, 8], [2, 4, 10], [1, 8, 9], [0, 10, 15], [4, 8, 10]]
 
 
-def _contributors(dfs, grid, cell, mask_fn=None):
-    """Every leaf word the granules contribute to child cell ``cell``."""
-    words = []
+def _contributor_rows(dfs, grid, cell, mask_fn=None):
+    """Every ``(h_ph value, leaf word)`` row the granules contribute to ``cell``."""
+    values, words = [], []
     for df in dfs:
         in_cell = np.asarray(grid.cells_of(df["leaf_id"].values)) == cell
         keep = in_cell
         if mask_fn is not None:
             keep = in_cell & mask_fn(df)
+        values.append(df["h_ph"].values[keep])
         words.append(df["leaf_id"].values[keep])
-    return np.concatenate(words)
+    return np.concatenate(values), np.concatenate(words)
+
+
+def _contributors(dfs, grid, cell, mask_fn=None):
+    """Every leaf word the granules contribute to child cell ``cell``."""
+    return _contributor_rows(dfs, grid, cell, mask_fn)[1]
 
 
 def _assert_ancestor_or_equal(locs, contributors):
@@ -406,7 +412,10 @@ class TestLocatedMultiBlock:
     def test_below_knee_locations_are_exact_point_words(self, monkeypatch):
         # n <= delta across every block: the fold stays loss-free, every
         # centroid is weight 1, and its location is the exact order-29 point
-        # word — the multiset of locations equals the contributor words.
+        # word — the multiset of locations equals the contributor words, AND
+        # each digest row's location is that row's own leaf. The multiset check
+        # alone is permutation-invariant, so it would pass a shuffled location
+        # channel; the per-row map below is what pins the alignment.
         _force_tiny_blocks(monkeypatch)
         key = _shard_key()
         cfg = _config(_variables(located=True, delta=512), streaming=_SPILL)
@@ -418,8 +427,17 @@ class TestLocatedMultiBlock:
         assert len(vals) > 0
         for cell_i, digest, cell_locs in zip(idx, vals, locs, strict=True):
             assert (digest[:, 1] == 1.0).all()
-            contributors = _contributors(dfs, grid, int(children[cell_i]))
+            values, contributors = _contributor_rows(dfs, grid, int(children[cell_i]))
             np.testing.assert_array_equal(np.sort(cell_locs), np.sort(contributors))
+            # Weight-1 centroids: digest[i, 0] IS an observation value (float32,
+            # the payload dtype), so the value identifies its row. Heights are
+            # drawn from a continuous normal, so ties are measure-zero — assert
+            # uniqueness rather than assume it.
+            keys = values.astype(np.float32)
+            assert len(np.unique(keys)) == len(keys)
+            value_to_leaf = dict(zip(keys.tolist(), contributors.tolist(), strict=True))
+            for centroid, loc in zip(digest, cell_locs, strict=True):
+                assert value_to_leaf[float(centroid[0])] == int(loc)
 
     def test_multi_block_actually_engaged(self, monkeypatch):
         _force_tiny_blocks(monkeypatch)
