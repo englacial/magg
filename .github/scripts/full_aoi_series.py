@@ -80,7 +80,9 @@ FULL_AOI_COLUMNS = [
     # measured store object total and the config-derived expectation (null
     # when the layout's count is data-dependent). The run record's
     # ``objects_mismatch`` description stays JSON-only (dropped by the
-    # reindex), like the per-merge series.
+    # reindex) on this leg: the release harness never fails on a mismatch, so
+    # its point is retained either way -- unlike the per-merge series, where a
+    # mismatch turns the job red and the row has to carry the reason (#365).
     "objects_total",
     "objects_expected",
     # Store-layout axis + flat<->hive parity verdict (issue #240 phase 4).

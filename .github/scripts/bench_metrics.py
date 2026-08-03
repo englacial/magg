@@ -116,9 +116,8 @@ RECORD_COLUMNS = [
     # count is data-dependent, i.e. not exact) -- the sharded-write-bypass
     # tripwire (issue #215). Null on rows recorded before the metric existed.
     # The per-run record additionally carries the JSON-only
-    # ``objects_per_shard`` / ``objects_telemetry`` / ``objects_mismatch``
-    # keys, which the reindex to these columns deliberately drops from the
-    # parquet series.
+    # ``objects_per_shard`` / ``objects_telemetry`` keys, which the reindex to
+    # these columns deliberately drops from the parquet series.
     "objects_total",
     "objects_expected",
     # Store-layout axis (issue #240 phase 4): "flat" | "hive". Null on rows
@@ -161,6 +160,14 @@ RECORD_COLUMNS = [
     # earlier rows. Appended last per the stable-schema rule, so it sits away
     # from the objects columns it belongs with.
     "objects_write_path",
+    # The object-count tripwire's verdict (issue #365): the mismatch description
+    # when the audited count deviated from the expectation, null when it agreed.
+    # Retained rather than left JSON-only because the run that trips the tripwire
+    # is now RECORDED before the job goes red -- so the row has to say why it is
+    # anomalous, or a reader hits an unexplained step in the object counts with
+    # nothing in the series to attribute it to. Null on rows recorded before the
+    # column existed (and on every clean run since).
+    "objects_mismatch",
 ]
 
 # summary["worker_phase_max"] key -> series column (issues #250/#256). A phase
@@ -253,6 +260,22 @@ def memory_pct_of_cap(max_memory_mb, memory_gb) -> float | None:
     return max_memory_mb / cap_mb
 
 
+def has_empty_metrics(record: dict) -> bool:
+    """Did this target come back without a usable measurement (issue #145)?
+
+    ``total_obs`` 0/missing or a null ``max_memory_mb`` is the signature of a
+    silent OOM -- there is no measurement in the row, only the shape of one.
+
+    ONE definition, shared by ``run_benchmark``'s ``--fail-on-empty`` tripwire and
+    ``update_series``'s retention filter (issue #365). The two used to be the same
+    predicate by construction: an empty run aborted the job, so the append step
+    never ran. Now that the append runs regardless of the tripwire verdict, the
+    appender has to recognise exactly the junk row the tripwire names -- otherwise
+    record-before-assert would retain the obs=0 point it was meant to reject.
+    """
+    return not record.get("total_obs") or record.get("max_memory_mb") is None
+
+
 def build_record(
     summary: dict,
     *,
@@ -329,15 +352,15 @@ def build_record(
     wpm = summary.get("worker_phase_max") or {}
     for src, col in PHASE_MAP.items():
         record[col] = wpm.get(src)
-    # Store object counts (issue #240). The two scalar columns are retained in
-    # the parquet series; per_shard/mismatch ride the metrics.json record only
-    # (update_series's reindex drops them).
+    # Store object counts (issue #240). The scalar columns and the mismatch
+    # verdict (issue #365) are retained in the parquet series; per_shard rides
+    # the metrics.json record only (update_series's reindex drops it).
     o = objects or {}
     record["objects_total"] = o.get("objects_total")
     record["objects_write_path"] = o.get("objects_write_path")
     record["objects_expected"] = o.get("objects_expected")
     record["objects_per_shard"] = o.get("objects_per_shard")
-    # Per-run root telemetry (issue #362): JSON-only like per_shard/mismatch —
+    # Per-run root telemetry (issue #362): JSON-only like per_shard --
     # reported so an accumulating shared store is legible, never audited.
     record["objects_telemetry"] = o.get("objects_telemetry")
     record["objects_mismatch"] = o.get("objects_mismatch")

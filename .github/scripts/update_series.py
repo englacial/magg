@@ -70,13 +70,28 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(records, list):
         raise SystemExit("records JSON must be a list of record objects")
 
-    # Only merge runs are retained (the locked design). Enforce it at the boundary
-    # so a stray non-merge record can never evict a retained merge point via the
-    # (commit, target) dedup. Report drops -- a silent skip would read as "stored".
-    retained = [r for r in records if r.get("event") == "merge"]
-    dropped = len(records) - len(retained)
-    if dropped:
-        print(f"skipping {dropped} non-merge record(s); only merge runs are retained")
+    # What may be retained is decided HERE, at the retention boundary, rather than
+    # by whether the benchmark job got this far (issue #365): the merge workflow now
+    # appends even when a tripwire fired, so a run whose metrics are junk must be
+    # rejected by this filter instead of by the job aborting before the append.
+    #   - non-merge (the locked design): a stray PR record must never evict a
+    #     retained merge point via the (commit, target) dedup.
+    #   - empty metrics (issue #145): obs=0 / null peak memory is a silent OOM, a
+    #     junk point that would plot as a real dip to zero.
+    # An object-count mismatch (issue #240) is NOT in this list -- that run measured
+    # fine and is exactly the point worth keeping; its verdict rides the row's
+    # ``objects_mismatch`` column. Every drop is reported: a silent skip reads as
+    # "stored".
+    retained, dropped = [], []
+    for r in records:
+        if r.get("event") != "merge":
+            dropped.append((r.get("target"), "non-merge run"))
+        elif bench_metrics.has_empty_metrics(r):
+            dropped.append((r.get("target"), "empty metrics (obs=0 / no peak memory)"))
+        else:
+            retained.append(r)
+    for target, why in dropped:
+        print(f"skipping record for '{target}': {why}")
 
     existing = load_series(args.series)
     updated = append_records(existing, retained)
