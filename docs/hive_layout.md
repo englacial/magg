@@ -112,7 +112,9 @@ output:
     windows:                        # explicit schedule only:
       - {label: melt-2019, start: "2019-06-01", end: "2019-09-01"}
       - {label: melt-2020, start: "2020-06-01", end: "2020-09-01"}
-      - {label: scene-a, timestamp: "2021-03-14T12:00:00Z"}  # point form
+      - {label: scene-a, timestamp: "2021-03-14T12:00:31.024Z"}  # point form:
+                                    #   the acquisition's OWN instant, copied
+                                    #   from the item — not a rounded-off one
 ```
 
 - **Leaf naming is frozen**: `{full_id}_{window}.zarr`, underscore separator,
@@ -136,7 +138,18 @@ output:
   as overlapping — as is a point that lands inside an already-declared range
   window, which is an ordinary overlap (see the validation paragraph below).
   If that ever bites, the fix is an explicit `width` key on the point form, not
-  a guessed default.
+  a guessed default; until it exists, any key on a point entry other than
+  `label`/`timestamp` (`width` included) is rejected rather than ignored.
+- **A point window that matches nothing fails SILENTLY** — it covers only the
+  whole second containing `t`, so the declared `timestamp` must be the
+  acquisition's own instant, copied from the item, not a rounded-off
+  approximation of it. STAC datetimes are rarely round seconds, so this is the
+  likely first-contact mistake: `timestamp: "2021-03-14T12:00:00Z"` matches
+  nothing for a scene whose `datetime` is `2021-03-14T12:00:31.024Z`. On the
+  point pipeline the window still dispatches and the worker's `ge`/`lt` filter
+  matches nothing, leaving an empty leaf; on raster the group is dropped at
+  dispatch (`runner._raster_windowed_units`) and no work unit, leaf, or warning
+  is produced at all. Neither path errors.
 - **Boundaries are UTC calendar terms, half-open `[start, end)`.** Window
   bounds are converted to dataset units once at dispatch, using the declared
   `epoch`/`scale`/`units` and a fixed scale offset (`GPS−UTC = 18 s`,
