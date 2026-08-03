@@ -2456,8 +2456,12 @@ def _validate_pyramid_fields(knob: dict, declared: dict, parent_order: int) -> N
     are near-free dense merges, so ``h_tdigest`` may run every 4 orders while
     ``count`` stays at every one. A per-field order outside the block schedule
     refuses rather than widening it: the sweep only ever walks the block's own
-    orders, so a widening entry would silently do nothing.
+    orders, so a widening entry would silently do nothing. Scheduling a
+    ``none``-class field refuses for the same reason — D24 excludes it from
+    every order regardless — while ``false``/``[]`` over one stays legal, since
+    that only states the exclusion the block already records.
     """
+    from zagg.semantics import field_composability
     from zagg.sweep_overview import pyramid_orders
 
     fields = knob["fields"]
@@ -2489,6 +2493,18 @@ def _validate_pyramid_fields(knob: dict, declared: dict, parent_order: int) -> N
             raise ValueError(
                 f"output.pyramid.fields.{name}.orders {extra} are outside the pyramid "
                 f"schedule {schedule} — a per-field schedule may only narrow it"
+            )
+        if not orders:
+            continue
+        try:
+            composable = field_composability(declared[name]) != "none"
+        except Exception:
+            continue  # malformed meta: the kind/shape validators own that error
+        if not composable:
+            raise ValueError(
+                f"output.pyramid.fields.{name}.orders schedules overviews for a "
+                f"non-composable field (D24 class 'none'), which is excluded from every "
+                f"order regardless — drop the entry, or write `false` to say so explicitly"
             )
 
 

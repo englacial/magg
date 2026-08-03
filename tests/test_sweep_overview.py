@@ -511,6 +511,20 @@ class TestPyramidBlock:
         with pytest.raises(ValueError, match="fields must be a mapping"):
             validate_config(self._cfg(store_layout="hive", pyramid={"fields": ["h_min"]}))
 
+    def test_validate_refuses_a_schedule_on_a_none_class_field(self):
+        """Scheduling a D24 ``none`` field would silently do nothing — so it refuses."""
+        from zagg.config import validate_config
+
+        with pytest.raises(ValueError, match="non-composable field"):
+            validate_config(
+                self._cfg(store_layout="hive", pyramid={"fields": {"h_mean": {"orders": [4]}}})
+            )
+        # Stating the exclusion the block already records stays legal.
+        validate_config(self._cfg(store_layout="hive", pyramid={"fields": {"h_mean": False}}))
+        validate_config(
+            self._cfg(store_layout="hive", pyramid={"fields": {"h_mean": {"orders": []}}})
+        )
+
     def test_field_schedule_recorded_in_block(self):
         """The per-field schedule is manifest-recorded — D24 option A absence."""
         from zagg.sweep_overview import build_pyramid_block
