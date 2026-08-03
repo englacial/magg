@@ -205,6 +205,30 @@ post-process sweep (D11), never at fan-out time, and the sweep adds its
 `materialized` actuals under the same key. Declaring it is not birth-only:
 see [Retrofitting the pyramid declaration](#retrofitting-the-pyramid-declaration).
 
+Which fields ride the schedule is a per-field knob (issue #352). The folds are
+not equally cheap — count/sum/min/max are dense merges, while a t-digest fold
+is a ragged read plus a k-way merge at every ancestor node — so
+`output.pyramid.fields` narrows an expensive field's schedule (or drops it)
+without coarsening the cheap ones:
+
+```yaml
+output:
+  pyramid:
+    orders: [7, 5, 3, 1]
+    fields:                       # optional; absent = every field at every order
+      h_tdigest: {orders: [7, 5]} # the costly fold, only near the top
+      photon_ids: false           # never in an overview
+```
+
+A per-field schedule may only **narrow** the block's `orders` (a wider one
+refuses at config-validation time — the sweep walks the block's orders, so a
+widening entry would silently do nothing). The narrowing is recorded in the
+manifest as the field's own `orders` list, so a reader learns the absence from
+the declaration alone — the same zero-open filtering D24 option A gives a
+`"class": "none"` field, never a probe. Fields the knob does not name carry no
+`orders` key and inherit the block schedule, so a config without the knob
+declares exactly as it did before the knob existed.
+
 A windowed store ([Time windows](#time-windows-morton-hive2)) additionally
 declares `spec: "morton-hive/2"` and a `temporal` block — schedule,
 `time_field`, `epoch`/`scale`/`units`/`calendar`, the explicit windows list,

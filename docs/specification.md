@@ -503,9 +503,11 @@ regionally heterogeneous resolution).
   **`fields` enumerates the materialized fields only** — exactly the fields
   present as arrays in *this* overview, each recording the fold that was
   actually applied. A `none`-class field is absent from the zarr (§4.4) and so
-  MUST be absent from this map: its recorded absence lives in the manifest's
-  `pyramid.overview.fields` (§4.5), which is the map that enumerates **every**
-  declared field. Consequently a reader MAY treat this map as the overview's
+  MUST be absent from this map — as is a field whose own schedule
+  (§4.5 `fields[…].orders`) does not list this overview's `order`, which is
+  why this map may differ between two overviews of the same product. Recorded
+  absence lives in the manifest's `pyramid.overview.fields` (§4.5), which is
+  the map that enumerates **every** declared field. Consequently a reader MAY treat this map as the overview's
   variable list and MUST be able to open every array it names; cross-checking
   it against the arrays present is a valid integrity check. Each entry carries
   at least `class` and `method`, and MAY carry further fold provenance — an
@@ -535,12 +537,15 @@ is the store's resolution axis, partially materialized). Concretely:
   `2^24` observations, and there `sum(weights)` is the nearest float32 to the
   true count rather than the count itself;
 - field inclusion is gated by the field's **composability class** (§4.5):
-  `exact` and `approximate` fields appear, `none` fields are **absent**.
+  `exact` and `approximate` fields appear, `none` fields are **absent**;
+- inclusion is additionally gated by the field's own **schedule** when it
+  declares one (§4.5 `fields[…].orders`): a field may carry overviews at a
+  subset of the block's orders, or at none of them.
 
-An overview's variable set may therefore be a *subset* of the leaf's —
-heterogeneous variable sets across level nodes are in contract, and a reader
-MUST NOT assume every leaf field exists at every overview order (the
-manifest declaration below is the zero-open way to know).
+An overview's variable set may therefore be a *subset* of the leaf's, and may
+differ **between orders** — heterogeneous variable sets across level nodes are
+in contract, and a reader MUST NOT assume every leaf field exists at every
+overview order (the manifest declaration below is the zero-open way to know).
 
 ### 4.5 The manifest `pyramid` block
 
@@ -560,7 +565,8 @@ overview family under the versioned `pyramid` block:
       "count":     {"class": "exact", "method": "sum", "nan_policy": "skip",
                     "dtype": "int32", "fill_value": 0},
       "h_tdigest": {"class": "approximate", "method": "tdigest_kway",
-                    "dtype": "float32", "inner_shape": [2], "delta": 512},
+                    "dtype": "float32", "inner_shape": [2], "delta": 512,
+                    "orders": [3]},
       "photon_ids": {"class": "none"}
     }
   }
@@ -599,6 +605,30 @@ overview family under the versioned `pyramid` block:
   metadata to know the overview array's form up front. This map is the
   **all-fields** view; the per-overview `zagg_overview.fields` attrs map
   (§4.3) is the materialized subset.
+- **`fields[…].orders`** (optional, `exact`/`approximate` entries only) — the
+  field's **own** overview schedule, a subset of the block's `orders` in the
+  same descending order. It exists because the folds are not equally cheap:
+  the exact folds are dense merges, while an `approximate` fold is a ragged
+  read plus a k-way merge per ancestor node, so a product may carry `count` at
+  every order and `h_tdigest` at every other one. Semantics:
+
+  - **absent** — the field carries an overview at **every** order in the
+    block's `orders`. This is the default and the pre-existing behavior; a
+    declaration with no per-field schedules is byte-identical to one written
+    before this key existed;
+  - **present** — the field carries an overview at exactly the listed orders
+    and at no others. `[]` therefore excludes it from the whole pyramid while
+    still recording its class and fold law (which is what distinguishes it
+    from a `"class": "none"` field: that one *cannot* fold, this one is not
+    *scheduled* to).
+
+  A `none` entry never carries `orders` — it is absent everywhere already, so
+  the key would be redundant. A reader MUST NOT read an order outside a
+  field's declared schedule as an incomplete sweep: like `"class": "none"`,
+  this is **recorded absence** (D24 option A) and answers the "is this field
+  here?" question with zero opens and never a probe. Values outside the
+  block's `orders` are not legal; a reader MAY ignore them (they name no
+  overview the family walks).
 - **`all_time`** — whether the `all.zarr` all-time fold is materialized at
   the declared orders (windowed stores only; a `schedule: none` store's
   single fold is already all-time).
