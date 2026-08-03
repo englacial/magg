@@ -331,6 +331,15 @@ class _DigestField(NamedTuple):
     ``location`` is the per-observation morton column (issue #87) or ``None``;
     ``where`` the field's raw ``where`` param (a column name or expression the
     fold resolves per cell, exactly like the pooled path) or ``None``.
+
+    ``stratum`` records that the DECLARED function is ``build_tdigest_where``
+    and is what selects the reducer in :meth:`SpillAggregator._fold_block` —
+    never ``where``'s presence. Keying on the param would let a config drop
+    ``where`` and silently get the unmasked population, or add one to a plain
+    ``build_tdigest`` and silently get a masked digest, in either case
+    disagreeing with the pooled replay (which raises ``TypeError``).
+    ``validate_spill_fold`` rejects both mis-declarations up front, so
+    ``stratum`` implies ``where is not None`` and vice versa.
     """
 
     source: str
@@ -338,6 +347,7 @@ class _DigestField(NamedTuple):
     pairwise: bool
     location: str | None
     where: object | None
+    stratum: bool
 
 
 def _resolve_param(param, col_arrays: dict[str, np.ndarray], start: int, end: int):
@@ -491,7 +501,11 @@ class SpillAggregator:
         # per cell at fold time exactly like the pooled path.
         self._composition_fields: dict[str, tuple[str, dict]] = {}
         if self._mergeable:
-            from zagg.processing.streaming import _COMPOSITION_FUNCTION, _TDIGEST_PAIRWISE_FUNCTION
+            from zagg.processing.streaming import (
+                _COMPOSITION_FUNCTION,
+                _TDIGEST_PAIRWISE_FUNCTION,
+                _TDIGEST_WHERE_FUNCTION,
+            )
 
             for name, meta in agg_fields.items():
                 sig = get_output_signature(meta)
@@ -504,6 +518,7 @@ class SpillAggregator:
                         pairwise=meta.get("function") == _TDIGEST_PAIRWISE_FUNCTION,
                         location=sig["location"],
                         where=params.get("where"),
+                        stratum=meta.get("function") == _TDIGEST_WHERE_FUNCTION,
                     )
                 elif meta.get("function") == _COMPOSITION_FUNCTION:
                     self._composition_fields[name] = (
@@ -715,7 +730,11 @@ class SpillAggregator:
         via ``build_tdigest_where`` with its mask resolved per cell over the
         block's spilled columns (:func:`_resolve_param` — row selection
         precedes the build, so block boundaries cannot shift a photon between
-        strata, issue #370) — and then, per the field's fold law: **k-way**
+        strata, issue #370). Which of the two reducers runs is decided by the
+        field's **declared function** (``_DigestField.stratum``), never by
+        whether a ``where`` param happens to be present, so the fold can never
+        substitute a reducer the config did not declare — and then, per the
+        field's fold law: **k-way**
         fields stash the block digest (+ locations) for one order-independent
         collapse at finalize (:meth:`_finalize_kway`); **pairwise** fields
         merge it into the running digest here, the located overload carrying
@@ -739,7 +758,7 @@ class SpillAggregator:
                 for name, f in self._digest_fields.items():
                     values = col_arrays[f.source][start:end]
                     locs = col_arrays[f.location][start:end] if f.location else None
-                    if f.where is not None:
+                    if f.stratum:
                         where = _resolve_param(f.where, col_arrays, start, end)
                         built = build_tdigest_where(
                             values, delta=f.delta, where=where, locations=locs
