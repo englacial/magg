@@ -637,6 +637,62 @@ class TestCompositionMultiBlock:
                 assert ls.shape == (len(ds),)
 
 
+class TestFoldColumnDiagnostics:
+    """A declared column the block never carried fails with the pooled path's
+    named ValueError, not a bare KeyError re-wrapped as SpillReduceError."""
+
+    @staticmethod
+    def _agg_with_block(variables, cols):
+        cfg = _config(variables, streaming=_SPILL)
+        grid = _grid(cfg)
+        agg = SpillAggregator(cfg, grid, "pandas", 1)
+        assert agg._mergeable
+        cells = np.asarray(grid.children(_shard_key()), dtype=np.uint64)[:1]
+        agg._block.append(np.zeros(1, dtype=np.uint64), cells, cols)
+        return agg
+
+    def test_missing_location_column_named(self):
+        agg = self._agg_with_block(_variables(located=True), {"h_ph": np.zeros(1, np.float32)})
+        with pytest.raises(ValueError, match="h_tdigest.*location: 'leaf_id'.*spilled block"):
+            agg._fold_block(agg._block)
+        agg.close()
+
+    def test_missing_source_column_named(self):
+        agg = self._agg_with_block(_variables(located=True), {"leaf_id": np.zeros(1, np.uint64)})
+        with pytest.raises(ValueError, match="h_tdigest.*source: 'h_ph'.*spilled block"):
+            agg._fold_block(agg._block)
+        agg.close()
+
+    def test_missing_composition_source_named(self):
+        variables = _variables()
+        variables["composition"] = {**_composition_field(), "source": "h_absent"}
+        agg = self._agg_with_block(variables, {"h_ph": np.zeros(1, np.float32)})
+        with pytest.raises(ValueError, match="'composition'.*source: 'h_absent'.*spilled block"):
+            agg._fold_block(agg._block)
+        agg.close()
+
+    def test_reducer_thread_surfaces_the_named_cause(self):
+        # On the overlap path the fold runs off-thread; _join_reducer wraps the
+        # failure, so the named ValueError must be the cause (not a KeyError).
+        from zagg.processing.spill import SpillReduceError
+
+        agg = self._agg_with_block(_variables(located=True), {"h_ph": np.zeros(1, np.float32)})
+        agg._reduce_one(agg._block)
+        with pytest.raises(SpillReduceError) as exc:
+            agg._join_reducer()
+        assert isinstance(exc.value.__cause__, ValueError)
+        assert "location: 'leaf_id'" in str(exc.value.__cause__)
+        agg.close()
+
+    def test_empty_block_needs_no_columns(self):
+        # A block that was never appended to (the final open block of a shard
+        # whose last flush closed one) has no schema and nothing to check.
+        cfg = _config(_variables(located=True), streaming=_SPILL)
+        agg = SpillAggregator(cfg, _grid(cfg), "pandas", 1)
+        agg._fold_block(agg._block)  # no raise
+        agg.close()
+
+
 class TestUnlocatedUnchanged:
     """Issue #370 adds nothing to the spill record — the fold reads the
     already-spilled read-carrier columns — so unlocated configs' spilled

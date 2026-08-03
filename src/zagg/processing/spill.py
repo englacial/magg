@@ -747,6 +747,7 @@ class SpillAggregator:
         """
         from zagg.processing.aggregate import _group_columns
 
+        self._check_fold_columns(block.schema)
         for key in block.partition_keys():
             t0 = time.perf_counter()
             cells, cols = block.read_partition(key, close=True)
@@ -803,6 +804,42 @@ class SpillAggregator:
                             merge_composition(held_word, held_n, word, n),
                             held_n + n,
                         )
+
+    def _check_fold_columns(self, schema) -> None:
+        """Name a missing source/location column, as the pooled path does.
+
+        The fold indexes ``col_arrays`` by each field's declared ``source`` and
+        ``location``; a column the block never carried would surface as a bare
+        ``KeyError`` raised on the overlap reducer thread, which
+        :meth:`_join_reducer` re-wraps as :class:`SpillReduceError` with the real
+        cause reachable only via ``__cause__`` — a materially worse diagnostic
+        than ``calculate_cell_statistics``'s named ``ValueError`` for the same
+        config error, and one that only appears on shards big enough to close a
+        block. Checked once per block against the block schema, off the per-cell
+        loop. An empty block (nothing appended, so no schema) has nothing to
+        fold and nothing to check.
+        """
+        available = sorted(name for name, _ in schema or [])
+        if not available:
+            return
+        for name, f in self._digest_fields.items():
+            if f.source not in available:
+                raise ValueError(
+                    f"ragged field {name!r} declares source: {f.source!r} but that "
+                    f"column is not in the spilled block (available: {available})"
+                )
+            if f.location is not None and f.location not in available:
+                raise ValueError(
+                    f"ragged field {name!r} declares location: {f.location!r} but that "
+                    f"column is not in the spilled block (available: {available}); "
+                    f"per-observation mortons require a HEALPix grid"
+                )
+        for name, (source, _) in self._composition_fields.items():
+            if source not in available:
+                raise ValueError(
+                    f"field {name!r} declares source: {source!r} but that column is "
+                    f"not in the spilled block (available: {available})"
+                )
 
     def _finalize_kway(self) -> None:
         """Collapse each k-way field's per-block parts into one digest per cell.
