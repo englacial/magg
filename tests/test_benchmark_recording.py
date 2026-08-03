@@ -152,6 +152,48 @@ def test_an_all_dropped_batch_leaves_the_series_untouched(tmp_path):
     assert after.equals(before)
 
 
+def test_appending_to_a_series_that_predates_the_column(tmp_path):
+    # The riskiest property here: series.parquet is a long-lived file on the
+    # benchmarks data branch, written before ``objects_mismatch`` existed, and
+    # append_records never reindexes the COMBINED frame -- the column arrives
+    # purely via pd.concat's column union. Every other test builds its "existing"
+    # frame from records_to_frame, which already has the column, so this is the
+    # one path they don't cover.
+    series = tmp_path / "series.parquet"
+    legacy = update_series.records_to_frame([_rec(commit="c0")]).drop(columns=["objects_mismatch"])
+    update_series.save_series(legacy, series)
+    assert "objects_mismatch" not in update_series.load_series(series).columns
+
+    update_series.main(
+        [
+            "--series",
+            str(series),
+            "--records",
+            _write(tmp_path, [_rec(commit="c1", mismatch="expected 10, measured 12")]),
+        ]
+    )
+    out = update_series.load_series(series)
+    # The column is added, the pre-existing row reads as "no anomaly" rather than
+    # dropping out, and the history keeps its order and its integer dtypes.
+    assert list(out.columns) == list(bench_metrics.RECORD_COLUMNS)
+    assert out["commit"].tolist() == ["c0", "c1"]
+    assert out["objects_mismatch"].tolist() == [None, "expected 10, measured 12"]
+    assert out["total_obs"].dtype == legacy["total_obs"].dtype
+
+    # ...and a later batch onto that now-present column still lands as a string.
+    update_series.main(
+        [
+            "--series",
+            str(series),
+            "--records",
+            _write(tmp_path, [_rec(commit="c2", mismatch="expected 10, measured 11")]),
+        ]
+    )
+    out = update_series.load_series(series)
+    assert out["objects_mismatch"].tolist()[-1] == "expected 10, measured 11"
+    assert out["total_obs"].dtype == legacy["total_obs"].dtype
+
+
 def test_mixed_batch_keeps_the_good_records(tmp_path):
     series = tmp_path / "series.parquet"
     update_series.main(
