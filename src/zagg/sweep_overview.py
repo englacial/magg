@@ -337,13 +337,20 @@ def _json_fill(fill_value):
     return fill_value
 
 
-def _update_manifest_pyramid(store_root, orders, store_kwargs) -> bool:
+def _update_manifest_pyramid(store_root, folded: dict, store_kwargs) -> bool:
     """Record materialized overview orders in the manifest pyramid block.
 
     The one manifest key the sweep may touch (D11: the block is populated/
     updated by the §7 sweep; it is excluded from the frozen resume keys, so
     this RMW can never brick appends). Fail-open — the declaration readers
     key on is untouched; ``materialized`` is a convenience actual.
+
+    ``folded`` is ``{order: fold_source}`` for the orders this pass wrote;
+    ``fold_sources`` carries the per-level provenance forward (issue #376) so
+    the manifest answers "which regime is this level in" without opening an
+    overview — a level's regime can differ from the declaration when a level
+    was materialized under an earlier one, and the declaration is what the
+    NEXT sweep applies, never a claim about what is on disk.
     """
     import obstore
 
@@ -355,9 +362,13 @@ def _update_manifest_pyramid(store_root, orders, store_kwargs) -> bool:
         if fresh is None:
             return False
         block = fresh.setdefault("pyramid", {}).setdefault("overview", {})
-        known = set((block.get("materialized") or {}).get("orders") or [])
+        prior = block.get("materialized") or {}
+        known = set(prior.get("orders") or [])
+        sources = dict(prior.get("fold_sources") or {})
+        sources.update({str(int(k)): v for k, v in folded.items()})
         block["materialized"] = {
-            "orders": sorted(known | {int(k) for k in orders}),
+            "orders": sorted(known | {int(k) for k in folded}),
+            "fold_sources": sources,
             "generated_at": _utcnow(),
         }
         obstore.put(
@@ -738,7 +749,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     plans = _fold_sources(decl, orders, cell_order, shard_order)
     candidates = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
     store = open_object_store(store_root, **store_kwargs)
-    materialized: set[int] = set()
+    materialized: dict[int, str] = {}
     for k in orders:
         nodes = sorted({_node_at(d, k) for d in by_shard})
         for node in nodes:
@@ -769,7 +780,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
                 if entry is not None:
                     entries[key] = entry
             if entries:
-                materialized.add(k)
+                materialized[k] = plans[k][0]
             fresh = {
                 "spec": _sweep().SWEEP_SPEC,
                 "family": "overview",
@@ -787,7 +798,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
                 )
     if counts["written"]:
         counts["manifest_updated"] = _update_manifest_pyramid(
-            store_root, sorted(materialized), store_kwargs
+            store_root, materialized, store_kwargs
         )
     return counts
 
@@ -1490,6 +1501,7 @@ def _write_overview(
                 "source_cell_order": int(cell_order),
                 "window": key,
                 "fields": {n: _field_provenance(m) for n, m in fields.items()},
+                **_fold_provenance(fold),
                 "generation": fold["generation"],
                 "content_hash": fold["content_hash"],
                 "generated_at": _utcnow(),
@@ -1535,6 +1547,23 @@ def _write_overview(
     except Exception as e:
         logger.warning(f"sweep[overview]: O11 sidecar failed at {node}/{basename} ({e})")
     return basename
+
+
+def _fold_provenance(fold: dict) -> dict:
+    """The overview's own fold provenance: which regime produced this level.
+
+    ``fold_source`` is ``"leaves"`` (single-quantization from the raw leaves)
+    or ``"cascade"``, and a cascaded overview also names the order it folded
+    from (``fold_from_order``). A reader needs this because the two regimes
+    are not interchangeable for the approximate class: a cascaded digest is a
+    merge of merges, so it inherits the documented merge order-dependence and
+    carries no precision guarantee, while an exact-from-leaves one is single
+    quantization (issue #376, spec §4.3).
+    """
+    entry = {"fold_source": fold.get("fold_source", "leaves")}
+    if fold.get("fold_from_order") is not None:
+        entry["fold_from_order"] = int(fold["fold_from_order"])
+    return entry
 
 
 def _field_provenance(meta: dict) -> dict:
