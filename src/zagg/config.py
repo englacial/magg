@@ -2375,9 +2375,11 @@ def get_pyramid(config: PipelineConfig) -> dict | None:
     order, the espg-ratified display default; no all-time fold) — and
     ``false`` returns ``None``, declaring the overview family OFF for the
     store. An explicit mapping may carry ``spacing`` (int >= 1), ``orders``
-    (explicit ancestor orders, winning over ``spacing``), ``all_time``
-    (bool: also maintain the ``all.zarr`` cross-window fold on windowed
-    stores), and ``summarize`` (the D24 opt-in derived-summary declarations,
+    (explicit ancestor orders, winning over ``spacing``), ``levels`` (the
+    issue #382 ``zagg-pyramid/2`` grammar: ordered ``{node, cells}`` entries
+    replacing ``orders``/``spacing`` wholesale — see :mod:`zagg.pyramid`),
+    ``all_time`` (bool: also maintain the ``all.zarr`` cross-window fold on
+    windowed stores), and ``summarize`` (the D24 opt-in derived-summary declarations,
     ``{source_field: {"as": name, ...}}`` — recorded in the pyramid block,
     never the semantic core).
     """
@@ -2407,13 +2409,30 @@ def _validate_pyramid(config: PipelineConfig) -> None:
             "output.pyramid requires output.store_layout: hive (overviews live at "
             "hive-tree ancestor nodes; flat stores have no digit tree)"
         )
-    unknown = set(knob) - {"spacing", "orders", "all_time", "summarize"}
+    unknown = set(knob) - {"spacing", "orders", "levels", "all_time", "summarize"}
     if unknown:
         raise ValueError(f"output.pyramid has unknown keys {sorted(unknown)}")
     spacing = knob.get("spacing")
     if spacing is not None and (not isinstance(spacing, int) or spacing < 1):
         raise ValueError(f"output.pyramid.spacing must be an int >= 1 (got {spacing!r})")
     parent_order = int((config.output.get("grid") or {}).get("parent_order", 0))
+    if knob.get("levels") is not None:
+        # The issue #382 (node, cells) grammar: a levels block REPLACES the
+        # /1 schedule knobs wholesale, so mixing the two grammars is refused
+        # rather than silently resolved either way.
+        if knob.get("orders") is not None or knob.get("spacing") is not None:
+            raise ValueError(
+                "output.pyramid.levels is the zagg-pyramid/2 grammar and replaces "
+                "orders/spacing wholesale — declare levels OR orders/spacing, never both"
+            )
+        from zagg.pyramid import normalize_levels, validate_levels
+
+        child_order = int((config.output.get("grid") or {}).get("child_order", 0))
+        validate_levels(
+            normalize_levels(knob["levels"]),
+            parent_order=parent_order,
+            child_order=child_order,
+        )
     orders = knob.get("orders")
     if orders is not None:
         ok = isinstance(orders, list) and all(isinstance(k, int) for k in orders)

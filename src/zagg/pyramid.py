@@ -1,0 +1,148 @@
+"""Pyramid level grammar: the ``(node, cells)`` declaration model (issue #382).
+
+The ``zagg-pyramid/2`` revision of the manifest pyramid declaration, ratified
+on the issue #381 design record (points (4)–(5)): a pyramid is an ordered
+list of **level entries** ``{node: N, cells: [...]}`` — ``node`` the hive
+prefix where the level's artifacts live (one artifact per ``(node, window)``),
+``cells`` the reader-facing resolutions stored there (slab length
+``4^(cells - node)``; ``cells == node`` is the degenerate 1-cell
+whole-footprint group, the writer's universal partial — there is no
+``partial/`` grammar). Today's constant-depth grammar (``zagg-pyramid/1``,
+``orders`` + ``spacing``) is the special case
+``cells = node + (child_order - parent_order)`` and stays readable; its
+constants and its sweep live in :mod:`zagg.sweep_overview`.
+
+Semantics pinned on the issue:
+
+- **Whole-list replacement** — an explicit ``levels:`` block replaces the
+  derived default wholesale; there is no per-node merge (the
+  explicit-beats-derived rule).
+- **Internal members are derived, never spelled** — spelling one (e.g.
+  ``cells: [13, 11]`` where 11 is derivable from a coarser declaration)
+  is legal and PROMOTES it to reader-facing contract.
+- Refusals are loud and named; nothing widens silently.
+
+This module owns the grammar only: parsing/normalization, validation, the
+derived default, and the per-field D24 composability declarations both spec
+revisions record. Writers (issue #383) and the staged sweep (issue #384)
+consume the normalized form; nothing here writes a store.
+"""
+
+from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+#: Version string of the manifest ``pyramid`` block carrying grouped
+#: ``(node, cells)`` levels (issue #382). The ``/1`` marker lives in
+#: :mod:`zagg.sweep_overview`, which owns sweeping that revision.
+PYRAMID_SPEC_V2 = "zagg-pyramid/2"
+
+
+def normalize_levels(raw) -> list[dict]:
+    """``output.pyramid.levels`` in the normalized grouped form.
+
+    A non-empty ordered list of ``{node: N, cells: [...]}`` entries; a scalar
+    ``cells`` is sugar for the one-element list. Shape errors raise here;
+    the ordering/range rules live in :func:`validate_levels` (they need the
+    grid orders). The manifest records exactly this normalized form.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            f"output.pyramid.levels must be a non-empty list of {{node, cells}} entries "
+            f"(got {raw!r}); `output.pyramid: false` is how a store declares no pyramid"
+        )
+    levels = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict) or set(entry) != {"node", "cells"}:
+            raise ValueError(
+                f"output.pyramid.levels[{i}] must be a mapping with exactly "
+                f"'node' and 'cells' (got {entry!r})"
+            )
+        node, cells = entry["node"], entry["cells"]
+        if not isinstance(node, int) or node < 0:
+            raise ValueError(f"output.pyramid.levels[{i}].node must be an int >= 0 (got {node!r})")
+        if isinstance(cells, int):
+            cells = [cells]
+        if not isinstance(cells, list) or not cells or not all(isinstance(c, int) for c in cells):
+            raise ValueError(
+                f"output.pyramid.levels[{i}].cells must be an int or a non-empty "
+                f"list of ints (got {entry['cells']!r})"
+            )
+        levels.append({"node": int(node), "cells": [int(c) for c in cells]})
+    return levels
+
+
+def validate_levels(levels: list, *, parent_order: int, child_order: int) -> None:
+    """Refuse an out-of-contract level schedule — loudly, never by widening.
+
+    The issue #382 rules, over the normalized form:
+
+    - entries by strictly descending ``node``, each in ``[0, parent_order]``
+      (the shard node itself is legal — its levels become the leaf-written
+      column of #381 point (2));
+    - within an entry, ``cells`` strictly descending, each ``>= node``
+      (equality: the 1-cell whole-footprint group) and ``< child_order``
+      (a member at the base data's own order IS the base data — binding at
+      the leaf node, implied coarser by the descent rule);
+    - across consecutive entries, resolutions strictly descend — EXCEPT the
+      declared gather: the SAME ``cells`` list at a coarser ``node`` (pure
+      concatenation, #381 point (3)).
+    """
+    parent_order, child_order = int(parent_order), int(child_order)
+    for i, entry in enumerate(levels):
+        node, cells = entry["node"], entry["cells"]
+        if not 0 <= node <= parent_order:
+            raise ValueError(
+                f"output.pyramid.levels[{i}].node = {node} is outside [0, parent_order = "
+                f"{parent_order}] — level artifacts live at hive prefixes, none finer "
+                f"than the shard order"
+            )
+        if any(b >= a for a, b in zip(cells, cells[1:])):
+            raise ValueError(f"output.pyramid.levels[{i}].cells {cells} must strictly descend")
+        if cells[-1] < node:
+            raise ValueError(
+                f"output.pyramid.levels[{i}].cells {cells} reach coarser than their own "
+                f"node {node} — a node stores resolutions >= its own order (equality is "
+                f"the 1-cell whole-footprint group)"
+            )
+        if cells[0] >= child_order:
+            raise ValueError(
+                f"output.pyramid.levels[{i}].cells {cells} reach the base data's own "
+                f"cell order ({child_order}) — the base level is the store itself, "
+                f"not a declarable overview member"
+            )
+    for i, (prev, entry) in enumerate(zip(levels, levels[1:]), start=1):
+        if entry["node"] >= prev["node"]:
+            raise ValueError(
+                f"output.pyramid.levels nodes must strictly descend: levels[{i}].node = "
+                f"{entry['node']} does not descend from levels[{i - 1}].node = {prev['node']}"
+            )
+        if entry["cells"] == prev["cells"]:
+            continue  # the declared gather: same cells, coarser node
+        if entry["cells"][0] >= prev["cells"][-1]:
+            raise ValueError(
+                f"output.pyramid.levels[{i}].cells {entry['cells']} do not descend from "
+                f"levels[{i - 1}].cells {prev['cells']} — across entries resolutions "
+                f"strictly descend, except a declared gather (the SAME cells at a "
+                f"coarser node)"
+            )
+
+
+def default_levels(parent_order: int, chunk_inner: int | None) -> list[dict]:
+    """The derived default schedule, bound to the grid block (#381 point (5)).
+
+    With ``d = chunk_inner - parent_order``: ``{node: parent_order, cells:
+    [chunk_inner]}`` plus ``{node: k, cells: [k + d]}`` for
+    ``k = parent_order - 2`` stepping ``-2`` down to 1. For the 19/13/9
+    reference geometry: (9,[13]) (7,[11]) (5,[9]) (3,[7]) (1,[5]). An unset
+    ``chunk_inner`` (K == 1: chunk order == shard order) gives ``d = 0`` —
+    every level the degenerate whole-footprint group, still legal. An
+    explicit ``levels:`` block replaces this default WHOLESALE.
+    """
+    parent_order = int(parent_order)
+    d = (parent_order if chunk_inner is None else int(chunk_inner)) - parent_order
+    levels = [{"node": parent_order, "cells": [parent_order + d]}]
+    levels += [{"node": k, "cells": [k + d]} for k in range(parent_order - 2, 0, -2)]
+    return levels

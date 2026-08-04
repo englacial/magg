@@ -426,6 +426,10 @@ class TestPyramidBlock:
         with pytest.raises(ValueError, match="all_time must be a boolean"):
             validate_config(self._cfg(store_layout="hive", pyramid={"all_time": "yes"}))
         with pytest.raises(ValueError, match="unknown keys"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"depths": [1]}))
+        # `levels` is a KNOWN key since issue #382 — its grammar errors are
+        # zagg.pyramid's (tests/test_pyramid.py), surfaced through here.
+        with pytest.raises(ValueError, match="levels\\[0\\] must be a mapping"):
             validate_config(self._cfg(store_layout="hive", pyramid={"levels": [1]}))
         with pytest.raises(ValueError, match="must be a mapping or false"):
             validate_config(self._cfg(store_layout="hive", pyramid=True))
