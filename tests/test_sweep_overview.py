@@ -680,6 +680,17 @@ class TestPyramidV2Gate:
         assert counts["sweepable"] is False and counts["written"] == 0
         assert "NOT yet sweepable" in caplog.text
 
+    def test_a_bare_v2_marker_declares_nothing(self, tmp_path):
+        from zagg.sweep_overview import sweep_overviews
+
+        # The `spec`-only arm: a /2 marker with no overview block is a
+        # declaration of nothing, and must report `declared: False` exactly as
+        # the /1 branch does for an absent/empty `orders`.
+        manifest = self._v2_manifest(tmp_path)
+        manifest["pyramid"] = {"spec": "zagg-pyramid/2"}
+        counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
+        assert counts["declared"] is False and counts["sweepable"] is False
+
 
 class TestOverviewWriter:
     def test_folds_leaves_at_every_declared_order(self, tmp_path):
@@ -693,6 +704,9 @@ class TestOverviewWriter:
         counts = result["families"]["overview"]
         # order 1: node -31; order 0: node -3 -> two overview zarrs.
         assert counts["written"] == 2 and counts["failed"] == 0
+        # The run record's counts schema does not vary by revision: a /1 store
+        # carries `sweepable` too (the /2 gate is the only False).
+        assert counts["sweepable"] is True and counts["declared"] is True
 
         # Order 1 (cells at order 3, 4 source cells per overview cell):
         # leaf -311 occupies overview rows 0-3, leaf -312 rows 4-7.

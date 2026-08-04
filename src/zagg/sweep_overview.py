@@ -739,14 +739,29 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     folded payload — and whose zarr is confirmed present and stamped, since the
     envelope and the artifact are two objects (D9) — is skipped; the hash is
     the same-second backstop the engine's payload compare provides for JSON
-    families. Returns the standard
-    ``written``/``current``/``empty``/``failed`` counts plus ``declared``.
+    families.
+
+    Returns the standard ``written``/``current``/``empty``/``failed`` counts
+    plus ``declared`` (whether the manifest carries a usable overview
+    declaration at all) and ``sweepable`` (whether THIS zagg can fold the
+    declared revision — ``False`` only for the ``/2`` grammar of issue #382,
+    whose materialization arrives with issues #383/#384). Both keys are
+    present on every path: this dict is serialized into the sweep run record
+    (:func:`zagg.sweep._write_sweep_record`), an operator-facing artifact
+    whose schema must not vary by revision.
     """
     from zagg.pyramid import PYRAMID_SPEC_V2
     from zagg.store import open_object_store
 
     store_kwargs = dict(store_kwargs or {})
-    counts: dict = {"written": 0, "current": 0, "empty": 0, "failed": 0, "declared": True}
+    counts: dict = {
+        "written": 0,
+        "current": 0,
+        "empty": 0,
+        "failed": 0,
+        "declared": True,
+        "sweepable": True,
+    }
     decl = (manifest.get("pyramid") or {}).get("overview")
     spec = (manifest.get("pyramid") or {}).get("spec")
     if spec == PYRAMID_SPEC_V2 or (isinstance(decl, dict) and decl.get("levels") is not None):
@@ -757,6 +772,10 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
         # here — never folding a schedule this sweep does not understand —
         # is the /1-vs-/2 gate; /1 stores sweep exactly as before.
         counts["sweepable"] = False
+        # The `spec`-only arm reaches here with `decl` unvalidated: a /2 marker
+        # carrying no overview block declares nothing, and must report the same
+        # `declared: False` the /1 branch below would give it.
+        counts["declared"] = bool(isinstance(decl, dict) and decl.get("levels"))
         logger.warning(
             f"sweep[overview]: the manifest pyramid declaration is {spec!r} — the "
             f"(node, cells) level grammar (issue #382) is declared but NOT yet "
