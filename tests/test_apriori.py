@@ -285,6 +285,33 @@ class TestAprioriReadGroup:
         )
         assert result is None
 
+    def test_short_circuits_read_as_measured_zero(self, tmp_path):
+        # Both a-priori exits above return before any base-rate decode, so
+        # neither reaches _execute_plan_group's counter. Each stamps a measured
+        # zero itself, or the route reports None -- "unmeasured", the signal
+        # reserved for a seam that was never instrumented (issue #374).
+        _write_parquet(tmp_path)
+        ds = _data_source(chunk_boundaries={"prefix": str(tmp_path)})
+        url = f"/data/{GRANULE}"
+
+        io_stats: dict = {}  # no chunk's span touches the shard
+        assert (
+            _read_group(
+                _Granule(), "gt1l", ds, 0, _BandGrid(80.0, 81.0), granule_url=url, io_stats=io_stats
+            )
+            is None
+        )
+        assert io_stats["obs_read"] == 0
+
+        io_stats = {}  # beam absent from the boundary parquet
+        assert (
+            _read_group(
+                _Granule(), "gt2r", ds, 0, _BandGrid(*BAND), granule_url=url, io_stats=io_stats
+            )
+            is None
+        )
+        assert io_stats["obs_read"] == 0
+
     def test_missing_parquet_raises(self, tmp_path):
         ds = _data_source(chunk_boundaries={"prefix": str(tmp_path)})
         with pytest.raises(FileNotFoundError, match="boundary parquet"):
@@ -348,8 +375,14 @@ class TestLoadBoundaries:
 
 class TestWorkerSeam:
     """The worker passes ``granule_url`` to ``_read_group`` only when the
-    feature is on, so monkeypatched fakes (and the flag-off production call)
-    keep their existing signature."""
+    a-priori feature is on, so the flag-off call carries no boundary-parquet
+    plumbing.
+
+    ``io_stats`` (issue #374) is by contrast passed ALWAYS — it is always-on
+    instrumentation, mirroring the raster ``io_stats`` sink — so the fakes
+    below take it explicitly. The gate these tests pin is ``granule_url``'s,
+    asserted directly on the received kwargs rather than indirectly via a
+    fake's signature arity."""
 
     def _run(self, monkeypatch, data_source, fake_read_group):
         cfg = PipelineConfig(
@@ -364,7 +397,7 @@ class TestWorkerSeam:
     def test_granule_url_passed_when_enabled(self, monkeypatch):
         captured = {}
 
-        def fake(h5obj, g, ds, sk, grid, arrow=False, granule_url=None):
+        def fake(h5obj, g, ds, sk, grid, arrow=False, granule_url=None, io_stats=None):
             captured["granule_url"] = granule_url
             return None
 
@@ -374,10 +407,16 @@ class TestWorkerSeam:
         assert captured["granule_url"] == "s3://b/g0.h5"
         assert meta["error"] == "No data after filtering"
 
-    def test_flag_off_call_signature_unchanged(self, monkeypatch):
-        # A fake WITHOUT granule_url in its signature must keep working when
-        # the feature is off (it would TypeError if the kwarg were passed).
-        def fake(h5obj, g, ds, sk, grid, arrow=False):
+    def test_granule_url_absent_when_flag_off(self, monkeypatch):
+        # The gate itself: with the feature off, ``granule_url`` must not be
+        # in the call at all (a fake lacking it would TypeError). Asserted on
+        # the received kwargs, so the invariant survives the addition of other
+        # always-on kwargs like ``io_stats``.
+        captured = {}
+
+        def fake(h5obj, g, ds, sk, grid, arrow=False, **kwargs):
+            captured.update(kwargs)
+            captured["seen"] = True
             return None
 
         ds = _data_source()
@@ -388,4 +427,6 @@ class TestWorkerSeam:
         # ``chunk_boundaries`` carve-out in ``index_from_config``).
         ds["index"] = {"backend": "hierarchical"}
         _, meta = self._run(monkeypatch, ds, fake)
+        assert captured["seen"] is True
+        assert "granule_url" not in captured
         assert meta["error"] == "No data after filtering"

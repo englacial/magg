@@ -6,6 +6,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from importlib import resources
 from typing import Any, NotRequired, TypedDict
 
@@ -1059,13 +1060,96 @@ def _validate_windowing(config: PipelineConfig) -> None:
     _validate_windowing_windows(block, schedule)
 
 
+#: Width of the window a ``{label, timestamp}`` point entry desugars to (#355).
+#: One second is the grammar's native resolution — boundaries render at
+#: ``timespec="seconds"`` throughout — and keeps membership off float equality.
+_POINT_WINDOW_WIDTH = timedelta(seconds=1)
+
+
+def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
+    """The half-open UTC ``[start, end)`` of one explicit ``windows`` entry.
+
+    Two forms, discriminated on keys and never mixed (issue #355): the range
+    ``{label, start, end}``, and the point sugar ``{label, timestamp}`` ->
+    ``[t, t + 1s)``. Either form refuses keys beyond its own — a dead or
+    typo'd key has no semantic effect, so it fails loud rather than riding
+    along. Bounds come back at declared precision; :func:`get_windowing`
+    renders them through ``windows.iso_utc`` (``timespec="seconds"``), so a
+    sub-second ``timestamp`` normalizes to the whole second containing it —
+    truncation is monotone, so it can neither move ``t`` out of its own window
+    nor manufacture an overlap. *Range* bounds truncate identically, each to
+    the second containing it, so a fractional ``start``/``end`` silently
+    retimes that edge of the window; a range is never widened to recover the
+    truncated fraction. The one refusal is total collapse — bounds that render
+    to the same second would dispatch as an empty window, so it is rejected
+    here, on the rendered values. See ``docs/hive_layout.md`` for the
+    bound-truncation edge, the same-second collision and the silent-miss edge.
+    """
+    from zagg import windows as _windows
+
+    ranged = sorted({"start", "end"} & set(entry))
+    if "timestamp" in entry:
+        if ranged:
+            raise ValueError(
+                f"explicit window entry carries both timestamp and {', '.join(ranged)}; each "
+                f"entry declares exactly one of {{timestamp}} or {{start, end}} "
+                f"(got {entry!r})"
+            )
+        # `width` is documented as the future escape hatch but does not exist
+        # yet: accepting it silently would hand back a 1 s window and a clean
+        # validate_config.
+        extra = sorted(set(entry) - {"label", "timestamp"}, key=repr)
+        if extra:
+            raise ValueError(
+                f"explicit point window entry carries unsupported key(s) "
+                f"{', '.join(map(repr, extra))}; the point form is "
+                f"{{label, timestamp}} (got {entry!r})"
+            )
+        point = _windows.parse_utc(entry["timestamp"])
+        return point, point + _POINT_WINDOW_WIDTH
+    # repr, not str: YAML 1.1 resolves bare `on`/`no`/numerals to bool/int
+    # keys, which are neither sortable against strings nor joinable — the
+    # TypeError would escape _validate_windowing_windows' ValueError wrapper
+    # and lose the `output.windowing.windows:` prefix. repr also shows the
+    # reader that the key came back coerced.
+    extra = sorted(set(entry) - {"label", "start", "end"}, key=repr)
+    if extra:
+        raise ValueError(
+            f"explicit range window entry carries unsupported key(s) "
+            f"{', '.join(map(repr, extra))}; the range form is "
+            f"{{label, start, end}} (got {entry!r})"
+        )
+    start = _windows.parse_utc(entry["start"])
+    end = _windows.parse_utc(entry["end"])
+    if start < end and _windows.iso_utc(start) == _windows.iso_utc(end):
+        # Each bound truncates to the second containing it (windows.iso_utc,
+        # timespec="seconds"), so a range with both bounds inside one second
+        # renders to a `ge x` / `lt x` pair that silently matches nothing. The
+        # predicate above calls the renderer rather than repeating its
+        # truncation, so the two cannot drift.
+        # Refuse rather than widen — the point form is the spelling for
+        # one-second intent. Only this total collapse is refused: a fractional
+        # bound in a *different* second merely retimes that edge (documented in
+        # docs/hive_layout.md).
+        raise ValueError(
+            f"explicit window range is empty after truncation to whole-second "
+            f"granularity: start {entry['start']!r} and end {entry['end']!r} "
+            f"both render as {_windows.iso_utc(start)!r}; use the point form "
+            f"{{label, timestamp}} for a one-second window"
+        )
+    return start, end
+
+
 def _validate_windowing_windows(block: dict, schedule: str) -> None:
     """Validate the ``windows`` list half of ``output.windowing`` (issue #246).
 
     Shared by the point-pipeline and raster branches of
     :func:`_validate_windowing`: frozen label grammar, half-open
     ``start < end``, unique labels, non-overlapping ranges — required for
-    ``schedule: explicit``, rejected otherwise.
+    ``schedule: explicit``, rejected otherwise. Point entries
+    (``{label, timestamp}``, issue #355) are desugared by
+    :func:`_explicit_window_bounds` first, so every check below runs on ordinary
+    bounds and composes unchanged.
     """
     from zagg import windows as _windows
 
@@ -1080,17 +1164,20 @@ def _validate_windowing_windows(block: dict, schedule: str) -> None:
     if not isinstance(declared_windows, list) or not declared_windows:
         raise ValueError(
             "output.windowing.windows is required for schedule: explicit — a "
-            "non-empty list of {label, start, end} entries"
+            "non-empty list of {label, start, end} (or {label, timestamp}) entries"
         )
     seen: dict = {}
     for entry in declared_windows:
-        if not isinstance(entry, dict) or not {"label", "start", "end"} <= set(entry):
+        if not isinstance(entry, dict) or not (
+            "label" in entry and ({"start", "end"} <= set(entry) or "timestamp" in entry)
+        ):
             raise ValueError(
-                f"each explicit window must be a {{label, start, end}} mapping (got {entry!r})"
+                f"each explicit window must be a {{label, start, end}} or "
+                f"{{label, timestamp}} mapping (got {entry!r})"
             )
         try:
             label = _windows.validate_label(entry["label"], "explicit")
-            start, end = _windows.parse_utc(entry["start"]), _windows.parse_utc(entry["end"])
+            start, end = _explicit_window_bounds(entry)
         except ValueError as e:
             raise ValueError(f"output.windowing.windows: {e}") from e
         if label == _windows.SCHEDULE_NONE_TOKEN:
@@ -1105,6 +1192,7 @@ def _validate_windowing_windows(block: dict, schedule: str) -> None:
                 f"declare a different explicit label"
             )
         if not start < end:
+            # Range form only — a desugared point is half-open by construction.
             raise ValueError(
                 f"explicit window {label!r} is not half-open: start "
                 f"{entry['start']!r} must precede end {entry['end']!r}"
@@ -2555,7 +2643,10 @@ def get_windowing(config: PipelineConfig) -> dict | None:
         {"schedule", "time_field", "epoch", "scale", "units", "windows"}
 
     ``epoch`` and explicit-window boundaries are canonicalized to ISO-8601
-    UTC strings; ``windows`` is ``None`` except for ``schedule: explicit``.
+    UTC strings; ``windows`` is ``None`` except for ``schedule: explicit``,
+    where a ``{label, timestamp}`` point entry is desugared to its second-wide
+    range (issue #355) so the normalized list is uniformly ``{label, start,
+    end}``.
     On the raster branch (``reader: raster``) ``time_field`` is the fixed STAC
     ``datetime`` and ``epoch``/``scale``/``units`` are hardcoded to the
     Unix-epoch UTC-seconds encoding any ISO instant normalizes to, rather than
@@ -2571,14 +2662,16 @@ def get_windowing(config: PipelineConfig) -> dict | None:
         return None
     declared = None
     if block["schedule"] == "explicit":
-        declared = [
-            {
-                "label": w["label"],
-                "start": _windows.iso_utc(_windows.parse_utc(w["start"])),
-                "end": _windows.iso_utc(_windows.parse_utc(w["end"])),
-            }
-            for w in block["windows"]
-        ]
+        declared = []
+        for w in block["windows"]:
+            start, end = _explicit_window_bounds(w)
+            declared.append(
+                {
+                    "label": w["label"],
+                    "start": _windows.iso_utc(start),
+                    "end": _windows.iso_utc(end),
+                }
+            )
     if (config.data_source or {}).get("reader") == "raster":
         # Raster membership is the acquisition's STAC ``datetime`` (issue
         # #247, ratified): the manifest records the resolved field plus the
