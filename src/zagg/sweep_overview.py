@@ -1004,6 +1004,11 @@ def _roll_node(
         # only the recorded regime distinguishes them (issue #376). Entries
         # predating #376 carry no key and read as the leaves fold they were.
         and existing_entry.get("fold_source", "leaves") == fold["fold_source"]
+        # The regime is the pair: which LEVEL a cascade folded from is
+        # spec-normative too (§4.3's fold_from_order), and dropping an
+        # intermediate order changes it without moving n_leaves or the hash.
+        # Both sides are None on the leaves path, so it is a no-op there.
+        and existing_entry.get("fold_from_order") == fold.get("fold_from_order")
         and _overview_committed(store_root, node, existing_entry.get("object"), store_kwargs)
     ):
         counts["current"] += 1
