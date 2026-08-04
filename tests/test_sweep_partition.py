@@ -574,10 +574,15 @@ class TestSweepCLI:
         summary = json.loads(capsys.readouterr().out)
         assert "partition" not in summary and summary["n_leaves"] == len(LEAVES)
 
-    def test_a_bad_partition_count_is_refused_before_any_fold(self, tmp_path):
-        from zagg.sweep import main
+    @pytest.mark.parametrize("bad", ["8", "0", "-4", "3"])
+    def test_a_bad_partition_count_is_refused_before_the_store_is_read(self, bad, monkeypatch):
+        # From argv alone: no manifest read, no run-record LIST, no fold. The
+        # store path is deliberately nonexistent — reaching it would raise
+        # something else.
+        from zagg import sweep as mod
 
-        _store(tmp_path)
-        _run_record(tmp_path)
-        with pytest.raises(ValueError, match=r"splits a morton digit in half"):
-            main([str(tmp_path), "--families", "stats", "--partitions", "8"])
+        monkeypatch.setattr(
+            mod, "discover_leaves", lambda *a, **k: pytest.fail("store read before validation")
+        )
+        with pytest.raises(ValueError, match=r"power of two|morton digit"):
+            mod.main(["s3://nowhere/store", "--families", "stats", "--partitions", bad])

@@ -1144,9 +1144,15 @@ def main(argv=None) -> int:
         metavar="CONFIG_YAML",
         help="Retrofit the manifest pyramid declaration from this pipeline config "
         "(issue #358), print the summary, and exit — declaration-only: no sweep "
-        "pass runs in the same invocation (--families is ignored)",
+        "pass runs in the same invocation (--families and --partitions are ignored)",
     )
     args = parser.parse_args(argv)
+    # Validate the fan-out width from argv alone, BEFORE anything touches the
+    # store: discover_leaves is a LIST plus a parquet read per run record, and
+    # a mistyped width should not cost that (review finding, issue #377).
+    from zagg.sweep_partition import partition_split_order
+
+    partition_split_order(args.partitions)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     store_kwargs: dict = {"region": args.region}
     if args.output_creds:
