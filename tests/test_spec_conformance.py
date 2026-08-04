@@ -635,19 +635,20 @@ class TestPyramidV2Declaration:
         assert _pyramid_block()["overview"]["fields"]["h_mean"] == {"class": "none"}
 
     def test_default_derivation_matches_the_spec_formula(self):
-        # §4.5's derived default, computed from the spec text for this
-        # geometry, must equal both the committed expectation and zagg's own
-        # derivation — the informative formula cannot drift from the code.
-        from zagg.pyramid import default_levels
-
+        # §4.5's informative derived default, computed from the spec text for
+        # this geometry, must equal the committed expectation — the formula on
+        # the page and the one the fixture records cannot drift apart. The
+        # CODE binding (zagg's own default_levels for this same geometry) is
+        # pinned in tests/test_pyramid.py::TestDefaultLevels, which is where
+        # reading back through zagg belongs: this class decodes the committed
+        # fixture from spec text alone.
         exp = _expected(PYRAMID)
-        s, chunk, c = exp["shard_order"], exp["chunk_order"], exp["cell_order"]
+        s, chunk = exp["shard_order"], exp["chunk_order"]
         d = chunk - s
         formula = [{"node": s, "cells": [chunk]}] + [
             {"node": k, "cells": [k + d]} for k in range(s - 2, 0, -2)
         ]
         assert formula == exp["default_levels"]
-        assert default_levels(s, chunk, child_order=c) == exp["default_levels"]
 
     def test_v1_compat_constant_depth_rule(self):
         # §4.4: /1 is the special case cells = [node + (c - s)]. The leaf
