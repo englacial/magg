@@ -158,7 +158,7 @@ class TestValidateLevels:
 
 class TestDefaultLevels:
     def test_reference_geometry_pins_the_ratified_schedule(self):
-        assert default_levels(9, 13) == [
+        assert default_levels(9, 13, child_order=19) == [
             {"node": 9, "cells": [13]},
             {"node": 7, "cells": [11]},
             {"node": 5, "cells": [9]},
@@ -167,16 +167,30 @@ class TestDefaultLevels:
         ]
 
     def test_spec_fixture_geometry(self):
-        assert default_levels(4, 5) == [{"node": 4, "cells": [5]}, {"node": 2, "cells": [3]}]
+        assert default_levels(4, 5, child_order=6) == [
+            {"node": 4, "cells": [5]},
+            {"node": 2, "cells": [3]},
+        ]
 
     def test_k_one_degenerates_to_whole_footprint_groups(self):
         # K == 1: the grid's RESOLVED chunk order equals parent_order, so
         # d = 0 and every level is the 1-cell whole-footprint group.
-        assert default_levels(4, 4) == [{"node": 4, "cells": [4]}, {"node": 2, "cells": [2]}]
+        assert default_levels(4, 4, child_order=6) == [
+            {"node": 4, "cells": [4]},
+            {"node": 2, "cells": [2]},
+        ]
 
-    def test_default_validates_clean(self):
-        validate_levels(default_levels(9, 13), **REF)
-        validate_levels(default_levels(4, 5), parent_order=4, child_order=6)
+    def test_chunk_order_at_child_order_refused(self):
+        # HealpixGrid admits chunk_order == child_order; the base entry would
+        # BE the base data, so the default refuses loudly at derive time.
+        with pytest.raises(ValueError, match="base data's own cell order"):
+            default_levels(9, 19, child_order=19)
+
+    @pytest.mark.parametrize("chunk_order", [9, 11, 13, 18])
+    def test_default_round_trips_through_validate(self, chunk_order):
+        # Valid by construction for every geometry the grid admits between
+        # chunk_order == parent_order (K == 1) and child_order - 1.
+        validate_levels(default_levels(9, chunk_order, child_order=19), **REF)
 
 
 class TestConfigWiring:

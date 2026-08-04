@@ -148,7 +148,7 @@ def validate_levels(levels: list, *, parent_order: int, child_order: int) -> Non
             )
 
 
-def default_levels(parent_order: int, chunk_order: int) -> list[dict]:
+def default_levels(parent_order: int, chunk_order: int, *, child_order: int) -> list[dict]:
     """The derived default schedule, bound to the grid block (#381 point (5)).
 
     With ``d = chunk_order - parent_order``: ``{node: parent_order, cells:
@@ -166,11 +166,19 @@ def default_levels(parent_order: int, chunk_order: int) -> list[dict]:
     geometry. When K == 1 the resolved chunk order equals ``parent_order``,
     giving ``d = 0`` — every level the degenerate whole-footprint group,
     still legal.
+
+    The result is checked against :func:`validate_levels` before it is
+    returned: the derived default is what every store that never spells
+    ``levels:`` gets, so it must be valid by construction for every geometry
+    the grid admits. ``HealpixGrid`` accepts ``chunk_order == child_order``,
+    whose base entry would BE the base data — that geometry refuses loudly
+    here rather than shipping an invalid schedule into a manifest.
     """
     parent_order, chunk_order = int(parent_order), int(chunk_order)
     d = chunk_order - parent_order
     levels = [{"node": parent_order, "cells": [parent_order + d]}]
     levels += [{"node": k, "cells": [k + d]} for k in range(parent_order - 2, 0, -2)]
+    validate_levels(levels, parent_order=parent_order, child_order=child_order)
     return levels
 
 
