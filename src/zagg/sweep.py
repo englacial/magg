@@ -86,8 +86,11 @@ class SweepFamily:
     ``coverage.moc``. A family whose artifact is not a per-node JSON rollup
     (the overview family's zarrs, issue #201) instead defines ``sweep_store``
     — the whole-tree hook :func:`run_sweep` dispatches to with the manifest,
-    the normalized dirty work set, and the partition's ``min_order`` floor
-    (issue #377). Families registered with
+    the normalized dirty work set, and ``min_order``. That last one is
+    CONTRACTUAL, not advisory (issue #377): it is the partition's split order,
+    and a hook that swallows it into ``**kwargs`` writes above the split and
+    breaks the disjointness invariant for every family in the pass.
+    Families registered with
     ``available = False`` are visible slots that :func:`get_family` refuses
     with their ``reason``.
     """
@@ -576,6 +579,8 @@ def run_sweep(
     the coarse-level finisher, so no two partitions can write the same
     ``(node, window)`` artifact. ``of=1`` is the identity partition, byte-
     identical to an unpartitioned pass. See :mod:`zagg.sweep_partition`.
+    Every summary field is then partition-scoped EXCEPT ``skipped_leaves``,
+    which is derived before the filter and stays store-wide.
 
     Unless ``record=False``, the summary is also PUT at the store root as the
     sweep's own run record (:func:`_write_sweep_record`, fail-open).
@@ -737,7 +742,11 @@ def _sweep_family(
     tops = [computed[d] for d in frontier]
     result = dict(counts)
     if min_order:
+        # Deferred in ORDERS as well as by name, so the finisher's obligation
+        # is machine-readable and sized: split == shard_order is permitted,
+        # and then every node above the leaves is owed, not just the base ones.
         result["finish_deferred"] = True  # spans partitions -> the finisher's
+        result["deferred_orders"] = list(range(min_order))
     else:
         result.update(fam.finish(store_root, tops, shard_order, store_kwargs))
     return result

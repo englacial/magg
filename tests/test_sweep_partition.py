@@ -378,6 +378,20 @@ class TestPartitionedPass:
         assert "root_moc_written" not in moc
         assert not (tmp_path / "coverage.moc").exists()
 
+    def test_the_deferred_orders_are_named_not_just_flagged(self, tmp_path):
+        # `finish_deferred` says THAT the finisher is owed something; the
+        # orders say how much, the way the overview family already reports it.
+        # split == shard_order is permitted, and then every node above the
+        # leaves is owed — half this fixture's tree (issue #377).
+        refs = _store(tmp_path)
+        block = dict(families=["stats"], record=False)
+        four = run_sweep(str(tmp_path), refs, partition={"index": 0, "of": 4}, **block)
+        assert four["families"]["stats"]["deferred_orders"] == [0]
+        deep = run_sweep(str(tmp_path), refs, partition={"index": 0, "of": 16}, **block)
+        assert deep["families"]["stats"]["deferred_orders"] == [0, 1]
+        whole = run_sweep(str(tmp_path), refs, **block)["families"]["stats"]
+        assert "deferred_orders" not in whole and "finish_deferred" not in whole
+
     def test_identity_partition_matches_an_unpartitioned_pass(self, tmp_path, monkeypatch):
         whole, one = tmp_path / "whole", tmp_path / "one"
         refs_whole, refs_one = _store(whole), _store(one)
