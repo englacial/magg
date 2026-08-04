@@ -83,8 +83,31 @@ class TestValidateLevels:
     def test_cells_equal_node_is_the_one_cell_group(self):
         validate_levels(norm({"node": 9, "cells": [13, 9]}), **REF)
 
+    def test_cells_equal_node_coexists_with_a_coarser_entry(self):
+        # The whole-footprint member (#381 point (2)) is the writer's universal
+        # partial — it serves the coarser folds below it, so it never sets the
+        # descent floor. The floor here is 13, so the (7,[11]) tail is legal.
+        validate_levels(norm({"node": 9, "cells": [13, 9]}, {"node": 7, "cells": [11]}), **REF)
+
+    def test_bare_node_order_entry_constrains_nothing(self):
+        # An entry declaring ONLY its node-order member has no reader-facing
+        # member at all, so it imposes no cross-entry constraint.
+        validate_levels(norm({"node": 9, "cells": [9]}, {"node": 7, "cells": [8]}), **REF)
+
     def test_gather_same_cells_at_coarser_node(self):
         validate_levels(norm({"node": 9, "cells": [13, 11]}, {"node": 5, "cells": [13, 11]}), **REF)
+
+    def test_gather_does_not_reset_the_descent_floor(self):
+        # After the gather the next comparison is against the GATHER entry:
+        # its reader-facing floor is still 11, so (3,[7]) descends cleanly.
+        validate_levels(
+            norm(
+                {"node": 9, "cells": [13, 11]},
+                {"node": 5, "cells": [13, 11]},
+                {"node": 3, "cells": [7]},
+            ),
+            **REF,
+        )
 
     def test_node_zero_and_leaf_node_are_both_legal(self):
         validate_levels(norm({"node": 9, "cells": 13}, {"node": 0, "cells": 4}), **REF)
@@ -126,6 +149,9 @@ class TestValidateLevels:
             )
 
     def test_cross_entry_equal_resolution_without_gather_refused(self):
+        # 11 is reader-facing on the leaf entry (it is not the node's own
+        # order), so it IS the floor: an o7 entry restating it must spell the
+        # whole cells list to read as the declared gather.
         with pytest.raises(ValueError, match="do not descend from"):
             validate_levels(norm({"node": 9, "cells": [13, 11]}, {"node": 7, "cells": [11]}), **REF)
 

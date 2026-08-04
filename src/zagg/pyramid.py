@@ -88,9 +88,16 @@ def validate_levels(levels: list, *, parent_order: int, child_order: int) -> Non
       (equality: the 1-cell whole-footprint group) and ``< child_order``
       (a member at the base data's own order IS the base data — binding at
       the leaf node, implied coarser by the descent rule);
-    - across consecutive entries, resolutions strictly descend — EXCEPT the
-      declared gather: the SAME ``cells`` list at a coarser ``node`` (pure
-      concatenation, #381 point (3)).
+    - across consecutive entries, resolutions strictly descend — the next
+      entry's finest member must be strictly coarser than the previous
+      entry's coarsest **reader-facing** one. Two exemptions: the declared
+      gather (the SAME ``cells`` list at a coarser ``node`` — pure
+      concatenation, #381 point (3)), and a trailing ``cells == node``
+      member, which is the 1-cell whole-footprint group of #381 point (2)
+      — the writer's universal partial, whose entire purpose is serving the
+      coarser folds declared below it, so it never sets the descent floor.
+      An entry declaring ONLY its node-order member therefore constrains
+      nothing that follows.
     """
     parent_order, child_order = int(parent_order), int(child_order)
     for i, entry in enumerate(levels):
@@ -123,11 +130,20 @@ def validate_levels(levels: list, *, parent_order: int, child_order: int) -> Non
             )
         if entry["cells"] == prev["cells"]:
             continue  # the declared gather: same cells, coarser node
-        if entry["cells"][0] >= prev["cells"][-1]:
+        # The previous entry's floor is its coarsest READER-FACING member: a
+        # trailing `cells == node` member is the 1-cell whole-footprint group
+        # (#381 point (2)), the writer's universal partial that exists to serve
+        # the coarser folds below it, so it is exempt. An entry that declares
+        # only that member constrains nothing.
+        reader = [c for c in prev["cells"] if c != prev["node"]]
+        if not reader:
+            continue
+        if entry["cells"][0] >= reader[-1]:
             raise ValueError(
                 f"output.pyramid.levels[{i}].cells {entry['cells']} do not descend from "
                 f"levels[{i - 1}].cells {prev['cells']} — across entries resolutions "
-                f"strictly descend, except a declared gather (the SAME cells at a "
+                f"strictly descend below the previous entry's coarsest reader-facing "
+                f"member ({reader[-1]}), except a declared gather (the SAME cells at a "
                 f"coarser node)"
             )
 
