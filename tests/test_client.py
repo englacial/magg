@@ -439,6 +439,57 @@ class TestConcurrencyPreflight:
         handle.results()
         assert len(handle) == 3
 
+    def test_sync_probes_fd_bound(self, catalog, monkeypatch):
+        # The sync pool holds one socket per in-flight shard: FD-bounded.
+        width, calls = self._dispatch(
+            catalog, monkeypatch, probe=lambda requested: (2, self._report())
+        )
+        assert width == 2
+        assert self._probe_fd_bound(catalog, monkeypatch, transport="sync") is True
+
+    def test_event_window_is_not_fd_bound(self, catalog, monkeypatch):
+        # The event transport holds no connections, so its pacing window is
+        # sized by account headroom alone (issue #375).
+        assert self._probe_fd_bound(catalog, monkeypatch, transport="event") is False
+
+    @staticmethod
+    def _probe_fd_bound(catalog, monkeypatch, *, transport):
+        """The ``fd_bound`` ``dispatch`` hands the probe for ``transport``.
+
+        Intercepts at ``_probe_workers`` and aborts the dispatch there with a
+        sentinel: the wiring under test is decided before any invoke, so the
+        event transport's runtime (status store + poller) need not be stood up
+        to observe it.
+        """
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        class _ProbeReachedError(Exception):
+            pass
+
+        session = MagicMock()
+        session.client.side_effect = lambda service, **k: MagicMock()
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: session)
+
+        seen: dict = {}
+
+        def _probe(self, session, n, *, fd_bound=True):
+            seen["fd_bound"] = fd_bound
+            raise _ProbeReachedError
+
+        monkeypatch.setattr(Run, "_probe_workers", _probe)
+        run = Run.from_config(
+            default_config("atl06"),
+            shardmap=catalog,
+            store=_STORE,
+            function_name="process-shard-test",
+            source_credentials=_CREDS,
+        )
+        with pytest.raises(_ProbeReachedError):
+            run.dispatch(transport=transport)
+        return seen["fd_bound"]
+
 
 # -- parity with the runner's lambda path -------------------------------------
 
