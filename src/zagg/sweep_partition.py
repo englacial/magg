@@ -136,6 +136,11 @@ def partition_leaves(leaves, partitions: int) -> list[list]:
 def select_partition(by_shard: dict, partitions: int, index: int) -> tuple[dict, int]:
     """Restrict a normalized work set to one partition; ``(kept, n_foreign)``.
 
+    ``n_foreign`` counts DROPPED ``(shard, window)`` leaves — the same currency
+    as the summary's ``n_leaves``, so ``n_leaves + foreign_leaves`` is the work
+    set the invoke was handed. Counting shard nodes instead would understate it
+    by the window multiplicity on a D13 windowed store.
+
     The worker-side half: the ``discover: true`` transport re-derives the WHOLE
     store's work set from its run records, and a hand-rolled invoke may carry
     anything, so the partition filter is applied where the fold happens rather
@@ -148,7 +153,8 @@ def select_partition(by_shard: dict, partitions: int, index: int) -> tuple[dict,
     """
     normalize_partition({"index": index, "of": partitions})
     kept = {d: w for d, w in by_shard.items() if partition_index(d, partitions) == index}
-    return kept, len(by_shard) - len(kept)
+    total = sum(len(w) for w in by_shard.values())
+    return kept, total - sum(len(w) for w in kept.values())
 
 
 def sweep_partitions(store_root: str, leaves, *, partitions: int, **kwargs) -> list[dict]:

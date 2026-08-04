@@ -60,13 +60,13 @@ def _write_manifest(root, *, pyramid=None):
     obstore.put(open_object_store(str(root)), MANIFEST_NAME, json.dumps(manifest).encode())
 
 
-def _put_leaf(root, decimal, *, n_obs=10):
+def _put_leaf(root, decimal, *, n_obs=10, window=None):
     record = build_record(
         shard_key=morton_word(decimal),
         metadata={"total_obs": n_obs, "cells_with_data": 2, "duration_s": 0.5},
         granule_ids=[f"g-{decimal}"],
     )
-    write_sidecar(shard_leaf_path(str(root), morton_word(decimal)), record)
+    write_sidecar(shard_leaf_path(str(root), morton_word(decimal), window=window), record)
     return record
 
 
@@ -204,11 +204,20 @@ class TestPartitionLeaves:
 
 
 class TestSelectPartition:
-    def test_filters_and_counts_foreign_shards(self):
+    def test_filters_and_counts_dropped_leaves(self):
         by_shard = {d: {None} for d in NODES}
         kept, foreign = select_partition(by_shard, 16, 0)
         assert set(kept) == {d for d in NODES if partition_index(d, 16) == 0}
         assert foreign == len(NODES) - len(kept)
+
+    def test_foreign_is_counted_in_leaves_not_shard_nodes(self):
+        # A windowed store has several (shard, window) leaves per shard node;
+        # the dropped count must be in the same currency as the summary's
+        # n_leaves, or "seen minus kept" no longer adds up.
+        by_shard = {d: {"2019", "2020", "2021"} for d in NODES}
+        kept, foreign = select_partition(by_shard, 16, 0)
+        assert foreign == 3 * (len(NODES) - len(kept))
+        assert foreign + 3 * len(kept) == 3 * len(NODES)
 
     def test_union_over_indices_is_the_whole_work_set(self):
         by_shard = {d: {None} for d in NODES}
@@ -332,6 +341,23 @@ class TestWorkerSideFiltering:
         )
         assert summary["n_leaves"] == 3  # -341, 141, 142
         assert summary["foreign_leaves"] == 3
+
+    def test_a_windowed_work_set_is_filtered_and_counted_in_leaves(self, tmp_path):
+        # The D13 windowed layout: several (shard, window) leaves per shard
+        # node. Window membership follows the shard's, and the counts stay in
+        # leaf currency on both sides.
+        _write_manifest(tmp_path)
+        windows = ("2019", "2020")
+        refs = []
+        for decimal in LEAVES:
+            for window in windows:
+                _put_leaf(tmp_path, decimal, window=window)
+                refs.append((morton_word(decimal), window))
+        summary = run_sweep(
+            str(tmp_path), refs, families=["stats"], partition={"index": 0, "of": 4}
+        )
+        assert summary["n_leaves"] == 2 * len(windows)  # -311, -312 x two windows
+        assert summary["n_leaves"] + summary["foreign_leaves"] == len(refs)
 
     def test_split_finer_than_the_shard_order_is_refused(self, tmp_path):
         refs = _store(tmp_path)
