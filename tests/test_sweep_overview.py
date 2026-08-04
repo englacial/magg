@@ -468,6 +468,62 @@ class TestPyramidBlock:
 
         validate_config(self._cfg(store_layout="hive"))  # absent knob is legal
 
+    def test_default_declaration_is_cascade_with_one_exact_level(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        overview = build_pyramid_block(self._cfg(), shard_order=6)["overview"]
+        assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
+
+    def test_exact_levels_knob_recorded(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"exact_levels": 2})
+        assert build_pyramid_block(cfg, shard_order=6)["overview"]["exact_levels"] == 2
+
+    def test_leaves_source_is_deprecated_and_carries_no_boundary(self, caplog):
+        from zagg.sweep_overview import build_pyramid_block
+
+        overview = build_pyramid_block(self._cfg(pyramid={"fold_source": "leaves"}), shard_order=6)[
+            "overview"
+        ]
+        assert overview["fold_source"] == "leaves"
+        # The boundary is a cascade-only concept: recording one under 'leaves'
+        # would declare a distinction the store does not have (issue #376).
+        assert "exact_levels" not in overview
+        assert "DEPRECATED" in caplog.text
+
+    def test_declared_off_block_carries_no_fold_keys(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        # Spec §4.5: the declared-off form is exactly ``{"orders": []}``.
+        block = build_pyramid_block(self._cfg(pyramid=False), shard_order=6)
+        assert block["overview"] == {"orders": []}
+
+    def test_unusable_fold_knobs_fall_back_to_the_default(self, caplog):
+        from zagg.sweep_overview import build_pyramid_block
+
+        # The issue #358 retrofit path reaches build_pyramid_block without
+        # validate_config, so an unusable value declares the default loudly.
+        cfg = self._cfg(pyramid={"fold_source": "sideways", "exact_levels": 0})
+        overview = build_pyramid_block(cfg, shard_order=6)["overview"]
+        assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
+        assert "unknown fold_source" in caplog.text and "exact_levels must be" in caplog.text
+
+    def test_validate_fold_grammar(self, caplog):
+        from zagg.config import validate_config
+
+        validate_config(self._cfg(store_layout="hive", pyramid={"exact_levels": 3}))
+        with pytest.raises(ValueError, match="fold_source must be one of"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"fold_source": "sideways"}))
+        with pytest.raises(ValueError, match="exact_levels must be an int >= 1"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"exact_levels": 0}))
+        with pytest.raises(ValueError, match="exact_levels is meaningless"):
+            validate_config(
+                self._cfg(store_layout="hive", pyramid={"fold_source": "leaves", "exact_levels": 2})
+            )
+        validate_config(self._cfg(store_layout="hive", pyramid={"fold_source": "leaves"}))
+        assert "DEPRECATED" in caplog.text
+
 
 class TestOverviewWriter:
     def test_folds_leaves_at_every_declared_order(self, tmp_path):

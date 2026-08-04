@@ -55,6 +55,27 @@ PYRAMID_SPEC = "zagg-pyramid/1"
 #: display schedule is every 2 orders — 16x per step, ~1/15 extra storage).
 DEFAULT_SPACING = 2
 
+#: The two fold sources a declared level can have (issue #376). ``cascade``
+#: folds a level from the next FINER declared level's already-materialized
+#: overview — fold-of-folds, so per-node input is the 4^gap child overview
+#: slabs (constant, independent of subtree size) and the leaves are read once
+#: for the whole pyramid. ``leaves`` is the pre-#376 exact-from-leaves fold:
+#: every level re-reads the whole subtree, and a single-base-cell AOI's
+#: coarse nodes accumulate their entire subtree's centroids before one k-way
+#: merge — the state-scale wall the issue names. It is kept as a DEPRECATED
+#: opt-in only.
+FOLD_SOURCES = ("cascade", "leaves")
+#: The espg-ratified default (issue #376): overviews are display artifacts,
+#: with no precision guarantee past the first skip level.
+DEFAULT_FOLD_SOURCE = "cascade"
+#: How many of the FINEST declared levels fold exactly from the leaves; every
+#: coarser level cascades from the level below it in this list. 1 is the
+#: ratified default — the finest declared level has no finer overview to
+#: cascade from, so it is exact by construction. The open sub-decision on
+#: issue #376 is whether the second level is exact too ("first, or possibly
+#: second"), which is exactly ``exact_levels: 2``.
+DEFAULT_EXACT_LEVELS = 1
+
 #: NaN policy the exact fold actually implements, recorded per field in the
 #: pyramid declaration and in every overview's attrs (review finding, issue
 #: #201). A leaf's stored NaN is the same bytes whether it is the fill sentinel
@@ -197,7 +218,9 @@ def build_pyramid_block(config, shard_order: int) -> dict:
 
     Declares the overview family's order schedule (``output.pyramid`` knob;
     default every :data:`DEFAULT_SPACING` orders below the shard order —
-    espg-ratified) and each field's composability class + fold method (D24).
+    espg-ratified), how each level is folded (:data:`DEFAULT_FOLD_SOURCE` /
+    :data:`DEFAULT_EXACT_LEVELS`, issue #376), and each field's composability
+    class + fold method (D24).
     ``none`` fields are declared with their class ONLY — the recorded absence
     that gives readers zero-open filtering (option A, the ruled default) —
     and warned about loudly at template time, per the D24 ruling. The sweep
@@ -214,6 +237,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
         orders = sorted({int(k) for k in knob["orders"]}, reverse=True)
     else:
         orders = list(range(int(shard_order) - spacing, -1, -spacing))
+    fold_source, exact_levels = _fold_plan(knob, orders)
     agg = get_agg_fields(config)
     fields: dict = {}
     excluded = []
@@ -249,11 +273,61 @@ def build_pyramid_block(config, shard_order: int) -> dict:
         "spacing": spacing,
         "orders": orders,
         "all_time": bool(knob.get("all_time", False)),
-        "fields": fields,
+        "fold_source": fold_source,
     }
+    # ``exact_levels`` is the cascade boundary and nothing else: under the
+    # deprecated ``leaves`` source every level is exact, so recording a
+    # boundary there would declare a distinction the store does not have.
+    if fold_source == "cascade":
+        overview["exact_levels"] = exact_levels
+    overview["fields"] = fields
     if knob.get("summarize"):
         overview["summarize"] = {str(k): dict(v) for k, v in knob["summarize"].items()}
     return {"spec": PYRAMID_SPEC, "overview": overview}
+
+
+def _fold_plan(knob: dict, orders: list) -> tuple[str, int]:
+    """The declared ``(fold_source, exact_levels)`` pair (issue #376).
+
+    Defensive like the rest of the declaration path: :func:`declare_pyramid`
+    reaches this without ``validate_config`` (issue #358), so an unusable
+    value warns and falls back to the ratified default rather than writing a
+    declaration the sweep would then have to second-guess. ``leaves`` is
+    accepted but deprecated — it is the pre-#376 fold whose per-node input is
+    the whole subtree.
+    """
+    raw = knob.get("fold_source")
+    fold_source = DEFAULT_FOLD_SOURCE if raw is None else str(raw)
+    if fold_source not in FOLD_SOURCES:
+        logger.warning(
+            f"pyramid: unknown fold_source {raw!r} (known: {list(FOLD_SOURCES)}); "
+            f"declaring the default {DEFAULT_FOLD_SOURCE!r}"
+        )
+        fold_source = DEFAULT_FOLD_SOURCE
+    raw = knob.get("exact_levels")
+    try:
+        exact_levels = DEFAULT_EXACT_LEVELS if raw is None else int(raw)
+    except (TypeError, ValueError):
+        exact_levels = 0
+    if exact_levels < 1:
+        logger.warning(
+            f"pyramid: exact_levels must be an int >= 1 (got {raw!r}); declaring the "
+            f"default {DEFAULT_EXACT_LEVELS}"
+        )
+        exact_levels = DEFAULT_EXACT_LEVELS
+    if fold_source == "leaves" and orders:
+        logger.warning(
+            "pyramid: fold_source 'leaves' is DEPRECATED (issue #376) — every declared "
+            "level re-folds the whole subtree from the raw leaves, so per-node memory "
+            "grows with the subtree and the leaves are read once per level; the default "
+            "'cascade' folds each coarse level from the level below it instead"
+            + (
+                " (the declared exact_levels is ignored: every level is exact here)"
+                if knob.get("exact_levels") is not None
+                else ""
+            )
+        )
+    return fold_source, exact_levels
 
 
 def _json_fill(fill_value):
