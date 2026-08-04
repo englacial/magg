@@ -954,6 +954,8 @@ class SpillAggregator:
 
     def _chunk_outputs_merged(self, children, agg_fields: dict):
         """Multi-block regime: emit from the cross-block mergeable state."""
+        from zagg.processing.aggregate import _field_sentinel, _integer_fill
+
         if not self._finalized:
             # Join the in-flight overlap reduce (its failure re-raises here),
             # then fold the final (still-open, never threshold-closed) block
@@ -977,11 +979,21 @@ class SpillAggregator:
             else:
                 stats_arrays[name] = np.zeros(n_cells, dtype=dtype)
         for name in self._composition_fields:
-            # The packed word (issue #321): integer dtype, numeric fill — the
-            # spec mandates fill_value 0 so unwritten cells read as "no lanes".
+            # The packed word (issue #321). Same dtype default as every other
+            # emission path (`_aggregate_chunk_cells`, the count loop above) and
+            # the same fill derivation the pooled path uses for an empty cell
+            # (`_integer_fill` for integer dtypes — it names a non-numeric
+            # sentinel instead of letting it reach numpy — else
+            # `_field_sentinel`): a dtype-omitted composition field must not
+            # store float32 single-block and uint64 multi-block.
             meta = agg_fields[name]
-            dtype = np.dtype(meta.get("dtype", "uint64"))
-            stats_arrays[name] = np.full(n_cells, meta.get("fill_value", 0), dtype=dtype)
+            dtype = np.dtype(meta.get("dtype", "float32"))
+            fill = (
+                _integer_fill(meta, dtype)
+                if np.issubdtype(dtype, np.integer)
+                else _field_sentinel(meta)
+            )
+            stats_arrays[name] = np.full(n_cells, fill, dtype=dtype)
         ragged_payloads: dict[str, list] = {n: [] for n in self._digest_fields}
         ragged_cell_indices: dict[str, list[int]] = {n: [] for n in self._digest_fields}
         # Located fields only (issue #87): keyed presence tells the worker to

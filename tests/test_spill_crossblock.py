@@ -593,6 +593,56 @@ def _true_lane_counts(dfs, grid, cell, threshold=2):
 class TestCompositionMultiBlock:
     """merge_composition across forced block closes (issue #370 option (a))."""
 
+    @pytest.mark.parametrize("declared", [None, "uint64"])
+    def test_prealloc_dtype_and_fill_match_single_block(self, monkeypatch, declared):
+        # The two spill regimes must agree on the stored dtype and on an empty
+        # cell's fill. Nothing forces a composition field to declare `dtype`,
+        # and the merged prealloc used to default it to uint64 while every
+        # other emission path (and the single-block replay) defaults float32.
+        key = _shard_key()
+        field = _composition_field()
+        if declared is None:
+            del field["dtype"], field["fill_value"]
+        else:
+            field["dtype"] = declared
+        variables = {
+            "count": {"function": "len", "source": "h_ph", "dtype": "int32", "fill_value": 0},
+            "composition": field,
+        }
+        cfg = _config(dict(variables), streaming=_SPILL)
+        dfs = _granule_dfs(_grid(cfg), key, _CELL_LISTS[:2], obs_per_cell=8, seed=5, conf=True)
+        df_1, _, _ = _run(monkeypatch, cfg, _grid(cfg), key, list(dfs))
+        multi_cfg = _config(dict(variables), streaming=_SPILL)
+        _force_tiny_blocks(monkeypatch)
+        df_m, _, _ = _run(monkeypatch, multi_cfg, _grid(multi_cfg), key, list(dfs))
+        expected = np.dtype("float32" if declared is None else declared)
+        assert df_1["composition"].dtype == expected
+        assert df_m["composition"].dtype == expected
+        # Empty cells (no observation at all) take the same sentinel in both
+        # regimes: NaN for the float default, the declared 0 for the word.
+        empty = df_1["count"].values == 0
+        assert empty.any()
+        w1, wm = df_1["composition"].values[empty], df_m["composition"].values[empty]
+        if declared is None:
+            assert np.isnan(w1).all() and np.isnan(wm).all()
+        else:
+            assert (w1 == 0).all() and (wm == 0).all()
+
+    def test_non_numeric_fill_on_the_word_is_named(self, monkeypatch):
+        # An integer-dtype field with a string sentinel is rejected by name
+        # (_integer_fill), not by numpy's int('NaN') deep in the prealloc.
+        key = _shard_key()
+        variables = {
+            "count": {"function": "len", "source": "h_ph", "dtype": "int32", "fill_value": 0},
+            "composition": {**_composition_field(), "fill_value": "NaN"},
+        }
+        cfg = _config(dict(variables), streaming=_SPILL)
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS[:2], obs_per_cell=8, seed=6, conf=True)
+        _force_tiny_blocks(monkeypatch)
+        with pytest.raises(ValueError, match="cannot hold a non-numeric sentinel"):
+            _run(monkeypatch, cfg, grid, key, list(dfs))
+
     def test_presence_exact_counts_within_fold_bound(self, monkeypatch):
         key = _shard_key()
         variables = {
