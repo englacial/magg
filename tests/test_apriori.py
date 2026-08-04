@@ -285,6 +285,33 @@ class TestAprioriReadGroup:
         )
         assert result is None
 
+    def test_short_circuits_read_as_measured_zero(self, tmp_path):
+        # Both a-priori exits above return before any base-rate decode, so
+        # neither reaches _execute_plan_group's counter. Each stamps a measured
+        # zero itself, or the route reports None -- "unmeasured", the signal
+        # reserved for a seam that was never instrumented (issue #374).
+        _write_parquet(tmp_path)
+        ds = _data_source(chunk_boundaries={"prefix": str(tmp_path)})
+        url = f"/data/{GRANULE}"
+
+        io_stats: dict = {}  # no chunk's span touches the shard
+        assert (
+            _read_group(
+                _Granule(), "gt1l", ds, 0, _BandGrid(80.0, 81.0), granule_url=url, io_stats=io_stats
+            )
+            is None
+        )
+        assert io_stats["obs_read"] == 0
+
+        io_stats = {}  # beam absent from the boundary parquet
+        assert (
+            _read_group(
+                _Granule(), "gt2r", ds, 0, _BandGrid(*BAND), granule_url=url, io_stats=io_stats
+            )
+            is None
+        )
+        assert io_stats["obs_read"] == 0
+
     def test_missing_parquet_raises(self, tmp_path):
         ds = _data_source(chunk_boundaries={"prefix": str(tmp_path)})
         with pytest.raises(FileNotFoundError, match="boundary parquet"):
