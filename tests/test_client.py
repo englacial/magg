@@ -499,13 +499,16 @@ class TestConcurrencyPreflight:
         # lazily, but the declared cap is what turns into EMFILE if the loop
         # ever goes concurrent (PR #378, question (5) ruling).
         monkeypatch.setattr(zagg.client, "fd_safe_max_workers", lambda: 2)
-        _, _, pool = self._dispatch(catalog, monkeypatch, max_workers=5)
-        assert pool == 2
+        width, _, pool = self._dispatch(catalog, monkeypatch, max_workers=5)
+        # The clamp stops at the DECLARED pool: the fan-out width is still the
+        # shard-count clamp of the requested 5, un-touched by the fd bound --
+        # re-clamping it there would undo issue #375.
+        assert (pool, width) == (2, 3)
 
     def test_pool_cap_unchanged_below_fd_bound(self, catalog, monkeypatch):
         monkeypatch.setattr(zagg.client, "fd_safe_max_workers", lambda: 100)
-        _, _, pool = self._dispatch(catalog, monkeypatch, max_workers=2)
-        assert pool == 2
+        width, _, pool = self._dispatch(catalog, monkeypatch, max_workers=2)
+        assert (pool, width) == (2, 2)
 
     @staticmethod
     def _probe_fd_bound(catalog, monkeypatch, *, transport):
