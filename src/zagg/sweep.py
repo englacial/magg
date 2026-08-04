@@ -321,7 +321,14 @@ def write_leaf_submap(
     meta = dict(metadata or {})
     for stale in ("aoi_mask", "build_wall_s", "reproject"):
         meta.pop(stale, None)
-    meta.update(total_shards=1, total_granules=len(entries), total_pairs=len(entries))
+    meta.update(
+        total_shards=1,
+        total_granules=len(entries),
+        total_pairs=len(entries),
+        # Whole-catalog count from the build metadata: rewritten per leaf like
+        # its siblings above, or a leaf object would publish the run total.
+        granules_assigned=len({g["id"] for g in entries}),
+    )
     payload = {
         "metadata": meta,
         "grid_signature": dict(grid_signature),
@@ -445,6 +452,9 @@ class SubmapFamily(SweepFamily):
         meta = dict(payloads[0].get("metadata") or {})
         meta.pop("reproject", None)  # never inherit a child fold's stamp
         meta["total_granules"] = len({e["id"] for g in granules for e in g})
+        # On a folded map the distinct-union IS the assigned set; keep the two
+        # keys agreeing rather than inheriting a stale build-side value.
+        meta["granules_assigned"] = meta["total_granules"]
         folded = ShardMap(signature, keys, granules, meta)
         if int(signature["parent_order"]) == int(order):
             # Shard-node fold: already at the node's order — a window union,

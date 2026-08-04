@@ -536,6 +536,11 @@ class ShardMap:
             "backend": chosen,
             "footprint": footprint,
             "total_granules": len(records),
+            # Distinct granules the exact intersection ASSIGNED to some shard —
+            # ``total_granules`` above is the catalog records CONSIDERED (the
+            # input, often a conservative bbox-prefilter superset), and reading
+            # it as the assigned count is a recurring misread (demo, 2026-08-04).
+            "granules_assigned": len({g["id"] for shard in granules for g in shard}),
             "total_shards": len(shard_keys),
             "total_pairs": sum(len(g) for g in granules),
             "build_wall_s": round(wall, 3),
@@ -728,6 +733,10 @@ class ShardMap:
         }
         meta["total_shards"] = len(new_keys)
         meta["total_pairs"] = sum(len(g) for g in new_granules)
+        # Recomputed like total_shards/total_pairs: a derived map must not carry
+        # the source's assigned count (refine can over-include at boundaries;
+        # a pre-field source map simply gains the key).
+        meta["granules_assigned"] = len({g["id"] for shard in new_granules for g in shard})
         # The dropped per-shard AOI mask (aoi_mask=None below) must not still be
         # advertised in the derived map's metadata.
         meta.pop("aoi_mask", None)
