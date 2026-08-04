@@ -80,7 +80,7 @@ from zagg.config import (
     load_config_from_dict,
     validate_config,
 )
-from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, max_cost_usd
+from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, LAMBDA_PRICE_PER_GB_SEC, max_cost_usd
 from zagg.grids import from_config as grid_from_config
 from zagg.grids.morton import morton_word
 from zagg.hive import effective_store_root
@@ -153,9 +153,18 @@ class RunHandle:
     tail — the finisher is a daemon so that case cannot hang exit.
     """
 
-    def __init__(self, futures: dict[int, Future], *, store_path: str):
+    def __init__(
+        self,
+        futures: dict[int, Future],
+        *,
+        store_path: str,
+        memory_gb: float | None = None,
+        price_per_gb_sec: float = LAMBDA_PRICE_PER_GB_SEC,
+    ):
         self.futures = futures
         self.store_path = store_path
+        self._memory_gb = memory_gb
+        self._price_per_gb_sec = price_per_gb_sec
         self._finisher: threading.Thread | None = None
         self._finalize_error: BaseException | None = None
         self._tail_error: BaseException | None = None
@@ -180,6 +189,60 @@ class RunHandle:
         """
         yield from as_completed(self.futures.values(), timeout=timeout)
         self._join_tail()
+
+    def cost_usd(self) -> float | None:
+        """Metered Lambda cost of the settled shards so far (billed-duration rollup).
+
+        Sums ``lambda_duration`` over every settled shard — worker envelopes
+        and :class:`ShardError` payloads alike (a failed invoke still billed)
+        — priced at the run's worker memory, the same rollup the CLI prints
+        post-run (issue #298). Non-blocking: on a live run this is the
+        running subtotal, so a status cell can show cost-so-far. ``None``
+        when the handle does not know the worker memory (a reattached
+        handle) — the run-stats parquet has the authoritative figures.
+        """
+        if self._memory_gb is None:
+            return None
+        total = 0.0
+        for fut in self.futures.values():
+            if not fut.done():
+                continue
+            exc = fut.exception()
+            if exc is None:
+                payload = fut.result()
+            elif isinstance(exc, ShardError):
+                payload = exc.payload
+            else:
+                continue
+            total += float(payload.get("lambda_duration") or 0.0)
+        return total * self._memory_gb * self._price_per_gb_sec
+
+    def progress_async(self, **tqdm_kwargs) -> threading.Thread:
+        """Drive the harvest on a daemon thread: live bar, the cell returns at once.
+
+        The notebook-async form of :meth:`progress` (issue #328): the
+        returned (already-started) thread drains :meth:`progress` — or the
+        bar-less :meth:`as_completed` when tqdm is absent — so later cells
+        execute while the bar ticks. Draining joins the post-run tail as
+        usual; a tail failure is logged and re-raises from :meth:`wait`,
+        never on the daemon thread. Join the run (:meth:`wait`, or the
+        returned thread) before consuming results.
+        """
+
+        def _drain() -> None:
+            try:
+                iterator = self.progress(**tqdm_kwargs)
+            except ImportError:
+                iterator = self.as_completed()
+            try:
+                for _ in iterator:
+                    pass
+            except BaseException as e:  # noqa: BLE001 - surfaced via wait(), not the daemon
+                logger.warning(f"async progress drain: {e} (re-raises from handle.wait())")
+
+        thread = threading.Thread(target=_drain, name="zagg-client-progress", daemon=True)
+        thread.start()
+        return thread
 
     def status(self) -> dict[str, int]:
         """Non-blocking snapshot: ``{"pending": n, "ok": n, "failed": n}``."""
@@ -797,7 +860,7 @@ class Run:
                 )
             closer = pool
 
-        handle = RunHandle(futures, store_path=self.store)
+        handle = RunHandle(futures, store_path=self.store, memory_gb=memory_gb)
         finisher = threading.Thread(
             target=self._post_run,
             args=(handle, client, closer, config_dict, dataset, output_creds_event, run_id),

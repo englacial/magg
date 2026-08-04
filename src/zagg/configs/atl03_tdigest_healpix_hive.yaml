@@ -8,6 +8,9 @@ data_source:
   granule_workers: 4
   reader: h5coro
   driver: s3
+  index:
+    backend: inline            # virtual chunk-index for the byte-range reads;
+                               # omit the block for the pure hierarchical metadata walk
   groups: [gt1l, gt1r, gt2l, gt2r, gt3l, gt3r]
   coordinates:
     latitude: "/{group}/heights/lat_ph"
@@ -38,6 +41,13 @@ data_source:
     pad: 1                       # one segment of padding on each side per #43
 
 aggregation:
+  streaming:
+    mode: spill                # bounded read buffers spilled to /tmp partitions, one
+                               # aggregate pass after the reads (pooled-identical in the
+                               # single-block regime; every reducer). Omit the block for
+                               # the fully-pooled path; mode: merge folds incrementally
+                               # (mergeable reducers only). Pairs with worker.extra_disk.
+                               # buffer_granules defaults to 50.
   coordinates:
     morton:
       dtype: uint64
@@ -70,3 +80,10 @@ output:
     child_order: 19              # leaf cell resolution (~10 m)
   store_layout: hive             # each dispatched shard writes its own leaf zarr
   pyramid: false                 # overview sweep off (untested at demo scale, issue #201)
+
+worker:
+  memory: 4096                   # pre-provisioned Lambda variant, MB (2048|4096|8192) --
+                                 # picks the process-shard-<memory> function and keys both
+                                 # the pre-invoke cost ceiling and the metered rollup
+  extra_disk: true               # the -disk twin: memory+2048 MB of /tmp, backing the
+                                 # spill partitions (aggregation.streaming.mode: spill)

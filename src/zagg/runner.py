@@ -1239,6 +1239,12 @@ class RasterStrategy:
             "output": config.output,
             "pipeline": config.pipeline,
         }
+        # Stamp the RESOLVED store layout into the shipped config: the deployed
+        # handler routes hive-vs-flat (and so whether ``time_index`` is
+        # required) by peeking at the raw dict, so a config relying on the
+        # hive-by-default resolution (#253) would otherwise dispatch hive-shaped
+        # events that the worker validates against the flat requirements.
+        config_dict["output"] = {**config.output, "store_layout": store_layout}
         # Normalize creds + resolved endpoint into the camelCase envelope the
         # handler's ``_output_store_kwargs`` requires, exactly as the spatial and
         # temporal lambda paths do — so raster inherits snake_case/STS-PascalCase

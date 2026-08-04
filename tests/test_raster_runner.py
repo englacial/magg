@@ -1166,8 +1166,14 @@ class TestRasterHiveLambdaBackend:
         # Issue #253 phase 4, lambda dispatcher: a healpix raster config with
         # NO store_layout key runs the hive lifecycle (ping -> async setup ->
         # hive process events -> finalize/coverage), not the issue #264 flat
-        # sync-setup path. The default resolves in get_store_layout on both
-        # ends — the events forward the config untouched, no injected key.
+        # sync-setup path. The shipped config carries the RESOLVED layout
+        # (regression, demo 2026-08-03): this test originally pinned
+        # "the default resolves in get_store_layout on both ends — the events
+        # forward the config untouched", but the deployed handler routes
+        # hive-vs-flat (and so whether ``time_index`` is required) by peeking
+        # at the RAW config dict, so a defaulted-hive dispatch shipped
+        # hive-shaped events that the worker 400'd against the flat
+        # requirements. The dispatcher now stamps the resolution it acted on.
         import boto3
 
         cfg, sm_path, shard, _data = manifest
@@ -1214,10 +1220,12 @@ class TestRasterHiveLambdaBackend:
         assert all("time_index" not in ev and "window" not in ev for ev in procs)
         assert all(ev["shard_key"] == shard for ev in procs)
         # No sync flat raster setup: no event carries the flat template's
-        # times_us, and the forwarded config still has no store_layout key.
+        # times_us, and every shipped config carries the resolved hive layout
+        # so the handler's raw-dict peek agrees with the event shape.
         assert all("times_us" not in ev for ev in fake.events)
-        for ev in fake.events[:2] + [fake.events[-2]]:
-            assert "store_layout" not in ev["config"]["output"]
+        for ev in fake.events:
+            if "config" in ev:
+                assert ev["config"]["output"]["store_layout"] == "hive"
 
     def test_all_failed_finalizes_before_raise(self, manifest, monkeypatch):
         # All-shards-failed still runs the finalize backstop BEFORE the

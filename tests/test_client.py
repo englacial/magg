@@ -898,6 +898,32 @@ class TestTailTiming:
         assert stub.modes().count("stats") == 2
 
 
+class TestCostRollup:
+    def test_cost_usd_prices_billed_durations(self, catalog):
+        from zagg.dispatch import LAMBDA_PRICE_PER_GB_SEC
+
+        handle = _run(catalog, client=StubLambdaClient()).dispatch()
+        handle.results()
+        total = sum(f.result().get("lambda_duration") or 0.0 for f in handle.futures.values())
+        assert handle.cost_usd() == pytest.approx(total * 4.0 * LAMBDA_PRICE_PER_GB_SEC)
+
+    def test_cost_usd_none_without_memory(self):
+        handle = RunHandle({}, store_path="s3://b/s.zarr")
+        assert handle.cost_usd() is None
+
+
+class TestProgressAsync:
+    def test_drains_and_joins_tail_without_blocking(self, catalog):
+        stub = StubLambdaClient(mode_delay=0.05)
+        handle = _run(catalog, client=stub).dispatch()
+        thread = handle.progress_async(leave=False, disable=True)
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+        assert handle.status()["pending"] == 0
+        # Draining on the thread still joined the post-run tail.
+        assert stub.modes()[-3:] == ["finalize", "coverage", "stats"]
+
+
 # -- tqdm optionality --------------------------------------------------------
 
 

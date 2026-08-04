@@ -69,3 +69,4 @@ out.zarr/
 # demo notebook artifacts (generated at run time)
 demo/outputs/
 demo/wheels/
+demo/atl03_v007_full.parquet
