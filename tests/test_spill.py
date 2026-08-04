@@ -727,10 +727,13 @@ class TestSpillWorkerSingleBlock:
             "spill_write_s",
             "spill_read_s",
             "spill_bytes",
+            "spill_blocks_closed",
         }
         assert timings["spill_bytes"] > 0
         assert timings["spill_write_s"] >= 0
         assert timings["spill_read_s"] >= 0
+        # Single-block run: the fold-regime marker reads 0 (exact regime).
+        assert timings["spill_blocks_closed"] == 0
 
 
 class TestSpillWorkerMultiBlock:

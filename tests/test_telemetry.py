@@ -159,6 +159,8 @@ class TestBuildRecord:
         # The spill instrumentation (issue #217) stamps byte counts alongside
         # the ``*_s`` seconds in ``phase_timings``; the record keeps timings
         # seconds-only and surfaces the volume on its own top-level field.
+        # The issue #370 fold-regime marker splits out the same way (a count,
+        # not seconds).
         rec = _record(
             phases={
                 "read": 8.0,
@@ -166,6 +168,7 @@ class TestBuildRecord:
                 "spill_write_s": 0.5,
                 "spill_read_s": 0.25,
                 "spill_bytes": 4096.0,
+                "spill_blocks_closed": 3,
             }
         )
         assert rec["phase_timings"] == {
@@ -175,6 +178,21 @@ class TestBuildRecord:
             "spill_read_s": 0.25,
         }
         assert rec["spill_bytes"] == pytest.approx(4096.0)
+        assert rec["spill_blocks_closed"] == 3
+
+    def test_spill_blocks_closed_absent_reads_none(self):
+        # 0/absent = exact regime; a record without the marker carries None.
+        assert _record()["spill_blocks_closed"] is None
+
+    def test_spill_blocks_closed_merges_by_sum_and_flattens(self):
+        # Rollups sum the fold counts (like spill_bytes); the run parquet gets
+        # a real column so folded leaves are queryable after the fact.
+        a = _record(phases={"read": 1.0, "spill_blocks_closed": 2})
+        b = _record(phases={"read": 1.0, "spill_blocks_closed": 3})
+        assert merge([a, b])["spill_blocks_closed"] == 5
+        row = flatten_record(a)
+        assert row["spill_blocks_closed"] == 2
+        assert "phase_spill_blocks_closed" not in row
 
     def test_granules_sha256_order_independent(self):
         assert granules_sha256(["b", "a"]) == granules_sha256(["a", "b"])

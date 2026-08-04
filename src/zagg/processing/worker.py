@@ -792,6 +792,11 @@ def process_shard(
         phase_timings["spill_write_s"] = buffered.spill_write_s
         phase_timings["spill_read_s"] = buffered.spill_read_s
         phase_timings["spill_bytes"] = buffered.spill_bytes
+        # Fold-regime marker (issue #370): blocks closed at the threshold.
+        # 0 = exact single-block regime; > 0 = this leaf's outputs were folded
+        # across blocks. Split out of the seconds-only timings by build_record,
+        # like spill_bytes.
+        phase_timings["spill_blocks_closed"] = buffered.closed_blocks
     metadata["phase_timings"] = phase_timings
 
     duration = (datetime.now() - start_time).total_seconds()

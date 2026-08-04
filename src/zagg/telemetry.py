@@ -53,6 +53,7 @@ _SUM_OR_NONE_KEYS = (
     "gb_seconds",
     "est_cost_usd",
     "spill_bytes",
+    "spill_blocks_closed",
     "raster_bytes_read",
     "raster_px_decoded",
     "raster_px_sampled",
@@ -167,9 +168,16 @@ def build_record(
     # in the seconds-only phase block: the run parquet flattens phase_timings to
     # seconds-typed columns, where a byte count would mislead cost/latency
     # queries. Split any ``*_bytes`` entries out; surface spill volume on its own
-    # summed field (issue #297).
+    # summed field (issue #297). ``spill_blocks_closed`` (issue #370) is split
+    # the same way: the fold-regime marker (0/absent = exact single-block leaf)
+    # is a count, not seconds.
     spill_bytes = phase_entries.get("spill_bytes")
-    phase_timings = {k: v for k, v in phase_entries.items() if not k.endswith("_bytes")}
+    spill_blocks_closed = _opt_int(phase_entries.get("spill_blocks_closed"))
+    phase_timings = {
+        k: v
+        for k, v in phase_entries.items()
+        if not k.endswith("_bytes") and k != "spill_blocks_closed"
+    }
     granule_ids = list(granule_ids) if granule_ids is not None else None
     n_granules = metadata.get("granule_count")
     if n_granules is None:
@@ -198,6 +206,11 @@ def build_record(
         "phase_timings": phase_timings,
         "duration_s": duration_s,
         "spill_bytes": spill_bytes,
+        # Fold-regime marker (issue #370): blocks closed at the spill threshold.
+        # 0/absent = exact single-block leaf; > 0 = the leaf's outputs were
+        # folded across blocks (digest merge semantics, coarsened locations,
+        # one composition re-quantization).
+        "spill_blocks_closed": spill_blocks_closed,
         # Raster read-volume counters (issue #297): compressed bytes fetched,
         # pixels decoded (whole tiles), cell samples gathered. Stored raw — the
         # px_decoded / px_sampled ratio is derived at read, never stored
@@ -321,6 +334,7 @@ _ROW_SCALARS = (
     "gb_seconds",
     "est_cost_usd",
     "spill_bytes",
+    "spill_blocks_closed",
     "raster_bytes_read",
     "raster_px_decoded",
     "raster_px_sampled",
