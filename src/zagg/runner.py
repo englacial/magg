@@ -5140,7 +5140,17 @@ def _invoke_lambda_sweep(
     partitions own no node above the split order, so the coarse levels and the
     store-root artifacts are left to the finisher. ``partitions=1`` (the
     default, and what the runner tail keeps firing) is the single-invoke form,
-    byte-identical to the pre-feature event.
+    byte-identical to the pre-feature event — it short-circuits past
+    :func:`partition_leaves` precisely to keep that byte-identity, so the two
+    branches differ on an EMPTY work set (one ``leaves: []`` invoke vs none).
+    Every call site guards with ``if leaves:``, so the difference is unreachable.
+
+    The fan-out is deliberately NOT error-isolated: an invoke that throws
+    (throttling, transient) aborts the remaining partitions and the call sites'
+    fail-open ``except`` swallows it. Benign by construction — each partition
+    is independently idempotent (D22 generation stamps), so the next hook run
+    or ``python -m zagg.sweep`` folds whatever did not fire; the returned count
+    is how a caller says how many landed.
     """
     from zagg.sweep_partition import partition_leaves
 
