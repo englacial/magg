@@ -112,6 +112,9 @@ output:
     windows:                        # explicit schedule only:
       - {label: melt-2019, start: "2019-06-01", end: "2019-09-01"}
       - {label: melt-2020, start: "2020-06-01", end: "2020-09-01"}
+      - {label: scene-a, timestamp: "2021-03-14T12:00:31.024Z"}  # point form:
+                                    #   the acquisition's OWN instant, copied
+                                    #   from the item — not a rounded-off one
 ```
 
 - **Leaf naming is frozen**: `{full_id}_{window}.zarr`, underscore separator,
@@ -120,6 +123,34 @@ output:
   chronological order; explicit labels are opaque (`[0-9A-Za-z-]{1,32}`) and
   decode only through the declared list. `quarterly` is grammar-reserved but
   not implemented (validation rejects it).
+- **An explicit entry may be a point** ([issue #355](https://github.com/englacial/zagg/issues/355)):
+  `{label, timestamp}` is sugar for the second-wide half-open `[t, t + 1s)`,
+  for time axes that are effectively discrete (single acquisitions, scene
+  timestamps, isolated campaign instants). Each entry declares *exactly one* of
+  `timestamp` or `start`+`end` — mixing them in one entry is rejected. The
+  desugaring happens in `zagg.config.get_windowing`, so the manifest and every
+  downstream consumer only ever see an ordinary `{label, start, end}` window.
+  One second is the grammar's own resolution (boundaries are whole seconds
+  throughout), which also keeps membership off float equality on observation
+  timestamps (a sub-second `timestamp` normalizes to the whole second
+  containing it). *Consequence*: two acquisitions within the same wall-clock
+  second share a window, and two point entries inside one second are rejected
+  as overlapping — as is a point that lands inside an already-declared range
+  window, which is an ordinary overlap (see the validation paragraph below).
+  If that ever bites, the fix is an explicit `width` key on the point form, not
+  a guessed default; until it exists, any key on an entry beyond its own form's
+  (`label`/`timestamp` or `label`/`start`/`end`; `width` included) is rejected
+  rather than ignored.
+- **A point window that matches nothing fails SILENTLY** — it covers only the
+  whole second containing `t`, so the declared `timestamp` must be the
+  acquisition's own instant, copied from the item, not a rounded-off
+  approximation of it. STAC datetimes are rarely round seconds, so this is the
+  likely first-contact mistake: `timestamp: "2021-03-14T12:00:00Z"` matches
+  nothing for a scene whose `datetime` is `2021-03-14T12:00:31.024Z`. On the
+  point pipeline the window still dispatches and the worker's `ge`/`lt` filter
+  matches nothing, leaving an empty leaf; on raster the group is dropped at
+  dispatch (`runner._raster_windowed_units`) and no work unit, leaf, or warning
+  is produced at all. Neither path errors.
 - **Boundaries are UTC calendar terms, half-open `[start, end)`.** Window
   bounds are converted to dataset units once at dispatch, using the declared
   `epoch`/`scale`/`units` and a fixed scale offset (`GPS−UTC = 18 s`,
@@ -149,7 +180,20 @@ output:
 Validation: `output.windowing` requires the hive layout on a healpix grid;
 `time_field` must be a declared `data_source` column (the worker can only
 filter what it reads); explicit windows must be well-formed (frozen label
-grammar, `start < end`, unique labels, disjoint ranges). On the raster path
+grammar, `start < end`, unique labels, disjoint ranges — point entries are
+desugared first, so a point landing inside another window's range is a genuine
+overlap and is rejected). Range bounds render at whole-second granularity
+exactly as a point `timestamp` does — **each bound truncates to the second
+containing it** — so a fractional bound silently retimes that edge of the
+window: `[12:00:00.0Z, 12:00:01.5Z)` dispatches as
+`[12:00:00, 12:00:01)`, dropping the declared half second of coverage at the
+tail. A range is never widened to recover the truncated fraction. The one
+case refused outright is total collapse: when *both* bounds render to the
+same second (say `12:00:01.0Z` → `12:00:01.4Z`) the window dispatches as an
+empty `ge x`/`lt x` pair, so it is rejected — the point form is the spelling
+for one-second intent. A sub-second range that *straddles* a second boundary
+(`12:00:01.9Z` → `12:00:02.1Z`) is still valid; it renders to the one-second
+window its truncated bounds describe. On the raster path
 ([issue #247](https://github.com/englacial/zagg/issues/247)) membership is
 the acquisition's STAC `datetime`: `time_field` is optional (fixed to
 `datetime`) and the `epoch`/`scale`/`units` conversion knobs are rejected.

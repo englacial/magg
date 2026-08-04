@@ -631,7 +631,7 @@ class Run:
 
     # -- dispatch -----------------------------------------------------------
 
-    def _probe_workers(self, session, n: int) -> int:
+    def _probe_workers(self, session, n: int, *, fd_bound: bool = True) -> int:
         """Account-concurrency preflight, degrading to the default on denial.
 
         Runs ``agg``'s own :func:`~zagg.concurrency.compute_available_workers`
@@ -639,6 +639,11 @@ class Run:
         size, so a notebook fan-out is sized by what the account can actually
         take rather than by a hardcoded guess (espg ruling on PR #333: whoever
         can invoke the workers normally can read the concurrency too).
+
+        ``fd_bound`` carries the transport's connection model through to the
+        probe: the sync transport holds one socket per in-flight shard, so its
+        window is FD-bounded; the event transport holds none and passes
+        ``False`` (issue #375).
 
         Fail-open by design: ANY probe failure — ``AccessDenied`` under a
         narrow-permission deployment (the cryocloud case, where the worker role
@@ -656,6 +661,7 @@ class Run:
                 session.client("lambda", region_name=self.region),
                 session.client("cloudwatch", region_name=self.region),
                 self.function_name,
+                fd_bound=fd_bound,
             )
             runner._log_concurrency_report(report, workers)
             return workers
@@ -698,6 +704,17 @@ class Run:
             shards may be dispatched-but-unresolved at once, load-bearing
             because the fleet's 60 s ``MaximumEventAgeInSeconds`` silently
             drops an Event invoke the account has no concurrency to start.
+            The two transports therefore probe differently (issue #375): the
+            sync pool is clamped by the local ``RLIMIT_NOFILE`` ceiling (one
+            held socket per in-flight shard), while the event window — which
+            holds no connections — is sized by account headroom alone, so a
+            low ``ulimit -n`` no longer strands concurrency the account has
+            already granted. The window is fired serially by the poller thread
+            (:meth:`~zagg.client_transport.StatusPoller._dispatch_up_to_window`),
+            so a wider window also lengthens the opening dispatch ramp
+            proportionally — roughly 10 ms of invoke round-trip per shard, and
+            no LIST runs during it. Deliberate: the ramp grows by seconds while
+            the clamp cost whole 900 s waves (issue #375).
         transport : str
             ``"sync"`` (default, the v1 transport): a thread pool over
             synchronous ``RequestResponse`` invokes — one held connection per
@@ -715,7 +732,7 @@ class Run:
             writes status objects (issue #327) and read access to the status
             prefix for the poll.
         """
-        from zagg import runner
+        from zagg import concurrency, runner
 
         if transport not in ("sync", "event"):
             raise ValueError(f'transport must be "sync" or "event", got {transport!r}')
@@ -735,11 +752,21 @@ class Run:
             from botocore.config import Config
 
             session = boto3.Session()
-            requested = max_workers if max_workers is not None else self._probe_workers(session, n)
+            # The FD ceiling bounds the SYNC pool (one held socket per in-flight
+            # shard); the event transport holds no connections, so its pacing
+            # window comes from account headroom alone (issue #375).
+            requested = (
+                max_workers
+                if max_workers is not None
+                else self._probe_workers(session, n, fd_bound=transport == "sync")
+            )
             workers = max(1, min(requested, n))
             # read_timeout must exceed the 900 s function ceiling (same
             # rationale as agg's preflight-built client, issue #148); the
-            # connection pool tracks the fan-out width.
+            # connection pool tracks the fan-out width, but must never exceed
+            # the fd ceiling regardless of pacing window — the event window
+            # may clear RLIMIT_NOFILE (issue #375), a pool of sockets may not.
+            # Through the module seam, so the fd ceiling has one patch point.
             client = session.client(
                 "lambda",
                 region_name=self.region,
@@ -747,7 +774,7 @@ class Run:
                     read_timeout=960,
                     connect_timeout=10,
                     retries={"max_attempts": 0},
-                    max_pool_connections=workers,
+                    max_pool_connections=min(workers, concurrency.fd_safe_max_workers()),
                 ),
             )
             invoked_by = runner._resolve_invoked_by(session, self.region)

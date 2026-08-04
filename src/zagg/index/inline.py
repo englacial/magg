@@ -608,7 +608,17 @@ class InlineIndex(VirtualIndex):
         key = write_manifest(granule_manifest(maps), self.store, _granule_id(granule_url))
         logger.info(f"  inline write-back: {len(maps)} dataset(s) -> {self.store}/{key}")
 
-    def read_group(self, h5obj, group, data_source, shard_key, grid, arrow=False, granule_url=None):
+    def read_group(
+        self,
+        h5obj,
+        group,
+        data_source,
+        shard_key,
+        grid,
+        arrow=False,
+        granule_url=None,
+        io_stats=None,
+    ):
         from zagg.processing.read import (
             _planned_read_group,
             _read_group_full,
@@ -635,10 +645,24 @@ class InlineIndex(VirtualIndex):
         read_fn = self._chunk_aligned_read_fn(h5obj, planned=planned)
         if planned:
             return _planned_read_group(
-                h5obj, group, data_source, shard_key, grid, arrow=arrow, read_fn=read_fn
+                h5obj,
+                group,
+                data_source,
+                shard_key,
+                grid,
+                arrow=arrow,
+                read_fn=read_fn,
+                io_stats=io_stats,
             )
         return _read_group_full(
-            h5obj, group, data_source, shard_key, grid, arrow=arrow, read_fn=read_fn
+            h5obj,
+            group,
+            data_source,
+            shard_key,
+            grid,
+            arrow=arrow,
+            read_fn=read_fn,
+            io_stats=io_stats,
         )
 
     def _chunk_aligned_read_fn(self, h5obj, *, planned=True):

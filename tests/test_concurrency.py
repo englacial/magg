@@ -236,3 +236,58 @@ class TestComputeAvailableWorkers:
         cw = _cloudwatch_client(current_max=200)
         workers, _ = concurrency.compute_available_workers(1700, lam, cw, "fn")
         assert workers == 1
+
+
+class TestFdBound:
+    """``fd_bound=False`` drops the FD term for connection-less carriers (#375).
+
+    The event transport holds no socket per in-flight shard, so clamping its
+    pacing window at ``RLIMIT_NOFILE`` strands account headroom that has
+    already been granted (observed: ~1,000 window against ~1,898 available).
+    """
+
+    def test_event_window_ignores_the_fd_ceiling(self, fake_rlimit):
+        fake_rlimit(1024, 1024)  # fd ceiling 992, well below account headroom
+        lam = _lambda_client(account_limit=2000)
+        cw = _cloudwatch_client(current_max=0)
+        workers, report = concurrency.compute_available_workers(2721, lam, cw, "fn", fd_bound=False)
+        # account available = 2000 - 0 - 100 padding; the fd ceiling does not bite
+        assert report.available == 1900
+        assert workers == 1900
+
+    def test_sync_stays_fd_clamped_on_the_same_inputs(self, fake_rlimit):
+        # Same probe, same request: the default (sync) path still clamps, so the
+        # divergence is attributable to fd_bound alone.
+        fake_rlimit(1024, 1024)
+        lam = _lambda_client(account_limit=2000)
+        cw = _cloudwatch_client(current_max=0)
+        workers, _ = concurrency.compute_available_workers(2721, lam, cw, "fn")
+        assert workers == 1024 - concurrency._FD_HEADROOM
+
+    def test_account_headroom_still_clamps_without_the_fd_term(self, fake_rlimit):
+        # Dropping the FD term must not drop the account bound too.
+        fake_rlimit(65536, 65536)
+        lam = _lambda_client(account_limit=1000)
+        cw = _cloudwatch_client(current_max=200)
+        workers, _ = concurrency.compute_available_workers(1700, lam, cw, "fn", fd_bound=False)
+        assert workers == 700
+
+    def test_requested_still_wins_when_below_headroom(self, fake_rlimit):
+        fake_rlimit(1024, 1024)
+        lam = _lambda_client(account_limit=10000)
+        cw = _cloudwatch_client(current_max=0)
+        workers, _ = concurrency.compute_available_workers(50, lam, cw, "fn", fd_bound=False)
+        assert workers == 50
+
+    def test_unreadable_account_falls_back_to_fd_even_unbound(self, fake_rlimit):
+        # With no account headroom to size from, the FD ceiling is the only
+        # bound left — an unbounded window would fire the whole shard set at
+        # once and the 60 s MaximumEventAgeInSeconds would drop the overflow.
+        fake_rlimit(1024, 1024)
+        lam = MagicMock()
+        lam.get_account_settings.side_effect = Exception("AccessDenied")
+        lam.get_function_concurrency.return_value = {}
+        cw = _cloudwatch_client(current_max=0)
+        workers, report = concurrency.compute_available_workers(2721, lam, cw, "fn", fd_bound=False)
+        assert report.available is None
+        assert workers == 1024 - concurrency._FD_HEADROOM
