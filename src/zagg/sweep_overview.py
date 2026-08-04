@@ -232,7 +232,13 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     the ``orders``/``spacing`` schedule wholesale.
     """
     from zagg.config import get_pyramid
-    from zagg.pyramid import declared_fields, normalize_levels, overview_block_v2, warn_excluded
+    from zagg.pyramid import (
+        declared_fields,
+        normalize_levels,
+        overview_block_v2,
+        validate_levels,
+        warn_excluded,
+    )
 
     knob = get_pyramid(config)
     if knob is None:  # output.pyramid: false — declared off
@@ -240,6 +246,18 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     fields, excluded = declared_fields(config)
     if knob.get("levels") is not None:
         levels = normalize_levels(knob["levels"])
+        # Ordering/range live here, not in ``normalize_levels`` (they need the
+        # grid orders) — and this is the ONLY validation the templating path
+        # gets: the Lambda worker builds its config with ``load_config_from_dict``,
+        # which never calls ``validate_config``, then goes straight to
+        # ``build_manifest``. A grid-less retrofit config (no ``output.grid``,
+        # the ``declare_pyramid`` shape) is the one case skipped: there is no
+        # child order to check against here, and ``declare_pyramid``
+        # re-validates against the MANIFEST's own shard_order/cell_order before
+        # anything is written.
+        grid_child = (config.output.get("grid") or {}).get("child_order")
+        if grid_child is not None:
+            validate_levels(levels, parent_order=int(shard_order), child_order=int(grid_child))
         fold = _fold_plan(knob, [e["node"] for e in levels])
         return overview_block_v2(knob, levels, fold, fields, excluded)
     spacing = int(knob.get("spacing") or DEFAULT_SPACING)

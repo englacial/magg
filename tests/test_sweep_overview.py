@@ -461,6 +461,45 @@ class TestPyramidBlock:
         assert manifest["pyramid"]["overview"]["levels"] == [{"node": 6, "cells": [7]}]
         json.dumps(manifest)
 
+    def test_levels_validated_against_the_grid_block(self):
+        """The templating path validates too — it is the Lambda worker's path.
+
+        ``deployment/aws/lambda_handler.py`` builds the worker config with
+        ``load_config_from_dict``, which never runs ``validate_config``, and
+        then calls ``build_manifest``; without the check here an out-of-contract
+        schedule in a dispatch payload would reach ``morton_hive.json``.
+        """
+        from zagg.sweep_overview import build_pyramid_block
+
+        # Ascending nodes.
+        cfg = self._cfg(pyramid={"levels": [{"node": 2, "cells": [3]}, {"node": 4, "cells": [5]}]})
+        with pytest.raises(ValueError, match="nodes must strictly descend"):
+            build_pyramid_block(cfg, shard_order=6)
+        # A node finer than the shard order — no hive prefix lives there.
+        cfg = self._cfg(pyramid={"levels": [{"node": 9, "cells": [10]}]})
+        with pytest.raises(ValueError, match=r"outside \[0, parent_order = 6\]"):
+            build_pyramid_block(cfg, shard_order=6)
+        # A member at (or past) the base data's own cell order.
+        cfg = self._cfg(pyramid={"levels": [{"node": 4, "cells": [12]}]})
+        with pytest.raises(ValueError, match="base data's own"):
+            build_pyramid_block(cfg, shard_order=6)
+
+    def test_levels_skip_validation_without_a_grid_block(self):
+        """A grid-less retrofit config templates; ``declare_pyramid`` re-validates.
+
+        There is no child order to check against here, so the check is skipped
+        rather than guessed at — the store's own manifest orders win at
+        declare time (``TestDeclarePyramid``).
+        """
+        from zagg.pyramid import PYRAMID_SPEC_V2
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"levels": [{"node": 4, "cells": [5]}]})
+        cfg.output.pop("grid")
+        block = build_pyramid_block(cfg, shard_order=6)
+        assert block["spec"] == PYRAMID_SPEC_V2
+        assert block["overview"]["levels"] == [{"node": 4, "cells": [5]}]
+
     def test_validate_rejects_bad_grammar(self):
         from zagg.config import validate_config
 
