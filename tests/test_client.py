@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import zagg.client
+import zagg.concurrency
 from zagg.client import Run, RunHandle, ShardError
 from zagg.config import PipelineConfig, default_config
 
@@ -504,7 +505,7 @@ class TestConcurrencyPreflight:
         # `maxsize` to urllib3 (block=False), so an oversized declaration
         # allocates nothing on its own -- it is the number of sockets the
         # pool would KEEP once a concurrent dispatch loop opened them.
-        monkeypatch.setattr(zagg.client, "fd_safe_max_workers", lambda: 2)
+        monkeypatch.setattr(zagg.concurrency, "fd_safe_max_workers", lambda: 2)
         width, _, pool = self._dispatch(catalog, monkeypatch, max_workers=5)
         # The clamp stops at the DECLARED pool: the fan-out width is still the
         # shard-count clamp of the requested 5, un-touched by the fd bound --
@@ -512,7 +513,7 @@ class TestConcurrencyPreflight:
         assert (pool, width) == (2, 3)
 
     def test_pool_cap_unchanged_below_fd_bound(self, catalog, monkeypatch):
-        monkeypatch.setattr(zagg.client, "fd_safe_max_workers", lambda: 100)
+        monkeypatch.setattr(zagg.concurrency, "fd_safe_max_workers", lambda: 100)
         width, _, pool = self._dispatch(catalog, monkeypatch, max_workers=2)
         assert (pool, width) == (2, 2)
 

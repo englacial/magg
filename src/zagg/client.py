@@ -61,7 +61,6 @@ from concurrent.futures import wait as futures_wait
 from dataclasses import asdict
 from typing import Any, Iterator
 
-from zagg.concurrency import fd_safe_max_workers
 from zagg.config import (
     PipelineConfig,
     get_child_order,
@@ -733,7 +732,7 @@ class Run:
             writes status objects (issue #327) and read access to the status
             prefix for the poll.
         """
-        from zagg import runner
+        from zagg import concurrency, runner
 
         if transport not in ("sync", "event"):
             raise ValueError(f'transport must be "sync" or "event", got {transport!r}')
@@ -767,6 +766,7 @@ class Run:
             # connection pool tracks the fan-out width, but must never exceed
             # the fd ceiling regardless of pacing window — the event window
             # may clear RLIMIT_NOFILE (issue #375), a pool of sockets may not.
+            # Through the module seam, so the fd ceiling has one patch point.
             client = session.client(
                 "lambda",
                 region_name=self.region,
@@ -774,7 +774,7 @@ class Run:
                     read_timeout=960,
                     connect_timeout=10,
                     retries={"max_attempts": 0},
-                    max_pool_connections=min(workers, fd_safe_max_workers()),
+                    max_pool_connections=min(workers, concurrency.fd_safe_max_workers()),
                 ),
             )
             invoked_by = runner._resolve_invoked_by(session, self.region)
