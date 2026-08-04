@@ -530,12 +530,35 @@ class TestOverviewOrdersAreClamped:
         )
         before = (tmp_path / MANIFEST_NAME).read_bytes()
         result = run_sweep(
-            str(tmp_path), refs, families=["overview"], record=False, partition={"index": 0, "of": 4}
+            str(tmp_path),
+            refs,
+            families=["overview"],
+            record=False,
+            partition={"index": 0, "of": 4},
         )["families"]["overview"]
         assert result["written"] > 0  # the fence is reached, not skipped
         assert result["manifest_deferred"] is True
         assert "manifest_updated" not in result
         assert (tmp_path / MANIFEST_NAME).read_bytes() == before
+
+    def test_the_deferred_manifest_update_carries_its_payload(self, tmp_path):
+        # A deferral the finisher can act on from the record alone: the order
+        # set the RMW would have unioned, not just "somebody owes an update".
+        refs = _overview_store(tmp_path)
+        parted = run_sweep(
+            str(tmp_path),
+            refs,
+            families=["overview"],
+            record=False,
+            partition={"index": 0, "of": 4},
+        )["families"]["overview"]
+        # Order 0 is deferred, so only the order-1 overview materialized here.
+        assert parted["materialized_orders"] == [1]
+        whole_root = tmp_path / "whole"
+        whole = run_sweep(
+            str(whole_root), _overview_store(whole_root), families=["overview"], record=False
+        )["families"]["overview"]
+        assert "materialized_orders" not in whole and whole["manifest_updated"] is True
 
 
 class TestRootMocIsAlsoAnInput:
@@ -550,7 +573,11 @@ class TestRootMocIsAlsoAnInput:
     def test_a_degraded_root_moc_read_is_reported_not_only_logged(self, tmp_path):
         refs = _overview_store(tmp_path)
         result = run_sweep(
-            str(tmp_path), refs, families=["overview"], record=False, partition={"index": 0, "of": 4}
+            str(tmp_path),
+            refs,
+            families=["overview"],
+            record=False,
+            partition={"index": 0, "of": 4},
         )["families"]["overview"]
         assert result["root_moc_stale"] is True
 
@@ -562,7 +589,11 @@ class TestRootMocIsAlsoAnInput:
             str(tmp_path), build_root_coverage([morton_word(d) for d in LEAVES], SHARD_ORDER)
         )
         result = run_sweep(
-            str(tmp_path), refs, families=["overview"], record=False, partition={"index": 0, "of": 4}
+            str(tmp_path),
+            refs,
+            families=["overview"],
+            record=False,
+            partition={"index": 0, "of": 4},
         )["families"]["overview"]
         assert "root_moc_stale" not in result and result["written"] > 0
 

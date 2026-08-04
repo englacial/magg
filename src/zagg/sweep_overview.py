@@ -626,7 +626,8 @@ def sweep_overviews(
     ``min_order`` (issue #377) is the sweep partition's split order. Two things
     span partitions and so are left to the coarse-level finisher: declared
     orders coarser than it (``deferred_orders``), and the manifest pyramid RMW
-    at the store root (``manifest_deferred``).
+    at the store root (``manifest_deferred``, carrying the order set the RMW
+    would have unioned as ``materialized_orders``).
     """
     from zagg.store import open_object_store
 
@@ -725,7 +726,11 @@ def sweep_overviews(
         # The manifest pyramid RMW is a store-ROOT shared write: 2^n partitions
         # racing it would lose updates. It belongs to the finisher, the one
         # invoke that runs alone after the partitions land (issue #377).
+        # Carry the payload the RMW would have written: the per-partition
+        # record is the only durable trace, and "somebody owes an update"
+        # without saying WHAT to write makes the finisher re-derive it.
         counts["manifest_deferred"] = True
+        counts["materialized_orders"] = sorted(materialized)
     elif counts["written"]:
         counts["manifest_updated"] = _update_manifest_pyramid(
             store_root, sorted(materialized), store_kwargs
