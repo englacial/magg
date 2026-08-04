@@ -1,29 +1,97 @@
 """``2^n`` morton-subtree sweep partitions (issue #377): the decomposition.
 
-The standing claims this file pins: the split rounds to morton DIGIT
-boundaries (a power of four) and rejects an odd ``2^n`` by name; partition
-ownership is a pure prefix test over the D1 decimal id; and the decomposition
-is a partition in the set-theoretic sense — disjoint and covering — so no two
-partitions can ever address the same node.
+The standing claims this file pins. On the decomposition itself: the split
+rounds to morton DIGIT boundaries (a power of four) and rejects an odd ``2^n``
+by name; ownership is a pure prefix test over the D1 decimal id; and the
+decomposition is a partition in the set-theoretic sense — disjoint and
+covering. On a partitioned pass: no two partitions write the same object, the
+union of every partition equals an unpartitioned pass minus the coarse nodes
+above the split, the ``finish`` hook and the coarse overview orders are
+deferred, and each partition stays independently idempotent and resumable.
 """
 
 import itertools
+import json
 
+import obstore
 import pytest
 
+from zagg import sweep as sweep_mod
 from zagg.grids.morton import morton_decimal, morton_word
-from zagg.hive import _decimal_order
+from zagg.hive import MANIFEST_NAME, _decimal_order, shard_leaf_path
+from zagg.store import open_object_store
+from zagg.sweep import run_sweep
 from zagg.sweep_partition import (
     normalize_partition,
     partition_index,
     partition_leaves,
     partition_split_order,
     select_partition,
+    sweep_partitions,
 )
+from zagg.telemetry import build_record, write_sidecar
 
 #: Every order-2 node of one base cell, plus a second base cell's, so the
 #: "one order-k subtree per base cell" property is exercised, not assumed.
 NODES = [f"{b}{i}{j}" for b in ("-3", "1") for i in "1234" for j in "1234"]
+
+SHARD_ORDER = 2
+
+#: The unpatched rollup writer, captured once so a re-installed spy never nests.
+_PUT_ROLLUP = sweep_mod._put_rollup
+
+#: Leaves spread over three of the four order-1 subtrees AND two base cells,
+#: so a partitions=4 (split order 1) pass exercises a partition with several
+#: shards, one with a single shard, one spanning two base cells, and an empty
+#: one — the four cases a fan-out actually meets.
+LEAVES = ("-311", "-312", "-321", "-341", "141", "142")
+
+
+def _write_manifest(root, *, pyramid=None):
+    manifest = {
+        "spec": "morton-hive/1",
+        "dataset": {"short_name": "TEST", "version": "1"},
+        "cell_order": SHARD_ORDER + 2,
+        "shard_order": SHARD_ORDER,
+        "split_schedule": [1] * SHARD_ORDER,
+        "pyramid": pyramid if pyramid is not None else {"orders": [], "aggregation": {}},
+        "generated_at": "2026-01-01T00:00:00+00:00",
+    }
+    obstore.put(open_object_store(str(root)), MANIFEST_NAME, json.dumps(manifest).encode())
+
+
+def _put_leaf(root, decimal, *, n_obs=10):
+    record = build_record(
+        shard_key=morton_word(decimal),
+        metadata={"total_obs": n_obs, "cells_with_data": 2, "duration_s": 0.5},
+        granule_ids=[f"g-{decimal}"],
+    )
+    write_sidecar(shard_leaf_path(str(root), morton_word(decimal)), record)
+    return record
+
+
+def _store(tmp_path, decimals=LEAVES, **kwargs):
+    _write_manifest(tmp_path, **kwargs)
+    for decimal in decimals:
+        _put_leaf(tmp_path, decimal)
+    return [(morton_word(d), None) for d in decimals]
+
+
+def _written(monkeypatch):
+    """Capture every rollup object key a pass PUTs (the write-conflict probe).
+
+    Always delegates to the PRISTINE writer, so calling this twice in one test
+    replaces the spy rather than nesting it — each returned list holds exactly
+    the keys of the pass it was installed for.
+    """
+    keys: list[str] = []
+
+    def spy(store, fam, decimal, envelope):
+        keys.append(sweep_mod._rollup_key(fam, decimal))
+        return _PUT_ROLLUP(store, fam, decimal, envelope)
+
+    monkeypatch.setattr(sweep_mod, "_put_rollup", spy)
+    return keys
 
 
 class TestSplitOrder:
@@ -168,3 +236,176 @@ class TestPartitionsValidatedAsAParameter:
     def test_select_partition_range_checks_its_index(self):
         with pytest.raises(ValueError, match=r"out of range"):
             select_partition({d: {None} for d in NODES}, 4, 9)
+
+
+class TestPartitionedPass:
+    """``run_sweep(partition=...)``: exactly what one partition worker writes."""
+
+    def test_writes_only_its_own_subtrees_and_stops_at_the_split(self, tmp_path, monkeypatch):
+        refs = _store(tmp_path)
+        keys = _written(monkeypatch)
+        summary = run_sweep(
+            str(tmp_path), refs, families=["stats"], partition={"index": 0, "of": 4}
+        )
+        # Partition 0 owns the "-31" subtree: its two shards plus their order-1
+        # parent. The base node -3 sits at order 0, above the split -> nobody's.
+        assert summary["partition"] == {"index": 0, "of": 4, "split_order": 1}
+        assert summary["n_leaves"] == 2 and summary["foreign_leaves"] == 4
+        assert sorted(keys) == [
+            "-3/1/1/stats.rollup.json",
+            "-3/1/2/stats.rollup.json",
+            "-3/1/stats.rollup.json",
+        ]
+
+    def test_no_two_partitions_write_the_same_object(self, tmp_path, monkeypatch):
+        # The disjointness obligation, against the real writer rather than the
+        # index arithmetic: the four partitions' key sets are pairwise disjoint.
+        refs = _store(tmp_path)
+        per_partition = []
+        for index in range(4):
+            keys = _written(monkeypatch)
+            run_sweep(str(tmp_path), refs, families=["stats"], partition={"index": index, "of": 4})
+            per_partition.append(set(keys))
+        for a, b in itertools.combinations(per_partition, 2):
+            assert not a & b
+        assert per_partition[2] == set()  # no leaf under -33/13: an empty partition
+        assert "1/4/stats.rollup.json" in per_partition[3]  # and one spanning two base cells
+
+    def test_union_equals_an_unpartitioned_pass_minus_the_coarse_nodes(self, tmp_path, monkeypatch):
+        whole, split = tmp_path / "whole", tmp_path / "split"
+        refs_whole, refs_split = _store(whole), _store(split)
+        full = _written(monkeypatch)
+        run_sweep(str(whole), refs_whole, families=["stats"], record=False)
+        full_keys = set(full)
+        parted = _written(monkeypatch)
+        for index in range(4):
+            run_sweep(
+                str(split),
+                refs_split,
+                families=["stats"],
+                record=False,
+                partition={"index": index, "of": 4},
+            )
+        # Every node the whole-tree pass wrote — except the order-0 base nodes,
+        # which span partitions — was written by exactly one partition.
+        coarse = {"-3/stats.rollup.json", "1/stats.rollup.json"}
+        assert coarse <= full_keys
+        assert set(parted) == full_keys - coarse
+
+    def test_finish_is_deferred_so_partitions_never_race_on_the_root_moc(self, tmp_path):
+        refs = _store(tmp_path)
+        result = run_sweep(str(tmp_path), refs, families=["moc"], partition={"index": 0, "of": 4})
+        moc = result["families"]["moc"]
+        assert moc["finish_deferred"] is True
+        assert "root_moc_written" not in moc
+        assert not (tmp_path / "coverage.moc").exists()
+
+    def test_identity_partition_matches_an_unpartitioned_pass(self, tmp_path, monkeypatch):
+        whole, one = tmp_path / "whole", tmp_path / "one"
+        refs_whole, refs_one = _store(whole), _store(one)
+        keys_whole = _written(monkeypatch)
+        run_sweep(str(whole), refs_whole, families=["stats", "moc"], record=False)
+        keys_one = _written(monkeypatch)
+        summary = run_sweep(
+            str(one),
+            refs_one,
+            families=["stats", "moc"],
+            record=False,
+            partition={"index": 0, "of": 1},
+        )
+        assert sorted(keys_one) == sorted(keys_whole)
+        # of=1 splits at order 0: the base nodes ARE owned, so the finish hook
+        # runs (it reports its own key) rather than being deferred.
+        assert "root_moc_written" in summary["families"]["moc"]
+        assert "finish_deferred" not in summary["families"]["moc"]
+
+
+class TestWorkerSideFiltering:
+    """The partition filter lives where the fold happens, not in the dispatcher."""
+
+    def test_a_discover_style_whole_store_work_set_is_filtered(self, tmp_path):
+        # ``discover: true`` re-derives the WHOLE store's leaves worker-side; a
+        # partition invoke must still sweep only its own.
+        refs = _store(tmp_path)
+        summary = run_sweep(
+            str(tmp_path), refs, families=["stats"], partition={"index": 3, "of": 4}
+        )
+        assert summary["n_leaves"] == 3  # -341, 141, 142
+        assert summary["foreign_leaves"] == 3
+
+    def test_split_finer_than_the_shard_order_is_refused(self, tmp_path):
+        refs = _store(tmp_path)
+        with pytest.raises(ValueError, match=r"splits at order 3, finer than the store's"):
+            run_sweep(str(tmp_path), refs, families=["stats"], partition={"index": 0, "of": 64})
+
+
+class TestPartitionIdempotence:
+    """The D22 generation stamps make each partition resumable on its own."""
+
+    def test_second_pass_of_one_partition_writes_nothing(self, tmp_path):
+        refs = _store(tmp_path)
+        block = {"index": 0, "of": 4}
+        first = run_sweep(str(tmp_path), refs, families=["stats"], partition=block)
+        second = run_sweep(str(tmp_path), refs, families=["stats"], partition=block)
+        assert first["families"]["stats"]["written"] == 3
+        assert second["families"]["stats"]["written"] == 0
+        assert second["families"]["stats"]["current"] == 3
+
+    def test_a_rerun_leaf_rewrites_only_its_own_partition_chain(self, tmp_path, monkeypatch):
+        refs = _store(tmp_path)
+        for index in range(4):
+            run_sweep(str(tmp_path), refs, families=["stats"], partition={"index": index, "of": 4})
+        _put_leaf(tmp_path, "-341", n_obs=99)
+        keys = _written(monkeypatch)
+        for index in range(4):
+            run_sweep(str(tmp_path), refs, families=["stats"], partition={"index": index, "of": 4})
+        assert sorted(keys) == ["-3/4/1/stats.rollup.json", "-3/4/stats.rollup.json"]
+
+
+class TestPartitionRecord:
+    """Per-partition timing rows — the issue #354 record, extended."""
+
+    def test_record_key_carries_the_partition_so_the_fan_out_cannot_clobber(self, tmp_path):
+        refs = _store(tmp_path)
+        records = [
+            run_sweep(str(tmp_path), refs, families=["stats"], partition={"index": i, "of": 4})[
+                "record"
+            ]
+            for i in (0, 1)
+        ]
+        # The 2^n invokes of one fan-out land in the same wall-clock second.
+        assert records[0].endswith("_p0of4.json") and records[1].endswith("_p1of4.json")
+        body = json.loads((tmp_path / records[1]).read_text())
+        assert body["partition"] == {"index": 1, "of": 4, "split_order": 1}
+        assert body["families"]["stats"]["duration_s"] >= 0.0
+
+    def test_an_unpartitioned_record_keeps_its_name_and_carries_no_partition(self, tmp_path):
+        refs = _store(tmp_path)
+        summary = run_sweep(str(tmp_path), refs, families=["stats"])
+        assert summary["record"].endswith("Z.json") and "_p" not in summary["record"]
+        assert "partition" not in summary and "foreign_leaves" not in summary
+
+
+class TestOverviewOrdersAreClamped:
+    def test_orders_coarser_than_the_split_are_deferred_to_the_finisher(self, tmp_path):
+        decl = {
+            "overview": {
+                "orders": [1, 0],
+                "fields": {"count": {"class": "exact", "method": "sum", "dtype": "int32"}},
+            }
+        }
+        refs = _store(tmp_path, pyramid=decl)
+        parted = run_sweep(
+            str(tmp_path), refs, families=["overview"], partition={"index": 0, "of": 4}
+        )
+        assert parted["families"]["overview"]["deferred_orders"] == [0]
+        whole = run_sweep(str(tmp_path), refs, families=["overview"])
+        assert "deferred_orders" not in whole["families"]["overview"]
+
+
+class TestSweepPartitionsDriver:
+    def test_runs_every_non_empty_partition_in_index_order(self, tmp_path):
+        refs = _store(tmp_path)
+        summaries = sweep_partitions(str(tmp_path), refs, partitions=4, families=["stats"])
+        assert [s["partition"]["index"] for s in summaries] == [0, 1, 3]  # 2 is empty
+        assert sum(s["n_leaves"] for s in summaries) == len(LEAVES)

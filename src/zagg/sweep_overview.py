@@ -600,7 +600,9 @@ def _field_drift(group, name, meta) -> str | None:
 ENVELOPE_NAME = "overview.rollup.json"
 
 
-def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kwargs=None) -> dict:
+def sweep_overviews(
+    store_root: str, manifest: dict, by_shard: dict, *, store_kwargs=None, min_order: int = 0
+) -> dict:
     """Generate/refresh overview zarrs at the manifest-declared orders (D22).
 
     ``by_shard`` is the engine's normalized dirty work set
@@ -617,6 +619,10 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     the same-second backstop the engine's payload compare provides for JSON
     families. Returns the standard
     ``written``/``current``/``empty``/``failed`` counts plus ``declared``.
+
+    ``min_order`` (issue #377) is the sweep partition's split order: declared
+    orders coarser than it span partitions, so a partitioned pass skips them
+    (``deferred_orders``) and leaves them to the coarse-level finisher.
     """
     from zagg.store import open_object_store
 
@@ -654,6 +660,13 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
             f"shard_order {shard_order}; skipping them"
         )
         orders = [k for k in orders if k not in bad]
+    if deferred := [k for k in orders if k < int(min_order)]:
+        counts["deferred_orders"] = deferred
+        orders = [k for k in orders if k not in deferred]
+        logger.info(
+            f"sweep[overview]: orders {deferred} are coarser than the partition split order "
+            f"{min_order}; they span partitions and are the finisher's (issue #377)"
+        )
     candidates = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
     store = open_object_store(store_root, **store_kwargs)
     materialized: set[int] = set()

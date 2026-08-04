@@ -149,3 +149,25 @@ def select_partition(by_shard: dict, partitions: int, index: int) -> tuple[dict,
     normalize_partition({"index": index, "of": partitions})
     kept = {d: w for d, w in by_shard.items() if partition_index(d, partitions) == index}
     return kept, len(by_shard) - len(kept)
+
+
+def sweep_partitions(store_root: str, leaves, *, partitions: int, **kwargs) -> list[dict]:
+    """Run every non-empty partition of one sweep pass IN-PROCESS, in index order.
+
+    The single-process mirror of the ``2^n``-invoke fan-out: no parallelism,
+    but each pass folds one partition's subtrees only, so peak resident memory
+    is bounded by the partition rather than by the store — the half of issue
+    #377 a CLI backstop can still buy on a store no single walk fits. Returns
+    one :func:`zagg.sweep.run_sweep` summary per non-empty partition;
+    ``kwargs`` forward verbatim (``families``, ``store_kwargs``, ``record``).
+
+    Coarse levels above the split order are swept by NO partition here — see
+    the module docstring; the finisher leg is issue #377's deferred phase.
+    """
+    from zagg.sweep import run_sweep
+
+    return [
+        run_sweep(store_root, work, partition={"index": index, "of": partitions}, **kwargs)
+        for index, work in enumerate(partition_leaves(leaves, partitions))
+        if work
+    ]
