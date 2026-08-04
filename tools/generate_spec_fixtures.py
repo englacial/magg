@@ -29,6 +29,16 @@ conformance tests assert decoded values, never object bytes.
   (the `atl03_tdigest_strata_healpix.yaml` field shapes), including a
   single-photon cell that packs the §3.1 golden word `0xFF000000FF0000FF`
   and a noise-only cell whose signal payload is the empty ``(0, 2)`` array.
+- ``pyramid/`` — MANIFEST ONLY: the §4.5 ``zagg-pyramid/2`` declaration
+  (issue #382), produced by the production declaration paths end to end
+  (``/1`` template -> production sweep bookkeeping -> ``declare_pyramid``
+  retrofit to ``/2``). One manifest carries every ``/2`` reading a decoder
+  must tell apart: unequal member depths, a promoted ``cells == node``
+  member, a declared gather, normalized scalar sugar, the #376 fold keys,
+  and the preserved ``/1``-era ``materialized`` actuals. No store beneath
+  it on purpose — the block is a template-time artifact, decodable from
+  ``morton_hive.json`` alone, and ``/2`` artifacts are not yet writable
+  (issues #383/#384).
 """
 
 from __future__ import annotations
@@ -52,6 +62,30 @@ DELTA = 16
 #: The §3.1 golden-word photon: per-surface confidences at threshold 2 pack
 #: lanes [255, 0, 0, 255, 0, 0, 0, 255] = 0xFF000000FF0000FF.
 GOLDEN_CONF = (4, -1, 0, 3, 1)
+#: The ``pyramid/`` fixture's ``output.pyramid`` knob (§4.5, issue #382): the
+#: raw CONFIG form, sugar and all — one declaration carrying every ``/2``
+#: entry reading. Entry 0: unequal depths + a promoted ``cells == node``
+#: member (the 1-cell whole-footprint group). Entry 1: the declared gather
+#: (same cells, coarser node). Entry 2: scalar sugar, normalized to ``[2]``
+#: in the manifest.
+PYRAMID_KNOB = {
+    "levels": [
+        {"node": 4, "cells": [5, 4]},
+        {"node": 2, "cells": [5, 4]},
+        {"node": 1, "cells": 2},
+    ],
+}
+#: Fields the ``pyramid/`` fixture declares beyond the ``minimal`` pair, so
+#: one manifest carries every composability class: exact (``count`` +
+#: ``h_min``), approximate (``h_tdigest``), and ``none`` (``h_mean`` — no
+#: exact merge law, D24).
+PYRAMID_EXTRA_VARIABLES = {
+    "h_min": {"function": "nanmin", "source": "h", "dtype": "float32", "fill_value": 0},
+    "h_mean": {"function": "mean", "source": "h", "dtype": "float32", "fill_value": 0},
+}
+#: The ``/1``-era sweep actuals the retrofit must preserve (§4.5): the
+#: ``{order: fold_source}`` shape the production bookkeeping writer takes.
+PYRAMID_V1_ACTUALS = {2: "leaves", 0: "cascade"}
 
 
 def _cell_photons(rng, n, *, signal_frac=0.6):
@@ -81,7 +115,7 @@ def _point_words(grid, cell_word, n, rng):
     return morton_words(MortonIndexArray.from_latlon(lats, lons, points=True))
 
 
-def _config(kitchen_sink: bool):
+def _config(kitchen_sink: bool, pyramid: dict | None = None):
     from zagg.config import PipelineConfig
 
     variables: dict = {
@@ -134,22 +168,25 @@ def _config(kitchen_sink: bool):
             "fill_value": 0,
             "params": {"delta": DELTA},
         }
+    output: dict = {
+        "store_layout": "hive",
+        "grid": {
+            "type": "healpix",
+            "parent_order": 4,
+            "child_order": 6,
+            "chunk_inner": 5,
+            "sharded": True,
+        },
+    }
+    if pyramid is not None:
+        output["pyramid"] = pyramid
     return PipelineConfig(
         data_source={"groups": ["g"]},
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
             "variables": variables,
         },
-        output={
-            "store_layout": "hive",
-            "grid": {
-                "type": "healpix",
-                "parent_order": 4,
-                "child_order": 6,
-                "chunk_inner": 5,
-                "sharded": True,
-            },
-        },
+        output=output,
     )
 
 
@@ -366,6 +403,78 @@ def build(out: Path, kitchen_sink: bool) -> None:
     print(f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells")
 
 
+def build_pyramid(out: Path) -> None:
+    """The manifest-only fixture: the §4.5 ``zagg-pyramid/2`` declaration.
+
+    Every byte of the committed manifest comes from a production declaration
+    path, in the order a real store would live it: templated under ``/1``
+    (``hive.build_manifest`` — no ``levels`` knob), given sweep actuals by
+    the production bookkeeping writer
+    (``sweep_overview._update_manifest_pyramid``, the function the real ``/1``
+    sweep calls), then retrofitted to ``/2`` with ``declare_pyramid`` and the
+    :data:`PYRAMID_KNOB` config — which must preserve those ``/1``-era
+    actuals verbatim (§4.5). No leaf exists on purpose (the declaration is a
+    template-time artifact; ``declare_pyramid``'s field probe skips loudly),
+    so this fixture writes exactly one object: ``morton_hive.json``.
+
+    The expectations are derived HERE from the generator's INPUTS
+    (:data:`PYRAMID_KNOB` normalized by the §4.5 rule, slab lengths by the
+    §4.4 rule), never read back out of the written manifest — the same
+    discipline the leaf fixtures' cell values follow.
+    """
+    from zagg import hive
+    from zagg.grids import HealpixGrid
+    from zagg.sweep_overview import _update_manifest_pyramid, declare_pyramid
+
+    cfg_v1 = _config(False)
+    cfg_v2 = _config(False, pyramid=PYRAMID_KNOB)
+    for cfg in (cfg_v1, cfg_v2):
+        cfg.aggregation["variables"].update(PYRAMID_EXTRA_VARIABLES)
+    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg_v1, chunk_inner=5, sharded=True)
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    hive.ensure_manifest(
+        str(out),
+        hive.build_manifest(grid, dataset={"short_name": "SPEC_FIXTURE", "version": "1"}),
+    )
+    assert _update_manifest_pyramid(str(out), dict(PYRAMID_V1_ACTUALS), {})
+    summary = declare_pyramid(str(out), cfg_v2)
+    assert summary["updated"] is True, summary
+    # The normalized grouped form, spelled from the KNOB by the §4.5 rule
+    # (scalar sugar -> one-element list), and §4.4's slab-length rule.
+    levels = [
+        {"node": e["node"], "cells": [e["cells"]] if isinstance(e["cells"], int) else e["cells"]}
+        for e in PYRAMID_KNOB["levels"]
+    ]
+    expected = {
+        "shard_order": 4,
+        "chunk_order": 5,
+        "cell_order": 6,
+        "declared": PYRAMID_KNOB,
+        "levels": levels,
+        "slabs": [[4 ** (r - e["node"]) for r in e["cells"]] for e in levels],
+        "gather_entries": [1],  # same cells as the entry above, coarser node
+        "fold_source": "cascade",
+        "exact_levels": 1,
+        "materialized": {
+            "orders": sorted(PYRAMID_V1_ACTUALS),
+            "fold_sources": {str(k): v for k, v in PYRAMID_V1_ACTUALS.items()},
+        },
+        "fields": {
+            "count": "exact",
+            "h_tdigest": "approximate",
+            "h_min": "exact",
+            "h_mean": "none",
+        },
+        # The §4.5 derived-default formula for this geometry (informative in
+        # the spec; pinned here so zagg's derivation cannot drift from it).
+        "default_levels": [{"node": 4, "cells": [5]}, {"node": 2, "cells": [3]}],
+    }
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(f"{out.name}: manifest-only, {len(levels)} level entries, /1 actuals preserved")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -376,6 +485,7 @@ def main() -> None:
     args = parser.parse_args()
     build(args.out / "minimal", kitchen_sink=False)
     build(args.out / "kitchen_sink", kitchen_sink=True)
+    build_pyramid(args.out / "pyramid")
 
 
 if __name__ == "__main__":
