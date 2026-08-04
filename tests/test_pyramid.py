@@ -236,6 +236,19 @@ class TestConfigWiring:
         with pytest.raises(ValueError, match="base data's own cell order"):
             self._validate({"levels": [{"node": 6, "cells": 12}]})
 
+    def test_missing_child_order_refuses_by_name(self):
+        # Pinned on _validate_pyramid directly: validate_config's own grid
+        # check catches a missing child_order first, so this is the only place
+        # the accessor's named refusal is observable — the levels branch must
+        # not inherit the raw `.get(..., 0)` fallback, which would refuse with
+        # "cells [9] reach the base data's own cell order (0)" instead.
+        from zagg.config import _validate_pyramid
+
+        cfg = self._cfg(store_layout="hive", pyramid={"levels": [{"node": 6, "cells": 9}]})
+        cfg.output["grid"] = {k: v for k, v in cfg.output["grid"].items() if k != "child_order"}
+        with pytest.raises(ValueError, match="output.grid.child_order is required"):
+            _validate_pyramid(cfg)
+
     def test_levels_require_hive_layout(self):
         from zagg.config import validate_config
 

@@ -2439,11 +2439,14 @@ def _validate_pyramid(config: PipelineConfig) -> None:
             )
         from zagg.pyramid import normalize_levels, validate_levels
 
-        child_order = int((config.output.get("grid") or {}).get("child_order", 0))
+        # The module's own accessor, not a raw .get with a 0 fallback: a
+        # missing key must refuse by NAME ("output.grid.child_order is
+        # required"), not validate its way to a level-range error that points
+        # at neither the problem nor the key.
         validate_levels(
             normalize_levels(knob["levels"]),
             parent_order=parent_order,
-            child_order=child_order,
+            child_order=get_child_order(config),
         )
     orders = knob.get("orders")
     if orders is not None:
