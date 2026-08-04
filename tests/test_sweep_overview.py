@@ -899,6 +899,29 @@ class TestCascadeFold:
         assert counts["written"] == 1 and counts["current"] == 1
         assert self._entry(tmp_path, "-3")["fold_source"] == "cascade"
 
+    def test_dropping_an_intermediate_order_regenerates_the_coarse_overview(self, tmp_path):
+        # Exact-only fields, so the coarse slabs — and therefore the content
+        # hash — are byte-equal whichever level they cascaded from, and the
+        # summed n_leaves is the same either way: only fold_from_order moves.
+        exact = {n: m for n, m in FIELDS_DECL.items() if m["class"] == "exact"}
+        leaves = {"-3111": {0: [1.0, 2.0]}, "-3231": {5: [7.0]}}
+        geometry = dict(shard_order=3, cell_order=6, fields=exact)
+        _write_manifest(tmp_path, orders=(2, 1, 0), **geometry)
+        for decimal, cells in leaves.items():
+            _make_leaf(tmp_path, decimal, cells, shard_order=3, cell_order=6)
+        refs = [(morton_word(d), None) for d in leaves]
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        assert self._entry(tmp_path, "-3")["fold_from_order"] == 1
+        # Re-declare without the intermediate level: order 0 now folds from
+        # order 2, so the stored overview names a level that is gone.
+        _write_manifest(tmp_path, orders=(2, 0), **geometry)
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 1 and counts["current"] == 2
+        assert self._entry(tmp_path, "-3")["fold_from_order"] == 2
+        assert (
+            _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]["fold_from_order"] == 2
+        )
+
     def test_pre_376_envelope_entry_reads_as_the_leaves_fold(self, tmp_path):
         _write_manifest(tmp_path, orders=(1, 0), fold_source="leaves")
         refs = self._two_leaves(tmp_path)
