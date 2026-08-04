@@ -150,3 +150,21 @@ class TestSelectPartition:
             assert not seen & set(kept)
             seen |= set(kept)
         assert seen == set(by_shard)
+
+
+class TestPartitionsValidatedAsAParameter:
+    """A bad ``partitions`` is a PARAMETER error, not a per-ref one."""
+
+    def test_empty_work_set_still_refuses_an_odd_power_of_two(self):
+        with pytest.raises(ValueError, match=r"splits a morton digit in half"):
+            partition_leaves([], 8)
+
+    def test_refs_are_indexed_before_the_buckets_exist(self):
+        # A too-deep split is caught by the ownership test, not after 4^k
+        # empty lists have been materialized.
+        with pytest.raises(ValueError, match=r"coarser than the partitions="):
+            partition_leaves([morton_word("-311")], 4**15)
+
+    def test_select_partition_range_checks_its_index(self):
+        with pytest.raises(ValueError, match=r"out of range"):
+            select_partition({d: {None} for d in NODES}, 4, 9)

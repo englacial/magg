@@ -114,14 +114,22 @@ def partition_leaves(leaves, partitions: int) -> list[list]:
     :func:`zagg.sweep.run_sweep` takes, index-aligned with the partition index.
     Empty lists are kept in place (a partition with no dirty leaf still has an
     index) — callers skip them rather than fire an empty invoke.
+
+    ``partitions`` is validated FIRST and every ref's index is resolved BEFORE
+    the buckets exist: this is the dispatch-side entry point, reached long
+    before any manifest names a shard order, so a bad count must fail as a
+    parameter error (even on an empty work set) rather than as a per-ref one.
     """
     from zagg.grids.morton import morton_decimal
 
+    partition_split_order(partitions)
+    indexed = [
+        (partition_index(morton_decimal(int(key)), partitions), int(key), window)
+        for key, window in (r if isinstance(r, (tuple, list)) else (r, None) for r in leaves)
+    ]
     buckets: list[list] = [[] for _ in range(int(partitions))]
-    for ref in leaves:
-        key, window = ref if isinstance(ref, (tuple, list)) else (ref, None)
-        decimal = morton_decimal(int(key))
-        buckets[partition_index(decimal, partitions)].append((int(key), window))
+    for index, key, window in indexed:
+        buckets[index].append((key, window))
     return buckets
 
 
@@ -133,6 +141,11 @@ def select_partition(by_shard: dict, partitions: int, index: int) -> tuple[dict,
     anything, so the partition filter is applied where the fold happens rather
     than trusted from the dispatcher. ``by_shard`` is
     :func:`zagg.sweep._normalize_leaves`' ``{shard_decimal: {window, ...}}``.
+    ``(index, partitions)`` is re-validated here for the same reason: an
+    out-of-range index would otherwise filter EVERYTHING out and read as a
+    clean "nothing to do" — the silent wrong answer this filter exists to
+    prevent.
     """
+    normalize_partition({"index": index, "of": partitions})
     kept = {d: w for d, w in by_shard.items() if partition_index(d, partitions) == index}
     return kept, len(by_shard) - len(kept)
