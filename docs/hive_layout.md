@@ -182,7 +182,11 @@ Validation: `output.windowing` requires the hive layout on a healpix grid;
 filter what it reads); explicit windows must be well-formed (frozen label
 grammar, `start < end`, unique labels, disjoint ranges — point entries are
 desugared first, so a point landing inside another window's range is a genuine
-overlap and is rejected). On the raster path
+overlap and is rejected). Because boundaries render at whole-second
+granularity, a range narrower than the second containing it (say
+`12:00:01.0Z` → `12:00:01.4Z`) would dispatch as an empty window; it is
+refused rather than widened — the point form is the spelling for one-second
+intent. On the raster path
 ([issue #247](https://github.com/englacial/zagg/issues/247)) membership is
 the acquisition's STAC `datetime`: `time_field` is optional (fixed to
 `datetime`) and the `epoch`/`scale`/`units` conversion knobs are rejected.
