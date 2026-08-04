@@ -2379,7 +2379,10 @@ def get_pyramid(config: PipelineConfig) -> dict | None:
     issue #382 ``zagg-pyramid/2`` grammar: ordered ``{node, cells}`` entries
     replacing ``orders``/``spacing`` wholesale — see :mod:`zagg.pyramid`),
     ``all_time`` (bool: also maintain the ``all.zarr`` cross-window fold on
-    windowed stores), and ``summarize`` (the D24 opt-in derived-summary declarations,
+    windowed stores), ``fold_source`` (``"cascade"`` — the default — or the
+    deprecated ``"leaves"``, issue #376) with ``exact_levels`` (how many of
+    the finest declared levels fold exactly from the leaves), and
+    ``summarize`` (the D24 opt-in derived-summary declarations,
     ``{source_field: {"as": name, ...}}`` — recorded in the pyramid block,
     never the semantic core).
     """
@@ -2409,9 +2412,18 @@ def _validate_pyramid(config: PipelineConfig) -> None:
             "output.pyramid requires output.store_layout: hive (overviews live at "
             "hive-tree ancestor nodes; flat stores have no digit tree)"
         )
-    unknown = set(knob) - {"spacing", "orders", "levels", "all_time", "summarize"}
+    unknown = set(knob) - {
+        "spacing",
+        "orders",
+        "levels",
+        "all_time",
+        "fold_source",
+        "exact_levels",
+        "summarize",
+    }
     if unknown:
         raise ValueError(f"output.pyramid has unknown keys {sorted(unknown)}")
+    _validate_pyramid_fold(knob)
     spacing = knob.get("spacing")
     if spacing is not None and (not isinstance(spacing, int) or spacing < 1):
         raise ValueError(f"output.pyramid.spacing must be an int >= 1 (got {spacing!r})")
@@ -2465,6 +2477,44 @@ def _validate_pyramid(config: PipelineConfig) -> None:
                 f"declared field: derived summaries must use a DIFFERENT name so overview "
                 f"schema never silently differs from source (D24)"
             )
+
+
+def _validate_pyramid_fold(knob: dict) -> None:
+    """Validate the ``fold_source``/``exact_levels`` fold knobs (issue #376).
+
+    ``fold_source: "leaves"`` — the pre-#376 exact-from-leaves fold — is legal
+    but deprecated, so it warns here (config validation, the one place a
+    misspelled knob still refuses before any store exists) rather than
+    refusing. ``exact_levels`` is the cascade boundary: how many of the finest
+    declared levels keep the exact-from-leaves fold. It is meaningful only
+    under ``cascade`` (under ``leaves`` every level is exact already), so
+    declaring both is a contradiction worth naming.
+    """
+    from zagg.sweep_overview import FOLD_SOURCES
+
+    fold_source = knob.get("fold_source")
+    if fold_source is not None and fold_source not in FOLD_SOURCES:
+        raise ValueError(
+            f"output.pyramid.fold_source must be one of {list(FOLD_SOURCES)} (got {fold_source!r})"
+        )
+    exact_levels = knob.get("exact_levels")
+    if exact_levels is not None and (not isinstance(exact_levels, int) or exact_levels < 1):
+        raise ValueError(
+            f"output.pyramid.exact_levels must be an int >= 1 — the finest declared "
+            f"level has no finer overview to cascade from, so it is always folded from "
+            f"the leaves (got {exact_levels!r})"
+        )
+    if fold_source == "leaves":
+        if exact_levels is not None:
+            raise ValueError(
+                "output.pyramid.exact_levels is meaningless under fold_source: leaves "
+                "(every level folds from the leaves there); drop one of the two"
+            )
+        logger.warning(
+            "output.pyramid.fold_source: leaves is DEPRECATED (issue #376) — it re-folds "
+            "every declared level from the raw leaves, so per-node memory grows with the "
+            "subtree; the default 'cascade' folds each coarse level from the level below it"
+        )
 
 
 #: Exact-law reductions whose plain (NaN-propagating) forms cannot round-trip

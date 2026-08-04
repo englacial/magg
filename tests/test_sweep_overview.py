@@ -56,12 +56,21 @@ FIELDS_DECL = {
 
 
 def _write_manifest(
-    root, *, orders=(1, 0), all_time=False, windowed=False, shard_order=SHARD_ORDER, fields=None
+    root,
+    *,
+    orders=(1, 0),
+    all_time=False,
+    windowed=False,
+    shard_order=SHARD_ORDER,
+    cell_order=CELL_ORDER,
+    fields=None,
+    fold_source=None,
+    exact_levels=None,
 ):
     manifest = {
         "spec": "morton-hive/2" if windowed else "morton-hive/1",
         "dataset": {"short_name": "TEST", "version": "1"},
-        "cell_order": CELL_ORDER,
+        "cell_order": cell_order,
         "shard_order": shard_order,
         "split_schedule": [1] * shard_order,
         "pyramid": {
@@ -75,6 +84,10 @@ def _write_manifest(
         },
         "generated_at": "2026-01-01T00:00:00+00:00",
     }
+    if fold_source is not None:
+        manifest["pyramid"]["overview"]["fold_source"] = fold_source
+    if exact_levels is not None:
+        manifest["pyramid"]["overview"]["exact_levels"] = exact_levels
     if windowed:
         manifest["temporal"] = {"schedule": "yearly", "time_field": "t"}
     obstore.put(open_object_store(str(root)), MANIFEST_NAME, json.dumps(manifest).encode())
@@ -114,6 +127,7 @@ def _make_leaf(
     time_range=None,
     with_h_min=True,
     shard_order=SHARD_ORDER,
+    cell_order=CELL_ORDER,
 ):
     """Write one committed leaf: ``cells`` maps leaf row -> observation values."""
     from mortie import generate_morton_children
@@ -121,13 +135,13 @@ def _make_leaf(
     from zagg.grids.healpix import HealpixGrid
     from zagg.stats.tdigest import build_tdigest
 
-    grid = HealpixGrid(shard_order, CELL_ORDER, config=_leaf_cfg(with_h_min=with_h_min))
+    grid = HealpixGrid(shard_order, cell_order, config=_leaf_cfg(with_h_min=with_h_min))
     word = morton_word(decimal)
     store = open_store(shard_leaf_path(str(root), word, window=window))
     grid.emit_shard_template(store, overwrite=True)
-    group = zarr.open_group(store, path=str(CELL_ORDER), mode="r+", zarr_format=3)
-    n = 4 ** (CELL_ORDER - shard_order)
-    group["morton"][:] = np.asarray(generate_morton_children(word, CELL_ORDER), dtype=np.uint64)
+    group = zarr.open_group(store, path=str(cell_order), mode="r+", zarr_format=3)
+    n = 4 ** (cell_order - shard_order)
+    group["morton"][:] = np.asarray(generate_morton_children(word, cell_order), dtype=np.uint64)
     count = np.zeros(n, np.int32)
     h_min = np.full(n, np.nan, np.float32)
     h_mean = np.full(n, np.nan, np.float32)
@@ -472,6 +486,85 @@ class TestPyramidBlock:
 
         validate_config(self._cfg(store_layout="hive"))  # absent knob is legal
 
+    def test_default_declaration_is_cascade_with_one_exact_level(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        overview = build_pyramid_block(self._cfg(), shard_order=6)["overview"]
+        assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
+
+    def test_exact_levels_knob_recorded(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"exact_levels": 2})
+        assert build_pyramid_block(cfg, shard_order=6)["overview"]["exact_levels"] == 2
+
+    def test_leaves_source_is_deprecated_and_carries_no_boundary(self, caplog):
+        from zagg.sweep_overview import build_pyramid_block
+
+        overview = build_pyramid_block(self._cfg(pyramid={"fold_source": "leaves"}), shard_order=6)[
+            "overview"
+        ]
+        assert overview["fold_source"] == "leaves"
+        # The boundary is a cascade-only concept: recording one under 'leaves'
+        # would declare a distinction the store does not have (issue #376).
+        assert "exact_levels" not in overview
+        assert "DEPRECATED" in caplog.text
+
+    def test_declared_off_block_carries_no_fold_keys(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        # Spec §4.5: the declared-off form is exactly ``{"orders": []}``.
+        block = build_pyramid_block(self._cfg(pyramid=False), shard_order=6)
+        assert block["overview"] == {"orders": []}
+
+    def test_unusable_fold_knobs_fall_back_to_the_default(self, caplog):
+        from zagg.sweep_overview import build_pyramid_block
+
+        # The issue #358 retrofit path reaches build_pyramid_block without
+        # validate_config, so an unusable value declares the default loudly.
+        cfg = self._cfg(pyramid={"fold_source": "sideways", "exact_levels": 0})
+        overview = build_pyramid_block(cfg, shard_order=6)["overview"]
+        assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
+        assert "unknown fold_source" in caplog.text and "exact_levels must be" in caplog.text
+
+    def test_the_deprecation_stays_silent_on_the_default_path(self, caplog):
+        from zagg.sweep_overview import _fold_sources, build_pyramid_block
+
+        # build_pyramid_block runs at every manifest bootstrap (hive.py) and
+        # _fold_sources at every sweep, so the #376 deprecation must never fire
+        # on the shipped default — a warning that cries wolf stops being read.
+        build_pyramid_block(self._cfg(), shard_order=6)
+        _fold_sources({}, [4, 2, 0], 8, 6)
+        assert "DEPRECATED" not in caplog.text
+
+    def test_exact_levels_past_the_last_level_warns_it_is_the_leaves_regime(self, caplog):
+        from zagg.sweep_overview import build_pyramid_block
+
+        # validate_config accepts exact_levels: 3 (it has no shard_order, so it
+        # cannot know the schedule); here the derived orders are [4, 2, 0], and
+        # a boundary of 3 silently buys the deprecated all-leaves regime under
+        # a block that declares "cascade".
+        overview = build_pyramid_block(self._cfg(pyramid={"exact_levels": 3}), shard_order=6)[
+            "overview"
+        ]
+        assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 3
+        assert "covers all 3 declared levels" in caplog.text and "DEPRECATED" in caplog.text
+
+    def test_validate_fold_grammar(self, caplog):
+        from zagg.config import validate_config
+
+        validate_config(self._cfg(store_layout="hive", pyramid={"exact_levels": 3}))
+        with pytest.raises(ValueError, match="fold_source must be one of"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"fold_source": "sideways"}))
+        with pytest.raises(ValueError, match="exact_levels must be an int >= 1"):
+            validate_config(self._cfg(store_layout="hive", pyramid={"exact_levels": 0}))
+        with pytest.raises(ValueError, match="exact_levels is meaningless"):
+            validate_config(
+                self._cfg(store_layout="hive", pyramid={"fold_source": "leaves", "exact_levels": 2})
+            )
+        validate_config(self._cfg(store_layout="hive", pyramid={"fold_source": "leaves"}))
+        assert "DEPRECATED" in caplog.text
+
 
 class TestOverviewWriter:
     def test_folds_leaves_at_every_declared_order(self, tmp_path):
@@ -702,6 +795,9 @@ class TestOverviewWriter:
         block = read_manifest(str(tmp_path))["pyramid"]["overview"]
         assert block["materialized"]["orders"] == [0, 1]
         assert block["materialized"]["generated_at"]
+        # Per-level fold provenance (issue #376): the finest level is exact,
+        # the one below it cascaded from it.
+        assert block["materialized"]["fold_sources"] == {"1": "leaves", "0": "cascade"}
         # The declaration itself is untouched (the sweep populates, never
         # rewrites — D11/D22 write-once discipline).
         assert block["orders"] == [1, 0] and block["fields"] == FIELDS_DECL
@@ -733,6 +829,450 @@ class TestOverviewWriter:
         g = _overview_group(tmp_path, "-3", "all.zarr", 1)
         np.testing.assert_array_equal(g["count"][:], [3, 0, 0, 0])
         assert g["h_min"][0] == 1.0
+
+
+#: The composable subset of the declaration — what the sweep hands the folds.
+COMPOSABLE = {n: m for n, m in FIELDS_DECL.items() if m["class"] != "none"}
+
+
+class TestCascadeFold:
+    """Fold-of-folds: coarse levels fold the level below them (issue #376)."""
+
+    def _leaf_orders(self, monkeypatch):
+        """Record which declared orders read the raw leaves (``_fold_node``)."""
+        import zagg.sweep_overview as so
+
+        seen = []
+        real = so._fold_node
+
+        def spy(store_root, node, k, *args, **kwargs):
+            seen.append(k)
+            return real(store_root, node, k, *args, **kwargs)
+
+        monkeypatch.setattr(so, "_fold_node", spy)
+        return seen
+
+    def _two_leaves(self, root):
+        _make_leaf(root, "-311", {0: [1.0, 2.0], 5: [10.0]})
+        _make_leaf(root, "-312", {0: [3.0]})
+        return [(morton_word("-311"), None), (morton_word("-312"), None)]
+
+    def _entry(self, root, node_rel):
+        envelope = json.loads((root / node_rel / "overview.rollup.json").read_text())
+        return envelope["windows"]["all"]
+
+    def test_coarse_level_folds_from_the_finer_overview(self, tmp_path, monkeypatch):
+        from zagg.stats.tdigest import quantile_from_tdigest
+
+        seen = self._leaf_orders(monkeypatch)
+        _write_manifest(tmp_path, orders=(1, 0))  # cascade is the default
+        refs = self._two_leaves(tmp_path)
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 2 and counts["failed"] == 0
+        # The headline property: the leaves are read ONCE for the whole
+        # pyramid, by the finest declared level only.
+        assert set(seen) == {1}
+        entry = self._entry(tmp_path, "-3")
+        assert entry["fold_source"] == "cascade" and entry["fold_from_order"] == 1
+        assert self._entry(tmp_path, "-3/1")["fold_source"] == "leaves"
+        # Same answer as the leaves fold for the exact class, and the digest
+        # of the whole -311 leaf still carries all three observations.
+        g0 = _overview_group(tmp_path, "-3", "all.zarr", 2)
+        np.testing.assert_array_equal(g0["count"][:2], [3, 1])
+        assert g0["h_min"][0] == 1.0 and g0["h_min"][1] == 3.0
+        merged = decode_digest(bytes(g0["h_tdigest"][:][0]), "float32")
+        assert merged[:, 1].sum() == 3
+        assert np.isclose(quantile_from_tdigest(merged, 0.5), 2.0, atol=1.0)
+
+    def test_exact_fields_are_byte_equal_under_either_source(self, tmp_path):
+        # The exact merge laws are associative, so folding folds is the same
+        # arithmetic: only the approximate class pays for the cascade.
+        slabs = {}
+        for source in ("cascade", "leaves"):
+            root = tmp_path / source
+            root.mkdir()
+            _write_manifest(root, orders=(1, 0), fold_source=source)
+            refs = self._two_leaves(root)
+            run_sweep(str(root), refs, families=("overview",))
+            group = _overview_group(root, "-3", "all.zarr", 2)
+            slabs[source] = (group["count"][:], group["h_min"][:])
+        np.testing.assert_array_equal(slabs["cascade"][0], slabs["leaves"][0])
+        np.testing.assert_array_equal(slabs["cascade"][1], slabs["leaves"][1])
+
+    def test_leaves_source_reads_the_leaves_at_every_level(self, tmp_path, monkeypatch):
+        seen = self._leaf_orders(monkeypatch)
+        _write_manifest(tmp_path, orders=(1, 0), fold_source="leaves")
+        refs = self._two_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        assert sorted(seen) == [0, 1]
+        entry = self._entry(tmp_path, "-3")
+        assert entry["fold_source"] == "leaves" and "fold_from_order" not in entry
+
+    def test_exact_levels_two_keeps_the_second_level_on_the_leaves(self, tmp_path, monkeypatch):
+        seen = self._leaf_orders(monkeypatch)
+        _write_manifest(tmp_path, orders=(1, 0), exact_levels=2)
+        run_sweep(str(tmp_path), self._two_leaves(tmp_path), families=("overview",))
+        assert sorted(seen) == [0, 1]
+        assert self._entry(tmp_path, "-3")["fold_source"] == "leaves"
+
+    def test_switching_the_source_regenerates_the_coarse_overview(self, tmp_path):
+        _write_manifest(tmp_path, orders=(1, 0), fold_source="leaves")
+        refs = self._two_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        _write_manifest(tmp_path, orders=(1, 0))  # same leaves, now cascading
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        # The exact slabs are byte-equal under either source, so only the
+        # recorded regime can tell the stored overview is the other fold.
+        assert counts["written"] == 1 and counts["current"] == 1
+        assert self._entry(tmp_path, "-3")["fold_source"] == "cascade"
+
+    def test_dropping_an_intermediate_order_regenerates_the_coarse_overview(self, tmp_path):
+        # Exact-only fields, so the coarse slabs — and therefore the content
+        # hash — are byte-equal whichever level they cascaded from, and the
+        # summed n_leaves is the same either way: only fold_from_order moves.
+        exact = {n: m for n, m in FIELDS_DECL.items() if m["class"] == "exact"}
+        leaves = {"-3111": {0: [1.0, 2.0]}, "-3231": {5: [7.0]}}
+        geometry = dict(shard_order=3, cell_order=6, fields=exact)
+        _write_manifest(tmp_path, orders=(2, 1, 0), **geometry)
+        for decimal, cells in leaves.items():
+            _make_leaf(tmp_path, decimal, cells, shard_order=3, cell_order=6)
+        refs = [(morton_word(d), None) for d in leaves]
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        assert self._entry(tmp_path, "-3")["fold_from_order"] == 1
+        # Re-declare without the intermediate level: order 0 now folds from
+        # order 2, so the stored overview names a level that is gone.
+        _write_manifest(tmp_path, orders=(2, 0), **geometry)
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 1 and counts["current"] == 2
+        assert self._entry(tmp_path, "-3")["fold_from_order"] == 2
+        assert (
+            _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]["fold_from_order"] == 2
+        )
+
+    def test_pre_376_envelope_entry_reads_as_the_leaves_fold(self, tmp_path):
+        _write_manifest(tmp_path, orders=(1, 0), fold_source="leaves")
+        refs = self._two_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        for node_rel in ("-3", "-3/1"):
+            path = tmp_path / node_rel / "overview.rollup.json"
+            envelope = json.loads(path.read_text())
+            envelope["windows"]["all"].pop("fold_source")
+            path.write_text(json.dumps(envelope))
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 0 and counts["current"] == 2
+
+    def test_windowed_levels_cascade_per_window(self, tmp_path):
+        _write_manifest(tmp_path, orders=(1, 0), windowed=True, all_time=True)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]}, window="2019")
+        _make_leaf(tmp_path, "-311", {0: [10.0]}, window="2020")
+        word = morton_word("-311")
+        refs = [(word, "2019"), (word, "2020")]
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 6 and counts["failed"] == 0  # 3 windows x 2 orders
+        # Each coarse window cascades from the SAME window's child overview
+        # (D23 naming), and the all-time one from the child's all.zarr.
+        assert _overview_group(tmp_path, "-3", "2019.zarr", 2)["count"][0] == 2
+        assert _overview_group(tmp_path, "-3", "2020.zarr", 2)["count"][0] == 1
+        assert _overview_group(tmp_path, "-3", "all.zarr", 2)["count"][0] == 3
+        envelope = json.loads((tmp_path / "-3" / "overview.rollup.json").read_text())
+        assert {e["fold_source"] for e in envelope["windows"].values()} == {"cascade"}
+
+    def test_plan_names_the_source_of_every_level(self, caplog):
+        from zagg.sweep_overview import _fold_sources
+
+        # Depth 2 (cell_order 8 over shard_order 6): a 2-order gap is the
+        # widest a 4^2-cell node slab can address.
+        assert _fold_sources({}, [4, 2, 0], 8, 6) == {
+            4: ("leaves", None),
+            2: ("cascade", 4),
+            0: ("cascade", 2),
+        }
+        assert _fold_sources({"exact_levels": 2}, [4, 2, 0], 8, 6)[2] == ("leaves", None)
+        assert _fold_sources({"fold_source": "leaves"}, [4, 2, 0], 8, 6) == {
+            4: ("leaves", None),
+            2: ("leaves", None),
+            0: ("leaves", None),
+        }
+        wide = _fold_sources({}, [5, 0], 8, 6)
+        assert wide[0] == ("leaves", None) and "wider than the 2-order node slab" in caplog.text
+
+    def test_a_boundary_past_the_last_level_folds_everything_from_the_leaves_loudly(self, caplog):
+        from zagg.sweep_overview import _fold_sources
+
+        # The manifest reaches the sweep hand-edited too, so the check is
+        # mirrored here: a cascade declaration whose boundary covers every
+        # level IS the deprecated regime, and must not be silent about it.
+        assert _fold_sources({"exact_levels": 3}, [4, 2, 0], 8, 6) == {
+            4: ("leaves", None),
+            2: ("leaves", None),
+            0: ("leaves", None),
+        }
+        assert "covers all 3 declared levels" in caplog.text and "DEPRECATED" in caplog.text
+
+    def test_unusable_fold_declaration_falls_back_loudly(self, caplog):
+        from zagg.sweep_overview import _fold_sources
+
+        decl = {"fold_source": "sideways", "exact_levels": "two"}
+        assert _fold_sources(decl, [4, 2], 8, 6) == {4: ("leaves", None), 2: ("cascade", 4)}
+        assert "fold_source 'sideways' is unknown" in caplog.text
+        assert "exact_levels 'two' is unusable" in caplog.text
+
+    def test_child_that_is_not_an_overview_is_skipped_loudly(self, tmp_path, caplog):
+        from zagg.sweep_overview import _cascade_node
+
+        _write_manifest(tmp_path, orders=(1,))
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        # A stamped object at a node position that does not classify as an
+        # overview at the source order is not this fold's input (D11: role is
+        # never inferred from tree position).
+        store = open_store(str(tmp_path / "-3" / "1" / "all.zarr"))
+        zarr.open_group(store, mode="r+", zarr_format=3).attrs[ROLE_ATTR] = "something-else"
+        counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
+        fold = _cascade_node(
+            str(tmp_path),
+            "-3",
+            0,
+            1,
+            "all",
+            ["-311"],
+            COMPOSABLE,
+            CELL_ORDER,
+            SHARD_ORDER,
+            counts,
+            {},
+        )
+        assert fold is None and counts["failed"] == 1
+        assert "is not an overview at order 1" in caplog.text
+
+    def test_cascade_without_a_materialized_child_is_empty(self, tmp_path, caplog):
+        import logging
+
+        from zagg.sweep_overview import _cascade_node
+
+        caplog.set_level(logging.INFO)
+        _write_manifest(tmp_path, orders=(1, 0))
+        _make_leaf(tmp_path, "-311", {0: [1.0]})  # leaves only: no child overview yet
+        counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
+        fold = _cascade_node(
+            str(tmp_path),
+            "-3",
+            0,
+            1,
+            "all",
+            ["-311"],
+            COMPOSABLE,
+            CELL_ORDER,
+            SHARD_ORDER,
+            counts,
+            {},
+        )
+        assert fold is None and counts["failed"] == 0
+        # An unmaterialized child is not an error, but it IS under-coverage:
+        # the cascade folds what is on disk, so it is recorded.
+        assert "1 of 1 candidate child overviews at order 1 are not usable" in caplog.text
+        assert "(1 not materialized, 0 unreadable)" in caplog.text
+
+    def _sibling_leaves(self, root):
+        """Two leaves in DIFFERENT order-1 subtrees, both in the coverage MOC."""
+        _make_leaf(root, "-311", {0: [1.0, 2.0]})
+        _make_leaf(root, "-321", {0: [7.0]})
+        refs = [(morton_word(d), None) for d in ("-311", "-321")]
+        run_sweep(str(root), refs, families=("moc",))
+        return refs
+
+    def test_a_partially_swept_store_self_heals_on_the_next_sweep(self, tmp_path):
+        # The end-to-end shape of the PR's "a cascade folds what is on disk":
+        # sweep A only, then sweep B, through run_sweep both times.
+        _write_manifest(tmp_path, orders=(1, 0))
+        refs = self._sibling_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs[:1], families=("overview",))
+        # -32 has a committed leaf but no overview yet, so its span in the
+        # order-0 parent is fill — indistinguishable from empty without the
+        # recorded coverage.
+        coarse = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert coarse["source_children"] == {"folded": 1, "missing": 1, "unreadable": 0}
+        assert coarse["generation"]["n_leaves"] == 1
+        counts0 = _overview_group(tmp_path, "-3", "all.zarr", 2)["count"][:]
+        assert counts0[0] == 2 and counts0[4] == 0  # -311's span; -321's still fill
+        # Sweep B: the parent must be REWRITTEN, not read as current — the
+        # repair rests on its summed n_leaves moving once the child exists.
+        counts = run_sweep(str(tmp_path), refs[1:], families=("overview",))["families"]["overview"]
+        assert counts["written"] == 2 and counts["current"] == 0
+        coarse = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert coarse["source_children"] == {"folded": 2, "missing": 0, "unreadable": 0}
+        assert coarse["generation"]["n_leaves"] == 2
+        counts0 = _overview_group(tmp_path, "-3", "all.zarr", 2)["count"][:]
+        assert counts0[0] == 2 and counts0[4] == 1  # A unchanged, B now populated
+        assert counts0.sum() == 3
+
+    def test_an_unusable_child_still_leaves_the_parent_covering_the_rest(self, tmp_path):
+        _write_manifest(tmp_path, orders=(1, 0))
+        refs = self._sibling_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        # Break ONE child's role attr. Its own level reads as current (the
+        # envelope and the D4 stamp are untouched), so it is not regenerated
+        # and the order-0 cascade meets a child it must skip.
+        store = open_store(str(tmp_path / "-3" / "2" / "all.zarr"))
+        zarr.open_group(store, mode="r+", zarr_format=3).attrs[ROLE_ATTR] = "something-else"
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 1 and counts["current"] == 2 and counts["failed"] == 1
+        # The parent is still written, covering the child it COULD read, and
+        # records that it under-covers the other.
+        coarse = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert coarse["source_children"] == {"folded": 1, "missing": 0, "unreadable": 1}
+        counts0 = _overview_group(tmp_path, "-3", "all.zarr", 2)["count"][:]
+        assert counts0[0] == 2 and counts0[4] == 0
+
+    def test_under_coverage_is_recorded_in_the_overview_attrs(self, tmp_path, caplog):
+        import logging
+
+        caplog.set_level(logging.INFO)
+        _write_manifest(tmp_path, orders=(1, 0))
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        _make_leaf(tmp_path, "-321", {0: [7.0]})  # committed, but not swept yet
+        refs = [(morton_word(d), None) for d in ("-311", "-321")]
+        run_sweep(str(tmp_path), refs, families=("moc",))  # both leaves in the coverage MOC
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        # -32 is a candidate child of -3 (its leaf is in the coverage MOC) with
+        # no overview on disk, so the order-0 cascade under-covers its subtree
+        # — and says so IN THE ARTIFACT, not only in this process's log.
+        info = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert info["source_children"] == {"folded": 1, "missing": 1, "unreadable": 0}
+        assert "1 of 2 candidate child overviews at order 1 are not usable" in caplog.text
+        # The exact-from-leaves level carries no such key: fill there means
+        # empty, full stop.
+        assert (
+            "source_children"
+            not in _overview_root(tmp_path, "-3/1", "all.zarr").attrs[OVERVIEW_ATTR]
+        )
+
+    def test_an_unreadable_child_is_counted_in_both_terms(self, tmp_path, caplog):
+        import logging
+
+        from zagg.sweep_overview import _cascade_node
+
+        caplog.set_level(logging.INFO)
+        _write_manifest(tmp_path, orders=(1, 0))
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        _make_leaf(tmp_path, "-321", {0: [7.0]})
+        refs = [(morton_word(d), None) for d in ("-311", "-321")]
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        # One child unreadable as an overview, one never materialized: both
+        # leave their span at fill, so both are under-coverage and both have
+        # to reach the count (the denominator is the candidate children).
+        store = open_store(str(tmp_path / "-3" / "2" / "all.zarr"))
+        zarr.open_group(store, mode="r+", zarr_format=3).attrs[ROLE_ATTR] = "something-else"
+        counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
+        fold = _cascade_node(
+            str(tmp_path),
+            "-3",
+            0,
+            1,
+            "all",
+            ["-311", "-321", "-331"],
+            COMPOSABLE,
+            CELL_ORDER,
+            SHARD_ORDER,
+            counts,
+            {},
+        )
+        assert fold["source_children"] == {"folded": 1, "missing": 1, "unreadable": 1}
+        assert "2 of 3 candidate child overviews at order 1 are not usable" in caplog.text
+        assert "(1 not materialized, 1 unreadable)" in caplog.text
+
+    def test_two_order_gap_places_each_of_the_16_children(self, tmp_path):
+        # The DEFAULT schedule is every 2 orders, so the ordinary cascade gap
+        # is 2: 16 children, each owning a 1/16 span of the parent slab. A
+        # geometry one order deeper than the module default (shard 3, cell 6)
+        # is the smallest one that can hold it.
+        _write_manifest(tmp_path, orders=(2, 0), shard_order=3, cell_order=6)
+        leaves = {"-3111": {0: [1.0, 2.0]}, "-3231": {5: [7.0], 9: [8.0, 9.0]}}
+        for decimal, cells in leaves.items():
+            _make_leaf(tmp_path, decimal, cells, shard_order=3, cell_order=6)
+        refs = [(morton_word(d), None) for d in leaves]
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 3 and counts["failed"] == 0  # 2 nodes + the root
+        assert self._entry(tmp_path, "-3")["fold_from_order"] == 2
+        # The order-0 overview holds the 64 order-3 cells of -3: one per leaf
+        # shard, so each leaf's whole count lands in its own cell — cell 0 for
+        # -3111 and cell 24 for -3231 (digits 2,3,1 in base 4).
+        counts0 = _overview_group(tmp_path, "-3", "all.zarr", 3)["count"][:]
+        assert counts0[0] == 2 and counts0[24] == 3
+        assert counts0.sum() == 5
+
+    def test_every_level_records_its_fold_in_its_attrs(self, tmp_path):
+        _write_manifest(tmp_path, orders=(1, 0))
+        run_sweep(str(tmp_path), self._two_leaves(tmp_path), families=("overview",))
+        fine = _overview_root(tmp_path, "-3/1", "all.zarr").attrs[OVERVIEW_ATTR]
+        coarse = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert fine["fold_source"] == "leaves" and "fold_from_order" not in fine
+        assert coarse["fold_source"] == "cascade" and coarse["fold_from_order"] == 1
+
+    def test_materialized_fold_sources_carry_forward(self, tmp_path):
+        from zagg.hive import read_manifest
+
+        _write_manifest(tmp_path, orders=(1, 0), fold_source="leaves")
+        refs = self._two_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        # Narrow the declaration to the finest level only, in place — the
+        # sweep's own actuals must survive an edit of the declaration.
+        manifest = read_manifest(str(tmp_path))
+        manifest["pyramid"]["overview"]["orders"] = [1]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0, 4.0], 5: [10.0]})  # a changed leaf
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]["materialized"]
+        # Order 0 was not swept this pass: its recorded regime survives, so
+        # the manifest still describes what is actually on disk.
+        assert block["orders"] == [0, 1]
+        assert block["fold_sources"] == {"1": "leaves", "0": "leaves"}
+
+    def test_materialized_fold_sources_record_only_a_level_that_wrote(self, tmp_path, monkeypatch):
+        import zagg.sweep_overview as so
+        from zagg.hive import read_manifest
+
+        def block(name):
+            return read_manifest(str(tmp_path))["pyramid"]["overview"]["materialized"][name]
+
+        _write_manifest(tmp_path, orders=(1, 0), fold_source="leaves")
+        refs = self._two_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        assert block("fold_sources") == {"1": "leaves", "0": "leaves"}
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("cascade unavailable")
+
+        # Now cascade, but the order-0 fold fails: order 0 keeps the entries —
+        # and the artifacts — an earlier sweep left, so nothing at that level
+        # was written this pass. The declaration is edited in place so the
+        # sweep's own prior actuals are still there to be contradicted.
+        manifest = read_manifest(str(tmp_path))
+        manifest["pyramid"]["overview"].pop("fold_source")  # back to the cascade default
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        monkeypatch.setattr(so, "_cascade_node", boom)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0, 4.0], 5: [10.0]})  # a changed leaf
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 1 and counts["failed"] == 1
+        # An actual, not the plan (§4.5): order 0 still carries the leaves fold
+        # that is really on disk, and the order stays materialized.
+        assert block("orders") == [0, 1]
+        assert block("fold_sources") == {"1": "leaves", "0": "leaves"}
+        assert (
+            _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]["fold_source"]
+            == "leaves"
+        )
+
+    def test_cascade_generation_stamp_counts_the_underlying_leaves(self, tmp_path):
+        _write_manifest(tmp_path, orders=(1, 0))
+        run_sweep(str(tmp_path), self._two_leaves(tmp_path), families=("overview",))
+        # Both leaves sit under -31, so the order-0 node inherits their count
+        # through the child's own generation stamp — staleness stays keyed to
+        # leaf commits, not to overview writes.
+        info = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert info["generation"]["n_leaves"] == 2
+        stamp = read_commit(open_store(str(tmp_path / "-3" / "all.zarr")))
+        assert stamp is not None and stamp["granule_count"] == 2
 
 
 class TestOverviewContentHashes:
@@ -1089,6 +1629,7 @@ class TestDeclarePyramid:
         summary = declare_pyramid(str(tmp_path), _leaf_cfg())
         assert summary["updated"] is True and summary["previous"] == "absent"
         assert summary["orders"] == [0]  # shard_order 2, default spacing 2
+        assert summary["fold_source"] == "cascade"  # the regime future sweeps apply
         assert summary["fields"] == {
             "count": "exact",
             "h_min": "exact",
@@ -1155,7 +1696,7 @@ class TestDeclarePyramid:
 
         def concurrent_sweep(*args, **kwargs):
             out = real(*args, **kwargs)
-            sweep_overview._update_manifest_pyramid(str(tmp_path), [0], {})
+            sweep_overview._update_manifest_pyramid(str(tmp_path), {0: "leaves"}, {})
             return out
 
         monkeypatch.setattr(sweep_overview, "_validate_block_against_store", concurrent_sweep)
