@@ -543,6 +543,26 @@ regionally heterogeneous resolution).
   overview that carries **no** `fold_source` as `"leaves"` — the only fold
   that existed before #376.
 
+  **`source_children` records the cascade's coverage** — present on a
+  `"cascade"` overview only, and the companion a reader needs to interpret
+  the level's *fill* cells:
+
+  ```json
+  "source_children": {"folded": 15, "missing": 1, "unreadable": 0}
+  ```
+
+  A cascade folds the child overviews that are **on disk**, where a
+  `"leaves"` fold folds every leaf the coverage MOC knows about. `folded`
+  counts the children that contributed, `missing` those with no materialized
+  (D4-stamped) overview, and `unreadable` those that failed to open or did
+  not classify as an overview at `fold_from_order`. When either of the latter
+  two is nonzero the level **under-covers its subtree**: the spans those
+  children own hold the fill value, and a fill cell there is **not** evidence
+  that the subtree is empty. Such a level is repaired by a later sweep, which
+  sees the parent's summed generation change once the child exists. A reader
+  MUST tolerate the key's absence (a `"leaves"` level, or a pre-#376
+  artifact) and MUST NOT read absence as `missing: 0`.
+
 An overview also carries the standard D4 **commit stamp** as its final
 write: an unstamped overview prefix is debris, exactly as for leaves.
 Write order is pinned — template, arrays, `role`/provenance attrs, stamp
@@ -574,8 +594,10 @@ MUST NOT assume every leaf field exists at every overview order (the
 manifest declaration below is the zero-open way to know).
 
 The fold **regime** (§4.3's `fold_source`) does not enter this contract: a
-cascaded level has exactly the layout above, and differs only in the values
-its `approximate` fields carry.
+cascaded level has exactly the layout above. It differs in the values its
+`approximate` fields carry and, when it under-covers its subtree, in *which
+cells are populated at all* — §4.3's `source_children` is the key that says
+so, in every class.
 
 ### 4.5 The manifest `pyramid` block
 
