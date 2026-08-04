@@ -479,6 +479,48 @@ class TestConcurrencyPreflight:
         # caller's value, not `compute_available_workers`' own default.
         assert seen == [False, True]
 
+    def test_pool_cap_clamped_when_window_exceeds_fd_bound(self, catalog, monkeypatch):
+        # The pacing window may clear RLIMIT_NOFILE (fd_bound=False, issue
+        # #375), but the shared client's DECLARED pool never may: today the
+        # serial dispatch loop holds <=1 connection and urllib3 sizes pools
+        # lazily, but the declared cap is what turns into EMFILE if the loop
+        # ever goes concurrent (PR #378, question (5) ruling).
+        monkeypatch.setattr(zagg.client, "fd_safe_max_workers", lambda: 2)
+        assert self._pool_cap(catalog, monkeypatch, max_workers=5) == 2
+
+    def test_pool_cap_unchanged_below_fd_bound(self, catalog, monkeypatch):
+        monkeypatch.setattr(zagg.client, "fd_safe_max_workers", lambda: 100)
+        assert self._pool_cap(catalog, monkeypatch, max_workers=2) == 2
+
+    @staticmethod
+    def _pool_cap(catalog, monkeypatch, **dispatch_kwargs):
+        """The ``max_pool_connections`` handed to the shared client's Config."""
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        stub = StubLambdaClient()
+        seen: dict = {}
+
+        def _client(service, **k):
+            if service != "lambda":
+                return MagicMock()
+            seen["pool"] = k["config"].max_pool_connections
+            return stub
+
+        session = MagicMock()
+        session.client.side_effect = _client
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: session)
+        run = Run.from_config(
+            default_config("atl06"),
+            shardmap=catalog,
+            store=_STORE,
+            function_name="process-shard-test",
+            source_credentials=_CREDS,
+        )
+        run.dispatch(**dispatch_kwargs).results()
+        return seen["pool"]
+
     @staticmethod
     def _probe_fd_bound(catalog, monkeypatch, *, transport):
         """The ``fd_bound`` ``dispatch`` hands the probe for ``transport``.

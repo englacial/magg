@@ -61,6 +61,7 @@ from concurrent.futures import wait as futures_wait
 from dataclasses import asdict
 from typing import Any, Iterator
 
+from zagg.concurrency import fd_safe_max_workers
 from zagg.config import (
     PipelineConfig,
     get_child_order,
@@ -763,7 +764,9 @@ class Run:
             workers = max(1, min(requested, n))
             # read_timeout must exceed the 900 s function ceiling (same
             # rationale as agg's preflight-built client, issue #148); the
-            # connection pool tracks the fan-out width.
+            # connection pool tracks the fan-out width, but must never exceed
+            # the fd ceiling regardless of pacing window — the event window
+            # may clear RLIMIT_NOFILE (issue #375), a pool of sockets may not.
             client = session.client(
                 "lambda",
                 region_name=self.region,
@@ -771,7 +774,7 @@ class Run:
                     read_timeout=960,
                     connect_timeout=10,
                     retries={"max_attempts": 0},
-                    max_pool_connections=workers,
+                    max_pool_connections=min(workers, fd_safe_max_workers()),
                 ),
             )
             invoked_by = runner._resolve_invoked_by(session, self.region)
