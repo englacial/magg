@@ -1163,6 +1163,41 @@ class TestCascadeFold:
         assert block["orders"] == [0, 1]
         assert block["fold_sources"] == {"1": "leaves", "0": "leaves"}
 
+    def test_materialized_fold_sources_record_only_a_level_that_wrote(self, tmp_path, monkeypatch):
+        import zagg.sweep_overview as so
+        from zagg.hive import read_manifest
+
+        def block(name):
+            return read_manifest(str(tmp_path))["pyramid"]["overview"]["materialized"][name]
+
+        _write_manifest(tmp_path, orders=(1, 0), fold_source="leaves")
+        refs = self._two_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        assert block("fold_sources") == {"1": "leaves", "0": "leaves"}
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("cascade unavailable")
+
+        # Now cascade, but the order-0 fold fails: order 0 keeps the entries —
+        # and the artifacts — an earlier sweep left, so nothing at that level
+        # was written this pass. The declaration is edited in place so the
+        # sweep's own prior actuals are still there to be contradicted.
+        manifest = read_manifest(str(tmp_path))
+        manifest["pyramid"]["overview"].pop("fold_source")  # back to the cascade default
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        monkeypatch.setattr(so, "_cascade_node", boom)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0, 4.0], 5: [10.0]})  # a changed leaf
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 1 and counts["failed"] == 1
+        # An actual, not the plan (§4.5): order 0 still carries the leaves fold
+        # that is really on disk, and the order stays materialized.
+        assert block("orders") == [0, 1]
+        assert block("fold_sources") == {"1": "leaves", "0": "leaves"}
+        assert (
+            _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]["fold_source"]
+            == "leaves"
+        )
+
     def test_cascade_generation_stamp_counts_the_underlying_leaves(self, tmp_path):
         _write_manifest(tmp_path, orders=(1, 0))
         run_sweep(str(tmp_path), self._two_leaves(tmp_path), families=("overview",))

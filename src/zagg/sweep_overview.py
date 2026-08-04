@@ -355,12 +355,15 @@ def _update_manifest_pyramid(store_root, folded: dict, store_kwargs) -> bool:
     this RMW can never brick appends). Fail-open — the declaration readers
     key on is untouched; ``materialized`` is a convenience actual.
 
-    ``folded`` is ``{order: fold_source}`` for the orders this pass wrote;
-    ``fold_sources`` carries the per-level provenance forward (issue #376) so
-    the manifest answers "which regime is this level in" without opening an
-    overview — a level's regime can differ from the declaration when a level
-    was materialized under an earlier one, and the declaration is what the
-    NEXT sweep applies, never a claim about what is on disk.
+    ``folded`` is ``{order: fold_source}`` for the orders this pass touched,
+    with ``None`` for an order that is materialized but wrote nothing this
+    pass (current, or an empty fold): its recorded regime stays as it is,
+    because the artifact on disk did not change. ``fold_sources`` carries the
+    per-level provenance forward (issue #376) so the manifest answers "which
+    regime is this level in" without opening an overview — a level's regime
+    can differ from the declaration when a level was materialized under an
+    earlier one, and the declaration is what the NEXT sweep applies, never a
+    claim about what is on disk.
     """
     import obstore
 
@@ -375,7 +378,7 @@ def _update_manifest_pyramid(store_root, folded: dict, store_kwargs) -> bool:
         prior = block.get("materialized") or {}
         known = set(prior.get("orders") or [])
         sources = dict(prior.get("fold_sources") or {})
-        sources.update({str(int(k)): v for k, v in folded.items()})
+        sources.update({str(int(k)): v for k, v in folded.items() if v is not None})
         block["materialized"] = {
             "orders": sorted(known | {int(k) for k in folded}),
             "fold_sources": sources,
@@ -764,7 +767,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     plans = _fold_sources(decl, orders, cell_order, shard_order)
     candidates = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
     store = open_object_store(store_root, **store_kwargs)
-    materialized: dict[int, str] = {}
+    materialized: dict[int, str | None] = {}
     for k in orders:
         nodes = sorted({_node_at(d, k) for d in by_shard})
         for node in nodes:
@@ -776,6 +779,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
             envelope = _read_envelope(store, node)
             entries = dict((envelope or {}).get("windows") or {})
             for key, fold_windows in _window_work(decl, windowed, dirty_windows, entries):
+                before = counts["written"]
                 entry = _roll_node(
                     store_root,
                     node,
@@ -794,8 +798,17 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
                 )
                 if entry is not None:
                     entries[key] = entry
+                    if counts["written"] > before:
+                        # §4.5's fold_sources is an ACTUAL: record the regime
+                        # that just WROTE, never the plan. A carried-forward
+                        # entry (current, or an empty fold) keeps whatever
+                        # regime made the artifact that is still on disk.
+                        materialized[k] = entry["fold_source"]
             if entries:
-                materialized[k] = plans[k][0]
+                # The order IS materialized (an entry means an overview) even
+                # when nothing was written this pass; its regime may not be
+                # known here, and ``None`` leaves the recorded one standing.
+                materialized.setdefault(k, None)
             fresh = {
                 "spec": _sweep().SWEEP_SPEC,
                 "family": "overview",
