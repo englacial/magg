@@ -339,7 +339,13 @@ class TestConcurrencyPreflight:
 
     @staticmethod
     def _dispatch(catalog, monkeypatch, *, probe=None, **dispatch_kwargs):
-        """Dispatch with NO injected client; return (pool_width, probe_calls)."""
+        """Dispatch with NO injected client.
+
+        Returns ``(pool_width, probe_calls, declared_pool)`` -- the fan-out
+        width the ``ThreadPoolExecutor`` was built with, the probe's call
+        record, and the ``max_pool_connections`` handed to the shared client's
+        ``Config`` (``None`` if no client was built).
+        """
         from unittest.mock import MagicMock
 
         import boto3
@@ -347,10 +353,17 @@ class TestConcurrencyPreflight:
         from zagg import runner
 
         stub = StubLambdaClient()
+        seen: dict = {}
+
+        def _client(service, **k):
+            if service != "lambda":
+                return MagicMock()
+            if "config" in k:  # the fan-out client; the probe's carries none
+                seen["pool"] = k["config"].max_pool_connections
+            return stub
+
         session = MagicMock()
-        session.client.side_effect = lambda service, **k: (
-            stub if service == "lambda" else MagicMock()
-        )
+        session.client.side_effect = _client
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: session)
 
         calls: list = []
@@ -378,7 +391,7 @@ class TestConcurrencyPreflight:
             source_credentials=_CREDS,
         )
         run.dispatch(**dispatch_kwargs).results()
-        return widths[0], calls
+        return widths[0], calls, seen.get("pool")
 
     @staticmethod
     def _report():
@@ -393,7 +406,7 @@ class TestConcurrencyPreflight:
         )
 
     def test_probe_sizes_the_pool(self, catalog, monkeypatch):
-        width, calls = self._dispatch(
+        width, calls, _ = self._dispatch(
             catalog, monkeypatch, probe=lambda requested: (2, self._report())
         )
         assert width == 2  # the probe's clamp, not _DEFAULT_MAX_WORKERS
@@ -414,7 +427,7 @@ class TestConcurrencyPreflight:
             )
 
         with pytest.warns(RuntimeWarning, match="AccessDenied"):
-            width, calls = self._dispatch(catalog, monkeypatch, probe=_denied)
+            width, calls, _ = self._dispatch(catalog, monkeypatch, probe=_denied)
         assert width == 2  # degraded to the default, run still dispatched
         assert calls == [(3, "process-shard-test", True)]
 
@@ -422,7 +435,7 @@ class TestConcurrencyPreflight:
         def _must_not_run(requested):
             raise AssertionError("probe ran despite an explicit max_workers")
 
-        width, calls = self._dispatch(catalog, monkeypatch, probe=_must_not_run, max_workers=1)
+        width, calls, _ = self._dispatch(catalog, monkeypatch, probe=_must_not_run, max_workers=1)
         assert width == 1
         assert calls == []
 
@@ -486,40 +499,13 @@ class TestConcurrencyPreflight:
         # lazily, but the declared cap is what turns into EMFILE if the loop
         # ever goes concurrent (PR #378, question (5) ruling).
         monkeypatch.setattr(zagg.client, "fd_safe_max_workers", lambda: 2)
-        assert self._pool_cap(catalog, monkeypatch, max_workers=5) == 2
+        _, _, pool = self._dispatch(catalog, monkeypatch, max_workers=5)
+        assert pool == 2
 
     def test_pool_cap_unchanged_below_fd_bound(self, catalog, monkeypatch):
         monkeypatch.setattr(zagg.client, "fd_safe_max_workers", lambda: 100)
-        assert self._pool_cap(catalog, monkeypatch, max_workers=2) == 2
-
-    @staticmethod
-    def _pool_cap(catalog, monkeypatch, **dispatch_kwargs):
-        """The ``max_pool_connections`` handed to the shared client's Config."""
-        from unittest.mock import MagicMock
-
-        import boto3
-
-        stub = StubLambdaClient()
-        seen: dict = {}
-
-        def _client(service, **k):
-            if service != "lambda":
-                return MagicMock()
-            seen["pool"] = k["config"].max_pool_connections
-            return stub
-
-        session = MagicMock()
-        session.client.side_effect = _client
-        monkeypatch.setattr(boto3, "Session", lambda *a, **k: session)
-        run = Run.from_config(
-            default_config("atl06"),
-            shardmap=catalog,
-            store=_STORE,
-            function_name="process-shard-test",
-            source_credentials=_CREDS,
-        )
-        run.dispatch(**dispatch_kwargs).results()
-        return seen["pool"]
+        _, _, pool = self._dispatch(catalog, monkeypatch, max_workers=2)
+        assert pool == 2
 
     @staticmethod
     def _probe_fd_bound(catalog, monkeypatch, *, transport):
