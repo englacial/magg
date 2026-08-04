@@ -499,6 +499,18 @@ still rides, so worker-side discovery stays narrowed to that partition. On
 windowed stores the window axis is a second, free parallelism dimension
 (per-`(partition, window)` invokes); noted, not used yet.
 
+**Shipping status.** The decomposition, the partition-scoped pass
+(`run_sweep(partition=…)`), the fan-out event builder and the in-process
+`--partitions` backstop are in. Two links of the Lambda leg are not yet
+connected, and until both are, the fan-out must not be fired against a
+deployed worker: nothing in a production dispatch path passes `partitions`
+yet, and the worker's `mode="sweep"` handler does not forward the event's
+`partition` block to `run_sweep` — so a `partition`-carrying event would today
+be swept as a whole-tree pass over that partition's slice, walking up to the
+base node and racing its siblings on exactly the shared coarse rollups this
+section says cannot be shared. The single-process `--partitions` path has
+neither gap and is safe now.
+
 ## 8. Decisions registry
 
 ### 8.1 Decisions made (rationale recorded)
