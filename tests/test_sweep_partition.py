@@ -77,6 +77,19 @@ def _store(tmp_path, decimals=LEAVES, **kwargs):
     return [(morton_word(d), None) for d in decimals]
 
 
+def _run_record(root, decimals=LEAVES, run_id="r1"):
+    """The store-root run parquet ``discover_leaves`` (and so the CLI) reads."""
+    from zagg.telemetry import flatten_record, write_run_parquet
+
+    rows = [
+        flatten_record(
+            build_record(shard_key=morton_word(d), metadata={"total_obs": 1, "duration_s": 1.0})
+        )
+        for d in decimals
+    ]
+    write_run_parquet(str(root), rows, run_id=run_id)
+
+
 def _written(monkeypatch):
     """Capture every rollup object key a pass PUTs (the write-conflict probe).
 
@@ -461,3 +474,110 @@ class TestSweepPartitionsDriver:
         summaries = sweep_partitions(str(tmp_path), refs, partitions=4, families=["stats"])
         assert [s["partition"]["index"] for s in summaries] == [0, 1, 3]  # 2 is empty
         assert sum(s["n_leaves"] for s in summaries) == len(LEAVES)
+
+
+class TestDispatchFanOut:
+    """``_invoke_lambda_sweep(partitions=2**n)``: the D8 worker-invoke leg."""
+
+    def _client(self):
+        from unittest.mock import MagicMock
+
+        return MagicMock()
+
+    def _events(self, client):
+        return [json.loads(c.kwargs["Payload"]) for c in client.invoke.call_args_list]
+
+    def test_default_is_the_single_invoke_form_byte_identical(self):
+        from zagg.runner import _invoke_lambda_sweep
+
+        client = self._client()
+        fired = _invoke_lambda_sweep(client, "fn", "s3://b/store", [(7, None), (8, "2019")])
+        assert fired == 1
+        event = self._events(client)[0]
+        assert event == {
+            "mode": "sweep",
+            "store_path": "s3://b/store",
+            "leaves": [[7, None], [8, "2019"]],
+        }
+
+    def test_fan_out_fires_one_invoke_per_non_empty_partition(self):
+        from zagg.runner import _invoke_lambda_sweep
+
+        client = self._client()
+        refs = [(morton_word(d), None) for d in LEAVES]
+        fired = _invoke_lambda_sweep(client, "fn", "s3://b/store", refs, partitions=4)
+        events = self._events(client)
+        assert fired == 3  # partition 2 is empty -> no invoke
+        assert all(c.kwargs["InvocationType"] == "Event" for c in client.invoke.call_args_list)
+        assert [e["partition"] for e in events] == [
+            {"index": 0, "of": 4},
+            {"index": 1, "of": 4},
+            {"index": 3, "of": 4},
+        ]
+
+    def test_each_invoke_carries_only_its_own_disjoint_slice(self):
+        from zagg.runner import _invoke_lambda_sweep
+
+        client = self._client()
+        refs = [(morton_word(d), None) for d in LEAVES]
+        _invoke_lambda_sweep(client, "fn", "s3://b/store", refs, partitions=4)
+        slices = [[tuple(leaf) for leaf in e["leaves"]] for e in self._events(client)]
+        for a, b in itertools.combinations(slices, 2):
+            assert not set(a) & set(b)
+        assert sorted(leaf for s in slices for leaf in s) == sorted(
+            (key, window) for key, window in refs
+        )
+        for event in self._events(client):
+            for key, _window in event["leaves"]:
+                assert partition_index(morton_decimal(key), 4) == event["partition"]["index"]
+
+    def test_an_oversized_slice_falls_back_to_partition_scoped_discovery(self):
+        from zagg.runner import _ASYNC_PAYLOAD_CAP_BYTES, _invoke_lambda_sweep
+
+        client = self._client()
+        # Packed-word-sized keys under one order-1 subtree, enough to overflow.
+        n = _ASYNC_PAYLOAD_CAP_BYTES // 16
+        refs = [(morton_word("-311"), f"w{i:06d}") for i in range(n)]
+        _invoke_lambda_sweep(client, "fn", "s3://b/store", refs, partitions=4)
+        event = self._events(client)[0]
+        assert "leaves" not in event and event["discover"] is True
+        # The block still rides: the worker re-derives the WHOLE store's work
+        # set and select_partition narrows it, so discovery stays per-partition.
+        assert event["partition"] == {"index": 0, "of": 4}
+
+    def test_a_bad_partition_count_is_refused_at_dispatch(self):
+        from zagg.runner import _invoke_lambda_sweep
+
+        client = self._client()
+        refs = [(morton_word(d), None) for d in LEAVES]
+        with pytest.raises(ValueError, match=r"splits a morton digit in half"):
+            _invoke_lambda_sweep(client, "fn", "s3://b/store", refs, partitions=8)
+        client.invoke.assert_not_called()
+
+
+class TestSweepCLI:
+    def test_partitions_flag_folds_one_partition_at_a_time(self, tmp_path, capsys):
+        from zagg.sweep import main
+
+        _store(tmp_path)
+        _run_record(tmp_path)
+        assert main([str(tmp_path), "--families", "stats", "--partitions", "4"]) == 0
+        summaries = json.loads(capsys.readouterr().out)
+        assert [s["partition"]["index"] for s in summaries] == [0, 1, 3]
+
+    def test_default_prints_the_single_whole_tree_summary(self, tmp_path, capsys):
+        from zagg.sweep import main
+
+        _store(tmp_path)
+        _run_record(tmp_path)
+        assert main([str(tmp_path), "--families", "stats"]) == 0
+        summary = json.loads(capsys.readouterr().out)
+        assert "partition" not in summary and summary["n_leaves"] == len(LEAVES)
+
+    def test_a_bad_partition_count_is_refused_before_any_fold(self, tmp_path):
+        from zagg.sweep import main
+
+        _store(tmp_path)
+        _run_record(tmp_path)
+        with pytest.raises(ValueError, match=r"splits a morton digit in half"):
+            main([str(tmp_path), "--families", "stats", "--partitions", "8"])

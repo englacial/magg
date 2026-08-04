@@ -1101,7 +1101,14 @@ def _sidecar_window(name: str, spec: str | None):
 
 
 def main(argv=None) -> int:
-    """Manual CLI: ``python -m zagg.sweep <store_root>`` (issue #300, D22)."""
+    """Manual CLI: ``python -m zagg.sweep <store_root>`` (issue #300, D22).
+
+    ``--partitions 2^n`` (issue #377) folds one partition at a time instead of
+    the whole tree — the single-process half of the parallel sweep: no
+    speed-up, but peak memory is bounded by the partition, which is what lets
+    a store no single walk fits still be swept from a laptop. Prints a list of
+    per-partition summaries in that mode instead of the single summary.
+    """
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -1114,6 +1121,15 @@ def main(argv=None) -> int:
         default=None,
         help=f"Comma-separated families (default: {','.join(DEFAULT_FAMILIES)}; "
         f"registered: {', '.join(sorted(FAMILIES))})",
+    )
+    parser.add_argument(
+        "--partitions",
+        type=int,
+        default=1,
+        help="Split the pass into 2^n disjoint morton-subtree partitions and fold them "
+        "one at a time, bounding peak memory by the partition rather than the store "
+        "(issue #377). Must be a power of FOUR (each morton digit is 2 bits); coarse "
+        "levels above the split order are left to the finisher. Default: 1 (whole tree)",
     )
     parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
     parser.add_argument(
@@ -1158,7 +1174,18 @@ def main(argv=None) -> int:
     if not leaves:
         print("No completed leaves found in the store's run records; nothing to sweep.")
         return 0
-    summary = run_sweep(args.store_root, leaves, families=families, store_kwargs=store_kwargs)
+    if args.partitions != 1:
+        from zagg.sweep_partition import sweep_partitions
+
+        summary = sweep_partitions(
+            args.store_root,
+            leaves,
+            partitions=args.partitions,
+            families=families,
+            store_kwargs=store_kwargs,
+        )
+    else:
+        summary = run_sweep(args.store_root, leaves, families=families, store_kwargs=store_kwargs)
     print(json.dumps(summary, indent=2))
     return 0
 

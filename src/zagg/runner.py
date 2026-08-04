@@ -5082,36 +5082,85 @@ def _invoke_lambda_coverage(
     )
 
 
-def _invoke_lambda_sweep(lambda_client, function_name, store_path, leaves, output_creds_event=None):
-    """Fire-and-forget end-of-run rollup sweep invoke (issue #300, D8).
+def _build_sweep_event(store_path, leaves, output_creds_event=None, partition=None) -> dict:
+    """One ``mode="sweep"`` worker event — the single construction site.
 
-    ``InvocationType="Event"`` (async, retries-0 semantics, nothing blocks on
-    it and no response is read) — the Lambda-path dispatcher never PUTs to
-    the store (the D8 standing rule), so the sweep runs worker-side exactly
-    like the root ``coverage.moc``'s ``mode="coverage"`` leg. The run's
-    ``(shard_key, window)`` leaves ride inline when they fit the async
+    Extracted from :func:`_invoke_lambda_sweep` (issue #377) so the fan-out
+    and the single-invoke form build identical payloads, mirroring how
+    :func:`_build_cell_event` serves every shard-dispatch transport. Optional
+    keys are added only when set, so a default (unpartitioned) run's event
+    stays byte-identical to its pre-feature shape.
+
+    The ``(shard_key, window)`` leaves ride inline when they fit the async
     budget; an oversized set falls back to ``discover: true`` — the worker
     re-derives the work set from the store's run records (the D22 discovery
-    path). Ordering caveat since issue #313 moved the run-record write behind
-    its own fire-and-forget ``mode="stats"`` invoke: the two Event invokes
-    race, so a ``discover`` fallback may read only earlier runs' records and
-    miss this run's leaves — accepted (fail-open): the oversized case is
-    rare, and the next hook run or the manual CLI backstop
-    (``python -m zagg.sweep``) folds anything missed. Failure is harmless by
-    design: rollups are regenerable caches (D9).
+    path) and, under a ``partition`` block, filters it to that partition's
+    subtrees, so the fallback stays correct per partition.
+
+    ``partition`` (issue #377) is the ``{"index", "of"}`` block naming which
+    ``2^n`` morton-subtree partition this invoke owns; it is validated here
+    (:func:`zagg.sweep_partition.normalize_partition`) rather than shipped
+    unchecked. Absent -> the whole tree, exactly as before.
     """
+    from zagg.sweep_partition import normalize_partition
+
     event: dict = {"mode": "sweep", "store_path": store_path}
     if output_creds_event is not None:
         event["output_credentials"] = output_creds_event
+    if partition is not None:
+        index, of = normalize_partition(partition)
+        event["partition"] = {"index": index, "of": of}
     event["leaves"] = [[int(key), window] for key, window in leaves]
     if len(json.dumps(event)) > _ASYNC_PAYLOAD_CAP_BYTES:
         del event["leaves"]
         event["discover"] = True
-    lambda_client.invoke(
-        FunctionName=function_name,
-        InvocationType="Event",
-        Payload=json.dumps(event),
-    )
+    return event
+
+
+def _invoke_lambda_sweep(
+    lambda_client, function_name, store_path, leaves, output_creds_event=None, partitions=1
+) -> int:
+    """Fire-and-forget end-of-run rollup sweep invoke(s); how many were fired.
+
+    ``InvocationType="Event"`` (async, retries-0 semantics, nothing blocks on
+    it and no response is read) — the Lambda-path dispatcher never PUTs to
+    the store (the D8 standing rule), so the sweep runs worker-side exactly
+    like the root ``coverage.moc``'s ``mode="coverage"`` leg. Ordering caveat
+    since issue #313 moved the run-record write behind its own fire-and-forget
+    ``mode="stats"`` invoke: the two Event invokes race, so a ``discover``
+    fallback may read only earlier runs' records and miss this run's leaves —
+    accepted (fail-open): the oversized case is rare, and the next hook run or
+    the manual CLI backstop (``python -m zagg.sweep``) folds anything missed.
+    Failure is harmless by design: rollups are regenerable caches (D9).
+
+    ``partitions`` (issue #377) fans the pass out over ``2^n`` morton-subtree
+    partitions: one Event invoke per NON-EMPTY partition, each carrying its
+    own disjoint slice of the work set plus a ``partition: {index, of}`` block
+    — the D8 shape is unchanged, every store write is still worker-side. The
+    partitions own no node above the split order, so the coarse levels and the
+    store-root artifacts are left to the finisher. ``partitions=1`` (the
+    default, and what the runner tail keeps firing) is the single-invoke form,
+    byte-identical to the pre-feature event.
+    """
+    from zagg.sweep_partition import partition_leaves
+
+    if int(partitions) == 1:
+        work = [(list(leaves), None)]
+    else:
+        work = [
+            (bucket, {"index": index, "of": int(partitions)})
+            for index, bucket in enumerate(partition_leaves(leaves, partitions))
+            if bucket
+        ]
+    for bucket, partition in work:
+        lambda_client.invoke(
+            FunctionName=function_name,
+            InvocationType="Event",
+            Payload=json.dumps(
+                _build_sweep_event(store_path, bucket, output_creds_event, partition)
+            ),
+        )
+    return len(work)
 
 
 def _build_cell_event(
