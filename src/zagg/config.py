@@ -1116,10 +1116,12 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
         )
     start = _windows.parse_utc(entry["start"])
     end = _windows.parse_utc(entry["end"])
-    if start < end and start.replace(microsecond=0) == end.replace(microsecond=0):
+    if start < end and _windows.iso_utc(start) == _windows.iso_utc(end):
         # Each bound truncates to the second containing it (windows.iso_utc,
         # timespec="seconds"), so a range with both bounds inside one second
-        # renders to a `ge x` / `lt x` pair that silently matches nothing.
+        # renders to a `ge x` / `lt x` pair that silently matches nothing. The
+        # predicate above calls the renderer rather than repeating its
+        # truncation, so the two cannot drift.
         # Refuse rather than widen — the point form is the spelling for
         # one-second intent. Only this total collapse is refused: a fractional
         # bound in a *different* second merely retimes that edge (documented in
