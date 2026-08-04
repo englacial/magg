@@ -52,12 +52,16 @@ class TestNormalizeLevels:
         with pytest.raises(ValueError, match="exactly 'node' and 'cells'"):
             norm(entry)
 
-    @pytest.mark.parametrize("node", [None, -1, "9", 9.0])
+    # True/False are ints in Python: a typo'd YAML `node: true` must refuse,
+    # never launder into order 1.
+    @pytest.mark.parametrize("node", [None, -1, "9", 9.0, True, False])
     def test_bad_node_refused(self, node):
         with pytest.raises(ValueError, match="node must be an int >= 0"):
             norm({"node": node, "cells": [13]})
 
-    @pytest.mark.parametrize("cells", [None, [], "13", [13, "11"], [13.0], {"r": 13}])
+    @pytest.mark.parametrize(
+        "cells", [None, [], "13", [13, "11"], [13.0], {"r": 13}, True, False, [True]]
+    )
     def test_bad_cells_refused(self, cells):
         with pytest.raises(ValueError, match="cells must be an int or a non-empty"):
             norm({"node": 9, "cells": cells})

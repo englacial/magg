@@ -63,11 +63,18 @@ def normalize_levels(raw) -> list[dict]:
                 f"'node' and 'cells' (got {entry!r})"
             )
         node, cells = entry["node"], entry["cells"]
-        if not isinstance(node, int) or node < 0:
+        # YAML `true`/`yes` is a bool, and bool IS an int in Python — without
+        # the explicit rejection a typo'd `node: true` would launder into a
+        # real order 1 declaration (the repo convention, cf. config.py).
+        if not isinstance(node, int) or isinstance(node, bool) or node < 0:
             raise ValueError(f"output.pyramid.levels[{i}].node must be an int >= 0 (got {node!r})")
-        if isinstance(cells, int):
+        if isinstance(cells, int) and not isinstance(cells, bool):
             cells = [cells]
-        if not isinstance(cells, list) or not cells or not all(isinstance(c, int) for c in cells):
+        if (
+            not isinstance(cells, list)
+            or not cells
+            or not all(isinstance(c, int) and not isinstance(c, bool) for c in cells)
+        ):
             raise ValueError(
                 f"output.pyramid.levels[{i}].cells must be an int or a non-empty "
                 f"list of ints (got {entry['cells']!r})"
