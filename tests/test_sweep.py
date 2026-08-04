@@ -908,7 +908,7 @@ class TestSweepCli:
         assert node["windows"] == ["2019", "2020"]
         assert node["payload"] == merge([a, b])
 
-    def _config_yaml(self, tmp_path):
+    def _config_yaml(self, tmp_path, pyramid=None, name="config.yaml"):
         """A real pipeline config file (the shipped atl06, hive layout)."""
         import yaml
 
@@ -916,7 +916,9 @@ class TestSweepCli:
 
         cfg = default_config("atl06")
         cfg.output["store_layout"] = "hive"
-        path = tmp_path / "config.yaml"
+        if pyramid is not None:
+            cfg.output["pyramid"] = pyramid
+        path = tmp_path / name
         path.write_text(
             yaml.safe_dump(
                 {
@@ -954,6 +956,26 @@ class TestSweepCli:
         # Declaration-only semantics: no sweep pass ran in the invocation —
         # the same store swept normally writes four stats rollups.
         assert not list(tmp_path.rglob("*.rollup.json"))
+
+    def test_declare_pyramid_flag_prints_a_v2_summary(self, tmp_path, capsys):
+        # The printed summary mirrors the manifest block: /2 declares `levels`
+        # and `orders` DOES NOT EXIST. An empty `orders` is /1's wire signal
+        # for "pyramid declared off" (specification §4.5), so printing it
+        # beside a levels list would read to the operator as "no pyramid".
+        from zagg.hive import read_manifest
+        from zagg.pyramid import PYRAMID_SPEC_V2
+        from zagg.sweep import main
+
+        _write_manifest(tmp_path)  # shard_order 2, cell_order 4
+        levels = [{"node": 2, "cells": [3]}, {"node": 0, "cells": [1]}]
+        config_path = self._config_yaml(tmp_path, pyramid={"levels": levels})
+        assert main([str(tmp_path), "--declare-pyramid", str(config_path)]) == 0
+        out = capsys.readouterr().out
+        summary = json.loads(out)
+        assert "orders" not in summary and '"orders"' not in out
+        assert summary["levels"] == levels and summary["updated"] is True
+        block = read_manifest(str(tmp_path))["pyramid"]
+        assert block["spec"] == PYRAMID_SPEC_V2 and block["overview"]["levels"] == levels
 
     def test_declare_pyramid_flag_does_not_sweep_a_sweepable_store(self, tmp_path, capsys):
         # The positive control for the assertion above: the SAME fixture, swept

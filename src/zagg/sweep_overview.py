@@ -423,11 +423,14 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     An ``output.pyramid: false`` config installs the declared-off block:
     recording absence is a valid retrofit.
 
-    Returns a summary dict: ``orders`` (the declared schedule),
-    ``fold_source`` (the declared fold regime, issue #376), ``fields``
-    (``{name: class}``), ``validated`` (what store truth was checked),
-    ``previous`` (``absent``/``identical``/``replaced``), and ``updated``
-    (whether a PUT happened).
+    Returns a summary dict carrying ``fold_source`` (the declared fold
+    regime, issue #376), ``fields`` (``{name: class}``), ``validated`` (what
+    store truth was checked), ``previous`` (``absent``/``identical``/
+    ``replaced``), and ``updated`` (whether a PUT happened), plus the
+    revision's schedule key and NOT the other one's — mirroring the manifest
+    block itself: ``orders`` under ``/1``, ``levels`` (the normalized grouped
+    form, issue #382) under ``/2``. An empty ``orders`` is ``/1``'s
+    declared-off signal, so a ``/2`` summary must not carry the key at all.
     """
     import obstore
 
@@ -501,18 +504,19 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     if materialized is not None:
         block["overview"]["materialized"] = materialized
     summary = {
-        "orders": list(block["overview"].get("orders") or []),
+        # The schedule key of the declared revision, and only that one: this
+        # dict is what ``--declare-pyramid`` prints, and an empty ``orders``
+        # is /1's wire signal for "pyramid declared OFF" (§4.5) — printing it
+        # beside a /2 ``levels`` list would read as a store with no pyramid.
+        **(
+            {"levels": [dict(e) for e in block["overview"]["levels"]]}
+            if "levels" in block["overview"]
+            else {"orders": list(block["overview"].get("orders") or [])}
+        ),
         # The retrofit's user sees which fold regime they just declared for
         # every future sweep of this store (issue #376) — it is printed by
         # ``python -m zagg.sweep --declare-pyramid`` and nowhere else.
         "fold_source": block["overview"].get("fold_source"),
-        # ...and, for a /2 declaration (issue #382), the normalized levels the
-        # store now declares (declared-but-not-yet-sweepable: #383/#384).
-        **(
-            {"levels": [dict(e) for e in block["overview"]["levels"]]}
-            if "levels" in block["overview"]
-            else {}
-        ),
         "fields": {n: m.get("class") for n, m in (block["overview"].get("fields") or {}).items()},
         "validated": f"{validated}; {semantic}",
         "previous": "absent" if prior is None else "identical" if prior == block else "replaced",

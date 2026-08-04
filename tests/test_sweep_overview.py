@@ -2096,8 +2096,10 @@ class TestDeclarePyramid:
         cfg.output["pyramid"] = {"levels": [{"node": 2, "cells": 3}, {"node": 1, "cells": 2}]}
         summary = declare_pyramid(str(tmp_path), cfg)
         assert summary["updated"] is True and summary["previous"] == "absent"
-        # /2 declares levels, not orders — the summary reports the normalized form.
-        assert summary["orders"] == []
+        # /2 declares levels, not orders — the summary reports the normalized
+        # form and omits `orders` ENTIRELY, mirroring the manifest block: an
+        # empty `orders` is /1's declared-off signal (specification §4.5).
+        assert "orders" not in summary
         assert summary["levels"] == [{"node": 2, "cells": [3]}, {"node": 1, "cells": [2]}]
         assert summary["validated"].startswith("leaf ")  # store truth still probed
         after = read_manifest(str(tmp_path))
