@@ -968,14 +968,14 @@ class TestSweepCli:
 
         _write_manifest(tmp_path)  # shard_order 2, cell_order 4
         levels = [{"node": 2, "cells": [3]}, {"node": 0, "cells": [1]}]
-        config_path = self._config_yaml(tmp_path, pyramid={"levels": levels})
+        config_path = self._config_yaml(tmp_path, pyramid={"overviews": levels})
         assert main([str(tmp_path), "--declare-pyramid", str(config_path)]) == 0
         out = capsys.readouterr().out
         summary = json.loads(out)
         assert "orders" not in summary and '"orders"' not in out
-        assert summary["levels"] == levels and summary["updated"] is True
+        assert summary["overviews"] == levels and summary["updated"] is True
         block = read_manifest(str(tmp_path))["pyramid"]
-        assert block["spec"] == PYRAMID_SPEC_V2 and block["overview"]["levels"] == levels
+        assert block["spec"] == PYRAMID_SPEC_V2 and block["overview"]["overviews"] == levels
 
     def test_declare_pyramid_flag_does_not_sweep_a_sweepable_store(self, tmp_path, capsys):
         # The positive control for the assertion above: the SAME fixture, swept

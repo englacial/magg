@@ -226,7 +226,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     and warned about loudly at template time, per the D24 ruling. The sweep
     later adds ``materialized`` actuals; it never rewrites the declaration.
 
-    An explicit ``output.pyramid.levels`` knob (issue #382) declares the
+    An explicit ``output.pyramid.overviews`` knob (issue #382) declares the
     ``zagg-pyramid/2`` grouped ``(node, cells)`` grammar instead — built in
     :mod:`zagg.pyramid` (:func:`zagg.pyramid.overview_block_v2`), replacing
     the ``orders``/``spacing`` schedule wholesale.
@@ -234,9 +234,9 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     from zagg.config import get_pyramid
     from zagg.pyramid import (
         declared_fields,
-        normalize_levels,
+        normalize_overviews,
         overview_block_v2,
-        validate_levels,
+        validate_overviews,
         warn_excluded,
     )
 
@@ -244,9 +244,9 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     if knob is None:  # output.pyramid: false — declared off
         return {"spec": PYRAMID_SPEC, "overview": {"orders": []}}
     fields, excluded = declared_fields(config)
-    if knob.get("levels") is not None:
-        levels = normalize_levels(knob["levels"])
-        # Ordering/range live here, not in ``normalize_levels`` (they need the
+    if knob.get("overviews") is not None:
+        levels = normalize_overviews(knob["overviews"])
+        # Ordering/range live here, not in ``normalize_overviews`` (they need the
         # grid orders) — and this is the ONLY validation the templating path
         # gets: the Lambda worker builds its config with ``load_config_from_dict``,
         # which never calls ``validate_config``, then goes straight to
@@ -257,7 +257,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
         # anything is written.
         grid_child = (config.output.get("grid") or {}).get("child_order")
         if grid_child is not None:
-            validate_levels(levels, parent_order=int(shard_order), child_order=int(grid_child))
+            validate_overviews(levels, parent_order=int(shard_order), child_order=int(grid_child))
         fold = _fold_plan(knob, [e["node"] for e in levels])
         return overview_block_v2(knob, levels, fold, fields, excluded)
     spacing = int(knob.get("spacing") or DEFAULT_SPACING)
@@ -428,8 +428,8 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     store truth was checked), ``previous`` (``absent``/``identical``/
     ``replaced``), and ``updated`` (whether a PUT happened), plus the
     revision's schedule key and NOT the other one's — mirroring the manifest
-    block itself: ``orders`` under ``/1``, ``levels`` (the normalized grouped
-    form, issue #382) under ``/2``. An empty ``orders`` is ``/1``'s
+    block itself: ``orders`` under ``/1``, ``overviews`` (the normalized
+    grouped form, issue #382) under ``/2``. An empty ``orders`` is ``/1``'s
     declared-off signal, so a ``/2`` summary must not carry the key at all.
     """
     import obstore
@@ -463,14 +463,14 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     # It also surfaces an unserializable block HERE rather than at the PUT,
     # after the whole store-truth probe has been paid for.
     block = json.loads(json.dumps(block))
-    if "levels" in block["overview"]:
+    if "overviews" in block["overview"]:
         # The /2 (node, cells) declaration (issue #382): re-validate against
         # the MANIFEST's own orders — config validation saw the config's grid
         # block, and the retrofit contract is that the store's truth wins.
-        from zagg.pyramid import validate_levels
+        from zagg.pyramid import validate_overviews
 
-        validate_levels(
-            block["overview"]["levels"],
+        validate_overviews(
+            block["overview"]["overviews"],
             parent_order=shard_order,
             child_order=int(manifest["cell_order"]),
         )
@@ -507,10 +507,10 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
         # The schedule key of the declared revision, and only that one: this
         # dict is what ``--declare-pyramid`` prints, and an empty ``orders``
         # is /1's wire signal for "pyramid declared OFF" (§4.5) — printing it
-        # beside a /2 ``levels`` list would read as a store with no pyramid.
+        # beside a /2 ``overviews`` list would read as a store with no pyramid.
         **(
-            {"levels": [dict(e) for e in block["overview"]["levels"]]}
-            if "levels" in block["overview"]
+            {"overviews": [dict(e) for e in block["overview"]["overviews"]]}
+            if "overviews" in block["overview"]
             else {"orders": list(block["overview"].get("orders") or [])}
         ),
         # The retrofit's user sees which fold regime they just declared for
@@ -764,7 +764,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     }
     decl = (manifest.get("pyramid") or {}).get("overview")
     spec = (manifest.get("pyramid") or {}).get("spec")
-    if spec == PYRAMID_SPEC_V2 or (isinstance(decl, dict) and decl.get("levels") is not None):
+    if spec == PYRAMID_SPEC_V2 or (isinstance(decl, dict) and decl.get("overviews") is not None):
         # Declared-but-not-yet-sweepable is a legal recorded state (#381
         # point (11)): the /2 (node, cells) declaration stands in the
         # manifest, and materialization arrives with the leaf columns
@@ -775,7 +775,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
         # The `spec`-only arm reaches here with `decl` unvalidated: a /2 marker
         # carrying no overview block declares nothing, and must report the same
         # `declared: False` the /1 branch below would give it.
-        counts["declared"] = bool(isinstance(decl, dict) and decl.get("levels"))
+        counts["declared"] = bool(isinstance(decl, dict) and decl.get("overviews"))
         logger.warning(
             f"sweep[overview]: the manifest pyramid declaration is {spec!r} — the "
             f"(node, cells) level grammar (issue #382) is declared but NOT yet "

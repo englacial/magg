@@ -664,14 +664,14 @@ overview family under the versioned `pyramid` block:
 ```
 
 Under revision `/2` ([#382](https://github.com/englacial/zagg/issues/382))
-the schedule is the **`levels`** list instead — `orders` and `spacing` do
+the schedule is the **`overviews`** list instead — `orders` and `spacing` do
 not exist in a `/2` block; every other key is unchanged:
 
 ```json
 "pyramid": {
   "spec": "zagg-pyramid/2",
   "overview": {
-    "levels": [
+    "overviews": [
       {"node": 4, "cells": [5, 4]},
       {"node": 2, "cells": [5, 4]},
       {"node": 1, "cells": [2]}
@@ -689,7 +689,7 @@ not exist in a `/2` block; every other key is unchanged:
   step (default 2 — the ratified display schedule). Schedules are per
   artifact family and deliberately decoupled from the tree's
   `path_grouping`.
-- **`levels`** (`/2`) — the ordered level entries (§4.4), in the
+- **`overviews`** (`/2`) — the ordered level entries (§4.4), in the
   **normalized grouped form**: every entry a `{node, cells}` mapping with
   `cells` a list (the config grammar's scalar sugar, `cells: 11` for
   `cells: [11]`, never survives into the manifest). A writer MUST order
@@ -705,7 +705,7 @@ not exist in a `/2` block; every other key is unchanged:
   declared below it) — with one exception: the **declared gather**, the
   SAME `cells` list at a coarser `node` (pure concatenation of the finer
   node's groups, #381 point (3)). Declaration semantics, recorded here from
-  the config grammar: an explicit `levels:` block replaces the derived
+  the config grammar: an explicit `overviews:` block replaces the derived
   default **wholesale** (no per-node merge), and **internal members are
   derived from coarser declarations, never spelled** — spelling one (e.g.
   the `4` in `{"node": 4, "cells": [5, 4]}`) *promotes* it to reader-facing
@@ -717,7 +717,7 @@ not exist in a `/2` block; every other key is unchanged:
   reach; espg ruling on the declaring PR). That derivation is
   **informative** — a reader never needs it, since the manifest always
   records the resolved list, and today zagg emits a `/2` block only for an
-  explicit `levels:` knob. It becomes the writer default when `/2` becomes
+  explicit `overviews:` knob. It becomes the writer default when `/2` becomes
   sweepable ([#383](https://github.com/englacial/zagg/issues/383),
   [#384](https://github.com/englacial/zagg/issues/384)).
 - **The declared-off form is smaller, and `orders` is the only key a reader
@@ -730,11 +730,11 @@ not exist in a `/2` block; every other key is unchanged:
   — `spacing`, `all_time`, `fold_source`, `exact_levels`, `fields`, and
   `summarize` are **absent**, not empty. Recording absence never needs the
   new grammar, so the declared-off form is always this `/1` shape — a `/2`
-  block's `levels` list is **never empty**.
+  block's `overviews` list is **never empty**.
   A reader MUST branch on `spec` first, then on the revision's schedule key:
   under `/1` that is `orders` — an empty `orders` (or no `pyramid` block at
   all — pre-pyramid manifests) means no overview family exists and no other
-  key of the block may be assumed — and under `/2` it is `levels`. When the
+  key of the block may be assumed — and under `/2` it is `overviews`. When the
   schedule key is non-empty, `all_time` and `fields` MUST be present
   (`spacing` too under `/1`; `summarize` stays optional), so the zero-open
   field query of §4.4 is well-defined exactly when there is something to
@@ -756,6 +756,9 @@ not exist in a `/2` block; every other key is unchanged:
   `zagg_overview.fold_source`, which is authoritative for a given overview.
   Under `/2` the pair is declared identically; `exact_levels` counts **level
   entries** from the finest end, exactly as it counts `orders` under `/1`.
+  (`exact_levels` predates the `overviews` key-naming convention and is
+  deliberately untouched by it — ruled vestigial-in-waiting under the #381
+  regime law, which makes the exact/approximate boundary structural.)
 - **`fields`** — every aggregation field, keyed by name, with its
   **composability class**: `exact` (folds byte-equal — count/sum/min/max),
   `approximate` (t-digest merge — `np.isclose` equality class), or `none`

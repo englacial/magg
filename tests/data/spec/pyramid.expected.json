@@ -3,7 +3,7 @@
  "chunk_order": 5,
  "cell_order": 6,
  "declared": {
-  "levels": [
+  "overviews": [
    {
     "node": 4,
     "cells": [
@@ -24,7 +24,7 @@
    }
   ]
  },
- "levels": [
+ "overviews": [
   {
    "node": 4,
    "cells": [
@@ -80,7 +80,7 @@
   "h_min": "exact",
   "h_mean": "none"
  },
- "default_levels": [
+ "default_overviews": [
   {
    "node": 4,
    "cells": [

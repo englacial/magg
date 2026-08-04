@@ -14,7 +14,7 @@ constants and its sweep live in :mod:`zagg.sweep_overview`.
 
 Semantics pinned on the issue:
 
-- **Whole-list replacement** — an explicit ``levels:`` block replaces the
+- **Whole-list replacement** — an explicit ``overviews:`` block replaces the
   derived default wholesale; there is no per-node merge (the
   explicit-beats-derived rule).
 - **Internal members are derived, never spelled** — spelling one (e.g.
@@ -42,24 +42,24 @@ logger = logging.getLogger(__name__)
 PYRAMID_SPEC_V2 = "zagg-pyramid/2"
 
 
-def normalize_levels(raw) -> list[dict]:
-    """``output.pyramid.levels`` in the normalized grouped form.
+def normalize_overviews(raw) -> list[dict]:
+    """``output.pyramid.overviews`` in the normalized grouped form.
 
     A non-empty ordered list of ``{node: N, cells: [...]}`` entries; a scalar
     ``cells`` is sugar for the one-element list. Shape errors raise here;
-    the ordering/range rules live in :func:`validate_levels` (they need the
+    the ordering/range rules live in :func:`validate_overviews` (they need the
     grid orders). The manifest records exactly this normalized form.
     """
     if not isinstance(raw, list) or not raw:
         raise ValueError(
-            f"output.pyramid.levels must be a non-empty list of {{node, cells}} entries "
+            f"output.pyramid.overviews must be a non-empty list of {{node, cells}} entries "
             f"(got {raw!r}); `output.pyramid: false` is how a store declares no pyramid"
         )
     levels = []
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict) or set(entry) != {"node", "cells"}:
             raise ValueError(
-                f"output.pyramid.levels[{i}] must be a mapping with exactly "
+                f"output.pyramid.overviews[{i}] must be a mapping with exactly "
                 f"'node' and 'cells' (got {entry!r})"
             )
         node, cells = entry["node"], entry["cells"]
@@ -67,7 +67,9 @@ def normalize_levels(raw) -> list[dict]:
         # the explicit rejection a typo'd `node: true` would launder into a
         # real order 1 declaration (the repo convention, cf. config.py).
         if not isinstance(node, int) or isinstance(node, bool) or node < 0:
-            raise ValueError(f"output.pyramid.levels[{i}].node must be an int >= 0 (got {node!r})")
+            raise ValueError(
+                f"output.pyramid.overviews[{i}].node must be an int >= 0 (got {node!r})"
+            )
         if isinstance(cells, int) and not isinstance(cells, bool):
             cells = [cells]
         if (
@@ -76,14 +78,14 @@ def normalize_levels(raw) -> list[dict]:
             or not all(isinstance(c, int) and not isinstance(c, bool) for c in cells)
         ):
             raise ValueError(
-                f"output.pyramid.levels[{i}].cells must be an int or a non-empty "
+                f"output.pyramid.overviews[{i}].cells must be an int or a non-empty "
                 f"list of ints (got {entry['cells']!r})"
             )
         levels.append({"node": int(node), "cells": [int(c) for c in cells]})
     return levels
 
 
-def validate_levels(levels: list, *, parent_order: int, child_order: int) -> None:
+def validate_overviews(levels: list, *, parent_order: int, child_order: int) -> None:
     """Refuse an out-of-contract level schedule — loudly, never by widening.
 
     The issue #382 rules, over the normalized form:
@@ -111,29 +113,29 @@ def validate_levels(levels: list, *, parent_order: int, child_order: int) -> Non
         node, cells = entry["node"], entry["cells"]
         if not 0 <= node <= parent_order:
             raise ValueError(
-                f"output.pyramid.levels[{i}].node = {node} is outside [0, parent_order = "
+                f"output.pyramid.overviews[{i}].node = {node} is outside [0, parent_order = "
                 f"{parent_order}] — level artifacts live at hive prefixes, none finer "
                 f"than the shard order"
             )
         if any(b >= a for a, b in zip(cells, cells[1:])):
-            raise ValueError(f"output.pyramid.levels[{i}].cells {cells} must strictly descend")
+            raise ValueError(f"output.pyramid.overviews[{i}].cells {cells} must strictly descend")
         if cells[-1] < node:
             raise ValueError(
-                f"output.pyramid.levels[{i}].cells {cells} reach coarser than their own "
+                f"output.pyramid.overviews[{i}].cells {cells} reach coarser than their own "
                 f"node {node} — a node stores resolutions >= its own order (equality is "
                 f"the 1-cell whole-footprint group)"
             )
         if cells[0] >= child_order:
             raise ValueError(
-                f"output.pyramid.levels[{i}].cells {cells} reach the base data's own "
+                f"output.pyramid.overviews[{i}].cells {cells} reach the base data's own "
                 f"cell order ({child_order}) — the base level is the store itself, "
                 f"not a declarable overview member"
             )
     for i, (prev, entry) in enumerate(zip(levels, levels[1:]), start=1):
         if entry["node"] >= prev["node"]:
             raise ValueError(
-                f"output.pyramid.levels nodes must strictly descend: levels[{i}].node = "
-                f"{entry['node']} does not descend from levels[{i - 1}].node = {prev['node']}"
+                f"output.pyramid.overviews nodes must strictly descend: overviews[{i}].node = "
+                f"{entry['node']} does not descend from overviews[{i - 1}].node = {prev['node']}"
             )
         if entry["cells"] == prev["cells"]:
             continue  # the declared gather: same cells, coarser node
@@ -147,15 +149,15 @@ def validate_levels(levels: list, *, parent_order: int, child_order: int) -> Non
             continue
         if entry["cells"][0] >= reader[-1]:
             raise ValueError(
-                f"output.pyramid.levels[{i}].cells {entry['cells']} do not descend from "
-                f"levels[{i - 1}].cells {prev['cells']} — across entries resolutions "
+                f"output.pyramid.overviews[{i}].cells {entry['cells']} do not descend from "
+                f"overviews[{i - 1}].cells {prev['cells']} — across entries resolutions "
                 f"strictly descend below the previous entry's coarsest reader-facing "
                 f"member ({reader[-1]}), except a declared gather (the SAME cells at a "
                 f"coarser node)"
             )
 
 
-def default_levels(parent_order: int, chunk_order: int, *, child_order: int) -> list[dict]:
+def default_overviews(parent_order: int, chunk_order: int, *, child_order: int) -> list[dict]:
     """The derived default schedule, bound to the grid block (#381 point (5)).
 
     With ``d = chunk_order - parent_order``: ``{node: parent_order, cells:
@@ -164,8 +166,8 @@ def default_levels(parent_order: int, chunk_order: int, *, child_order: int) -> 
     node 0 on even shard orders, node 1 on odd (step by 2 until you run out;
     espg ruling on the PR #389 thread, matching the ``/1`` default's
     ``range(shard - 2, -1, -2)`` reach). For the 19/13/9 reference geometry:
-    (9,[13]) (7,[11]) (5,[9]) (3,[7]) (1,[5]). An explicit ``levels:`` block
-    replaces this default WHOLESALE.
+    (9,[13]) (7,[11]) (5,[9]) (3,[7]) (1,[5]). An explicit ``overviews:``
+    block replaces this default WHOLESALE.
 
     ``chunk_order`` is the grid's RESOLVED chunk order — pass
     ``grid.chunk_order``, never the raw ``output.grid.chunk_inner`` knob: an
@@ -177,9 +179,9 @@ def default_levels(parent_order: int, chunk_order: int, *, child_order: int) -> 
     giving ``d = 0`` — every level the degenerate whole-footprint group,
     still legal.
 
-    The result is checked against :func:`validate_levels` before it is
+    The result is checked against :func:`validate_overviews` before it is
     returned: the derived default is what every store that never spells
-    ``levels:`` gets, so it must be valid by construction for every geometry
+    ``overviews:`` gets, so it must be valid by construction for every geometry
     the grid admits. ``HealpixGrid`` accepts ``chunk_order == child_order``,
     whose base entry would BE the base data — that geometry refuses loudly
     here rather than shipping an invalid schedule into a manifest.
@@ -188,7 +190,7 @@ def default_levels(parent_order: int, chunk_order: int, *, child_order: int) -> 
     d = chunk_order - parent_order
     levels = [{"node": parent_order, "cells": [parent_order + d]}]
     levels += [{"node": k, "cells": [k + d]} for k in range(parent_order - 2, -1, -2)]
-    validate_levels(levels, parent_order=parent_order, child_order=child_order)
+    validate_overviews(levels, parent_order=parent_order, child_order=child_order)
     return levels
 
 
@@ -252,7 +254,7 @@ def _json_fill(fill_value):
 
 
 def overview_block_v2(knob: dict, levels: list, fold: tuple, fields: dict, excluded: list) -> dict:
-    """The ``zagg-pyramid/2`` manifest block for an explicit ``levels:`` knob.
+    """The ``zagg-pyramid/2`` manifest block for an explicit ``overviews:`` knob.
 
     ``levels`` is the NORMALIZED grouped form (scalars expanded) — the
     manifest is the reader-facing contract, so no sugar survives into it.
@@ -269,7 +271,7 @@ def overview_block_v2(knob: dict, levels: list, fold: tuple, fields: dict, exclu
         warn_excluded(excluded)
     fold_source, exact_levels = fold
     overview: dict = {
-        "levels": [dict(e) for e in levels],
+        "overviews": [dict(e) for e in levels],
         "all_time": bool(knob.get("all_time", False)),
         "fold_source": fold_source,
     }

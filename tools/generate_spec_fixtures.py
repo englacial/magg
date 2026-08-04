@@ -75,7 +75,7 @@ GOLDEN_CONF = (4, -1, 0, 3, 1)
 #: (same cells, coarser node). Entry 2: scalar sugar, normalized to ``[2]``
 #: in the manifest.
 PYRAMID_KNOB = {
-    "levels": [
+    "overviews": [
         {"node": 4, "cells": [5, 4]},
         {"node": 2, "cells": [5, 4]},
         {"node": 1, "cells": 2},
@@ -414,7 +414,7 @@ def build_pyramid(out: Path) -> None:
 
     Every byte of the committed manifest comes from a production declaration
     path, in the order a real store would live it: templated under ``/1``
-    (``hive.build_manifest`` — no ``levels`` knob), given sweep actuals by
+    (``hive.build_manifest`` — no ``overviews`` knob), given sweep actuals by
     the production bookkeeping writer
     (``sweep_overview._update_manifest_pyramid``, the function the real ``/1``
     sweep calls), then retrofitted to ``/2`` with ``declare_pyramid`` and the
@@ -451,14 +451,14 @@ def build_pyramid(out: Path) -> None:
     # (scalar sugar -> one-element list), and §4.4's slab-length rule.
     levels = [
         {"node": e["node"], "cells": [e["cells"]] if isinstance(e["cells"], int) else e["cells"]}
-        for e in PYRAMID_KNOB["levels"]
+        for e in PYRAMID_KNOB["overviews"]
     ]
     expected = {
         "shard_order": 4,
         "chunk_order": 5,
         "cell_order": 6,
         "declared": PYRAMID_KNOB,
-        "levels": levels,
+        "overviews": levels,
         "slabs": [[4 ** (r - e["node"]) for r in e["cells"]] for e in levels],
         "gather_entries": [1],  # same cells as the entry above, coarser node
         "fold_source": "cascade",
@@ -475,7 +475,7 @@ def build_pyramid(out: Path) -> None:
         },
         # The §4.5 derived-default formula for this geometry (informative in
         # the spec; pinned here so zagg's derivation cannot drift from it).
-        "default_levels": [
+        "default_overviews": [
             {"node": 4, "cells": [5]},
             {"node": 2, "cells": [3]},
             {"node": 0, "cells": [1]},

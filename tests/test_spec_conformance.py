@@ -561,24 +561,24 @@ class TestPyramidV2Declaration:
         block = _pyramid_block()
         assert block["spec"] == "zagg-pyramid/2"
         overview = block["overview"]
-        # §4.5: under /2 the schedule key is `levels`; orders/spacing do not
+        # §4.5: under /2 the schedule key is `overviews`; orders/spacing do not
         # exist. With a non-empty schedule, all_time and fields MUST be there.
         assert "orders" not in overview and "spacing" not in overview
-        assert overview["levels"] and overview["all_time"] is False
+        assert overview["overviews"] and overview["all_time"] is False
         assert set(overview["fields"]) == set(_expected(PYRAMID)["fields"])
 
     def test_levels_are_the_normalized_grouped_form(self):
         exp = _expected(PYRAMID)
-        levels = _pyramid_block()["overview"]["levels"]
-        assert levels == exp["levels"]
+        levels = _pyramid_block()["overview"]["overviews"]
+        assert levels == exp["overviews"]
         # The config knob spelled entry 2 with scalar sugar; the manifest
         # records lists only — sugar never survives into the contract.
-        assert isinstance(exp["declared"]["levels"][2]["cells"], int)
+        assert isinstance(exp["declared"]["overviews"][2]["cells"], int)
         assert all(isinstance(e["cells"], list) for e in levels)
 
     def test_entry_rules_decode_per_spec(self):
         exp = _expected(PYRAMID)
-        levels = _pyramid_block()["overview"]["levels"]
+        levels = _pyramid_block()["overview"]["overviews"]
         nodes = [e["node"] for e in levels]
         # Strictly descending nodes, each in [0, shard_order].
         assert all(b < a for a, b in zip(nodes, nodes[1:]))
@@ -592,7 +592,7 @@ class TestPyramidV2Declaration:
 
     def test_gather_and_whole_footprint_member(self):
         exp = _expected(PYRAMID)
-        levels = _pyramid_block()["overview"]["levels"]
+        levels = _pyramid_block()["overview"]["overviews"]
         for i in exp["gather_entries"]:
             # The declared gather: the SAME cells list at a coarser node.
             assert levels[i]["cells"] == levels[i - 1]["cells"]
@@ -605,7 +605,7 @@ class TestPyramidV2Declaration:
         # §4.5: the next entry's finest member descends below the previous
         # entry's coarsest READER-FACING member — a trailing cells == node
         # member is exempt — except the declared gather (same cells).
-        levels = _pyramid_block()["overview"]["levels"]
+        levels = _pyramid_block()["overview"]["overviews"]
         for prev, entry in zip(levels, levels[1:]):
             if entry["cells"] == prev["cells"]:
                 continue
@@ -638,7 +638,7 @@ class TestPyramidV2Declaration:
         # §4.5's informative derived default, computed from the spec text for
         # this geometry, must equal the committed expectation — the formula on
         # the page and the one the fixture records cannot drift apart. The
-        # CODE binding (zagg's own default_levels for this same geometry) is
+        # CODE binding (zagg's own default_overviews for this same geometry) is
         # pinned in tests/test_pyramid.py::TestDefaultLevels, which is where
         # reading back through zagg belongs: this class decodes the committed
         # fixture from spec text alone.
@@ -651,7 +651,7 @@ class TestPyramidV2Declaration:
             {"node": k, "cells": [k + d]}
             for k in range(s - 2, -1, -2)
         ]
-        assert formula == exp["default_levels"]
+        assert formula == exp["default_overviews"]
 
     def test_v1_compat_constant_depth_rule(self):
         # §4.4: /1 is the special case cells = [node + (c - s)]. The leaf
@@ -677,7 +677,7 @@ class TestPyramidV2Declaration:
         block = build_pyramid_block(cfg, shard_order=s)
         assert block["spec"] == "zagg-pyramid/1"
         overview = block["overview"]
-        assert "levels" not in overview  # /1 never carries the /2 schedule key
+        assert "overviews" not in overview  # /1 never carries the /2 schedule key
         # The whole derived /1 schedule for shard order 4, by VALUE.
         assert overview["orders"] == [2, 0] and overview["spacing"] == 2
         assert overview["all_time"] is False

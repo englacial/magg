@@ -11,14 +11,14 @@ behavior lives in ``tests/test_sweep_overview.py``; the spec fixture in
 
 import pytest
 
-from zagg.pyramid import default_levels, normalize_levels, validate_levels
+from zagg.pyramid import default_overviews, normalize_overviews, validate_overviews
 
 #: The reference 19/13/9 geometry from the issue #381 design record.
 REF = {"parent_order": 9, "child_order": 19}
 
 
 def norm(*entries):
-    return normalize_levels(list(entries))
+    return normalize_overviews(list(entries))
 
 
 class TestNormalizeLevels:
@@ -30,12 +30,12 @@ class TestNormalizeLevels:
 
     def test_order_preserved_never_sorted(self):
         raw = [{"node": 9, "cells": 13}, {"node": 1, "cells": 5}, {"node": 5, "cells": 9}]
-        assert [e["node"] for e in normalize_levels(raw)] == [9, 1, 5]
+        assert [e["node"] for e in normalize_overviews(raw)] == [9, 1, 5]
 
-    @pytest.mark.parametrize("raw", [None, {}, [], "levels", 7])
+    @pytest.mark.parametrize("raw", [None, {}, [], "overviews", 7])
     def test_non_list_or_empty_refused(self, raw):
         with pytest.raises(ValueError, match="non-empty list"):
-            normalize_levels(raw)
+            normalize_overviews(raw)
 
     @pytest.mark.parametrize(
         "entry",
@@ -69,7 +69,7 @@ class TestNormalizeLevels:
 
 class TestValidateLevels:
     def test_reference_default_schedule_is_valid(self):
-        validate_levels(
+        validate_overviews(
             norm(
                 {"node": 9, "cells": 13},
                 {"node": 7, "cells": 11},
@@ -82,29 +82,31 @@ class TestValidateLevels:
 
     def test_lone_entry_declares_a_whole_pyramid(self):
         # Whole-list replacement: this is a complete two-level declaration.
-        validate_levels(norm({"node": 9, "cells": [16, 13]}), **REF)
+        validate_overviews(norm({"node": 9, "cells": [16, 13]}), **REF)
 
     def test_cells_equal_node_is_the_one_cell_group(self):
-        validate_levels(norm({"node": 9, "cells": [13, 9]}), **REF)
+        validate_overviews(norm({"node": 9, "cells": [13, 9]}), **REF)
 
     def test_cells_equal_node_coexists_with_a_coarser_entry(self):
         # The whole-footprint member (#381 point (2)) is the writer's universal
         # partial — it serves the coarser folds below it, so it never sets the
         # descent floor. The floor here is 13, so the (7,[11]) tail is legal.
-        validate_levels(norm({"node": 9, "cells": [13, 9]}, {"node": 7, "cells": [11]}), **REF)
+        validate_overviews(norm({"node": 9, "cells": [13, 9]}, {"node": 7, "cells": [11]}), **REF)
 
     def test_bare_node_order_entry_constrains_nothing(self):
         # An entry declaring ONLY its node-order member has no reader-facing
         # member at all, so it imposes no cross-entry constraint.
-        validate_levels(norm({"node": 9, "cells": [9]}, {"node": 7, "cells": [8]}), **REF)
+        validate_overviews(norm({"node": 9, "cells": [9]}, {"node": 7, "cells": [8]}), **REF)
 
     def test_gather_same_cells_at_coarser_node(self):
-        validate_levels(norm({"node": 9, "cells": [13, 11]}, {"node": 5, "cells": [13, 11]}), **REF)
+        validate_overviews(
+            norm({"node": 9, "cells": [13, 11]}, {"node": 5, "cells": [13, 11]}), **REF
+        )
 
     def test_gather_does_not_reset_the_descent_floor(self):
         # After the gather the next comparison is against the GATHER entry:
         # its reader-facing floor is still 11, so (3,[7]) descends cleanly.
-        validate_levels(
+        validate_overviews(
             norm(
                 {"node": 9, "cells": [13, 11]},
                 {"node": 5, "cells": [13, 11]},
@@ -114,33 +116,33 @@ class TestValidateLevels:
         )
 
     def test_node_zero_and_leaf_node_are_both_legal(self):
-        validate_levels(norm({"node": 9, "cells": 13}, {"node": 0, "cells": 4}), **REF)
+        validate_overviews(norm({"node": 9, "cells": 13}, {"node": 0, "cells": 4}), **REF)
 
     def test_node_above_parent_order_refused(self):
         with pytest.raises(ValueError, match=r"outside \[0, parent_order = 9\]"):
-            validate_levels(norm({"node": 10, "cells": 13}), **REF)
+            validate_overviews(norm({"node": 10, "cells": 13}), **REF)
 
     @pytest.mark.parametrize("cells", [[11, 13], [13, 13]])
     def test_cells_not_strictly_descending_refused(self, cells):
         with pytest.raises(ValueError, match="must strictly descend"):
-            validate_levels(norm({"node": 9, "cells": cells}), **REF)
+            validate_overviews(norm({"node": 9, "cells": cells}), **REF)
 
     def test_cells_coarser_than_node_refused(self):
         with pytest.raises(ValueError, match="coarser than their own node"):
-            validate_levels(norm({"node": 9, "cells": [13, 8]}), **REF)
+            validate_overviews(norm({"node": 9, "cells": [13, 8]}), **REF)
 
     @pytest.mark.parametrize("cell", [19, 20])
     def test_cells_at_or_past_base_order_refused(self, cell):
         # Binding at the leaf node per the issue; enforced on every entry —
         # the base level is the store itself, never a declarable member.
         with pytest.raises(ValueError, match="base data's own cell order"):
-            validate_levels(norm({"node": 9, "cells": [cell, 13]}), **REF)
+            validate_overviews(norm({"node": 9, "cells": [cell, 13]}), **REF)
 
     @pytest.mark.parametrize("nodes", [(9, 9), (7, 9)])
     def test_nodes_not_strictly_descending_refused(self, nodes):
         first, second = nodes
         with pytest.raises(ValueError, match="nodes must strictly descend"):
-            validate_levels(
+            validate_overviews(
                 norm({"node": first, "cells": 13}, {"node": second, "cells": 13}), **REF
             )
 
@@ -148,7 +150,7 @@ class TestValidateLevels:
         # Neither descending nor a gather (the cells lists differ): refuse by
         # name, never widen.
         with pytest.raises(ValueError, match="do not descend from"):
-            validate_levels(
+            validate_overviews(
                 norm({"node": 9, "cells": [16, 13]}, {"node": 7, "cells": [13, 11]}), **REF
             )
 
@@ -157,12 +159,14 @@ class TestValidateLevels:
         # order), so it IS the floor: an o7 entry restating it must spell the
         # whole cells list to read as the declared gather.
         with pytest.raises(ValueError, match="do not descend from"):
-            validate_levels(norm({"node": 9, "cells": [13, 11]}, {"node": 7, "cells": [11]}), **REF)
+            validate_overviews(
+                norm({"node": 9, "cells": [13, 11]}, {"node": 7, "cells": [11]}), **REF
+            )
 
 
 class TestDefaultLevels:
     def test_reference_geometry_pins_the_ratified_schedule(self):
-        assert default_levels(9, 13, child_order=19) == [
+        assert default_overviews(9, 13, child_order=19) == [
             {"node": 9, "cells": [13]},
             {"node": 7, "cells": [11]},
             {"node": 5, "cells": [9]},
@@ -171,7 +175,7 @@ class TestDefaultLevels:
         ]
 
     def test_spec_fixture_geometry(self):
-        assert default_levels(4, 5, child_order=6) == [
+        assert default_overviews(4, 5, child_order=6) == [
             {"node": 4, "cells": [5]},
             {"node": 2, "cells": [3]},
             {"node": 0, "cells": [1]},
@@ -181,13 +185,13 @@ class TestDefaultLevels:
         # The espg ruling on the node walk's tail (PR #389 thread): step by 2
         # until you run out — node 0 on even shard orders, node 1 on odd,
         # matching the /1 default's range(shard - 2, -1, -2) reach.
-        assert [e["node"] for e in default_levels(6, 8, child_order=12)] == [6, 4, 2, 0]
-        assert [e["node"] for e in default_levels(9, 13, child_order=19)] == [9, 7, 5, 3, 1]
+        assert [e["node"] for e in default_overviews(6, 8, child_order=12)] == [6, 4, 2, 0]
+        assert [e["node"] for e in default_overviews(9, 13, child_order=19)] == [9, 7, 5, 3, 1]
 
     def test_k_one_degenerates_to_whole_footprint_groups(self):
         # K == 1: the grid's RESOLVED chunk order equals parent_order, so
         # d = 0 and every level is the 1-cell whole-footprint group.
-        assert default_levels(4, 4, child_order=6) == [
+        assert default_overviews(4, 4, child_order=6) == [
             {"node": 4, "cells": [4]},
             {"node": 2, "cells": [2]},
             {"node": 0, "cells": [0]},
@@ -197,17 +201,17 @@ class TestDefaultLevels:
         # HealpixGrid admits chunk_order == child_order; the base entry would
         # BE the base data, so the default refuses loudly at derive time.
         with pytest.raises(ValueError, match="base data's own cell order"):
-            default_levels(9, 19, child_order=19)
+            default_overviews(9, 19, child_order=19)
 
     @pytest.mark.parametrize("chunk_order", [9, 11, 13, 18])
     def test_default_round_trips_through_validate(self, chunk_order):
         # Valid by construction for every geometry the grid admits between
         # chunk_order == parent_order (K == 1) and child_order - 1.
-        validate_levels(default_levels(9, chunk_order, child_order=19), **REF)
+        validate_overviews(default_overviews(9, chunk_order, child_order=19), **REF)
 
 
 class TestConfigWiring:
-    """``output.pyramid.levels`` through ``validate_config`` (issue #382)."""
+    """``output.pyramid.overviews`` through ``validate_config`` (issue #382)."""
 
     def _cfg(self, **output):
         from zagg.config import default_config
@@ -224,7 +228,7 @@ class TestConfigWiring:
     def test_valid_levels_block(self):
         self._validate(
             {
-                "levels": [
+                "overviews": [
                     {"node": 6, "cells": 9},
                     {"node": 4, "cells": 7},
                     {"node": 2, "cells": [5, 2]},
@@ -234,16 +238,16 @@ class TestConfigWiring:
 
     def test_levels_with_orders_or_spacing_refused(self):
         for extra in ({"orders": [4]}, {"spacing": 2}):
-            with pytest.raises(ValueError, match="declare levels OR orders/spacing"):
-                self._validate({"levels": [{"node": 6, "cells": 9}], **extra})
+            with pytest.raises(ValueError, match="declare overviews OR orders/spacing"):
+                self._validate({"overviews": [{"node": 6, "cells": 9}], **extra})
 
     def test_levels_grammar_errors_surface_through_validate_config(self):
         with pytest.raises(ValueError, match="non-empty list"):
-            self._validate({"levels": []})
+            self._validate({"overviews": []})
         with pytest.raises(ValueError, match=r"outside \[0, parent_order = 6\]"):
-            self._validate({"levels": [{"node": 7, "cells": 9}]})
+            self._validate({"overviews": [{"node": 7, "cells": 9}]})
         with pytest.raises(ValueError, match="base data's own cell order"):
-            self._validate({"levels": [{"node": 6, "cells": 12}]})
+            self._validate({"overviews": [{"node": 6, "cells": 12}]})
 
     def test_missing_child_order_refuses_by_name(self):
         # Pinned on _validate_pyramid directly: validate_config's own grid
@@ -253,7 +257,7 @@ class TestConfigWiring:
         # "cells [9] reach the base data's own cell order (0)" instead.
         from zagg.config import _validate_pyramid
 
-        cfg = self._cfg(store_layout="hive", pyramid={"levels": [{"node": 6, "cells": 9}]})
+        cfg = self._cfg(store_layout="hive", pyramid={"overviews": [{"node": 6, "cells": 9}]})
         cfg.output["grid"] = {k: v for k, v in cfg.output["grid"].items() if k != "child_order"}
         with pytest.raises(ValueError, match="output.grid.child_order is required"):
             _validate_pyramid(cfg)
@@ -267,6 +271,6 @@ class TestConfigWiring:
                     store_layout="flat",
                     coverage_moc=False,
                     sweep=False,
-                    pyramid={"levels": [{"node": 4, "cells": 6}]},
+                    pyramid={"overviews": [{"node": 4, "cells": 6}]},
                 )
             )
