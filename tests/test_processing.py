@@ -2139,6 +2139,23 @@ class TestObsReadMetadata:
         assert len(set(seen)) == len(seen) == 3  # three distinct dicts
         assert metadata["total_obs_read"] == 15
 
+    def test_one_read_log_line_per_shard(self, monkeypatch, caplog):
+        # "Read N observations" is how a shard's KEPT tally is grepped out of
+        # CloudWatch today. Emitting the pre-filter count under the same verb
+        # gave two contradictory hits per shard, so the new line says "Decoded"
+        # (review finding): one verb, one meaning.
+        import logging
+
+        def read_group(h5obj, group, ds, sk, grid, arrow=False, io_stats=None, **k):
+            io_stats["obs_read"] = io_stats.get("obs_read", 0) + 10
+            return self._carrier(grid, sk, 3)
+
+        with caplog.at_level(logging.INFO, logger="zagg.processing.worker"):
+            self._run(monkeypatch, read_group, ["s3://a"])
+        lines = [r.getMessage() for r in caplog.records]
+        assert sum("Read " in ln and "observations" in ln for ln in lines) == 1
+        assert "  Decoded 10 observations pre-filter, kept 3" in lines
+
 
 class TestMultiChunkWorker:
     """Issue #30 item 3: one worker (one shard) owns K = grid.chunks_per_shard finer
