@@ -7,6 +7,7 @@ from zagg.stats.composition import (
     LANES,
     counts_from_composition,
     merge_composition,
+    merge_composition_kway,
     pack_composition,
     unpack_composition,
 )
@@ -182,6 +183,83 @@ class TestMergeComposition:
         wa = pack_composition(np.zeros(30), **_conf_kwargs(conf_a))
         wb = pack_composition(np.zeros(50), **_conf_kwargs(conf_b))
         assert merge_composition(wa, 30, wb, 50) == merge_composition(wb, 50, wa, 30)
+
+
+class TestMergeCompositionKway:
+    """One-pass k-way fold: order-independent and tighter than the chain."""
+
+    @staticmethod
+    def _parts(rng, sizes, signal_col=1):
+        """``(parts, pooled_word, n_total, conf)`` for blocks of ``sizes`` rows."""
+        conf = rng.integers(-2, 5, size=(sum(sizes), 5))
+        conf[:, signal_col] = 4  # everything signal, so n == len(rows)
+        parts, off = [], 0
+        for size in sizes:
+            block = conf[off : off + size]
+            parts.append((pack_composition(np.zeros(size), **_conf_kwargs(block)), size))
+            off += size
+        pooled = pack_composition(np.zeros(len(conf)), **_conf_kwargs(conf))
+        return parts, pooled, len(conf), conf
+
+    def test_identity_and_empty(self):
+        conf = np.array([[4, -1, -1, 2, -1]])
+        w = pack_composition(np.array([1.0]), **_conf_kwargs(conf))
+        assert merge_composition_kway([]) == 0
+        assert merge_composition_kway([(0, 0), (0, 0)]) == 0
+        assert merge_composition_kway([(w, 1), (0, 0)]) == w
+        assert merge_composition_kway([(w, 1)]) == w
+
+    def test_order_independent(self):
+        rng = np.random.default_rng(4)
+        parts, _, _, _ = self._parts(rng, [7, 40, 13, 60, 5, 90])
+        word = merge_composition_kway(parts)
+        for seed in range(5):
+            shuffled = list(parts)
+            np.random.default_rng(seed).shuffle(shuffled)
+            assert merge_composition_kway(shuffled) == word
+
+    def test_tighter_than_the_pairwise_chain(self):
+        # 12 blocks: the chain re-quantizes 11 times and drifts; one pass
+        # quantizes once, so its recovered counts sit within a single step of
+        # the pooled word however many parts there are.
+        rng = np.random.default_rng(87)
+        parts, pooled, n, _ = self._parts(rng, [40] * 12)
+        chained, held_n = parts[0]
+        for word, n_i in parts[1:]:
+            chained = merge_composition(chained, held_n, word, n_i)
+            held_n += n_i
+        assert held_n == n
+        kway = merge_composition_kway(parts)
+        truth = counts_from_composition(pooled, n)
+        assert np.max(np.abs(counts_from_composition(kway, n) - truth)) <= 1 + n / 255.0
+        assert np.max(np.abs(counts_from_composition(kway, n) - truth)) <= np.max(
+            np.abs(counts_from_composition(chained, n) - truth)
+        )
+        assert np.array_equal(unpack_composition(kway) > 0, unpack_composition(pooled) > 0)
+
+    def test_presence_floor_survives_many_parts(self):
+        # One rare flag in one part must stay nonzero against 20 parts that
+        # never carry it, exactly as the binary law guarantees.
+        conf0 = np.full((10, 5), -1)
+        conf0[:, 0] = 4
+        conf0[0, 4] = 3  # rare inland_water flag
+        confk = np.full((100, 5), -1)
+        confk[:, 0] = 4
+        parts = [(pack_composition(np.zeros(10), **_conf_kwargs(conf0)), 10)]
+        wk = pack_composition(np.zeros(100), **_conf_kwargs(confk))
+        parts += [(wk, 100)] * 20
+        assert unpack_composition(merge_composition_kway(parts))[4] >= 1
+
+    def test_weighted_by_n_not_part_count(self):
+        # A 1-row part must not pull the mean like a 200-row one.
+        big = np.full((200, 5), -1)
+        big[:, 0] = 4
+        small = np.array([[-1, -1, -1, -1, 4]])
+        wb = pack_composition(np.zeros(200), **_conf_kwargs(big))
+        ws = pack_composition(np.zeros(1), **_conf_kwargs(small))
+        lanes = unpack_composition(merge_composition_kway([(wb, 200), (ws, 1)]))
+        assert lanes[0] == 254  # 200/201 of the stratum
+        assert lanes[4] == 1  # present, floored
 
 
 class TestBuildTdigestWhere:

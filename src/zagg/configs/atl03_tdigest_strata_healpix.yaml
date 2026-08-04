@@ -34,7 +34,8 @@
 # Strata + composition run pooled, or under ``mode: spill`` including the
 # multi-block regime (issue #370): a block close folds per-block stratum
 # digests (row selection precedes the build) and composition words
-# (``merge_composition`` — presence exact, counts within O(n/510) per fold).
+# (``merge_composition_kway`` — presence exact, counts within one
+# quantization however many blocks close).
 # ``mode: merge`` still rejects them (its per-flush fold would degrade
 # locations continuously and has no ``where`` state).
 # Grid geometry matches atl03_tdigest_healpix.yaml (o11 shard / o13 inner
