@@ -744,6 +744,45 @@ class TestFoldColumnDiagnostics:
             agg._fold_block(agg._block)
         agg.close()
 
+    def test_missing_composition_param_column_named(self):
+        # A typo'd conf column used to fall through _resolve_param as a literal
+        # string and die inside np.column_stack, naming neither the field nor
+        # the column ("the array at index 4 has size 1").
+        variables = _variables()
+        field = _composition_field()
+        field["params"] = {**field["params"], "conf_ocean": "signal_conf_ocaen"}
+        variables["composition"] = field
+        cols = {c: np.zeros(1, np.int64) for c in _CONF_COLS}
+        cols["h_ph"] = np.zeros(1, np.float32)
+        agg = self._agg_with_block(variables, cols)
+        with pytest.raises(
+            ValueError, match="'composition'.*conf_ocean.*signal_conf_ocaen.*spilled block"
+        ):
+            agg._fold_block(agg._block)
+        agg.close()
+
+    def test_missing_where_column_named(self):
+        # A where expression over an unread column reached build_tdigest_where
+        # and raised "where shape () does not match values shape (n,)".
+        variables = _variables(strata=True)
+        variables["h_sig"]["params"] = {**variables["h_sig"]["params"], "where": "flag > 0"}
+        agg = self._agg_with_block(variables, {"h_ph": np.zeros(1, np.float32)})
+        with pytest.raises(ValueError, match="h_sig.*where: 'flag > 0'.*\\['flag'\\]"):
+            agg._fold_block(agg._block)
+        agg.close()
+
+    def test_expression_over_spilled_columns_passes(self):
+        # np/numpy and the block's own columns are the whole namespace, so a
+        # real expression over them must not trip the check.
+        variables = _variables(strata=True)
+        variables["h_sig"]["params"] = {
+            **variables["h_sig"]["params"],
+            "where": "np.isfinite(h_ph) & (h_ph > 0)",
+        }
+        agg = self._agg_with_block(variables, {"h_ph": np.ones(1, np.float32)})
+        agg._fold_block(agg._block)  # no raise
+        agg.close()
+
     def test_reducer_thread_surfaces_the_named_cause(self):
         # On the overlap path the fold runs off-thread; _join_reducer wraps the
         # failure, so the named ValueError must be the cause (not a KeyError).
