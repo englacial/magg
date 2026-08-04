@@ -251,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
             "path": args.catalog,
             "total_granules": n_total,
             "granules_after_prefilter": n_kept,
-            "granules_intersecting_conus": sm.metadata["total_granules"],
+            "granules_intersecting_conus": sm.metadata["granules_assigned"],
         },
         "summary": {
             "total_shards": sm.metadata["total_shards"],
