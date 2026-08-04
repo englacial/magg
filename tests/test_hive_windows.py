@@ -453,8 +453,13 @@ class TestWindowingConfig:
             validate_config(cfg)
 
     def test_explicit_subsecond_range_spanning_a_second_boundary_allowed(self, cfg):
-        # A sub-second-wide range that straddles a second boundary renders to
-        # a real one-second window and stays valid.
+        # A sub-second-wide range that straddles a second boundary does NOT
+        # collapse — but it is RETIMED, not preserved: each bound truncates to
+        # the second containing it, so the declared [12:00:01.9, 12:00:02.1)
+        # renders as [12:00:01, 12:00:02) — 0.9 s earlier at the head, 0.1 s
+        # short at the tail. That truncation is the documented behavior for
+        # range bounds (docs/hive_layout.md); ranges are never widened, and
+        # only the total collapse to one second is refused.
         _windowed(
             cfg,
             schedule="explicit",

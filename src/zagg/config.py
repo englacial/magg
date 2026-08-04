@@ -1070,10 +1070,13 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
     renders them through ``windows.iso_utc`` (``timespec="seconds"``), so a
     sub-second ``timestamp`` normalizes to the whole second containing it —
     truncation is monotone, so it can neither move ``t`` out of its own window
-    nor manufacture an overlap. A *range* whose bounds collapse to the same
-    rendered second would dispatch as an empty window, so it is refused here,
-    on the rendered values. See ``docs/hive_layout.md`` for the same-second
-    collision and the silent-miss edge.
+    nor manufacture an overlap. *Range* bounds truncate identically, each to
+    the second containing it, so a fractional ``start``/``end`` silently
+    retimes that edge of the window; a range is never widened to recover the
+    truncated fraction. The one refusal is total collapse — bounds that render
+    to the same second would dispatch as an empty window, so it is rejected
+    here, on the rendered values. See ``docs/hive_layout.md`` for the
+    bound-truncation edge, the same-second collision and the silent-miss edge.
     """
     from zagg import windows as _windows
 
@@ -1107,10 +1110,13 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
     start = _windows.parse_utc(entry["start"])
     end = _windows.parse_utc(entry["end"])
     if start < end and start.replace(microsecond=0) == end.replace(microsecond=0):
-        # Bounds render at whole-second granularity (windows.iso_utc,
-        # timespec="seconds"), so a sub-second range collapses to a `ge x` /
-        # `lt x` pair that silently matches nothing. Refuse rather than widen
-        # — the point form is the spelling for one-second intent.
+        # Each bound truncates to the second containing it (windows.iso_utc,
+        # timespec="seconds"), so a range with both bounds inside one second
+        # renders to a `ge x` / `lt x` pair that silently matches nothing.
+        # Refuse rather than widen — the point form is the spelling for
+        # one-second intent. Only this total collapse is refused: a fractional
+        # bound in a *different* second merely retimes that edge (documented in
+        # docs/hive_layout.md).
         raise ValueError(
             f"explicit window range is empty after truncation to whole-second "
             f"granularity: start {entry['start']!r} and end {entry['end']!r} "

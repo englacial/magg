@@ -182,11 +182,18 @@ Validation: `output.windowing` requires the hive layout on a healpix grid;
 filter what it reads); explicit windows must be well-formed (frozen label
 grammar, `start < end`, unique labels, disjoint ranges — point entries are
 desugared first, so a point landing inside another window's range is a genuine
-overlap and is rejected). Because boundaries render at whole-second
-granularity, a range narrower than the second containing it (say
-`12:00:01.0Z` → `12:00:01.4Z`) would dispatch as an empty window; it is
-refused rather than widened — the point form is the spelling for one-second
-intent. On the raster path
+overlap and is rejected). Range bounds render at whole-second granularity
+exactly as a point `timestamp` does — **each bound truncates to the second
+containing it** — so a fractional bound silently retimes that edge of the
+window: `[12:00:00.0Z, 12:00:01.5Z)` dispatches as
+`[12:00:00, 12:00:01)`, dropping the declared half second of coverage at the
+tail. A range is never widened to recover the truncated fraction. The one
+case refused outright is total collapse: when *both* bounds render to the
+same second (say `12:00:01.0Z` → `12:00:01.4Z`) the window dispatches as an
+empty `ge x`/`lt x` pair, so it is rejected — the point form is the spelling
+for one-second intent. A sub-second range that *straddles* a second boundary
+(`12:00:01.9Z` → `12:00:02.1Z`) is still valid; it renders to the one-second
+window its truncated bounds describe. On the raster path
 ([issue #247](https://github.com/englacial/zagg/issues/247)) membership is
 the acquisition's STAC `datetime`: `time_field` is optional (fixed to
 `datetime`) and the `epoch`/`scale`/`units` conversion knobs are rejected.
