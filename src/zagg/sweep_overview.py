@@ -610,7 +610,10 @@ def sweep_overviews(
     of those shards at each declared order. The full descendant leaf set per
     node comes from the dirty set unioned with the root ``coverage.moc``
     (run record + MOC — never a LIST); with the default family order the MOC
-    family has just refreshed that root in the same pass.
+    family has just refreshed that root in the same pass — except in a
+    PARTITIONED pass, which defers that refresh, so the root MOC is this
+    pass's input as well as the finisher's obligation and a degraded read is
+    reported as ``root_moc_stale`` (:func:`_candidate_decimals`).
 
     Idempotent: a (node, window) whose stored generation stamp (merged-leaf
     count + max leaf stamp timestamp) AND content hash both match the freshly
@@ -668,7 +671,9 @@ def sweep_overviews(
             f"sweep[overview]: orders {deferred} are coarser than the partition split order "
             f"{min_order}; they span partitions and are the finisher's (issue #377)"
         )
-    candidates = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
+    candidates, moc_stale = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
+    if moc_stale:
+        counts["root_moc_stale"] = True
     store = open_object_store(store_root, **store_kwargs)
     materialized: set[int] = set()
     for k in orders:
@@ -754,14 +759,24 @@ def _rel_rank(decimal: str, node: str) -> int:
     return rank
 
 
-def _candidate_decimals(store_root, shard_order, by_shard, store_kwargs) -> set:
-    """Descendant-leaf candidates: the dirty set unioned with the root MOC.
+def _candidate_decimals(store_root, shard_order, by_shard, store_kwargs) -> tuple[set, bool]:
+    """Descendant-leaf candidates and whether the root MOC was unusable.
 
     Discovery stays LIST-free (D22): untouched sibling shards contribute via
-    the root ``coverage.moc`` (default-on for hive; refreshed by the MOC
-    family earlier in the same default pass). A missing/unusable root MOC
-    degrades to the dirty set with a loud warning — the overview then covers
-    only the given leaves until a full sweep repairs it (D9: regenerable).
+    the root ``coverage.moc`` (default-on for hive). An unpartitioned default
+    pass has the MOC family refresh that root earlier in the same pass — but a
+    PARTITIONED pass DEFERS that refresh (a store-root shared write, issue
+    #377), so the root MOC is a partitioned pass's INPUT as well as its
+    deferred output, and what it reads is whatever the last whole-tree sweep
+    or ``mode="coverage"`` leg left. That ordering is the finisher's to own: a
+    partition handed a RUN-scoped leaf set against a missing root MOC re-folds
+    from the run's leaves alone, and :func:`_roll_node` overwrites on a
+    generation mismatch, so a complete node overview can be rewritten with
+    fewer contributing leaves until the next whole-tree pass repairs it.
+
+    A missing/unusable root MOC therefore degrades to the dirty set with a
+    loud warning AND a ``root_moc_stale`` count, so the per-partition record
+    shows it rather than only the log (D9: regenerable).
     """
     from zagg.grids.morton import morton_decimal
     from zagg.hive import read_root_coverage, root_coverage_words
@@ -774,7 +789,7 @@ def _candidate_decimals(store_root, shard_order, by_shard, store_kwargs) -> set:
     if isinstance(env, dict) and env.get("order") == shard_order:
         try:
             decimals |= {morton_decimal(int(w)) for w in root_coverage_words(env)}
-            return decimals
+            return decimals, False
         except (KeyError, TypeError, ValueError) as e:
             logger.warning(f"sweep[overview]: unusable root coverage.moc ({e})")
     if decimals:
@@ -782,7 +797,7 @@ def _candidate_decimals(store_root, shard_order, by_shard, store_kwargs) -> set:
             "sweep[overview]: no usable root coverage.moc — overviews will fold ONLY "
             "the run's own leaves; sweep the moc family (or the default set) to repair"
         )
-    return decimals
+    return decimals, True
 
 
 def _window_work(decl, windowed, dirty_windows, entries) -> list:

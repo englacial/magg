@@ -538,6 +538,35 @@ class TestOverviewOrdersAreClamped:
         assert (tmp_path / MANIFEST_NAME).read_bytes() == before
 
 
+class TestRootMocIsAlsoAnInput:
+    """The fenced list's reciprocal: a partitioned pass READS what it defers.
+
+    Overview discovery unions the dirty set with the store-root
+    ``coverage.moc`` — the refresh a partitioned pass skips — so the degraded
+    read is the partitioned steady state and belongs in the per-partition
+    record, not only in a log line several frames down (issue #377).
+    """
+
+    def test_a_degraded_root_moc_read_is_reported_not_only_logged(self, tmp_path):
+        refs = _overview_store(tmp_path)
+        result = run_sweep(
+            str(tmp_path), refs, families=["overview"], record=False, partition={"index": 0, "of": 4}
+        )["families"]["overview"]
+        assert result["root_moc_stale"] is True
+
+    def test_a_usable_root_moc_is_not_reported_stale(self, tmp_path):
+        from zagg.hive import build_root_coverage, write_root_coverage
+
+        refs = _overview_store(tmp_path)
+        write_root_coverage(
+            str(tmp_path), build_root_coverage([morton_word(d) for d in LEAVES], SHARD_ORDER)
+        )
+        result = run_sweep(
+            str(tmp_path), refs, families=["overview"], record=False, partition={"index": 0, "of": 4}
+        )["families"]["overview"]
+        assert "root_moc_stale" not in result and result["written"] > 0
+
+
 class TestOverviewDisjointness:
     """The overview family's own write-conflict evidence.
 

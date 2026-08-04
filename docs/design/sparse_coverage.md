@@ -491,6 +491,17 @@ the partitions land, folding the coarse levels from the partitions'
 already-materialized overview slabs, which is bounded work only under #376's
 cascade (hence the sequencing).
 
+The root `coverage.moc` is on that list twice: it is a partitioned pass's
+**input** as well as a deferred output. Overview discovery unions the dirty set
+with it (LIST-free, above), so a partition reads whatever the last whole-tree
+sweep or `mode="coverage"` leg left — never a refresh from its own pass. A
+partition handed a *run-scoped* leaf set against a missing root MOC folds from
+that run's leaves alone, and since a generation mismatch overwrites, it can
+rewrite a complete node overview with fewer contributing leaves until the next
+whole-tree pass repairs it (D9: regenerable). The degraded read is surfaced as
+`root_moc_stale` in the partition's record, and ordering the refresh ahead of
+the fan-out is part of the finisher's obligation.
+
 Transport is unchanged (D8 — every store write stays worker-side): the client
 fires one fire-and-forget `mode="sweep"` Event invoke per non-empty partition,
 each carrying its disjoint slice of the work set plus a `partition: {index, of}`
