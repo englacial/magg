@@ -357,7 +357,7 @@ class TestConcurrencyPreflight:
         if probe is not None:
 
             def _probe(requested, lambda_client, cloudwatch_client, function_name, **k):
-                calls.append((requested, function_name))
+                calls.append((requested, function_name, k.get("fd_bound")))
                 return probe(requested)
 
             monkeypatch.setattr(runner, "compute_available_workers", _probe)
@@ -398,7 +398,7 @@ class TestConcurrencyPreflight:
         )
         assert width == 2  # the probe's clamp, not _DEFAULT_MAX_WORKERS
         # It asks for the work size and names the dispatch target.
-        assert calls == [(3, "process-shard-test")]
+        assert calls == [(3, "process-shard-test", True)]
 
     def test_probe_denial_falls_back_with_a_warning(self, catalog, monkeypatch):
         # Distinguish the fallback from the shard-count clamp by shrinking the
@@ -416,7 +416,7 @@ class TestConcurrencyPreflight:
         with pytest.warns(RuntimeWarning, match="AccessDenied"):
             width, calls = self._dispatch(catalog, monkeypatch, probe=_denied)
         assert width == 2  # degraded to the default, run still dispatched
-        assert calls == [(3, "process-shard-test")]
+        assert calls == [(3, "process-shard-test", True)]
 
     def test_explicit_max_workers_skips_the_probe(self, catalog, monkeypatch):
         def _must_not_run(requested):
@@ -441,10 +441,6 @@ class TestConcurrencyPreflight:
 
     def test_sync_probes_fd_bound(self, catalog, monkeypatch):
         # The sync pool holds one socket per in-flight shard: FD-bounded.
-        width, calls = self._dispatch(
-            catalog, monkeypatch, probe=lambda requested: (2, self._report())
-        )
-        assert width == 2
         assert self._probe_fd_bound(catalog, monkeypatch, transport="sync") is True
 
     def test_event_window_is_not_fd_bound(self, catalog, monkeypatch):
