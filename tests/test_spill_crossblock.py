@@ -362,7 +362,8 @@ class TestSpillFoldProbe:
 
     def test_overflow_message_names_the_fold_surface(self, monkeypatch):
         # A genuinely non-foldable config crossing the threshold names what
-        # the fold DOES cover (and still names the remedies).
+        # the fold DOES cover, WHICH field put it outside that surface (the
+        # probe's verdict, spliced in), and the remedies.
         from zagg.processing.spill import SpillOverflowError
 
         _force_tiny_blocks(monkeypatch)
@@ -371,7 +372,10 @@ class TestSpillFoldProbe:
         cfg = _config(variables, streaming=_SPILL)
         grid = _grid(cfg)
         dfs = _granule_dfs(grid, _shard_key(), _CELL_LISTS[:2], obs_per_cell=10, seed=1)
-        with pytest.raises(SpillOverflowError, match="cross-block fold law.*memory tier"):
+        with pytest.raises(
+            SpillOverflowError,
+            match="cross-block fold law.*'h_spread': expression fields.*memory tier",
+        ):
             _run(monkeypatch, cfg, grid, _shard_key(), dfs)
 
 

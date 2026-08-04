@@ -74,7 +74,8 @@ class SpillOverflowError(RuntimeError):
     """A spill block hit its threshold under a config with no merge law.
 
     Raised the moment a second block would open (never on single-block
-    shards, where every reducer is exact); the message names the remedies.
+    shards, where every reducer is exact); the message carries the probe's
+    per-field verdict (``validate_spill_fold``) and the remedies.
     Deliberately a distinct type so the worker's tolerated per-granule
     ``except`` can re-raise it instead of warn-and-continue.
     """
@@ -496,11 +497,17 @@ class SpillAggregator:
         # block close (SpillOverflowError).
         from zagg.processing.streaming import validate_spill_fold
 
+        # The probe names every offending field; keep its text so the overflow
+        # raised at the first block close can say WHICH reducer has no fold law
+        # (this is its only call site — dropping the message left an operator
+        # re-deriving it from a 900 s Lambda they cannot reproduce locally).
+        self._fold_problems: str | None = None
         try:
             validate_spill_fold(config)
             self._mergeable = True
-        except ValueError:
+        except ValueError as e:
             self._mergeable = False
+            self._fold_problems = str(e)
         self._count_fields: list[str] = []
         self._digest_fields: dict[str, _DigestField] = {}
         # name -> (source, params): scalar pack_composition fields (issue #370
@@ -688,6 +695,7 @@ class SpillAggregator:
                 f"results cannot combine (the fold covers 'len'/'count', tdigest "
                 f"fields — located, where-strata, pairwise — and the packed "
                 f"composition word; single-block spill is exact for every reducer). "
+                f"{self._fold_problems}. "
                 f"Remedies: a bigger memory tier, a '-disk' function variant with "
                 f"more ephemeral storage, or a finer parent_order (smaller shards)."
             )
