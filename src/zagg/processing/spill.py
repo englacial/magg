@@ -42,6 +42,7 @@ naming the ``-disk`` function-variant fix.
 
 from __future__ import annotations
 
+import ast
 import os
 import tempfile
 import threading
@@ -378,6 +379,33 @@ def _resolve_param(param, cell_data: dict[str, np.ndarray]):
         ns = {"__builtins__": {}, "np": np, "numpy": np, **cell_data}
         return eval(_compile_param_expr(param), ns)  # noqa: S307
     return param
+
+
+def _unresolvable_names(param, available) -> tuple[str, ...]:
+    """Identifiers ``param`` needs that :func:`_resolve_param` could not supply.
+
+    The eval namespace is exactly the cell's columns plus ``np``/``numpy``
+    (``__builtins__`` stripped), so an expression's free names are checkable
+    against the block schema without running it — which is the only way to name
+    the field AND the column for a param that today either falls through as a
+    literal string (nothing in it matches a column: the failure surfaces as a
+    shape mismatch deep inside the reducer) or reaches ``eval`` and raises a
+    ``NameError`` naming the identifier but not the field. Bare column names
+    parse as a single :class:`ast.Name`, so one rule covers both forms.
+
+    Non-strings and strings that are not parseable expressions are genuine
+    literals for their reducer and yield ``()`` — the check never widens
+    :func:`_resolve_param`'s pass-through rule beyond what the caller declared
+    must be a column.
+    """
+    if not isinstance(param, str):
+        return ()
+    try:
+        tree = ast.parse(param, mode="eval")
+    except SyntaxError:
+        return ()
+    allowed = set(available) | {"np", "numpy"}
+    return tuple(sorted({n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} - allowed))
 
 
 def _memory_budget_bytes() -> int:
@@ -824,10 +852,13 @@ class SpillAggregator:
                         )
 
     def _check_fold_columns(self, schema) -> None:
-        """Name a missing source/location column, as the pooled path does.
+        """Name a missing source/location/param column, as the pooled path does.
 
-        The fold indexes ``col_arrays`` by each field's declared ``source`` and
-        ``location``; a column the block never carried would surface as a bare
+        Covers every column the fold resolves out of the block: a field's
+        ``source`` and ``location``, a stratum's ``where``, and a composition
+        field's ``conf_*`` params (the hand-written ones — five per field — and
+        the ones whose failure mode is worst; see :func:`_unresolvable_names`).
+        A column the block never carried would surface as a bare
         ``KeyError`` raised on the overlap reducer thread, which
         :meth:`_join_reducer` re-wraps as :class:`SpillReduceError` with the real
         cause reachable only via ``__cause__`` — a materially worse diagnostic
@@ -852,12 +883,32 @@ class SpillAggregator:
                     f"column is not in the spilled block (available: {available}); "
                     f"per-observation mortons require a HEALPix grid"
                 )
-        for name, (source, _) in self._composition_fields.items():
+            missing = _unresolvable_names(f.where, available)
+            if missing:
+                raise ValueError(
+                    f"ragged field {name!r} declares where: {f.where!r}, which names "
+                    f"{list(missing)} — not in the spilled block (available: "
+                    f"{available}); the stratum mask is resolved per cell over the "
+                    f"block's columns"
+                )
+        for name, (source, params) in self._composition_fields.items():
             if source not in available:
                 raise ValueError(
                     f"field {name!r} declares source: {source!r} but that column is "
                     f"not in the spilled block (available: {available})"
                 )
+            # The five conf_* params MUST resolve to row-aligned columns (they
+            # are stacked in pack_composition_n): a typo falls through
+            # _resolve_param as a literal string and dies inside
+            # np.column_stack naming neither the field nor the column.
+            for pname, pval in params.items():
+                missing = _unresolvable_names(pval, available) if pname.startswith("conf_") else ()
+                if missing:
+                    raise ValueError(
+                        f"field {name!r} param {pname}: {pval!r} names {list(missing)}, "
+                        f"not in the spilled block (available: {available}); the conf "
+                        f"params must resolve to row-aligned columns"
+                    )
 
     def _finalize_kway(self) -> None:
         """Collapse each k-way field's per-block parts into one digest per cell.
