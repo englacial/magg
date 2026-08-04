@@ -499,10 +499,11 @@ class TestConcurrencyPreflight:
         # carries no fd term at all -- the same shape the event transport
         # reaches through the probe when it passes fd_bound=False (issue
         # #375; that wiring is pinned by test_event_window_is_not_fd_bound,
-        # which this test deliberately does not re-derive). Today the serial
-        # dispatch loop holds <=1 connection and urllib3 sizes pools lazily,
-        # but the declared cap is what turns into EMFILE if the loop ever
-        # goes concurrent.
+        # which this test deliberately does not re-derive). The cap is a
+        # RETENTION bound, not an EMFILE guard: botocore passes only
+        # `maxsize` to urllib3 (block=False), so an oversized declaration
+        # allocates nothing on its own -- it is the number of sockets the
+        # pool would KEEP once a concurrent dispatch loop opened them.
         monkeypatch.setattr(zagg.client, "fd_safe_max_workers", lambda: 2)
         width, _, pool = self._dispatch(catalog, monkeypatch, max_workers=5)
         # The clamp stops at the DECLARED pool: the fan-out width is still the
