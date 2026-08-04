@@ -1071,7 +1071,9 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
 
     Two forms, discriminated on keys and never mixed (issue #355): the range
     ``{label, start, end}``, and the point sugar ``{label, timestamp}`` ->
-    ``[t, t + 1s)``. Bounds come back at declared precision; :func:`get_windowing`
+    ``[t, t + 1s)``. Either form refuses keys beyond its own — a dead or
+    typo'd key has no semantic effect, so it fails loud rather than riding
+    along. Bounds come back at declared precision; :func:`get_windowing`
     renders them through ``windows.iso_utc`` (``timespec="seconds"``), so a
     sub-second ``timestamp`` normalizes to the whole second containing it —
     truncation is monotone, so it can neither move ``t`` out of its own window
@@ -1100,6 +1102,13 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
             )
         point = _windows.parse_utc(entry["timestamp"])
         return point, point + _POINT_WINDOW_WIDTH
+    extra = sorted(set(entry) - {"label", "start", "end"})
+    if extra:
+        raise ValueError(
+            f"explicit range window entry carries unsupported key(s) "
+            f"{', '.join(extra)}; the range form is {{label, start, end}} "
+            f"(got {entry!r})"
+        )
     return _windows.parse_utc(entry["start"]), _windows.parse_utc(entry["end"])
 
 

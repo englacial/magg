@@ -138,8 +138,9 @@ output:
   as overlapping — as is a point that lands inside an already-declared range
   window, which is an ordinary overlap (see the validation paragraph below).
   If that ever bites, the fix is an explicit `width` key on the point form, not
-  a guessed default; until it exists, any key on a point entry other than
-  `label`/`timestamp` (`width` included) is rejected rather than ignored.
+  a guessed default; until it exists, any key on an entry beyond its own form's
+  (`label`/`timestamp` or `label`/`start`/`end`; `width` included) is rejected
+  rather than ignored.
 - **A point window that matches nothing fails SILENTLY** — it covers only the
   whole second containing `t`, so the declared `timestamp` must be the
   acquisition's own instant, copied from the item, not a rounded-off
