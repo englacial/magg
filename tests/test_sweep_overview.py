@@ -766,6 +766,9 @@ class TestOverviewWriter:
         block = read_manifest(str(tmp_path))["pyramid"]["overview"]
         assert block["materialized"]["orders"] == [0, 1]
         assert block["materialized"]["generated_at"]
+        # Per-level fold provenance (issue #376): the finest level is exact,
+        # the one below it cascaded from it.
+        assert block["materialized"]["fold_sources"] == {"1": "leaves", "0": "cascade"}
         # The declaration itself is untouched (the sweep populates, never
         # rewrites — D11/D22 write-once discipline).
         assert block["orders"] == [1, 0] and block["fields"] == FIELDS_DECL
@@ -997,6 +1000,33 @@ class TestCascadeFold:
             {},
         )
         assert fold is None and counts["failed"] == 0
+
+    def test_every_level_records_its_fold_in_its_attrs(self, tmp_path):
+        _write_manifest(tmp_path, orders=(1, 0))
+        run_sweep(str(tmp_path), self._two_leaves(tmp_path), families=("overview",))
+        fine = _overview_root(tmp_path, "-3/1", "all.zarr").attrs[OVERVIEW_ATTR]
+        coarse = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert fine["fold_source"] == "leaves" and "fold_from_order" not in fine
+        assert coarse["fold_source"] == "cascade" and coarse["fold_from_order"] == 1
+
+    def test_materialized_fold_sources_carry_forward(self, tmp_path):
+        from zagg.hive import read_manifest
+
+        _write_manifest(tmp_path, orders=(1, 0), fold_source="leaves")
+        refs = self._two_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        # Narrow the declaration to the finest level only, in place — the
+        # sweep's own actuals must survive an edit of the declaration.
+        manifest = read_manifest(str(tmp_path))
+        manifest["pyramid"]["overview"]["orders"] = [1]
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0, 4.0], 5: [10.0]})  # a changed leaf
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        block = read_manifest(str(tmp_path))["pyramid"]["overview"]["materialized"]
+        # Order 0 was not swept this pass: its recorded regime survives, so
+        # the manifest still describes what is actually on disk.
+        assert block["orders"] == [0, 1]
+        assert block["fold_sources"] == {"1": "leaves", "0": "leaves"}
 
     def test_cascade_generation_stamp_counts_the_underlying_leaves(self, tmp_path):
         _write_manifest(tmp_path, orders=(1, 0))
@@ -1430,7 +1460,7 @@ class TestDeclarePyramid:
 
         def concurrent_sweep(*args, **kwargs):
             out = real(*args, **kwargs)
-            sweep_overview._update_manifest_pyramid(str(tmp_path), [0], {})
+            sweep_overview._update_manifest_pyramid(str(tmp_path), {0: "leaves"}, {})
             return out
 
         monkeypatch.setattr(sweep_overview, "_validate_block_against_store", concurrent_sweep)
