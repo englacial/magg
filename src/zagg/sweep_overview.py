@@ -1254,6 +1254,7 @@ def _cascade_node(
     slabs = {name: _empty_slab(meta, n_cells) for name, meta in fields.items()}
     basename = _overview_basename(key)
     n_sources, n_leaves, timestamps, granules, ranges = 0, 0, [], 0, []
+    missing = 0
     for child in sorted({_node_at(d, source_order) for d in node_shards}):
         path = f"{store_root}/{_node_rel(child)}/{basename}"
         try:
@@ -1264,7 +1265,8 @@ def _cascade_node(
             counts["failed"] += 1
             continue
         if stamp is None:
-            continue  # never generated, or unstamped debris (D4)
+            missing += 1  # never generated, or unstamped debris (D4)
+            continue
         # Fold the whole child BEFORE touching the slabs, so a corrupt child
         # skips cleanly instead of half-applying (the leaf path's discipline).
         try:
@@ -1289,15 +1291,31 @@ def _cascade_node(
             logger.warning(f"sweep[overview]: skipping unreadable overview {path} ({e})")
             counts["failed"] += 1
             continue
-        seg = slice(_rel_rank(child, node) * span, _rel_rank(child, node) * span + span)
+        start = _rel_rank(child, node) * span
         for name, partial in partials.items():
-            slabs[name][seg] = partial  # children own disjoint spans: no accumulation
+            # Children own disjoint spans of the parent slab, so this is an
+            # assignment — the accumulate-then-merge the leaf fold needs (and
+            # pays for in memory) has no counterpart here.
+            slabs[name][start : start + span] = partial
         n_sources += 1
         n_leaves += int((provenance.get("generation") or {}).get("n_leaves") or 0)
         timestamps.append((provenance.get("generation") or {}).get("max_leaf_timestamp"))
         granules += int(stamp.get("granule_count") or 0)
         if stamp.get("time_range") is not None:
             ranges.append(stamp["time_range"])
+    if missing:
+        # The cascade folds what is ON DISK, where the leaf fold folds every
+        # leaf the MOC knows about: a child with no materialized overview
+        # leaves its span at fill until a sweep covers it. Recorded rather
+        # than warned — a candidate child with no leaf in THIS window has no
+        # overview either, which is ordinary on a windowed store; the cases
+        # that are not ordinary (a fold that failed, a node that folded
+        # nothing) are already counted in ``failed``/``empty``.
+        logger.info(
+            f"sweep[overview]: node {node} order {k} window {key!r}: {missing} of "
+            f"{missing + n_sources} candidate child overviews at order {source_order} are "
+            f"not materialized — their cells stay fill until a sweep regenerates them"
+        )
     if n_sources == 0:
         return None
     stamps = [t for t in timestamps if t is not None]

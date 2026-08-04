@@ -980,9 +980,12 @@ class TestCascadeFold:
         assert fold is None and counts["failed"] == 1
         assert "is not an overview at order 1" in caplog.text
 
-    def test_cascade_without_a_materialized_child_is_empty(self, tmp_path):
+    def test_cascade_without_a_materialized_child_is_empty(self, tmp_path, caplog):
+        import logging
+
         from zagg.sweep_overview import _cascade_node
 
+        caplog.set_level(logging.INFO)
         _write_manifest(tmp_path, orders=(1, 0))
         _make_leaf(tmp_path, "-311", {0: [1.0]})  # leaves only: no child overview yet
         counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
@@ -1000,6 +1003,9 @@ class TestCascadeFold:
             {},
         )
         assert fold is None and counts["failed"] == 0
+        # An unmaterialized child is not an error, but it IS under-coverage:
+        # the cascade folds what is on disk, so it is recorded.
+        assert "1 of 1 candidate child overviews at order 1 are not materialized" in caplog.text
 
     def test_every_level_records_its_fold_in_its_attrs(self, tmp_path):
         _write_manifest(tmp_path, orders=(1, 0))
