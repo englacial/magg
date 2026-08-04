@@ -5014,6 +5014,54 @@ class TestPlannedReadGroup:
         assert _read_group(h5, "gt1l", ds_full, 0, grid, io_stats=io_stats) is None
         assert io_stats["obs_read"] == 12  # decoded, then all masked out
 
+    def test_planned_short_circuits_read_as_measured_zero(self):
+        # The planned route's three exits BEFORE any base-rate decode never
+        # reach _execute_plan_group's counter, so each has to stamp the zero
+        # itself (review finding). Without it a beam that short-circuits --
+        # the common per-beam outcome on the spatial-index route, where a
+        # granule is assigned for one beam and the other five miss -- reports
+        # None, indistinguishable from an uninstrumented seam.
+        ds = _planned_read_data_source()
+        seg = {
+            "/seg/lat": np.array([0.0, 100.0]),
+            "/seg/lon": np.zeros(2),
+            "/heights/lat_ph": np.array([0.0, 100.0]),
+            "/heights/lon_ph": np.zeros(2),
+            "/heights/h": np.zeros(2, dtype=np.float32),
+        }
+        cases = {
+            # empty AOI: no segment rep-point intersects the shard
+            "empty_aoi": (_planned_read_h5(), _LatBboxGrid((-0.1, 100000.0, 0.1, 100001.0))),
+            # coarse level carries no segments at all
+            "empty_coarse": (
+                _FakeH5(
+                    {
+                        **seg,
+                        "/seg/lat": np.array([]),
+                        "/seg/lon": np.array([]),
+                        "/seg/ph_index_beg": np.array([], dtype=np.int64),
+                        "/seg/segment_ph_cnt": np.array([], dtype=np.int64),
+                    }
+                ),
+                _LatBboxGrid((-0.1, -1.0, 0.1, 1000.0)),
+            ),
+            # segments present but link counts sum to zero base rows
+            "no_base_rows": (
+                _FakeH5(
+                    {
+                        **seg,
+                        "/seg/ph_index_beg": np.zeros(2, dtype=np.int64),
+                        "/seg/segment_ph_cnt": np.zeros(2, dtype=np.int64),
+                    }
+                ),
+                _LatBboxGrid((-0.1, -1.0, 0.1, 1000.0)),
+            ),
+        }
+        for name, (h5, grid) in cases.items():
+            io_stats: dict = {}
+            assert _read_group(h5, "gt1l", ds, 0, grid, io_stats=io_stats) is None, name
+            assert io_stats["obs_read"] == 0, name
+
     def test_multi_slice_plan_global_idx_alignment(self):
         # Force a plan with two disjoint base-slices (one ATL03 track that
         # crosses the shard lat band twice). Fixture: 10 segments × 1 photon

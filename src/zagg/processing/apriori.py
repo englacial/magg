@@ -211,7 +211,7 @@ def _apriori_read_group(
     ``io_stats`` (issue #374) is forwarded to whichever arm decodes base-rate
     rows, so this route reports ``obs_read`` like the others.
     """
-    from zagg.processing.read import _execute_plan_group, _read_group_full
+    from zagg.processing.read import _execute_plan_group, _read_group_full, _record_obs_read
 
     rp = data_source["read_plan"]
     cfg = rp["chunk_boundaries"]
@@ -228,6 +228,10 @@ def _apriori_read_group(
     beam = group.strip("/").split("/")[0]
     bdf = bdf[bdf["beam"] == beam]
     if bdf.empty:
+        # Pre-decode short-circuit: stamp a measured zero so the a-priori route
+        # agrees with the full-read one, where absence means "unmeasured", not
+        # "read nothing" (issue #374, review finding).
+        _record_obs_read(io_stats, 0)
         return None  # beam absent or photon-less at extraction time -> no data
 
     plan, n_base = _plan_from_boundaries(
@@ -239,6 +243,7 @@ def _apriori_read_group(
         samples_per_chunk=int(cfg.get("samples_per_chunk", DEFAULT_SAMPLES_PER_CHUNK)),
     )
     if not plan.parent_runs:
+        _record_obs_read(io_stats, 0)
         return None  # no chunk's span touches this shard
     if plan.full_read:
         return _read_group_full(

@@ -382,7 +382,9 @@ def _planned_read_group(
 
     ``io_stats`` (issue #374) is the optional read-counter sink, forwarded to
     whichever arm actually decodes base-rate rows — the full-read fallback or
-    :func:`_execute_plan_group` — so a group is counted exactly once.
+    :func:`_execute_plan_group` — so a group is counted exactly once. The
+    pre-decode short-circuits stamp a measured zero themselves, so this route
+    never reports "unmeasured" for a group it did look at.
     """
     levels = data_source["levels"]
     base_level_key = data_source["base_level"]
@@ -429,7 +431,14 @@ def _planned_read_group(
     ibeg_arr = coarse_data[ibeg_path]
     cnt_arr = coarse_data[cnt_path]
 
+    # The three short-circuits below return before any base-rate decode, so
+    # each stamps a measured zero (issue #374): without it the planned route --
+    # the production route for ATL03, where a granule assigned for one beam
+    # short-circuits on the other five -- reports ``n_obs_read = None``,
+    # indistinguishable from an uninstrumented read seam. That discrimination
+    # is the whole point of the nullable column (review finding).
     if len(coarse_lats) == 0:
+        _record_obs_read(io_stats, 0)
         return None
 
     # ``n_base`` under #43's contiguity assumption ("ranges do not overlap and
@@ -440,6 +449,7 @@ def _planned_read_group(
     # either form under- or over-estimates -- track via a follow-up to #43.
     n_base = int(np.asarray(cnt_arr).sum())
     if n_base <= 0:
+        _record_obs_read(io_stats, 0)
         return None
 
     # Match segments to this shard with the SAME mortie test the photon path
@@ -468,6 +478,7 @@ def _planned_read_group(
     )
 
     if not plan.parent_runs:
+        _record_obs_read(io_stats, 0)
         return None  # empty AOI -- no parent intersects, skip the group entirely
 
     if plan.full_read:
@@ -571,7 +582,9 @@ def _execute_plan_group(
     # straddling reads counted BEFORE the shard mask and filters below, so the
     # segment→photon indexed-IO efficiency (issue #43) is derivable from the
     # run parquet. Recorded ahead of the empty short-circuit so an instrumented
-    # route that decodes nothing still reads as measured-zero, not unmeasured.
+    # route that decodes nothing still reads as measured-zero, not unmeasured
+    # -- as do the pre-decode short-circuits in ``_planned_read_group`` and
+    # ``_apriori_read_group``, which never reach this line.
     _record_obs_read(io_stats, len(lats))
 
     if len(lats) == 0:
