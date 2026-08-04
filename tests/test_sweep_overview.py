@@ -461,6 +461,25 @@ class TestPyramidBlock:
         assert manifest["pyramid"]["overview"]["levels"] == [{"node": 6, "cells": [7]}]
         json.dumps(manifest)
 
+    def test_levels_carry_all_time_and_summarize(self):
+        # The declaration keys the /2 block carries forward from the knob:
+        # all_time (read by the windowed all.zarr fold) and the D24 opt-in
+        # summarize map, dict()-copied for JSON safety exactly as under /1.
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(
+            pyramid={
+                "levels": [{"node": 4, "cells": [5]}],
+                "all_time": True,
+                "summarize": {"h_mean": {"as": "h_mean_digest"}},
+            }
+        )
+        overview = build_pyramid_block(cfg, shard_order=6)["overview"]
+        assert overview["all_time"] is True
+        assert overview["summarize"] == {"h_mean": {"as": "h_mean_digest"}}
+        assert overview["summarize"]["h_mean"] is not cfg.output["pyramid"]["summarize"]["h_mean"]
+        json.dumps(overview)
+
     def test_levels_validated_against_the_grid_block(self):
         """The templating path validates too — it is the Lambda worker's path.
 
@@ -639,13 +658,13 @@ class TestPyramidBlock:
 class TestPyramidV2Gate:
     """zagg-pyramid/2 is declared-but-not-yet-sweepable (issues #382/#383/#384)."""
 
-    def _v2_manifest(self, root):
-        manifest = _write_manifest(root, orders=(1, 0))
+    def _v2_manifest(self, root, *, windowed=False, all_time=False):
+        manifest = _write_manifest(root, orders=(1, 0), windowed=windowed)
         manifest["pyramid"] = {
             "spec": "zagg-pyramid/2",
             "overview": {
                 "levels": [{"node": 2, "cells": [3, 2]}],
-                "all_time": False,
+                "all_time": all_time,
                 "fold_source": "cascade",
                 "exact_levels": 1,
                 "fields": dict(FIELDS_DECL),
@@ -679,6 +698,25 @@ class TestPyramidV2Gate:
         counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
         assert counts["sweepable"] is False and counts["written"] == 0
         assert "NOT yet sweepable" in caplog.text
+
+    def test_a_windowed_v2_store_writes_no_all_time_fold(self, tmp_path, caplog):
+        from zagg.sweep_overview import sweep_overviews
+
+        # The gate returns BEFORE `windowed = manifest.get("temporal") is not
+        # None` is ever computed, so the windowed path is untested by the
+        # unwindowed fixtures above: an all_time /2 store must produce zero
+        # all.zarr writes too, not a partial cross-window fold.
+        manifest = self._v2_manifest(tmp_path, windowed=True, all_time=True)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]}, window="2019")
+        counts = sweep_overviews(str(tmp_path), manifest, {"-311": {"2019"}})
+        assert counts["sweepable"] is False and counts["declared"] is True
+        assert counts["written"] == 0 and counts["failed"] == 0
+        assert "NOT yet sweepable" in caplog.text
+        for node in ("-3", "-3/1"):
+            assert not (tmp_path / node / "all.zarr").exists()
+            assert not (tmp_path / node / "2019.zarr").exists()
+        assert not list(tmp_path.rglob("overview.rollup.json"))
+        assert json.loads((tmp_path / MANIFEST_NAME).read_text())["pyramid"] == manifest["pyramid"]
 
     def test_a_bare_v2_marker_declares_nothing(self, tmp_path):
         from zagg.sweep_overview import sweep_overviews
