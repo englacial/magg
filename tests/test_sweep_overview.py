@@ -1030,7 +1030,65 @@ class TestCascadeFold:
         assert fold is None and counts["failed"] == 0
         # An unmaterialized child is not an error, but it IS under-coverage:
         # the cascade folds what is on disk, so it is recorded.
-        assert "1 of 1 candidate child overviews at order 1 are not materialized" in caplog.text
+        assert "1 of 1 candidate child overviews at order 1 are not usable" in caplog.text
+        assert "(1 not materialized, 0 unreadable)" in caplog.text
+
+    def test_under_coverage_is_recorded_in_the_overview_attrs(self, tmp_path, caplog):
+        import logging
+
+        caplog.set_level(logging.INFO)
+        _write_manifest(tmp_path, orders=(1, 0))
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        _make_leaf(tmp_path, "-321", {0: [7.0]})  # committed, but not swept yet
+        refs = [(morton_word(d), None) for d in ("-311", "-321")]
+        run_sweep(str(tmp_path), refs, families=("moc",))  # both leaves in the coverage MOC
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        # -32 is a candidate child of -3 (its leaf is in the coverage MOC) with
+        # no overview on disk, so the order-0 cascade under-covers its subtree
+        # — and says so IN THE ARTIFACT, not only in this process's log.
+        info = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert info["source_children"] == {"folded": 1, "missing": 1, "unreadable": 0}
+        assert "1 of 2 candidate child overviews at order 1 are not usable" in caplog.text
+        # The exact-from-leaves level carries no such key: fill there means
+        # empty, full stop.
+        assert (
+            "source_children"
+            not in _overview_root(tmp_path, "-3/1", "all.zarr").attrs[OVERVIEW_ATTR]
+        )
+
+    def test_an_unreadable_child_is_counted_in_both_terms(self, tmp_path, caplog):
+        import logging
+
+        from zagg.sweep_overview import _cascade_node
+
+        caplog.set_level(logging.INFO)
+        _write_manifest(tmp_path, orders=(1, 0))
+        _make_leaf(tmp_path, "-311", {0: [1.0]})
+        _make_leaf(tmp_path, "-321", {0: [7.0]})
+        refs = [(morton_word(d), None) for d in ("-311", "-321")]
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        # One child unreadable as an overview, one never materialized: both
+        # leave their span at fill, so both are under-coverage and both have
+        # to reach the count (the denominator is the candidate children).
+        store = open_store(str(tmp_path / "-3" / "2" / "all.zarr"))
+        zarr.open_group(store, mode="r+", zarr_format=3).attrs[ROLE_ATTR] = "something-else"
+        counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
+        fold = _cascade_node(
+            str(tmp_path),
+            "-3",
+            0,
+            1,
+            "all",
+            ["-311", "-321", "-331"],
+            COMPOSABLE,
+            CELL_ORDER,
+            SHARD_ORDER,
+            counts,
+            {},
+        )
+        assert fold["source_children"] == {"folded": 1, "missing": 1, "unreadable": 1}
+        assert "2 of 3 candidate child overviews at order 1 are not usable" in caplog.text
+        assert "(1 not materialized, 1 unreadable)" in caplog.text
 
     def test_two_order_gap_places_each_of_the_16_children(self, tmp_path):
         # The DEFAULT schedule is every 2 orders, so the ordinary cascade gap

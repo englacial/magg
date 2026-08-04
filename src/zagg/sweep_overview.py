@@ -1264,8 +1264,9 @@ def _cascade_node(
     slabs = {name: _empty_slab(meta, n_cells) for name, meta in fields.items()}
     basename = _overview_basename(key)
     n_sources, n_leaves, timestamps, granules, ranges = 0, 0, [], 0, []
-    missing = 0
-    for child in sorted({_node_at(d, source_order) for d in node_shards}):
+    missing, unreadable = 0, 0
+    children = sorted({_node_at(d, source_order) for d in node_shards})
+    for child in children:
         path = f"{store_root}/{_node_rel(child)}/{basename}"
         try:
             child_store = open_store(path, read_only=True, **store_kwargs)
@@ -1273,6 +1274,7 @@ def _cascade_node(
         except Exception as e:
             logger.warning(f"sweep[overview]: skipping unreadable overview {path} ({e})")
             counts["failed"] += 1
+            unreadable += 1
             continue
         if stamp is None:
             missing += 1  # never generated, or unstamped debris (D4)
@@ -1300,6 +1302,7 @@ def _cascade_node(
         except Exception as e:
             logger.warning(f"sweep[overview]: skipping unreadable overview {path} ({e})")
             counts["failed"] += 1
+            unreadable += 1
             continue
         start = _rel_rank(child, node) * span
         for name, partial in partials.items():
@@ -1313,18 +1316,20 @@ def _cascade_node(
         granules += int(stamp.get("granule_count") or 0)
         if stamp.get("time_range") is not None:
             ranges.append(stamp["time_range"])
-    if missing:
+    if missing or unreadable:
         # The cascade folds what is ON DISK, where the leaf fold folds every
-        # leaf the MOC knows about: a child with no materialized overview
-        # leaves its span at fill until a sweep covers it. Recorded rather
-        # than warned — a candidate child with no leaf in THIS window has no
-        # overview either, which is ordinary on a windowed store; the cases
-        # that are not ordinary (a fold that failed, a node that folded
-        # nothing) are already counted in ``failed``/``empty``.
+        # leaf the MOC knows about: a child the fold could not use leaves its
+        # span at fill until a sweep covers it. Logged rather than warned — a
+        # candidate child with no leaf in THIS window has no overview either,
+        # which is ordinary on a windowed store — but ALSO recorded in the
+        # overview's own attrs below, since a log line in an exited process
+        # cannot tell a reader that a fill cell is under-coverage rather than
+        # emptiness (§4.3 ``source_children``).
         logger.info(
-            f"sweep[overview]: node {node} order {k} window {key!r}: {missing} of "
-            f"{missing + n_sources} candidate child overviews at order {source_order} are "
-            f"not materialized — their cells stay fill until a sweep regenerates them"
+            f"sweep[overview]: node {node} order {k} window {key!r}: {missing + unreadable} of "
+            f"{len(children)} candidate child overviews at order {source_order} are not usable "
+            f"({missing} not materialized, {unreadable} unreadable) — their cells stay fill "
+            f"until a sweep regenerates them"
         )
     if n_sources == 0:
         return None
@@ -1340,6 +1345,11 @@ def _cascade_node(
         "time_range": union_time_range(*ranges) if ranges else None,
         "fold_source": "cascade",
         "fold_from_order": int(source_order),
+        "source_children": {
+            "folded": int(n_sources),
+            "missing": int(missing),
+            "unreadable": int(unreadable),
+        },
     }
 
 
@@ -1587,10 +1597,19 @@ def _fold_provenance(fold: dict) -> dict:
     merge of merges, so it inherits the documented merge order-dependence and
     carries no precision guarantee, while an exact-from-leaves one is single
     quantization (issue #376, spec §4.3).
+
+    A cascade also records ``source_children`` — how many candidate child
+    overviews it folded, and how many it could not use. The cascade folds
+    what is on disk, so a nonzero ``missing``/``unreadable`` means the level
+    UNDER-COVERS its subtree and a fill cell there is not evidence of
+    emptiness: the distinction lives in the artifact rather than in a sweep
+    log, which is the only place a later reader can find it.
     """
     entry = {"fold_source": fold.get("fold_source", "leaves")}
     if fold.get("fold_from_order") is not None:
         entry["fold_from_order"] = int(fold["fold_from_order"])
+    if fold.get("source_children") is not None:
+        entry["source_children"] = dict(fold["source_children"])
     return entry
 
 
