@@ -402,6 +402,32 @@ class TestOverviewOrdersAreClamped:
         whole = run_sweep(str(tmp_path), refs, families=["overview"])
         assert "deferred_orders" not in whole["families"]["overview"]
 
+    def test_the_manifest_pyramid_rmw_is_left_to_the_finisher(self, tmp_path, monkeypatch):
+        # `_update_manifest_pyramid` is a GET-modify-PUT of the ONE store-root
+        # manifest: 2^n partitions racing it would lose updates, so a
+        # partitioned pass must not touch it at all.
+        from zagg import sweep_overview as ov
+
+        decl = {
+            "overview": {
+                "orders": [1],
+                "fields": {"count": {"class": "exact", "method": "sum", "dtype": "int32"}},
+            }
+        }
+        refs = _store(tmp_path, pyramid=decl)
+        monkeypatch.setattr(
+            ov,
+            "_update_manifest_pyramid",
+            lambda *a, **k: pytest.fail("manifest RMW in a partition"),
+        )
+        before = (tmp_path / MANIFEST_NAME).read_bytes()
+        result = run_sweep(
+            str(tmp_path), refs, families=["overview"], partition={"index": 0, "of": 4}
+        )["families"]["overview"]
+        assert result["manifest_deferred"] is True
+        assert "manifest_updated" not in result
+        assert (tmp_path / MANIFEST_NAME).read_bytes() == before
+
 
 class TestSweepPartitionsDriver:
     def test_runs_every_non_empty_partition_in_index_order(self, tmp_path):
