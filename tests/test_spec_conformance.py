@@ -673,10 +673,16 @@ class TestPyramidV2Declaration:
         block = build_pyramid_block(cfg, shard_order=s)
         assert block["spec"] == "zagg-pyramid/1"
         overview = block["overview"]
-        assert "levels" not in overview and overview["orders"]
-        for k in overview["orders"]:
-            assert [k + (c - s)] == [c - (s - k)]  # the /2 spelling == /1 rule
-            assert k <= k + (c - s) < c
+        assert "levels" not in overview  # /1 never carries the /2 schedule key
+        # The whole derived /1 schedule for shard order 4, by VALUE.
+        assert overview["orders"] == [2, 0] and overview["spacing"] == 2
+        assert overview["all_time"] is False
+        assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
+        # ...and the constant-depth member each declared order implies, also by
+        # value: with s = 4, c = 6 the /2 spelling of this store is
+        # [{node: 2, cells: [4]}, {node: 0, cells: [2]}].
+        assert (s, c) == (4, 6)
+        assert [c - (s - k) for k in overview["orders"]] == [4, 2]
 
     def test_manifest_envelope(self):
         manifest = json.loads((SPEC_DATA / PYRAMID / "morton_hive.json").read_text())
