@@ -1400,6 +1400,7 @@ class TestDeclarePyramid:
         summary = declare_pyramid(str(tmp_path), _leaf_cfg())
         assert summary["updated"] is True and summary["previous"] == "absent"
         assert summary["orders"] == [0]  # shard_order 2, default spacing 2
+        assert summary["fold_source"] == "cascade"  # the regime future sweeps apply
         assert summary["fields"] == {
             "count": "exact",
             "h_min": "exact",
