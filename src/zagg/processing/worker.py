@@ -828,9 +828,12 @@ def process_shard(
 
     metadata["cells_with_data"] = cells_with_data
     metadata["total_obs"] = n_obs_total
-    if obs_read_total is not None:  # stamped above, before the no-data return
-        logger.info(f"  Read {obs_read_total:,} observations, kept {n_obs_total:,}")
     metadata["duration_s"] = duration
+    # "Read" already means "kept" in the two lines above (worker.py:673/:676),
+    # which is what CloudWatch greps for today, so this one says "Decoded" —
+    # one verb, one meaning (review finding, issue #374).
+    if obs_read_total is not None:
+        logger.info(f"  Decoded {obs_read_total:,} observations pre-filter, kept {n_obs_total:,}")
 
     # K==1: deliver the lone chunk's carrier as the 2-tuple ``df_out`` and its
     # ragged via ``ragged_out`` (unchanged contract). K>1: the carriers + ragged
