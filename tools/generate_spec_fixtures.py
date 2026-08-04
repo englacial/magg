@@ -34,8 +34,11 @@ conformance tests assert decoded values, never object bytes.
   (``/1`` template -> production sweep bookkeeping -> ``declare_pyramid``
   retrofit to ``/2``). One manifest carries every ``/2`` reading a decoder
   must tell apart: unequal member depths, a promoted ``cells == node``
-  member, a declared gather, normalized scalar sugar, the #376 fold keys,
-  and the preserved ``/1``-era ``materialized`` actuals. No store beneath
+  member, a declared gather, the #376 fold keys, and the preserved ``/1``-era
+  ``materialized`` actuals — plus, through the ``pyramid.expected.json``
+  record of the raw config knob, the config-side scalar sugar normalized to
+  its list form (a WRITER pin: the manifest is sugar-free by construction,
+  so no decoder can tell sugar was used). No store beneath
   it on purpose — the block is a template-time artifact, decodable from
   ``morton_hive.json`` alone, and ``/2`` artifacts are not yet writable
   (issues #383/#384).

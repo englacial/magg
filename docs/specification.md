@@ -1066,10 +1066,13 @@ hive default):
   to `/2` with `declare_pyramid` — and carries every `/2` reading a decoder
   must tell apart: unequal member depths at one node (`{"node": 4, "cells":
   [5, 4]}`), a promoted `cells == node` member (the 1-cell whole-footprint
-  group, §4.4), a declared gather (`{"node": 2, "cells": [5, 4]}`), a
-  scalar-sugar config entry normalized to its list form, the #376 fold keys
-  (`fold_source`, `exact_levels`), and the preserved `/1`-era
-  `materialized.fold_sources` actuals. It writes no store beneath it on
+  group, §4.4), a declared gather (`{"node": 2, "cells": [5, 4]}`), the #376
+  fold keys (`fold_source`, `exact_levels`), and the preserved `/1`-era
+  `materialized.fold_sources` actuals — and, via the committed
+  `pyramid.expected.json`, which records the raw config knob, the
+  config-side scalar sugar normalized to its list form (the manifest itself
+  is sugar-free by construction, so that one is a *writer* pin, not a
+  decoder reading). It writes no store beneath it on
   purpose: the pyramid block is a template-time manifest artifact, decodable
   from `morton_hive.json` alone, and `/2` artifacts are not yet writable
   (#383/#384) — a third leaf would pin nothing the other two do not.
