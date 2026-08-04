@@ -523,6 +523,19 @@ class TestPyramidBlock:
         assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
         assert "unknown fold_source" in caplog.text and "exact_levels must be" in caplog.text
 
+    def test_exact_levels_past_the_last_level_warns_it_is_the_leaves_regime(self, caplog):
+        from zagg.sweep_overview import build_pyramid_block
+
+        # validate_config accepts exact_levels: 3 (it has no shard_order, so it
+        # cannot know the schedule); here the derived orders are [4, 2, 0], and
+        # a boundary of 3 silently buys the deprecated all-leaves regime under
+        # a block that declares "cascade".
+        overview = build_pyramid_block(self._cfg(pyramid={"exact_levels": 3}), shard_order=6)[
+            "overview"
+        ]
+        assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 3
+        assert "covers all 3 declared levels" in caplog.text and "DEPRECATED" in caplog.text
+
     def test_validate_fold_grammar(self, caplog):
         from zagg.config import validate_config
 
@@ -968,6 +981,19 @@ class TestCascadeFold:
         }
         wide = _fold_sources({}, [5, 0], 8, 6)
         assert wide[0] == ("leaves", None) and "wider than the 2-order node slab" in caplog.text
+
+    def test_a_boundary_past_the_last_level_folds_everything_from_the_leaves_loudly(self, caplog):
+        from zagg.sweep_overview import _fold_sources
+
+        # The manifest reaches the sweep hand-edited too, so the check is
+        # mirrored here: a cascade declaration whose boundary covers every
+        # level IS the deprecated regime, and must not be silent about it.
+        assert _fold_sources({"exact_levels": 3}, [4, 2, 0], 8, 6) == {
+            4: ("leaves", None),
+            2: ("leaves", None),
+            0: ("leaves", None),
+        }
+        assert "covers all 3 declared levels" in caplog.text and "DEPRECATED" in caplog.text
 
     def test_unusable_fold_declaration_falls_back_loudly(self, caplog):
         from zagg.sweep_overview import _fold_sources

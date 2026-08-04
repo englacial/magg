@@ -327,6 +327,16 @@ def _fold_plan(knob: dict, orders: list) -> tuple[str, int]:
                 else ""
             )
         )
+    elif orders and exact_levels >= len(orders):
+        # A boundary at or past the last declared level buys the DEPRECATED
+        # regime wholesale — every level folds from the leaves — while the
+        # block still declares 'cascade'. Say so here: this is the only place
+        # that knows the derived schedule (validate_config has no shard_order).
+        logger.warning(
+            f"pyramid: exact_levels {exact_levels} covers all {len(orders)} declared levels "
+            f"{orders}, so EVERY level folds from the raw leaves — the DEPRECATED 'leaves' "
+            f"regime (issue #376) under a 'cascade' declaration; lower it to keep the cascade"
+        )
     return fold_source, exact_levels
 
 
@@ -1417,6 +1427,15 @@ def _fold_sources(decl, orders, cell_order, shard_order) -> dict:
             f"folding {DEFAULT_EXACT_LEVELS} level(s) from the leaves"
         )
         exact_levels = DEFAULT_EXACT_LEVELS
+    if declared == "cascade" and orders and exact_levels >= len(orders):
+        # Mirrored from _fold_plan: a hand-edited manifest reaches the sweep
+        # without either declaration path, and this is the same deprecated
+        # regime under a 'cascade' declaration (issue #376).
+        logger.warning(
+            f"sweep[overview]: declared exact_levels {exact_levels} covers all "
+            f"{len(orders)} declared levels {orders}, so EVERY level folds from the raw "
+            f"leaves — the DEPRECATED 'leaves' regime under a 'cascade' declaration"
+        )
     depth = cell_order - shard_order
     plan: dict = {}
     for i, k in enumerate(orders):
