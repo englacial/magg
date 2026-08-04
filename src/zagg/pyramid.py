@@ -148,19 +148,27 @@ def validate_levels(levels: list, *, parent_order: int, child_order: int) -> Non
             )
 
 
-def default_levels(parent_order: int, chunk_inner: int | None) -> list[dict]:
+def default_levels(parent_order: int, chunk_order: int) -> list[dict]:
     """The derived default schedule, bound to the grid block (#381 point (5)).
 
-    With ``d = chunk_inner - parent_order``: ``{node: parent_order, cells:
-    [chunk_inner]}`` plus ``{node: k, cells: [k + d]}`` for
+    With ``d = chunk_order - parent_order``: ``{node: parent_order, cells:
+    [chunk_order]}`` plus ``{node: k, cells: [k + d]}`` for
     ``k = parent_order - 2`` stepping ``-2`` down to 1. For the 19/13/9
-    reference geometry: (9,[13]) (7,[11]) (5,[9]) (3,[7]) (1,[5]). An unset
-    ``chunk_inner`` (K == 1: chunk order == shard order) gives ``d = 0`` —
-    every level the degenerate whole-footprint group, still legal. An
+    reference geometry: (9,[13]) (7,[11]) (5,[9]) (3,[7]) (1,[5]). An
     explicit ``levels:`` block replaces this default WHOLESALE.
+
+    ``chunk_order`` is the grid's RESOLVED chunk order — pass
+    ``grid.chunk_order``, never the raw ``output.grid.chunk_inner`` knob: an
+    unset knob does not mean K == 1, since :func:`zagg.grids.get_grid`
+    derives ``child_order - 6`` for a sharded fullsphere grid (issue #259).
+    Passing the raw ``None``-shaped knob as ``parent_order`` would silently
+    hand back an all-whole-footprint schedule for exactly the flagship
+    geometry. When K == 1 the resolved chunk order equals ``parent_order``,
+    giving ``d = 0`` — every level the degenerate whole-footprint group,
+    still legal.
     """
-    parent_order = int(parent_order)
-    d = (parent_order if chunk_inner is None else int(chunk_inner)) - parent_order
+    parent_order, chunk_order = int(parent_order), int(chunk_order)
+    d = chunk_order - parent_order
     levels = [{"node": parent_order, "cells": [parent_order + d]}]
     levels += [{"node": k, "cells": [k + d]} for k in range(parent_order - 2, 0, -2)]
     return levels

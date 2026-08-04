@@ -169,8 +169,10 @@ class TestDefaultLevels:
     def test_spec_fixture_geometry(self):
         assert default_levels(4, 5) == [{"node": 4, "cells": [5]}, {"node": 2, "cells": [3]}]
 
-    def test_unset_chunk_inner_degenerates_to_whole_footprint_groups(self):
-        assert default_levels(4, None) == [{"node": 4, "cells": [4]}, {"node": 2, "cells": [2]}]
+    def test_k_one_degenerates_to_whole_footprint_groups(self):
+        # K == 1: the grid's RESOLVED chunk order equals parent_order, so
+        # d = 0 and every level is the 1-cell whole-footprint group.
+        assert default_levels(4, 4) == [{"node": 4, "cells": [4]}, {"node": 2, "cells": [2]}]
 
     def test_default_validates_clean(self):
         validate_levels(default_levels(9, 13), **REF)
