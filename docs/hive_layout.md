@@ -275,6 +275,39 @@ family materializes the declared orders on the next sweep — it is in
 `DEFAULT_FAMILIES`, so a plain `python -m zagg.sweep <root>` picks it up
 (the fold itself is issue #201 / PR #344; the retrofit is issue #358).
 
+### Partitioning a sweep that will not fit
+
+A sweep pass holds the fold state for the subtree it is walking, so on a large
+store a single pass can exceed the worker's (or the laptop's) memory. Split it
+into `2^n` disjoint morton-subtree partitions:
+
+```
+python -m zagg.sweep s3://bucket/store --partitions 16
+```
+
+Each partition folds one order-`k` subtree per HEALPix base cell (`n = 2k`), so
+peak memory is bounded by the partition rather than by the store, and the
+command prints one summary per non-empty partition. `--partitions` must be a
+power of **four** — a morton digit is 2 bits, so that is where the split lands
+cleanly; an odd `2^n` is refused with the two valid neighbours named.
+
+Partitions are disjoint by construction, so they are also safe to run
+concurrently: no two write the same object, and each is independently
+idempotent (a re-run folds only what actually changed). What a partitioned
+pass deliberately does *not* do is anything **above** the split order — the
+coarse rollup levels, the root `coverage.moc` refresh, and the manifest's
+`pyramid.materialized` bookkeeping all span partitions and are left to a
+coarse-level finisher (issue #377).
+
+Until that finisher lands, the coarse levels of the **JSON rollup families**
+(`stats`, `moc`, `submap`) can be picked up by following a partitioned sweep
+with a plain `python -m zagg.sweep <root> --families stats,moc,submap`: the
+partitions' work is skip-if-current, and an interior fold reads its children's
+rollups rather than the leaves, so the extra pass is cheap. The **overview**
+family's coarse levels are not cheap that way — folding them from raw leaves is
+exactly the blow-up issue [#376](https://github.com/englacial/zagg/issues/376)'s
+cascade exists to remove — so leave those to the finisher.
+
 ## The commit stamp
 
 S3 has no empty directories and LIST is strongly consistent, so **absence is
