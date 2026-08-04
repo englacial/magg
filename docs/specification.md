@@ -697,8 +697,9 @@ not exist in a `/2` block; every other key is unchanged:
   an entry `cells` MUST be strictly descending, every member `>= node`
   (`== node` is the 1-cell whole-footprint group, §4.4) and `< cell_order`
   (a member at the base data's own order would *be* the base data, not an
-  overview). Across consecutive entries the finest member MUST be strictly
-  finer-bounded by the previous entry's coarsest **reader-facing** member —
+  overview). Across consecutive entries resolutions strictly descend: the
+  next entry's finest member MUST be strictly **coarser** (numerically
+  lower) than the previous entry's coarsest **reader-facing** member —
   a trailing `cells == node` member is exempt from that floor (it is the
   universal partial, whose entire purpose is serving the coarser folds
   declared below it) — with one exception: the **declared gather**, the
