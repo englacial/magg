@@ -554,11 +554,40 @@ class TestOverviewOrdersAreClamped:
         )["families"]["overview"]
         # Order 0 is deferred, so only the order-1 overview materialized here.
         assert parted["materialized_orders"] == [1]
+        # ...and the regime that WROTE it (issue #376's §4.5 fold_sources
+        # actual): the deferred RMW's whole payload rides the record, or the
+        # finisher re-derives it from the envelopes.
+        assert parted["materialized_fold_sources"] == {"1": "leaves"}
         whole_root = tmp_path / "whole"
         whole = run_sweep(
             str(whole_root), _overview_store(whole_root), families=["overview"], record=False
         )["families"]["overview"]
         assert "materialized_orders" not in whole and whole["manifest_updated"] is True
+        assert "materialized_fold_sources" not in whole
+
+    def test_a_cascade_level_at_the_split_runs_inside_the_partition(self, tmp_path):
+        # Plans derive from the FULL declared schedule (issue #376) and only
+        # then does the partition clamp drop the coarse tail (issue #377):
+        # with orders (2, 1, 0) and a split at 1, order 2 folds the leaves,
+        # order 1 CASCADES from order 2 entirely inside the partition's own
+        # prefix, and order 0 stays the finisher's.
+        from test_sweep_overview import _make_leaf
+        from test_sweep_overview import _write_manifest as _write_overview_manifest
+
+        _write_overview_manifest(tmp_path, orders=(2, 1, 0), shard_order=3, cell_order=5)
+        decimals = ("-3111", "-3124")  # one order-1 subtree: partition 0 of 4
+        for decimal in decimals:
+            _make_leaf(tmp_path, decimal, {0: [1.0, 2.0], 5: [10.0]}, shard_order=3, cell_order=5)
+        refs = [(morton_word(d), None) for d in decimals]
+        parted = run_sweep(
+            str(tmp_path),
+            refs,
+            families=["overview"],
+            record=False,
+            partition={"index": 0, "of": 4},
+        )["families"]["overview"]
+        assert parted["deferred_orders"] == [0] and parted["written"] > 0
+        assert parted["materialized_fold_sources"] == {"2": "leaves", "1": "cascade"}
 
 
 class TestRootMocIsAlsoAnInput:

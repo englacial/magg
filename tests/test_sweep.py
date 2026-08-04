@@ -466,7 +466,9 @@ def _emit_submap(root, decimal, gids, window=None):
         morton_word(decimal),
         [_entry(g) for g in gids],
         grid_signature=SUBMAP_SIG,
-        metadata={"collection": "TEST_001"},
+        # stale whole-catalog count: the leaf writer must rewrite it (review,
+        # granules_assigned fold)
+        metadata={"collection": "TEST_001", "granules_assigned": 22116},
         window=window,
     )
 
@@ -498,6 +500,7 @@ class TestSubmapRollup:
         assert sm.shard_keys == [morton_word("-311")]
         assert [g["id"] for g in sm.granules[0]] == ["gA", "gB"]
         assert sm.metadata["total_shards"] == 1 and sm.metadata["total_granules"] == 2
+        assert sm.metadata["granules_assigned"] == 2  # rewritten, not the stale 22116
         assert json.loads(path.read_text())["written_at"]  # staleness stamp rides the file
 
     def test_reproject_shim_matches_real_grid_signature(self):

@@ -161,6 +161,25 @@ class TestBuildSpherelyBrute:
         assert sm.metadata["total_pairs"] == sum(len(g) for g in sm.granules)
         assert sm.metadata["total_granules"] == 3
 
+    def test_granules_assigned_counts_only_intersectors(self, grid, fake_spherely):
+        # total_granules is the records CONSIDERED (input superset);
+        # granules_assigned is the distinct set the exact intersection placed
+        # on shards -- the fixture must actually prune, or an implementation
+        # of len(records) would pass (review finding).
+        cat = _catalog(
+            [
+                _item("Gwest", -76.62, -76.57),
+                _item("Geast", -76.55, -76.50),
+                _item("Gfar", -70.00, -69.95),  # outside the grid -> pruned
+            ]
+        )
+        sm = ShardMap.build(cat, grid, backend="spherely")
+        assert sm.metadata["total_granules"] == 3
+        assert sm.metadata["granules_assigned"] == 2
+        assert sm.metadata["granules_assigned"] == len(
+            {g["id"] for shard in sm.granules for g in shard}
+        )
+
     def test_brute_empty_records_early_out(self, grid, fake_spherely):
         # No records -> no polygons -> {} early-out, no intersect call (#36 brute path).
         from zagg.catalog.shardmap import _intersect_spherely
@@ -958,6 +977,14 @@ class TestReproject:
             "target_parent_order": 11,
             "method": "coarsen",
         }
+        # Recomputed for the derived map, like total_shards/total_pairs.
+        assert sm_coarse_reproj.metadata["granules_assigned"] == len(
+            {g["id"] for shard in sm_coarse_reproj.granules for g in shard}
+        )
+        assert (
+            sm_coarse_reproj.metadata["granules_assigned"]
+            == sm_coarse_direct.metadata["granules_assigned"]
+        )
 
     def test_coarsen_dedups_granule_spanning_multiple_children(self, fine_grid, coarse_grid):
         # A granule wide enough to land in >=2 fine shards under the same
