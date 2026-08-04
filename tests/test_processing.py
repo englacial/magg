@@ -2110,6 +2110,21 @@ class TestObsReadMetadata:
         assert metadata["total_obs"] == 3
         assert "total_obs_read" not in metadata
 
+    def test_stamped_on_the_no_data_shard(self, monkeypatch):
+        # The highest-signal case for issue #374: every photon was decoded and
+        # every one filtered out. The shard takes the "No data after filtering"
+        # early return, which must still carry the read volume — otherwise the
+        # run parquet reports nothing for exactly the shards whose read was
+        # pure waste.
+        def read_group(h5obj, group, ds, sk, grid, arrow=False, io_stats=None, **k):
+            io_stats["obs_read"] = io_stats.get("obs_read", 0) + 1000
+            return None  # legitimately empty after filtering
+
+        metadata, _grid, _sk = self._run(monkeypatch, read_group, ["s3://a"])
+        assert metadata["error"] == "No data after filtering"
+        assert metadata["total_obs_read"] == 1000
+        assert metadata["total_obs"] == 0
+
     def test_each_granule_gets_its_own_sink(self, monkeypatch):
         # The no-lock argument: the worker must not hand the same dict to two
         # granules (they may be read concurrently under granule_workers > 1).

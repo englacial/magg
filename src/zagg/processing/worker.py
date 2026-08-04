@@ -584,6 +584,14 @@ def process_shard(
         buffered.flush()
     phase_timings["read"] = time.time() - _read_t0
 
+    # Pre-filter read volume (issue #374), stamped as soon as the read loop is
+    # done so it survives the no-data early return below — a shard that decoded
+    # millions of photons and kept NONE is precisely the read-vs-keep case this
+    # counter exists to expose. Absent when no read route measured it, so
+    # absence stays "unmeasured" rather than a fabricated zero.
+    if obs_read_total is not None:
+        metadata["total_obs_read"] = obs_read_total
+
     if buffered.empty if buffered is not None else not all_reads:
         # Distinguish a genuinely-empty read from one where a group read raised
         # (issue #116): a raised read is a real error masquerading as "no data",
@@ -820,10 +828,7 @@ def process_shard(
 
     metadata["cells_with_data"] = cells_with_data
     metadata["total_obs"] = n_obs_total
-    # Pre-filter read volume (issue #374), stamped only when a read route
-    # actually measured it — absence is "unmeasured", not zero.
-    if obs_read_total is not None:
-        metadata["total_obs_read"] = obs_read_total
+    if obs_read_total is not None:  # stamped above, before the no-data return
         logger.info(f"  Read {obs_read_total:,} observations, kept {n_obs_total:,}")
     metadata["duration_s"] = duration
 
