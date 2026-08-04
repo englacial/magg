@@ -66,12 +66,16 @@ part of the store contract, not a zagg implementation detail).
 
 ## Operational caveat
 
-Strata and composition run on the **pooled path and the single-block spill
-regime** (exact, via the pooled replay). The streaming merge surface rejects
-them: its fold rebuilds digests from the raw source column and would silently
-ignore the `where` mask, and the composition fold is not wired into the
-streaming state. Heavy multi-block shards need the fold-law follow-up
-(issue #321).
+Strata and composition run on the **pooled path and the spill path** — exact
+via the pooled replay in the single-block regime, and folding across block
+closes on overflow shards (issue #370): per-block stratum digests merge like
+any digest (row selection precedes the build), and the composition words
+collapse in one k-way weighted lane mean (presence exact via the floor,
+counts within the documented quantization bound — the folded word is not
+byte-stable against the single-block result). The streaming **merge** surface
+still rejects them: its per-flush fold rebuilds digests from the raw source
+column (no `where` state) and would re-quantize composition lanes on every
+flush.
 
 ## What the mask channel gains
 
