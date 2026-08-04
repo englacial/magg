@@ -585,9 +585,13 @@ MUST ignore unstamped overview prefixes.
 ### 4.4 Structure
 
 **Contract.** A pyramid is an ordered list of **level entries**
-`{node, cells}` (§4.5): `node` is the hive-tree ancestor order whose
-artifact carries the level — one artifact per `(node, window)`, named by
-§4.2 — and `cells` the **reader-facing cell resolutions** stored there. For
+`{node, cells}` (§4.5): `node` is the hive-tree **ancestor-or-self** order
+whose artifact carries the level — one artifact per `(node, window)`, named
+by §4.2 — and `cells` the **reader-facing cell resolutions** stored there.
+`node == shard_order` is legal and is not an ancestor artifact at all: it is
+the leaf's own level column (#381 point (2)), which is why §4.5 admits the
+closed range `[0, shard_order]` where `/1`'s `orders` are strict ancestors.
+For
 each member resolution `r` the artifact holds one **resolution group**: the
 zarr group named `str(r)`, with the same layout as a source leaf's cell
 group. Concretely, for a member `r` at an order-`k` node:
@@ -612,10 +616,14 @@ Under `zagg-pyramid/1` every artifact holds exactly **one** resolution
 group, at the constant depth `k_cell = c - (s - k)` for shard order `s` and
 cell order `c` (cells coarsen 4× per order of ascent — the pyramid is the
 store's resolution axis, partially materialized): the `/1` grammar is the
-special case `cells = [node + (c - s)]`, and §4.1–§4.3 apply to both
-revisions unchanged. Multi-group `/2` artifacts arrive with the issue #383
-leaf columns and the issue #384 staged sweep; until then a `/2` store is
-declared-but-unmaterialized, which is legal (§4.5).
+special case `cells = [node + (c - s)]`, and §4.1–§4.2 apply to both
+revisions unchanged. §4.3's per-artifact `zagg_overview` attrs block — in
+particular its single scalar `cell_order = c - (s - k)` — is specified for
+`/1`'s single-group artifacts; the `/2` per-artifact attrs, which must
+describe an artifact holding one group per member of `cells`, are pinned
+when the writers land (issues #383/#384). Multi-group `/2` artifacts arrive
+with the issue #383 leaf columns and the issue #384 staged sweep; until then
+a `/2` store is declared-but-unmaterialized, which is legal (§4.5).
 
 An overview's variable set may therefore be a *subset* of the leaf's —
 heterogeneous variable sets across level nodes are in contract, and a reader
