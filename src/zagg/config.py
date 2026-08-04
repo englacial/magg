@@ -1077,7 +1077,9 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
     renders them through ``windows.iso_utc`` (``timespec="seconds"``), so a
     sub-second ``timestamp`` normalizes to the whole second containing it —
     truncation is monotone, so it can neither move ``t`` out of its own window
-    nor manufacture an overlap. See ``docs/hive_layout.md`` for the same-second
+    nor manufacture an overlap. A *range* whose bounds collapse to the same
+    rendered second would dispatch as an empty window, so it is refused here,
+    on the rendered values. See ``docs/hive_layout.md`` for the same-second
     collision and the silent-miss edge.
     """
     from zagg import windows as _windows
@@ -1109,7 +1111,20 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
             f"{', '.join(extra)}; the range form is {{label, start, end}} "
             f"(got {entry!r})"
         )
-    return _windows.parse_utc(entry["start"]), _windows.parse_utc(entry["end"])
+    start = _windows.parse_utc(entry["start"])
+    end = _windows.parse_utc(entry["end"])
+    if start < end and start.replace(microsecond=0) == end.replace(microsecond=0):
+        # Bounds render at whole-second granularity (windows.iso_utc,
+        # timespec="seconds"), so a sub-second range collapses to a `ge x` /
+        # `lt x` pair that silently matches nothing. Refuse rather than widen
+        # — the point form is the spelling for one-second intent.
+        raise ValueError(
+            f"explicit window range is empty after truncation to whole-second "
+            f"granularity: start {entry['start']!r} and end {entry['end']!r} "
+            f"both render as {_windows.iso_utc(start)!r}; use the point form "
+            f"{{label, timestamp}} for a one-second window"
+        )
+    return start, end
 
 
 def _validate_windowing_windows(block: dict, schedule: str) -> None:

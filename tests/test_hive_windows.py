@@ -438,6 +438,39 @@ class TestWindowingConfig:
         ):
             validate_config(cfg)
 
+    def test_explicit_subsecond_range_collapses_and_is_rejected(self, cfg):
+        # start < end at declared precision, but both bounds render to the
+        # same whole second (iso_utc, timespec="seconds") — the dispatched
+        # ge/lt pair would silently match nothing. Refused, never widened.
+        _windowed(
+            cfg,
+            schedule="explicit",
+            windows=[
+                {"label": "w", "start": "2019-06-01T12:00:01.0Z", "end": "2019-06-01T12:00:01.4Z"}
+            ],
+        )
+        with pytest.raises(ValueError, match="empty after truncation to whole-second"):
+            validate_config(cfg)
+
+    def test_explicit_subsecond_range_spanning_a_second_boundary_allowed(self, cfg):
+        # A sub-second-wide range that straddles a second boundary renders to
+        # a real one-second window and stays valid.
+        _windowed(
+            cfg,
+            schedule="explicit",
+            windows=[
+                {"label": "w", "start": "2019-06-01T12:00:01.9Z", "end": "2019-06-01T12:00:02.1Z"}
+            ],
+        )
+        validate_config(cfg)
+        assert get_windowing(cfg)["windows"] == [
+            {
+                "label": "w",
+                "start": "2019-06-01T12:00:01+00:00",
+                "end": "2019-06-01T12:00:02+00:00",
+            }
+        ]
+
     def test_explicit_point_bad_timestamp_rejected(self, cfg):
         _windowed(cfg, schedule="explicit", windows=[{"label": "w", "timestamp": "not-a-time"}])
         with pytest.raises(ValueError, match="ISO-8601"):
