@@ -62,6 +62,7 @@ def _write_manifest(
     all_time=False,
     windowed=False,
     shard_order=SHARD_ORDER,
+    cell_order=CELL_ORDER,
     fields=None,
     fold_source=None,
     exact_levels=None,
@@ -69,7 +70,7 @@ def _write_manifest(
     manifest = {
         "spec": "morton-hive/2" if windowed else "morton-hive/1",
         "dataset": {"short_name": "TEST", "version": "1"},
-        "cell_order": CELL_ORDER,
+        "cell_order": cell_order,
         "shard_order": shard_order,
         "split_schedule": [1] * shard_order,
         "pyramid": {
@@ -126,6 +127,7 @@ def _make_leaf(
     time_range=None,
     with_h_min=True,
     shard_order=SHARD_ORDER,
+    cell_order=CELL_ORDER,
 ):
     """Write one committed leaf: ``cells`` maps leaf row -> observation values."""
     from mortie import generate_morton_children
@@ -133,13 +135,13 @@ def _make_leaf(
     from zagg.grids.healpix import HealpixGrid
     from zagg.stats.tdigest import build_tdigest
 
-    grid = HealpixGrid(shard_order, CELL_ORDER, config=_leaf_cfg(with_h_min=with_h_min))
+    grid = HealpixGrid(shard_order, cell_order, config=_leaf_cfg(with_h_min=with_h_min))
     word = morton_word(decimal)
     store = open_store(shard_leaf_path(str(root), word, window=window))
     grid.emit_shard_template(store, overwrite=True)
-    group = zarr.open_group(store, path=str(CELL_ORDER), mode="r+", zarr_format=3)
-    n = 4 ** (CELL_ORDER - shard_order)
-    group["morton"][:] = np.asarray(generate_morton_children(word, CELL_ORDER), dtype=np.uint64)
+    group = zarr.open_group(store, path=str(cell_order), mode="r+", zarr_format=3)
+    n = 4 ** (cell_order - shard_order)
+    group["morton"][:] = np.asarray(generate_morton_children(word, cell_order), dtype=np.uint64)
     count = np.zeros(n, np.int32)
     h_min = np.full(n, np.nan, np.float32)
     h_mean = np.full(n, np.nan, np.float32)
@@ -1006,6 +1008,26 @@ class TestCascadeFold:
         # An unmaterialized child is not an error, but it IS under-coverage:
         # the cascade folds what is on disk, so it is recorded.
         assert "1 of 1 candidate child overviews at order 1 are not materialized" in caplog.text
+
+    def test_two_order_gap_places_each_of_the_16_children(self, tmp_path):
+        # The DEFAULT schedule is every 2 orders, so the ordinary cascade gap
+        # is 2: 16 children, each owning a 1/16 span of the parent slab. A
+        # geometry one order deeper than the module default (shard 3, cell 6)
+        # is the smallest one that can hold it.
+        _write_manifest(tmp_path, orders=(2, 0), shard_order=3, cell_order=6)
+        leaves = {"-3111": {0: [1.0, 2.0]}, "-3231": {5: [7.0], 9: [8.0, 9.0]}}
+        for decimal, cells in leaves.items():
+            _make_leaf(tmp_path, decimal, cells, shard_order=3, cell_order=6)
+        refs = [(morton_word(d), None) for d in leaves]
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 3 and counts["failed"] == 0  # 2 nodes + the root
+        assert self._entry(tmp_path, "-3")["fold_from_order"] == 2
+        # The order-0 overview holds the 64 order-3 cells of -3: one per leaf
+        # shard, so each leaf's whole count lands in its own cell — cell 0 for
+        # -3111 and cell 24 for -3231 (digits 2,3,1 in base 4).
+        counts0 = _overview_group(tmp_path, "-3", "all.zarr", 3)["count"][:]
+        assert counts0[0] == 2 and counts0[24] == 3
+        assert counts0.sum() == 5
 
     def test_every_level_records_its_fold_in_its_attrs(self, tmp_path):
         _write_manifest(tmp_path, orders=(1, 0))
