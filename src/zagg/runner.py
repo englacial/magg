@@ -5159,8 +5159,7 @@ def _invoke_lambda_sweep(
     else:
         work = [
             (bucket, {"index": index, "of": int(partitions)})
-            for index, bucket in enumerate(partition_leaves(leaves, partitions))
-            if bucket
+            for index, bucket in partition_leaves(leaves, partitions).items()
         ]
     for bucket, partition in work:
         lambda_client.invoke(

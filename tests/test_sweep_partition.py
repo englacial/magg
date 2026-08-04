@@ -191,14 +191,14 @@ class TestPartitionLeaves:
     def test_split_is_disjoint_and_covering(self):
         refs = self._refs(NODES)
         buckets = partition_leaves(refs, 16)
-        assert len(buckets) == 16
-        flat = [r for b in buckets for r in b]
+        assert sorted(buckets) == list(range(16))  # every index owns a NODES leaf
+        flat = [r for b in buckets.values() for r in b]
         assert sorted(flat) == sorted(refs)  # covering, and no duplication
-        for a, b in itertools.combinations(buckets, 2):
+        for a, b in itertools.combinations(buckets.values(), 2):
             assert not set(a) & set(b)
 
     def test_every_ref_lands_in_its_own_index(self):
-        for index, bucket in enumerate(partition_leaves(self._refs(NODES), 16)):
+        for index, bucket in partition_leaves(self._refs(NODES), 16).items():
             for key, _window in bucket:
                 assert partition_index(morton_decimal(key), 16) == index
 
@@ -207,13 +207,14 @@ class TestPartitionLeaves:
         assert buckets[0] == [(morton_word("-311"), None)]
         assert buckets[1] == [(morton_word("-321"), "2019")]
 
-    def test_empty_partitions_keep_their_slot(self):
-        buckets = partition_leaves(self._refs(["-311"]), 16)
-        assert len(buckets) == 16 and buckets[0] and not any(buckets[1:])
+    def test_empty_partitions_are_absent_not_slotted(self):
+        # Sparse by design: the empty partitions carry no slot, so the return
+        # never costs one allocation per partition (see the width test below).
+        assert partition_leaves(self._refs(["-311"]), 16) == {0: [(morton_word("-311"), None)]}
 
     def test_one_partition_returns_the_whole_work_set(self):
         refs = self._refs(NODES)
-        assert partition_leaves(refs, 1) == [refs]
+        assert partition_leaves(refs, 1) == {0: refs}
 
 
 class TestSelectPartition:
@@ -254,6 +255,14 @@ class TestPartitionsValidatedAsAParameter:
         # empty lists have been materialized.
         with pytest.raises(ValueError, match=r"coarser than the partitions="):
             partition_leaves([morton_word("-311")], 4**15)
+
+    @pytest.mark.parametrize("width", [4, 16, 4**15])
+    def test_an_empty_work_set_costs_nothing_at_any_valid_width(self, width):
+        # The cell the two tests above straddle: a VALID power of four with an
+        # EMPTY work set. No ref exists to raise, so a dense index-aligned
+        # return would allocate `width` empty lists here — at 4**15 that is
+        # 1,073,741,824 of them, and the call never returns.
+        assert partition_leaves([], width) == {}
 
     def test_select_partition_range_checks_its_index(self):
         with pytest.raises(ValueError, match=r"out of range"):

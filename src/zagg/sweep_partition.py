@@ -106,31 +106,34 @@ def normalize_partition(partition) -> tuple[int, int] | None:
     return index, of
 
 
-def partition_leaves(leaves, partitions: int) -> list[list]:
-    """Split a ``(shard_key, window)`` work set into ``partitions`` disjoint lists.
+def partition_leaves(leaves, partitions: int) -> dict[int, list]:
+    """Split a ``(shard_key, window)`` work set into disjoint per-partition lists.
 
-    The dispatch-side half of the decomposition: each returned list is one
-    partition's inline work set, in the same ``(int key, window)`` currency
-    :func:`zagg.sweep.run_sweep` takes, index-aligned with the partition index.
-    Empty lists are kept in place (a partition with no dirty leaf still has an
-    index) — callers skip them rather than fire an empty invoke.
+    The dispatch-side half of the decomposition: ``{partition index: work
+    set}`` for the NON-EMPTY partitions only, in index order, each list in the
+    same ``(int key, window)`` currency :func:`zagg.sweep.run_sweep` takes.
 
-    ``partitions`` is validated FIRST and every ref's index is resolved BEFORE
-    the buckets exist: this is the dispatch-side entry point, reached long
-    before any manifest names a shard order, so a bad count must fail as a
-    parameter error (even on an empty work set) rather than as a per-ref one.
+    Sparse deliberately. A dense index-aligned return would allocate one slot
+    per partition whatever the work set holds, so an operator typo like
+    ``partitions=4**15`` materializes 10^9 empty lists before any ref can
+    refuse it — and on an EMPTY work set there is no ref to refuse it at all.
+    No caller wants the empty slots either: both drop them on the next line
+    rather than fire an empty invoke.
+
+    ``partitions`` is validated FIRST: this is the dispatch-side entry point,
+    reached long before any manifest names a shard order, so a bad count must
+    fail as a parameter error (even on an empty work set) rather than as a
+    per-ref one.
     """
     from zagg.grids.morton import morton_decimal
 
     partition_split_order(partitions)
-    indexed = [
-        (partition_index(morton_decimal(int(key)), partitions), int(key), window)
-        for key, window in (r if isinstance(r, (tuple, list)) else (r, None) for r in leaves)
-    ]
-    buckets: list[list] = [[] for _ in range(int(partitions))]
-    for index, key, window in indexed:
-        buckets[index].append((key, window))
-    return buckets
+    buckets: dict[int, list] = {}
+    for ref in leaves:
+        key, window = ref if isinstance(ref, (tuple, list)) else (ref, None)
+        index = partition_index(morton_decimal(int(key)), partitions)
+        buckets.setdefault(index, []).append((int(key), window))
+    return dict(sorted(buckets.items()))
 
 
 def select_partition(by_shard: dict, partitions: int, index: int) -> tuple[dict, int]:
@@ -174,6 +177,5 @@ def sweep_partitions(store_root: str, leaves, *, partitions: int, **kwargs) -> l
 
     return [
         run_sweep(store_root, work, partition={"index": index, "of": partitions}, **kwargs)
-        for index, work in enumerate(partition_leaves(leaves, partitions))
-        if work
+        for index, work in partition_leaves(leaves, partitions).items()
     ]
