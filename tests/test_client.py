@@ -493,11 +493,16 @@ class TestConcurrencyPreflight:
         assert seen == [False, True]
 
     def test_pool_cap_clamped_when_window_exceeds_fd_bound(self, catalog, monkeypatch):
-        # The pacing window may clear RLIMIT_NOFILE (fd_bound=False, issue
-        # #375), but the shared client's DECLARED pool never may: today the
-        # serial dispatch loop holds <=1 connection and urllib3 sizes pools
-        # lazily, but the declared cap is what turns into EMFILE if the loop
-        # ever goes concurrent (PR #378, question (5) ruling).
+        # A fan-out width above RLIMIT_NOFILE must not reach the shared
+        # client's DECLARED pool (PR #378, question (5) ruling). Forced here
+        # by an explicit max_workers, which skips the probe so `workers`
+        # carries no fd term at all -- the same shape the event transport
+        # reaches through the probe when it passes fd_bound=False (issue
+        # #375; that wiring is pinned by test_event_window_is_not_fd_bound,
+        # which this test deliberately does not re-derive). Today the serial
+        # dispatch loop holds <=1 connection and urllib3 sizes pools lazily,
+        # but the declared cap is what turns into EMFILE if the loop ever
+        # goes concurrent.
         monkeypatch.setattr(zagg.client, "fd_safe_max_workers", lambda: 2)
         width, _, pool = self._dispatch(catalog, monkeypatch, max_workers=5)
         # The clamp stops at the DECLARED pool: the fan-out width is still the
