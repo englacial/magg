@@ -684,6 +684,13 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     (run record + MOC — never a LIST); with the default family order the MOC
     family has just refreshed that root in the same pass.
 
+    Orders are walked **finest first**, which is what makes the default
+    cascade (issue #376) possible: the finest ``exact_levels`` levels fold
+    from the leaves, and each coarser level then folds from the level this
+    same pass has just materialized (:func:`_fold_sources`,
+    :func:`_cascade_node`) — bounded per-node input, and the leaves read once
+    for the whole pyramid instead of once per level.
+
     Idempotent: a (node, window) whose stored generation stamp (merged-leaf
     count + max leaf stamp timestamp) AND content hash both match the freshly
     folded payload — and whose zarr is confirmed present and stamped, since the
@@ -728,6 +735,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
             f"shard_order {shard_order}; skipping them"
         )
         orders = [k for k in orders if k not in bad]
+    plans = _fold_sources(decl, orders, cell_order, shard_order)
     candidates = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
     store = open_object_store(store_root, **store_kwargs)
     materialized: set[int] = set()
@@ -746,6 +754,7 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
                     store_root,
                     node,
                     k,
+                    plans[k],
                     key,
                     fold_windows,
                     node_shards,
@@ -877,6 +886,13 @@ def _window_work(decl, windowed, dirty_windows, entries) -> list:
     return work
 
 
+def _overview_basename(key: str) -> str:
+    """The D23 basename of a (node, window) overview — ``all.zarr`` for the token."""
+    from zagg.windows import SCHEDULE_NONE_TOKEN, leaf_name_v3
+
+    return leaf_name_v3(None if key == SCHEDULE_NONE_TOKEN else key)
+
+
 def _read_envelope(store, node: str) -> dict | None:
     """The node's stored overview envelope, or ``None`` (strict, D9 cache)."""
     import obstore
@@ -906,6 +922,7 @@ def _roll_node(
     store_root,
     node,
     k,
+    plan,
     key,
     fold_windows,
     node_shards,
@@ -919,23 +936,42 @@ def _roll_node(
 ):
     """Fold one (node, window) overview; write its zarr unless current.
 
-    Returns the fresh envelope entry, the existing one when current (or when
-    no leaf contributed — an emptied window keeps its prior overview, the
-    same append-only posture as the engine's interior fallback), or ``None``.
+    ``plan`` is this level's ``(fold_source, source_order)`` (:func:`_fold_sources`):
+    a cascading level folds the level below it (:func:`_cascade_node`), an
+    exact one folds the leaves (:func:`_fold_node`). Returns the fresh
+    envelope entry, the existing one when current (or when nothing
+    contributed — an emptied window keeps its prior overview, the same
+    append-only posture as the engine's interior fallback), or ``None``.
     """
+    fold_source, source_order = plan
     try:
-        fold = _fold_node(
-            store_root,
-            node,
-            k,
-            fold_windows,
-            node_shards,
-            fields,
-            cell_order,
-            shard_order,
-            counts,
-            store_kwargs,
-        )
+        if fold_source == "cascade":
+            fold = _cascade_node(
+                store_root,
+                node,
+                k,
+                source_order,
+                key,
+                node_shards,
+                fields,
+                cell_order,
+                shard_order,
+                counts,
+                store_kwargs,
+            )
+        else:
+            fold = _fold_node(
+                store_root,
+                node,
+                k,
+                fold_windows,
+                node_shards,
+                fields,
+                cell_order,
+                shard_order,
+                counts,
+                store_kwargs,
+            )
     except Exception as e:
         logger.warning(f"sweep[overview]: fold failed at node {node} window {key!r}; ({e})")
         counts["failed"] += 1
@@ -947,6 +983,11 @@ def _roll_node(
         isinstance(existing_entry, dict)
         and existing_entry.get("generation") == fold["generation"]
         and existing_entry.get("content_hash") == fold["content_hash"]
+        # A stored overview folded the other way is NOT current, even when the
+        # bytes agree — the exact folds are byte-equal under either source, so
+        # only the recorded regime distinguishes them (issue #376). Entries
+        # predating #376 carry no key and read as the leaves fold they were.
+        and existing_entry.get("fold_source", "leaves") == fold["fold_source"]
         and _overview_committed(store_root, node, existing_entry.get("object"), store_kwargs)
     ):
         counts["current"] += 1
@@ -960,11 +1001,15 @@ def _roll_node(
         counts["failed"] += 1
         return None
     counts["written"] += 1
-    return {
+    entry = {
         "object": basename,
         "generation": fold["generation"],
         "content_hash": fold["content_hash"],
+        "fold_source": fold["fold_source"],
     }
+    if fold.get("fold_from_order") is not None:
+        entry["fold_from_order"] = int(fold["fold_from_order"])
+    return entry
 
 
 def _overview_committed(store_root, node, basename, store_kwargs) -> bool:
@@ -1004,6 +1049,14 @@ def _fold_node(
 ):
     """Fold the node's committed descendant leaves into per-field slabs.
 
+    The **exact** fold: single-quantization from the raw leaves, byte-equal to
+    a direct aggregation at the coarser order for the exact class. It is the
+    finest level's fold always, and every level's fold under the deprecated
+    ``fold_source: "leaves"`` — deprecated because it re-reads the whole
+    subtree per level AND accumulates that subtree's centroid lists per
+    output cell before merging, so per-node memory grows with the subtree
+    (issue #376; :func:`_cascade_node` is the bounded default).
+
     Reads leaf DATA by declared array name only — never a member enumeration
     — so orphan array prefixes from schema evolution (issue #341 Bug A) and
     foreign objects (status prefixes, #327) cannot crash the fold. A leaf
@@ -1025,10 +1078,7 @@ def _fold_node(
     digests: dict = {}
     for name, meta in fields.items():
         if meta["class"] == "exact":
-            dtype = np.dtype(meta.get("dtype") or "float32")
-            slabs[name] = np.full(
-                n_cells, _fill_scalar(meta.get("fill_value", "NaN"), dtype), dtype
-            )
+            slabs[name] = _empty_slab(meta, n_cells)
         else:
             digests[name] = [[] for _ in range(n_cells)]
     if target_order >= shard_order:
@@ -1122,7 +1172,219 @@ def _fold_node(
         "content_hash": _content_hash(node, k, target_order, fields, slabs),
         "granule_count": granules,
         "time_range": union_time_range(*ranges) if ranges else None,
+        "fold_source": "leaves",
     }
+
+
+def _empty_slab(meta: dict, n_cells: int) -> np.ndarray:
+    """One field's empty output slab: the dense fill, or the ragged empty payload."""
+    if meta["class"] != "exact":
+        return np.full(n_cells, b"", dtype=object)
+    dtype = np.dtype(meta.get("dtype") or "float32")
+    return np.full(n_cells, _fill_scalar(meta.get("fill_value", "NaN"), dtype), dtype)
+
+
+def _cascade_node(
+    store_root,
+    node,
+    k,
+    source_order,
+    key,
+    node_shards,
+    fields,
+    cell_order,
+    shard_order,
+    counts,
+    store_kwargs,
+):
+    """Fold one node's overview from the level below it — fold-of-folds (#376).
+
+    The cascade path, and the ratified default: the input is the node's
+    ``4^gap`` child overviews at ``source_order`` (``gap = source_order - k``),
+    not its subtree's leaves. Every overview slab in the tree holds the same
+    ``4^(cell_order - shard_order)`` cells (constant tree depth, §4.4), so a
+    child's slab folds ``4^gap``-to-one into the ``4^(cell_order-shard_order)
+    / 4^gap`` output cells the child owns — a **disjoint** span per child
+    (assignment, never accumulation). Two consequences, both the point of the
+    issue:
+
+    * per-node resident memory is the output slab plus ONE child slab, whose
+      cells each hold at most delta centroids — constant in the subtree size,
+      where :func:`_fold_node` grows with it (it accumulates the whole
+      subtree's centroid lists per output cell before merging);
+    * each leaf is read once for the WHOLE pyramid, by the finest level only.
+
+    The cost is accuracy: a cascaded digest is a merge of merges, so it
+    inherits the documented order-dependence of the t-digest merge and drifts
+    from the exact-from-leaves fold. That is in contract — overviews are
+    display artifacts with no precision guarantee past the exact levels
+    (espg, issue #376) — and it is why every level records which regime made
+    it (§4.3/§4.5).
+
+    Children are read exactly like leaves are: by declared array name only
+    (never a member enumeration), stamp-gated (an unstamped child is debris,
+    D4), and skipped loudly — never fatally — when unreadable. A child whose
+    ``role``/``zagg_overview`` attrs do not classify it as an overview at
+    ``source_order`` is skipped rather than folded blind: write order pins
+    those attrs BEFORE the commit stamp, so a stamped overview always carries
+    them, and anything else at that path is not this fold's input.
+    """
+    import zarr
+
+    from zagg.hive import read_commit
+    from zagg.store import open_store
+    from zagg.windows import union_time_range
+
+    target_order = cell_order - (shard_order - k)
+    n_cells = 4 ** (target_order - k)
+    factor = 4 ** (source_order - k)
+    span = n_cells // factor
+    source_cell_order = target_order + (source_order - k)
+    slabs = {name: _empty_slab(meta, n_cells) for name, meta in fields.items()}
+    basename = _overview_basename(key)
+    n_sources, n_leaves, timestamps, granules, ranges = 0, 0, [], 0, []
+    for child in sorted({_node_at(d, source_order) for d in node_shards}):
+        path = f"{store_root}/{_node_rel(child)}/{basename}"
+        try:
+            child_store = open_store(path, read_only=True, **store_kwargs)
+            stamp = read_commit(child_store)
+        except Exception as e:
+            logger.warning(f"sweep[overview]: skipping unreadable overview {path} ({e})")
+            counts["failed"] += 1
+            continue
+        if stamp is None:
+            continue  # never generated, or unstamped debris (D4)
+        # Fold the whole child BEFORE touching the slabs, so a corrupt child
+        # skips cleanly instead of half-applying (the leaf path's discipline).
+        try:
+            root = zarr.open_group(child_store, path="", mode="r", zarr_format=3)
+            provenance = root.attrs.get(OVERVIEW_ATTR)
+            provenance = dict(provenance) if isinstance(provenance, dict) else {}
+            if root.attrs.get(ROLE_ATTR) != "overview" or provenance.get("order") != source_order:
+                raise ValueError(
+                    f"role {root.attrs.get(ROLE_ATTR)!r} / declared order "
+                    f"{provenance.get('order')!r} is not an overview at order {source_order}"
+                )
+            group = zarr.open_group(
+                child_store, path=str(source_cell_order), mode="r", zarr_format=3
+            )
+            if group["morton"].shape != (n_cells,):
+                raise ValueError(
+                    f"morton shape {group['morton'].shape} is not the {n_cells}-cell "
+                    f"overview slab of order {source_order}"
+                )
+            partials = _fold_child(group, fields, factor, span, path)
+        except Exception as e:
+            logger.warning(f"sweep[overview]: skipping unreadable overview {path} ({e})")
+            counts["failed"] += 1
+            continue
+        seg = slice(_rel_rank(child, node) * span, _rel_rank(child, node) * span + span)
+        for name, partial in partials.items():
+            slabs[name][seg] = partial  # children own disjoint spans: no accumulation
+        n_sources += 1
+        n_leaves += int((provenance.get("generation") or {}).get("n_leaves") or 0)
+        timestamps.append((provenance.get("generation") or {}).get("max_leaf_timestamp"))
+        granules += int(stamp.get("granule_count") or 0)
+        if stamp.get("time_range") is not None:
+            ranges.append(stamp["time_range"])
+    if n_sources == 0:
+        return None
+    stamps = [t for t in timestamps if t is not None]
+    return {
+        "slabs": slabs,
+        "generation": {
+            "n_leaves": int(n_leaves),
+            "max_leaf_timestamp": max(stamps) if stamps else None,
+        },
+        "content_hash": _content_hash(node, k, target_order, fields, slabs),
+        "granule_count": granules,
+        "time_range": union_time_range(*ranges) if ranges else None,
+        "fold_source": "cascade",
+        "fold_from_order": int(source_order),
+    }
+
+
+def _fold_child(group, fields, factor, span, path) -> dict:
+    """One child overview's slabs, folded ``factor``-to-one into ``span`` cells.
+
+    Digest cells are merged group by group, so at most ``factor`` decoded
+    digests are ever resident — the bound that makes the cascade fold's
+    per-node memory independent of the subtree (issue #376). A field absent
+    from the child contributes nothing (schema evolution, as at the leaves).
+    """
+    partials: dict = {}
+    for name, meta in fields.items():
+        try:
+            values = group[name][:]
+        except KeyError:
+            logger.debug(f"sweep[overview]: overview {path} lacks field {name!r}")
+            continue
+        if meta["class"] == "exact":
+            partials[name] = fold_dense(
+                values, factor, meta.get("method"), meta.get("fill_value", "NaN")
+            )
+            continue
+        dtype = meta.get("dtype") or "float32"
+        inner = tuple(meta.get("inner_shape") or (2,))
+        delta = int(meta.get("delta") or 512)
+        folded = np.full(span, b"", dtype=object)
+        for j in range(span):
+            cell = [
+                decode_digest(payload, dtype, inner)
+                for payload in values[j * factor : (j + 1) * factor]
+                if payload is not None and len(payload)
+            ]
+            if cell:
+                folded[j] = fold_digests(cell, delta=delta, dtype=dtype)
+        partials[name] = folded
+    return partials
+
+
+def _fold_sources(decl, orders, cell_order, shard_order) -> dict:
+    """Per-order ``(fold_source, source_order)`` for one sweep (issue #376).
+
+    ``orders`` is descending (finest first) and the sweep walks it in that
+    order, so ``orders[i - 1]`` is the level a cascading level folds from —
+    the one this same pass has just materialized. The finest
+    ``exact_levels`` levels fold from the leaves: the first has no finer
+    overview to cascade from at all, and the knob is what carries the open
+    "first, or possibly second" sub-decision. A gap wider than the node slab
+    can address (``4^gap`` children but only ``4^(cell_order - shard_order)``
+    output cells) falls back to the leaves loudly rather than folding a slab
+    it cannot divide.
+    """
+    declared = decl.get("fold_source") or DEFAULT_FOLD_SOURCE
+    if declared not in FOLD_SOURCES:
+        logger.warning(
+            f"sweep[overview]: declared fold_source {declared!r} is unknown "
+            f"(known: {list(FOLD_SOURCES)}); folding as {DEFAULT_FOLD_SOURCE!r}"
+        )
+        declared = DEFAULT_FOLD_SOURCE
+    try:
+        exact_levels = max(1, int(decl.get("exact_levels") or DEFAULT_EXACT_LEVELS))
+    except (TypeError, ValueError):
+        logger.warning(
+            f"sweep[overview]: declared exact_levels {decl.get('exact_levels')!r} is unusable; "
+            f"folding {DEFAULT_EXACT_LEVELS} level(s) from the leaves"
+        )
+        exact_levels = DEFAULT_EXACT_LEVELS
+    depth = cell_order - shard_order
+    plan: dict = {}
+    for i, k in enumerate(orders):
+        if declared == "leaves" or i < exact_levels:
+            plan[k] = ("leaves", None)
+            continue
+        gap = orders[i - 1] - k
+        if gap > depth:
+            logger.warning(
+                f"sweep[overview]: order {k} sits {gap} orders below {orders[i - 1]}, wider "
+                f"than the {depth}-order node slab — a cascade would have 4^{gap} children "
+                f"for {4**depth} output cells; folding it from the leaves instead"
+            )
+            plan[k] = ("leaves", None)
+        else:
+            plan[k] = ("cascade", orders[i - 1])
+    return plan
 
 
 def _content_hash(node, k, target_order, fields, slabs) -> str:
@@ -1201,10 +1463,9 @@ def _write_overview(
     from zagg.grids.morton import morton_word
     from zagg.hive import _utcnow, stamp_commit
     from zagg.store import open_store
-    from zagg.windows import SCHEDULE_NONE_TOKEN, leaf_name_v3
 
     target_order = cell_order - (shard_order - k)
-    basename = leaf_name_v3(None if key == SCHEDULE_NONE_TOKEN else key)
+    basename = _overview_basename(key)
     path = f"{store_root}/{_node_rel(node)}/{basename}"
     grid = HealpixGrid(k, target_order, config=_overview_config(fields), sharded=True)
     store = open_store(path, **store_kwargs)
