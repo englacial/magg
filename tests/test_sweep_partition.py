@@ -17,6 +17,7 @@ import obstore
 import pytest
 
 from zagg import sweep as sweep_mod
+from zagg import sweep_overview as overview_mod
 from zagg.grids.morton import morton_decimal, morton_word
 from zagg.hive import MANIFEST_NAME, _decimal_order, shard_leaf_path
 from zagg.store import open_object_store
@@ -37,8 +38,10 @@ NODES = [f"{b}{i}{j}" for b in ("-3", "1") for i in "1234" for j in "1234"]
 
 SHARD_ORDER = 2
 
-#: The unpatched rollup writer, captured once so a re-installed spy never nests.
+#: The unpatched writers, captured once so a re-installed spy never nests.
 _PUT_ROLLUP = sweep_mod._put_rollup
+_WRITE_OVERVIEW = overview_mod._write_overview
+_OBSTORE_PUT = obstore.put
 
 #: Leaves spread over three of the four order-1 subtrees AND two base cells,
 #: so a partitions=4 (split order 1) pass exercises a partition with several
@@ -75,6 +78,50 @@ def _store(tmp_path, decimals=LEAVES, **kwargs):
     for decimal in decimals:
         _put_leaf(tmp_path, decimal)
     return [(morton_word(d), None) for d in decimals]
+
+
+def _overview_store(tmp_path, decimals=LEAVES, *, orders=(1, 0)):
+    """A store with REAL leaf zarrs, so the overview family actually folds.
+
+    ``_store`` above writes telemetry sidecars only — enough for the JSON
+    families, whose leaf IS the sidecar, but the overview family reads leaf
+    zarrs, so on such a store every ``_roll_node`` fails and ``written``
+    stays 0. An overview assertion on that store passes vacuously, which is
+    exactly how the manifest-RMW fence came to be untested (issue #377).
+    """
+    from test_sweep_overview import _make_leaf
+    from test_sweep_overview import _write_manifest as _write_overview_manifest
+
+    _write_overview_manifest(tmp_path, orders=orders)
+    for decimal in decimals:
+        _make_leaf(tmp_path, decimal, {0: [1.0, 2.0], 5: [10.0]})
+    return [(morton_word(d), None) for d in decimals]
+
+
+def _overview_written(monkeypatch):
+    """Capture every OVERVIEW object key a pass writes (envelope AND slab).
+
+    The overview family never reaches ``_put_rollup``: it PUTs its envelope
+    directly and writes the slab through ``_write_overview``, so :func:`_written`
+    is structurally blind to it — and the overview slabs are the artifacts
+    issue #377 exists to parallelize. Delegates to the PRISTINE writers, so a
+    re-install replaces the spy rather than nesting it.
+    """
+    keys: list[str] = []
+
+    def put_spy(store, path, *args, **kwargs):
+        if str(path).endswith(overview_mod.ENVELOPE_NAME):
+            keys.append(str(path))
+        return _OBSTORE_PUT(store, path, *args, **kwargs)
+
+    def write_spy(store_root, node, *args, **kwargs):
+        basename = _WRITE_OVERVIEW(store_root, node, *args, **kwargs)
+        keys.append(f"{overview_mod._node_rel(node)}/{basename}")
+        return basename
+
+    monkeypatch.setattr(obstore, "put", put_spy)
+    monkeypatch.setattr(overview_mod, "_write_overview", write_spy)
+    return keys
 
 
 def _run_record(root, decimals=LEAVES, run_id="r1"):
@@ -435,46 +482,104 @@ class TestPartitionRecord:
 
 
 class TestOverviewOrdersAreClamped:
+    """Every assertion here runs against REAL leaves and asserts ``written``.
+
+    Both of these tests are only load-bearing on a pass that actually folded
+    something: the unfenced manifest RMW is reached ``if counts["written"]``,
+    so a pass whose every fold failed cannot tell the fence from its absence.
+    """
+
     def test_orders_coarser_than_the_split_are_deferred_to_the_finisher(self, tmp_path):
-        decl = {
-            "overview": {
-                "orders": [1, 0],
-                "fields": {"count": {"class": "exact", "method": "sum", "dtype": "int32"}},
-            }
-        }
-        refs = _store(tmp_path, pyramid=decl)
+        whole_root, split_root = tmp_path / "whole", tmp_path / "split"
         parted = run_sweep(
-            str(tmp_path), refs, families=["overview"], partition={"index": 0, "of": 4}
-        )
-        assert parted["families"]["overview"]["deferred_orders"] == [0]
-        whole = run_sweep(str(tmp_path), refs, families=["overview"])
-        assert "deferred_orders" not in whole["families"]["overview"]
+            str(split_root),
+            _overview_store(split_root),
+            families=["overview"],
+            record=False,
+            partition={"index": 0, "of": 4},
+        )["families"]["overview"]
+        assert parted["deferred_orders"] == [0] and parted["written"] > 0
+        whole = run_sweep(
+            str(whole_root), _overview_store(whole_root), families=["overview"], record=False
+        )["families"]["overview"]
+        assert "deferred_orders" not in whole and whole["written"] > 0
 
     def test_the_manifest_pyramid_rmw_is_left_to_the_finisher(self, tmp_path, monkeypatch):
         # `_update_manifest_pyramid` is a GET-modify-PUT of the ONE store-root
         # manifest: 2^n partitions racing it would lose updates, so a
         # partitioned pass must not touch it at all.
-        from zagg import sweep_overview as ov
-
-        decl = {
-            "overview": {
-                "orders": [1],
-                "fields": {"count": {"class": "exact", "method": "sum", "dtype": "int32"}},
-            }
-        }
-        refs = _store(tmp_path, pyramid=decl)
+        refs = _overview_store(tmp_path, orders=(1,))
         monkeypatch.setattr(
-            ov,
+            overview_mod,
             "_update_manifest_pyramid",
             lambda *a, **k: pytest.fail("manifest RMW in a partition"),
         )
         before = (tmp_path / MANIFEST_NAME).read_bytes()
         result = run_sweep(
-            str(tmp_path), refs, families=["overview"], partition={"index": 0, "of": 4}
+            str(tmp_path), refs, families=["overview"], record=False, partition={"index": 0, "of": 4}
         )["families"]["overview"]
+        assert result["written"] > 0  # the fence is reached, not skipped
         assert result["manifest_deferred"] is True
         assert "manifest_updated" not in result
         assert (tmp_path / MANIFEST_NAME).read_bytes() == before
+
+
+class TestOverviewDisjointness:
+    """The overview family's own write-conflict evidence.
+
+    The ``_put_rollup`` spy the JSON-family tests use is blind to this family
+    (:func:`_overview_written`), and the overview slabs are the artifacts issue
+    #377 exists for — the o9 blow-up in the issue is overview folds, not JSON
+    rollups. So the pairwise-disjointness obligation is discharged here too,
+    against the real writers.
+    """
+
+    def test_no_two_partitions_write_the_same_overview_object(self, tmp_path, monkeypatch):
+        refs = _overview_store(tmp_path)
+        per_partition = []
+        for index in range(4):
+            keys = _overview_written(monkeypatch)
+            run_sweep(
+                str(tmp_path),
+                refs,
+                families=["overview"],
+                record=False,
+                partition={"index": index, "of": 4},
+            )
+            per_partition.append(set(keys))
+        for a, b in itertools.combinations(per_partition, 2):
+            assert not a & b
+        assert per_partition[2] == set()  # no leaf under -33/13: an empty partition
+        # Both object kinds are in the audit — the slab and its envelope.
+        assert {"-3/1/all.zarr", f"-3/1/{overview_mod.ENVELOPE_NAME}"} <= per_partition[0]
+        assert "1/4/all.zarr" in per_partition[3]  # and one spanning two base cells
+
+    def test_overview_union_equals_a_whole_tree_pass_minus_the_coarse_nodes(
+        self, tmp_path, monkeypatch
+    ):
+        whole, split = tmp_path / "whole", tmp_path / "split"
+        refs_whole, refs_split = _overview_store(whole), _overview_store(split)
+        full = _overview_written(monkeypatch)
+        run_sweep(str(whole), refs_whole, families=["overview"], record=False)
+        full_keys = set(full)
+        parted = _overview_written(monkeypatch)
+        for index in range(4):
+            run_sweep(
+                str(split),
+                refs_split,
+                families=["overview"],
+                record=False,
+                partition={"index": index, "of": 4},
+            )
+        # The order-0 overviews span partitions and are the finisher's; every
+        # other overview object was written by exactly one partition.
+        coarse = {
+            f"{node}/{name}"
+            for node in ("-3", "1")
+            for name in ("all.zarr", overview_mod.ENVELOPE_NAME)
+        }
+        assert coarse <= full_keys
+        assert set(parted) == full_keys - coarse
 
 
 class TestSweepPartitionsDriver:
