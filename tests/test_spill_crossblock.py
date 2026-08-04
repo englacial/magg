@@ -855,3 +855,34 @@ class TestUnlocatedUnchanged:
         assert nan_rows > 0
         assert 4 not in idx_s
         assert counted == nan_rows
+
+
+class TestFoldRegimeVisibility:
+    """The fold regime must be loud (one warning) and queryable
+    (``spill_blocks_closed`` in the stats metadata) — issue #370."""
+
+    _MSG = "leaves the exact single-block regime"
+
+    def test_first_block_close_warns_once_and_counts_land(self, monkeypatch, caplog):
+        _force_tiny_blocks(monkeypatch)
+        key = _shard_key()
+        cfg = _config(_variables(located=True), streaming=_SPILL)
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=20, seed=5)
+        with caplog.at_level("WARNING", logger="zagg.processing.spill"):
+            _, _, meta = _run(monkeypatch, cfg, grid, key, dfs)
+        warned = [r for r in caplog.records if self._MSG in r.message]
+        assert len(warned) == 1  # once per shard, not once per close
+        assert warned[0].levelname == "WARNING"
+        # buffer_granules=1 + 1-byte threshold: every flush closes a block.
+        assert meta["phase_timings"]["spill_blocks_closed"] == len(_CELL_LISTS)
+
+    def test_single_block_run_is_silent_and_reads_zero(self, monkeypatch, caplog):
+        key = _shard_key()
+        cfg = _config(_variables(located=True), streaming=_SPILL)
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=20, seed=5)
+        with caplog.at_level("WARNING", logger="zagg.processing.spill"):
+            _, _, meta = _run(monkeypatch, cfg, grid, key, dfs)
+        assert not any(self._MSG in r.message for r in caplog.records)
+        assert meta["phase_timings"]["spill_blocks_closed"] == 0

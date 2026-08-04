@@ -43,6 +43,7 @@ naming the ``-disk`` function-variant fix.
 from __future__ import annotations
 
 import ast
+import logging
 import os
 import tempfile
 import threading
@@ -65,6 +66,8 @@ from zagg.stats.tdigest import (
     merge_tdigests,
     merge_tdigests_kway,
 )
+
+logger = logging.getLogger(__name__)
 
 #: Floor for the spill-enable /tmp check: below this, even a degraded
 #: many-block run is pointless — fail at config time instead of thrashing.
@@ -706,6 +709,16 @@ class SpillAggregator:
         """True when no observation ever survived filtering."""
         return self.n_obs_total == 0 and not self._buffer
 
+    @property
+    def closed_blocks(self) -> int:
+        """Blocks closed at the threshold; 0 = exact single-block regime.
+
+        Ridden into the worker's ``phase_timings`` as ``spill_blocks_closed``
+        (issue #370) so an overflow-folded leaf is queryable in the run
+        telemetry, the same route ``spill_bytes`` takes.
+        """
+        return self._closed_blocks
+
     def occupied_cells(self) -> np.ndarray:
         """Distinct populated cell words (issue #200 coverage sink), sorted."""
         if not self._occupied:
@@ -736,6 +749,17 @@ class SpillAggregator:
                 f"{self._fold_problems}. "
                 f"Remedies: a bigger memory tier, a '-disk' function variant with "
                 f"more ephemeral storage, or a finer parent_order (smaller shards)."
+            )
+        if self._closed_blocks == 0:
+            # Once per shard, at the moment the exact regime is left (issue
+            # #370): from here on outputs FOLD across blocks — an overflow
+            # leaf is not byte-identical to its single-block result.
+            logger.warning(
+                f"spill block threshold ({self.block_bytes:,} bytes) crossed: this "
+                f"shard leaves the exact single-block regime and its outputs now "
+                f"fold across blocks — digests merge under t-digest semantics, "
+                f"located centroids coarsen to common ancestors, composition takes "
+                f"one k-way re-quantization; counts stay exact."
             )
         block = self._block
         self._block = SpillBlock(self.tmp_dir)
