@@ -1,11 +1,14 @@
 """Generate the committed spec-conformance fixtures with zagg's REAL writers.
 
-The `docs/specification.md` §7 fixtures (issue #340): two tiny hive stores
-under ``tests/data/spec/``, each one shard leaf written by the production
-write path — ``hive.ensure_manifest`` + ``hive.process_and_write_hive``
-(leaf template, sharded dense + ragged writes, coverage sidecar, commit
-stamp) — plus a committed ``*.expected.json`` recording the decoded values
-and the §5 O11 content hashes. ``tests/test_spec_conformance.py`` asserts
+The `docs/specification.md` §7 fixtures (issue #340), under
+``tests/data/spec/``: two tiny hive stores, each one shard leaf written by
+the production write path — ``hive.ensure_manifest`` +
+``hive.process_and_write_hive`` (leaf template, sharded dense + ragged
+writes, coverage sidecar, commit stamp) — plus one MANIFEST-ONLY pyramid
+declaration written by the production declaration paths (issue #382, no
+leaf beneath it). Each carries a committed ``*.expected.json`` recording the
+decoded values and the §5 O11 content hashes.
+``tests/test_spec_conformance.py`` asserts
 the fixtures against the shipping readers AND against spec-text-only
 decoders, so the spec, the fixtures, and the reader cannot drift apart
 silently. moczarr vendors the same fixtures for its parity gates
@@ -15,7 +18,7 @@ Run from a zagg checkout::
 
     uv run python tools/generate_spec_fixtures.py
 
-Geometry (both fixtures): parent order 4 / chunk order 5 / cell order 6 —
+Geometry (both leaf fixtures): parent order 4 / chunk order 5 / cell order 6 —
 16 cells per shard, K = 4 inner chunks of 4 cells, `sharded` (the D17 hive
 default), deliberately tiny. Chunk ordinal 2 is left EMPTY to pin the
 shard-index absence sentinel (§1.5); populated chunks carry empty cells to
