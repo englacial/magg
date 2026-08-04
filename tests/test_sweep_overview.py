@@ -430,6 +430,37 @@ class TestPyramidBlock:
         assert manifest["pyramid"]["overview"]["orders"] == [4, 2, 0]
         json.dumps(manifest)
 
+    def test_levels_knob_declares_v2(self):
+        from zagg.pyramid import PYRAMID_SPEC_V2
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._cfg(pyramid={"levels": [{"node": 4, "cells": [5, 4]}, {"node": 2, "cells": 3}]})
+        block = build_pyramid_block(cfg, shard_order=6)
+        assert block["spec"] == PYRAMID_SPEC_V2
+        overview = block["overview"]
+        # The normalized grouped form: scalar sugar expanded, order preserved.
+        assert overview["levels"] == [{"node": 4, "cells": [5, 4]}, {"node": 2, "cells": [3]}]
+        # levels REPLACE the /1 schedule keys wholesale — they must not exist.
+        assert "orders" not in overview and "spacing" not in overview
+        # The issue #376 fold declaration rides along exactly as under /1.
+        assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
+        # The fields map is revision-independent (same D24 declarations).
+        assert overview["fields"]["count"]["class"] == "exact"
+        assert overview["fields"]["h_mean"] == {"class": "none"}
+        assert overview["all_time"] is False
+        json.dumps(block)  # JSON-safe by construction
+
+    def test_levels_via_build_manifest(self):
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.hive import build_manifest
+        from zagg.pyramid import PYRAMID_SPEC_V2
+
+        grid = HealpixGrid(6, 12, config=self._cfg(pyramid={"levels": [{"node": 6, "cells": 7}]}))
+        manifest = build_manifest(grid, dataset={"short_name": "ATL06", "version": "007"})
+        assert manifest["pyramid"]["spec"] == PYRAMID_SPEC_V2
+        assert manifest["pyramid"]["overview"]["levels"] == [{"node": 6, "cells": [7]}]
+        json.dumps(manifest)
+
     def test_validate_rejects_bad_grammar(self):
         from zagg.config import validate_config
 
@@ -564,6 +595,51 @@ class TestPyramidBlock:
             )
         validate_config(self._cfg(store_layout="hive", pyramid={"fold_source": "leaves"}))
         assert "DEPRECATED" in caplog.text
+
+
+class TestPyramidV2Gate:
+    """zagg-pyramid/2 is declared-but-not-yet-sweepable (issues #382/#383/#384)."""
+
+    def _v2_manifest(self, root):
+        manifest = _write_manifest(root, orders=(1, 0))
+        manifest["pyramid"] = {
+            "spec": "zagg-pyramid/2",
+            "overview": {
+                "levels": [{"node": 2, "cells": [3, 2]}],
+                "all_time": False,
+                "fold_source": "cascade",
+                "exact_levels": 1,
+                "fields": dict(FIELDS_DECL),
+            },
+        }
+        obstore.put(open_object_store(str(root)), MANIFEST_NAME, json.dumps(manifest).encode())
+        return manifest
+
+    def test_sweep_refuses_v2_loudly_and_writes_nothing(self, tmp_path, caplog):
+        from zagg.sweep_overview import sweep_overviews
+
+        manifest = self._v2_manifest(tmp_path)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
+        assert counts["sweepable"] is False and counts["declared"] is True
+        assert counts["written"] == 0 and counts["failed"] == 0
+        assert "NOT yet sweepable" in caplog.text
+        # Declared-unswept is a recorded state, not a partial write: no
+        # overview artifacts, no envelopes, the declaration untouched.
+        assert not list(tmp_path.rglob("overview.rollup.json"))
+        assert not (tmp_path / "-3" / "1" / "all.zarr").exists()
+        assert json.loads((tmp_path / MANIFEST_NAME).read_text()) == manifest
+
+    def test_levels_key_gates_even_under_a_v1_marker(self, tmp_path, caplog):
+        from zagg.sweep_overview import sweep_overviews
+
+        # Defense in depth: a hand-edited manifest carrying levels under a /1
+        # marker is still the (node, cells) grammar — never fold it as orders.
+        manifest = self._v2_manifest(tmp_path)
+        manifest["pyramid"]["spec"] = PYRAMID_SPEC
+        counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
+        assert counts["sweepable"] is False and counts["written"] == 0
+        assert "NOT yet sweepable" in caplog.text
 
 
 class TestOverviewWriter:
@@ -1972,3 +2048,74 @@ class TestDeclarePyramid:
         assert g["h_min"][0] == 1.0 and g["h_min"][1] == 3.0
         block = read_manifest(str(tmp_path))["pyramid"]["overview"]
         assert block["materialized"]["orders"] == [0]
+
+    def test_declare_v2_levels_on_existing_store(self, tmp_path):
+        from zagg.pyramid import PYRAMID_SPEC_V2
+
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"levels": [{"node": 2, "cells": 3}, {"node": 1, "cells": 2}]}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is True and summary["previous"] == "absent"
+        # /2 declares levels, not orders — the summary reports the normalized form.
+        assert summary["orders"] == []
+        assert summary["levels"] == [{"node": 2, "cells": [3]}, {"node": 1, "cells": [2]}]
+        assert summary["validated"].startswith("leaf ")  # store truth still probed
+        after = read_manifest(str(tmp_path))
+        assert after["pyramid"]["spec"] == PYRAMID_SPEC_V2
+        assert after["pyramid"]["overview"]["levels"] == summary["levels"]
+
+    def test_declare_v2_is_idempotent(self, tmp_path):
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"levels": [{"node": 2, "cells": 3}]}
+        declare_pyramid(str(tmp_path), cfg)
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["updated"] is False and summary["previous"] == "identical"
+
+    def test_declare_v2_levels_outside_the_store_refuse(self, tmp_path):
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        # Valid grammar in the abstract, but node 3 is finer than this store's
+        # shard_order 2 — the manifest's own orders win (issue #358 posture).
+        cfg.output["pyramid"] = {"levels": [{"node": 3, "cells": 3}]}
+        with pytest.raises(ValueError, match=r"outside \[0, parent_order = 2\]"):
+            declare_pyramid(str(tmp_path), cfg)
+
+    def test_declare_v2_replaces_v1_preserving_materialized(self, tmp_path):
+        from zagg.pyramid import PYRAMID_SPEC_V2
+
+        self._pre_declaration_store(tmp_path)
+        declare_pyramid(str(tmp_path), _leaf_cfg())  # installs the /1 default
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        actuals = {
+            "orders": [0],
+            "fold_sources": {"0": "leaves"},
+            "generated_at": "2026-01-01T00:00:00+00:00",
+        }
+        manifest["pyramid"]["overview"]["materialized"] = actuals
+        obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"levels": [{"node": 2, "cells": 3}]}
+        summary = declare_pyramid(str(tmp_path), cfg)
+        assert summary["previous"] == "replaced" and summary["updated"] is True
+        after = read_manifest(str(tmp_path))
+        # The /1 actuals survive the revision bump: they inventory overview
+        # artifacts already on disk (regenerable-cache debris, D24 option A).
+        assert after["pyramid"]["spec"] == PYRAMID_SPEC_V2
+        assert after["pyramid"]["overview"]["materialized"] == actuals
+
+    def test_declared_v2_store_sweeps_to_a_loud_noop(self, tmp_path, caplog):
+        # End-to-end (#381 point (11)): declaring is free, sweeping is the
+        # operational decision — a /2 retrofit leaves the store sweep-safe.
+        from zagg.sweep import discover_leaves
+
+        self._pre_declaration_store(tmp_path, decimals=("-311", "-312"))
+        cfg = _leaf_cfg()
+        cfg.output["pyramid"] = {"levels": [{"node": 2, "cells": 3}]}
+        declare_pyramid(str(tmp_path), cfg)
+        result = run_sweep(str(tmp_path), discover_leaves(str(tmp_path)), families=("overview",))
+        counts = result["families"]["overview"]
+        assert counts["sweepable"] is False and counts["written"] == 0
+        assert "NOT yet sweepable" in caplog.text
+        assert not list(tmp_path.rglob("overview.rollup.json"))

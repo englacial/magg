@@ -225,50 +225,31 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     that gives readers zero-open filtering (option A, the ruled default) —
     and warned about loudly at template time, per the D24 ruling. The sweep
     later adds ``materialized`` actuals; it never rewrites the declaration.
+
+    An explicit ``output.pyramid.levels`` knob (issue #382) declares the
+    ``zagg-pyramid/2`` grouped ``(node, cells)`` grammar instead — built in
+    :mod:`zagg.pyramid` (:func:`zagg.pyramid.overview_block_v2`), replacing
+    the ``orders``/``spacing`` schedule wholesale.
     """
-    from zagg.config import get_agg_fields, get_pyramid
-    from zagg.semantics import EXACT_MERGE_LAWS, _fold_function_name, composability_classes
+    from zagg.config import get_pyramid
+    from zagg.pyramid import declared_fields, normalize_levels, overview_block_v2, warn_excluded
 
     knob = get_pyramid(config)
     if knob is None:  # output.pyramid: false — declared off
         return {"spec": PYRAMID_SPEC, "overview": {"orders": []}}
+    fields, excluded = declared_fields(config)
+    if knob.get("levels") is not None:
+        levels = normalize_levels(knob["levels"])
+        fold = _fold_plan(knob, [e["node"] for e in levels])
+        return overview_block_v2(knob, levels, fold, fields, excluded)
     spacing = int(knob.get("spacing") or DEFAULT_SPACING)
     if knob.get("orders") is not None:
         orders = sorted({int(k) for k in knob["orders"]}, reverse=True)
     else:
         orders = list(range(int(shard_order) - spacing, -1, -spacing))
     fold_source, exact_levels = _fold_plan(knob, orders)
-    agg = get_agg_fields(config)
-    fields: dict = {}
-    excluded = []
-    for name, cls in composability_classes(config).items():
-        meta = agg[name]
-        if cls == "exact":
-            fields[name] = {
-                "class": "exact",
-                "method": EXACT_MERGE_LAWS[_fold_function_name(meta.get("function")) or ""],
-                "nan_policy": EXACT_NAN_POLICY,
-                "dtype": meta.get("dtype", "float32"),
-                "fill_value": _json_fill(meta.get("fill_value", "NaN")),
-            }
-        elif cls == "approximate":
-            inner = meta.get("inner_shape") or (2,)
-            fields[name] = {
-                "class": "approximate",
-                "method": TDIGEST_LAW,
-                "dtype": meta.get("dtype", "float32"),
-                "inner_shape": [int(inner)] if isinstance(inner, int) else [int(x) for x in inner],
-                "delta": int((meta.get("params") or {}).get("delta", 512)),
-            }
-        else:
-            fields[name] = {"class": "none"}
-            excluded.append(name)
     if excluded and orders:
-        logger.warning(
-            f"pyramid: fields {excluded} are non-composable (D24 class 'none') and will "
-            f"exist ONLY at native resolution — excluded from every overview order (the "
-            f"per-field-exclusion default; declare a derived summary to opt in, issue #201)"
-        )
+        warn_excluded(excluded)
     overview: dict = {
         "spacing": spacing,
         "orders": orders,
@@ -338,13 +319,6 @@ def _fold_plan(knob: dict, orders: list) -> tuple[str, int]:
             f"regime (issue #376) under a 'cascade' declaration; lower it to keep the cascade"
         )
     return fold_source, exact_levels
-
-
-def _json_fill(fill_value):
-    """A JSON-safe fill token (zarr v3 uses the string ``"NaN"``)."""
-    if isinstance(fill_value, float) and np.isnan(fill_value):
-        return "NaN"
-    return fill_value
 
 
 def _update_manifest_pyramid(store_root, folded: dict, store_kwargs) -> bool:
@@ -468,6 +442,17 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     # It also surfaces an unserializable block HERE rather than at the PUT,
     # after the whole store-truth probe has been paid for.
     block = json.loads(json.dumps(block))
+    if "levels" in block["overview"]:
+        # The /2 (node, cells) declaration (issue #382): re-validate against
+        # the MANIFEST's own orders — config validation saw the config's grid
+        # block, and the retrofit contract is that the store's truth wins.
+        from zagg.pyramid import validate_levels
+
+        validate_levels(
+            block["overview"]["levels"],
+            parent_order=shard_order,
+            child_order=int(manifest["cell_order"]),
+        )
     bad = [k for k in block["overview"].get("orders") or [] if not 0 <= int(k) < shard_order]
     if bad:
         raise ValueError(
@@ -503,6 +488,13 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
         # every future sweep of this store (issue #376) — it is printed by
         # ``python -m zagg.sweep --declare-pyramid`` and nowhere else.
         "fold_source": block["overview"].get("fold_source"),
+        # ...and, for a /2 declaration (issue #382), the normalized levels the
+        # store now declares (declared-but-not-yet-sweepable: #383/#384).
+        **(
+            {"levels": [dict(e) for e in block["overview"]["levels"]]}
+            if "levels" in block["overview"]
+            else {}
+        ),
         "fields": {n: m.get("class") for n, m in (block["overview"].get("fields") or {}).items()},
         "validated": f"{validated}; {semantic}",
         "previous": "absent" if prior is None else "identical" if prior == block else "replaced",
@@ -728,11 +720,28 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     families. Returns the standard
     ``written``/``current``/``empty``/``failed`` counts plus ``declared``.
     """
+    from zagg.pyramid import PYRAMID_SPEC_V2
     from zagg.store import open_object_store
 
     store_kwargs = dict(store_kwargs or {})
     counts: dict = {"written": 0, "current": 0, "empty": 0, "failed": 0, "declared": True}
     decl = (manifest.get("pyramid") or {}).get("overview")
+    spec = (manifest.get("pyramid") or {}).get("spec")
+    if spec == PYRAMID_SPEC_V2 or (isinstance(decl, dict) and decl.get("levels") is not None):
+        # Declared-but-not-yet-sweepable is a legal recorded state (#381
+        # point (11)): the /2 (node, cells) declaration stands in the
+        # manifest, and materialization arrives with the leaf columns
+        # (issue #383) and the staged sweep (issue #384). Refusing loudly
+        # here — never folding a schedule this sweep does not understand —
+        # is the /1-vs-/2 gate; /1 stores sweep exactly as before.
+        counts["sweepable"] = False
+        logger.warning(
+            f"sweep[overview]: the manifest pyramid declaration is {spec!r} — the "
+            f"(node, cells) level grammar (issue #382) is declared but NOT yet "
+            f"sweepable by this zagg (leaf columns: issue #383; staged sweep: "
+            f"issue #384); the declaration stands, nothing was generated"
+        )
+        return counts
     if not isinstance(decl, dict) or not decl.get("orders"):
         counts["declared"] = False
         logger.info(

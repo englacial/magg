@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 #: Version string of the manifest ``pyramid`` block carrying grouped
@@ -146,3 +148,92 @@ def default_levels(parent_order: int, chunk_inner: int | None) -> list[dict]:
     levels = [{"node": parent_order, "cells": [parent_order + d]}]
     levels += [{"node": k, "cells": [k + d]} for k in range(parent_order - 2, 0, -2)]
     return levels
+
+
+def declared_fields(config) -> tuple[dict, list]:
+    """Per-field D24 composability declarations for the manifest pyramid block.
+
+    The ``fields`` map is identical under both spec revisions: ``exact``
+    entries carry the fold method + nan policy + dense dtype/fill, and
+    ``approximate`` entries the k-way t-digest law + ragged element typing;
+    ``none`` fields are declared with their **class only** — the recorded
+    absence that gives readers zero-open filtering (option A, the ruled D24
+    default) — and returned in the excluded list for the caller's loud
+    template-time warning (:func:`warn_excluded`).
+    """
+    from zagg.config import get_agg_fields
+    from zagg.semantics import EXACT_MERGE_LAWS, _fold_function_name, composability_classes
+    from zagg.sweep_overview import EXACT_NAN_POLICY, TDIGEST_LAW
+
+    agg = get_agg_fields(config)
+    fields: dict = {}
+    excluded: list = []
+    for name, cls in composability_classes(config).items():
+        meta = agg[name]
+        if cls == "exact":
+            fields[name] = {
+                "class": "exact",
+                "method": EXACT_MERGE_LAWS[_fold_function_name(meta.get("function")) or ""],
+                "nan_policy": EXACT_NAN_POLICY,
+                "dtype": meta.get("dtype", "float32"),
+                "fill_value": _json_fill(meta.get("fill_value", "NaN")),
+            }
+        elif cls == "approximate":
+            inner = meta.get("inner_shape") or (2,)
+            fields[name] = {
+                "class": "approximate",
+                "method": TDIGEST_LAW,
+                "dtype": meta.get("dtype", "float32"),
+                "inner_shape": [int(inner)] if isinstance(inner, int) else [int(x) for x in inner],
+                "delta": int((meta.get("params") or {}).get("delta", 512)),
+            }
+        else:
+            fields[name] = {"class": "none"}
+            excluded.append(name)
+    return fields, excluded
+
+
+def warn_excluded(excluded: list) -> None:
+    """The loud template-time D24 warning for ``none``-class fields."""
+    logger.warning(
+        f"pyramid: fields {excluded} are non-composable (D24 class 'none') and will "
+        f"exist ONLY at native resolution — excluded from every overview level (the "
+        f"per-field-exclusion default; declare a derived summary to opt in, issue #201)"
+    )
+
+
+def _json_fill(fill_value):
+    """A JSON-safe fill token (zarr v3 uses the string ``"NaN"``)."""
+    if isinstance(fill_value, float) and np.isnan(fill_value):
+        return "NaN"
+    return fill_value
+
+
+def overview_block_v2(knob: dict, levels: list, fold: tuple, fields: dict, excluded: list) -> dict:
+    """The ``zagg-pyramid/2`` manifest block for an explicit ``levels:`` knob.
+
+    ``levels`` is the NORMALIZED grouped form (scalars expanded) — the
+    manifest is the reader-facing contract, so no sugar survives into it.
+    Entries carry exactly ``node`` and ``cells`` at template time; the staged
+    sweep (issues #383/#384) later nests per-``(node, cells)`` materialization
+    actuals inside the entry it swept — it never rewrites the declaration.
+    ``fold`` is the declared ``(fold_source, exact_levels)`` pair (issue #376,
+    recorded exactly as under ``/1``: ``exact_levels`` only under the cascade).
+    A declared store is NOT yet sweepable by this zagg: declaring is free,
+    sweeping is the operational decision (#381 point (11)), and
+    :func:`zagg.sweep_overview.sweep_overviews` refuses ``/2`` loudly.
+    """
+    if excluded:
+        warn_excluded(excluded)
+    fold_source, exact_levels = fold
+    overview: dict = {
+        "levels": [dict(e) for e in levels],
+        "all_time": bool(knob.get("all_time", False)),
+        "fold_source": fold_source,
+    }
+    if fold_source == "cascade":
+        overview["exact_levels"] = exact_levels
+    overview["fields"] = fields
+    if knob.get("summarize"):
+        overview["summarize"] = {str(k): dict(v) for k, v in knob["summarize"].items()}
+    return {"spec": PYRAMID_SPEC_V2, "overview": overview}
