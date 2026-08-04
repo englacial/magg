@@ -257,7 +257,8 @@ def main(argv: list[str] | None = None) -> int:
 
     props = json.loads(Path(args.polygon).read_text())["features"][0].get("properties", {})
     dist = _distribution(counts)
-    distinct = {g["id"] for gl in sm.granules for g in gl}
+    # Distinct granules assigned to >=1 shard, as ShardMap.build records it.
+    n_intersecting = int(sm.metadata["granules_assigned"])
     stats = {
         "region": args.name,
         "polygon_reference": {
@@ -281,11 +282,11 @@ def main(argv: list[str] | None = None) -> int:
             "path": args.catalog,
             "total_granules": n_total,
             "granules_after_prefilter": n_kept,
-            "granules_intersecting_aoi": len(distinct),
+            "granules_intersecting_aoi": n_intersecting,
         },
         "summary": {
             "total_shards": sm.metadata["total_shards"],
-            "total_granules_intersecting": len(distinct),
+            "total_granules_intersecting": n_intersecting,
             "total_pairs": sm.metadata["total_pairs"],
             "build_wall_s": round(wall, 1),
         },
@@ -301,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"wrote {shardmap_path} + {stem}_stats.json", flush=True)
     print(
-        f"SUMMARY {stem}: shards={dist['n_shards']:,} granules={len(distinct):,} "
+        f"SUMMARY {stem}: shards={dist['n_shards']:,} granules={n_intersecting:,} "
         f"pairs={dist['total_pairs']:,} max/shard={dist['max']:,} "
         f"median/shard={dist['median']}",
         flush=True,
