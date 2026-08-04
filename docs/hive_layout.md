@@ -247,11 +247,15 @@ output:
 
 Spelling `levels` writes the manifest block as `zagg-pyramid/2` with the
 normalized list (sugar expanded); without it the block stays `/1` exactly as
-above. The grammar's rules — descending nodes, per-entry descending cells
-with the legal `cells == node` whole-footprint group, the declared gather,
-and the derived default `d = chunk_order − shard_order` schedule — are
-normative in [the specification §4.5](specification.md); refusals are loud
-and named, never silently widened. Two practice points:
+above. The grammar's **validation rules** — descending nodes, per-entry
+descending cells with the legal `cells == node` whole-footprint group, and
+the declared gather — are normative in [the specification
+§4.5](specification.md); refusals are loud and named, never silently
+widened. The derived default schedule (`d = chunk_order − shard_order`,
+`{node: shard_order, cells: [chunk_order]}` then `{node: k, cells: [k + d]}`
+stepping `−2`) is the intended default a store gets when it never spells
+`levels:`; it is recorded there as informative, since a `/2` manifest always
+carries an explicit resolved list. Two practice points:
 
 - **Declare the full schedule up front.** A declared-but-unswept level costs
   nothing (declared intent and swept actuals are separate — [#381 point
