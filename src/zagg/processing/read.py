@@ -321,6 +321,23 @@ def _level_coord_paths(level: dict, group: str) -> tuple[str, str]:
     return lat_path, lon_path
 
 
+def _record_obs_read(io_stats: dict | None, n: int) -> None:
+    """Accumulate base-rate rows DECODED (pre-filter) for the read counter.
+
+    The point-path counterpart of the raster ``io_stats`` counters (issue #374
+    / issue #297): rows fetched, before the shard mask, structured/expression
+    filters, and segment padding are applied — so ``n_obs_read / n_obs`` is the
+    read-vs-keep ratio, derived at read time and never stored.
+
+    PRESENCE of the key is the "measured" signal, not its value: a read seam
+    that never calls this (a stubbed ``_read_group``, or a worker predating the
+    field) leaves it absent, which the worker reports as ``None`` — unmeasured,
+    per the #297 nullable-column convention — rather than a real zero.
+    """
+    if io_stats is not None:
+        io_stats["obs_read"] = io_stats.get("obs_read", 0) + int(n)
+
+
 def _planned_read_group(
     h5obj,
     group: str,
@@ -329,6 +346,7 @@ def _planned_read_group(
     grid,
     arrow: bool = False,
     read_fn=None,
+    io_stats: dict | None = None,
 ):
     """Planned (AOI-bounded) read of one HDF5 group via the coarse spatial index.
 
@@ -361,6 +379,10 @@ def _planned_read_group(
     reads; ``None`` (default) uses the plain h5coro bridge — the hierarchical
     baseline. Selection semantics (the plan) and everything downstream of the
     returned columns are identical regardless.
+
+    ``io_stats`` (issue #374) is the optional read-counter sink, forwarded to
+    whichever arm actually decodes base-rate rows — the full-read fallback or
+    :func:`_execute_plan_group` — so a group is counted exactly once.
     """
     levels = data_source["levels"]
     base_level_key = data_source["base_level"]
@@ -454,11 +476,27 @@ def _planned_read_group(
         # ``read_fn`` rides along (issue #179): the fallback keeps the compiled
         # + pooled addressing instead of dropping to serial h5coro.
         return _read_group_full(
-            h5obj, group, data_source, shard_key, grid, arrow=arrow, read_fn=read_fn
+            h5obj,
+            group,
+            data_source,
+            shard_key,
+            grid,
+            arrow=arrow,
+            read_fn=read_fn,
+            io_stats=io_stats,
         )
 
     return _execute_plan_group(
-        h5obj, group, data_source, shard_key, grid, plan, n_base, arrow, read_fn=read_fn
+        h5obj,
+        group,
+        data_source,
+        shard_key,
+        grid,
+        plan,
+        n_base,
+        arrow,
+        read_fn=read_fn,
+        io_stats=io_stats,
     )
 
 
@@ -472,6 +510,7 @@ def _execute_plan_group(
     n_base,
     arrow=False,
     read_fn=None,
+    io_stats: dict | None = None,
 ):
     """Execute a computed :class:`~zagg.read_plan.ReadPlan` over one group.
 
@@ -527,6 +566,13 @@ def _execute_plan_group(
         workers,
     )
     lats, lons = coord_arrays[lat_path], coord_arrays[lon_path]
+
+    # Rows DECODED by this group's plan (issue #374): the padded, boundary-
+    # straddling reads counted BEFORE the shard mask and filters below, so the
+    # segment→photon indexed-IO efficiency (issue #43) is derivable from the
+    # run parquet. Recorded ahead of the empty short-circuit so an instrumented
+    # route that decodes nothing still reads as measured-zero, not unmeasured.
+    _record_obs_read(io_stats, len(lats))
 
     if len(lats) == 0:
         return None
@@ -671,6 +717,7 @@ def _read_group(
     grid,
     arrow: bool = False,
     granule_url: str | None = None,
+    io_stats: dict | None = None,
 ):
     """Read and spatially filter one HDF5 group.
 
@@ -706,6 +753,12 @@ def _read_group(
     Empty-AOI groups short-circuit to ``None``. Selectivity above the configured
     threshold falls back to the full-read path; the planned and full paths
     produce row-for-row identical output (#43 Phase C parity).
+
+    ``io_stats`` (issue #374) is an optional mutable dict the read routes
+    accumulate ``obs_read`` (rows decoded, pre-filter) into. The worker owns
+    one per granule, so it is written only by that granule's thread and read
+    by the dispatcher after the read completes — no lock (the point-path
+    analogue of the raster ``io_stats`` sink). ``None`` counts nothing.
     """
     rp = data_source.get("read_plan")
     # Presence check, not truthiness: an empty/misconfigured ``chunk_boundaries``
@@ -715,7 +768,14 @@ def _read_group(
         from zagg.processing.apriori import _apriori_read_group
 
         return _apriori_read_group(
-            h5obj, group, data_source, shard_key, grid, arrow=arrow, granule_url=granule_url
+            h5obj,
+            group,
+            data_source,
+            shard_key,
+            grid,
+            arrow=arrow,
+            granule_url=granule_url,
+            io_stats=io_stats,
         )
     # Truthy-checking ``levels``/``base_level`` would route an empty ``{}`` (a
     # config typo, easy to do) back to the full-read path silently. Reject
@@ -724,8 +784,12 @@ def _read_group(
     # multi-level structure to operate on.
     if isinstance(rp, dict) and rp.get("spatial_index"):
         _validate_planned_config(data_source)
-        return _planned_read_group(h5obj, group, data_source, shard_key, grid, arrow=arrow)
-    return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
+        return _planned_read_group(
+            h5obj, group, data_source, shard_key, grid, arrow=arrow, io_stats=io_stats
+        )
+    return _read_group_full(
+        h5obj, group, data_source, shard_key, grid, arrow=arrow, io_stats=io_stats
+    )
 
 
 def _validate_planned_config(data_source: dict) -> None:
@@ -778,7 +842,14 @@ def _read_paths_pooled(entries, read_one, workers: int) -> dict:
 
 
 def _read_group_full(
-    h5obj, group: str, data_source: dict, shard_key: int, grid, arrow: bool = False, read_fn=None
+    h5obj,
+    group: str,
+    data_source: dict,
+    shard_key: int,
+    grid,
+    arrow: bool = False,
+    read_fn=None,
+    io_stats: dict | None = None,
 ):
     """Full-coord-read variant of :func:`_read_group` (the pre-#49-Phase-C path).
 
@@ -797,6 +868,10 @@ def _read_group_full(
     — so index backends (``inline``) can route this path's decode through the
     compiled reader too, giving read-plan-less (flat) data sources the fast
     decode. ``None`` keeps the batched h5coro reads byte-identical.
+
+    ``io_stats`` (issue #374) is the optional read-counter sink; this path
+    decodes the base-rate coordinates in FULL, so what it records is the whole
+    group's row count regardless of how few rows survive the shard mask.
     """
     coordinates = data_source["coordinates"]
     variables = data_source["variables"]
@@ -835,6 +910,10 @@ def _read_group_full(
     lon_path = coordinates["longitude"].format(group=group)
     lats = coord_data[lat_path]
     lons = coord_data[lon_path]
+
+    # Rows DECODED by this group (issue #374) — the full base-rate coordinate
+    # read, counted before the shard mask and filters below.
+    _record_obs_read(io_stats, len(lats))
 
     if len(lats) == 0:
         return None

@@ -87,6 +87,7 @@ class VirtualIndex:
         grid,
         arrow: bool = False,
         granule_url: str | None = None,
+        io_stats: dict | None = None,
     ):
         """Read + spatially filter one HDF5 group for one shard.
 
@@ -96,6 +97,13 @@ class VirtualIndex:
         by the worker only when the a-priori chunk-boundary arm (issue #148
         arm 2a, ``read_plan.chunk_boundaries``) is configured — it locates the
         granule's boundary parquet on that route and is omitted otherwise.
+
+        ``io_stats`` (issue #374) is the optional read-counter sink: a dict the
+        backend's read routes accumulate ``obs_read`` (base-rate rows decoded,
+        BEFORE filtering and shard assignment) into. The worker allocates one
+        per granule, so a backend may write it without locking from the thread
+        that owns the granule. A backend that does not count leaves the key
+        absent, which reports as ``None`` (unmeasured) rather than zero.
         """
         raise NotImplementedError
 
