@@ -442,6 +442,8 @@ class TestWindowingConfig:
         # start < end at declared precision, but both bounds render to the
         # same whole second (iso_utc, timespec="seconds") — the dispatched
         # ge/lt pair would silently match nothing. Refused, never widened.
+        # The message quotes the rendered second the predicate compared, so
+        # the refusal is tied to what get_windowing would actually emit.
         _windowed(
             cfg,
             schedule="explicit",
@@ -449,7 +451,11 @@ class TestWindowingConfig:
                 {"label": "w", "start": "2019-06-01T12:00:01.0Z", "end": "2019-06-01T12:00:01.4Z"}
             ],
         )
-        with pytest.raises(ValueError, match="empty after truncation to whole-second"):
+        with pytest.raises(
+            ValueError,
+            match=r"empty after truncation to whole-second .*"
+            r"both render as '2019-06-01T12:00:01\+00:00'",
+        ):
             validate_config(cfg)
 
     def test_explicit_subsecond_range_spanning_a_second_boundary_allowed(self, cfg):
