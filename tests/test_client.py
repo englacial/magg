@@ -452,6 +452,37 @@ class TestConcurrencyPreflight:
         # sized by account headroom alone (issue #375).
         assert self._probe_fd_bound(catalog, monkeypatch, transport="event") is False
 
+    def test_probe_body_forwards_fd_bound(self, catalog, monkeypatch):
+        # The seam the two tests above bracket without crossing: they pin what
+        # `dispatch` hands `_probe_workers`, and `TestFdBound` pins what
+        # `compute_available_workers` does with it -- but neither runs the real
+        # `_probe_workers` body, so deleting `fd_bound=fd_bound` at
+        # `client.py:664` left the suite green (review finding). Drive the real
+        # body and assert the value it forwards.
+        from unittest.mock import MagicMock
+
+        from zagg import runner
+
+        seen: list = []
+
+        def _probe(requested, lambda_client, cloudwatch_client, function_name, **k):
+            seen.append(k.get("fd_bound"))
+            return 7, self._report()
+
+        run = Run.from_config(
+            default_config("atl06"),
+            shardmap=catalog,
+            store=_STORE,
+            function_name="process-shard-test",
+            source_credentials=_CREDS,
+        )
+        monkeypatch.setattr(runner, "compute_available_workers", _probe)
+        assert run._probe_workers(MagicMock(), 3, fd_bound=False) == 7
+        assert run._probe_workers(MagicMock(), 3, fd_bound=True) == 7
+        # Not `[None, None]`: the kwarg reaches the probe, and it is the
+        # caller's value, not `compute_available_workers`' own default.
+        assert seen == [False, True]
+
     @staticmethod
     def _probe_fd_bound(catalog, monkeypatch, *, transport):
         """The ``fd_bound`` ``dispatch`` hands the probe for ``transport``.
