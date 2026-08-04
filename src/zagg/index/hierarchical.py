@@ -39,11 +39,13 @@ class HierarchicalIndex(VirtualIndex):
         # ``granule_url`` is forwarded only when set (the a-priori arm), so
         # monkeypatched ``_read_group`` fakes keep their existing signature on
         # every other path -- mirroring the worker's presence-gated kwarg.
-        # ``io_stats`` (issue #374) is gated the same way, for the same reason:
-        # a fake that takes neither keeps working, and simply reports no count.
-        kwargs = {"arrow": arrow}
+        # ``io_stats`` (issue #374) is NOT gated: it is always-on
+        # instrumentation, the worker always passes a dict (``worker.py:422``,
+        # ``worker.py:436``), and ``_record_obs_read`` no-ops on ``None`` for
+        # the direct callers that omit it -- so gating it would protect nothing
+        # while diverging from ``InlineIndex.read_group``, which forwards it
+        # unconditionally (review finding).
+        kwargs = {"arrow": arrow, "io_stats": io_stats}
         if granule_url is not None:
             kwargs["granule_url"] = granule_url
-        if io_stats is not None:
-            kwargs["io_stats"] = io_stats
         return _processing._read_group(h5obj, group, data_source, shard_key, grid, **kwargs)
