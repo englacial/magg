@@ -709,7 +709,12 @@ class Run:
             held socket per in-flight shard), while the event window — which
             holds no connections — is sized by account headroom alone, so a
             low ``ulimit -n`` no longer strands concurrency the account has
-            already granted.
+            already granted. The window is fired serially by the poller thread
+            (:meth:`~zagg.client_transport.StatusPoller._dispatch_up_to_window`),
+            so a wider window also lengthens the opening dispatch ramp
+            proportionally — roughly 10 ms of invoke round-trip per shard, and
+            no LIST runs during it. Deliberate: the ramp grows by seconds while
+            the clamp cost whole 900 s waves (issue #375).
         transport : str
             ``"sync"`` (default, the v1 transport): a thread pool over
             synchronous ``RequestResponse`` invokes — one held connection per
