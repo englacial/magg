@@ -523,6 +523,16 @@ class TestPyramidBlock:
         assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
         assert "unknown fold_source" in caplog.text and "exact_levels must be" in caplog.text
 
+    def test_the_deprecation_stays_silent_on_the_default_path(self, caplog):
+        from zagg.sweep_overview import _fold_sources, build_pyramid_block
+
+        # build_pyramid_block runs at every manifest bootstrap (hive.py) and
+        # _fold_sources at every sweep, so the #376 deprecation must never fire
+        # on the shipped default — a warning that cries wolf stops being read.
+        build_pyramid_block(self._cfg(), shard_order=6)
+        _fold_sources({}, [4, 2, 0], 8, 6)
+        assert "DEPRECATED" not in caplog.text
+
     def test_exact_levels_past_the_last_level_warns_it_is_the_leaves_regime(self, caplog):
         from zagg.sweep_overview import build_pyramid_block
 
@@ -1058,6 +1068,57 @@ class TestCascadeFold:
         # the cascade folds what is on disk, so it is recorded.
         assert "1 of 1 candidate child overviews at order 1 are not usable" in caplog.text
         assert "(1 not materialized, 0 unreadable)" in caplog.text
+
+    def _sibling_leaves(self, root):
+        """Two leaves in DIFFERENT order-1 subtrees, both in the coverage MOC."""
+        _make_leaf(root, "-311", {0: [1.0, 2.0]})
+        _make_leaf(root, "-321", {0: [7.0]})
+        refs = [(morton_word(d), None) for d in ("-311", "-321")]
+        run_sweep(str(root), refs, families=("moc",))
+        return refs
+
+    def test_a_partially_swept_store_self_heals_on_the_next_sweep(self, tmp_path):
+        # The end-to-end shape of the PR's "a cascade folds what is on disk":
+        # sweep A only, then sweep B, through run_sweep both times.
+        _write_manifest(tmp_path, orders=(1, 0))
+        refs = self._sibling_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs[:1], families=("overview",))
+        # -32 has a committed leaf but no overview yet, so its span in the
+        # order-0 parent is fill — indistinguishable from empty without the
+        # recorded coverage.
+        coarse = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert coarse["source_children"] == {"folded": 1, "missing": 1, "unreadable": 0}
+        assert coarse["generation"]["n_leaves"] == 1
+        counts0 = _overview_group(tmp_path, "-3", "all.zarr", 2)["count"][:]
+        assert counts0[0] == 2 and counts0[4] == 0  # -311's span; -321's still fill
+        # Sweep B: the parent must be REWRITTEN, not read as current — the
+        # repair rests on its summed n_leaves moving once the child exists.
+        counts = run_sweep(str(tmp_path), refs[1:], families=("overview",))["families"]["overview"]
+        assert counts["written"] == 2 and counts["current"] == 0
+        coarse = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert coarse["source_children"] == {"folded": 2, "missing": 0, "unreadable": 0}
+        assert coarse["generation"]["n_leaves"] == 2
+        counts0 = _overview_group(tmp_path, "-3", "all.zarr", 2)["count"][:]
+        assert counts0[0] == 2 and counts0[4] == 1  # A unchanged, B now populated
+        assert counts0.sum() == 3
+
+    def test_an_unusable_child_still_leaves_the_parent_covering_the_rest(self, tmp_path):
+        _write_manifest(tmp_path, orders=(1, 0))
+        refs = self._sibling_leaves(tmp_path)
+        run_sweep(str(tmp_path), refs, families=("overview",))
+        # Break ONE child's role attr. Its own level reads as current (the
+        # envelope and the D4 stamp are untouched), so it is not regenerated
+        # and the order-0 cascade meets a child it must skip.
+        store = open_store(str(tmp_path / "-3" / "2" / "all.zarr"))
+        zarr.open_group(store, mode="r+", zarr_format=3).attrs[ROLE_ATTR] = "something-else"
+        counts = run_sweep(str(tmp_path), refs, families=("overview",))["families"]["overview"]
+        assert counts["written"] == 1 and counts["current"] == 2 and counts["failed"] == 1
+        # The parent is still written, covering the child it COULD read, and
+        # records that it under-covers the other.
+        coarse = _overview_root(tmp_path, "-3", "all.zarr").attrs[OVERVIEW_ATTR]
+        assert coarse["source_children"] == {"folded": 1, "missing": 0, "unreadable": 1}
+        counts0 = _overview_group(tmp_path, "-3", "all.zarr", 2)["count"][:]
+        assert counts0[0] == 2 and counts0[4] == 0
 
     def test_under_coverage_is_recorded_in_the_overview_attrs(self, tmp_path, caplog):
         import logging
