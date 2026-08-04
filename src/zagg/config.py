@@ -1091,21 +1091,26 @@ def _explicit_window_bounds(entry: dict) -> tuple[datetime, datetime]:
         # `width` is documented as the future escape hatch but does not exist
         # yet: accepting it silently would hand back a 1 s window and a clean
         # validate_config.
-        extra = sorted(set(entry) - {"label", "timestamp"})
+        extra = sorted(set(entry) - {"label", "timestamp"}, key=repr)
         if extra:
             raise ValueError(
                 f"explicit point window entry carries unsupported key(s) "
-                f"{', '.join(extra)}; the point form is {{label, timestamp}} "
-                f"(got {entry!r})"
+                f"{', '.join(map(repr, extra))}; the point form is "
+                f"{{label, timestamp}} (got {entry!r})"
             )
         point = _windows.parse_utc(entry["timestamp"])
         return point, point + _POINT_WINDOW_WIDTH
-    extra = sorted(set(entry) - {"label", "start", "end"})
+    # repr, not str: YAML 1.1 resolves bare `on`/`no`/numerals to bool/int
+    # keys, which are neither sortable against strings nor joinable — the
+    # TypeError would escape _validate_windowing_windows' ValueError wrapper
+    # and lose the `output.windowing.windows:` prefix. repr also shows the
+    # reader that the key came back coerced.
+    extra = sorted(set(entry) - {"label", "start", "end"}, key=repr)
     if extra:
         raise ValueError(
             f"explicit range window entry carries unsupported key(s) "
-            f"{', '.join(extra)}; the range form is {{label, start, end}} "
-            f"(got {entry!r})"
+            f"{', '.join(map(repr, extra))}; the range form is "
+            f"{{label, start, end}} (got {entry!r})"
         )
     start = _windows.parse_utc(entry["start"])
     end = _windows.parse_utc(entry["end"])

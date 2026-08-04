@@ -414,17 +414,48 @@ class TestWindowingConfig:
         with pytest.raises(ValueError, match="unsupported key"):
             validate_config(cfg)
 
+    def test_explicit_point_non_string_key_named(self, cfg):
+        # YAML 1.1 resolves bare `on:`/`no:`/numerals to bool/int keys, which
+        # cannot be sorted against strings or str-joined: the offenders must
+        # still be named as a ValueError (a TypeError would escape the
+        # output.windowing.windows: wrapper entirely) — PR #367.
+        _windowed(
+            cfg,
+            schedule="explicit",
+            windows=[{"label": "w", "timestamp": "2019-06-01T12:00:00Z", True: 1, 3: "x"}],
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"output\.windowing\.windows: .*unsupported key\(s\) 3, True; the point form",
+        ):
+            validate_config(cfg)
+
     @pytest.mark.parametrize(
         "entry,named",
         [
             (
                 {"label": "w", "start": "2019-06-01", "end": "2019-09-01", "width": 3600},
-                "width",
+                "'width'",
             ),
             (
                 # Every offending key is named, so one edit fixes the entry.
                 {"label": "w", "start": "2019-06-01", "end": "2019-09-01", "note": "x", "stop": 1},
-                "note, stop",
+                "'note', 'stop'",
+            ),
+            (
+                # YAML 1.1 hands back bool/int keys for bare `on:`/numerals;
+                # mixing them with a string key must still name the offenders
+                # rather than raising TypeError out of sorted()/join()
+                # (PR #367).
+                {
+                    "label": "w",
+                    "start": "2019-06-01",
+                    "end": "2019-09-01",
+                    "note": "x",
+                    True: 1,
+                    3: "y",
+                },
+                "'note', 3, True",
             ),
         ],
     )
