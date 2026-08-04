@@ -59,10 +59,11 @@ _TDIGEST_FUNCTIONS = (_TDIGEST_FUNCTION, _TDIGEST_PAIRWISE_FUNCTION)
 _TDIGEST_WHERE_FUNCTION = "zagg.stats.tdigest.build_tdigest_where"
 _TDIGEST_SPILL_FUNCTIONS = (*_TDIGEST_FUNCTIONS, _TDIGEST_WHERE_FUNCTION)
 
-#: The packed composition reducer (issue #321): the SPILL fold combines its
-#: per-block ``(word, n_signal)`` pairs via ``merge_composition`` — issue #370
-#: option (a), accepting the documented O(n/510)-per-fold lane-quantization
-#: error (presence exact via the floor). Flipping to option (b) — composition
+#: The packed composition reducer (issue #321): the SPILL fold collapses its
+#: per-block ``(word, n_signal)`` pairs in one pass via
+#: ``merge_composition_kway`` — issue #370 option (a), accepting the documented
+#: lane-quantization error (one quantization over the parts, presence exact via
+#: the floor) rather than a byte-stable word. Flipping to option (b) — composition
 #: stays non-mergeable, so a strata-with-composition config fails loudly on a
 #: block close — is the one-line removal of this function from the
 #: ``validate_spill_fold`` scalar branch below.
@@ -168,9 +169,9 @@ def validate_streaming(config: PipelineConfig) -> None:
             # ``count`` is the pooled path's alias of ``len`` (aggregate.py);
             # both merge by summation.
             if meta.get("function") == _COMPOSITION_FUNCTION:
-                # The packed word folds via merge_composition on the spill
-                # path (issue #370 option (a)); merge mode would re-quantize
-                # the lanes on every flush, compounding the O(n/510) error.
+                # The packed word folds k-way at finalize on the spill path
+                # (issue #370 option (a)); merge mode would re-quantize the
+                # lanes on every flush, compounding the O(n/510) error.
                 problems.append(
                     f"field '{name}': the packed composition word is not per-flush "
                     f"mergeable (each fold re-quantizes the lanes); it folds only on "
@@ -200,10 +201,10 @@ def validate_spill_fold(config: PipelineConfig) -> None:
     located ``merge_tdigests``/``merge_tdigests_kway`` overloads carry the
     channel), **``build_tdigest_where`` strata** (row selection precedes
     the build, so per-block stratum digests merge like any digest), and the
-    **packed composition word** (``merge_composition`` over per-block
-    ``(word, n_signal)`` pairs — presence exact, counts within the documented
-    O(n/510)-per-fold bound; see :data:`_COMPOSITION_FUNCTION` for the
-    option (a)/(b) flip point).
+    **packed composition word** (``merge_composition_kway`` over the per-block
+    ``(word, n_signal)`` pairs — presence exact, counts within one
+    quantization; see :data:`_COMPOSITION_FUNCTION` for the option (a)/(b)
+    flip point).
 
     ``where`` and ``build_tdigest_where`` must be declared **together**: either
     one alone is a config error here, mirroring the ``TypeError`` the pooled

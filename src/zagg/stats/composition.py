@@ -38,7 +38,10 @@ only within ``O(n/510)``, so folds are not byte-stable across orders)::
     lane_merged = quantize((n_a * lane_a + n_b * lane_b) / (n_a + n_b))
 
 with the same presence floor, so presence survives re-quantization exactly and
-count error stays O(n/510) per merge.
+count error stays O(n/510) per merge. :func:`merge_composition_kway` folds a
+whole set of parts in one pass instead — same law, quantized once, so it is
+order-independent and does not compound with the part count (the writer's
+spill fold, issue #370); the binary law above stays the reader-facing contract.
 """
 
 from __future__ import annotations
@@ -52,6 +55,7 @@ __all__ = [
     "composition_attrs_block",
     "counts_from_composition",
     "merge_composition",
+    "merge_composition_kway",
     "pack_composition",
     "pack_composition_n",
     "unpack_composition",
@@ -238,4 +242,40 @@ def merge_composition(word_a: int, n_a: int, word_b: int, n_b: int) -> int:
     merged = (n_a * la + n_b * lb) / n
     k = np.rint(merged)
     k = np.where(((la > 0) | (lb > 0)) & (k == 0), 1.0, k)
+    return _pack(np.clip(k, 0, 255).astype(np.uint64))
+
+
+def merge_composition_kway(parts: list[tuple[int, int]]) -> int:
+    """Fold many ``(word, n_signal)`` pairs in ONE pass — **order-independent**.
+
+    The merge law is a weighted mean, so ``k`` parts collapse directly:
+    ``lane = quantize(Σ nᵢ·laneᵢ / Σ nᵢ)`` with the same presence floor. A
+    left-fold of :func:`merge_composition` re-quantizes ``k-1`` times and the
+    result depends on the fold order; this quantizes **once**, so the count
+    error stays one quantization wide (≤ 1 lane step over the parts' own,
+    i.e. O(n/255) recovered counts) no matter how many parts there are, and a
+    permutation of ``parts`` returns identical bytes. That is the writer's
+    fold law on the spill path (issue #370), where the parts are per-block
+    words and the block count is small; :func:`merge_composition` remains the
+    reader-facing binary law of spec §3.4 — folding k-way is inside its
+    documented "associative up to the bounded re-quantization error" tolerance
+    and strictly tighter than the binary chain.
+
+    Parts with ``n <= 0`` are skipped (the ``(0, 0)`` identity), and an empty
+    or all-empty ``parts`` returns ``0`` — an empty signal stratum.
+    """
+    lanes = np.zeros(len(LANES), dtype=np.float64)
+    present = np.zeros(len(LANES), dtype=bool)
+    total = 0
+    for word, n in parts:
+        if n <= 0:
+            continue
+        la = unpack_composition(word).astype(np.float64)
+        lanes += n * la
+        present |= la > 0
+        total += int(n)
+    if total <= 0:
+        return 0
+    k = np.rint(lanes / total)
+    k = np.where(present & (k == 0), 1.0, k)
     return _pack(np.clip(k, 0, 255).astype(np.uint64))

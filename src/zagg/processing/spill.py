@@ -57,7 +57,7 @@ from zagg.config import (
     get_data_vars,
     get_output_signature,
 )
-from zagg.stats.composition import merge_composition, pack_composition_n
+from zagg.stats.composition import merge_composition_kway, pack_composition_n
 from zagg.stats.tdigest import (
     _DEFAULT_DELTA,
     build_tdigest,
@@ -489,7 +489,7 @@ class SpillAggregator:
       summation, tdigests via ``merge_tdigests``/``merge_tdigests_kway`` —
       including located fields and ``build_tdigest_where`` strata, whose
       per-block builds fold under the located overloads — and composition
-      words via ``merge_composition``, issue #370),
+      words via ``merge_composition_kway``, issue #370),
       collapsing merge rounds from N/buffer to ~spill/threshold. A
       config with any reducer outside the ``validate_spill_fold`` surface
       raises :class:`SpillOverflowError` at the first crossing instead of
@@ -601,12 +601,22 @@ class SpillAggregator:
         self._digest_locs: dict[str, dict[int, np.ndarray]] = {
             n: {} for n, f in self._digest_fields.items() if f.location
         }
-        # Composition running state (issue #370): per-cell (word, n_signal),
-        # folded pairwise in block-close order via merge_composition — presence
-        # exact (the floor survives re-quantization), counts within the
-        # documented O(n/510)-per-fold bound, so an overflow shard's word is
-        # NOT byte-stable against the single-block result (option (a)).
+        # Composition state (issue #370): per-cell (word, n_signal), written
+        # once at finalize from the per-block parts below.
         self._compositions: dict[str, dict[int, tuple[int, int]]] = {
+            n: {} for n in self._composition_fields
+        }
+        # Per-block (word, n_signal) parts, stashed like ``_digest_parts`` and
+        # collapsed in ONE weighted-mean pass at finalize
+        # (``merge_composition_kway``): quantizing once instead of once per
+        # block close keeps the stored word independent of block-close order —
+        # the property the k-way digest fold already has, and the one #280's
+        # parallel reduce would otherwise silently break here — and holds the
+        # count error at one quantization instead of compounding with the block
+        # count. Still option (a): the word is not byte-stable against the
+        # single-block result, presence is exact via the floor. Two ints per
+        # cell per block, negligible beside the digest parts.
+        self._composition_parts: dict[str, dict[int, list[tuple[int, int]]]] = {
             n: {} for n in self._composition_fields
         }
         # k-way fold accumulator: for order-independent fields, each block's
@@ -783,9 +793,9 @@ class SpillAggregator:
         merge it into the running digest here, the located overload carrying
         the location channel. Composition fields pack a per-block ``(word,
         n_signal)`` pair (``pack_composition_n`` — the same predicate and
-        bytes as the pooled reducer) and fold it via ``merge_composition`` in
-        block-close order. Either way it is one build round per block
-        instead of per buffer — the ~6x merge-CPU collapse the design targets
+        bytes as the pooled reducer) and stash it for the same finalize
+        collapse (``merge_composition_kway``). Either way it is one build round
+        per block instead of per buffer — the ~6x merge-CPU collapse the design targets
         (issue #279).
         """
         from zagg.processing.aggregate import _group_columns
@@ -840,16 +850,9 @@ class SpillAggregator:
                 for name, (source, params) in self._composition_fields.items():
                     values = cell_data[source]
                     kwargs = {k: _resolve_param(v, cell_data) for k, v in params.items()}
-                    word, n = pack_composition_n(values, **kwargs)
-                    held_comp = self._compositions[name].get(cell)
-                    if held_comp is None:
-                        self._compositions[name][cell] = (word, n)
-                    else:
-                        held_word, held_n = held_comp
-                        self._compositions[name][cell] = (
-                            merge_composition(held_word, held_n, word, n),
-                            held_n + n,
-                        )
+                    self._composition_parts[name].setdefault(cell, []).append(
+                        pack_composition_n(values, **kwargs)
+                    )
 
     def _check_fold_columns(self, schema) -> None:
         """Name a missing source/location/param column, as the pooled path does.
@@ -911,7 +914,7 @@ class SpillAggregator:
                     )
 
     def _finalize_kway(self) -> None:
-        """Collapse each k-way field's per-block parts into one digest per cell.
+        """Collapse every k-way channel's per-block parts, once per cell.
 
         Runs once, after the final block is folded and before the first emission.
         The single-pass k-way merge is order-independent (t-digest merge is not
@@ -921,7 +924,11 @@ class SpillAggregator:
         ``merge_tdigests_kway`` overload), keeping both channels row-aligned —
         and the location channel is order-independent too, since the located
         merge breaks ``(mean, weight)`` ties on the location word itself
-        (issue #370); a reducer parallelized under #280 inherits both.
+        (issue #370). Composition parts collapse the same way
+        (``merge_composition_kway`` over the block ``(word, n_signal)`` pairs:
+        one weighted lane mean, quantized once), so a reducer parallelized
+        under #280 inherits the property on all three channels rather than
+        finding composition silently excluded.
         """
         for name, cell_parts in self._digest_parts.items():
             f = self._digest_fields[name]
@@ -938,6 +945,14 @@ class SpillAggregator:
                 for cell, parts in cell_parts.items():
                     dest[cell] = merge_tdigests_kway(parts, delta=f.delta)
             cell_parts.clear()
+        for name, comp_parts in self._composition_parts.items():
+            comp_dest = self._compositions[name]
+            for cell, pairs in comp_parts.items():
+                comp_dest[cell] = (
+                    merge_composition_kway(pairs),
+                    sum(n for _, n in pairs),
+                )
+            comp_parts.clear()
 
     # -- post-read emission ----------------------------------------------------
 

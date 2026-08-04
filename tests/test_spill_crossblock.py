@@ -591,7 +591,7 @@ def _true_lane_counts(dfs, grid, cell, threshold=2):
 
 
 class TestCompositionMultiBlock:
-    """merge_composition across forced block closes (issue #370 option (a))."""
+    """merge_composition_kway across forced block closes (issue #370 option (a))."""
 
     @pytest.mark.parametrize("declared", [None, "uint64"])
     def test_prealloc_dtype_and_fill_match_single_block(self, monkeypatch, declared):
@@ -670,11 +670,12 @@ class TestCompositionMultiBlock:
             np.testing.assert_array_equal(unpack_composition(word_p) > 0, truth > 0)
             np.testing.assert_array_equal(unpack_composition(word_s) > 0, truth > 0)
             # Below n=254 the pooled word recovers counts exactly; the folded
-            # word stays within the documented O(n/510)-per-fold error over
-            # at most len(dfs) folds (one block per granule here).
+            # word stays within ONE quantization of it — the k-way collapse
+            # quantizes once over every block's part, so the bound does not
+            # grow with the block count (a pairwise chain's would).
             assert n <= 254
             np.testing.assert_array_equal(counts_from_composition(word_p, n), truth)
-            tol = 1 + len(dfs) * n / 510.0
+            tol = 1 + n / 255.0
             assert np.abs(counts_from_composition(word_s, n) - truth).max() <= tol
             checked += 1
         assert checked >= 3
