@@ -487,6 +487,7 @@ regionally heterogeneous resolution).
   "window": "2019",
   "fields": {"count": {"class": "exact", "method": "sum", "nan_policy": "skip"},
              "h_tdigest": {"class": "approximate", "method": "tdigest_kway"}},
+  "fold_source": "leaves",
   "generation": {"n_leaves": 16, "max_leaf_timestamp": "2026-07-20T00:00:00Z"},
   "content_hash": "…",
   "generated_at": "2026-07-21T00:00:00Z"
@@ -516,6 +517,31 @@ regionally heterogeneous resolution).
   at least `class` and `method`, and MAY carry further fold provenance — an
   `exact` entry records the reduction's `nan_policy` (`"skip"`: nan-skipping,
   never NaN-propagating) — so readers MUST tolerate additional keys.
+
+  **`fold_source` names the regime that produced this level**
+  ([#376](https://github.com/englacial/zagg/issues/376)) — the one piece of
+  provenance a reader cannot recover from the arrays:
+
+  - `"leaves"` — folded directly from the subtree's source leaves: **single
+    quantization**, and for the `exact` class byte-equal to a direct
+    aggregation at this cell order (§4.4);
+  - `"cascade"` — folded from an already-materialized **finer overview**
+    (fold-of-folds), whose order the entry then also names:
+
+    ```json
+    "fold_source": "cascade", "fold_from_order": 3
+    ```
+
+  The distinction is only material for the `approximate` class: the exact
+  merge laws are associative, so a cascaded `sum`/`min`/`max` is the same
+  value either way, while a cascaded digest is a **merge of merges** — it
+  inherits the merge's documented behavior once per level and carries **no
+  precision guarantee**. That is in contract: overviews are display
+  artifacts, and the precision promise stops at the levels declared exact
+  (`pyramid.overview.exact_levels`, §4.5). A reader that needs the exact
+  regime MUST check this key rather than the level's depth, and MUST read an
+  overview that carries **no** `fold_source` as `"leaves"` — the only fold
+  that existed before #376.
 
 An overview also carries the standard D4 **commit stamp** as its final
 write: an unstamped overview prefix is debris, exactly as for leaves.
@@ -547,6 +573,10 @@ heterogeneous variable sets across level nodes are in contract, and a reader
 MUST NOT assume every leaf field exists at every overview order (the
 manifest declaration below is the zero-open way to know).
 
+The fold **regime** (§4.3's `fold_source`) does not enter this contract: a
+cascaded level has exactly the layout above, and differs only in the values
+its `approximate` fields carry.
+
 ### 4.5 The manifest `pyramid` block
 
 **Contract.** The product manifest (`morton_hive.json`; manifest bootstrap
@@ -561,6 +591,8 @@ overview family under the versioned `pyramid` block:
     "spacing": 2,
     "orders": [3, 1],
     "all_time": false,
+    "fold_source": "cascade",
+    "exact_levels": 1,
     "fields": {
       "count":     {"class": "exact", "method": "sum", "nan_policy": "skip",
                     "dtype": "int32", "fill_value": 0},
@@ -583,13 +615,29 @@ overview family under the versioned `pyramid` block:
   "pyramid": {"spec": "zagg-pyramid/1", "overview": {"orders": []}}
   ```
 
-  — `spacing`, `all_time`, `fields`, and `summarize` are **absent**, not empty.
+  — `spacing`, `all_time`, `fold_source`, `exact_levels`, `fields`, and
+  `summarize` are **absent**, not empty.
   A reader MUST branch on `orders` first: an empty `orders` (or no `pyramid`
   block at all — pre-pyramid manifests) means no overview family exists and no
   other key of the block may be assumed. When `orders` is **non-empty**,
   `spacing`, `all_time`, and `fields` MUST all be present (`summarize` stays
   optional), so the zero-open field query of §4.4 is well-defined exactly when
   there is something to query.
+- **`fold_source` / `exact_levels`** — the declared fold regime
+  ([#376](https://github.com/englacial/zagg/issues/376)): `"cascade"` (the
+  default) folds each declared level from the next **finer** declared level's
+  overviews, and `exact_levels` is how many of the finest levels are folded
+  from the leaves instead — so under `{"orders": [3, 1], "fold_source":
+  "cascade", "exact_levels": 1}` order 3 is exact and order 1 is a fold of
+  order 3's folds. `"leaves"` is the deprecated exact-from-leaves regime,
+  where every declared level folds the raw leaves and no `exact_levels` key
+  is written (every level is exact there, so a boundary would name a
+  distinction the store does not have). These two keys are written by
+  #376-and-later writers; a reader that finds **no `fold_source`** MUST read
+  the declaration as `"leaves"`, which is the only regime that existed
+  before. They declare what the **next** sweep will do — what is on disk is
+  `materialized.fold_sources` below and, per artifact, §4.3's
+  `zagg_overview.fold_source`, which is authoritative for a given overview.
 - **`fields`** — every aggregation field, keyed by name, with its
   **composability class**: `exact` (folds byte-equal — count/sum/min/max),
   `approximate` (t-digest merge — `np.isclose` equality class), or `none`
@@ -621,7 +669,23 @@ overview family under the versioned `pyramid` block:
 - The sweep MAY additionally record materialized-actuals bookkeeping in the
   block; the template-time declaration above is never rewritten by the
   sweep, and the `pyramid` block is excluded from the manifest's frozen
-  append-guard keys.
+  append-guard keys. zagg's sweep writes
+
+  ```json
+  "materialized": {"orders": [3, 1],
+                   "fold_sources": {"3": "leaves", "1": "cascade"},
+                   "generated_at": "2026-08-04T00:00:00Z"}
+  ```
+
+  — the orders it has written and, per level, the §4.3 regime that wrote it
+  (keys are the orders as strings, JSON having no integer keys). Both are
+  **actuals**, accumulated across sweeps: a level swept under an earlier
+  declaration keeps the regime it was made with until it is regenerated, so
+  this map can disagree with the declaration above, and that disagreement is
+  informative rather than an error. It is a convenience — a reader MAY
+  instead open the overviews and read §4.3 — and, like every other actual,
+  it says nothing about an overview still being present (overviews are
+  regenerable caches, §4.1).
 
 ### 4.6 What §4 does not cover (informative)
 
