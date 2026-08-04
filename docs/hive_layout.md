@@ -297,7 +297,8 @@ the declared gather — are normative in [the specification
 §4.5](specification.md); refusals are loud and named, never silently
 widened. The derived default schedule (`d = chunk_order − shard_order`,
 `{node: shard_order, cells: [chunk_order]}` then `{node: k, cells: [k + d]}`
-stepping `−2`) is the intended default a store gets when it never spells
+stepping `−2` down to `shard_order % 2` — node 0 on even shard orders, node
+1 on odd) is the intended default a store gets when it never spells
 `levels:`; it is recorded there as informative, since a `/2` manifest always
 carries an explicit resolved list. Two practice points:
 

@@ -712,14 +712,14 @@ not exist in a `/2` block; every other key is unchanged:
   contract. The derived default is bound to the grid block: with
   `d = chunk_order - shard_order`, `{node: shard_order, cells:
   [chunk_order]}` plus `{node: k, cells: [k + d]}` for `k = shard_order - 2`
-  stepping `-2` down to 1. That derivation is **informative** — a reader
-  never needs it, since the manifest always records the resolved list, and
-  today zagg emits a `/2` block only for an explicit `levels:` knob. It
-  becomes the writer default when `/2` becomes sweepable
-  ([#383](https://github.com/englacial/zagg/issues/383),
-  [#384](https://github.com/englacial/zagg/issues/384)), and its exact tail
-  — whether an even shard order reaches node 0 — is an open question on the
-  declaring PR.
+  stepping `-2` down to `shard_order % 2` — node 0 on even shard orders,
+  node 1 on odd (step by 2 until you run out, matching the `/1` default's
+  reach; espg ruling on the declaring PR). That derivation is
+  **informative** — a reader never needs it, since the manifest always
+  records the resolved list, and today zagg emits a `/2` block only for an
+  explicit `levels:` knob. It becomes the writer default when `/2` becomes
+  sweepable ([#383](https://github.com/englacial/zagg/issues/383),
+  [#384](https://github.com/englacial/zagg/issues/384)).
 - **The declared-off form is smaller, and `orders` is the only key a reader
   may bind unconditionally.** With the pyramid knob off the block is exactly
 

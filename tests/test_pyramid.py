@@ -174,7 +174,15 @@ class TestDefaultLevels:
         assert default_levels(4, 5, child_order=6) == [
             {"node": 4, "cells": [5]},
             {"node": 2, "cells": [3]},
+            {"node": 0, "cells": [1]},
         ]
+
+    def test_even_shard_order_walks_down_to_node_zero(self):
+        # The espg ruling on the node walk's tail (PR #389 thread): step by 2
+        # until you run out — node 0 on even shard orders, node 1 on odd,
+        # matching the /1 default's range(shard - 2, -1, -2) reach.
+        assert [e["node"] for e in default_levels(6, 8, child_order=12)] == [6, 4, 2, 0]
+        assert [e["node"] for e in default_levels(9, 13, child_order=19)] == [9, 7, 5, 3, 1]
 
     def test_k_one_degenerates_to_whole_footprint_groups(self):
         # K == 1: the grid's RESOLVED chunk order equals parent_order, so
@@ -182,6 +190,7 @@ class TestDefaultLevels:
         assert default_levels(4, 4, child_order=6) == [
             {"node": 4, "cells": [4]},
             {"node": 2, "cells": [2]},
+            {"node": 0, "cells": [0]},
         ]
 
     def test_chunk_order_at_child_order_refused(self):

@@ -475,7 +475,11 @@ def build_pyramid(out: Path) -> None:
         },
         # The §4.5 derived-default formula for this geometry (informative in
         # the spec; pinned here so zagg's derivation cannot drift from it).
-        "default_levels": [{"node": 4, "cells": [5]}, {"node": 2, "cells": [3]}],
+        "default_levels": [
+            {"node": 4, "cells": [5]},
+            {"node": 2, "cells": [3]},
+            {"node": 0, "cells": [1]},
+        ],
     }
     (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
     print(f"{out.name}: manifest-only, {len(levels)} level entries, /1 actuals preserved")

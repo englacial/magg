@@ -160,9 +160,12 @@ def default_levels(parent_order: int, chunk_order: int, *, child_order: int) -> 
 
     With ``d = chunk_order - parent_order``: ``{node: parent_order, cells:
     [chunk_order]}`` plus ``{node: k, cells: [k + d]}`` for
-    ``k = parent_order - 2`` stepping ``-2`` down to 1. For the 19/13/9
-    reference geometry: (9,[13]) (7,[11]) (5,[9]) (3,[7]) (1,[5]). An
-    explicit ``levels:`` block replaces this default WHOLESALE.
+    ``k = parent_order - 2`` stepping ``-2`` down to ``parent_order % 2`` —
+    node 0 on even shard orders, node 1 on odd (step by 2 until you run out;
+    espg ruling on the PR #389 thread, matching the ``/1`` default's
+    ``range(shard - 2, -1, -2)`` reach). For the 19/13/9 reference geometry:
+    (9,[13]) (7,[11]) (5,[9]) (3,[7]) (1,[5]). An explicit ``levels:`` block
+    replaces this default WHOLESALE.
 
     ``chunk_order`` is the grid's RESOLVED chunk order — pass
     ``grid.chunk_order``, never the raw ``output.grid.chunk_inner`` knob: an
@@ -184,7 +187,7 @@ def default_levels(parent_order: int, chunk_order: int, *, child_order: int) -> 
     parent_order, chunk_order = int(parent_order), int(chunk_order)
     d = chunk_order - parent_order
     levels = [{"node": parent_order, "cells": [parent_order + d]}]
-    levels += [{"node": k, "cells": [k + d]} for k in range(parent_order - 2, 0, -2)]
+    levels += [{"node": k, "cells": [k + d]} for k in range(parent_order - 2, -1, -2)]
     validate_levels(levels, parent_order=parent_order, child_order=child_order)
     return levels
 

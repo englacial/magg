@@ -646,7 +646,10 @@ class TestPyramidV2Declaration:
         s, chunk = exp["shard_order"], exp["chunk_order"]
         d = chunk - s
         formula = [{"node": s, "cells": [chunk]}] + [
-            {"node": k, "cells": [k + d]} for k in range(s - 2, 0, -2)
+            # Down to shard_order % 2: node 0 on even shard orders, node 1 on
+            # odd (the espg ruling on the declaring PR's node-walk tail).
+            {"node": k, "cells": [k + d]}
+            for k in range(s - 2, -1, -2)
         ]
         assert formula == exp["default_levels"]
 
