@@ -414,6 +414,30 @@ class TestWindowingConfig:
         with pytest.raises(ValueError, match="unsupported key"):
             validate_config(cfg)
 
+    @pytest.mark.parametrize(
+        "entry,named",
+        [
+            (
+                {"label": "w", "start": "2019-06-01", "end": "2019-09-01", "width": 3600},
+                "width",
+            ),
+            (
+                # Every offending key is named, so one edit fixes the entry.
+                {"label": "w", "start": "2019-06-01", "end": "2019-09-01", "note": "x", "stop": 1},
+                "note, stop",
+            ),
+        ],
+    )
+    def test_explicit_range_unsupported_key_rejected(self, cfg, entry, named):
+        # The range form refuses unknown keys exactly like the point form: a
+        # dead or typo'd key has no semantic effect, so it fails loud rather
+        # than riding along (PR #367).
+        _windowed(cfg, schedule="explicit", windows=[entry])
+        with pytest.raises(
+            ValueError, match=rf"unsupported key\(s\) {named}; the range form is \{{label, start"
+        ):
+            validate_config(cfg)
+
     def test_explicit_point_bad_timestamp_rejected(self, cfg):
         _windowed(cfg, schedule="explicit", windows=[{"label": "w", "timestamp": "not-a-time"}])
         with pytest.raises(ValueError, match="ISO-8601"):
