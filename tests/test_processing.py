@@ -2030,6 +2030,101 @@ class TestRaggedChunkCompanion:
         np.testing.assert_array_equal(np.frombuffer(raw, "<f4"), [1.0, 2.0])
 
 
+class TestObsReadMetadata:
+    """Issue #374: the worker sums the per-granule read sink into
+    ``metadata["total_obs_read"]`` — observations READ, alongside the kept
+    ``total_obs`` — so the run parquet can carry the read-vs-keep ratio.
+
+    The decode-side counting is pinned in ``TestPlannedReadGroup``; what these
+    pin is the worker's half: it hands each granule its OWN sink, sums them,
+    and reports nothing at all when the read seam never measured.
+    """
+
+    @staticmethod
+    def _cfg():
+        from zagg.config import default_config
+
+        cfg = default_config("atl06")
+        cfg.output["grid"] = {
+            "type": "healpix",
+            "parent_order": 6,
+            "child_order": 8,
+            "sharded": False,
+        }
+        cfg.aggregation["variables"] = {"count": {"function": "len", "source": "h_li"}}
+        # One beam group, so "rows per granule" is exactly one read_group call
+        # and the arithmetic below is readable (atl06 declares six beams).
+        cfg.data_source["groups"] = ["gt1l"]
+        return cfg
+
+    def _run(self, monkeypatch, read_group, granules):
+        from mortie import geo2mort
+
+        from zagg.index.hierarchical import HierarchicalIndex
+
+        cfg = self._cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg, sharded=False)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+
+        monkeypatch.setattr("zagg.processing._read_group", read_group)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", lambda *a, **k: object())
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
+        _df, metadata = process_shard(
+            grid, shard_key, granules, s3_credentials={}, config=cfg, chunk_results=[]
+        )
+        return metadata, grid, shard_key
+
+    @staticmethod
+    def _carrier(grid, shard_key, n):
+        leaf = int(grid.children(shard_key)[0])
+        return pd.DataFrame(
+            {
+                "h_li": np.arange(n, dtype=np.float32),
+                "leaf_id": np.full(n, leaf, dtype=np.uint64),
+            }
+        )
+
+    def test_sums_the_sink_across_granules_and_exceeds_kept(self, monkeypatch):
+        # Each granule decodes 10 rows and keeps 3, across two granules: the
+        # worker reports 20 read against 6 kept.
+        def read_group(h5obj, group, ds, sk, grid, arrow=False, io_stats=None, **k):
+            io_stats["obs_read"] = io_stats.get("obs_read", 0) + 10
+            return self._carrier(grid, sk, 3)
+
+        metadata, _grid, _sk = self._run(monkeypatch, read_group, ["s3://a", "s3://b"])
+        assert metadata["total_obs"] == 6
+        assert metadata["total_obs_read"] == 20
+        assert metadata["total_obs_read"] > metadata["total_obs"]
+
+    def test_unmeasured_seam_omits_the_key(self, monkeypatch):
+        # A read seam that never touches the sink (a stub, or a backend
+        # predating the field) must leave the key ABSENT, so the record reads
+        # as unmeasured rather than a fabricated zero.
+        def read_group(h5obj, group, ds, sk, grid, arrow=False, io_stats=None, **k):
+            return self._carrier(grid, sk, 3)
+
+        metadata, _grid, _sk = self._run(monkeypatch, read_group, ["s3://a"])
+        assert metadata["total_obs"] == 3
+        assert "total_obs_read" not in metadata
+
+    def test_each_granule_gets_its_own_sink(self, monkeypatch):
+        # The no-lock argument: the worker must not hand the same dict to two
+        # granules (they may be read concurrently under granule_workers > 1).
+        seen: list = []
+
+        def read_group(h5obj, group, ds, sk, grid, arrow=False, io_stats=None, **k):
+            seen.append(id(io_stats))
+            io_stats["obs_read"] = io_stats.get("obs_read", 0) + 5
+            return self._carrier(grid, sk, 1)
+
+        metadata, _grid, _sk = self._run(monkeypatch, read_group, ["s3://a", "s3://b", "s3://c"])
+        assert len(set(seen)) == len(seen) == 3  # three distinct dicts
+        assert metadata["total_obs_read"] == 15
+
+
 class TestMultiChunkWorker:
     """Issue #30 item 3: one worker (one shard) owns K = grid.chunks_per_shard finer
     Zarr chunks. process_shard reads granules once and returns one carrier + ragged
@@ -4822,6 +4917,87 @@ class TestPlannedReadGroup:
         grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
         with pytest.raises(ValueError, match="must link directly to base level"):
             _read_group(h5, "gt1l", ds, 0, grid)
+
+    def test_obs_read_counts_padded_decode_above_kept(self):
+        # Issue #374: the read counter is rows DECODED, so the read-plan's
+        # pad — which pulls whole neighbouring segments in to recover boundary
+        # photons — shows up as obs_read > kept. Same fixture and band as
+        # test_pad_recovers_boundary_segment_and_matches_full: the mask picks
+        # segments 2,3 (rep-points 200,300); pad=1 widens the run to segments
+        # 1..4, i.e. photons [2, 10) = 8 decoded, of which 4 survive the band.
+        h5 = _planned_read_h5()
+        grid = _LatBboxGrid((-0.1, 150.0, 0.1, 310.0))
+        ds = _planned_read_data_source()
+        ds["read_plan"]["pad"] = 1
+
+        io_stats: dict = {}
+        df = _read_group(h5, "gt1l", ds, 0, grid, io_stats=io_stats)
+
+        assert df["h"].tolist() == [30.0, 40.0, 50.0, 60.0]
+        assert io_stats["obs_read"] == 8
+        assert io_stats["obs_read"] > len(df)
+
+    def test_obs_read_accumulates_across_groups(self):
+        # The sink is per-GRANULE, so successive group reads add into it — the
+        # worker sums one dict per granule rather than one per group.
+        h5 = _planned_read_h5()
+        grid = _LatBboxGrid((-0.1, 150.0, 0.1, 310.0))
+        ds = _planned_read_data_source()
+        ds["read_plan"]["pad"] = 1
+
+        io_stats: dict = {}
+        _read_group(h5, "gt1l", ds, 0, grid, io_stats=io_stats)
+        _read_group(h5, "gt1l", ds, 0, grid, io_stats=io_stats)
+        assert io_stats["obs_read"] == 16
+
+    def test_full_read_path_counts_the_whole_group(self):
+        # The flat/full route decodes the base coords entirely, so obs_read is
+        # the group's whole photon count however few survive the shard mask.
+        h5 = _planned_read_h5()
+        grid = _LatBboxGrid((-0.1, 175.0, 0.1, 225.0))
+        ds_full = {
+            "coordinates": {"latitude": "/heights/lat_ph", "longitude": "/heights/lon_ph"},
+            "variables": {"h": "/heights/h"},
+        }
+        io_stats: dict = {}
+        df = _read_group(h5, "gt1l", ds_full, 0, grid, io_stats=io_stats)
+        assert df["h"].tolist() == [40.0]
+        assert io_stats["obs_read"] == 12  # all 12 photons decoded to keep 1
+
+    def test_full_read_fallback_counts_once_not_twice(self):
+        # The selectivity fallback re-enters _read_group_full from inside the
+        # planned path. Only the arm that actually decodes may count, or the
+        # ratio would double-count the fallback.
+        ds = _planned_read_data_source()
+        ds["read_plan"]["full_read_threshold"] = 0.1  # force the fallback
+        h5 = _planned_read_h5()
+        grid = _BboxGrid((-0.1, 175.0, 0.1, 225.0))
+        io_stats: dict = {}
+        _read_group(h5, "gt1l", ds, 0, grid, io_stats=io_stats)
+        assert io_stats["obs_read"] == 12
+
+    def test_no_sink_counts_nothing(self):
+        # Default (None) is the unchanged path: no counting, no crash.
+        h5 = _planned_read_h5()
+        grid = _LatBboxGrid((-0.1, 150.0, 0.1, 310.0))
+        ds = _planned_read_data_source()
+        ds["read_plan"]["pad"] = 1
+        # Identical rows to the counted run above — the sink is observation-only.
+        assert _read_group(h5, "gt1l", ds, 0, grid)["h"].tolist() == [30.0, 40.0, 50.0, 60.0]
+
+    def test_empty_decode_reads_as_measured_zero(self):
+        # An instrumented route that decodes nothing must SET the key (measured
+        # zero), so it stays distinguishable from an uninstrumented seam, which
+        # leaves it absent and reports None.
+        h5 = _planned_read_h5()
+        ds_full = {
+            "coordinates": {"latitude": "/heights/lat_ph", "longitude": "/heights/lon_ph"},
+            "variables": {"h": "/heights/h"},
+        }
+        grid = _LatBboxGrid((-0.1, 100000.0, 0.1, 100001.0))  # matches nothing
+        io_stats: dict = {}
+        assert _read_group(h5, "gt1l", ds_full, 0, grid, io_stats=io_stats) is None
+        assert io_stats["obs_read"] == 12  # decoded, then all masked out
 
     def test_multi_slice_plan_global_idx_alignment(self):
         # Force a plan with two disjoint base-slices (one ATL03 track that

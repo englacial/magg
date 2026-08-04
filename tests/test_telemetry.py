@@ -132,6 +132,29 @@ class TestBuildRecord:
         # through the invoke payload, copied verbatim into the record.
         assert _record(run_id="deadbeef")["run_id"] == "deadbeef"
 
+    def test_n_obs_read_absent_reads_as_unmeasured(self):
+        # Issue #374: no ``total_obs_read`` in the worker metadata — a raster
+        # record, or one from a worker predating the field — reads as None
+        # (unmeasured), NOT as zero, so a rollup can't dilute the ratio with
+        # rows nobody counted.
+        assert _record()["n_obs_read"] is None
+
+    def test_n_obs_read_rides_worker_metadata(self):
+        rec = build_record(
+            shard_key=1,
+            metadata={"duration_s": 1.0, "total_obs": 400, "total_obs_read": 1000},
+        )
+        assert rec["n_obs"] == 400
+        assert rec["n_obs_read"] == 1000
+        # The ratio is derived at read time, never stored (the #297 convention).
+        assert "read_keep_ratio" not in rec
+
+    def test_n_obs_read_zero_is_distinct_from_absent(self):
+        rec = build_record(
+            shard_key=1, metadata={"duration_s": 1.0, "total_obs": 0, "total_obs_read": 0}
+        )
+        assert rec["n_obs_read"] == 0  # measured zero, not None
+
     def test_raster_counters_default_none_and_populate(self):
         # Off-raster records carry the read-volume fields as None (issue #297).
         rec = _record()
@@ -219,6 +242,33 @@ class TestMerge:
         assert m["phase_timings"]["read"] == pytest.approx(16.0)
         assert m["timestamp"] == max(a["timestamp"], b["timestamp"])
         assert m["success"] is True
+
+    def test_n_obs_read_sums_over_the_fold(self):
+        # Issue #374: mergeable by construction, like the raster counters —
+        # the up-tree rollup sums reads and keeps, and the ratio is taken
+        # after the fold rather than averaged across leaves.
+        a = build_record(
+            shard_key=1, metadata={"duration_s": 1.0, "total_obs": 40, "total_obs_read": 100}
+        )
+        b = build_record(
+            shard_key=2, metadata={"duration_s": 1.0, "total_obs": 60, "total_obs_read": 300}
+        )
+        m = merge([a, b])
+        assert m["n_obs"] == 100
+        assert m["n_obs_read"] == 400
+
+    def test_n_obs_read_back_compat_row_folds(self):
+        # A record predating the field (None) must not poison the fold: the
+        # _SUM_OR_NONE disposition skips it, so a mixed rollup reports the
+        # measured part rather than collapsing to None.
+        measured = build_record(
+            shard_key=1, metadata={"duration_s": 1.0, "total_obs": 40, "total_obs_read": 100}
+        )
+        legacy = build_record(shard_key=2, metadata={"duration_s": 1.0, "total_obs": 60})
+        assert legacy["n_obs_read"] is None
+        assert merge([measured, legacy])["n_obs_read"] == 100
+        # All-unmeasured stays unmeasured.
+        assert merge([legacy, legacy])["n_obs_read"] is None
 
     def test_content_hashes_merge_equal_or_none(self):
         # Per-leaf identity (issue #342): shared value survives a fold,
@@ -446,7 +496,19 @@ class TestRunParquet:
         assert row["invoked_by"] == ident["arn"]
         assert row["invoked_by_userid"] == ident["userid"]
         assert "raster_bytes_read" in row  # read-volume columns always present
+        # The point-path read counter is a column of every run parquet too, so
+        # the read-vs-keep ratio is queryable alongside n_obs (issue #374).
+        assert "n_obs_read" in row
         assert "phase_timings" not in row and "lambda" not in row  # flattened away
+
+    def test_n_obs_read_flattens_to_a_column(self):
+        rec = build_record(
+            shard_key=3, metadata={"duration_s": 1.0, "total_obs": 40, "total_obs_read": 100}
+        )
+        row = flatten_record(rec)
+        assert row["n_obs"] == 40 and row["n_obs_read"] == 100
+        # Unmeasured stays null in the column rather than defaulting to 0.
+        assert flatten_record(_record())["n_obs_read"] is None
 
     def test_failure_record_and_error_class(self):
         rec = failure_record(

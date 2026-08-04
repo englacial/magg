@@ -20,6 +20,13 @@ class ProcessingMetadata(TypedDict):
     cells_with_data: int
     total_obs: int
     granule_count: int
+    # Base-rate rows DECODED before filtering/assignment (issue #374), summed
+    # over the shard's granules — always >= ``total_obs``, whose difference is
+    # the read-plan padding, boundary-straddling segments, and filter rejects.
+    # ``NotRequired``: present only when a read route measured it, so absence
+    # reads as unmeasured (a stubbed read seam, or a worker predating the
+    # field) rather than a genuine zero.
+    total_obs_read: NotRequired[int]
     files_processed: int
     duration_s: float
     error: str | None

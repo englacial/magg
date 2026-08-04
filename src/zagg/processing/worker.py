@@ -235,8 +235,9 @@ def process_shard(
     -------
     (DataFrame, metadata)
         DataFrame in canonical chunk order; metadata dict with ``shard_key``,
-        ``cells_with_data``, ``total_obs``, ``granule_count``,
-        ``files_processed``, ``duration_s``, ``error``. Ragged fields are
+        ``cells_with_data``, ``total_obs``, ``total_obs_read`` (issue #374 —
+        rows decoded pre-filter, present only when a read route measured it),
+        ``granule_count``, ``files_processed``, ``duration_s``, ``error``. Ragged fields are
         delivered out-of-band via ``ragged_out`` (above), not in this tuple. At
         K>1 the per-chunk carriers + ragged are delivered via ``chunk_results``.
     """
@@ -403,17 +404,22 @@ def process_shard(
         → close, all in the calling thread (issue #180 — under the pool each
         granule gets its own ``H5Coro``, never shared across threads).
 
-        Returns ``(reads, group_errors)``: ``reads`` is the carriers of the
-        groups that returned data (group order, ``None`` — legitimately empty
-        — groups dropped); ``group_errors`` counts raised group reads, warned
-        here but folded into ``read_errors`` by the main thread (a shared
-        ``+= 1`` from worker threads could race). Raises when the granule
-        itself fails (e.g. the open) — the caller warns and skips it, shard
-        continues (issue #116 semantics).
+        Returns ``(reads, group_errors, io_stats)``: ``reads`` is the carriers
+        of the groups that returned data (group order, ``None`` — legitimately
+        empty — groups dropped); ``group_errors`` counts raised group reads,
+        warned here but folded into ``read_errors`` by the main thread (a
+        shared ``+= 1`` from worker threads could race); ``io_stats`` is this
+        granule's read counters (issue #374), allocated FRESH here so it is
+        written only by the thread that owns the granule and read by the main
+        thread after the result is handed back — the same no-lock argument as
+        ``group_errors``, rather than a shared dict the pool would race on.
+        Raises when the granule itself fails (e.g. the open) — the caller warns
+        and skips it, shard continues (issue #116 semantics).
         """
         h5obj = None
         reads: list = []
         group_errors = 0
+        io_stats: dict = {}
         try:
             resource_path = _rewrite_url(s3_url)
 
@@ -427,7 +433,7 @@ def process_shard(
 
             for g in data_source["groups"]:
                 try:
-                    read_kwargs = {"arrow": use_arrow}
+                    read_kwargs = {"arrow": use_arrow, "io_stats": io_stats}
                     if apriori:
                         read_kwargs["granule_url"] = s3_url
                     chunk = index_backend.read_group(
@@ -454,7 +460,7 @@ def process_shard(
                 # #175) on a path that never fails the read.
                 logger.warning(f"  index backend finish_granule failed for {s3_url}: {e}")
 
-            return reads, group_errors
+            return reads, group_errors, io_stats
         finally:
             # Release this granule's h5coro cache before the next one (issue #66):
             # without it each granule's unevicted cache stays resident for the whole
@@ -471,7 +477,7 @@ def process_shard(
                     logger.debug("h5coro cache release failed", exc_info=True)
 
     def _iter_granule_reads():
-        """Yield ``(s3_url, reads, group_errors)`` in original ``granule_urls`` order.
+        """Yield ``(s3_url, reads, group_errors, io_stats)`` in ``granule_urls`` order.
 
         ``granule_workers == 1`` reads each granule in this thread — the
         unchanged serial loop. Above 1, up to ``granule_workers`` granules are
@@ -502,7 +508,7 @@ def process_shard(
                 while in_flight:
                     s3_url, future = in_flight.popleft()
                     try:
-                        reads, group_errors = future.result()
+                        reads, group_errors, granule_io = future.result()
                     except Exception as e:
                         granule_errors += 1
                         _record_read_error(f"processing file {s3_url}", e)
@@ -515,11 +521,21 @@ def process_shard(
                     for u in islice(urls, 1):
                         in_flight.append((u, pool.submit(_read_granule, u)))
                     if reads is not None:
-                        yield s3_url, reads, group_errors
+                        yield s3_url, reads, group_errors, granule_io
+
+    # Observations READ (issue #374): base-rate rows decoded across every
+    # granule BEFORE the shard mask, filters, and read-plan segment padding
+    # cut them down — the numerator of the read-vs-keep ratio whose
+    # denominator is ``total_obs``. ``None`` until some read route reports a
+    # count, so a stubbed/older read seam reads as UNMEASURED rather than a
+    # real zero (the issue #297 nullable-counter convention).
+    obs_read_total: int | None = None
 
     # Read files and filter spatially, folding granules in original order.
-    for s3_url, reads, group_errors in _iter_granule_reads():
+    for s3_url, reads, group_errors, granule_io in _iter_granule_reads():
         read_errors += group_errors
+        if "obs_read" in granule_io:
+            obs_read_total = (obs_read_total or 0) + int(granule_io["obs_read"])
         try:
             for chunk in reads:
                 if buffered is not None:
@@ -804,6 +820,11 @@ def process_shard(
 
     metadata["cells_with_data"] = cells_with_data
     metadata["total_obs"] = n_obs_total
+    # Pre-filter read volume (issue #374), stamped only when a read route
+    # actually measured it — absence is "unmeasured", not zero.
+    if obs_read_total is not None:
+        metadata["total_obs_read"] = obs_read_total
+        logger.info(f"  Read {obs_read_total:,} observations, kept {n_obs_total:,}")
     metadata["duration_s"] = duration
 
     # K==1: deliver the lone chunk's carrier as the 2-tuple ``df_out`` and its

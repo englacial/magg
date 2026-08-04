@@ -52,6 +52,7 @@ _SUM_KEYS = ("n_shards", "n_granules", "n_obs", "cells_with_data", "duration_s")
 _SUM_OR_NONE_KEYS = (
     "gb_seconds",
     "est_cost_usd",
+    "n_obs_read",
     "spill_bytes",
     "spill_blocks_closed",
     "raster_bytes_read",
@@ -131,6 +132,7 @@ def build_record(
 
     ``metadata`` is the existing worker result (``process_shard`` /
     ``process_and_write_hive`` / the raster metas): ``total_obs``,
+    ``total_obs_read`` (when the read path measured it — issue #374),
     ``cells_with_data``, ``duration_s``, ``phase_timings``, and the memory
     telemetry keys when the caller stamped them. ``invoked_by`` is copied
     VERBATIM from the invoke payload — the dispatcher resolves it via
@@ -202,6 +204,13 @@ def build_record(
         # reads as unverifiable, not tampered.
         "content_hashes": metadata.get("content_hashes"),
         "n_obs": int(metadata.get("total_obs") or 0),
+        # Point-path read volume (issue #374): observations DECODED before the
+        # shard mask / filters / read-plan padding cut them to ``n_obs``, so
+        # ``n_obs_read >= n_obs`` and the read-vs-keep ratio is derivable at
+        # read time (never stored — the raster ``px_decoded`` convention).
+        # Nullable: ``None`` on the raster path and on records from workers
+        # predating the field, where absence means unmeasured, not zero.
+        "n_obs_read": _opt_int(metadata.get("total_obs_read")),
         "cells_with_data": int(metadata.get("cells_with_data") or 0),
         "phase_timings": phase_timings,
         "duration_s": duration_s,
@@ -329,6 +338,7 @@ _ROW_SCALARS = (
     "n_granules",
     "granules_sha256",
     "n_obs",
+    "n_obs_read",
     "cells_with_data",
     "duration_s",
     "gb_seconds",
