@@ -558,10 +558,13 @@ def write_leaf_column(
     the declaration carries no leaf-node levels — in which case any column a
     PREVIOUS declaration left at this ``(leaf, window)``, and its sidecar,
     are deleted (:func:`_clear_column`), so the artifact never outlives the
-    declaration that made it. Failures RAISE: the caller
-    treats a column failure like any other leaf-write failure — the unit
-    reports failed, and the idempotent retry rewrites leaf and column
-    wholesale (both writers clear their own prefix first).
+    declaration that made it. Failures RAISE;
+    ``hive.process_and_write_hive`` REPORTS them as the unit's
+    ``metadata["error"]`` rather than propagating (the leaf is already
+    committed there, and a propagated raise would take the unit's whole
+    telemetry envelope with it) — the unit still fails, and the idempotent
+    retry rewrites leaf and column wholesale (both writers clear their own
+    prefix first).
 
     Memory note (the PR #391 phase 1 review measurement): the node-order
     member's k-way merge concatenates every resident digest once — at the
