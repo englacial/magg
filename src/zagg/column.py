@@ -18,14 +18,34 @@ the issue #370 fold law) — the same kernels the sweep's from-leaves fold
 runs over the same per-cell inputs in the same ascending order, so column
 bytes are parity-equal with that fold by construction.
 
-This module owns the fold core (pure functions over in-memory slabs); the
-column writer and the worker integration are the later phases of issue #383.
-Nothing here reads or writes a store.
+This module owns the fold core (pure functions over in-memory slabs) and the
+column writer (one artifact per ``(leaf, window)``, D4 write discipline: a
+wholesale template, every resolution group, the role/provenance attrs, ONE
+commit stamp last covering the whole column, and the D20 stats sidecar after
+the stamp). The worker integration is the last phase of issue #383.
 """
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+#: Envelope version of the column artifact's provenance attrs payload.
+COLUMN_SPEC = "zagg-column/1"
+#: Root-group attrs key carrying the column provenance payload (D11).
+COLUMN_ATTR = "zagg_column"
+#: ``role`` attrs value classifying a column zarr (D11: classification by
+#: attrs, never tree position; source leaves carry no role — absence means
+#: source — and the sweep's overview family keeps its own ``overview`` role).
+COLUMN_ROLE = "column"
+#: The #381 point (7) regime every leaf-written group records: folded from
+#: the leaf's own resident cells. No ``source_children`` rides this regime
+#: (PR #379 precedent: coverage counts ride ``cascade``) — a leaf column's
+#: source is complete by construction, and its merges-from-raw is 1.
+LEAF_REGIME = "leaf-column"
 
 
 def column_resolutions(levels: list, node_order: int) -> list[int]:
@@ -176,3 +196,175 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
                 groups[name] = folded
         out[res] = groups
     return out
+
+
+def column_name(window: str | None) -> str:
+    """The column basename: the D23 window stem + ``.pyramid.zarr``.
+
+    ``{window}.pyramid.zarr``, with ``all.pyramid.zarr`` for the unwindowed /
+    schedule-none leaf — the same window-only stem the overview writer uses
+    unconditionally (:func:`zagg.windows.leaf_name_v3`), plus a ``.pyramid``
+    stem marker so the name is disjoint from every leaf and overview basename
+    (both end at ``{window}.zarr``). Proposed on the issue #383 PR, flagged
+    there as a naming question.
+    """
+    from zagg.windows import leaf_name_v3
+
+    return leaf_name_v3(window).removesuffix(".zarr") + ".pyramid.zarr"
+
+
+def write_column(
+    store_root: str,
+    shard_key,
+    folded: dict,
+    fields: dict,
+    *,
+    node_order: int,
+    cell_order: int,
+    window: str | None = None,
+    time_range=None,
+    granule_count: int = 0,
+    store_kwargs: dict | None = None,
+) -> str:
+    """Write one leaf's column artifact under its node prefix; returns its basename.
+
+    ``folded`` is :func:`fold_column`'s output; ``fields`` the declaration's
+    composable map (the template and the provenance attrs are derived from
+    it, exactly as the overview writer derives them). The write order is the
+    leaf's own D4 discipline: template (wholesale — the prefix is DELETED
+    first, the issue #341 semantics, so an idempotent re-run replaces the
+    column entirely and a prior torn write never survives) -> every
+    resolution group's ``morton`` + ``{order}/{field}`` arrays -> the
+    role/provenance attrs -> ONE commit stamp LAST covering the whole
+    column. There is no partial-column failure state: an interrupted writer
+    leaves an unstamped prefix — ignorable debris, and repair is re-invoking
+    the idempotent leaf (never a sweep-side fallback to raw cells). The D20
+    stats sidecar is a SIBLING object PUT after the stamp (fail-open,
+    telemetry class), so the stamp stays the column's own final write.
+
+    Single-writer law (#381 point (2)): the column lives only under its
+    leaf's node prefix and has exactly one writer, ever — no locking.
+    """
+    import zarr
+    from mortie import generate_morton_children
+    from pydantic_zarr.experimental.v3 import GroupSpec
+    from zarr import config as zarr_config
+    from zarr import open_array
+    from zarr.core.sync import sync
+
+    from zagg.grids.base import vlen_dtype_warning_suppressed
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.grids.morton import morton_decimal
+    from zagg.hive import _utcnow, shard_leaf_path, stamp_commit
+    from zagg.store import open_store
+    from zagg.sweep_overview import (
+        ROLE_ATTR,
+        _field_provenance,
+        _overview_config,
+        _populated_mask,
+    )
+    from zagg.windows import SCHEDULE_NONE_TOKEN
+
+    store_kwargs = dict(store_kwargs or {})
+    node_order, cell_order = int(node_order), int(cell_order)
+    fields = composable_fields(fields)
+    resolutions = sorted((int(r) for r in folded), reverse=True)
+    leaf_path = shard_leaf_path(store_root, shard_key, window=window)
+    node_prefix = leaf_path.rstrip("/").rsplit("/", 1)[0]
+    basename = column_name(window)
+    path = f"{node_prefix}/{basename}"
+    cfg = _overview_config(fields)
+    grids = {res: HealpixGrid(node_order, res, config=cfg, sharded=True) for res in resolutions}
+    spec = GroupSpec(
+        members={str(res): grids[res].shard_spec() for res in resolutions}, attributes={}
+    )
+    store = open_store(path, **store_kwargs)
+    staged: dict = {}
+    with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
+        sync(store.delete_dir(""))
+        spec.to_zarr(store, "", overwrite=True)
+    for res in resolutions:
+        words = np.asarray(generate_morton_children(int(shard_key), res), dtype=np.uint64)
+        arr = open_array(store, path=f"{res}/morton", zarr_format=3, consolidated=False)
+        arr[:] = words
+        staged[f"{res}/morton"] = words
+        for name, slab in folded[res].items():
+            arr = open_array(store, path=f"{res}/{name}", zarr_format=3, consolidated=False)
+            arr[:] = slab
+            staged[f"{res}/{name}"] = slab
+    root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
+    root.attrs.update(
+        {
+            ROLE_ATTR: COLUMN_ROLE,
+            COLUMN_ATTR: {
+                "spec": COLUMN_SPEC,
+                "node": morton_decimal(int(shard_key)),
+                "order": node_order,
+                "source_cell_order": cell_order,
+                "window": window if window is not None else SCHEDULE_NONE_TOKEN,
+                "fields": {n: _field_provenance(m) for n, m in fields.items()},
+                "groups": {
+                    str(res): {
+                        "regime": LEAF_REGIME,
+                        "merges_from_raw": 1,
+                        "n_cells": 4 ** (res - node_order),
+                    }
+                    for res in resolutions
+                },
+                "generated_at": _utcnow(),
+            },
+        }
+    )
+    populated = _populated_mask(folded[resolutions[0]], fields)
+    stamp_commit(
+        store,
+        cells_with_data=int(populated.sum()),
+        granule_count=int(granule_count),
+        window=window,
+        time_range=time_range if window is not None else None,
+    )
+    _write_sidecar(
+        path, shard_key, staged, int(populated.sum()), granule_count, window, store_kwargs
+    )
+    return basename
+
+
+def _write_sidecar(
+    path, shard_key, staged, cells_with_data, granule_count, window, store_kwargs
+) -> None:
+    """The column's D20 stats sidecar: ``{stem}.stats.json``, after the stamp.
+
+    The overview writer's O11 recipe (issue #342, spec §5): the content
+    hashes computed from the staged arrays just written, in a
+    :func:`zagg.telemetry.build_record` row keyed by the shard. The name is
+    derived from the column's own stem — ``telemetry.sidecar_key``'s label
+    grammar (rightly) rejects the dotted ``.pyramid`` stem, and the rule is
+    the same ``{stem}.stats.json`` one. Fail-open (D9 telemetry posture):
+    §5.3 reads absence as unverifiable, never tampered.
+    """
+    import json
+
+    import obstore
+    import zarr
+
+    from zagg.store import open_object_store, open_store
+
+    try:
+        from zagg.content_hash import content_hashes_record, hash_arrays
+        from zagg.telemetry import build_record
+
+        group = zarr.open_group(open_store(path, **store_kwargs), path="", mode="r", zarr_format=3)
+        record = build_record(
+            shard_key=int(shard_key),
+            metadata={
+                "cells_with_data": int(cells_with_data),
+                "granule_count": int(granule_count),
+                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+            },
+            window=window,
+        )
+        prefix, _, name = path.rstrip("/").rpartition("/")
+        sidecar = name.removesuffix(".zarr") + ".stats.json"
+        obstore.put(open_object_store(prefix, **store_kwargs), sidecar, json.dumps(record).encode())
+    except Exception as e:
+        logger.warning(f"column stats sidecar failed (fail-open, issue #383): {e}")
