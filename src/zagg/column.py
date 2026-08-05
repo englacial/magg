@@ -25,11 +25,7 @@ Nothing here reads or writes a store.
 
 from __future__ import annotations
 
-import logging
-
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 
 def column_resolutions(levels: list, node_order: int) -> list[int]:
