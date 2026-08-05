@@ -975,7 +975,7 @@ class TestSweepCli:
         assert "orders" not in summary and '"orders"' not in out
         assert summary["overviews"] == levels and summary["updated"] is True
         block = read_manifest(str(tmp_path))["pyramid"]
-        assert block["spec"] == PYRAMID_SPEC_V2 and block["overview"]["overviews"] == levels
+        assert block["spec"] == PYRAMID_SPEC_V2 and block["overviews"] == levels
 
     def test_declare_pyramid_flag_does_not_sweep_a_sweepable_store(self, tmp_path, capsys):
         # The positive control for the assertion above: the SAME fixture, swept

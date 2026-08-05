@@ -290,8 +290,11 @@ output:
 ```
 
 Spelling `overviews` writes the manifest block as `zagg-pyramid/2` with the
-normalized list (sugar expanded); without it the block stays `/1` exactly as
-above. The grammar's **validation rules** — descending nodes, per-entry
+normalized list (sugar expanded) at **block level** — `pyramid.overviews`,
+the store-wide product declaration — while the singular `pyramid.overview`
+family dict keeps the sweep leg's execution regime (`all_time`, the #376
+fold keys, `fields`, `materialized`) exactly as under `/1`; without the
+knob the block stays `/1` exactly as above. The grammar's **validation rules** — descending nodes, per-entry
 descending cells with the legal `cells == node` whole-footprint group, and
 the declared gather — are normative in [the specification
 §4.5](specification.md); refusals are loud and named, never silently

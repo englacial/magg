@@ -440,10 +440,13 @@ class TestPyramidBlock:
         block = build_pyramid_block(cfg, shard_order=6)
         assert block["spec"] == PYRAMID_SPEC_V2
         overview = block["overview"]
-        # The normalized grouped form: scalar sugar expanded, order preserved.
-        assert overview["overviews"] == [{"node": 4, "cells": [5, 4]}, {"node": 2, "cells": [3]}]
-        # levels REPLACE the /1 schedule keys wholesale — they must not exist.
+        # The normalized grouped form, at BLOCK level (the espg shape ruling):
+        # scalar sugar expanded, order preserved.
+        assert block["overviews"] == [{"node": 4, "cells": [5, 4]}, {"node": 2, "cells": [3]}]
+        # The list REPLACES the /1 schedule keys wholesale — they must not
+        # exist, and the family dict does not carry the declaration.
         assert "orders" not in overview and "spacing" not in overview
+        assert "overviews" not in overview
         # The issue #376 fold declaration rides along exactly as under /1.
         assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
         # The fields map is revision-independent (same D24 declarations).
@@ -462,7 +465,7 @@ class TestPyramidBlock:
         )
         manifest = build_manifest(grid, dataset={"short_name": "ATL06", "version": "007"})
         assert manifest["pyramid"]["spec"] == PYRAMID_SPEC_V2
-        assert manifest["pyramid"]["overview"]["overviews"] == [{"node": 6, "cells": [7]}]
+        assert manifest["pyramid"]["overviews"] == [{"node": 6, "cells": [7]}]
         json.dumps(manifest)
 
     def test_levels_carry_all_time_and_summarize(self):
@@ -523,7 +526,7 @@ class TestPyramidBlock:
         cfg.output.pop("grid")
         block = build_pyramid_block(cfg, shard_order=6)
         assert block["spec"] == PYRAMID_SPEC_V2
-        assert block["overview"]["overviews"] == [{"node": 4, "cells": [5]}]
+        assert block["overviews"] == [{"node": 4, "cells": [5]}]
 
     def test_validate_rejects_bad_grammar(self):
         from zagg.config import validate_config
@@ -668,8 +671,8 @@ class TestPyramidV2Gate:
         manifest = _write_manifest(root, orders=(1, 0), windowed=windowed)
         manifest["pyramid"] = {
             "spec": "zagg-pyramid/2",
+            "overviews": [{"node": 2, "cells": [3, 2]}],
             "overview": {
-                "overviews": [{"node": 2, "cells": [3, 2]}],
                 "all_time": all_time,
                 "fold_source": "cascade",
                 "exact_levels": 1,
@@ -2162,7 +2165,7 @@ class TestDeclarePyramid:
         assert summary["validated"].startswith("leaf ")  # store truth still probed
         after = read_manifest(str(tmp_path))
         assert after["pyramid"]["spec"] == PYRAMID_SPEC_V2
-        assert after["pyramid"]["overview"]["overviews"] == summary["overviews"]
+        assert after["pyramid"]["overviews"] == summary["overviews"]
 
     def test_declare_v2_is_idempotent(self, tmp_path):
         self._pre_declaration_store(tmp_path)
