@@ -664,18 +664,18 @@ overview family under the versioned `pyramid` block:
 ```
 
 Under revision `/2` ([#382](https://github.com/englacial/zagg/issues/382))
-the schedule is the **`overviews`** list instead — `orders` and `spacing` do
-not exist in a `/2` block; every other key is unchanged:
+the schedule is the **block-level `overviews`** list instead — `orders` and
+`spacing` do not exist in a `/2` block; every other key is unchanged:
 
 ```json
 "pyramid": {
   "spec": "zagg-pyramid/2",
+  "overviews": [
+    {"node": 4, "cells": [5, 4]},
+    {"node": 2, "cells": [5, 4]},
+    {"node": 1, "cells": [2]}
+  ],
   "overview": {
-    "overviews": [
-      {"node": 4, "cells": [5, 4]},
-      {"node": 2, "cells": [5, 4]},
-      {"node": 1, "cells": [2]}
-    ],
     "all_time": false,
     "fold_source": "cascade",
     "exact_levels": 1,
@@ -684,12 +684,23 @@ not exist in a `/2` block; every other key is unchanged:
 }
 ```
 
+The split is deliberate: the block-level `overviews` list is the
+**store-wide product declaration** — what fleet writers, stage sweeps,
+declare-time forecasts, and external readers consume — while the singular
+`overview` dict remains the **overview sweep family's execution regime**
+(D22 per-family bookkeeping: `all_time`, the #376 fold keys, `fields`, the
+sweep's `materialized` actuals), so the two never re-nest. Per-entry
+materialization actuals (#381 point (7)) will nest inside the block-level
+entries themselves when the writers land (#383/#384).
+
 - **`orders`** (`/1`) — the ancestor orders that carry overviews
   (descending; empty = pyramid declared off). `spacing` records the schedule
   step (default 2 — the ratified display schedule). Schedules are per
   artifact family and deliberately decoupled from the tree's
   `path_grouping`.
-- **`overviews`** (`/2`) — the ordered level entries (§4.4), in the
+- **`overviews`** (`/2`) — the ordered level entries (§4.4), recorded at
+  **block level** (a sibling of `spec` and `overview`, never inside the
+  family dict), in the
   **normalized grouped form**: every entry a `{node, cells}` mapping with
   `cells` a list (the config grammar's scalar sugar, `cells: 11` for
   `cells: [11]`, never survives into the manifest). A writer MUST order
@@ -734,11 +745,11 @@ not exist in a `/2` block; every other key is unchanged:
   A reader MUST branch on `spec` first, then on the revision's schedule key:
   under `/1` that is `orders` — an empty `orders` (or no `pyramid` block at
   all — pre-pyramid manifests) means no overview family exists and no other
-  key of the block may be assumed — and under `/2` it is `overviews`. When the
-  schedule key is non-empty, `all_time` and `fields` MUST be present
-  (`spacing` too under `/1`; `summarize` stays optional), so the zero-open
-  field query of §4.4 is well-defined exactly when there is something to
-  query.
+  key of the block may be assumed — and under `/2` it is the block-level
+  `overviews`. When the schedule key is non-empty, `all_time` and `fields`
+  MUST be present in the `overview` family dict (`spacing` too under `/1`;
+  `summarize` stays optional), so the zero-open field query of §4.4 is
+  well-defined exactly when there is something to query.
 - **`fold_source` / `exact_levels`** — the declared fold regime
   ([#376](https://github.com/englacial/zagg/issues/376)): `"cascade"` (the
   default) folds each declared level from the next **finer** declared level's
@@ -806,7 +817,7 @@ not exist in a `/2` block; every other key is unchanged:
   informative rather than an error. It is a convenience — a reader MAY
   instead open the overviews and read §4.3 — and, like every other actual,
   it says nothing about an overview still being present (overviews are
-  regenerable caches, §4.1). On a `/2` store this block-level `materialized`
+  regenerable caches, §4.1). On a `/2` store this family-dict `materialized`
   map is the **`/1`-era inventory**, preserved verbatim across a declaration
   revision bump: a retrofit never discards actuals, and the overviews it
   names stay on disk as regenerable-cache debris. `/2` materialization

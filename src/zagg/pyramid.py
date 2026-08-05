@@ -258,20 +258,25 @@ def overview_block_v2(knob: dict, levels: list, fold: tuple, fields: dict, exclu
 
     ``levels`` is the NORMALIZED grouped form (scalars expanded) — the
     manifest is the reader-facing contract, so no sugar survives into it.
-    Entries carry exactly ``node`` and ``cells`` at template time; the staged
-    sweep (issues #383/#384) later nests per-``(node, cells)`` materialization
-    actuals inside the entry it swept — it never rewrites the declaration.
-    ``fold`` is the declared ``(fold_source, exact_levels)`` pair (issue #376,
-    recorded exactly as under ``/1``: ``exact_levels`` only under the cascade).
-    A declared store is NOT yet sweepable by this zagg: declaring is free,
-    sweeping is the operational decision (#381 point (11)), and
+    The list records at BLOCK level (``pyramid.overviews``, espg shape
+    ruling on the PR #389 thread): it is the store-wide product declaration,
+    consumed by fleet writers, stage sweeps, forecasts, and external
+    readers, while the singular ``pyramid.overview`` family dict keeps one
+    sweep leg's execution regime exactly as under ``/1`` (``all_time``,
+    the issue #376 ``fold_source``/``exact_levels`` pair — ``exact_levels``
+    only under the cascade — ``fields``, ``summarize``, and the sweep's
+    ``materialized`` actuals). Entries carry exactly ``node`` and ``cells``
+    at template time; the staged sweep (issues #383/#384) later nests
+    per-``(node, cells)`` materialization actuals inside the entry it swept
+    — it never rewrites the declaration. A declared store is NOT yet
+    sweepable by this zagg: declaring is free, sweeping is the operational
+    decision (#381 point (11)), and
     :func:`zagg.sweep_overview.sweep_overviews` refuses ``/2`` loudly.
     """
     if excluded:
         warn_excluded(excluded)
     fold_source, exact_levels = fold
     overview: dict = {
-        "overviews": [dict(e) for e in levels],
         "all_time": bool(knob.get("all_time", False)),
         "fold_source": fold_source,
     }
@@ -280,4 +285,8 @@ def overview_block_v2(knob: dict, levels: list, fold: tuple, fields: dict, exclu
     overview["fields"] = fields
     if knob.get("summarize"):
         overview["summarize"] = {str(k): dict(v) for k, v in knob["summarize"].items()}
-    return {"spec": PYRAMID_SPEC_V2, "overview": overview}
+    return {
+        "spec": PYRAMID_SPEC_V2,
+        "overviews": [dict(e) for e in levels],
+        "overview": overview,
+    }

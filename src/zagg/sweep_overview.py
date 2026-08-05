@@ -463,14 +463,15 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     # It also surfaces an unserializable block HERE rather than at the PUT,
     # after the whole store-truth probe has been paid for.
     block = json.loads(json.dumps(block))
-    if "overviews" in block["overview"]:
-        # The /2 (node, cells) declaration (issue #382): re-validate against
-        # the MANIFEST's own orders — config validation saw the config's grid
-        # block, and the retrofit contract is that the store's truth wins.
+    if "overviews" in block:
+        # The /2 (node, cells) declaration (issue #382; block-level list per
+        # the espg shape ruling): re-validate against the MANIFEST's own
+        # orders — config validation saw the config's grid block, and the
+        # retrofit contract is that the store's truth wins.
         from zagg.pyramid import validate_overviews
 
         validate_overviews(
-            block["overview"]["overviews"],
+            block["overviews"],
             parent_order=shard_order,
             child_order=int(manifest["cell_order"]),
         )
@@ -509,8 +510,8 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
         # is /1's wire signal for "pyramid declared OFF" (§4.5) — printing it
         # beside a /2 ``overviews`` list would read as a store with no pyramid.
         **(
-            {"overviews": [dict(e) for e in block["overview"]["overviews"]]}
-            if "overviews" in block["overview"]
+            {"overviews": [dict(e) for e in block["overviews"]]}
+            if "overviews" in block
             else {"orders": list(block["overview"].get("orders") or [])}
         ),
         # The retrofit's user sees which fold regime they just declared for
@@ -762,20 +763,23 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
         "declared": True,
         "sweepable": True,
     }
-    decl = (manifest.get("pyramid") or {}).get("overview")
-    spec = (manifest.get("pyramid") or {}).get("spec")
-    if spec == PYRAMID_SPEC_V2 or (isinstance(decl, dict) and decl.get("overviews") is not None):
+    pyramid = manifest.get("pyramid") or {}
+    decl = pyramid.get("overview") if isinstance(pyramid, dict) else None
+    spec = pyramid.get("spec") if isinstance(pyramid, dict) else None
+    declared_v2 = isinstance(pyramid, dict) and pyramid.get("overviews") is not None
+    if spec == PYRAMID_SPEC_V2 or declared_v2:
         # Declared-but-not-yet-sweepable is a legal recorded state (#381
-        # point (11)): the /2 (node, cells) declaration stands in the
-        # manifest, and materialization arrives with the leaf columns
-        # (issue #383) and the staged sweep (issue #384). Refusing loudly
-        # here — never folding a schedule this sweep does not understand —
-        # is the /1-vs-/2 gate; /1 stores sweep exactly as before.
+        # point (11)): the /2 (node, cells) declaration stands at BLOCK
+        # level (``pyramid.overviews``, the espg shape ruling), and
+        # materialization arrives with the leaf columns (issue #383) and the
+        # staged sweep (issue #384). Refusing loudly here — never folding a
+        # schedule this sweep does not understand — is the /1-vs-/2 gate;
+        # /1 stores sweep exactly as before.
         counts["sweepable"] = False
-        # The `spec`-only arm reaches here with `decl` unvalidated: a /2 marker
-        # carrying no overview block declares nothing, and must report the same
-        # `declared: False` the /1 branch below would give it.
-        counts["declared"] = bool(isinstance(decl, dict) and decl.get("overviews"))
+        # The `spec`-only arm reaches here with no list checked: a /2 marker
+        # carrying no overviews list declares nothing, and must report the
+        # same `declared: False` the /1 branch below would give it.
+        counts["declared"] = bool(declared_v2 and pyramid.get("overviews"))
         logger.warning(
             f"sweep[overview]: the manifest pyramid declaration is {spec!r} — the "
             f"(node, cells) level grammar (issue #382) is declared but NOT yet "

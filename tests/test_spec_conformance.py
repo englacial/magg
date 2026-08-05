@@ -561,15 +561,19 @@ class TestPyramidV2Declaration:
         block = _pyramid_block()
         assert block["spec"] == "zagg-pyramid/2"
         overview = block["overview"]
-        # §4.5: under /2 the schedule key is `overviews`; orders/spacing do not
-        # exist. With a non-empty schedule, all_time and fields MUST be there.
+        # §4.5: under /2 the schedule is the BLOCK-level `overviews` list (the
+        # store-wide product declaration); the `overview` family dict keeps
+        # one sweep leg's execution regime and never carries the schedule.
+        # orders/spacing do not exist anywhere in a /2 block. With a non-empty
+        # schedule, all_time and fields MUST be present in the family dict.
+        assert block["overviews"] and "overviews" not in overview
         assert "orders" not in overview and "spacing" not in overview
-        assert overview["overviews"] and overview["all_time"] is False
+        assert overview["all_time"] is False
         assert set(overview["fields"]) == set(_expected(PYRAMID)["fields"])
 
     def test_levels_are_the_normalized_grouped_form(self):
         exp = _expected(PYRAMID)
-        levels = _pyramid_block()["overview"]["overviews"]
+        levels = _pyramid_block()["overviews"]
         assert levels == exp["overviews"]
         # The config knob spelled entry 2 with scalar sugar; the manifest
         # records lists only — sugar never survives into the contract.
@@ -578,7 +582,7 @@ class TestPyramidV2Declaration:
 
     def test_entry_rules_decode_per_spec(self):
         exp = _expected(PYRAMID)
-        levels = _pyramid_block()["overview"]["overviews"]
+        levels = _pyramid_block()["overviews"]
         nodes = [e["node"] for e in levels]
         # Strictly descending nodes, each in [0, shard_order].
         assert all(b < a for a, b in zip(nodes, nodes[1:]))
@@ -592,7 +596,7 @@ class TestPyramidV2Declaration:
 
     def test_gather_and_whole_footprint_member(self):
         exp = _expected(PYRAMID)
-        levels = _pyramid_block()["overview"]["overviews"]
+        levels = _pyramid_block()["overviews"]
         for i in exp["gather_entries"]:
             # The declared gather: the SAME cells list at a coarser node.
             assert levels[i]["cells"] == levels[i - 1]["cells"]
@@ -605,7 +609,7 @@ class TestPyramidV2Declaration:
         # §4.5: the next entry's finest member descends below the previous
         # entry's coarsest READER-FACING member — a trailing cells == node
         # member is exempt — except the declared gather (same cells).
-        levels = _pyramid_block()["overview"]["overviews"]
+        levels = _pyramid_block()["overviews"]
         for prev, entry in zip(levels, levels[1:]):
             if entry["cells"] == prev["cells"]:
                 continue
