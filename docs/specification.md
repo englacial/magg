@@ -618,11 +618,14 @@ the zarr group named `str(r)`, with the same layout as a source leaf's cell
 group. Concretely, for a member `r` at an order-`k` node:
 
 - the group's `morton` coordinate array holds the `4^(r - k)` order-`r`
-  descendant words of the node, in canonical nested order (`r > k` always,
-  by the window and ladder rules above; the writer-side whole-footprint
-  aggregate of #381 point (2) is an implementation detail of the #383 leaf
-  columns, never a recorded member — and no separate partial grammar or
-  `partial/` path exists anywhere);
+  words the node covers, in canonical nested order — its **descendant**
+  words where `r > k`, its **own** word where `r == k`. For a manifest
+  **level member** `r > k` always, by the window and ladder rules above;
+  the one recorded `r == k` group is the §4.6 column's **node-order
+  member** (the whole-footprint aggregate of #381 point (2) — the leaf's
+  universal partial for every coarser cell), which is a recorded group of
+  that artifact and still never a manifest member. No separate partial
+  grammar or `partial/` path exists anywhere;
 - each **included** field is the same array kind as at the leaves: dense
   fields as dense arrays, digest fields as `zagg-ragged/1` (or `/2`) vlen
   arrays — §1–§3 of this page apply to overview arrays unchanged, **including
