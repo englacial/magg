@@ -21,6 +21,7 @@ import warnings
 
 import numpy as np
 
+from zagg.column import COLUMN_SUFFIX
 from zagg.hive import (
     COVERAGE_SPEC,
     MANIFEST_NAME,
@@ -251,7 +252,9 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     supersedes it). DERIVED zarrs at ancestor nodes — the overview pyramid
     family, issue #201 — are stamped and can wear leaf-shaped basenames, so a
     ``.zarr`` off the shard-order depth is checked for the D11 ``role`` attr and
-    skipped when it carries one (never classified by position). A
+    skipped when it carries one (never classified by position) — as is a
+    ``{stem}.pyramid.zarr`` column (issue #383), the one derived family that
+    lives at the leaf's OWN node. A
     supersedes it). A successful refresh also re-arms the
     :func:`warn_if_stale` once-per-episode latch for this store. Returns the
     envelope written, or ``None`` — deleting any existing root object — when
@@ -295,11 +298,17 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                 stamp = read_commit(open_store(f"{root}/{rel}", **store_kwargs))
                 if stamp is None:
                     continue  # unstamped debris (D4)
-                if rel.count("/") - 1 != order and _is_derived_zarr(f"{root}/{rel}", store_kwargs):
-                    # A DERIVED artifact at an ancestor node, not source data:
-                    # overview pyramid zarrs are stamped and their basenames can
-                    # collide with the leaf grammar (issue #201). Silent like all
-                    # non-data children — the role attr is authoritative (D11).
+                at_leaf_depth = rel.count("/") - 1 == order
+                if (not at_leaf_depth or name.endswith(COLUMN_SUFFIX)) and _is_derived_zarr(
+                    f"{root}/{rel}", store_kwargs
+                ):
+                    # A DERIVED artifact, not source data: overview pyramid zarrs
+                    # are stamped and their basenames can collide with the leaf
+                    # grammar (issue #201), and a leaf's own column (issue #383)
+                    # is a derived zarr AT shard-order depth — so the depth gate
+                    # is a cost optimization only, widened by the column suffix.
+                    # Silent like all non-data children — role is authoritative
+                    # (D11), position never is.
                     logger.debug(f"refresh: skipping derived zarr {rel!r} (D11 role attr)")
                     continue
                 # Windowed leaves (issue #246, D13): `{full_id}_{window}.zarr`
