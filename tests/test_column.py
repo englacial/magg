@@ -145,6 +145,42 @@ class TestLeafSlabs:
             leaf_slabs(staged, FIELDS, group_path=str(CELL_ORDER), n_cells=LEAF_CELLS)
 
 
+class TestNoneClassFields:
+    """D24 ``class: "none"`` entries never become column content (option A)."""
+
+    #: What `zagg.pyramid.declared_fields` records for a non-composable field:
+    #: the class alone. `h_vec` stands for a vector field (staged dense at
+    #: (n_cells, k)), `h_chunks` for a chunk-resolution companion (written per
+    #: chunk-block, so never in the leaf's cell-slab sink).
+    DECL = dict(FIELDS, h_vec={"class": "none"}, h_chunks={"class": "none"})
+
+    def test_staged_vector_field_is_not_a_grid_disagreement(self):
+        # Failure mode (1): the (n_cells, k) slab tripping the extent refusal
+        # and killing the whole column fold, blaming a sink that is correct.
+        slabs = _cell_slabs({0: [1.0, 2.0]})
+        staged = {f"{CELL_ORDER}/{n}": s for n, s in slabs.items()}
+        staged[f"{CELL_ORDER}/h_vec"] = np.zeros((LEAF_CELLS, 3), np.float32)
+        out = leaf_slabs(staged, self.DECL, group_path=str(CELL_ORDER), n_cells=LEAF_CELLS)
+        assert set(out) == set(FIELDS)
+
+    def test_absent_companion_is_not_an_empty_ragged_group(self):
+        # Failure mode (2): synthesizing b"" fill for a field that exists ONLY
+        # at native resolution, then writing it as an all-empty column group.
+        slabs = _cell_slabs({0: [1.0, 2.0]})
+        staged = {f"{CELL_ORDER}/{n}": s for n, s in slabs.items()}
+        out = leaf_slabs(staged, self.DECL, group_path=str(CELL_ORDER), n_cells=LEAF_CELLS)
+        assert "h_chunks" not in out
+        folded = fold_column(out, self.DECL, cell_order=CELL_ORDER, resolutions=[3, SHARD_ORDER])
+        assert all(set(group) == set(FIELDS) for group in folded.values())
+
+    def test_filtered_fold_matches_the_pre_filtered_one(self):
+        slabs = _cell_slabs({0: [1.0, 2.0], 5: [10.0, 4.0]})
+        a = fold_column(slabs, self.DECL, cell_order=CELL_ORDER, resolutions=[3])
+        b = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3])
+        np.testing.assert_array_equal(a[3]["count"], b[3]["count"])
+        assert [bytes(p) for p in a[3]["h_tdigest"]] == [bytes(p) for p in b[3]["h_tdigest"]]
+
+
 class TestFoldColumn:
     CELLS = {0: [1.0, 2.0], 5: [10.0, 4.0], 6: [7.0], 15: [3.0, 8.0, 5.0]}
 
