@@ -411,7 +411,7 @@ def validate_config(config: PipelineConfig) -> None:
     _validate_filters(config.data_source)
 
     # Validate hierarchical multi-level form (issue #43, Phase B)
-    _validate_levels(config.data_source)
+    _validate_overviews(config.data_source)
 
     # Cross-check: each filter's level field must name a key in levels (issue #43)
     _validate_filter_levels(config.data_source)
@@ -1006,7 +1006,7 @@ def _validate_windowing(config: PipelineConfig) -> None:
         )
     # ``time_field`` must be a BASE-RATE variable column, i.e. a
     # ``data_source.variables`` entry (the base level reads its columns from
-    # there too — ``_validate_levels`` forbids a base-level ``variables``
+    # there too — ``_validate_overviews`` forbids a base-level ``variables``
     # mapping). The stamp ``time_range`` (a windowed leaf's headline truth) is
     # pooled from the read VARIABLE columns (``col_arrays`` in the worker),
     # never from ``coordinates`` — so a coordinate ``time_field`` would filter
@@ -1826,7 +1826,7 @@ def _segment_variable_names(data_source: dict) -> set[str]:
     return names
 
 
-def _validate_levels(data_source: dict) -> None:
+def _validate_overviews(data_source: dict) -> None:
     """Validate the hierarchical ``levels``/``base_level`` form (issue #43, Phase B).
 
     Rules:
@@ -2463,13 +2463,18 @@ def get_pyramid(config: PipelineConfig) -> dict | None:
     order, the espg-ratified display default; no all-time fold) — and
     ``false`` returns ``None``, declaring the overview family OFF for the
     store. An explicit mapping may carry ``spacing`` (int >= 1), ``orders``
-    (explicit ancestor orders, winning over ``spacing``), ``all_time``
-    (bool: also maintain the ``all.zarr`` cross-window fold on windowed
-    stores), ``fold_source`` (``"cascade"`` — the default — or the deprecated
-    ``"leaves"``, issue #376) with ``exact_levels`` (how many of the finest
-    declared levels fold exactly from the leaves), and ``summarize`` (the D24
-    opt-in derived-summary declarations, ``{source_field: {"as": name, ...}}``
-    — recorded in the pyramid block, never the semantic core).
+    (explicit ancestor orders, winning over ``spacing``), ``overviews`` (the
+    issue #382 ``zagg-pyramid/2`` grammar: leaf cell resolutions, strictly
+    descending and strictly inside the shard's resolution window, replacing
+    ``orders``/``spacing`` wholesale — the fixed every-order ladder above
+    the shard is law, see :mod:`zagg.pyramid`),
+    ``all_time`` (bool: also maintain the ``all.zarr`` cross-window fold on
+    windowed stores), ``fold_source`` (``"cascade"`` — the default — or the
+    deprecated ``"leaves"``, issue #376) with ``exact_levels`` (how many of
+    the finest declared levels fold exactly from the leaves), and
+    ``summarize`` (the D24 opt-in derived-summary declarations,
+    ``{source_field: {"as": name, ...}}`` — recorded in the pyramid block,
+    never the semantic core).
     """
     raw = config.output.get("pyramid")
     if raw is False:
@@ -2500,6 +2505,7 @@ def _validate_pyramid(config: PipelineConfig) -> None:
     unknown = set(knob) - {
         "spacing",
         "orders",
+        "overviews",
         "all_time",
         "fold_source",
         "exact_levels",
@@ -2512,6 +2518,27 @@ def _validate_pyramid(config: PipelineConfig) -> None:
     if spacing is not None and (not isinstance(spacing, int) or spacing < 1):
         raise ValueError(f"output.pyramid.spacing must be an int >= 1 (got {spacing!r})")
     parent_order = int((config.output.get("grid") or {}).get("parent_order", 0))
+    if knob.get("overviews") is not None:
+        # The issue #382 collapsed grammar (leaf cell resolutions; the fixed
+        # ladder above the shard is law, not declaration): an overviews knob
+        # REPLACES the /1 schedule knobs wholesale, so mixing the two
+        # grammars is refused rather than silently resolved either way.
+        if knob.get("orders") is not None or knob.get("spacing") is not None:
+            raise ValueError(
+                "output.pyramid.overviews is the zagg-pyramid/2 grammar and replaces "
+                "orders/spacing wholesale — declare overviews OR orders/spacing, never both"
+            )
+        from zagg.pyramid import normalize_overviews, validate_overviews
+
+        # The module's own accessor, not a raw .get with a 0 fallback: a
+        # missing key must refuse by NAME ("output.grid.child_order is
+        # required"), not validate its way to a level-range error that points
+        # at neither the problem nor the key.
+        validate_overviews(
+            normalize_overviews(knob["overviews"]),
+            parent_order=parent_order,
+            child_order=get_child_order(config),
+        )
     orders = knob.get("orders")
     if orders is not None:
         ok = isinstance(orders, list) and all(isinstance(k, int) for k in orders)
