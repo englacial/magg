@@ -68,9 +68,15 @@ def column_resolutions(levels: list, node_order: int) -> list[int]:
     no member of their own: the leaf's contribution to ANY coarser cell is
     its whole-footprint aggregate — the node-order member itself.
 
-    Empty when ``levels`` declares no ``node == node_order`` entry: a
-    schedule that starts coarser than the shard node declares no leaf-written
-    column (the #383 gate), and the sweep owns whatever it materializes.
+    Empty when ``levels`` declares no ``node == node_order`` entry — no
+    leaf-written column, and the sweep owns whatever it materializes. Under
+    the collapsed ``/2`` grammar that cannot happen: ``expand_overviews``
+    emits the leaf entry unconditionally, first, so an expanded list always
+    carries one. The guard is a robustness backstop for manifest-shaped
+    ``levels`` built some other way (a hand-edited block, or a future
+    declaration whose schedule starts coarser than the shard node) — this is
+    a public function and ``expand_overviews`` is not its only conceivable
+    caller.
     """
     node_order = int(node_order)
     if not any(int(e["node"]) == node_order for e in levels or []):
