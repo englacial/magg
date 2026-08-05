@@ -58,6 +58,10 @@ FROZEN_COMBINED = {
     "minimal": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
     "kitchen_sink": "57c413489b33fd82187072504a51b76dbb6455d357c4702d9bf92f77bcafab31",
 }
+#: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
+#: its leaf, which is ``minimal``'s): the only committed store whose §5 key
+#: shape is multi-group (``"5/h_tdigest"``, ``"4/morton"``, …).
+FROZEN_COMBINED_COLUMN = "061277118c8cc4c0b8ae3c62fe6515fefa8f9ccb717bd3104f4c8797edbcc918"
 #: FROZEN per-array digests, one per §5.2 element kind: a vlen digest payload
 #: array, a vlen uint64 locations sibling, and two fixed-width arrays.
 FROZEN_ARRAYS = {
@@ -786,8 +790,17 @@ class TestColumnArtifact:
         assert str(node["morton"][0]) == exp["column"]["groups"]["4"]["morton"][0]
 
     def test_sidecar_matches_the_recorded_hashes(self, exp):
+        # Recomputed LIVE over the committed column (the multi-group
+        # ``{order}/{field}`` key shape no leaf fixture exercises) — comparing
+        # the two committed files to each other would only catch a botched
+        # regeneration, since one generator run wrote both.
         node_dir = (SPEC_DATA / COLUMN / exp["leaf"]).parent
         record = json.loads((node_dir / "all.pyramid.stats.json").read_text())
+        arrays = TestContentHashes._hash_leaf(self._column_dir(exp))
+        combined = hashlib.sha256("\n".join(sorted(arrays.values())).encode()).hexdigest()
+        assert arrays == exp["column"]["content_hashes"]["arrays"]
+        assert combined == exp["column"]["content_hashes"]["combined"]
+        assert combined == FROZEN_COMBINED_COLUMN  # the recipe-drift pin (§5)
         assert record["content_hashes"] == exp["column"]["content_hashes"]
         assert record["cells_with_data"] == exp["column"]["commit"]["cells_with_data"]
 
