@@ -258,15 +258,30 @@ class TestFoldColumn:
                     assert [bytes(p) for p in a[res][name]] == [bytes(p) for p in b[res][name]]
 
 
+def _assert_group_matches(overview, group: dict, n: int) -> None:
+    """The leaf's ``n`` overview rows are byte-equal to its column group."""
+    for name, meta in FIELDS.items():
+        stored = overview[name][:n]
+        if meta["class"] == "exact":
+            assert stored.dtype == group[name].dtype
+            np.testing.assert_array_equal(stored, group[name][:n])
+        else:
+            assert [bytes(p) for p in stored] == [bytes(p) for p in group[name][:n]]
+
+
 class TestSweepParity:
     """The issue #383 headline: column groups == the sweep's from-leaves fold."""
 
     def test_column_matches_the_overview_sweep_bytes(self, tmp_path):
         from zagg.sweep import run_sweep
 
-        # A /1 store whose order-1 overview holds cells at order 3 — the same
-        # resolution a (2, [3]) column group folds — sourced from ONE leaf, so
-        # the overview rows covering that leaf are exactly the leaf's fold.
+        # A /1 store sourced from ONE leaf, so the overview rows covering that
+        # leaf are exactly the leaf's own fold. Both column group kinds are
+        # covered: the order-1 overview holds cells at order 3 (the resolution
+        # a (2, [3]) column group folds, `_fold_node`'s target >= shard arm),
+        # and the order-0 overview holds cells at order 2 == the shard order —
+        # the node-order member, where the leaf folds whole into one cell.
+        # `fold_source: "leaves"` because from-leaves IS the parity contract.
         manifest = {
             "spec": "morton-hive/1",
             "dataset": {"short_name": "TEST", "version": "1"},
@@ -277,7 +292,8 @@ class TestSweepParity:
                 "spec": PYRAMID_SPEC,
                 "overview": {
                     "spacing": 2,
-                    "orders": [1],
+                    "orders": [1, 0],
+                    "fold_source": "leaves",
                     "all_time": False,
                     "fields": dict(FIELDS),
                 },
@@ -288,18 +304,17 @@ class TestSweepParity:
         cells = {0: [1.0, 2.0], 5: [10.0, 4.0], 6: [7.0], 15: [3.0, 8.0, 5.0]}
         slabs = _make_leaf(tmp_path, "-311", cells)
         result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
-        assert result["families"]["overview"]["written"] == 1
+        assert result["families"]["overview"]["written"] == 2
 
-        folded = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3])
+        folded = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3, SHARD_ORDER])
         overview = zarr.open_group(
             open_store(f"{tmp_path}/-3/1/all.zarr"), path="3", mode="r", zarr_format=3
         )
         # Leaf -311 is child 0 of node -31: overview rows 0..3 are its fold.
-        n = 4 ** (3 - SHARD_ORDER)
-        for name, meta in FIELDS.items():
-            stored = overview[name][:n]
-            if meta["class"] == "exact":
-                assert stored.dtype == folded[3][name].dtype
-                np.testing.assert_array_equal(stored, folded[3][name])
-            else:
-                assert [bytes(p) for p in stored] == [bytes(p) for p in folded[3][name]]
+        _assert_group_matches(overview, folded[3], 4 ** (3 - SHARD_ORDER))
+        # The node-order member: leaf -311 is _rel_rank 0 under node -3, and
+        # the order-0 fold's factor is the whole leaf (4^(shard_order - 0)).
+        node_overview = zarr.open_group(
+            open_store(f"{tmp_path}/-3/all.zarr"), path=str(SHARD_ORDER), mode="r", zarr_format=3
+        )
+        _assert_group_matches(node_overview, folded[SHARD_ORDER], 1)
