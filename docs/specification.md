@@ -1317,4 +1317,8 @@ own.
 Regenerating the fixtures reproduces the same logical values (seeded rng);
 stamp timestamps and compressed bytes may differ across zstd versions —
 conformance is over *decoded* values, never stored object bytes (the same
-principle as §5).
+principle as §5). In the committed D20 sidecar
+(`column/…/all.pyramid.stats.json`) only `content_hashes` and
+`cells_with_data` are pinned: `timestamp`, `zagg_version`, `run_id` and the
+run counters are **informative provenance**, they churn on every
+regeneration, and conformance never asserts them.
