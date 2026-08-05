@@ -8,6 +8,7 @@ on the mortie spec page (mortie#62).
 """
 
 import re
+from datetime import datetime, timezone
 
 import pytest
 
@@ -237,25 +238,45 @@ class TestWindowingConfig:
             validate_config(cfg)
 
     @pytest.mark.parametrize(
-        "epoch, rendered, shift",
+        "epoch, declared, rendered, shift",
         [
-            ("2018-01-01T00:00:00.5Z", "2018-01-01T00:00:00+00:00", "0.5"),
+            (
+                "2018-01-01T00:00:00.5Z",
+                "2018-01-01T00:00:00.500000+00:00",
+                "2018-01-01T00:00:00+00:00",
+                "0.5",
+            ),
             # The fraction survives a non-UTC declaration: the offset is whole
             # minutes, so only the sub-second part is ever what iso_utc drops.
-            ("2018-01-01T05:30:00.001+05:30", "2018-01-01T00:00:00+00:00", "0.001"),
+            (
+                "2018-01-01T05:30:00.001+05:30",
+                "2018-01-01T00:00:00.001000+00:00",
+                "2018-01-01T00:00:00+00:00",
+                "0.001",
+            ),
+            # The production path is datetime-typed, not str: yaml.safe_load
+            # resolves an ISO timestamp scalar to an aware datetime and
+            # windows.parse_utc passes it through, so the message must render
+            # the author's value rather than repr a stdlib constructor call.
+            (
+                datetime(2018, 1, 1, 0, 0, 0, 500000, tzinfo=timezone.utc),
+                "2018-01-01T00:00:00.500000+00:00",
+                "2018-01-01T00:00:00+00:00",
+                "0.5",
+            ),
         ],
     )
-    def test_subsecond_epoch_rejected(self, cfg, epoch, rendered, shift):
+    def test_subsecond_epoch_rejected(self, cfg, epoch, declared, rendered, shift):
         # The epoch parses at full precision but is CONSUMED through
         # windows.iso_utc (timespec="seconds"), so a sub-second epoch used to
         # validate clean and then shift every window conversion by the dropped
         # fraction (issue #390 — the PR #367 validate-vs-render mismatch class).
-        # The message quotes the rendered value and the shift, so the refusal is
-        # tied to what get_windowing would actually emit.
+        # The message quotes the declared instant, the rendered value and the
+        # shift, so the refusal is tied to what get_windowing would actually emit.
         _windowed(cfg, epoch=epoch)
         with pytest.raises(
             ValueError,
-            match=rf"epoch {re.escape(repr(epoch))} carries sub-second precision.*"
+            match=rf"epoch {re.escape(repr(declared))} carries sub-second precision.*"
             rf"recorded as {re.escape(repr(rendered))}.*shift every window "
             rf"conversion by {shift} s",
         ):
