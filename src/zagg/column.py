@@ -284,6 +284,17 @@ def write_column(
     stats sidecar is a SIBLING object PUT after the stamp (fail-open,
     telemetry class), so the stamp stays the column's own final write.
 
+    Object cost (the fleet's bill, not the byte cost the design bounded):
+    each group contributes one ``zarr.json`` plus ``(1 morton + n_fields)``
+    arrays of one ``zarr.json`` + one chunk object each, and the root pays
+    three ``zarr.json`` PUTs (template, attrs, stamp) plus the sidecar. At
+    the 19/13/9 reference geometry with 2 composable fields — groups
+    {13, 12, 11, 10, 9} — that is ``5*(1 + 3*2) + 3 + 1 = 39`` objects per
+    ``(leaf, window)``, against the leaf's own ~10. The array writes run
+    inside the same ``async.concurrency: 128`` context as the template
+    (the leaf writers' posture, issue #209): serial open+PUT round-trips at
+    that count are a tail-latency term on every unit.
+
     The commit stamp's ``cells_with_data`` counts the populated mask of the
     column's FINEST group — the one denominator a leaf or an overview has
     implicitly, but a column (N grids) does not, so the group it counts is
@@ -344,15 +355,15 @@ def write_column(
         sync(store.delete_dir(""))
         _delete_sidecar(node_prefix, _sidecar_name(basename), store_kwargs)
         spec.to_zarr(store, "", overwrite=True)
-    for res in resolutions:
-        words = np.asarray(generate_morton_children(int(shard_key), res), dtype=np.uint64)
-        arr = open_array(store, path=f"{res}/morton", zarr_format=3, consolidated=False)
-        arr[:] = words
-        staged[f"{res}/morton"] = words
-        for name, slab in folded[res].items():
-            arr = open_array(store, path=f"{res}/{name}", zarr_format=3, consolidated=False)
-            arr[:] = slab
-            staged[f"{res}/{name}"] = slab
+        for res in resolutions:
+            words = np.asarray(generate_morton_children(int(shard_key), res), dtype=np.uint64)
+            arr = open_array(store, path=f"{res}/morton", zarr_format=3, consolidated=False)
+            arr[:] = words
+            staged[f"{res}/morton"] = words
+            for name, slab in folded[res].items():
+                arr = open_array(store, path=f"{res}/{name}", zarr_format=3, consolidated=False)
+                arr[:] = slab
+                staged[f"{res}/{name}"] = slab
     root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
     root.attrs.update(
         {
