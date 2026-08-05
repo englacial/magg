@@ -826,7 +826,7 @@ class TestWorkerIntegration:
             np.testing.assert_array_equal(
                 got["count"][:], fold_dense(leaf_group["count"][:], factor, "sum", 0)
             )
-            oracle = _refold_digests(leaf_group["h_tdigest"][:], factor, delta=16)
+            oracle = _refold_digests(leaf_group["h_tdigest"][:], factor, delta=_generator().DELTA)
             assert [bytes(p) for p in got["h_tdigest"][:]] == oracle
 
     def test_no_column_without_the_overviews_knob(self, tmp_path, monkeypatch):
@@ -960,7 +960,15 @@ class TestWorkerIntegration:
 
 
 def _refold_digests(payloads, factor, *, delta):
-    """The sweep-shaped digest oracle: per target cell, k-way over children."""
+    """Re-run the approximate fold kernels over the READ-BACK leaf.
+
+    NOT an independent oracle: same ``decode_digest``, same ``fold_digests``,
+    same child slicing and skip-empty predicate as ``column.fold_column``, so
+    as a check on the fold LAW it is circular. What it adds is the read-back
+    axis — it folds the COMMITTED leaf off disk where the writer folded the
+    in-memory staged slabs, which is the staged-vs-stored half of the phase's
+    claim (``TestSweepParity`` owns the law itself).
+    """
     from zagg.sweep_overview import decode_digest, fold_digests
 
     out = []
