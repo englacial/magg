@@ -7,6 +7,8 @@ themselves are pinned in ``tests/test_windows.py``; the frozen grammar lives
 on the mortie spec page (mortie#62).
 """
 
+import re
+
 import pytest
 
 from zagg import hive
@@ -233,6 +235,50 @@ class TestWindowingConfig:
         _windowed(cfg, epoch="the beginning")
         with pytest.raises(ValueError, match="ISO-8601"):
             validate_config(cfg)
+
+    @pytest.mark.parametrize(
+        "epoch, rendered, shift",
+        [
+            ("2018-01-01T00:00:00.5Z", "2018-01-01T00:00:00+00:00", "0.5"),
+            # The fraction survives a non-UTC declaration: the offset is whole
+            # minutes, so only the sub-second part is ever what iso_utc drops.
+            ("2018-01-01T05:30:00.001+05:30", "2018-01-01T00:00:00+00:00", "0.001"),
+        ],
+    )
+    def test_subsecond_epoch_rejected(self, cfg, epoch, rendered, shift):
+        # The epoch parses at full precision but is CONSUMED through
+        # windows.iso_utc (timespec="seconds"), so a sub-second epoch used to
+        # validate clean and then shift every window conversion by the dropped
+        # fraction (issue #390 — the PR #367 validate-vs-render mismatch class).
+        # The message quotes the rendered value and the shift, so the refusal is
+        # tied to what get_windowing would actually emit.
+        _windowed(cfg, epoch=epoch)
+        with pytest.raises(
+            ValueError,
+            match=rf"epoch {re.escape(repr(epoch))} carries sub-second precision.*"
+            rf"recorded as {re.escape(repr(rendered))}.*shift every window "
+            rf"conversion by {shift} s",
+        ):
+            validate_config(cfg)
+
+    @pytest.mark.parametrize(
+        "epoch",
+        [
+            "2018-01-01T00:00:00Z",
+            "2018-01-01T00:00:00+00:00",
+            # Naive input is taken AS UTC (windows.parse_utc), and a whole-second
+            # offset-bearing epoch still round-trips — only the fraction is lost.
+            "2018-01-01T00:00:00",
+            "2018-01-01T05:30:00+05:30",
+        ],
+    )
+    def test_whole_second_epoch_accepted(self, cfg, epoch):
+        # The guard is exactly "the rendering is lossless", not "the declaration
+        # is spelled canonically": every whole-second spelling stays legal and
+        # canonicalizes to the same instant.
+        _windowed(cfg, epoch=epoch)
+        validate_config(cfg)
+        assert get_windowing(cfg)["epoch"] == "2018-01-01T00:00:00+00:00"
 
     def test_bad_scale_and_units(self, cfg):
         _windowed(cfg, scale="tt")

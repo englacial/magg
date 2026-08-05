@@ -193,7 +193,13 @@ same second (say `12:00:01.0Z` → `12:00:01.4Z`) the window dispatches as an
 empty `ge x`/`lt x` pair, so it is rejected — the point form is the spelling
 for one-second intent. A sub-second range that *straddles* a second boundary
 (`12:00:01.9Z` → `12:00:02.1Z`) is still valid; it renders to the one-second
-window its truncated bounds describe. On the raster path
+window its truncated bounds describe. The `epoch` is the one time value held
+to a stricter rule ([issue #390](https://github.com/englacial/zagg/issues/390)):
+it too renders at whole-second granularity, but it defines *every* window
+conversion rather than one edge of one window, so a sub-second `epoch` is
+**refused** rather than truncated — `2018-01-01T00:00:00.5Z` would shift every
+boundary by half a second, invisibly. Declare it at second precision. On the
+raster path
 ([issue #247](https://github.com/englacial/zagg/issues/247)) membership is
 the acquisition's STAC `datetime`: `time_field` is optional (fixed to
 `datetime`) and the `epoch`/`scale`/`units` conversion knobs are rejected.

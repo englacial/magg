@@ -1044,9 +1044,25 @@ def _validate_windowing(config: PipelineConfig) -> None:
             "delta_time)"
         )
     try:
-        _windows.parse_utc(epoch)
+        parsed_epoch = _windows.parse_utc(epoch)
     except ValueError as e:
         raise ValueError(f"output.windowing.epoch: {e}") from e
+    # Validate the RENDERED epoch, not the parsed one (issue #390). get_windowing
+    # canonicalizes through windows.iso_utc (timespec="seconds"), so a sub-second
+    # epoch parses clean here and is then silently truncated at the one place it
+    # is consumed — shifting EVERY window conversion by the dropped fraction. The
+    # predicate calls the renderer and round-trips it rather than repeating the
+    # truncation rule, so the two cannot drift (the PR #367 pattern).
+    rendered_epoch = _windows.iso_utc(parsed_epoch)
+    if _windows.parse_utc(rendered_epoch) != parsed_epoch:
+        raise ValueError(
+            f"output.windowing.epoch {epoch!r} carries sub-second precision that the "
+            f"canonical whole-second rendering drops: it is recorded as "
+            f"{rendered_epoch!r}, which would shift every window conversion by "
+            f"{(parsed_epoch - _windows.parse_utc(rendered_epoch)).total_seconds()} s. "
+            f"Window granularity is whole seconds, so a finer epoch is a config "
+            f"error, never a silent shift — declare the epoch at second precision"
+        )
     scale = block.get("scale") or "utc"
     if scale not in _windows.EPOCH_SCALES:
         raise ValueError(
@@ -2670,7 +2686,12 @@ def get_windowing(config: PipelineConfig) -> dict | None:
         {"schedule", "time_field", "epoch", "scale", "units", "windows"}
 
     ``epoch`` and explicit-window boundaries are canonicalized to ISO-8601
-    UTC strings; ``windows`` is ``None`` except for ``schedule: explicit``,
+    UTC strings. The ``epoch`` canonicalization is lossless — ``timespec=
+    "seconds"`` would otherwise truncate a sub-second epoch and shift every
+    window conversion, so :func:`_validate_windowing` refuses one outright
+    (issue #390); explicit bounds do truncate, documented on
+    :func:`_explicit_window_bounds`. ``windows`` is ``None`` except for
+    ``schedule: explicit``,
     where a ``{label, timestamp}`` point entry is desugared to its second-wide
     range (issue #355) so the normalized list is uniformly ``{label, start,
     end}``.
