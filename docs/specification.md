@@ -1260,7 +1260,13 @@ hive default):
   fields, and the column's §5 hashes; the conformance tests additionally
   re-derive the base group from the committed leaf through the §4.4 fold
   kernels — the §4.6 from-leaves parity contract, pinned on committed
-  bytes.
+  bytes. The two-group set is forced, not chosen: on this 4/5/6 geometry
+  §4.4 admits only `overviews: 5`, so no committed golden here can carry an
+  **interior** ladder rung (a three-or-more-group column, its group
+  ordering, or a declared base distinct from an implied rung). That case is
+  pinned zagg-side by `tests/test_column.py`; a committed multi-rung golden
+  arrives with the sweep-side fixtures of
+  [#384](https://github.com/englacial/zagg/issues/384).
 
 `minimal/` and `kitchen_sink/` pin the layout edge cases a reader must
 handle (`column/`'s leaf is `minimal/`'s, so it pins them again): inner chunk
