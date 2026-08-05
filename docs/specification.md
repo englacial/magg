@@ -927,12 +927,12 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   "order": 4,
   "source_cell_order": 6,
   "window": "all",
-  "cells_with_data_order": 5,
   "fields": {"count": {"class": "exact", "method": "sum", "nan_policy": "skip"},
              "h_tdigest": {"class": "approximate", "method": "tdigest_kway",
-                            "dtype": "float32", "inner_shape": [2], "delta": 16}},
+                            "delta": 16, "dtype": "float32", "inner_shape": [2]}},
   "groups": {"5": {"regime": "leaf-column", "merges_from_raw": 1, "n_cells": 4},
              "4": {"regime": "leaf-column", "merges_from_raw": 1, "n_cells": 1}},
+  "cells_with_data_order": 5,
   "generated_at": "2026-08-05T00:00:00+00:00"
 }
 ```
@@ -947,7 +947,11 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   without the manifest). `groups` carries the per-group provenance slots:
   the fold **regime** (`"leaf-column"` — folded from the leaf's own
   resident cells; `source_children` never rides this regime, its source is
-  complete by construction) and the `merges_from_raw` integer.
+  complete by construction), the `merges_from_raw` integer, and `n_cells`
+  — the group's **grid** size `4^(r - order)`, i.e. its arrays' length, not
+  its populated-cell count (that is the stamp's `cells_with_data`, for the
+  `cells_with_data_order` group only). `n_cells` is derivable and recorded
+  as a convenience.
 - **Write discipline.** The leaf's own D4 order: template (wholesale — the
   column prefix, and any stale stats sidecar, are deleted first) → every
   group's arrays → `role`/`zagg_column` attrs → **one commit stamp last
