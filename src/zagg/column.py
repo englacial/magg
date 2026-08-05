@@ -35,6 +35,11 @@ logger = logging.getLogger(__name__)
 
 #: Envelope version of the column artifact's provenance attrs payload.
 COLUMN_SPEC = "zagg-column/1"
+#: Column basename suffix: the D23 window stem carries it in place of
+#: ``.zarr`` (:func:`column_name`). The ONE definition of the name seam —
+#: store walkers that must tell a column from a source leaf key off it
+#: (:func:`zagg.coverage.refresh_root_coverage`), never off a second literal.
+COLUMN_SUFFIX = ".pyramid.zarr"
 #: Root-group attrs key carrying the column provenance payload (D11).
 COLUMN_ATTR = "zagg_column"
 #: ``role`` attrs value classifying a column zarr (D11: classification by
@@ -210,7 +215,7 @@ def column_name(window: str | None) -> str:
     """
     from zagg.windows import leaf_name_v3
 
-    return leaf_name_v3(window).removesuffix(".zarr") + ".pyramid.zarr"
+    return leaf_name_v3(window).removesuffix(".zarr") + COLUMN_SUFFIX
 
 
 def write_column(

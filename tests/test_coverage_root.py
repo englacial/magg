@@ -758,6 +758,34 @@ class TestRefreshRootCoverage:
         assert any("not a D1 morton decimal" in r.message for r in caplog.records)
         np.testing.assert_array_equal(hive.root_coverage_words(env), _words(SHARD))
 
+    def test_leaf_node_column_is_skipped_silently(self, tmp_path, caplog):
+        # A column (issue #383) is the first DERIVED zarr at the leaf's OWN
+        # node, so the derived carve-out's depth gate never fired for it and
+        # every column earned the walk's real-data warning ("STAMPED leaf
+        # 'all.pyramid.zarr' whose id ... is not a D1 morton decimal"), one per
+        # column per refresh. The D11 role attr is authoritative: skipped
+        # silently, and the rebuilt MOC still lists the leaf.
+        import logging
+
+        from zagg.column import write_column
+        from zagg.coverage import refresh_root_coverage
+
+        root = self._store_with_leaves(tmp_path, stamped=(SHARD,))
+        fields = {"count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0}}
+        basename = write_column(
+            root,
+            morton_word(SHARD),
+            {6: {"count": np.asarray([7], np.int32)}},
+            fields,
+            node_order=6,
+            cell_order=8,
+        )
+        with caplog.at_level(logging.WARNING, logger="zagg.coverage"):
+            env = refresh_root_coverage(root)
+        assert basename == "all.pyramid.zarr"
+        assert [r.message for r in caplog.records if r.name == "zagg.coverage"] == []
+        np.testing.assert_array_equal(hive.root_coverage_words(env), _words(SHARD))
+
     def test_not_a_hive_root_raises(self, tmp_path):
         from zagg.coverage import refresh_root_coverage
 
