@@ -430,22 +430,28 @@ def _column_expected(column_dir: Path, basename: str) -> dict:
     """The committed §4.6 column record: attrs, decoded groups, O11 hashes."""
     import zarr
 
-    root = zarr.open_group(zarr.storage.LocalStore(str(column_dir)), mode="r", zarr_format=3)
-    attrs = dict(root.attrs)
+    store = zarr.storage.LocalStore(str(column_dir))
+    attrs = dict(zarr.open_group(store, mode="r", zarr_format=3).attrs)
+    fields = attrs["zagg_column"]["fields"]
     groups: dict = {}
-    for res in sorted((k for k in attrs["zagg_column"]["groups"]), key=int, reverse=True):
-        group = zarr.open_group(
-            zarr.storage.LocalStore(str(column_dir)), path=res, mode="r", zarr_format=3
-        )
-        digest = [
-            [[float(m), float(w)] for m, w in np.frombuffer(bytes(p), "<f4").reshape(-1, 2)]
-            for p in group["h_tdigest"][:]
-        ]
-        groups[res] = {
-            "morton": [str(w) for w in group["morton"][:]],
-            "count": [int(c) for c in group["count"][:]],
-            "h_tdigest": digest,
-        }
+    for res in sorted(attrs["zagg_column"]["groups"], key=int, reverse=True):
+        group = zarr.open_group(store, path=res, mode="r", zarr_format=3)
+        record: dict = {"morton": [str(w) for w in group["morton"][:]]}
+        for name, meta in fields.items():
+            # Element typing comes from the attrs block (§4.6 carries dtype +
+            # inner_shape for exactly this), never hardcoded: a kitchen-sink
+            # column's digest field need not be float32/(-1, 2), and its
+            # ``none``-class fields are absent from the artifact entirely.
+            if meta["class"] == "approximate":
+                dtype = np.dtype(meta["dtype"]).newbyteorder("<")
+                inner = tuple(meta["inner_shape"])
+                record[name] = [
+                    np.frombuffer(bytes(p), dtype).reshape((-1, *inner)).tolist()
+                    for p in group[name][:]
+                ]
+            elif meta["class"] == "exact":
+                record[name] = [v.item() for v in group[name][:]]
+        groups[res] = record
     return {
         "object": basename,
         "role": attrs["role"],
