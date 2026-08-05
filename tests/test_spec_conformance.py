@@ -550,10 +550,12 @@ def _pyramid_block():
 
 
 class TestPyramidV2Declaration:
-    """§4.5 — the ``zagg-pyramid/2`` (node, cells) declaration (issue #382).
+    """§4.5 — the ``zagg-pyramid/2`` overviews declaration (issue #382).
 
-    Every assertion decodes the committed ``pyramid/`` manifest from spec
-    text alone; the expected values come from the generator's INPUTS
+    The collapsed grammar: a leaf resolution list plus the §4.4 fixed
+    every-order ladder, recorded fully expanded at block level. Every
+    assertion decodes the committed ``pyramid/`` manifest from spec text
+    alone; the expected values come from the generator's INPUTS
     (``tools/generate_spec_fixtures.py``), never read back through zagg.
     """
 
@@ -571,50 +573,45 @@ class TestPyramidV2Declaration:
         assert overview["all_time"] is False
         assert set(overview["fields"]) == set(_expected(PYRAMID)["fields"])
 
-    def test_levels_are_the_normalized_grouped_form(self):
+    def test_overviews_are_the_fully_expanded_list(self):
+        # §4.5: the manifest records the EXPANDED (node, cells) list —
+        # readers never re-derive the ladder — while the config declared
+        # leaf resolutions only.
         exp = _expected(PYRAMID)
         levels = _pyramid_block()["overviews"]
         assert levels == exp["overviews"]
-        # The config knob spelled entry 2 with scalar sugar; the manifest
-        # records lists only — sugar never survives into the contract.
-        assert isinstance(exp["declared"]["overviews"][2]["cells"], int)
         assert all(isinstance(e["cells"], list) for e in levels)
+        assert isinstance(exp["declared"]["overviews"], list)  # the raw knob: ints only
+        assert all(isinstance(r, int) for r in exp["declared"]["overviews"])
 
-    def test_entry_rules_decode_per_spec(self):
+    def test_leaf_entry_carries_the_declared_resolutions(self):
+        # §4.5: every declared resolution materializes at the shard node —
+        # the first entry IS the leaf entry, strictly inside the window.
+        exp = _expected(PYRAMID)
+        leaf = _pyramid_block()["overviews"][0]
+        assert leaf["node"] == exp["shard_order"]
+        assert leaf["cells"] == exp["declared"]["overviews"]
+        assert all(b < a for a, b in zip(leaf["cells"], leaf["cells"][1:]))
+        assert all(exp["shard_order"] < r < exp["cell_order"] for r in leaf["cells"])
+
+    def test_fixed_ladder_law_decodes_per_spec(self):
+        # §4.4: above the shard the schedule is LAW — with d = base - shard
+        # (base the coarsest leaf resolution), every order k from shard - 1
+        # down to 0 inclusive carries exactly one member at k + d. Every
+        # store roots at order 0.
         exp = _expected(PYRAMID)
         levels = _pyramid_block()["overviews"]
-        nodes = [e["node"] for e in levels]
-        # Strictly descending nodes, each in [0, shard_order].
-        assert all(b < a for a, b in zip(nodes, nodes[1:]))
-        assert all(0 <= n <= exp["shard_order"] for n in nodes)
-        for entry, slabs in zip(levels, exp["slabs"]):
-            cells = entry["cells"]
-            assert all(b < a for a, b in zip(cells, cells[1:]))  # strictly descending
-            assert all(entry["node"] <= r < exp["cell_order"] for r in cells)
-            # §4.4: a member r at an order-k node holds 4^(r - k) cells.
-            assert [4 ** (r - entry["node"]) for r in cells] == slabs
+        s = exp["shard_order"]
+        d = levels[0]["cells"][-1] - s
+        assert d >= 1
+        assert levels[1:] == [{"node": k, "cells": [k + d]} for k in range(s - 1, -1, -1)]
+        assert levels[-1]["node"] == 0
 
-    def test_gather_and_whole_footprint_member(self):
+    def test_slab_lengths_decode_per_spec(self):
+        # §4.4: a member r at an order-k node holds 4^(r - k) cells.
         exp = _expected(PYRAMID)
-        levels = _pyramid_block()["overviews"]
-        for i in exp["gather_entries"]:
-            # The declared gather: the SAME cells list at a coarser node.
-            assert levels[i]["cells"] == levels[i - 1]["cells"]
-            assert levels[i]["node"] < levels[i - 1]["node"]
-        # The promoted cells == node member: the 1-cell whole-footprint group.
-        assert levels[0]["cells"][-1] == levels[0]["node"]
-        assert 4 ** (levels[0]["cells"][-1] - levels[0]["node"]) == 1
-
-    def test_cross_entry_descent_with_universal_partial_exemption(self):
-        # §4.5: the next entry's finest member descends below the previous
-        # entry's coarsest READER-FACING member — a trailing cells == node
-        # member is exempt — except the declared gather (same cells).
-        levels = _pyramid_block()["overviews"]
-        for prev, entry in zip(levels, levels[1:]):
-            if entry["cells"] == prev["cells"]:
-                continue
-            reader = [c for c in prev["cells"] if c != prev["node"]]
-            assert not reader or entry["cells"][0] < reader[-1]
+        for entry, slabs in zip(_pyramid_block()["overviews"], exp["slabs"]):
+            assert [4 ** (r - entry["node"]) for r in entry["cells"]] == slabs
 
     def test_fold_declaration_keys_ride_along(self):
         # PR #379's declaration keys are revision-independent (§4.5).
@@ -639,21 +636,17 @@ class TestPyramidV2Declaration:
         assert _pyramid_block()["overview"]["fields"]["h_mean"] == {"class": "none"}
 
     def test_default_derivation_matches_the_spec_formula(self):
-        # §4.5's informative derived default, computed from the spec text for
-        # this geometry, must equal the committed expectation — the formula on
-        # the page and the one the fixture records cannot drift apart. The
-        # CODE binding (zagg's own default_overviews for this same geometry) is
-        # pinned in tests/test_pyramid.py::TestDefaultLevels, which is where
-        # reading back through zagg belongs: this class decodes the committed
-        # fixture from spec text alone.
+        # §4.5's derived default (knob omitted -> one leaf resolution at the
+        # chunk order, then the same §4.4 fixed ladder), computed from the
+        # spec text for this geometry, must equal the committed expectation —
+        # the formula on the page and the one the fixture records cannot
+        # drift apart. The CODE binding (zagg's own default_overviews) is
+        # pinned in tests/test_pyramid.py::TestDefaultOverviews.
         exp = _expected(PYRAMID)
         s, chunk = exp["shard_order"], exp["chunk_order"]
         d = chunk - s
         formula = [{"node": s, "cells": [chunk]}] + [
-            # Down to shard_order % 2: node 0 on even shard orders, node 1 on
-            # odd (the espg ruling on the declaring PR's node-walk tail).
-            {"node": k, "cells": [k + d]}
-            for k in range(s - 2, -1, -2)
+            {"node": k, "cells": [k + d]} for k in range(s - 1, -1, -1)
         ]
         assert formula == exp["default_overviews"]
 
@@ -680,17 +673,17 @@ class TestPyramidV2Declaration:
         )
         block = build_pyramid_block(cfg, shard_order=s)
         assert block["spec"] == "zagg-pyramid/1"
+        assert "overviews" not in block  # /1 never carries the /2 schedule key
         overview = block["overview"]
-        assert "overviews" not in overview  # /1 never carries the /2 schedule key
-        # The whole derived /1 schedule for shard order 4, by VALUE.
-        assert overview["orders"] == [2, 0] and overview["spacing"] == 2
+        # The whole derived /1 schedule for shard order 3, by VALUE.
+        assert overview["orders"] == [1] and overview["spacing"] == 2
         assert overview["all_time"] is False
         assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
-        # ...and the constant-depth member each declared order implies, also by
-        # value: with s = 4, c = 6 the /2 spelling of this store is
-        # [{node: 2, cells: [4]}, {node: 0, cells: [2]}].
-        assert (s, c) == (4, 6)
-        assert [c - (s - k) for k in overview["orders"]] == [4, 2]
+        # ...and the constant-depth member each declared order implies, also
+        # by value: with s = 3, c = 6 the /2 spelling of this store's one
+        # declared order is [{node: 1, cells: [4]}].
+        assert (s, c) == (3, 6)
+        assert [c - (s - k) for k in overview["orders"]] == [4]
 
     def test_manifest_envelope(self):
         manifest = json.loads((SPEC_DATA / PYRAMID / "morton_hive.json").read_text())

@@ -275,43 +275,46 @@ output:
 
 The declaration also comes in a second revision
 ([issue #382](https://github.com/englacial/zagg/issues/382); design record
-[issue #381](https://github.com/englacial/zagg/issues/381)): explicit
-**`overviews`** — ordered `{node, cells}` entries, where `node` is the hive
-prefix carrying the level's artifacts and `cells` the reader-facing
-resolutions stored there (a scalar is sugar for a one-element list):
+[issue #381](https://github.com/englacial/zagg/issues/381), as collapsed by
+the espg grammar ruling on the declaring PR): **`overviews`** — the **leaf
+cell resolutions**, and nothing else. A scalar is sugar for one resolution;
+a list is strictly descending, each member strictly between `parent_order`
+and `child_order`; omitted, the default is one resolution at the grid's
+resolved chunk order:
 
 ```yaml
 output:
   pyramid:
-    overviews:                       # replaces orders/spacing WHOLESALE
-      - {node: 9, cells: [16, 13]}   # unequal depths at one node
-      - {node: 7, cells: 11}         # scalar sugar for [11]
-      - {node: 5, cells: 9}
+    overviews: [16, 13]   # leaf cell resolutions; replaces orders/spacing WHOLESALE
+    # overviews: 13       # scalar sugar for [13]
 ```
 
-Spelling `overviews` writes the manifest block as `zagg-pyramid/2` with the
-normalized list (sugar expanded) at **block level** — `pyramid.overviews`,
-the store-wide product declaration — while the singular `pyramid.overview`
-family dict keeps the sweep leg's execution regime (`all_time`, the #376
-fold keys, `fields`, `materialized`) exactly as under `/1`; without the
-knob the block stays `/1` exactly as above. The grammar's **validation rules** — descending nodes, per-entry
-descending cells with the legal `cells == node` whole-footprint group, and
-the declared gather — are normative in [the specification
-§4.5](specification.md); refusals are loud and named, never silently
-widened. The derived default schedule (`d = chunk_order − shard_order`,
-`{node: shard_order, cells: [chunk_order]}` then `{node: k, cells: [k + d]}`
-stepping `−2` down to `shard_order % 2` — node 0 on even shard orders, node
-1 on odd) is the intended default a store gets when it never spells
-`overviews:`; it is recorded there as informative, since a `/2` manifest always
-carries an explicit resolved list. Two practice points:
+There is no above-shard configurability: everything coarser than the shard
+is the **fixed every-order ladder** — with `d` = coarsest leaf resolution −
+`parent_order`, every order from `parent_order − 1` down to 0 carries one
+member at `order + d`. A `/2` store is therefore inherently a
+**multiresolution statistical grid**: every HEALPix order from 0 through
+the base plus the native resolution, each level spec-guaranteed and
+individually addressable (`pyramid: false` is the single-resolution
+opt-out; skipping levels when *reading* is a reader-side choice, never a
+store property). Spelling `overviews` writes the manifest block as
+`zagg-pyramid/2` with the **fully expanded** `(node, cells)` list at block
+level — `pyramid.overviews`, the store-wide product declaration; readers
+never re-derive the ladder — while the singular `pyramid.overview` family
+dict keeps the sweep leg's execution regime (`all_time`, the #376 fold
+keys, `fields`, `materialized`) exactly as under `/1`; without the knob the
+block stays `/1` exactly as above. The grammar's **validation rules** and
+the ladder law are normative in
+[the specification §4.4–§4.5](specification.md); refusals are loud and
+named, never silently widened. Two practice points:
 
-- **Declare the full schedule up front.** A declared-but-unswept level costs
-  nothing (declared intent and swept actuals are separate — [#381 point
-  (11)](https://github.com/englacial/zagg/issues/381)), and a column ending
-  at the node's own order future-proofs the store: coarse levels declared
-  later never rewrite a leaf. **Sweeping, not declaring, is the operational
-  decision** — one aggregation template serves both a state-scale AOI (sweep
-  immediately) and disjoint small deployments (sweep later, or never).
+- **Declaring is free.** A declared-but-unswept level costs nothing
+  (declared intent and swept actuals are separate — [#381 point
+  (11)](https://github.com/englacial/zagg/issues/381)), and the fixed
+  ladder makes every coarser level spec-guaranteed without spelling
+  anything. **Sweeping, not declaring, is the operational decision** — one
+  aggregation template serves both a state-scale AOI (sweep immediately)
+  and disjoint small deployments (sweep later, or never).
 - **A `/2` declaration is not yet sweepable by this zagg.** The overview
   sweep refuses it loudly and generates nothing; materialization arrives
   with the leaf columns

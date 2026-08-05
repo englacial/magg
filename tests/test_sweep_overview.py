@@ -434,15 +434,16 @@ class TestPyramidBlock:
         from zagg.pyramid import PYRAMID_SPEC_V2
         from zagg.sweep_overview import build_pyramid_block
 
-        cfg = self._cfg(
-            pyramid={"overviews": [{"node": 4, "cells": [5, 4]}, {"node": 2, "cells": 3}]}
-        )
+        cfg = self._cfg(pyramid={"overviews": [9, 7]})
         block = build_pyramid_block(cfg, shard_order=6)
         assert block["spec"] == PYRAMID_SPEC_V2
         overview = block["overview"]
-        # The normalized grouped form, at BLOCK level (the espg shape ruling):
-        # scalar sugar expanded, order preserved.
-        assert block["overviews"] == [{"node": 4, "cells": [5, 4]}, {"node": 2, "cells": [3]}]
+        # The FULLY EXPANDED list at BLOCK level (the espg shape + collapse
+        # rulings): the leaf entry carries every declared resolution, then
+        # the fixed every-order ladder (d = 7 - 6 = 1) runs down to node 0.
+        assert block["overviews"] == [{"node": 6, "cells": [9, 7]}] + [
+            {"node": k, "cells": [k + 1]} for k in range(5, -1, -1)
+        ]
         # The list REPLACES the /1 schedule keys wholesale — they must not
         # exist, and the family dict does not carry the declaration.
         assert "orders" not in overview and "spacing" not in overview
@@ -460,12 +461,13 @@ class TestPyramidBlock:
         from zagg.hive import build_manifest
         from zagg.pyramid import PYRAMID_SPEC_V2
 
-        grid = HealpixGrid(
-            6, 12, config=self._cfg(pyramid={"overviews": [{"node": 6, "cells": 7}]})
-        )
+        grid = HealpixGrid(6, 12, config=self._cfg(pyramid={"overviews": 7}))
         manifest = build_manifest(grid, dataset={"short_name": "ATL06", "version": "007"})
         assert manifest["pyramid"]["spec"] == PYRAMID_SPEC_V2
-        assert manifest["pyramid"]["overviews"] == [{"node": 6, "cells": [7]}]
+        # Scalar sugar expanded, ladder recorded in full, rooted at order 0.
+        assert manifest["pyramid"]["overviews"][0] == {"node": 6, "cells": [7]}
+        assert manifest["pyramid"]["overviews"][-1] == {"node": 0, "cells": [1]}
+        assert len(manifest["pyramid"]["overviews"]) == 7
         json.dumps(manifest)
 
     def test_levels_carry_all_time_and_summarize(self):
@@ -476,7 +478,7 @@ class TestPyramidBlock:
 
         cfg = self._cfg(
             pyramid={
-                "overviews": [{"node": 4, "cells": [5]}],
+                "overviews": [7],
                 "all_time": True,
                 "summarize": {"h_mean": {"as": "h_mean_digest"}},
             }
@@ -497,19 +499,17 @@ class TestPyramidBlock:
         """
         from zagg.sweep_overview import build_pyramid_block
 
-        # Ascending nodes.
-        cfg = self._cfg(
-            pyramid={"overviews": [{"node": 2, "cells": [3]}, {"node": 4, "cells": [5]}]}
-        )
-        with pytest.raises(ValueError, match="nodes must strictly descend"):
+        # Ascending resolutions.
+        cfg = self._cfg(pyramid={"overviews": [7, 9]})
+        with pytest.raises(ValueError, match="must strictly descend"):
             build_pyramid_block(cfg, shard_order=6)
-        # A node finer than the shard order — no hive prefix lives there.
-        cfg = self._cfg(pyramid={"overviews": [{"node": 9, "cells": [10]}]})
-        with pytest.raises(ValueError, match=r"outside \[0, parent_order = 6\]"):
+        # A resolution at the shard's own order — writer-side, never declared.
+        cfg = self._cfg(pyramid={"overviews": [6]})
+        with pytest.raises(ValueError, match="not strictly between"):
             build_pyramid_block(cfg, shard_order=6)
-        # A member at (or past) the base data's own cell order.
-        cfg = self._cfg(pyramid={"overviews": [{"node": 4, "cells": [12]}]})
-        with pytest.raises(ValueError, match="base data's own"):
+        # A resolution at the base data's own cell order.
+        cfg = self._cfg(pyramid={"overviews": [12]})
+        with pytest.raises(ValueError, match="not strictly between"):
             build_pyramid_block(cfg, shard_order=6)
 
     def test_levels_skip_validation_without_a_grid_block(self):
@@ -522,11 +522,12 @@ class TestPyramidBlock:
         from zagg.pyramid import PYRAMID_SPEC_V2
         from zagg.sweep_overview import build_pyramid_block
 
-        cfg = self._cfg(pyramid={"overviews": [{"node": 4, "cells": [5]}]})
+        cfg = self._cfg(pyramid={"overviews": [8]})
         cfg.output.pop("grid")
         block = build_pyramid_block(cfg, shard_order=6)
         assert block["spec"] == PYRAMID_SPEC_V2
-        assert block["overviews"] == [{"node": 4, "cells": [5]}]
+        assert block["overviews"][0] == {"node": 6, "cells": [8]}
+        assert block["overviews"][-1] == {"node": 0, "cells": [2]}
 
     def test_validate_rejects_bad_grammar(self):
         from zagg.config import validate_config
@@ -541,7 +542,7 @@ class TestPyramidBlock:
             validate_config(self._cfg(store_layout="hive", pyramid={"depths": [1]}))
         # `overviews` is a KNOWN key since issue #382 — its grammar errors
         # are zagg.pyramid's (tests/test_pyramid.py), surfaced through here.
-        with pytest.raises(ValueError, match="overviews\\[0\\] must be a mapping"):
+        with pytest.raises(ValueError, match="not strictly between"):
             validate_config(self._cfg(store_layout="hive", pyramid={"overviews": [1]}))
         with pytest.raises(ValueError, match="must be a mapping or false"):
             validate_config(self._cfg(store_layout="hive", pyramid=True))
@@ -671,7 +672,11 @@ class TestPyramidV2Gate:
         manifest = _write_manifest(root, orders=(1, 0), windowed=windowed)
         manifest["pyramid"] = {
             "spec": "zagg-pyramid/2",
-            "overviews": [{"node": 2, "cells": [3, 2]}],
+            "overviews": [
+                {"node": 2, "cells": [3]},
+                {"node": 1, "cells": [2]},
+                {"node": 0, "cells": [1]},
+            ],
             "overview": {
                 "all_time": all_time,
                 "fold_source": "cascade",
@@ -2154,14 +2159,18 @@ class TestDeclarePyramid:
 
         self._pre_declaration_store(tmp_path)
         cfg = _leaf_cfg()
-        cfg.output["pyramid"] = {"overviews": [{"node": 2, "cells": 3}, {"node": 1, "cells": 2}]}
+        cfg.output["pyramid"] = {"overviews": 3}  # scalar sugar; window is (2, 4)
         summary = declare_pyramid(str(tmp_path), cfg)
         assert summary["updated"] is True and summary["previous"] == "absent"
-        # /2 declares levels, not orders — the summary reports the normalized
-        # form and omits `orders` ENTIRELY, mirroring the manifest block: an
-        # empty `orders` is /1's declared-off signal (specification §4.5).
+        # /2 declares the expanded overviews list, not orders — the summary
+        # omits `orders` ENTIRELY, mirroring the manifest block: an empty
+        # `orders` is /1's declared-off signal (specification §4.5).
         assert "orders" not in summary
-        assert summary["overviews"] == [{"node": 2, "cells": [3]}, {"node": 1, "cells": [2]}]
+        assert summary["overviews"] == [
+            {"node": 2, "cells": [3]},
+            {"node": 1, "cells": [2]},
+            {"node": 0, "cells": [1]},
+        ]
         assert summary["validated"].startswith("leaf ")  # store truth still probed
         after = read_manifest(str(tmp_path))
         assert after["pyramid"]["spec"] == PYRAMID_SPEC_V2
@@ -2170,7 +2179,7 @@ class TestDeclarePyramid:
     def test_declare_v2_is_idempotent(self, tmp_path):
         self._pre_declaration_store(tmp_path)
         cfg = _leaf_cfg()
-        cfg.output["pyramid"] = {"overviews": [{"node": 2, "cells": 3}]}
+        cfg.output["pyramid"] = {"overviews": [3]}
         declare_pyramid(str(tmp_path), cfg)
         summary = declare_pyramid(str(tmp_path), cfg)
         assert summary["updated"] is False and summary["previous"] == "identical"
@@ -2178,10 +2187,11 @@ class TestDeclarePyramid:
     def test_declare_v2_levels_outside_the_store_refuse(self, tmp_path):
         self._pre_declaration_store(tmp_path)
         cfg = _leaf_cfg()
-        # Valid grammar in the abstract, but node 3 is finer than this store's
-        # shard_order 2 — the manifest's own orders win (issue #358 posture).
-        cfg.output["pyramid"] = {"overviews": [{"node": 3, "cells": 3}]}
-        with pytest.raises(ValueError, match=r"outside \[0, parent_order = 2\]"):
+        # Valid grammar in the abstract (the grid-less config skips the
+        # template-time check), but resolution 4 IS this store's cell order —
+        # the manifest's own orders win (issue #358 posture).
+        cfg.output["pyramid"] = {"overviews": [4]}
+        with pytest.raises(ValueError, match="not strictly between"):
             declare_pyramid(str(tmp_path), cfg)
 
     def test_declare_v2_replaces_v1_preserving_materialized(self, tmp_path):
@@ -2198,7 +2208,7 @@ class TestDeclarePyramid:
         manifest["pyramid"]["overview"]["materialized"] = actuals
         obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
         cfg = _leaf_cfg()
-        cfg.output["pyramid"] = {"overviews": [{"node": 2, "cells": 3}]}
+        cfg.output["pyramid"] = {"overviews": [3]}
         summary = declare_pyramid(str(tmp_path), cfg)
         assert summary["previous"] == "replaced" and summary["updated"] is True
         after = read_manifest(str(tmp_path))
@@ -2214,7 +2224,7 @@ class TestDeclarePyramid:
 
         self._pre_declaration_store(tmp_path, decimals=("-311", "-312"))
         cfg = _leaf_cfg()
-        cfg.output["pyramid"] = {"overviews": [{"node": 2, "cells": 3}]}
+        cfg.output["pyramid"] = {"overviews": [3]}
         declare_pyramid(str(tmp_path), cfg)
         result = run_sweep(str(tmp_path), discover_leaves(str(tmp_path)), families=("overview",))
         counts = result["families"]["overview"]
