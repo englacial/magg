@@ -437,8 +437,12 @@ partitions already materialized (the default `fold_source: cascade`, issue
 [#376](https://github.com/englacial/zagg/issues/376)) — but that follow-up is
 not cheap the way the JSON one is: an overview's currency check folds before
 it compares, so every leaves-fold level re-reads its raw leaf zarrs
-store-wide even where nothing changed. The follow-up also performs the
-deferred manifest `pyramid.materialized` bookkeeping. Only under the
+store-wide even where nothing changed. And the follow-up performs
+only half the deferred manifest bookkeeping: its RMW unions the materialized
+orders, but records a fold regime only for a level that wrote in that same
+pass — the regimes the partitions wrote under ride each partition's own run
+record as `materialized_fold_sources`, and reach the manifest only with a
+finisher that carries them. Only under the
 deprecated `fold_source: leaves` does that follow-up re-fold coarse levels
 from the raw leaves — the blow-up the cascade exists to remove — so there,
 leave them to the finisher. (A `zagg-pyramid/2` store never gets that far:
