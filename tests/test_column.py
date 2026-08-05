@@ -231,6 +231,21 @@ class TestFoldColumn:
         )
         assert bytes(group["h_tdigest"][0]) == encode_digest(oracle, "float32")
 
+    def test_declared_delta_bounds_an_over_budget_merge(self):
+        # Every CELLS digest is far under the δ budget, so no merge above ever
+        # re-compresses and `delta` is unobservable. These two cells share
+        # order-3 row 1 and their merge IS over budget, so the payload depends
+        # on the declared δ — one of the three values that decide the bytes.
+        slabs = _cell_slabs({4: np.arange(200.0), 5: np.arange(200.0, 400.0)})
+        parts = [decode_digest(slabs["h_tdigest"][i], "float32") for i in (4, 5)]
+        merged = merge_tdigests_kway(parts, delta=DELTA)
+        assert len(merged) < sum(len(p) for p in parts)  # re-compression bit
+        folded = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3])
+        assert bytes(folded[3]["h_tdigest"][1]) == encode_digest(merged, "float32")
+        # ... and a different δ is different bytes: the DECLARED one is used.
+        other = merge_tdigests_kway(parts, delta=DELTA // 4)
+        assert bytes(folded[3]["h_tdigest"][1]) != encode_digest(other, "float32")
+
     def test_resolution_finer_than_the_cells_refuses_by_name(self):
         # 4^(cell_order - res) would be fractional; the downstream divisibility
         # guards read 16 % 0.25 as clean and fail opaquely inside numpy.
@@ -301,7 +316,10 @@ class TestSweepParity:
             "generated_at": "2026-01-01T00:00:00+00:00",
         }
         obstore.put(open_object_store(str(tmp_path)), MANIFEST_NAME, json.dumps(manifest).encode())
-        cells = {0: [1.0, 2.0], 5: [10.0, 4.0], 6: [7.0], 15: [3.0, 8.0, 5.0]}
+        # Cells 5 and 6 hold enough observations that their merge is over the
+        # δ budget at both folded resolutions, so the declared delta decides
+        # the parity bytes rather than being carried unobserved.
+        cells = {0: [1.0, 2.0], 5: np.arange(200.0), 6: np.arange(200.0, 400.0), 15: [3.0, 8.0]}
         slabs = _make_leaf(tmp_path, "-311", cells)
         result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
         assert result["families"]["overview"]["written"] == 2
