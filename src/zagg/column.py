@@ -329,6 +329,9 @@ def write_column(
     basename = column_name(window)
     path = f"{node_prefix}/{basename}"
     cfg = _overview_config(fields)
+    # `sharded=True` is INERT here (as in `_write_overview`): with no
+    # `chunk_inner`, `HealpixGrid` computes chunks_per_shard == 1 and turns
+    # sharding back off for every group — one chunk per group, no shard index.
     grids = {res: HealpixGrid(node_order, res, config=cfg, sharded=True) for res in resolutions}
     spec = GroupSpec(
         members={str(res): grids[res].shard_spec() for res in resolutions}, attributes={}
