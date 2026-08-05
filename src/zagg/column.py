@@ -133,7 +133,10 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
     degenerate 1-cell group: the leaf's whole-footprint aggregate.
 
     ``fields`` is filtered to the composable classes (:func:`composable_fields`)
-    — a D24 ``none`` field has no coarser fold and never becomes a group.
+    — a D24 ``none`` field has no coarser fold and never becomes a group. A
+    resolution FINER than ``cell_order`` is refused by name: it would ask for
+    a fractional fold factor, which no guard downstream can read as a divisor
+    (both classes would surface it as an opaque numpy failure instead).
     """
     from zagg.sweep_overview import decode_digest, fold_dense, fold_digests
 
@@ -142,6 +145,13 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
     out: dict = {}
     for res in resolutions:
         res = int(res)
+        if res > cell_order:
+            raise ValueError(
+                f"cannot fold a column group at resolution {res}: it is FINER than the "
+                f"leaf's cell order {cell_order}, so the fold factor "
+                f"4^({cell_order} - {res}) is fractional — a column group is a fold of "
+                f"the leaf's own cells, never an upsample of them"
+            )
         factor = 4 ** (cell_order - res)
         groups: dict = {}
         for name, meta in fields.items():
