@@ -442,10 +442,12 @@ only half the deferred manifest bookkeeping: its RMW unions the materialized
 orders, but records a fold regime only for a level that wrote in that same
 pass — the regimes the partitions wrote under ride each partition's own run
 record as `materialized_fold_sources`, and reach the manifest only with a
-finisher that carries them. Only under the
-deprecated `fold_source: leaves` does that follow-up re-fold coarse levels
-from the raw leaves — the blow-up the cascade exists to remove — so there,
-leave them to the finisher. (A `zagg-pyramid/2` store never gets that far:
+finisher that carries them. Leaves-fold levels are not only the deprecated
+`fold_source: leaves`, where that is every level — the blow-up the cascade
+exists to remove: under `cascade` the finest `exact_levels` levels fold from
+the leaves too, as does any level declared a wider gap than the node slab can
+divide. Prefer the finisher for the overview family. (A `zagg-pyramid/2`
+store never gets that far:
 a partitioned pass refuses at the declared-not-yet-sweepable gate exactly
 like an unpartitioned one.)
 
