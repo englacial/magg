@@ -65,8 +65,11 @@ DEFAULT_SPACING = 2
 #: merge — the state-scale wall the issue names. It is kept as a DEPRECATED
 #: opt-in only.
 FOLD_SOURCES = ("cascade", "leaves")
-#: The espg-ratified default (issue #376): overviews are display artifacts,
-#: with no precision guarantee past the first skip level.
+#: The espg-ratified default (issue #376): under ``/1``, overviews are
+#: display artifacts with no precision guarantee past the first skip level.
+#: (For ``/2`` that doctrine is superseded — spec §4.4: exact fields exact at
+#: every order, approximate fields analysis-grade at their recorded
+#: generation.)
 DEFAULT_FOLD_SOURCE = "cascade"
 #: How many of the FINEST declared levels fold exactly from the leaves; every
 #: coarser level cascades from the level below it in this list. 1 is the
@@ -234,6 +237,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     from zagg.config import get_pyramid
     from zagg.pyramid import (
         declared_fields,
+        expand_overviews,
         normalize_overviews,
         overview_block_v2,
         validate_overviews,
@@ -245,7 +249,7 @@ def build_pyramid_block(config, shard_order: int) -> dict:
         return {"spec": PYRAMID_SPEC, "overview": {"orders": []}}
     fields, excluded = declared_fields(config)
     if knob.get("overviews") is not None:
-        levels = normalize_overviews(knob["overviews"])
+        resolutions = normalize_overviews(knob["overviews"])
         # Ordering/range live here, not in ``normalize_overviews`` (they need the
         # grid orders) — and this is the ONLY validation the templating path
         # gets: the Lambda worker builds its config with ``load_config_from_dict``,
@@ -257,7 +261,13 @@ def build_pyramid_block(config, shard_order: int) -> dict:
         # anything is written.
         grid_child = (config.output.get("grid") or {}).get("child_order")
         if grid_child is not None:
-            validate_overviews(levels, parent_order=int(shard_order), child_order=int(grid_child))
+            validate_overviews(
+                resolutions, parent_order=int(shard_order), child_order=int(grid_child)
+            )
+        # The manifest records the FULLY EXPANDED list — the leaf entry plus
+        # the fixed every-order ladder to 0 (espg ruling; readers never
+        # re-derive).
+        levels = expand_overviews(resolutions, parent_order=int(shard_order))
         fold = _fold_plan(knob, [e["node"] for e in levels])
         return overview_block_v2(knob, levels, fold, fields, excluded)
     spacing = int(knob.get("spacing") or DEFAULT_SPACING)
@@ -464,14 +474,17 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     # after the whole store-truth probe has been paid for.
     block = json.loads(json.dumps(block))
     if "overviews" in block:
-        # The /2 (node, cells) declaration (issue #382; block-level list per
-        # the espg shape ruling): re-validate against the MANIFEST's own
-        # orders — config validation saw the config's grid block, and the
-        # retrofit contract is that the store's truth wins.
+        # The /2 declaration (issue #382; block-level expanded list per the
+        # espg shape ruling): re-validate the LEAF resolutions against the
+        # MANIFEST's own orders — config validation saw the config's grid
+        # block, and the retrofit contract is that the store's truth wins.
+        # The first entry is the leaf entry (its node is the shard order the
+        # expansion was derived at); the ladder above it is fixed law, valid
+        # by construction given a valid leaf list.
         from zagg.pyramid import validate_overviews
 
         validate_overviews(
-            block["overviews"],
+            block["overviews"][0]["cells"],
             parent_order=shard_order,
             child_order=int(manifest["cell_order"]),
         )

@@ -33,15 +33,15 @@ conformance tests assert decoded values, never object bytes.
   single-photon cell that packs the §3.1 golden word `0xFF000000FF0000FF`
   and a noise-only cell whose signal payload is the empty ``(0, 2)`` array.
 - ``pyramid/`` — MANIFEST ONLY: the §4.5 ``zagg-pyramid/2`` declaration
-  (issue #382), produced by the production declaration paths end to end
-  (``/1`` template -> production sweep bookkeeping -> ``declare_pyramid``
-  retrofit to ``/2``). One manifest carries every ``/2`` reading a decoder
-  must tell apart: unequal member depths, a promoted ``cells == node``
-  member, a declared gather, the #376 fold keys, and the preserved ``/1``-era
-  ``materialized`` actuals — plus, through the ``pyramid.expected.json``
-  record of the raw config knob, the config-side scalar sugar normalized to
-  its list form (a WRITER pin: the manifest is sugar-free by construction,
-  so no decoder can tell sugar was used). No store beneath
+  (issue #382, collapsed grammar), produced by the production declaration
+  paths end to end (``/1`` template -> production sweep bookkeeping ->
+  ``declare_pyramid`` retrofit to ``/2``). Its grid is shard order 3 (see
+  :data:`PYRAMID_GRID`) so one manifest carries every ``/2`` reading a
+  decoder must tell apart: a multi-resolution leaf entry, the fixed
+  every-order ladder rooted at node 0, the #376 fold keys, and the
+  preserved ``/1``-era ``materialized`` actuals — plus, through the
+  ``pyramid.expected.json`` record of the raw config knob, the leaf-list
+  form of the declaration the expansion was derived from. No store beneath
   it on purpose — the block is a template-time artifact, decodable from
   ``morton_hive.json`` alone, and ``/2`` artifacts are not yet writable
   (issues #383/#384).
@@ -68,18 +68,20 @@ DELTA = 16
 #: The §3.1 golden-word photon: per-surface confidences at threshold 2 pack
 #: lanes [255, 0, 0, 255, 0, 0, 0, 255] = 0xFF000000FF0000FF.
 GOLDEN_CONF = (4, -1, 0, 3, 1)
-#: The ``pyramid/`` fixture's ``output.pyramid`` knob (§4.5, issue #382): the
-#: raw CONFIG form, sugar and all — one declaration carrying every ``/2``
-#: entry reading. Entry 0: unequal depths + a promoted ``cells == node``
-#: member (the 1-cell whole-footprint group). Entry 1: the declared gather
-#: (same cells, coarser node). Entry 2: scalar sugar, normalized to ``[2]``
-#: in the manifest.
-PYRAMID_KNOB = {
-    "overviews": [
-        {"node": 4, "cells": [5, 4]},
-        {"node": 2, "cells": [5, 4]},
-        {"node": 1, "cells": 2},
-    ],
+#: The ``pyramid/`` fixture's ``output.pyramid`` knob (§4.5, issue #382,
+#: collapsed grammar): leaf cell resolutions only. Two members exercise the
+#: multi-resolution leaf entry; everything above the shard is the fixed
+#: every-order ladder, expanded by the production path into the manifest.
+PYRAMID_KNOB = {"overviews": [5, 4]}
+#: The pyramid fixture's grid: shard order 3 (not the leaf fixtures' 4) so
+#: the leaf window (parent_order, child_order) = (3, 6) has TWO interior
+#: resolutions — a multi-member leaf entry is impossible on the 4/6 window.
+PYRAMID_GRID = {
+    "type": "healpix",
+    "parent_order": 3,
+    "child_order": 6,
+    "chunk_inner": 5,
+    "sharded": True,
 }
 #: Fields the ``pyramid/`` fixture declares beyond the ``minimal`` pair, so
 #: one manifest carries every composability class: exact (``count`` +
@@ -91,7 +93,7 @@ PYRAMID_EXTRA_VARIABLES = {
 }
 #: The ``/1``-era sweep actuals the retrofit must preserve (§4.5): the
 #: ``{order: fold_source}`` shape the production bookkeeping writer takes.
-PYRAMID_V1_ACTUALS = {2: "leaves", 0: "cascade"}
+PYRAMID_V1_ACTUALS = {1: "leaves", 0: "cascade"}
 
 
 def _cell_photons(rng, n, *, signal_frac=0.6):
@@ -424,9 +426,10 @@ def build_pyramid(out: Path) -> None:
     so this fixture writes exactly one object: ``morton_hive.json``.
 
     The expectations are derived HERE from the generator's INPUTS
-    (:data:`PYRAMID_KNOB` normalized by the §4.5 rule, slab lengths by the
-    §4.4 rule), never read back out of the written manifest — the same
-    discipline the leaf fixtures' cell values follow.
+    (:data:`PYRAMID_KNOB` expanded by the §4.5 leaf-entry rule and the §4.4
+    fixed-ladder law, slab lengths by the §4.4 rule), never read back out of
+    the written manifest — the same discipline the leaf fixtures' cell
+    values follow.
     """
     from zagg import hive
     from zagg.grids import HealpixGrid
@@ -436,7 +439,8 @@ def build_pyramid(out: Path) -> None:
     cfg_v2 = _config(False, pyramid=PYRAMID_KNOB)
     for cfg in (cfg_v1, cfg_v2):
         cfg.aggregation["variables"].update(PYRAMID_EXTRA_VARIABLES)
-    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg_v1, chunk_inner=5, sharded=True)
+        cfg.output["grid"] = dict(PYRAMID_GRID)
+    grid = HealpixGrid(3, 6, layout="fullsphere", config=cfg_v1, chunk_inner=5, sharded=True)
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
@@ -447,20 +451,23 @@ def build_pyramid(out: Path) -> None:
     assert _update_manifest_pyramid(str(out), dict(PYRAMID_V1_ACTUALS), {})
     summary = declare_pyramid(str(out), cfg_v2)
     assert summary["updated"] is True, summary
-    # The normalized grouped form, spelled from the KNOB by the §4.5 rule
-    # (scalar sugar -> one-element list), and §4.4's slab-length rule.
-    levels = [
-        {"node": e["node"], "cells": [e["cells"]] if isinstance(e["cells"], int) else e["cells"]}
-        for e in PYRAMID_KNOB["overviews"]
+    # The fully expanded (node, cells) list, spelled from the KNOB by the
+    # §4.5 leaf-entry rule plus the §4.4 fixed-ladder law (d = base - shard;
+    # one member per order from shard - 1 down to 0), and §4.4's slab rule.
+    s = PYRAMID_GRID["parent_order"]
+    resolutions = list(PYRAMID_KNOB["overviews"])
+    d = resolutions[-1] - s
+    levels = [{"node": s, "cells": resolutions}] + [
+        {"node": k, "cells": [k + d]} for k in range(s - 1, -1, -1)
     ]
+    chunk = PYRAMID_GRID["chunk_inner"]
     expected = {
-        "shard_order": 4,
-        "chunk_order": 5,
-        "cell_order": 6,
+        "shard_order": s,
+        "chunk_order": chunk,
+        "cell_order": PYRAMID_GRID["child_order"],
         "declared": PYRAMID_KNOB,
         "overviews": levels,
         "slabs": [[4 ** (r - e["node"]) for r in e["cells"]] for e in levels],
-        "gather_entries": [1],  # same cells as the entry above, coarser node
         "fold_source": "cascade",
         "exact_levels": 1,
         "materialized": {
@@ -473,13 +480,11 @@ def build_pyramid(out: Path) -> None:
             "h_min": "exact",
             "h_mean": "none",
         },
-        # The §4.5 derived-default formula for this geometry (informative in
-        # the spec; pinned here so zagg's derivation cannot drift from it).
-        "default_overviews": [
-            {"node": 4, "cells": [5]},
-            {"node": 2, "cells": [3]},
-            {"node": 0, "cells": [1]},
-        ],
+        # The §4.5 omitted-knob default for this geometry ([chunk_order] at
+        # the leaf, then the same fixed ladder), pinned so zagg's derivation
+        # cannot drift from the formula on the page.
+        "default_overviews": [{"node": s, "cells": [chunk]}]
+        + [{"node": k, "cells": [k + (chunk - s)]} for k in range(s - 1, -1, -1)],
     }
     (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
     print(f"{out.name}: manifest-only, {len(levels)} level entries, /1 actuals preserved")

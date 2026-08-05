@@ -2464,8 +2464,10 @@ def get_pyramid(config: PipelineConfig) -> dict | None:
     ``false`` returns ``None``, declaring the overview family OFF for the
     store. An explicit mapping may carry ``spacing`` (int >= 1), ``orders``
     (explicit ancestor orders, winning over ``spacing``), ``overviews`` (the
-    issue #382 ``zagg-pyramid/2`` grammar: ordered ``{node, cells}`` entries
-    replacing ``orders``/``spacing`` wholesale — see :mod:`zagg.pyramid`),
+    issue #382 ``zagg-pyramid/2`` grammar: leaf cell resolutions, strictly
+    descending and strictly inside the shard's resolution window, replacing
+    ``orders``/``spacing`` wholesale — the fixed every-order ladder above
+    the shard is law, see :mod:`zagg.pyramid`),
     ``all_time`` (bool: also maintain the ``all.zarr`` cross-window fold on
     windowed stores), ``fold_source`` (``"cascade"`` — the default — or the
     deprecated ``"leaves"``, issue #376) with ``exact_levels`` (how many of
@@ -2517,9 +2519,10 @@ def _validate_pyramid(config: PipelineConfig) -> None:
         raise ValueError(f"output.pyramid.spacing must be an int >= 1 (got {spacing!r})")
     parent_order = int((config.output.get("grid") or {}).get("parent_order", 0))
     if knob.get("overviews") is not None:
-        # The issue #382 (node, cells) grammar: an overviews block REPLACES
-        # the /1 schedule knobs wholesale, so mixing the two grammars is
-        # refused rather than silently resolved either way.
+        # The issue #382 collapsed grammar (leaf cell resolutions; the fixed
+        # ladder above the shard is law, not declaration): an overviews knob
+        # REPLACES the /1 schedule knobs wholesale, so mixing the two
+        # grammars is refused rather than silently resolved either way.
         if knob.get("orders") is not None or knob.get("spacing") is not None:
             raise ValueError(
                 "output.pyramid.overviews is the zagg-pyramid/2 grammar and replaces "
