@@ -212,10 +212,19 @@ def column_name(window: str | None) -> str:
     stem marker so the name is disjoint from every leaf and overview basename
     (both end at ``{window}.zarr``). Proposed on the issue #383 PR, flagged
     there as a naming question.
-    """
-    from zagg.windows import leaf_name_v3
 
-    return leaf_name_v3(window).removesuffix(".zarr") + COLUMN_SUFFIX
+    :data:`~zagg.windows.SCHEDULE_NONE_TOKEN` normalizes back to ``None``,
+    mirroring :func:`zagg.sweep_overview._overview_basename`: the token is
+    what :func:`write_column` records as the unwindowed column's
+    ``zagg_column.window``, and ``leaf_name_v3`` RAISES on it (an explicit
+    label may never be the reserved token), so the attrs value would
+    otherwise be the one input this function cannot take. The alias is
+    unambiguous precisely because no legitimate window carries that label.
+    """
+    from zagg.windows import SCHEDULE_NONE_TOKEN, leaf_name_v3
+
+    stem = leaf_name_v3(None if window == SCHEDULE_NONE_TOKEN else window)
+    return stem.removesuffix(".zarr") + COLUMN_SUFFIX
 
 
 def write_column(

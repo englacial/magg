@@ -485,6 +485,20 @@ class TestWriteColumn:
         assert read_commit(open_store(f"{tmp_path}/-3/1/1/{basename}")) is not None
         assert not sidecar.exists()
 
+    def test_attrs_window_round_trips_through_the_name(self, tmp_path):
+        # The attrs record the unwindowed column's window as the reserved
+        # SCHEDULE_NONE_TOKEN, and `leaf_name_v3` RAISES on that token — so
+        # the basename derivation normalizes it back, exactly as
+        # `_overview_basename` does, and attrs -> name round-trips.
+        from zagg.column import COLUMN_ATTR, column_name
+        from zagg.windows import SCHEDULE_NONE_TOKEN
+
+        basename, _folded = self._write(tmp_path)
+        root = zarr.open_group(open_store(f"{tmp_path}/-3/1/1/{basename}"), mode="r", zarr_format=3)
+        assert root.attrs[COLUMN_ATTR]["window"] == SCHEDULE_NONE_TOKEN
+        assert column_name(root.attrs[COLUMN_ATTR]["window"]) == basename
+        assert column_name(SCHEDULE_NONE_TOKEN) == column_name(None) == "all.pyramid.zarr"
+
     def test_sidecar_import_failure_never_fails_the_column(self, tmp_path, monkeypatch):
         # Every sidecar-only import sits INSIDE the fail-open try: a
         # telemetry-class ImportError (a slimmed runtime, say) must cost the
