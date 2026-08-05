@@ -946,8 +946,13 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   the stamp, fail-open: absence reads unverifiable, never tampered.
 - **Failure identity.** A column-write failure fails the worker unit; the
   retry rewrites leaf and column wholesale. A committed leaf whose column
-  is absent or unstamped is therefore a torn worker's signature — the
-  repair is re-invoking that leaf.
+  is absent or unstamped therefore reads as **either** a torn worker
+  **or** a leaf whose writing declaration carried no column (the gate and
+  the clear above) — and the manifest cannot always separate the two,
+  since its `pyramid` block MAY lag. Readers never require a column, so
+  absence is never an error state; where the **writing** declaration is
+  known to carry leaf-node levels, absence is the torn-worker signature
+  and the repair is re-invoking the idempotent leaf.
 
 ### 4.7 What §4 does not cover (informative)
 
