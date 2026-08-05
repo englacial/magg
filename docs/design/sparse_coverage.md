@@ -462,6 +462,66 @@ The sweep is idempotent and can fail or lag without corrupting anything: the
 write path (§2) is load-bearing; this phase is optimization — deleting every
 rollup leaves all leaf reads intact.
 
+### Partitioning the sweep (issue #377)
+
+One sweep invoke walks the whole store, so its wall clock and resident memory
+both scale with the store — at state scale (the California o9 case in
+[#376](https://github.com/englacial/zagg/issues/376): 2,721 leaves, entirely
+within one HEALPix base cell) a single 900 s worker cannot finish. The pass
+therefore decomposes into `2^n` **morton-subtree partitions**, each swept by
+an isolated worker (`zagg.sweep_partition`).
+
+A D1 id is `{sign+base}{digit}*` with one base-4 digit — 2 bits — per order,
+so a `2^n` split lands on a digit boundary exactly when `n` is even: **`n = 2k`
+splits at order `k`**, and partition *i* owns every id whose first `k` digits
+rank *i* — one order-`k` subtree per base cell, twelve in all
+(`12 · 4^k / 2^n = 12`). `partitions` is consequently a power of **four**; an
+odd `n` would halve a digit and is rejected rather than rounded (the bit-level
+alternative is an open fork on #377).
+
+Ownership being a plain prefix test is what makes the workers need no
+coordination: every node at order `≥ k` and every `(node, window)` artifact
+beneath it lies wholly inside one partition, so **no two partitions can write
+the same object**, and the generation stamps above keep each partition
+independently idempotent and resumable. Three things do span partitions and are
+excluded from a partitioned pass by construction — nodes above the split order,
+the store-root `coverage.moc` refresh, and the manifest `pyramid.materialized`
+read-modify-write. They belong to a **coarse-level finisher**: one invoke after
+the partitions land, folding the coarse levels from the partitions'
+already-materialized overview slabs, which is bounded work only under #376's
+cascade (hence the sequencing).
+
+The root `coverage.moc` is on that list twice: it is a partitioned pass's
+**input** as well as a deferred output. Overview discovery unions the dirty set
+with it (LIST-free, above), so a partition reads whatever the last whole-tree
+sweep or `mode="coverage"` leg left — never a refresh from its own pass. A
+partition handed a *run-scoped* leaf set against a missing root MOC folds from
+that run's leaves alone, and since a generation mismatch overwrites, it can
+rewrite a complete node overview with fewer contributing leaves until the next
+whole-tree pass repairs it (D9: regenerable). The degraded read is surfaced as
+`root_moc_stale` in the partition's record, and ordering the refresh ahead of
+the fan-out is part of the finisher's obligation.
+
+Transport is unchanged (D8 — every store write stays worker-side): the client
+fires one fire-and-forget `mode="sweep"` Event invoke per non-empty partition,
+each carrying its disjoint slice of the work set plus a `partition: {index, of}`
+block. An oversized slice degrades to `discover: true` as before, and the block
+still rides, so worker-side discovery stays narrowed to that partition. On
+windowed stores the window axis is a second, free parallelism dimension
+(per-`(partition, window)` invokes); noted, not used yet.
+
+**Shipping status.** The decomposition, the partition-scoped pass
+(`run_sweep(partition=…)`), the fan-out event builder and the in-process
+`--partitions` backstop are in. Two links of the Lambda leg are not yet
+connected, and until both are, the fan-out must not be fired against a
+deployed worker: nothing in a production dispatch path passes `partitions`
+yet, and the worker's `mode="sweep"` handler does not forward the event's
+`partition` block to `run_sweep` — so a `partition`-carrying event would today
+be swept as a whole-tree pass over that partition's slice, walking up to the
+base node and racing its siblings on exactly the shared coarse rollups this
+section says cannot be shared. The single-process `--partitions` path has
+neither gap and is safe now.
+
 ## 8. Decisions registry
 
 ### 8.1 Decisions made (rationale recorded)

@@ -403,6 +403,54 @@ next sweep then refuses loudly instead of materializing — a `/2` store is
 declared-but-not-yet-sweepable until issues #383/#384 land — which is a
 legal recorded state, not an error.
 
+### Partitioning a sweep that will not fit
+
+A sweep pass holds the fold state for the subtree it is walking, so on a large
+store a single pass can exceed the worker's (or the laptop's) memory. Split it
+into `2^n` disjoint morton-subtree partitions:
+
+```
+python -m zagg.sweep s3://bucket/store --partitions 16
+```
+
+Each partition folds one order-`k` subtree per HEALPix base cell (`n = 2k`), so
+peak memory is bounded by the partition rather than by the store, and the
+command prints one summary per non-empty partition. `--partitions` must be a
+power of **four** — a morton digit is 2 bits, so that is where the split lands
+cleanly; an odd `2^n` is refused with the two valid neighbours named.
+
+Partitions are disjoint by construction, so they are also safe to run
+concurrently: no two write the same object, and each is independently
+idempotent (a re-run folds only what actually changed). What a partitioned
+pass deliberately does *not* do is anything **above** the split order — the
+coarse rollup levels, the root `coverage.moc` refresh, and the manifest's
+`pyramid.materialized` bookkeeping all span partitions and are left to a
+coarse-level finisher (issue #377).
+
+Until that finisher lands, the coarse levels of the **JSON rollup families**
+(`stats`, `moc`, `submap`) can be picked up by following a partitioned sweep
+with a plain `python -m zagg.sweep <root> --families stats,moc,submap`: the
+partitions' work is skip-if-current, and an interior fold reads its children's
+rollups rather than the leaves, so the extra pass is cheap. The **overview**
+family's deferred coarse levels likewise fold from the finer overviews the
+partitions already materialized (the default `fold_source: cascade`, issue
+[#376](https://github.com/englacial/zagg/issues/376)) — but that follow-up is
+not cheap the way the JSON one is: an overview's currency check folds before
+it compares, so every leaves-fold level re-reads its raw leaf zarrs
+store-wide even where nothing changed. And the follow-up performs
+only half the deferred manifest bookkeeping: its RMW unions the materialized
+orders, but records a fold regime only for a level that wrote in that same
+pass — the regimes the partitions wrote under ride each partition's own run
+record as `materialized_fold_sources`, and reach the manifest only with a
+finisher that carries them. Leaves-fold levels are not only the deprecated
+`fold_source: leaves`, where that is every level — the blow-up the cascade
+exists to remove: under `cascade` the finest `exact_levels` levels fold from
+the leaves too, as does any level declared a wider gap than the node slab can
+divide. Prefer the finisher for the overview family. (A `zagg-pyramid/2`
+store never gets that far:
+a partitioned pass refuses at the declared-not-yet-sweepable gate exactly
+like an unpartitioned one.)
+
 ## The commit stamp
 
 S3 has no empty directories and LIST is strongly consistent, so **absence is

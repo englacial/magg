@@ -85,8 +85,12 @@ class SweepFamily:
     artifacts — the seam the MOC family uses to refresh the store-root
     ``coverage.moc``. A family whose artifact is not a per-node JSON rollup
     (the overview family's zarrs, issue #201) instead defines ``sweep_store``
-    — the whole-tree hook :func:`run_sweep` dispatches to with the manifest
-    and the normalized dirty work set. Families registered with
+    — the whole-tree hook :func:`run_sweep` dispatches to with the manifest,
+    the normalized dirty work set, and ``min_order``. That last one is
+    CONTRACTUAL, not advisory (issue #377): it is the partition's split order,
+    and a hook that swallows it into ``**kwargs`` writes above the split and
+    breaks the disjointness invariant for every family in the pass.
+    Families registered with
     ``available = False`` are visible slots that :func:`get_family` refuses
     with their ``reason``.
     """
@@ -509,10 +513,12 @@ class OverviewFamily(SweepFamily):
 
     name = "overview"
 
-    def sweep_store(self, store_root, manifest, by_shard, store_kwargs) -> dict:
+    def sweep_store(self, store_root, manifest, by_shard, store_kwargs, min_order=0) -> dict:
         from zagg.sweep_overview import sweep_overviews
 
-        return sweep_overviews(store_root, manifest, by_shard, store_kwargs=store_kwargs)
+        return sweep_overviews(
+            store_root, manifest, by_shard, store_kwargs=store_kwargs, min_order=min_order
+        )
 
 
 class DebrisFamily(SweepFamily):
@@ -550,6 +556,7 @@ def run_sweep(
     families=None,
     store_kwargs: dict | None = None,
     record: bool = True,
+    partition=None,
 ) -> dict:
     """One sweep pass: fold leaf artifacts up-tree for each family (D22).
 
@@ -571,6 +578,20 @@ def run_sweep(
     analogue of the workers' ``phase_timings``, so benchmark runs are not
     limited to billed-duration inference.
 
+    ``partition`` (issue #377) restricts the pass to ONE ``2^n`` morton-subtree
+    partition — the worker event's ``{"index", "of"}`` block. Three things
+    follow, and together they are what makes concurrent partitions safe: the
+    work set is filtered to the partition's subtrees HERE rather than trusted
+    from the dispatcher (the ``discover`` transport derives the whole store's
+    work set worker-side); the bottom-up walk stops at the split order; and the
+    post-walk :meth:`SweepFamily.finish` hook is deferred. Nodes above the
+    split and the store-root ``coverage.moc`` span partitions — they belong to
+    the coarse-level finisher, so no two partitions can write the same
+    ``(node, window)`` artifact. ``of=1`` is the identity partition, byte-
+    identical to an unpartitioned pass. See :mod:`zagg.sweep_partition`.
+    Every summary field is then partition-scoped EXCEPT ``skipped_leaves``,
+    which is derived before the filter and stays store-wide.
+
     Unless ``record=False``, the summary is also PUT at the store root as the
     sweep's own run record (:func:`_write_sweep_record`, fail-open).
     """
@@ -578,15 +599,26 @@ def run_sweep(
 
     from zagg.hive import MANIFEST_NAME, read_manifest
     from zagg.store import open_object_store
+    from zagg.sweep_partition import normalize_partition, partition_split_order, select_partition
 
     t0 = time.perf_counter()
     store_kwargs = dict(store_kwargs or {})
+    part = normalize_partition(partition)
     manifest = read_manifest(store_root, **store_kwargs)
     if manifest is None:
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")
     shard_order = int(manifest["shard_order"])
+    split = 0 if part is None else partition_split_order(part[1])
+    if split > shard_order:
+        raise ValueError(
+            f"sweep partitions={part[1]} splits at order {split}, finer than the store's "
+            f"shard_order {shard_order}; no leaf lies below the split (issue #377)"
+        )
     fams = [get_family(n) for n in (DEFAULT_FAMILIES if families is None else families)]
     by_shard, skipped = _normalize_leaves(leaves, shard_order)
+    foreign = 0
+    if part is not None:
+        by_shard, foreign = select_partition(by_shard, part[1], part[0])
     store = open_object_store(store_root, **store_kwargs)
     summary: dict = {
         "store_root": store_root,
@@ -595,14 +627,24 @@ def run_sweep(
         "skipped_leaves": skipped,
         "families": {},
     }
+    if part is not None:
+        summary["partition"] = {"index": part[0], "of": part[1], "split_order": split}
+        summary["foreign_leaves"] = foreign
     for fam in fams:
         fam_t0 = time.perf_counter()
         runner = getattr(fam, "sweep_store", None)
         if runner is not None:
-            result = runner(store_root, manifest, by_shard, store_kwargs)
+            result = runner(store_root, manifest, by_shard, store_kwargs, min_order=split)
         else:
             result = _sweep_family(
-                store_root, store, fam, by_shard, shard_order, manifest.get("spec"), store_kwargs
+                store_root,
+                store,
+                fam,
+                by_shard,
+                shard_order,
+                manifest.get("spec"),
+                store_kwargs,
+                split,
             )
         result["duration_s"] = time.perf_counter() - fam_t0
         summary["families"][fam.name] = result
@@ -625,7 +667,12 @@ def _write_sweep_record(store, summary: dict) -> str | None:
 
     One small JSON object per sweep pass — ``sweep_stats_{ts}.json``,
     timestamp-first like the run parquets (D20) so a lexicographic listing is
-    chronological, and deliberately OUTSIDE the ``stats_*.parquet`` glob the
+    chronological. A PARTITIONED pass (issue #377) appends ``_p{index}of{of}``:
+    the ``2^n`` invokes of one fan-out fire in the same second and would
+    otherwise clobber each other's record, and the per-partition rows are
+    exactly what the issue #354 timing record is asked to grow — one object
+    per partition, each carrying its own ``partition`` block and durations.
+    Both forms are deliberately OUTSIDE the ``stats_*.parquet`` glob the
     sweep's own run-record discovery scans (a sweep record must never read as
     a shard run record). A second pass within the same wall-clock second
     overwrites the first — acceptable for telemetry, which this is: fail-open
@@ -637,7 +684,9 @@ def _write_sweep_record(store, summary: dict) -> str | None:
     import obstore
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    key = f"sweep_stats_{ts}.json"
+    part = summary.get("partition")
+    tag = "" if part is None else f"_p{part['index']}of{part['of']}"
+    key = f"sweep_stats_{ts}{tag}.json"
     try:
         obstore.put(store, key, json.dumps({"spec": SWEEP_SPEC, **summary}, indent=1).encode())
     except Exception as e:
@@ -667,8 +716,15 @@ def _normalize_leaves(leaves, shard_order: int):
     return by_shard, skipped
 
 
-def _sweep_family(store_root, store, fam, by_shard, shard_order, spec, store_kwargs) -> dict:
-    """Bottom-up fold of one family over the dirty ancestor paths."""
+def _sweep_family(
+    store_root, store, fam, by_shard, shard_order, spec, store_kwargs, min_order=0
+) -> dict:
+    """Bottom-up fold of one family over the dirty ancestor paths.
+
+    ``min_order`` (issue #377) is the partition's split order: the walk writes
+    no node above it and the post-walk ``finish`` hook is deferred, because
+    both span partitions. Zero — an unpartitioned pass — is the whole tree.
+    """
     counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
     computed: dict[str, dict | None] = {}
     for decimal in sorted(by_shard):
@@ -684,7 +740,7 @@ def _sweep_family(store_root, store, fam, by_shard, shard_order, spec, store_kwa
             counts,
         )
     frontier = [d for d in sorted(by_shard) if computed[d] is not None]
-    for _order in range(shard_order - 1, -1, -1):
+    for _order in range(shard_order - 1, min_order - 1, -1):
         parents = sorted({a for d in frontier if (a := _ancestor(d)) is not None})
         frontier = []
         for node in parents:
@@ -695,7 +751,14 @@ def _sweep_family(store_root, store, fam, by_shard, shard_order, spec, store_kwa
             break
     tops = [computed[d] for d in frontier]
     result = dict(counts)
-    result.update(fam.finish(store_root, tops, shard_order, store_kwargs))
+    if min_order:
+        # Deferred in ORDERS as well as by name, so the finisher's obligation
+        # is machine-readable and sized: split == shard_order is permitted,
+        # and then every node above the leaves is owed, not just the base ones.
+        result["finish_deferred"] = True  # spans partitions -> the finisher's
+        result["deferred_orders"] = list(range(min_order))
+    else:
+        result.update(fam.finish(store_root, tops, shard_order, store_kwargs))
     return result
 
 
@@ -1057,7 +1120,14 @@ def _sidecar_window(name: str, spec: str | None):
 
 
 def main(argv=None) -> int:
-    """Manual CLI: ``python -m zagg.sweep <store_root>`` (issue #300, D22)."""
+    """Manual CLI: ``python -m zagg.sweep <store_root>`` (issue #300, D22).
+
+    ``--partitions 2^n`` (issue #377) folds one partition at a time instead of
+    the whole tree — the single-process half of the parallel sweep: no
+    speed-up, but peak memory is bounded by the partition, which is what lets
+    a store no single walk fits still be swept from a laptop. Prints a list of
+    per-partition summaries in that mode instead of the single summary.
+    """
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -1070,6 +1140,15 @@ def main(argv=None) -> int:
         default=None,
         help=f"Comma-separated families (default: {','.join(DEFAULT_FAMILIES)}; "
         f"registered: {', '.join(sorted(FAMILIES))})",
+    )
+    parser.add_argument(
+        "--partitions",
+        type=int,
+        default=1,
+        help="Split the pass into 2^n disjoint morton-subtree partitions and fold them "
+        "one at a time, bounding peak memory by the partition rather than the store "
+        "(issue #377). Must be a power of FOUR (each morton digit is 2 bits); coarse "
+        "levels above the split order are left to the finisher. Default: 1 (whole tree)",
     )
     parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
     parser.add_argument(
@@ -1084,9 +1163,15 @@ def main(argv=None) -> int:
         metavar="CONFIG_YAML",
         help="Retrofit the manifest pyramid declaration from this pipeline config "
         "(issue #358), print the summary, and exit — declaration-only: no sweep "
-        "pass runs in the same invocation (--families is ignored)",
+        "pass runs in the same invocation (--families and --partitions are ignored)",
     )
     args = parser.parse_args(argv)
+    # Validate the fan-out width from argv alone, BEFORE anything touches the
+    # store: discover_leaves is a LIST plus a parquet read per run record, and
+    # a mistyped width should not cost that (review finding, issue #377).
+    from zagg.sweep_partition import partition_split_order
+
+    partition_split_order(args.partitions)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     store_kwargs: dict = {"region": args.region}
     if args.output_creds:
@@ -1114,7 +1199,18 @@ def main(argv=None) -> int:
     if not leaves:
         print("No completed leaves found in the store's run records; nothing to sweep.")
         return 0
-    summary = run_sweep(args.store_root, leaves, families=families, store_kwargs=store_kwargs)
+    if args.partitions != 1:
+        from zagg.sweep_partition import sweep_partitions
+
+        summary = sweep_partitions(
+            args.store_root,
+            leaves,
+            partitions=args.partitions,
+            families=families,
+            store_kwargs=store_kwargs,
+        )
+    else:
+        summary = run_sweep(args.store_root, leaves, families=families, store_kwargs=store_kwargs)
     print(json.dumps(summary, indent=2))
     return 0
 
