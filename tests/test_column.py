@@ -710,12 +710,29 @@ def _generator():
     return mod
 
 
-def _run_unit(root, monkeypatch, *, pyramid=None, window=None, windowing=None, fail=False):
+def _column_bytes(column) -> dict:
+    """``{(resolution, array): bytes}`` for every array under a column."""
+    store = open_store(str(column))
+    out = {}
+    for res in (5, 4):
+        group = zarr.open_group(store, path=str(res), mode="r", zarr_format=3)
+        for name, arr in group.arrays():
+            v = arr[:]
+            out[(res, name)] = [bytes(p) for p in v] if v.dtype == object else v.tobytes()
+    return out
+
+
+def _run_unit(
+    root, monkeypatch, *, pyramid=None, window=None, windowing=None, fail=False, sharded=True
+):
     """One shard through the REAL ``process_and_write_hive`` (generator inputs).
 
     Returns ``(metadata, leaf_dir)``; the generator's fake ``process_shard``
-    feeds the production sharded leaf write, so the staged sink the column
-    folds from is exactly what the leaf stored.
+    feeds the production leaf write, so the staged sink the column folds from
+    is exactly what the leaf stored. ``sharded=False`` drives the same inputs
+    through the per-chunk STREAMING leaf writer instead — a different route to
+    ``staged`` (per-chunk lazy placement + ``write_ragged_leaf_to_zarr``), and
+    the one every ``chunk_inner``-unset grid takes.
     """
     from dataclasses import replace
 
@@ -730,7 +747,7 @@ def _run_unit(root, monkeypatch, *, pyramid=None, window=None, windowing=None, f
         # time_field's base-rate dataset path; the fake reader ignores it.
         ds = {**cfg.data_source, "variables": {windowing["time_field"]: "g/t"}}
         cfg = replace(cfg, data_source=ds, output={**cfg.output, "windowing": windowing})
-    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=sharded)
     shard = morton_word(gen.SHARD_KEY)
     by_chunk, _cells = gen._build_cells(grid, shard, kitchen_sink=False)
     hive.ensure_manifest(
@@ -741,7 +758,17 @@ def _run_unit(root, monkeypatch, *, pyramid=None, window=None, windowing=None, f
     def fake(*args, **kwargs):
         if fail:
             return None, {"error": "synthetic failure", "shard_key": int(args[1])}
+        # The generator's fake only knows the sharded ``chunk_results`` sink;
+        # the streaming path passes ``write_chunk`` instead, so collect the
+        # chunks locally and replay them through the callback (the
+        # ``test_content_hash._write_kitchen_sink`` precedent).
+        write_chunk = kwargs.get("write_chunk")
+        if kwargs.get("chunk_results") is None:
+            kwargs["chunk_results"] = []
         df, meta = inner(*args, **kwargs)
+        if write_chunk is not None:
+            for block, carrier, ragged in kwargs["chunk_results"]:
+                write_chunk(block, carrier, ragged)
         meta["phase_timings"] = {"read": 0.0, "index": 0.0, "aggregate": 0.0}
         return df, meta
 
@@ -826,21 +853,29 @@ class TestWorkerIntegration:
         assert stamp is not None and stamp["window"] == "2019"
 
     def test_rerun_rewrites_the_column_to_the_same_bytes(self, tmp_path, monkeypatch):
-        def snapshot(column):
-            store = open_store(str(column))
-            out = {}
-            for res in (5, 4):
-                group = zarr.open_group(store, path=str(res), mode="r", zarr_format=3)
-                for name, arr in group.arrays():
-                    v = arr[:]
-                    out[(res, name)] = [bytes(p) for p in v] if v.dtype == object else v.tobytes()
-            return out
-
         _meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
         column = leaf.parent / "all.pyramid.zarr"
-        before = snapshot(column)
+        before = _column_bytes(column)
         _meta, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
-        assert snapshot(column) == before
+        assert _column_bytes(column) == before
+
+    def test_streaming_leaf_writes_the_same_column(self, tmp_path, monkeypatch):
+        """The other leaf writer: same inputs, per-chunk stream, same bytes.
+
+        ``staged`` is built by a completely different route on the unsharded
+        path (per-chunk lazy placement in ``write_dataframe_to_zarr`` plus
+        ``write_ragged_leaf_to_zarr``, not the sharded single-slab pass), so
+        the phase's claim — the column folds exactly what the leaf stored —
+        needs pinning on both.
+        """
+        _meta, leaf = _run_unit(tmp_path / "sharded", monkeypatch, pyramid=self.PYRAMID)
+        meta, stream_leaf = _run_unit(
+            tmp_path / "stream", monkeypatch, pyramid=self.PYRAMID, sharded=False
+        )
+        assert meta.get("error") is None and meta["column"] == "all.pyramid.zarr"
+        assert _column_bytes(stream_leaf.parent / "all.pyramid.zarr") == _column_bytes(
+            leaf.parent / "all.pyramid.zarr"
+        )
 
     def test_column_failure_fails_the_unit(self, tmp_path, monkeypatch):
         def boom(*a, **k):
