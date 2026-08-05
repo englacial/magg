@@ -1259,6 +1259,11 @@ def process_and_write_hive(
     # streaming budget ever say otherwise, the escape valve is spilling the
     # ragged field back to per-inner-chunk writes against a regular-chunked
     # vlen array (the unsharded flat layout) — named here, not built.
+    # Sibling envelope (issue #383): when the /2 declaration carries leaf-node
+    # levels, the column fold at the TAIL of this function k-way merges this
+    # same resident digest load once more — measured ~+2.0 GB transient at the
+    # o8 scale above, on top of this accumulation, since nothing here is
+    # released before that call (``column.write_leaf_column``'s memory note).
     ragged_chunks: list = []
 
     def _write_chunk(block_index, carrier, ragged):
