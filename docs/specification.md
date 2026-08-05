@@ -903,6 +903,11 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   declared later never rewrites a leaf). Each group holds the `morton`
   coordinate (the node's order-`r` descendant words, ascending) and one
   array per **composable** field (§4.5 classes; `none` fields are absent).
+  A group's arrays are **single-chunk and unsharded** — `chunk_shape` equals
+  `shape` (`4^(r - node)` cells), no `sharding_indexed` codec — whatever the
+  leaf's own `chunk_inner`/sharding: a column group is small by construction,
+  and a reader sizes its GETs accordingly (§1.5's per-inner-chunk geometry,
+  read from the array metadata as §1.5 requires).
   Under the default `[chunk_inner]` declaration on the 19/13/9 reference
   geometry a column carries groups {13, 12, 11, 10, 9}.
 - **Fold laws.** Every group folds **directly from the leaf's resident cell
@@ -1253,7 +1258,8 @@ hive default):
   kernels — the §4.6 from-leaves parity contract, pinned on committed
   bytes.
 
-Both stores pin the layout edge cases a reader must handle: inner chunk
+`minimal/` and `kitchen_sink/` pin the layout edge cases a reader must
+handle (`column/`'s leaf is `minimal/`'s, so it pins them again): inner chunk
 ordinal 2 is **empty** (absent from the shard index — the §1.5 sentinel, and
 that sparsity reaches the dense arrays too: the `morton` coordinate and
 `count` hold their fill across that chunk, so a reader MUST NOT assume the
@@ -1261,14 +1267,17 @@ coordinate is dense across a shard), populated chunks contain empty cells
 (the `b""` fill), and one cell's digest carries merged centroids (weight > 1)
 whose location words are common ancestors (§2.2).
 
-Both fixtures are **sharded**, so §7's conformance claim is scoped to the
-§1.5 sharded geometry. The per-inner-chunk geometry — identical §1.4 framing,
-one object per inner chunk, no shard index — has no committed golden here; it
-is pinned zagg-side by
+Every fixture **leaf** is **sharded**, so §7's leaf conformance claim is
+scoped to the §1.5 sharded geometry. The per-inner-chunk geometry — identical
+§1.4 framing, one object per inner chunk, no shard index — now has a
+committed golden: `column/`'s resolution groups are single-chunk unsharded
+arrays (§4.6), including a `zagg-ragged/1` payload array (`h_tdigest`,
+`chunk_shape == shape`, no `sharding_indexed`), so a reader that hard-codes
+the shard-index suffix fails a §7 fixture instead of sailing through. The
+unsharded **multi**-chunk case remains pinned zagg-side by
 `tests/test_processing.py::TestRaggedVlenLayout`. A reader that derives the
-stored span from the array's own metadata, as §1.5 requires, reads both from
-one code path; a reader that hard-codes the shard-index suffix passes §7 and
-still fails on an unsharded store.
+stored span from the array's own metadata, as §1.5 requires, reads all of
+these from one code path.
 
 Each fixture ships a sibling **`{name}.expected.json`** recording the shard
 key, leaf path, geometry, every populated cell's decoded values (digest
