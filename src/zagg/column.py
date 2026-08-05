@@ -56,6 +56,27 @@ def column_resolutions(levels: list, node_order: int) -> list[int]:
     return sorted(within | {node_order}, reverse=True)
 
 
+def composable_fields(fields: dict) -> dict:
+    """The declared fields a column fold may carry: the two composable classes.
+
+    The D24 ``class: "none"`` entries — expressions, vector fields,
+    chunk-resolution companions, located ragged, and the derived statistics
+    (:func:`zagg.semantics.field_composability`, recorded by
+    :func:`zagg.pyramid.declared_fields`) — exist at native resolution ONLY,
+    and no coarser fold of them is defined. The fold core filters them here,
+    the same posture the sweep takes before ``_fold_node``
+    (:func:`zagg.sweep_overview.sweep_overviews`), so handing a whole
+    declaration's ``fields`` map straight through can neither refuse a leaf
+    over a non-cell-extent vector slab nor materialize an all-empty ragged
+    group for a companion the column has no business carrying.
+    """
+    return {
+        n: m
+        for n, m in (fields or {}).items()
+        if isinstance(m, dict) and m.get("class") in ("exact", "approximate")
+    }
+
+
 def leaf_slabs(staged: dict, fields: dict, *, group_path: str, n_cells: int) -> dict:
     """``{field: cell slab}`` fold inputs from the leaf writer's staged sink.
 
@@ -66,11 +87,17 @@ def leaf_slabs(staged: dict, fields: dict, *, group_path: str, n_cells: int) -> 
     fill — the leaf writers skip an all-empty ragged array entirely
     (``write_ragged_leaf_to_zarr``), and its stored cells are the ``b""``
     fill regardless — so the synthesized slab is exactly what a read-back
-    would return. A staged slab of the wrong cell extent raises: the sink and
-    the grid disagree, and folding either would write a wrong column.
+    would return.
+
+    ``fields`` is filtered to the composable classes first
+    (:func:`composable_fields`), which is what makes the ``(n_cells,)`` extent
+    check sound: those two classes admit nothing but cell-resolution scalars
+    and unlocated ragged payloads, so a staged slab of any other extent really
+    is a sink that disagrees with the grid — and folding it would write a
+    wrong column, so it raises.
     """
     slabs: dict = {}
-    for name, meta in fields.items():
+    for name, meta in composable_fields(fields).items():
         slab = staged.get(f"{group_path}/{name}")
         if slab is None:
             if meta["class"] == "exact":
@@ -106,10 +133,14 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
     :func:`zagg.sweep_overview.fold_digests`) of the committed leaf, which is
     the issue #383 byte-parity contract. The node-order resolution is the
     degenerate 1-cell group: the leaf's whole-footprint aggregate.
+
+    ``fields`` is filtered to the composable classes (:func:`composable_fields`)
+    — a D24 ``none`` field has no coarser fold and never becomes a group.
     """
     from zagg.sweep_overview import decode_digest, fold_dense, fold_digests
 
     cell_order = int(cell_order)
+    fields = composable_fields(fields)
     out: dict = {}
     for res in resolutions:
         res = int(res)
