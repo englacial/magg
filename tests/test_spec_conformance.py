@@ -32,7 +32,12 @@ from zagg.readers.tdigest_tensor import read_cell, read_locations
 from zagg.stats.composition import counts_from_composition, unpack_composition
 
 SPEC_DATA = Path(__file__).parent / "data" / "spec"
-FIXTURES = ("minimal", "kitchen_sink")
+#: Every fixture with a LEAF — the whole leaf-shaped suite runs over each.
+#: ``column`` is here because its leaf is ``minimal``'s inputs written by the
+#: same production path: the column writer must leave that leaf untouched
+#: (it holds the same payload ``bytes`` objects the leaf staged), and running
+#: the suite over both is what asserts it.
+FIXTURES = ("minimal", "kitchen_sink", "column")
 #: The manifest-only §4.5 declaration fixture (issue #382) — deliberately NOT
 #: in ``FIXTURES``: it has no leaf, so nothing leaf-shaped applies to it.
 PYRAMID = "pyramid"
@@ -40,6 +45,7 @@ PYRAMID = "pyramid"
 #: ``zagg-ragged/1`` array, payload and located siblings alike.
 RAGGED_ARRAYS = [
     ("minimal", "h_tdigest", "float32", (2,)),
+    ("column", "h_tdigest", "float32", (2,)),
     ("kitchen_sink", "h_tdigest_signal", "float32", (2,)),
     ("kitchen_sink", "h_tdigest_noise", "float32", (2,)),
     ("kitchen_sink", "h_tdigest_signal_locations", "uint64", ()),
@@ -57,6 +63,9 @@ SENTINEL = 2**64 - 1
 FROZEN_COMBINED = {
     "minimal": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
     "kitchen_sink": "57c413489b33fd82187072504a51b76dbb6455d357c4702d9bf92f77bcafab31",
+    # column/'s LEAF is minimal's, byte for byte — the same literal is the
+    # cross-fixture pin that writing a column perturbs nothing.
+    "column": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
 }
 #: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
 #: its leaf, which is ``minimal``'s): the only committed store whose §5 key
@@ -246,7 +255,7 @@ class TestDigestPayload:
     def test_absent_cell_decodes_zero_length(self, name):
         exp = _expected(name)
         store = _leaf_store(name, exp)
-        field = "h_tdigest" if name == "minimal" else "h_tdigest_signal"
+        field = "h_tdigest_signal" if name == "kitchen_sink" else "h_tdigest"
         empty_cell = exp["empty_chunk"] * exp["cells_per_chunk"]
         assert read_cell(store, f"{exp['group']}/{field}", empty_cell).shape == (0, 2)
 
@@ -528,6 +537,14 @@ class TestContentHashes:
         for (fixture, key), frozen in FROZEN_ARRAYS.items():
             if fixture == name:
                 assert exp["content_hashes"]["arrays"][key] == frozen
+
+    def test_the_column_store_leaf_is_unperturbed(self):
+        # Writing a column must not touch the leaf beside it — the writer
+        # folds from the SAME payload ``bytes`` objects the leaf staged, so an
+        # in-place fold would corrupt it. column/'s leaf is minimal's inputs
+        # through the same production path: identical committed bytes.
+        assert _expected("column")["content_hashes"] == _expected("minimal")["content_hashes"]
+        assert _expected("column")["cells"] == _expected("minimal")["cells"]
 
 
 class TestStoreEnvelope:
