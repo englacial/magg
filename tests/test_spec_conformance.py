@@ -33,6 +33,9 @@ from zagg.stats.composition import counts_from_composition, unpack_composition
 
 SPEC_DATA = Path(__file__).parent / "data" / "spec"
 FIXTURES = ("minimal", "kitchen_sink")
+#: The manifest-only §4.5 declaration fixture (issue #382) — deliberately NOT
+#: in ``FIXTURES``: it has no leaf, so nothing leaf-shaped applies to it.
+PYRAMID = "pyramid"
 #: (fixture, ragged field, element dtype, inner shape) — every committed
 #: ``zagg-ragged/1`` array, payload and located siblings alike.
 RAGGED_ARRAYS = [
@@ -538,3 +541,152 @@ class TestStoreEnvelope:
     def test_manifest_spec_marker(self, name):
         manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
         assert manifest["spec"] == "morton-hive/1"
+
+
+def _pyramid_block():
+    """The ``pyramid/`` fixture's committed manifest declaration (§4.5)."""
+    manifest = json.loads((SPEC_DATA / PYRAMID / "morton_hive.json").read_text())
+    return manifest["pyramid"]
+
+
+class TestPyramidV2Declaration:
+    """§4.5 — the ``zagg-pyramid/2`` overviews declaration (issue #382).
+
+    The collapsed grammar: a leaf resolution list plus the §4.4 fixed
+    every-order ladder, recorded fully expanded at block level. Every
+    assertion decodes the committed ``pyramid/`` manifest from spec text
+    alone; the expected values come from the generator's INPUTS
+    (``tools/generate_spec_fixtures.py``), never read back through zagg.
+    """
+
+    def test_marker_and_block_shape(self):
+        block = _pyramid_block()
+        assert block["spec"] == "zagg-pyramid/2"
+        overview = block["overview"]
+        # §4.5: under /2 the schedule is the BLOCK-level `overviews` list (the
+        # store-wide product declaration); the `overview` family dict keeps
+        # one sweep leg's execution regime and never carries the schedule.
+        # orders/spacing do not exist anywhere in a /2 block. With a non-empty
+        # schedule, all_time and fields MUST be present in the family dict.
+        assert block["overviews"] and "overviews" not in overview
+        assert "orders" not in overview and "spacing" not in overview
+        assert overview["all_time"] is False
+        assert set(overview["fields"]) == set(_expected(PYRAMID)["fields"])
+
+    def test_overviews_are_the_fully_expanded_list(self):
+        # §4.5: the manifest records the EXPANDED (node, cells) list —
+        # readers never re-derive the ladder — while the config declared
+        # leaf resolutions only.
+        exp = _expected(PYRAMID)
+        levels = _pyramid_block()["overviews"]
+        assert levels == exp["overviews"]
+        assert all(isinstance(e["cells"], list) for e in levels)
+        assert isinstance(exp["declared"]["overviews"], list)  # the raw knob: ints only
+        assert all(isinstance(r, int) for r in exp["declared"]["overviews"])
+
+    def test_leaf_entry_carries_the_declared_resolutions(self):
+        # §4.5: every declared resolution materializes at the shard node —
+        # the first entry IS the leaf entry, strictly inside the window.
+        exp = _expected(PYRAMID)
+        leaf = _pyramid_block()["overviews"][0]
+        assert leaf["node"] == exp["shard_order"]
+        assert leaf["cells"] == exp["declared"]["overviews"]
+        assert all(b < a for a, b in zip(leaf["cells"], leaf["cells"][1:]))
+        assert all(exp["shard_order"] < r < exp["cell_order"] for r in leaf["cells"])
+
+    def test_fixed_ladder_law_decodes_per_spec(self):
+        # §4.4: above the shard the schedule is LAW — with d = base - shard
+        # (base the coarsest leaf resolution), every order k from shard - 1
+        # down to 0 inclusive carries exactly one member at k + d. Every
+        # store roots at order 0.
+        exp = _expected(PYRAMID)
+        levels = _pyramid_block()["overviews"]
+        s = exp["shard_order"]
+        d = levels[0]["cells"][-1] - s
+        assert d >= 1
+        assert levels[1:] == [{"node": k, "cells": [k + d]} for k in range(s - 1, -1, -1)]
+        assert levels[-1]["node"] == 0
+
+    def test_slab_lengths_decode_per_spec(self):
+        # §4.4: a member r at an order-k node holds 4^(r - k) cells.
+        exp = _expected(PYRAMID)
+        for entry, slabs in zip(_pyramid_block()["overviews"], exp["slabs"]):
+            assert [4 ** (r - entry["node"]) for r in entry["cells"]] == slabs
+
+    def test_fold_declaration_keys_ride_along(self):
+        # PR #379's declaration keys are revision-independent (§4.5).
+        exp = _expected(PYRAMID)
+        overview = _pyramid_block()["overview"]
+        assert overview["fold_source"] == exp["fold_source"]
+        assert overview["exact_levels"] == exp["exact_levels"]
+
+    def test_v1_era_actuals_preserved_across_the_revision_bump(self):
+        # §4.5: on a /2 store the block-level materialized map is the /1-era
+        # inventory, preserved verbatim by the declare_pyramid retrofit.
+        exp = _expected(PYRAMID)
+        actuals = _pyramid_block()["overview"]["materialized"]
+        assert actuals["orders"] == exp["materialized"]["orders"]
+        # JSON has no integer keys: fold_sources is string-keyed (§4.5).
+        assert actuals["fold_sources"] == exp["materialized"]["fold_sources"]
+        assert set(actuals["fold_sources"]) <= {str(k) for k in actuals["orders"]}
+        assert actuals["generated_at"]  # present; value is sweep-time truth
+
+    def test_none_class_entry_is_class_only(self):
+        # The recorded absence (D24 option A) is revision-independent.
+        assert _pyramid_block()["overview"]["fields"]["h_mean"] == {"class": "none"}
+
+    def test_default_derivation_matches_the_spec_formula(self):
+        # §4.5's derived default (knob omitted -> one leaf resolution at the
+        # chunk order, then the same §4.4 fixed ladder), computed from the
+        # spec text for this geometry, must equal the committed expectation —
+        # the formula on the page and the one the fixture records cannot
+        # drift apart. The CODE binding (zagg's own default_overviews) is
+        # pinned in tests/test_pyramid.py::TestDefaultOverviews.
+        exp = _expected(PYRAMID)
+        s, chunk = exp["shard_order"], exp["chunk_order"]
+        d = chunk - s
+        formula = [{"node": s, "cells": [chunk]}] + [
+            {"node": k, "cells": [k + d]} for k in range(s - 1, -1, -1)
+        ]
+        assert formula == exp["default_overviews"]
+
+    def test_v1_compat_constant_depth_rule(self):
+        # §4.4: /1 is the special case cells = [node + (c - s)]. The leaf
+        # fixtures' committed pyramid blocks predate the §4.5 /1 grammar
+        # (their §7 conformance claim covers §1–§3 and §5 only), so the /1
+        # rule is pinned against the production builder instead: without a
+        # levels knob the block stays /1, never carries a levels key, and
+        # every declared order's one implied member is the constant-depth
+        # one — the /2 spelling of the same store.
+        from zagg.config import PipelineConfig
+        from zagg.sweep_overview import build_pyramid_block
+
+        s, c = _expected(PYRAMID)["shard_order"], _expected(PYRAMID)["cell_order"]
+        cfg = PipelineConfig(
+            aggregation={
+                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+                "variables": {
+                    "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0}
+                },
+            },
+            output={"store_layout": "hive"},
+        )
+        block = build_pyramid_block(cfg, shard_order=s)
+        assert block["spec"] == "zagg-pyramid/1"
+        assert "overviews" not in block  # /1 never carries the /2 schedule key
+        overview = block["overview"]
+        # The whole derived /1 schedule for shard order 3, by VALUE.
+        assert overview["orders"] == [1] and overview["spacing"] == 2
+        assert overview["all_time"] is False
+        assert overview["fold_source"] == "cascade" and overview["exact_levels"] == 1
+        # ...and the constant-depth member each declared order implies, also
+        # by value: with s = 3, c = 6 the /2 spelling of this store's one
+        # declared order is [{node: 1, cells: [4]}].
+        assert (s, c) == (3, 6)
+        assert [c - (s - k) for k in overview["orders"]] == [4]
+
+    def test_manifest_envelope(self):
+        manifest = json.loads((SPEC_DATA / PYRAMID / "morton_hive.json").read_text())
+        assert manifest["spec"] == "morton-hive/1"
+        assert manifest["shard_order"] == _expected(PYRAMID)["shard_order"]
+        assert manifest["cell_order"] == _expected(PYRAMID)["cell_order"]

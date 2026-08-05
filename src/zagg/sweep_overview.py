@@ -65,8 +65,11 @@ DEFAULT_SPACING = 2
 #: merge — the state-scale wall the issue names. It is kept as a DEPRECATED
 #: opt-in only.
 FOLD_SOURCES = ("cascade", "leaves")
-#: The espg-ratified default (issue #376): overviews are display artifacts,
-#: with no precision guarantee past the first skip level.
+#: The espg-ratified default (issue #376): under ``/1``, overviews are
+#: display artifacts with no precision guarantee past the first skip level.
+#: (For ``/2`` that doctrine is superseded — spec §4.4: exact fields exact at
+#: every order, approximate fields analysis-grade at their recorded
+#: generation.)
 DEFAULT_FOLD_SOURCE = "cascade"
 #: How many of the FINEST declared levels fold exactly from the leaves; every
 #: coarser level cascades from the level below it in this list. 1 is the
@@ -225,50 +228,56 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     that gives readers zero-open filtering (option A, the ruled default) —
     and warned about loudly at template time, per the D24 ruling. The sweep
     later adds ``materialized`` actuals; it never rewrites the declaration.
+
+    An explicit ``output.pyramid.overviews`` knob (issue #382) declares the
+    ``zagg-pyramid/2`` grouped ``(node, cells)`` grammar instead — built in
+    :mod:`zagg.pyramid` (:func:`zagg.pyramid.overview_block_v2`), replacing
+    the ``orders``/``spacing`` schedule wholesale.
     """
-    from zagg.config import get_agg_fields, get_pyramid
-    from zagg.semantics import EXACT_MERGE_LAWS, _fold_function_name, composability_classes
+    from zagg.config import get_pyramid
+    from zagg.pyramid import (
+        declared_fields,
+        expand_overviews,
+        normalize_overviews,
+        overview_block_v2,
+        validate_overviews,
+        warn_excluded,
+    )
 
     knob = get_pyramid(config)
     if knob is None:  # output.pyramid: false — declared off
         return {"spec": PYRAMID_SPEC, "overview": {"orders": []}}
+    fields, excluded = declared_fields(config)
+    if knob.get("overviews") is not None:
+        resolutions = normalize_overviews(knob["overviews"])
+        # Ordering/range live here, not in ``normalize_overviews`` (they need the
+        # grid orders) — and this is the ONLY validation the templating path
+        # gets: the Lambda worker builds its config with ``load_config_from_dict``,
+        # which never calls ``validate_config``, then goes straight to
+        # ``build_manifest``. A grid-less retrofit config (no ``output.grid``,
+        # the ``declare_pyramid`` shape) is the one case skipped: there is no
+        # child order to check against here, and ``declare_pyramid``
+        # re-validates against the MANIFEST's own shard_order/cell_order before
+        # anything is written.
+        grid_child = (config.output.get("grid") or {}).get("child_order")
+        if grid_child is not None:
+            validate_overviews(
+                resolutions, parent_order=int(shard_order), child_order=int(grid_child)
+            )
+        # The manifest records the FULLY EXPANDED list — the leaf entry plus
+        # the fixed every-order ladder to 0 (espg ruling; readers never
+        # re-derive).
+        levels = expand_overviews(resolutions, parent_order=int(shard_order))
+        fold = _fold_plan(knob, [e["node"] for e in levels])
+        return overview_block_v2(knob, levels, fold, fields, excluded)
     spacing = int(knob.get("spacing") or DEFAULT_SPACING)
     if knob.get("orders") is not None:
         orders = sorted({int(k) for k in knob["orders"]}, reverse=True)
     else:
         orders = list(range(int(shard_order) - spacing, -1, -spacing))
     fold_source, exact_levels = _fold_plan(knob, orders)
-    agg = get_agg_fields(config)
-    fields: dict = {}
-    excluded = []
-    for name, cls in composability_classes(config).items():
-        meta = agg[name]
-        if cls == "exact":
-            fields[name] = {
-                "class": "exact",
-                "method": EXACT_MERGE_LAWS[_fold_function_name(meta.get("function")) or ""],
-                "nan_policy": EXACT_NAN_POLICY,
-                "dtype": meta.get("dtype", "float32"),
-                "fill_value": _json_fill(meta.get("fill_value", "NaN")),
-            }
-        elif cls == "approximate":
-            inner = meta.get("inner_shape") or (2,)
-            fields[name] = {
-                "class": "approximate",
-                "method": TDIGEST_LAW,
-                "dtype": meta.get("dtype", "float32"),
-                "inner_shape": [int(inner)] if isinstance(inner, int) else [int(x) for x in inner],
-                "delta": int((meta.get("params") or {}).get("delta", 512)),
-            }
-        else:
-            fields[name] = {"class": "none"}
-            excluded.append(name)
     if excluded and orders:
-        logger.warning(
-            f"pyramid: fields {excluded} are non-composable (D24 class 'none') and will "
-            f"exist ONLY at native resolution — excluded from every overview order (the "
-            f"per-field-exclusion default; declare a derived summary to opt in, issue #201)"
-        )
+        warn_excluded(excluded)
     overview: dict = {
         "spacing": spacing,
         "orders": orders,
@@ -338,13 +347,6 @@ def _fold_plan(knob: dict, orders: list) -> tuple[str, int]:
             f"regime (issue #376) under a 'cascade' declaration; lower it to keep the cascade"
         )
     return fold_source, exact_levels
-
-
-def _json_fill(fill_value):
-    """A JSON-safe fill token (zarr v3 uses the string ``"NaN"``)."""
-    if isinstance(fill_value, float) and np.isnan(fill_value):
-        return "NaN"
-    return fill_value
 
 
 def _update_manifest_pyramid(store_root, folded: dict, store_kwargs) -> bool:
@@ -431,11 +433,14 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     An ``output.pyramid: false`` config installs the declared-off block:
     recording absence is a valid retrofit.
 
-    Returns a summary dict: ``orders`` (the declared schedule),
-    ``fold_source`` (the declared fold regime, issue #376), ``fields``
-    (``{name: class}``), ``validated`` (what store truth was checked),
-    ``previous`` (``absent``/``identical``/``replaced``), and ``updated``
-    (whether a PUT happened).
+    Returns a summary dict carrying ``fold_source`` (the declared fold
+    regime, issue #376), ``fields`` (``{name: class}``), ``validated`` (what
+    store truth was checked), ``previous`` (``absent``/``identical``/
+    ``replaced``), and ``updated`` (whether a PUT happened), plus the
+    revision's schedule key and NOT the other one's — mirroring the manifest
+    block itself: ``orders`` under ``/1``, ``overviews`` (the normalized
+    grouped form, issue #382) under ``/2``. An empty ``orders`` is ``/1``'s
+    declared-off signal, so a ``/2`` summary must not carry the key at all.
     """
     import obstore
 
@@ -468,6 +473,21 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     # It also surfaces an unserializable block HERE rather than at the PUT,
     # after the whole store-truth probe has been paid for.
     block = json.loads(json.dumps(block))
+    if "overviews" in block:
+        # The /2 declaration (issue #382; block-level expanded list per the
+        # espg shape ruling): re-validate the LEAF resolutions against the
+        # MANIFEST's own orders — config validation saw the config's grid
+        # block, and the retrofit contract is that the store's truth wins.
+        # The first entry is the leaf entry (its node is the shard order the
+        # expansion was derived at); the ladder above it is fixed law, valid
+        # by construction given a valid leaf list.
+        from zagg.pyramid import validate_overviews
+
+        validate_overviews(
+            block["overviews"][0]["cells"],
+            parent_order=shard_order,
+            child_order=int(manifest["cell_order"]),
+        )
     bad = [k for k in block["overview"].get("orders") or [] if not 0 <= int(k) < shard_order]
     if bad:
         raise ValueError(
@@ -498,7 +518,15 @@ def declare_pyramid(store_root: str, config, *, store_kwargs=None) -> dict:
     if materialized is not None:
         block["overview"]["materialized"] = materialized
     summary = {
-        "orders": list(block["overview"].get("orders") or []),
+        # The schedule key of the declared revision, and only that one: this
+        # dict is what ``--declare-pyramid`` prints, and an empty ``orders``
+        # is /1's wire signal for "pyramid declared OFF" (§4.5) — printing it
+        # beside a /2 ``overviews`` list would read as a store with no pyramid.
+        **(
+            {"overviews": [dict(e) for e in block["overviews"]]}
+            if "overviews" in block
+            else {"orders": list(block["overview"].get("orders") or [])}
+        ),
         # The retrofit's user sees which fold regime they just declared for
         # every future sweep of this store (issue #376) — it is printed by
         # ``python -m zagg.sweep --declare-pyramid`` and nowhere else.
@@ -730,21 +758,63 @@ def sweep_overviews(
     folded payload — and whose zarr is confirmed present and stamped, since the
     envelope and the artifact are two objects (D9) — is skipped; the hash is
     the same-second backstop the engine's payload compare provides for JSON
-    families. Returns the standard
-    ``written``/``current``/``empty``/``failed`` counts plus ``declared``.
+    families.
+
+    Returns the standard ``written``/``current``/``empty``/``failed`` counts
+    plus ``declared`` (whether the manifest carries a usable overview
+    declaration at all) and ``sweepable`` (whether THIS zagg can fold the
+    declared revision — ``False`` only for the ``/2`` grammar of issue #382,
+    whose materialization arrives with issues #383/#384). Both keys are
+    present on every path: this dict is serialized into the sweep run record
+    (:func:`zagg.sweep._write_sweep_record`), an operator-facing artifact
+    whose schema must not vary by revision.
 
     ``min_order`` (issue #377) is the sweep partition's split order. Two things
     span partitions and so are left to the coarse-level finisher: declared
     orders coarser than it (``deferred_orders``), and the manifest pyramid RMW
     at the store root (``manifest_deferred``, carrying the order set the RMW
     would have unioned as ``materialized_orders`` plus the regimes that wrote
-    them as ``materialized_fold_sources`` — issue #376's §4.5 actuals).
+    them as ``materialized_fold_sources`` — issue #376's §4.5 actuals). The
+    ``/2`` gate above fires BEFORE the partition clamp: a partitioned pass
+    over a ``/2``-declaring store refuses exactly like an unpartitioned one
+    (nothing is folded, so nothing is deferred).
     """
+    from zagg.pyramid import PYRAMID_SPEC_V2
     from zagg.store import open_object_store
 
     store_kwargs = dict(store_kwargs or {})
-    counts: dict = {"written": 0, "current": 0, "empty": 0, "failed": 0, "declared": True}
-    decl = (manifest.get("pyramid") or {}).get("overview")
+    counts: dict = {
+        "written": 0,
+        "current": 0,
+        "empty": 0,
+        "failed": 0,
+        "declared": True,
+        "sweepable": True,
+    }
+    pyramid = manifest.get("pyramid") or {}
+    decl = pyramid.get("overview") if isinstance(pyramid, dict) else None
+    spec = pyramid.get("spec") if isinstance(pyramid, dict) else None
+    declared_v2 = isinstance(pyramid, dict) and pyramid.get("overviews") is not None
+    if spec == PYRAMID_SPEC_V2 or declared_v2:
+        # Declared-but-not-yet-sweepable is a legal recorded state (#381
+        # point (11)): the /2 (node, cells) declaration stands at BLOCK
+        # level (``pyramid.overviews``, the espg shape ruling), and
+        # materialization arrives with the leaf columns (issue #383) and the
+        # staged sweep (issue #384). Refusing loudly here — never folding a
+        # schedule this sweep does not understand — is the /1-vs-/2 gate;
+        # /1 stores sweep exactly as before.
+        counts["sweepable"] = False
+        # The `spec`-only arm reaches here with no list checked: a /2 marker
+        # carrying no overviews list declares nothing, and must report the
+        # same `declared: False` the /1 branch below would give it.
+        counts["declared"] = bool(declared_v2 and pyramid.get("overviews"))
+        logger.warning(
+            f"sweep[overview]: the manifest pyramid declaration is {spec!r} — the "
+            f"(node, cells) level grammar (issue #382) is declared but NOT yet "
+            f"sweepable by this zagg (leaf columns: issue #383; staged sweep: "
+            f"issue #384); the declaration stands, nothing was generated"
+        )
+        return counts
     if not isinstance(decl, dict) or not decl.get("orders"):
         counts["declared"] = False
         logger.info(

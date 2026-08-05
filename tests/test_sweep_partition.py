@@ -589,6 +589,35 @@ class TestOverviewOrdersAreClamped:
         assert parted["deferred_orders"] == [0] and parted["written"] > 0
         assert parted["materialized_fold_sources"] == {"2": "leaves", "1": "cascade"}
 
+    def test_a_v2_declaration_refuses_identically_under_a_partition(self, tmp_path):
+        # zagg-pyramid/2 is declared-but-not-yet-sweepable (issue #382). The
+        # gate fires BEFORE the partition clamp, so a partitioned pass
+        # refuses exactly like an unpartitioned one: nothing is folded, so
+        # nothing is deferred and no partition key rides the counts.
+        refs = _overview_store(tmp_path)
+        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
+        manifest["pyramid"] = {
+            "spec": "zagg-pyramid/2",
+            "overviews": [{"node": 1, "cells": [2]}, {"node": 0, "cells": [1]}],
+        }
+        (tmp_path / MANIFEST_NAME).write_text(json.dumps(manifest))
+        parted = run_sweep(
+            str(tmp_path),
+            refs,
+            families=["overview"],
+            record=False,
+            partition={"index": 0, "of": 4},
+        )["families"]["overview"]
+        whole = run_sweep(str(tmp_path), refs, families=["overview"], record=False)["families"][
+            "overview"
+        ]
+        for counts in (parted, whole):
+            assert counts["sweepable"] is False and counts["written"] == 0
+        assert "deferred_orders" not in parted and "manifest_deferred" not in parted
+        assert {k: v for k, v in parted.items() if k != "duration_s"} == {
+            k: v for k, v in whole.items() if k != "duration_s"
+        }
+
 
 class TestRootMocIsAlsoAnInput:
     """The fenced list's reciprocal: a partitioned pass READS what it defers.
