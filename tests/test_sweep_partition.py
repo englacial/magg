@@ -558,6 +558,18 @@ class TestOverviewOrdersAreClamped:
         # actual): the deferred RMW's whole payload rides the record, or the
         # finisher re-derives it from the envelopes.
         assert parted["materialized_fold_sources"] == {"1": "leaves"}
+        # The other arm of the actuals: a re-run's levels are all current, so
+        # the order set still rides (the RMW would still union it) but NO
+        # regime is claimed for a level that did not write this pass.
+        rerun = run_sweep(
+            str(tmp_path),
+            refs,
+            families=["overview"],
+            record=False,
+            partition={"index": 0, "of": 4},
+        )["families"]["overview"]
+        assert rerun["materialized_orders"] == [1]
+        assert "materialized_fold_sources" not in rerun
         whole_root = tmp_path / "whole"
         whole = run_sweep(
             str(whole_root), _overview_store(whole_root), families=["overview"], record=False
