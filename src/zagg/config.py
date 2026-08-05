@@ -1056,17 +1056,17 @@ def _validate_windowing(config: PipelineConfig) -> None:
     # The message renders parsed_epoch rather than repr-ing the declared value:
     # yaml.safe_load types an ISO timestamp scalar as a datetime, which parse_utc
     # passes through, so repr would hand the author a stdlib constructor call
-    # instead of the value they wrote.
+    # instead of the value they wrote. The drop is reported in microseconds
+    # because that is exactly what iso_utc discards and nothing else: an integer,
+    # so no scientific notation for the 1 µs case, and never negative.
     rendered_epoch = _windows.iso_utc(parsed_epoch)
     if _windows.parse_utc(rendered_epoch) != parsed_epoch:
         raise ValueError(
             f"output.windowing.epoch {parsed_epoch.isoformat()!r} carries sub-second "
             f"precision that the canonical whole-second rendering drops: it is "
             f"recorded as {rendered_epoch!r}, which would shift every window "
-            f"conversion by "
-            f"{(parsed_epoch - _windows.parse_utc(rendered_epoch)).total_seconds()} s. "
-            f"Window granularity is whole seconds, so a finer epoch is a config "
-            f"error, never a silent shift — declare the epoch at second precision"
+            f"conversion by {parsed_epoch.microsecond} µs — declare the epoch at "
+            f"second precision"
         )
     scale = block.get("scale") or "utc"
     if scale not in _windows.EPOCH_SCALES:

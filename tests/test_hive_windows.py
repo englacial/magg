@@ -244,7 +244,7 @@ class TestWindowingConfig:
                 "2018-01-01T00:00:00.5Z",
                 "2018-01-01T00:00:00.500000+00:00",
                 "2018-01-01T00:00:00+00:00",
-                "0.5",
+                "500000",
             ),
             # The fraction survives a non-UTC declaration: the offset is whole
             # minutes, so only the sub-second part is ever what iso_utc drops.
@@ -252,7 +252,16 @@ class TestWindowingConfig:
                 "2018-01-01T05:30:00.001+05:30",
                 "2018-01-01T00:00:00.001000+00:00",
                 "2018-01-01T00:00:00+00:00",
-                "0.001",
+                "1000",
+            ),
+            # The smallest representable violation — a microsecond-precision
+            # timestamp pasted in from a data file — reads as an integer count,
+            # not as 1e-06.
+            (
+                "2018-01-01T00:00:00.000001Z",
+                "2018-01-01T00:00:00.000001+00:00",
+                "2018-01-01T00:00:00+00:00",
+                "1",
             ),
             # The production path is datetime-typed, not str: yaml.safe_load
             # resolves an ISO timestamp scalar to an aware datetime and
@@ -262,7 +271,7 @@ class TestWindowingConfig:
                 datetime(2018, 1, 1, 0, 0, 0, 500000, tzinfo=timezone.utc),
                 "2018-01-01T00:00:00.500000+00:00",
                 "2018-01-01T00:00:00+00:00",
-                "0.5",
+                "500000",
             ),
         ],
     )
@@ -278,7 +287,7 @@ class TestWindowingConfig:
             ValueError,
             match=rf"epoch {re.escape(repr(declared))} carries sub-second precision.*"
             rf"recorded as {re.escape(repr(rendered))}.*shift every window "
-            rf"conversion by {shift} s",
+            rf"conversion by {shift} µs",
         ):
             validate_config(cfg)
 
