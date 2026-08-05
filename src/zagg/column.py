@@ -408,6 +408,35 @@ def _delete_sidecar(prefix: str, name: str, store_kwargs: dict) -> None:
         logger.debug(f"column stats sidecar clear skipped at {prefix}/{name}: {e}")
 
 
+def _clear_column(store_root: str, shard_key, window: str | None, store_kwargs: dict) -> None:
+    """Delete this ``(leaf, window)``'s column and sidecar (the no-gate arm).
+
+    ``hive.process_and_write_hive`` clears ``{node}/{window}.zarr`` wholesale
+    on every write (issue #341), but nothing else owns the column beside it —
+    so a declaration that was removed or narrowed between runs would leave a
+    STAMPED column folded from cells that are gone. That is a third state
+    beyond the §4.6 pair (a column exists exactly when the run declares one;
+    absent-or-unstamped is a torn worker), and it is the same stale-beats-
+    absent inversion the sidecar clear already rules against.
+
+    NOT fail-open on the prefix: a stale stamped column is wrong data, so a
+    delete that cannot be performed fails the unit like any other write
+    failure. An absent prefix is not a failure (``delete_dir`` over a missing
+    prefix lists empty); the sidecar drop keeps its own fail-open posture.
+    Cost: one delete attempt per leaf write on stores that declare no column.
+    """
+    from zarr.core.sync import sync
+
+    from zagg.hive import shard_leaf_path
+    from zagg.store import open_store
+
+    leaf_path = shard_leaf_path(store_root, shard_key, window=window)
+    node_prefix = leaf_path.rstrip("/").rsplit("/", 1)[0]
+    basename = column_name(window)
+    sync(open_store(f"{node_prefix}/{basename}", **store_kwargs).delete_dir(""))
+    _delete_sidecar(node_prefix, _sidecar_name(basename), store_kwargs)
+
+
 def _write_sidecar(
     store, path, shard_key, staged, cells_with_data, granule_count, window, store_kwargs
 ) -> None:
@@ -515,7 +544,10 @@ def write_leaf_column(
     issue #342 staged sink (:func:`leaf_slabs` — the exact in-memory values
     the leaf write PUT) -> per-resolution folds (:func:`fold_column`) ->
     :func:`write_column` (D4). Returns the column basename, or ``None`` when
-    the declaration carries no leaf-node levels. Failures RAISE: the caller
+    the declaration carries no leaf-node levels — in which case any column a
+    PREVIOUS declaration left at this ``(leaf, window)``, and its sidecar,
+    are deleted (:func:`_clear_column`), so the artifact never outlives the
+    declaration that made it. Failures RAISE: the caller
     treats a column failure like any other leaf-write failure — the unit
     reports failed, and the idempotent retry rewrites leaf and column
     wholesale (both writers clear their own prefix first).
@@ -530,8 +562,10 @@ def write_leaf_column(
     ~2x that scale does not fit and needs the kernel-side preallocation
     named on the PR thread before the column can carry it.
     """
+    store_kwargs = dict(store_kwargs or {})
     plan = leaf_column_plan(config, grid)
     if plan is None:
+        _clear_column(store_root, shard_key, window, store_kwargs)
         return None
     resolutions, fields = plan
     slabs = leaf_slabs(staged, fields, group_path=grid.group_path, n_cells=grid.cells_per_shard)
