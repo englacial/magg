@@ -70,6 +70,15 @@ _EQ_OR_NONE_KEYS = (
     # collapses it to None (absence = unverifiable, §5.3) while merge([r])
     # stays r.
     "content_hashes",
+    # The recorded granule-id LIST (issue #388) — the id-set half of the
+    # skip-if-current identity pair, kept next to its hash so a contraction
+    # refusal can name the dropped ids. Per-leaf like content_hashes: a
+    # cross-leaf rollup collapses it to None.
+    "granule_ids",
+    # Leaf pyramid column basename (issue #383's deferred run-record key,
+    # landed with #388): D22 discovery is run-record-driven, so column
+    # existence must be discoverable without a tree listing.
+    "column",
     "zagg_version",
     "lambda",
     "invoked_by",
@@ -146,13 +155,19 @@ def build_record(
     merged equal-or-``None`` like the other identity fields, so a cross-window
     rollup reads ``None``. ``semantic_hash`` (issue #299, D19) is the run
     config's semantic-core hash — the identity half the ``has_run`` dedup
-    check compares; ``granules_sha256`` below is the catalog half.
+    check compares; ``granules_sha256`` below is the catalog half. When the
+    caller passes none, ``metadata["semantic_hash"]`` fills in (issue #388):
+    the shared hive seams stamp it there, so a caller that never resolved
+    the hash itself (the Lambda handler) still records the identity a later
+    skip-if-current comparison needs.
     ``lambda_config`` is :func:`lambda_env` on Lambda, ``None`` locally;
     when present it prices ``gb_seconds`` / ``est_cost_usd`` from
     ``duration_s`` (the billed-duration approximation the dispatcher's cost
     estimate already uses).
     """
     error = metadata.get("error")
+    if semantic_hash is None:
+        semantic_hash = metadata.get("semantic_hash")
     duration_s = float(metadata.get("duration_s") or 0.0)
     gb_seconds = est_cost = None
     if lambda_config and lambda_config.get("memory_mb"):
@@ -197,6 +212,12 @@ def build_record(
         "n_shards": 1,
         "n_granules": int(n_granules),
         "granules_sha256": granules_sha256(granule_ids),
+        # The recorded id LIST behind that hash (issue #388), in the hash's
+        # own canonical order (sorted, duplicates kept) — the set a later
+        # rerun's contraction guard diffs against to NAME dropped ids.
+        # Envelope-borne and sidecar-recorded, never a run-parquet column
+        # (the join key there is granules_sha256).
+        "granule_ids": sorted(str(g) for g in granule_ids) if granule_ids else None,
         # O11 content hashes (issue #342, spec §5.3): the verification half of
         # the D19 identity split, computed by the hive leaf writer from the
         # staged arrays and ridden here off ``metadata``. None wherever no
@@ -229,6 +250,12 @@ def build_record(
         "raster_bytes_read": _opt_int(metadata.get("raster_bytes_read")),
         "raster_px_decoded": _opt_int(metadata.get("raster_px_decoded")),
         "raster_px_sampled": _opt_int(metadata.get("raster_px_sampled")),
+        # Leaf pyramid column basename (issue #383, recorded per its PR #391
+        # deferral): rides the worker metadata when the unit wrote a column,
+        # so run-record-driven discovery (D22) sees columns without a tree
+        # listing. The column's resolution set lives in the artifact's own
+        # ``zagg_column`` attrs — read the column, not this row, for it.
+        "column": metadata.get("column"),
         "gb_seconds": gb_seconds,
         "est_cost_usd": est_cost,
         "max_memory_mb": _opt_float(metadata.get("max_memory_mb")),
@@ -266,12 +293,14 @@ def merge(records: Iterable[dict]) -> dict:
             # #297). One level deeper than a plain ``dict()``: flat values
             # (``lambda``/``invoked_by``) are unaffected, but
             # ``content_hashes`` nests an ``arrays`` map (issue #342) that a
-            # shallow copy would still alias.
-            out[key] = (
-                {k: dict(v) if isinstance(v, dict) else v for k, v in first.items()}
-                if isinstance(first, dict)
-                else first
-            )
+            # shallow copy would still alias. Lists (``granule_ids``, issue
+            # #388) copy shallow — their elements are strings.
+            if isinstance(first, dict):
+                out[key] = {k: dict(v) if isinstance(v, dict) else v for k, v in first.items()}
+            elif isinstance(first, list):
+                out[key] = list(first)
+            else:
+                out[key] = first
         else:
             out[key] = None
     for key in _SUM_KEYS:
@@ -348,6 +377,11 @@ _ROW_SCALARS = (
     "raster_bytes_read",
     "raster_px_decoded",
     "raster_px_sampled",
+    # Column basename (issue #383's deferred run-record key): a scalar
+    # string, so D22 run-record discovery can find column-bearing leaves
+    # with a plain column filter. ``granule_ids`` (a list) stays out — the
+    # parquet join key for catalog identity is granules_sha256.
+    "column",
     "max_memory_mb",
     "container_hwm_mb",
     "timestamp",

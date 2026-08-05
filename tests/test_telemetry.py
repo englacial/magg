@@ -652,3 +652,69 @@ class TestRunParquetShardKeyExactness:
         assert str(df["shard_key"].dtype) == "UInt64"
         assert int(df["shard_key"].dropna().iloc[0]) == word  # exact, not 2^53-rounded
         assert df["shard_key"].isna().sum() == 1  # the failure row keeps its null
+
+
+class TestRecordedIdentity:
+    """Issue #388 record keys: the granule-id list behind granules_sha256,
+    the #383 column basename, and the metadata semantic-hash fallback."""
+
+    def test_granule_ids_recorded_sorted_with_duplicates(self):
+        # The hash's own canonical form: sorted, duplicates kept — so the
+        # recorded list regenerates the recorded hash exactly.
+        rec = build_record(
+            shard_key=1,
+            metadata={"duration_s": 1.0},
+            granule_ids=["s3://b/g2.h5", "s3://b/g1.h5", "s3://b/g1.h5"],
+        )
+        assert rec["granule_ids"] == ["s3://b/g1.h5", "s3://b/g1.h5", "s3://b/g2.h5"]
+        assert rec["granules_sha256"] == granules_sha256(rec["granule_ids"])
+
+    def test_granule_ids_absent_reads_none(self):
+        rec = build_record(shard_key=1, metadata={"duration_s": 1.0})
+        assert rec["granule_ids"] is None
+        assert rec["granules_sha256"] is None
+
+    def test_column_rides_metadata(self):
+        # The #383 deferred run-record key: the worker stamps
+        # metadata["column"] iff the unit wrote a column artifact.
+        assert _record()["column"] is None
+        rec = build_record(shard_key=1, metadata={"duration_s": 1.0, "column": "all.pyramid.zarr"})
+        assert rec["column"] == "all.pyramid.zarr"
+
+    def test_semantic_hash_falls_back_to_metadata(self):
+        # Issue #388: the shared seams stamp metadata["semantic_hash"], so a
+        # caller that never resolved the hash (the Lambda handler) still
+        # records the identity half a skip-if-current comparison needs.
+        rec = build_record(shard_key=1, metadata={"duration_s": 1.0, "semantic_hash": "f" * 64})
+        assert rec["semantic_hash"] == "f" * 64
+
+    def test_explicit_semantic_hash_wins_over_metadata(self):
+        rec = build_record(
+            shard_key=1,
+            metadata={"duration_s": 1.0, "semantic_hash": "f" * 64},
+            semantic_hash="a" * 64,
+        )
+        assert rec["semantic_hash"] == "a" * 64
+
+    def test_merge_folds_identity_keys_equal_or_none(self):
+        a = _record()
+        b = _record()
+        b["timestamp"] = a["timestamp"]
+        folded = merge([a, b])
+        assert folded["granule_ids"] == a["granule_ids"]
+        assert folded["column"] is None  # both None -> stays None
+        mismatched = _record(granules=("s3://b/other.h5",))
+        assert merge([a, mismatched])["granule_ids"] is None
+
+    def test_merge_single_record_does_not_alias_the_id_list(self):
+        a = _record()
+        folded = merge([a])
+        assert folded["granule_ids"] == a["granule_ids"]
+        folded["granule_ids"].append("mutated")
+        assert a["granule_ids"][-1] != "mutated"
+
+    def test_flatten_carries_column_not_granule_ids(self):
+        rec = build_record(shard_key=1, metadata={"duration_s": 1.0, "column": "all.pyramid.zarr"})
+        row = flatten_record(rec)
+        assert row["column"] == "all.pyramid.zarr"
+        assert "granule_ids" not in row
