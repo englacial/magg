@@ -87,7 +87,9 @@ def leaf_slabs(staged: dict, fields: dict, *, group_path: str, n_cells: int) -> 
     fill — the leaf writers skip an all-empty ragged array entirely
     (``write_ragged_leaf_to_zarr``), and its stored cells are the ``b""``
     fill regardless — so the synthesized slab is exactly what a read-back
-    would return.
+    would return — synthesized by :func:`zagg.sweep_overview._empty_slab`, the
+    same seed the sweep's own fold starts from, so the fill semantics the two
+    machineries must agree on stay one definition.
 
     ``fields`` is filtered to the composable classes first
     (:func:`composable_fields`), which is what makes the ``(n_cells,)`` extent
@@ -96,17 +98,13 @@ def leaf_slabs(staged: dict, fields: dict, *, group_path: str, n_cells: int) -> 
     is a sink that disagrees with the grid — and folding it would write a
     wrong column, so it raises.
     """
+    from zagg.sweep_overview import _empty_slab
+
     slabs: dict = {}
     for name, meta in composable_fields(fields).items():
         slab = staged.get(f"{group_path}/{name}")
         if slab is None:
-            if meta["class"] == "exact":
-                from zagg.sweep_overview import _fill_scalar
-
-                dtype = np.dtype(meta.get("dtype") or "float32")
-                slab = np.full(n_cells, _fill_scalar(meta.get("fill_value", "NaN"), dtype), dtype)
-            else:
-                slab = np.full(n_cells, b"", dtype=object)
+            slab = _empty_slab(meta, n_cells)
         else:
             slab = np.asarray(slab)
             if slab.shape != (int(n_cells),):
