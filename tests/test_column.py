@@ -336,3 +336,169 @@ class TestSweepParity:
             open_store(f"{tmp_path}/-3/all.zarr"), path=str(SHARD_ORDER), mode="r", zarr_format=3
         )
         _assert_group_matches(node_overview, folded[SHARD_ORDER], 1)
+
+
+class TestWriteColumn:
+    """Phase 2: the column writer — D4 order, attrs, naming, sidecar."""
+
+    CELLS = {0: [1.0, 2.0], 5: [10.0, 4.0], 6: [7.0], 15: [3.0, 8.0, 5.0]}
+
+    def _write(self, root, *, window=None, time_range=None, cells=None):
+        from zagg.column import fold_column, write_column
+
+        slabs = _cell_slabs(cells if cells is not None else self.CELLS)
+        folded = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3, SHARD_ORDER])
+        basename = write_column(
+            str(root),
+            morton_word("-311"),
+            folded,
+            FIELDS,
+            node_order=SHARD_ORDER,
+            cell_order=CELL_ORDER,
+            window=window,
+            time_range=time_range,
+            granule_count=3,
+        )
+        return basename, folded
+
+    def test_layout_groups_and_morton(self, tmp_path):
+        from mortie import generate_morton_children
+
+        basename, folded = self._write(tmp_path)
+        assert basename == "all.pyramid.zarr"
+        word = morton_word("-311")
+        store = open_store(f"{tmp_path}/-3/1/1/{basename}")
+        for res, n in ((3, 4), (SHARD_ORDER, 1)):
+            group = zarr.open_group(store, path=str(res), mode="r", zarr_format=3)
+            np.testing.assert_array_equal(
+                group["morton"][:], np.asarray(generate_morton_children(word, res), np.uint64)
+            )
+            for name, meta in FIELDS.items():
+                if meta["class"] == "none":
+                    assert name not in group
+                elif meta["class"] == "exact":
+                    np.testing.assert_array_equal(group[name][:], folded[res][name])
+                else:
+                    stored = [bytes(p) for p in group[name][:]]
+                    assert stored == [bytes(p) for p in folded[res][name]]
+
+    def test_role_and_provenance_attrs(self, tmp_path):
+        from zagg.column import COLUMN_ATTR, COLUMN_ROLE, COLUMN_SPEC, LEAF_REGIME
+
+        basename, _folded = self._write(tmp_path)
+        root = zarr.open_group(open_store(f"{tmp_path}/-3/1/1/{basename}"), mode="r", zarr_format=3)
+        assert root.attrs["role"] == COLUMN_ROLE
+        attrs = dict(root.attrs[COLUMN_ATTR])
+        assert attrs["spec"] == COLUMN_SPEC
+        assert attrs["node"] == "-311" and attrs["order"] == SHARD_ORDER
+        assert attrs["source_cell_order"] == CELL_ORDER and attrs["window"] == "all"
+        assert set(attrs["fields"]) == {"count", "h_min", "h_tdigest"}
+        assert attrs["fields"]["count"] == {"class": "exact", "method": "sum", "nan_policy": "skip"}
+        assert attrs["groups"] == {
+            "3": {"regime": LEAF_REGIME, "merges_from_raw": 1, "n_cells": 4},
+            str(SHARD_ORDER): {"regime": LEAF_REGIME, "merges_from_raw": 1, "n_cells": 1},
+        }
+
+    def test_stamp_covers_the_column_and_is_last(self, tmp_path, monkeypatch):
+        from zagg.column import fold_column, write_column
+        from zagg.hive import read_commit
+
+        basename, _folded = self._write(tmp_path)
+        store = open_store(f"{tmp_path}/-3/1/1/{basename}")
+        stamp = read_commit(store)
+        # CELLS occupies leaf cells 0, 5, 6, 15 -> base-group rows 0, 1, 3:
+        # the stamp counts populated cells of the FINEST group (3), like the
+        # overview writer's populated mask.
+        assert stamp is not None and stamp["cells_with_data"] == 3
+        assert stamp["granule_count"] == 3
+
+        # An interrupted writer (death before the stamp) leaves ignorable
+        # debris: the artifact prefix exists, but read_commit sees no stamp.
+        import zagg.column as column_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("interrupted before the stamp")
+
+        monkeypatch.setattr("zagg.hive.stamp_commit", _boom)
+        slabs = _cell_slabs(self.CELLS)
+        folded = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3])
+        with pytest.raises(RuntimeError, match="interrupted"):
+            write_column(
+                str(tmp_path),
+                morton_word("-312"),
+                folded,
+                FIELDS,
+                node_order=SHARD_ORDER,
+                cell_order=CELL_ORDER,
+            )
+        debris = open_store(f"{tmp_path}/-3/1/2/{column_mod.column_name(None)}")
+        group = zarr.open_group(debris, path="3", mode="r", zarr_format=3)  # arrays landed
+        assert group["count"].shape == (4,)
+        assert read_commit(debris) is None  # ...but the column is debris (D4)
+
+    def test_windowed_naming_and_stamp(self, tmp_path):
+        from zagg.hive import read_commit
+
+        rng = ["2019-01-02T00:00:00+00:00", "2019-11-30T00:00:00+00:00"]
+        basename, _folded = self._write(tmp_path, window="2019", time_range=rng)
+        assert basename == "2019.pyramid.zarr"
+        stamp = read_commit(open_store(f"{tmp_path}/-3/1/1/{basename}"))
+        assert stamp["window"] == "2019" and stamp["time_range"] == rng
+
+    def test_sidecar_lands_after_the_stamp_and_fails_open(self, tmp_path, monkeypatch):
+        basename, _folded = self._write(tmp_path)
+        sidecar = tmp_path / "-3" / "1" / "1" / "all.pyramid.stats.json"
+        record = json.loads(sidecar.read_text())
+        assert record["cells_with_data"] == 3 and record["n_granules"] == 3
+        hashes = record["content_hashes"]["arrays"]
+        assert set(hashes) >= {"3/morton", "3/count", "3/h_tdigest", f"{SHARD_ORDER}/morton"}
+
+        # Fail-open: a hashing failure costs the sidecar, never the column.
+        monkeypatch.setattr(
+            "zagg.content_hash.hash_arrays",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        sidecar.unlink()
+        basename, _folded = self._write(tmp_path)
+        from zagg.hive import read_commit
+
+        assert read_commit(open_store(f"{tmp_path}/-3/1/1/{basename}")) is not None
+        assert not sidecar.exists()
+
+    def test_idempotent_rewrite_same_bytes(self, tmp_path):
+        basename, first = self._write(tmp_path)
+        store = open_store(f"{tmp_path}/-3/1/1/{basename}")
+        before = {
+            (res, name): ([bytes(p) for p in arr[:]] if arr.dtype == object else arr[:].tobytes())
+            for res in (3, SHARD_ORDER)
+            for name, arr in zarr.open_group(store, path=str(res), mode="r", zarr_format=3).arrays()
+        }
+        basename2, _second = self._write(tmp_path)
+        assert basename2 == basename
+        after = {
+            (res, name): ([bytes(p) for p in arr[:]] if arr.dtype == object else arr[:].tobytes())
+            for res in (3, SHARD_ORDER)
+            for name, arr in zarr.open_group(store, path=str(res), mode="r", zarr_format=3).arrays()
+        }
+        assert before == after
+
+    def test_none_class_fields_never_reach_the_template(self, tmp_path):
+        from zagg.column import fold_column, write_column
+
+        fields = dict(FIELDS, h_mean={"class": "none"})
+        slabs = _cell_slabs(self.CELLS)
+        folded = fold_column(slabs, fields, cell_order=CELL_ORDER, resolutions=[3])
+        basename = write_column(
+            str(tmp_path),
+            morton_word("-311"),
+            folded,
+            fields,
+            node_order=SHARD_ORDER,
+            cell_order=CELL_ORDER,
+        )
+        group = zarr.open_group(
+            open_store(f"{tmp_path}/-3/1/1/{basename}"), path="3", mode="r", zarr_format=3
+        )
+        assert "h_mean" not in group
+        root = zarr.open_group(open_store(f"{tmp_path}/-3/1/1/{basename}"), mode="r", zarr_format=3)
+        assert "h_mean" not in root.attrs["zagg_column"]["fields"]
