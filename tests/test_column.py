@@ -847,8 +847,12 @@ class TestWorkerIntegration:
             raise RuntimeError("column write exploded")
 
         monkeypatch.setattr("zagg.column.write_column", boom)
-        with pytest.raises(RuntimeError, match="column write exploded"):
-            _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        meta, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        # Reported, not raised: the caller keeps a coherent metadata dict to
+        # build its failure record from, and the unit still reports FAILED.
+        assert meta["error"] == "leaf column: column write exploded"
+        assert meta["column_error"] == "column write exploded"
+        assert "column" not in meta
 
     def test_errored_shard_writes_neither_leaf_nor_column(self, tmp_path, monkeypatch):
         meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID, fail=True)

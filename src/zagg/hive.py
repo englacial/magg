@@ -1399,29 +1399,43 @@ def process_and_write_hive(
     # Leaf pyramid column (issue #383): written AFTER the leaf's own commit,
     # from the same resident staged slabs — the fleet side of #381 points
     # (1)-(3). Gated inside on the /2 declaration carrying leaf-node levels
-    # (``output.pyramid.overviews``); a failure RAISES like any leaf-write
-    # failure, and the idempotent retry rewrites leaf + column wholesale.
+    # (``output.pyramid.overviews``); a failure FAILS THE UNIT, and the
+    # idempotent retry rewrites leaf + column wholesale.
     # The window filter injection above never touches ``config.output``, so
     # the windowed per-unit config copy carries the declaration unchanged.
     if not metadata.get("error") and "store" in box:
         from zagg.column import write_leaf_column
 
         _t0 = time.time()
-        column = write_leaf_column(
-            store_root,
-            shard_key,
-            grid,
-            config,
-            staged,
-            window=window["label"] if window else None,
-            time_range=time_range,
-            granule_count=metadata.get("granule_count", 0),
-            store_kwargs=store_kwargs,
-        )
-        if column is not None:
-            metadata["column"] = column
-            if "phase_timings" in metadata:
-                metadata["phase_timings"]["column"] = time.time() - _t0
+        try:
+            column = write_leaf_column(
+                store_root,
+                shard_key,
+                grid,
+                config,
+                staged,
+                window=window["label"] if window else None,
+                time_range=time_range,
+                granule_count=metadata.get("granule_count", 0),
+                store_kwargs=store_kwargs,
+            )
+        except Exception as e:
+            # Reported, not raised: the leaf is already COMMITTED here, so a
+            # raise would discard the caller's whole telemetry envelope (the
+            # D20 stats record, the leaf sidecar, the D22 sub-map) for data
+            # that landed. ``metadata["error"]`` is the same unit-failure
+            # channel a failed ``process_shard`` uses — the Lambda handler
+            # returns 500 on it and the dispatcher retries, identical retry
+            # semantics — while the caller keeps a coherent metadata dict to
+            # build its failure record from.
+            logger.error(f"leaf column write failed for shard {shard_key}: {e}")
+            metadata["error"] = f"leaf column: {e}"
+            metadata["column_error"] = str(e)
+        else:
+            if column is not None:
+                metadata["column"] = column
+                if "phase_timings" in metadata:
+                    metadata["phase_timings"]["column"] = time.time() - _t0
     return metadata
 
 
