@@ -224,6 +224,9 @@ def main(argv: list[str] | None = None) -> int:
     pq.write_table(table, args.out_parquet)
 
     dist = _distribution(counts)
+    # Distinct granules that land in >=1 CONUS shard, as ShardMap.build records
+    # it (shardmap.py: ``len({g["id"] for shard in granules for g in shard})``).
+    n_intersecting = int(sm.metadata["granules_assigned"])
     stats = {
         "issue": 202,
         "region": "CONUS (contiguous US, lower-48 + DC)",
@@ -251,25 +254,22 @@ def main(argv: list[str] | None = None) -> int:
             "path": args.catalog,
             "total_granules": n_total,
             "granules_after_prefilter": n_kept,
-            "granules_intersecting_conus": sm.metadata["granules_assigned"],
+            "granules_intersecting_conus": n_intersecting,
         },
         "summary": {
             "total_shards": sm.metadata["total_shards"],
-            "total_granules_intersecting": None,  # set below from distinct pairs' granules
+            "total_granules_intersecting": n_intersecting,
             "total_pairs": sm.metadata["total_pairs"],
             "build_wall_s": round(wall, 1),
         },
         "granules_per_shard": dist,
         "leak_check": leak,
     }
-    # distinct granules that land in >=1 CONUS shard
-    distinct = {g["id"] for gl in sm.granules for g in gl}
-    stats["summary"]["total_granules_intersecting"] = len(distinct)
     Path(args.out_stats).write_text(json.dumps(stats, indent=2))
 
     print(f"wrote {args.out_parquet} and {args.out_stats}", flush=True)
     print(
-        f"SUMMARY: shards={dist['n_shards']:,} granules={len(distinct):,} "
+        f"SUMMARY: shards={dist['n_shards']:,} granules={n_intersecting:,} "
         f"pairs={dist['total_pairs']:,} max/shard={dist['max']:,} "
         f"median/shard={dist['median']}",
         flush=True,
