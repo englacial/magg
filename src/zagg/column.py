@@ -577,7 +577,14 @@ def write_leaf_column(
     named on the PR thread before the column can carry it.
     """
     store_kwargs = dict(store_kwargs or {})
-    plan = leaf_column_plan(config, grid)
+    # The gate re-validates a declaration the templating path already
+    # accepted, so a divergence fires on EVERY shard at once — name the seam
+    # and the unit, or N thousand CloudWatch lines read like a template-time
+    # error rather than a refusal at the tail of a committed leaf write.
+    try:
+        plan = leaf_column_plan(config, grid)
+    except Exception as e:
+        raise ValueError(f"column gate refused shard {shard_key} window {window!r}: {e}") from e
     if plan is None:
         _clear_column(store_root, shard_key, window, store_kwargs)
         return None
