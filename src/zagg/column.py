@@ -575,12 +575,20 @@ def write_leaf_column(
     Memory note (the PR #391 phase 1 review measurement): the node-order
     member's k-way merge concatenates every resident digest once — at the
     ~17.6M-centroid scale ``hive.process_and_write_hive`` already cites for
-    its ~200 MB ragged accumulation, the fold's transient peak measured
-    ~2.0 GB (float64 copies + sort temporaries inside
-    ``merge_tdigests_kway``), alongside 4 GB workers (issue #193). The bound
-    is transient, single-threaded, and dies with the call; a digest load
-    ~2x that scale does not fit and needs the kernel-side preallocation
-    named on the PR thread before the column can carry it.
+    its ~200 MB ragged accumulation, the fold measured ~2.0 GB (float64
+    copies + sort temporaries inside ``merge_tdigests_kway``). That is a
+    DELTA over a bare build-the-slabs harness, and it rides ON TOP of what
+    the worker is still holding at this hook: ``chunk_results`` (never
+    cleared after the leaf write), ``ragged_chunks`` on the streaming path,
+    ``_df_out``, and ``staged`` itself — on Lambda those release only once
+    the handler returns from ``process_and_write_hive``. The overlap is
+    smaller than that list of live names suggests (the per-cell payload
+    ``bytes`` are shared references between ``chunk_results`` and
+    ``staged``), and the bound is transient, single-threaded, and dies with
+    the call — but it is 4 GB workers (issue #193) absorbing ~2.0 GB on top
+    of a loaded heap, not beside an empty one. A digest load ~2x that scale
+    does not fit and needs the kernel-side preallocation named on the PR
+    thread before the column can carry it.
     """
     store_kwargs = dict(store_kwargs or {})
     # The gate re-validates a declaration the templating path already
