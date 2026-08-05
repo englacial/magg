@@ -349,6 +349,10 @@ Under a `/2` declaration the **leaf worker itself** writes the finest pyramid
 levels, at aggregation time, while the shard's cell data is resident
 ([issue #383](https://github.com/englacial/zagg/issues/383); the fleet side
 of [#381](https://github.com/englacial/zagg/issues/381) points (1)–(3)).
+The gate is the **writing run's own config**, not a store read — workers
+never open the manifest, and the manifest's `pyramid` block (excluded from
+the frozen keys above) MAY lag a config-only change — so a `/2` manifest
+does not by itself imply columns on disk: read the columns, not the block.
 Each `(leaf, window)` gains one **column artifact** beside the leaf under
 its own node directory — `{window}.pyramid.zarr`, `all.pyramid.zarr`
 unwindowed — holding one resolution group per within-footprint level: the
@@ -361,8 +365,13 @@ order-independent k-way merge), so a column group is byte-identical to the
 sweep kernels' fold of the committed leaf. The write discipline is the
 leaf's own: template → groups → `role: column` + `zagg_column` attrs →
 **one commit stamp last**, then the `{stem}.stats.json` sidecar — an
-unstamped column is debris, and the repair for a torn or missing column is
-re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
+unstamped column is debris. A run that declares no leaf-node levels (or no
+composable field) writes no column and **deletes** any the previous
+declaration left at that `(leaf, window)`, so a column never outlives the
+declaration that wrote it — which is why an absent column is not by itself
+a fault: under a declaration known to carry leaf columns it is a torn
+worker, and the repair is re-invoking the idempotent leaf, never a
+sweep-side fold from raw cells.
 Byte grammar: [`specification.md`](specification.md) §4.6.
 
 ### Retrofitting the pyramid declaration
