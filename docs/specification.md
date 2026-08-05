@@ -858,10 +858,13 @@ entries themselves when the writers land (#383/#384).
 contribution, written at aggregation time while the shard's cell data is
 resident: one zarr per `(leaf, window)`, a **sibling of the leaf under the
 leaf's own node prefix**. A column exists exactly when the **writing run's**
-pyramid declaration is `zagg-pyramid/2` (§4.5) and carries leaf-node levels —
+pyramid declaration is `zagg-pyramid/2` (§4.5), carries leaf-node levels —
 the expanded `overviews` list always places the declared resolutions at the
-shard node — and it is written by the same worker invocation that commits the
-leaf, after the leaf's own stamp. The gate is the config the unit carries, not
+shard node — **and declares at least one composable field** (§4.5): a
+declaration whose fields are all `none`-class writes **no artifact at all**
+(not a morton-only column), and clears any prior one exactly as the
+no-levels arm below does. When it does exist it is written by the same
+worker invocation that commits the leaf, after the leaf's own stamp. The gate is the config the unit carries, not
 a store read: workers never open the manifest, so the manifest's `pyramid`
 block is the **reader- and sweep-facing** declaration and MAY lag a
 config-only change until the store is re-templated or retrofitted

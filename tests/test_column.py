@@ -129,6 +129,27 @@ class TestColumnResolutions:
         assert column_resolutions(levels, 2) == []
         assert column_resolutions([], 2) == []
 
+    def test_all_none_fields_mean_no_column_at_all(self):
+        # The gate's third arm (§4.6): leaf-node levels but nothing composable
+        # writes NO artifact — not a morton-only column.
+        from dataclasses import replace
+
+        from zagg.column import leaf_column_plan
+        from zagg.grids import HealpixGrid
+
+        cfg = _leaf_cfg()
+        cfg = replace(
+            cfg,
+            aggregation={**cfg.aggregation, "variables": {"h_mean": {"function": "mean"}}},
+            output={**(cfg.output or {}), "pyramid": {"overviews": 3}},
+        )
+        grid = HealpixGrid(SHARD_ORDER, CELL_ORDER, config=cfg)
+        assert column_resolutions([{"node": SHARD_ORDER, "cells": [3]}], SHARD_ORDER) == [
+            3,
+            SHARD_ORDER,
+        ]
+        assert leaf_column_plan(cfg, grid) is None
+
 
 class TestLeafSlabs:
     def test_staged_refs_pass_through(self):
