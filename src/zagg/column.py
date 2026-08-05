@@ -350,13 +350,13 @@ def write_column(
         time_range=time_range if window is not None else None,
     )
     _write_sidecar(
-        path, shard_key, staged, int(populated.sum()), granule_count, window, store_kwargs
+        store, path, shard_key, staged, int(populated.sum()), granule_count, window, store_kwargs
     )
     return basename
 
 
 def _write_sidecar(
-    path, shard_key, staged, cells_with_data, granule_count, window, store_kwargs
+    store, path, shard_key, staged, cells_with_data, granule_count, window, store_kwargs
 ) -> None:
     """The column's D20 stats sidecar: ``{stem}.stats.json``, after the stamp.
 
@@ -366,20 +366,23 @@ def _write_sidecar(
     derived from the column's own stem — ``telemetry.sidecar_key``'s label
     grammar (rightly) rejects the dotted ``.pyramid`` stem, and the rule is
     the same ``{stem}.stats.json`` one. Fail-open (D9 telemetry posture):
-    §5.3 reads absence as unverifiable, never tampered.
+    §5.3 reads absence as unverifiable, never tampered — so EVERY import a
+    sidecar needs sits inside the ``try`` (``_write_overview``'s posture): an
+    ImportError here is a telemetry-class failure and must not fail a column
+    that is already committed. The caller's open ``store`` is reused rather
+    than re-derived — one fewer store construction and root-metadata read.
     """
-    import json
-
-    import obstore
-    import zarr
-
-    from zagg.store import open_object_store, open_store
-
     try:
+        import json
+
+        import obstore
+        import zarr
+
         from zagg.content_hash import content_hashes_record, hash_arrays
+        from zagg.store import open_object_store
         from zagg.telemetry import build_record
 
-        group = zarr.open_group(open_store(path, **store_kwargs), path="", mode="r", zarr_format=3)
+        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
         record = build_record(
             shard_key=int(shard_key),
             metadata={

@@ -480,6 +480,27 @@ class TestWriteColumn:
         assert read_commit(open_store(f"{tmp_path}/-3/1/1/{basename}")) is not None
         assert not sidecar.exists()
 
+    def test_sidecar_import_failure_never_fails_the_column(self, tmp_path, monkeypatch):
+        # Every sidecar-only import sits INSIDE the fail-open try: a
+        # telemetry-class ImportError (a slimmed runtime, say) must cost the
+        # sidecar, never a column whose stamp already landed.
+        import builtins
+
+        from zagg.hive import read_commit
+
+        real_import = builtins.__import__
+
+        def _boom(name, *args, **kwargs):
+            if name == "zagg.telemetry":
+                raise ImportError("no telemetry on this runtime")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _boom)
+        basename, _folded = self._write(tmp_path)
+        monkeypatch.undo()
+        assert read_commit(open_store(f"{tmp_path}/-3/1/1/{basename}")) is not None
+        assert not (tmp_path / "-3" / "1" / "1" / "all.pyramid.stats.json").exists()
+
     def test_idempotent_rewrite_same_array_bytes(self, tmp_path):
         """A re-run reproduces the DATA bytes; provenance timestamps move.
 
