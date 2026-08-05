@@ -914,8 +914,15 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   data** — never group from group: exact classes by their §4.5 merge law
   (nan-skipping, §4.3), approximate classes by the order-independent k-way
   digest merge. Column bytes at a resolution MUST equal the sweep-kernel
-  fold of the committed leaf's arrays at that resolution (the from-leaves
-  parity contract); `merges_from_raw` is 1 for every group.
+  fold of the committed leaf's arrays at that resolution — the from-leaves
+  parity contract, which reads differently per class: for **exact** fields
+  it is checkable from this page (the §4.5 merge law plus §4.3's nan
+  policy, so an external reader can reproduce a group by direct
+  aggregation), while for **approximate** fields the merge algebra is
+  zagg-owned and deliberately unspecified (§2.3), so the MUST binds
+  implementations sharing those kernels and is pinned on committed bytes by
+  the §7 `column/` fixture rather than derivable from spec text.
+  `merges_from_raw` is 1 for every group.
 - **The `role` and `zagg_column` attrs.** `role` is `"column"`;
   `zagg_column` is the versioned provenance block, present exactly when
   `role` is `"column"`:
