@@ -723,7 +723,15 @@ def _column_bytes(column) -> dict:
 
 
 def _run_unit(
-    root, monkeypatch, *, pyramid=None, window=None, windowing=None, fail=False, sharded=True
+    root,
+    monkeypatch,
+    *,
+    pyramid=None,
+    window=None,
+    windowing=None,
+    fail=False,
+    sharded=True,
+    time_range=None,
 ):
     """One shard through the REAL ``process_and_write_hive`` (generator inputs).
 
@@ -732,7 +740,10 @@ def _run_unit(
     is exactly what the leaf stored. ``sharded=False`` drives the same inputs
     through the per-chunk STREAMING leaf writer instead — a different route to
     ``staged`` (per-chunk lazy placement + ``write_ragged_leaf_to_zarr``), and
-    the one every ``chunk_inner``-unset grid takes.
+    the one every ``chunk_inner``-unset grid takes. ``time_range`` is the D15
+    observed extent in DATASET units the fake reports; the caller converts it
+    to the stamp's ISO pair (``windows.iso_time_range``) and rewrites
+    ``metadata["time_range"]`` with the result.
     """
     from dataclasses import replace
 
@@ -770,6 +781,8 @@ def _run_unit(
             for block, carrier, ragged in kwargs["chunk_results"]:
                 write_chunk(block, carrier, ragged)
         meta["phase_timings"] = {"read": 0.0, "index": 0.0, "aggregate": 0.0}
+        if time_range is not None:
+            meta["time_range"] = list(time_range)
         return df, meta
 
     monkeypatch.setattr(processing, "process_shard", fake)
@@ -790,6 +803,7 @@ def _run_unit(
 
 class TestWorkerIntegration:
     PYRAMID = {"overviews": 5}
+    WINDOWING = {"schedule": "yearly", "time_field": "t", "epoch": "2018-01-01T00:00:00Z"}
 
     def test_column_rides_the_leaf_write(self, tmp_path, monkeypatch):
         from zagg.hive import read_commit
@@ -841,16 +855,43 @@ class TestWorkerIntegration:
             monkeypatch,
             pyramid=self.PYRAMID,
             window={"label": "2019", "start": 0.0, "end": 1.0},
-            windowing={
-                "schedule": "yearly",
-                "time_field": "t",
-                "epoch": "2018-01-01T00:00:00Z",
-            },
+            windowing=self.WINDOWING,
+            time_range=[31536000.0, 31536060.0],
         )
         assert meta.get("error") is None
         assert meta["column"] == "2019.pyramid.zarr"
         stamp = read_commit(open_store(str(leaf.parent / "2019.pyramid.zarr")))
         assert stamp is not None and stamp["window"] == "2019"
+        # The D15 truth half: the worker's observed extent, converted to the
+        # stamp's ISO pair, reached the COLUMN's stamp and not just the leaf's.
+        assert stamp["time_range"] == meta["time_range"]
+        assert stamp["time_range"] == ["2019-01-01T00:00:00+00:00", "2019-01-01T00:01:00+00:00"]
+
+    def test_two_windows_get_side_by_side_columns(self, tmp_path, monkeypatch):
+        from zagg.hive import read_commit
+
+        def run(label, start, end):
+            return _run_unit(
+                tmp_path,
+                monkeypatch,
+                pyramid=self.PYRAMID,
+                window={"label": label, "start": start, "end": end},
+                windowing=self.WINDOWING,
+            )
+
+        meta, leaf = run("2019", 0.0, 1.0)
+        assert meta["column"] == "2019.pyramid.zarr"
+        first = _column_bytes(leaf.parent / "2019.pyramid.zarr")
+        meta = run("2020", 1.0, 2.0)[0]
+        assert meta["column"] == "2020.pyramid.zarr"
+        # The D13 case: the second window's WHOLESALE clear is scoped to its
+        # own basename, so the first window's column and sidecar are untouched.
+        assert _column_bytes(leaf.parent / "2019.pyramid.zarr") == first
+        assert (leaf.parent / "2019.pyramid.stats.json").exists()
+        assert (leaf.parent / "2020.pyramid.stats.json").exists()
+        for label in ("2019", "2020"):
+            stamp = read_commit(open_store(str(leaf.parent / f"{label}.pyramid.zarr")))
+            assert stamp is not None and stamp["window"] == label
 
     def test_rerun_rewrites_the_column_to_the_same_bytes(self, tmp_path, monkeypatch):
         _meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
@@ -881,13 +922,19 @@ class TestWorkerIntegration:
         def boom(*a, **k):
             raise RuntimeError("column write exploded")
 
+        from zagg.hive import read_commit
+
         monkeypatch.setattr("zagg.column.write_column", boom)
-        meta, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
         # Reported, not raised: the caller keeps a coherent metadata dict to
         # build its failure record from, and the unit still reports FAILED.
         assert meta["error"] == "leaf column: column write exploded"
         assert meta["column_error"] == "column write exploded"
         assert "column" not in meta
+        # The state the retry has to repair (§4.6 failure identity): the leaf
+        # is COMMITTED and stamped, and no column stands beside it.
+        assert read_commit(open_store(str(leaf))) is not None
+        assert not list(leaf.parent.glob("*.pyramid.zarr"))
 
     def test_gate_refusal_names_the_shard_and_window(self, tmp_path, monkeypatch):
         # The gate re-validates a declaration the templating path already
@@ -909,7 +956,7 @@ class TestWorkerIntegration:
         assert meta.get("error") == "synthetic failure"
         assert "column" not in meta
         assert not leaf.exists()
-        assert not list(leaf.parent.glob("*.pyramid.zarr")) if leaf.parent.exists() else True
+        assert not list(leaf.parent.glob("*.pyramid.zarr"))
 
 
 def _refold_digests(payloads, factor, *, delta):
