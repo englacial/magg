@@ -425,7 +425,7 @@ def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None) -> None:
         # and the column's own O11 hashes so a spec-text decoder can be
         # asserted against committed bytes.
         assert meta.get("column"), meta
-        expected["pyramid_knob"] = pyramid
+        expected["declared"] = pyramid
         expected["column"] = _column_expected(
             out / leaf_rel.rsplit("/", 1)[0] / meta["column"], meta["column"]
         )
