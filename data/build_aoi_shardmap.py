@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 DEFAULT_CATALOG = "data/atl03_v007/atl03_v007_full.parquet"
-DEFAULT_CONFIG = "tests/data/benchmark/configs/atl03_tdigest_healpix_o9_hive_k8.yaml"
+DEFAULT_CONFIG = "src/zagg/configs/atl03_tdigest_healpix_hive.yaml"
 
 
 def _polygon_parts(geojson_path: str):
