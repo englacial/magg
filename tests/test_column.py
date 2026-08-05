@@ -8,6 +8,7 @@ leaf, which is the issue #383 acceptance contract.
 """
 
 import json
+import pathlib
 
 import numpy as np
 import obstore
@@ -509,6 +510,78 @@ class TestWriteColumn:
         # The root object is rewritten too: same attrs and same stamp CONTENT
         # (a regression that changed either would pass a data-bytes-only check).
         assert _root_meta_sans_timestamps(store) == meta_before
+
+    def test_rewrite_spares_the_sibling_leaf_and_its_sidecar(self, tmp_path):
+        # The wholesale clear (issue #341 semantics) is scoped to the column's
+        # own prefix: the node dir now holds three siblings, and the leaf is
+        # the one object a mis-scoped delete would eat.
+        from zagg.hive import read_commit
+
+        slabs = _make_leaf(tmp_path, "-311", self.CELLS)
+        leaf_sidecar = tmp_path / "-3" / "1" / "1" / "-311.stats.json"
+        leaf_sidecar.write_text("{}")
+        basename, _folded = self._write(tmp_path)
+        basename, _folded = self._write(tmp_path)  # ...and again, the rewrite
+
+        leaf = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        assert read_commit(leaf) is not None
+        group = zarr.open_group(leaf, path=str(CELL_ORDER), mode="r", zarr_format=3)
+        np.testing.assert_array_equal(group["count"][:], slabs["count"])
+        assert leaf_sidecar.read_text() == "{}"
+        assert (tmp_path / "-3" / "1" / "1" / "all.pyramid.stats.json").exists()
+
+    def test_clear_is_scoped_on_an_obstore_prefix_store(self, tmp_path, monkeypatch):
+        # The string-prefix hazard only exists on the fleet backend, where
+        # `open_store` builds `zarr.storage.ObjectStore(store=S3Store(prefix=…))`
+        # and zarr's `ObjectStore.delete_dir` leaves the EMPTY prefix un-slashed
+        # — scoping rests on obstore's prefix store re-adding the delimiter.
+        # Mirrors tests/test_hive.py's
+        # `test_overwrite_clear_is_scoped_on_an_obstore_prefix_store`, using
+        # obstore's own LocalStore in prefix mode (the same composition).
+        import obstore as _obstore
+        from zarr.storage import ObjectStore
+
+        import zagg.store as store_mod
+
+        def _prefixed(path, **kwargs):
+            pathlib.Path(path).mkdir(parents=True, exist_ok=True)
+            return ObjectStore(store=_obstore.store.LocalStore(prefix=path))
+
+        monkeypatch.setattr(store_mod, "open_store", _prefixed)
+        basename, _folded = self._write(tmp_path)
+        node = tmp_path / "-3" / "1" / "1"
+        # The adversarial shape: a name-prefix sibling of the column, which a
+        # missing delimiter would sweep up with it.
+        twin = node / f"{basename}.status"
+        twin.mkdir()
+        (twin / "r.json").write_text("{}")
+        stray = node / basename / "3" / "stray.json"
+        stray.write_text("{}")  # in-column debris
+        self._write(tmp_path)
+
+        assert not stray.exists()  # the clear really ran
+        assert (twin / "r.json").read_text() == "{}"
+        assert (node / "all.pyramid.stats.json").exists()
+
+    def test_narrowed_rewrite_drops_the_retired_group(self, tmp_path):
+        # The docstring's "a prior torn write never survives": a rewrite under
+        # a narrower declaration leaves no orphan group behind.
+        from zagg.column import fold_column, write_column
+
+        self._write(tmp_path)
+        node = tmp_path / "-3" / "1" / "1" / "all.pyramid.zarr"
+        assert (node / "3").exists()
+        slabs = _cell_slabs(self.CELLS)
+        write_column(
+            str(tmp_path),
+            morton_word("-311"),
+            fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[SHARD_ORDER]),
+            FIELDS,
+            node_order=SHARD_ORDER,
+            cell_order=CELL_ORDER,
+        )
+        assert not (node / "3").exists()
+        assert (node / str(SHARD_ORDER)).exists()
 
     def test_missing_node_member_refuses_by_name(self, tmp_path):
         # The node-order member is the universal partial #384's gather may
