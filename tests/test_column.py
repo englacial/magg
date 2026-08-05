@@ -793,6 +793,19 @@ class TestWorkerIntegration:
         assert meta.get("error") is None and "column" not in meta
         assert not list(leaf.parent.glob("*.pyramid.zarr"))
 
+    def test_dropping_the_knob_clears_the_previous_column(self, tmp_path, monkeypatch):
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        assert meta["column"] == "all.pyramid.zarr"
+        assert (leaf.parent / "all.pyramid.zarr").exists()
+        assert (leaf.parent / "all.pyramid.stats.json").exists()
+        # Same leaf, declaration removed: the fresh leaf must not keep a
+        # STAMPED column folded from the superseded run's cells.
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=None)
+        assert meta.get("error") is None and "column" not in meta
+        assert not (leaf.parent / "all.pyramid.zarr").exists()
+        assert not (leaf.parent / "all.pyramid.stats.json").exists()
+        assert (leaf / "zarr.json").exists()
+
     def test_windowed_unit_gets_a_window_named_column(self, tmp_path, monkeypatch):
         from zagg.hive import read_commit
 
