@@ -731,7 +731,9 @@ def _field_drift(group, name, meta) -> str | None:
 ENVELOPE_NAME = "overview.rollup.json"
 
 
-def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kwargs=None) -> dict:
+def sweep_overviews(
+    store_root: str, manifest: dict, by_shard: dict, *, store_kwargs=None, min_order: int = 0
+) -> dict:
     """Generate/refresh overview zarrs at the manifest-declared orders (D22).
 
     ``by_shard`` is the engine's normalized dirty work set
@@ -739,7 +741,10 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     of those shards at each declared order. The full descendant leaf set per
     node comes from the dirty set unioned with the root ``coverage.moc``
     (run record + MOC — never a LIST); with the default family order the MOC
-    family has just refreshed that root in the same pass.
+    family has just refreshed that root in the same pass — except in a
+    PARTITIONED pass, which defers that refresh, so the root MOC is this
+    pass's input as well as the finisher's obligation and a degraded read is
+    reported as ``root_moc_stale`` (:func:`_candidate_decimals`).
 
     Orders are walked **finest first**, which is what makes the default
     cascade (issue #376) possible: the finest ``exact_levels`` levels fold
@@ -763,6 +768,16 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
     present on every path: this dict is serialized into the sweep run record
     (:func:`zagg.sweep._write_sweep_record`), an operator-facing artifact
     whose schema must not vary by revision.
+
+    ``min_order`` (issue #377) is the sweep partition's split order. Two things
+    span partitions and so are left to the coarse-level finisher: declared
+    orders coarser than it (``deferred_orders``), and the manifest pyramid RMW
+    at the store root (``manifest_deferred``, carrying the order set the RMW
+    would have unioned as ``materialized_orders`` plus the regimes that wrote
+    them as ``materialized_fold_sources`` — issue #376's §4.5 actuals). The
+    ``/2`` gate above fires BEFORE the partition clamp: a partitioned pass
+    over a ``/2``-declaring store refuses exactly like an unpartitioned one
+    (nothing is folded, so nothing is deferred).
     """
     from zagg.pyramid import PYRAMID_SPEC_V2
     from zagg.store import open_object_store
@@ -831,8 +846,23 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
             f"shard_order {shard_order}; skipping them"
         )
         orders = [k for k in orders if k not in bad]
+    # Plans derive from the FULL declared schedule, before the partition clamp:
+    # a level's cascade source is the next FINER declared level (issue #376),
+    # which the clamp never removes (it drops only the coarse tail), so the
+    # surviving levels' plans are identical either way — but _fold_sources'
+    # declaration-level warnings must describe the declaration, not one
+    # partition's clamped view of it.
     plans = _fold_sources(decl, orders, cell_order, shard_order)
-    candidates = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
+    if deferred := [k for k in orders if k < int(min_order)]:
+        counts["deferred_orders"] = deferred
+        orders = [k for k in orders if k not in deferred]
+        logger.info(
+            f"sweep[overview]: orders {deferred} are coarser than the partition split order "
+            f"{min_order}; they span partitions and are the finisher's (issue #377)"
+        )
+    candidates, moc_stale = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
+    if moc_stale:
+        counts["root_moc_stale"] = True
     store = open_object_store(store_root, **store_kwargs)
     materialized: dict[int, str | None] = {}
     for k in orders:
@@ -891,7 +921,21 @@ def sweep_overviews(store_root: str, manifest: dict, by_shard: dict, *, store_kw
                     f"{_node_rel(node)}/{ENVELOPE_NAME}",
                     json.dumps(fresh, indent=1).encode(),
                 )
-    if counts["written"]:
+    if min_order:
+        # The manifest pyramid RMW is a store-ROOT shared write: 2^n partitions
+        # racing it would lose updates. It belongs to the finisher, the one
+        # invoke that runs alone after the partitions land (issue #377).
+        # Carry the payload the RMW would have written: the per-partition
+        # record is the only durable trace, and "somebody owes an update"
+        # without saying WHAT to write makes the finisher re-derive it. Since
+        # issue #376 that payload is the fold-source actuals too — the regime
+        # that WROTE each order this pass (§4.5's fold_sources shape), never
+        # the plan.
+        counts["manifest_deferred"] = True
+        counts["materialized_orders"] = sorted(materialized)
+        if sources := {str(int(k)): v for k, v in materialized.items() if v is not None}:
+            counts["materialized_fold_sources"] = sources
+    elif counts["written"]:
         counts["manifest_updated"] = _update_manifest_pyramid(
             store_root, materialized, store_kwargs
         )
@@ -924,14 +968,24 @@ def _rel_rank(decimal: str, node: str) -> int:
     return rank
 
 
-def _candidate_decimals(store_root, shard_order, by_shard, store_kwargs) -> set:
-    """Descendant-leaf candidates: the dirty set unioned with the root MOC.
+def _candidate_decimals(store_root, shard_order, by_shard, store_kwargs) -> tuple[set, bool]:
+    """Descendant-leaf candidates and whether the root MOC was unusable.
 
     Discovery stays LIST-free (D22): untouched sibling shards contribute via
-    the root ``coverage.moc`` (default-on for hive; refreshed by the MOC
-    family earlier in the same default pass). A missing/unusable root MOC
-    degrades to the dirty set with a loud warning — the overview then covers
-    only the given leaves until a full sweep repairs it (D9: regenerable).
+    the root ``coverage.moc`` (default-on for hive). An unpartitioned default
+    pass has the MOC family refresh that root earlier in the same pass — but a
+    PARTITIONED pass DEFERS that refresh (a store-root shared write, issue
+    #377), so the root MOC is a partitioned pass's INPUT as well as its
+    deferred output, and what it reads is whatever the last whole-tree sweep
+    or ``mode="coverage"`` leg left. That ordering is the finisher's to own: a
+    partition handed a RUN-scoped leaf set against a missing root MOC re-folds
+    from the run's leaves alone, and :func:`_roll_node` overwrites on a
+    generation mismatch, so a complete node overview can be rewritten with
+    fewer contributing leaves until the next whole-tree pass repairs it.
+
+    A missing/unusable root MOC therefore degrades to the dirty set with a
+    loud warning AND a ``root_moc_stale`` count, so the per-partition record
+    shows it rather than only the log (D9: regenerable).
     """
     from zagg.grids.morton import morton_decimal
     from zagg.hive import read_root_coverage, root_coverage_words
@@ -944,7 +998,7 @@ def _candidate_decimals(store_root, shard_order, by_shard, store_kwargs) -> set:
     if isinstance(env, dict) and env.get("order") == shard_order:
         try:
             decimals |= {morton_decimal(int(w)) for w in root_coverage_words(env)}
-            return decimals
+            return decimals, False
         except (KeyError, TypeError, ValueError) as e:
             logger.warning(f"sweep[overview]: unusable root coverage.moc ({e})")
     if decimals:
@@ -952,7 +1006,7 @@ def _candidate_decimals(store_root, shard_order, by_shard, store_kwargs) -> set:
             "sweep[overview]: no usable root coverage.moc — overviews will fold ONLY "
             "the run's own leaves; sweep the moc family (or the default set) to repair"
         )
-    return decimals
+    return decimals, True
 
 
 def _window_work(decl, windowed, dirty_windows, entries) -> list:
