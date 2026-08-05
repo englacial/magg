@@ -50,6 +50,14 @@ conformance tests assert decoded values, never object bytes.
   it on purpose — the block is a template-time artifact, decodable from
   ``morton_hive.json`` alone; the ``/2`` artifacts a fleet writes are the
   ``column/`` fixture's job (issue #383 — sweep-side levels are issue #384).
+
+STALE BY DESIGN: ``minimal/`` and ``kitchen_sink/`` were committed before
+issue #382 and their ``morton_hive.json`` still carries the pre-#382
+``pyramid`` block (``{"orders": [], "aggregation": {}}``). Running this
+script refreshes them to the current block shape — real churn in files no
+test asserts. When regenerating for one fixture only, ``git checkout --``
+the others; a deliberate refresh of the older-era manifests is its own
+commit.
 """
 
 from __future__ import annotations
