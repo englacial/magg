@@ -98,14 +98,17 @@ class TestColumnResolutions:
     def test_default_schedule_reaches_node_and_members(self):
         from zagg.pyramid import default_overviews
 
-        # 19/13/9 reference geometry: base (9,[13]) + implied 11/9 members
-        # from the (7,[11]) and (5,[9]) declarations + the node-order member.
+        # 19/13/9 reference geometry under the fixed every-order ladder
+        # (espg ruling, the PR #389 thread): base (9,[13]) plus the ladder's
+        # within-footprint members (8,[12]) (7,[11]) (6,[10]) (5,[9]) — every
+        # coarser rung's cells fall below the node — and the node-order member.
         levels = default_overviews(9, 13, child_order=19)
-        assert column_resolutions(levels, 9) == [13, 11, 9]
+        assert column_resolutions(levels, 9) == [13, 12, 11, 10, 9]
 
     def test_small_geometry_default(self):
         from zagg.pyramid import default_overviews
 
+        # (2,[3]) + ladder (1,[2]) (0,[1]): within-footprint members {3, 2}.
         levels = default_overviews(SHARD_ORDER, 3, child_order=CELL_ORDER)
         assert column_resolutions(levels, SHARD_ORDER) == [3, 2]
 
