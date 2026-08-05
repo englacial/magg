@@ -195,7 +195,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--start", default="2018-10-13")
     ap.add_argument("--end", default="2026-03-15")
     ap.add_argument("--order", type=int, default=9, help="HEALPix parent_order (shard order)")
-    ap.add_argument("--worker-memory", type=int, default=2048, help="Worker memory (MB)")
+    ap.add_argument(
+        "--worker-memory",
+        type=int,
+        default=2048,
+        help="Worker memory (MB): one of the pre-provisioned sizes 2048/4096/8192",
+    )
     ap.add_argument("--extra-disk", action="store_true", help="Use the extra-/tmp worker variant")
     ap.add_argument(
         "--pad-deg",
@@ -210,9 +215,18 @@ def main(argv: list[str] | None = None) -> int:
 
     from zagg.catalog.shardmap import ShardMap
     from zagg.catalog.sources import Catalog
-    from zagg.config import load_config
+    from zagg.config import WORKER_MEMORIES, load_config
     from zagg.grids import from_config
     from zagg.notebook import max_cost_preview
+
+    # ``config.worker`` is set below the loader, so ``_validate_worker`` never
+    # sees it: check the size here or an unlisted one silently prices a worker
+    # variant no run can dispatch to (issue #235).
+    if args.worker_memory not in WORKER_MEMORIES:
+        ap.error(
+            f"--worker-memory must be one of {sorted(WORKER_MEMORIES)} MB "
+            f"(the pre-provisioned variant sizes, issue #235)"
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
