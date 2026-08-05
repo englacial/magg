@@ -203,6 +203,28 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
     return out
 
 
+def _column_provenance(meta: dict) -> dict:
+    """One field's column-attrs entry: the sweep's, plus the digest budget.
+
+    :func:`zagg.sweep_overview._field_provenance` records class + fold law
+    (+ ``nan_policy`` for exact). An approximate group's stored centroids are
+    also decided by the three values :func:`fold_column` reads — ``delta``,
+    ``dtype``, ``inner_shape`` — and a reader gathering columns k-way (#370)
+    needs them: they cannot be recovered from the leaf, since a column can
+    outlive a declaration change. Recorded here rather than in the sweep's
+    shared helper — the overview's identical gap is a spec call for the
+    issue #383 phase 4 section, not a reason to leave this artifact short.
+    """
+    from zagg.sweep_overview import _field_provenance
+
+    entry = dict(_field_provenance(meta))
+    if meta.get("class") == "approximate":
+        entry["delta"] = int(meta.get("delta") or 512)
+        entry["dtype"] = meta.get("dtype") or "float32"
+        entry["inner_shape"] = list(meta.get("inner_shape") or (2,))
+    return entry
+
+
 def column_name(window: str | None) -> str:
     """The column basename: the D23 window stem + ``.pyramid.zarr``.
 
@@ -289,12 +311,7 @@ def write_column(
     from zagg.grids.morton import morton_decimal
     from zagg.hive import _utcnow, shard_leaf_path, stamp_commit
     from zagg.store import open_store
-    from zagg.sweep_overview import (
-        ROLE_ATTR,
-        _field_provenance,
-        _overview_config,
-        _populated_mask,
-    )
+    from zagg.sweep_overview import ROLE_ATTR, _overview_config, _populated_mask
     from zagg.windows import SCHEDULE_NONE_TOKEN
 
     store_kwargs = dict(store_kwargs or {})
@@ -341,7 +358,7 @@ def write_column(
                 "order": node_order,
                 "source_cell_order": cell_order,
                 "window": window if window is not None else SCHEDULE_NONE_TOKEN,
-                "fields": {n: _field_provenance(m) for n, m in fields.items()},
+                "fields": {n: _column_provenance(m) for n, m in fields.items()},
                 "groups": {
                     str(res): {
                         "regime": LEAF_REGIME,

@@ -406,6 +406,15 @@ class TestWriteColumn:
         assert attrs["source_cell_order"] == CELL_ORDER and attrs["window"] == "all"
         assert set(attrs["fields"]) == {"count", "h_min", "h_tdigest"}
         assert attrs["fields"]["count"] == {"class": "exact", "method": "sum", "nan_policy": "skip"}
+        # An approximate entry also carries what decided its centroid bytes:
+        # a #370 k-way gather cannot recover δ from the leaf.
+        assert attrs["fields"]["h_tdigest"] == {
+            "class": "approximate",
+            "method": "tdigest_kway",
+            "delta": DELTA,
+            "dtype": "float32",
+            "inner_shape": [2],
+        }
         assert attrs["groups"] == {
             "3": {"regime": LEAF_REGIME, "merges_from_raw": 1, "n_cells": 4},
             str(SHARD_ORDER): {"regime": LEAF_REGIME, "merges_from_raw": 1, "n_cells": 1},
