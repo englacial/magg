@@ -748,7 +748,9 @@ class TestColumnArtifact:
         assert got == exp["column"]["commit"]
         # cells_with_data counts the FINEST group (its order is named in attrs).
         assert attrs["zagg_column"]["cells_with_data_order"] == 5
-        assert stamp["cells_with_data"] == 3  # leaf cells 5+6 share a res-5 row
+        # Leaf cells 0, 2, 5, 15 (counts 40, 1, 5, 300) fold to res-5 rows
+        # [41, 5, 0, 300] — 0 and 2 share row 0 — so three rows are populated.
+        assert stamp["cells_with_data"] == 3
 
     def test_group_set_and_provenance_slots(self):
         exp = _expected(COLUMN)
