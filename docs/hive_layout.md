@@ -431,11 +431,13 @@ Until that finisher lands, the coarse levels of the **JSON rollup families**
 (`stats`, `moc`, `submap`) can be picked up by following a partitioned sweep
 with a plain `python -m zagg.sweep <root> --families stats,moc,submap`: the
 partitions' work is skip-if-current, and an interior fold reads its children's
-rollups rather than the leaves, so the extra pass is cheap. The same holds for
-the **overview** family under its default `fold_source: cascade` (issue
-[#376](https://github.com/englacial/zagg/issues/376)): a follow-up
-unpartitioned pass folds each deferred level from the finer overviews the
-partitions already materialized — never the raw leaves — and performs the
+rollups rather than the leaves, so the extra pass is cheap. The **overview**
+family's deferred coarse levels likewise fold from the finer overviews the
+partitions already materialized (the default `fold_source: cascade`, issue
+[#376](https://github.com/englacial/zagg/issues/376)) — but that follow-up is
+not cheap the way the JSON one is: an overview's currency check folds before
+it compares, so every leaves-fold level re-reads its raw leaf zarrs
+store-wide even where nothing changed. The follow-up also performs the
 deferred manifest `pyramid.materialized` bookkeeping. Only under the
 deprecated `fold_source: leaves` does that follow-up re-fold coarse levels
 from the raw leaves — the blow-up the cascade exists to remove — so there,
