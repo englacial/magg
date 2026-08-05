@@ -231,6 +231,21 @@ class TestFoldColumn:
         )
         assert bytes(group["h_tdigest"][0]) == encode_digest(oracle, "float32")
 
+    def test_resolution_finer_than_the_cells_refuses_by_name(self):
+        # 4^(cell_order - res) would be fractional; the downstream divisibility
+        # guards read 16 % 0.25 as clean and fail opaquely inside numpy.
+        slabs = _cell_slabs(self.CELLS)
+        with pytest.raises(ValueError, match="FINER than the leaf's cell order"):
+            fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[CELL_ORDER + 1])
+
+    def test_indivisible_ragged_slab_refuses_by_name(self):
+        # The ragged guard, reached with only the approximate field declared
+        # (the exact class gets the identically-worded refusal from fold_dense).
+        ragged = {"h_tdigest": FIELDS["h_tdigest"]}
+        slabs = {"h_tdigest": _cell_slabs(self.CELLS)["h_tdigest"][:6]}
+        with pytest.raises(ValueError, match="cannot fold 6 cells 4-to-one for 'h_tdigest'"):
+            fold_column(slabs, ragged, cell_order=CELL_ORDER, resolutions=[3])
+
     def test_fold_is_deterministic(self):
         slabs = _cell_slabs(self.CELLS)
         a = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3, 2])
