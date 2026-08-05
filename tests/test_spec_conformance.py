@@ -690,3 +690,110 @@ class TestPyramidV2Declaration:
         assert manifest["spec"] == "morton-hive/1"
         assert manifest["shard_order"] == _expected(PYRAMID)["shard_order"]
         assert manifest["cell_order"] == _expected(PYRAMID)["cell_order"]
+
+
+#: The §4.6 leaf-column fixture (issue #383): the ``minimal`` inputs plus an
+#: explicit ``output.pyramid.overviews: 5`` knob, so the committed store holds
+#: a leaf AND the column its worker wrote beside it.
+COLUMN = "column"
+
+
+class TestColumnArtifact:
+    """§4.6 leaf columns: the committed bytes against the spec grammar."""
+
+    @pytest.fixture(scope="class")
+    def exp(self):
+        return _expected(COLUMN)
+
+    def _column_dir(self, exp) -> Path:
+        return (SPEC_DATA / COLUMN / exp["leaf"]).parent / exp["column"]["object"]
+
+    def test_basename_role_and_attrs_grammar(self, exp):
+        col = exp["column"]
+        # D23 window stem + the `.pyramid` marker; `all` = the unwindowed leaf.
+        assert col["object"] == "all.pyramid.zarr"
+        attrs = json.loads((self._column_dir(exp) / "zarr.json").read_text())["attributes"]
+        assert attrs["role"] == "column"
+        assert attrs["zagg_column"] == col["zagg_column"]
+        block = attrs["zagg_column"]
+        assert block["spec"] == "zagg-column/1"
+        assert block["node"] == exp["shard"] and block["order"] == exp["shard_order"]
+        assert block["source_cell_order"] == exp["cell_order"]
+        assert block["window"] == "all"
+
+    def test_stamp_is_present_and_field_pinned(self, exp):
+        attrs = json.loads((self._column_dir(exp) / "zarr.json").read_text())["attributes"]
+        stamp = attrs["morton_hive_commit"]
+        got = {k: v for k, v in stamp.items() if k != "written_at"}
+        assert got == exp["column"]["commit"]
+        # cells_with_data counts the FINEST group (its order is named in attrs).
+        assert attrs["zagg_column"]["cells_with_data_order"] == 5
+        assert stamp["cells_with_data"] == 3  # leaf cells 5+6 share a res-5 row
+
+    def test_group_set_and_provenance_slots(self, exp):
+        groups = exp["column"]["zagg_column"]["groups"]
+        # Declared base (5) + the node-order member (4); nothing else on this
+        # geometry (no interior ladder rung between them).
+        assert sorted(groups, key=int, reverse=True) == ["5", "4"]
+        assert groups["5"]["n_cells"] == 4 and groups["4"]["n_cells"] == 1
+        for entry in groups.values():
+            assert entry["regime"] == "leaf-column"
+            assert entry["merges_from_raw"] == 1
+            assert "source_children" not in entry  # rides cascade only (§4.3)
+
+    def test_groups_decode_and_match_expected(self, exp):
+        store = LocalStore(str(self._column_dir(exp)))
+        for res, want in exp["column"]["groups"].items():
+            group = zarr.open_group(store, path=res, mode="r", zarr_format=3)
+            assert [str(w) for w in group["morton"][:]] == want["morton"]
+            assert [int(c) for c in group["count"][:]] == want["count"]
+            for payload, rows in zip(group["h_tdigest"][:], want["h_tdigest"], strict=True):
+                got = np.frombuffer(bytes(payload) if payload is not None else b"", "<f4").reshape(
+                    -1, 2
+                )
+                np.testing.assert_array_equal(got, np.array(rows, "<f4").reshape(-1, 2))
+
+    def test_base_group_is_the_from_leaves_fold(self, exp):
+        # The §4.6 parity contract: column bytes == the sweep-kernel fold of
+        # the COMMITTED leaf at the same resolution (merges-from-raw 1).
+        from zagg.sweep_overview import decode_digest, fold_dense, fold_digests
+
+        leaf = zarr.open_group(_leaf_store(COLUMN, exp), path=exp["group"], mode="r", zarr_format=3)
+        store = LocalStore(str(self._column_dir(exp)))
+        factor = 4 ** (exp["cell_order"] - 5)
+        base = zarr.open_group(store, path="5", mode="r", zarr_format=3)
+        np.testing.assert_array_equal(
+            base["count"][:], fold_dense(leaf["count"][:], factor, "sum", 0)
+        )
+        payloads = leaf["h_tdigest"][:]
+        for j, stored in enumerate(base["h_tdigest"][:]):
+            cell = [
+                decode_digest(bytes(p), "float32", (2,))
+                for p in payloads[j * factor : (j + 1) * factor]
+                if p is not None and len(p)
+            ]
+            want = fold_digests(cell, delta=exp["delta"], dtype="float32") if cell else b""
+            assert bytes(stored) == want
+
+    def test_node_member_is_the_whole_footprint_aggregate(self, exp):
+        store = LocalStore(str(self._column_dir(exp)))
+        node = zarr.open_group(store, path="4", mode="r", zarr_format=3)
+        leaf_counts = [c["count"] for c in exp["cells"]]
+        assert node["count"].shape == (1,)
+        assert int(node["count"][0]) == sum(leaf_counts)
+        # One cell, one word: the node's own morton word.
+        assert node["morton"].shape == (1,)
+        assert str(node["morton"][0]) == exp["column"]["groups"]["4"]["morton"][0]
+
+    def test_sidecar_matches_the_recorded_hashes(self, exp):
+        node_dir = (SPEC_DATA / COLUMN / exp["leaf"]).parent
+        record = json.loads((node_dir / "all.pyramid.stats.json").read_text())
+        assert record["content_hashes"] == exp["column"]["content_hashes"]
+        assert record["cells_with_data"] == exp["column"]["commit"]["cells_with_data"]
+
+    def test_manifest_declares_the_v2_schedule(self, exp):
+        manifest = json.loads((SPEC_DATA / COLUMN / "morton_hive.json").read_text())
+        block = manifest["pyramid"]
+        assert block["spec"] == "zagg-pyramid/2"
+        assert block["overviews"][0] == {"node": exp["shard_order"], "cells": [5]}
+        assert exp["pyramid_knob"] == {"overviews": 5}

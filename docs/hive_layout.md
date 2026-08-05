@@ -316,12 +316,32 @@ named, never silently widened. Two practice points:
   aggregation template serves both a state-scale AOI (sweep immediately)
   and disjoint small deployments (sweep later, or never).
 - **A `/2` declaration is not yet sweepable by this zagg.** The overview
-  sweep refuses it loudly and generates nothing; materialization arrives
-  with the leaf columns
-  ([issue #383](https://github.com/englacial/zagg/issues/383)) and the
-  staged sweep
+  sweep refuses it loudly and generates nothing; sweep-side materialization
+  arrives with the staged sweep
   ([issue #384](https://github.com/englacial/zagg/issues/384)). `/1` stores
   sweep exactly as before.
+
+### Leaf columns (`zagg-column/1`)
+
+Under a `/2` declaration the **leaf worker itself** writes the finest pyramid
+levels, at aggregation time, while the shard's cell data is resident
+([issue #383](https://github.com/englacial/zagg/issues/383); the fleet side
+of [#381](https://github.com/englacial/zagg/issues/381) points (1)–(3)).
+Each `(leaf, window)` gains one **column artifact** beside the leaf under
+its own node directory — `{window}.pyramid.zarr`, `all.pyramid.zarr`
+unwindowed — holding one resolution group per within-footprint level: the
+declared base resolution(s), every ladder rung down to the shard order, and
+the **node-order member** (one cell — the leaf's whole-footprint aggregate,
+its *universal partial* for every coarser cell, which is why no coarse level
+declared later ever rewrites a leaf). Groups fold **from the raw resident
+cells only** (merges-from-raw 1; exact classes exactly, digests by the
+order-independent k-way merge), so a column group is byte-identical to the
+sweep kernels' fold of the committed leaf. The write discipline is the
+leaf's own: template → groups → `role: column` + `zagg_column` attrs →
+**one commit stamp last**, then the `{stem}.stats.json` sidecar — an
+unstamped column is debris, and the repair for a torn or missing column is
+re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
+Byte grammar: [`specification.md`](specification.md) §4.6.
 
 A windowed store ([Time windows](#time-windows-morton-hive2)) additionally
 declares `spec: "morton-hive/2"` and a `temporal` block — schedule,

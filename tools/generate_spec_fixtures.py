@@ -32,6 +32,11 @@ conformance tests assert decoded values, never object bytes.
   (the `atl03_tdigest_strata_healpix.yaml` field shapes), including a
   single-photon cell that packs the §3.1 golden word `0xFF000000FF0000FF`
   and a noise-only cell whose signal payload is the empty ``(0, 2)`` array.
+- ``column/`` — the ``minimal`` inputs plus an explicit
+  ``output.pyramid.overviews: 5`` knob, so the SAME worker invocation also
+  writes the §4.6 leaf column (issue #383): ``all.pyramid.zarr`` beside the
+  leaf, groups {5, 4} (declared base + the node-order member), `role:
+  column` + ``zagg_column`` attrs, its own commit stamp and O11 record.
 - ``pyramid/`` — MANIFEST ONLY: the §4.5 ``zagg-pyramid/2`` declaration
   (issue #382, collapsed grammar), produced by the production declaration
   paths end to end (``/1`` template -> production sweep bookkeeping ->
@@ -43,8 +48,8 @@ conformance tests assert decoded values, never object bytes.
   ``pyramid.expected.json`` record of the raw config knob, the leaf-list
   form of the declaration the expansion was derived from. No store beneath
   it on purpose — the block is a template-time artifact, decodable from
-  ``morton_hive.json`` alone, and ``/2`` artifacts are not yet writable
-  (issues #383/#384).
+  ``morton_hive.json`` alone; the ``/2`` artifacts a fleet writes are the
+  ``column/`` fixture's job (issue #383 — sweep-side levels are issue #384).
 """
 
 from __future__ import annotations
@@ -355,13 +360,13 @@ def _o11_hashes(leaf_path: str) -> dict:
     return {"arrays": dict(sorted(hashes.items())), "combined": combined}
 
 
-def build(out: Path, kitchen_sink: bool) -> None:
+def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None) -> None:
     import zagg.processing as processing
     from zagg import hive
     from zagg.grids import HealpixGrid
     from zagg.grids.morton import morton_word
 
-    cfg = _config(kitchen_sink)
+    cfg = _config(kitchen_sink, pyramid=pyramid)
     grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
     shard = morton_word(SHARD_KEY)
     by_chunk, expected_cells = _build_cells(grid, shard, kitchen_sink)
@@ -406,9 +411,51 @@ def build(out: Path, kitchen_sink: bool) -> None:
         "cells": expected_cells,
         "content_hashes": _o11_hashes(str(out / leaf_rel)),
     }
+    if pyramid is not None:
+        # The §4.6 column fixture (issue #383): the SAME worker invocation
+        # wrote the leaf's column; record the raw knob, the decoded groups,
+        # and the column's own O11 hashes so a spec-text decoder can be
+        # asserted against committed bytes.
+        assert meta.get("column"), meta
+        expected["pyramid_knob"] = pyramid
+        expected["column"] = _column_expected(
+            out / leaf_rel.rsplit("/", 1)[0] / meta["column"], meta["column"]
+        )
     expected_path = out.parent / f"{out.name}.expected.json"
     expected_path.write_text(json.dumps(expected, indent=1) + "\n")
     print(f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells")
+
+
+def _column_expected(column_dir: Path, basename: str) -> dict:
+    """The committed §4.6 column record: attrs, decoded groups, O11 hashes."""
+    import zarr
+
+    root = zarr.open_group(zarr.storage.LocalStore(str(column_dir)), mode="r", zarr_format=3)
+    attrs = dict(root.attrs)
+    groups: dict = {}
+    for res in sorted((k for k in attrs["zagg_column"]["groups"]), key=int, reverse=True):
+        group = zarr.open_group(
+            zarr.storage.LocalStore(str(column_dir)), path=res, mode="r", zarr_format=3
+        )
+        digest = [
+            [[float(m), float(w)] for m, w in np.frombuffer(bytes(p), "<f4").reshape(-1, 2)]
+            for p in group["h_tdigest"][:]
+        ]
+        groups[res] = {
+            "morton": [str(w) for w in group["morton"][:]],
+            "count": [int(c) for c in group["count"][:]],
+            "h_tdigest": digest,
+        }
+    return {
+        "object": basename,
+        "role": attrs["role"],
+        "zagg_column": attrs["zagg_column"],
+        "commit": {
+            k: v for k, v in attrs["morton_hive_commit"].items() if k != "written_at"
+        },  # timestamps move on regeneration; the spec pins fields, not clocks
+        "groups": groups,
+        "content_hashes": _o11_hashes(str(column_dir)),
+    }
 
 
 def build_pyramid(out: Path) -> None:
@@ -500,6 +547,7 @@ def main() -> None:
     args = parser.parse_args()
     build(args.out / "minimal", kitchen_sink=False)
     build(args.out / "kitchen_sink", kitchen_sink=True)
+    build(args.out / "column", kitchen_sink=False, pyramid={"overviews": 5})
     build_pyramid(args.out / "pyramid")
 
 
