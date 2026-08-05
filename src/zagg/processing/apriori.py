@@ -194,6 +194,7 @@ def _apriori_read_group(
     grid,
     arrow: bool = False,
     granule_url: str | None = None,
+    io_stats: dict | None = None,
 ):
     """A-priori (chunk-boundary) read of one HDF5 group — issue #148 arm 2a.
 
@@ -206,8 +207,11 @@ def _apriori_read_group(
     bit-identical to the production paths. Selectivity above
     ``full_read_threshold`` falls back to the full-coord read, mirroring
     :func:`~zagg.processing.read._planned_read_group`.
+
+    ``io_stats`` (issue #374) is forwarded to whichever arm decodes base-rate
+    rows, so this route reports ``obs_read`` like the others.
     """
-    from zagg.processing.read import _execute_plan_group, _read_group_full
+    from zagg.processing.read import _execute_plan_group, _read_group_full, _record_obs_read
 
     rp = data_source["read_plan"]
     cfg = rp["chunk_boundaries"]
@@ -224,6 +228,10 @@ def _apriori_read_group(
     beam = group.strip("/").split("/")[0]
     bdf = bdf[bdf["beam"] == beam]
     if bdf.empty:
+        # Pre-decode short-circuit: stamp a measured zero so the a-priori route
+        # agrees with the full-read one, where absence means "unmeasured", not
+        # "read nothing" (issue #374, review finding).
+        _record_obs_read(io_stats, 0)
         return None  # beam absent or photon-less at extraction time -> no data
 
     plan, n_base = _plan_from_boundaries(
@@ -235,11 +243,23 @@ def _apriori_read_group(
         samples_per_chunk=int(cfg.get("samples_per_chunk", DEFAULT_SAMPLES_PER_CHUNK)),
     )
     if not plan.parent_runs:
+        _record_obs_read(io_stats, 0)
         return None  # no chunk's span touches this shard
     if plan.full_read:
-        return _read_group_full(h5obj, group, data_source, shard_key, grid, arrow=arrow)
+        return _read_group_full(
+            h5obj, group, data_source, shard_key, grid, arrow=arrow, io_stats=io_stats
+        )
 
     read_fn = _make_boundary_read_fn(h5obj)
     return _execute_plan_group(
-        h5obj, group, data_source, shard_key, grid, plan, n_base, arrow, read_fn=read_fn
+        h5obj,
+        group,
+        data_source,
+        shard_key,
+        grid,
+        plan,
+        n_base,
+        arrow,
+        read_fn=read_fn,
+        io_stats=io_stats,
     )

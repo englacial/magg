@@ -332,6 +332,19 @@ class TestHierarchicalDelegation:
         out = HierarchicalIndex().read_group(object(), "gt1l", {}, 0, None)
         assert out is sentinel
 
+    def test_io_stats_forwarded_unconditionally(self, monkeypatch):
+        # ``io_stats`` (issue #374) is always-on instrumentation, not a gated
+        # kwarg: the sink reaches ``_read_group`` on every call, and a caller
+        # that omits it forwards ``None`` rather than dropping the kwarg — the
+        # same contract ``InlineIndex.read_group`` already honours, so the two
+        # backends present one signature to the read seam (review finding).
+        seen: list = []
+        monkeypatch.setattr("zagg.processing._read_group", lambda *a, **k: seen.append(k) or None)
+        sink: dict = {}
+        HierarchicalIndex().read_group(object(), "gt1l", {}, 0, None, io_stats=sink)
+        HierarchicalIndex().read_group(object(), "gt1l", {}, 0, None)
+        assert [k["io_stats"] for k in seen] == [sink, None]
+
     def test_finish_granule_is_noop(self):
         HierarchicalIndex().finish_granule(object(), "s3://bucket/granule.h5")
 

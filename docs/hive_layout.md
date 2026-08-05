@@ -112,6 +112,9 @@ output:
     windows:                        # explicit schedule only:
       - {label: melt-2019, start: "2019-06-01", end: "2019-09-01"}
       - {label: melt-2020, start: "2020-06-01", end: "2020-09-01"}
+      - {label: scene-a, timestamp: "2021-03-14T12:00:31.024Z"}  # point form:
+                                    #   the acquisition's OWN instant, copied
+                                    #   from the item — not a rounded-off one
 ```
 
 - **Leaf naming is frozen**: `{full_id}_{window}.zarr`, underscore separator,
@@ -120,6 +123,34 @@ output:
   chronological order; explicit labels are opaque (`[0-9A-Za-z-]{1,32}`) and
   decode only through the declared list. `quarterly` is grammar-reserved but
   not implemented (validation rejects it).
+- **An explicit entry may be a point** ([issue #355](https://github.com/englacial/zagg/issues/355)):
+  `{label, timestamp}` is sugar for the second-wide half-open `[t, t + 1s)`,
+  for time axes that are effectively discrete (single acquisitions, scene
+  timestamps, isolated campaign instants). Each entry declares *exactly one* of
+  `timestamp` or `start`+`end` — mixing them in one entry is rejected. The
+  desugaring happens in `zagg.config.get_windowing`, so the manifest and every
+  downstream consumer only ever see an ordinary `{label, start, end}` window.
+  One second is the grammar's own resolution (boundaries are whole seconds
+  throughout), which also keeps membership off float equality on observation
+  timestamps (a sub-second `timestamp` normalizes to the whole second
+  containing it). *Consequence*: two acquisitions within the same wall-clock
+  second share a window, and two point entries inside one second are rejected
+  as overlapping — as is a point that lands inside an already-declared range
+  window, which is an ordinary overlap (see the validation paragraph below).
+  If that ever bites, the fix is an explicit `width` key on the point form, not
+  a guessed default; until it exists, any key on an entry beyond its own form's
+  (`label`/`timestamp` or `label`/`start`/`end`; `width` included) is rejected
+  rather than ignored.
+- **A point window that matches nothing fails SILENTLY** — it covers only the
+  whole second containing `t`, so the declared `timestamp` must be the
+  acquisition's own instant, copied from the item, not a rounded-off
+  approximation of it. STAC datetimes are rarely round seconds, so this is the
+  likely first-contact mistake: `timestamp: "2021-03-14T12:00:00Z"` matches
+  nothing for a scene whose `datetime` is `2021-03-14T12:00:31.024Z`. On the
+  point pipeline the window still dispatches and the worker's `ge`/`lt` filter
+  matches nothing, leaving an empty leaf; on raster the group is dropped at
+  dispatch (`runner._raster_windowed_units`) and no work unit, leaf, or warning
+  is produced at all. Neither path errors.
 - **Boundaries are UTC calendar terms, half-open `[start, end)`.** Window
   bounds are converted to dataset units once at dispatch, using the declared
   `epoch`/`scale`/`units` and a fixed scale offset (`GPS−UTC = 18 s`,
@@ -149,7 +180,20 @@ output:
 Validation: `output.windowing` requires the hive layout on a healpix grid;
 `time_field` must be a declared `data_source` column (the worker can only
 filter what it reads); explicit windows must be well-formed (frozen label
-grammar, `start < end`, unique labels, disjoint ranges). On the raster path
+grammar, `start < end`, unique labels, disjoint ranges — point entries are
+desugared first, so a point landing inside another window's range is a genuine
+overlap and is rejected). Range bounds render at whole-second granularity
+exactly as a point `timestamp` does — **each bound truncates to the second
+containing it** — so a fractional bound silently retimes that edge of the
+window: `[12:00:00.0Z, 12:00:01.5Z)` dispatches as
+`[12:00:00, 12:00:01)`, dropping the declared half second of coverage at the
+tail. A range is never widened to recover the truncated fraction. The one
+case refused outright is total collapse: when *both* bounds render to the
+same second (say `12:00:01.0Z` → `12:00:01.4Z`) the window dispatches as an
+empty `ge x`/`lt x` pair, so it is rejected — the point form is the spelling
+for one-second intent. A sub-second range that *straddles* a second boundary
+(`12:00:01.9Z` → `12:00:02.1Z`) is still valid; it renders to the one-second
+window its truncated bounds describe. On the raster path
 ([issue #247](https://github.com/englacial/zagg/issues/247)) membership is
 the acquisition's STAC `datetime`: `time_field` is optional (fixed to
 `datetime`) and the `epoch`/`scale`/`units` conversion knobs are rejected.
@@ -200,7 +244,9 @@ path is computable arithmetically with zero requests:
 `split_schedule` is implicit under D2 (one digit per level down to the shard
 order) but recorded explicitly for forward compatibility. `pyramid` carries
 the overview family's order schedule and each field's D24 composability class
-(issue #201); an `overview` with an empty `orders` list is the declared-*off*
+(issue #201) — or, under `zagg-pyramid/2`, its grouped `(node, cells)` level
+schedule ([Pyramid overviews](#pyramid-overviews-zagg-pyramid2), issue #382); an
+`overview` with an empty `orders` list is the declared-*off*
 form. It is **declaration** only — overview zarrs are generated by a later
 post-process sweep (D11), never at fan-out time, and the sweep adds its
 `materialized` actuals under the same key. Declaring it is not birth-only:
@@ -224,6 +270,58 @@ output:
     exact_levels: 1        # cascade boundary; 1 is the default
     # fold_source: leaves  # deprecated: exact at every level, unbounded per-node input
 ```
+
+### Pyramid overviews (`zagg-pyramid/2`)
+
+The declaration also comes in a second revision
+([issue #382](https://github.com/englacial/zagg/issues/382); design record
+[issue #381](https://github.com/englacial/zagg/issues/381), as collapsed by
+the espg grammar ruling on the declaring PR): **`overviews`** — the **leaf
+cell resolutions**, and nothing else. A scalar is sugar for one resolution;
+a list is strictly descending, each member strictly between `parent_order`
+and `child_order`; omitted, the default is one resolution at the grid's
+resolved chunk order:
+
+```yaml
+output:
+  pyramid:
+    overviews: [16, 13]   # leaf cell resolutions; replaces orders/spacing WHOLESALE
+    # overviews: 13       # scalar sugar for [13]
+```
+
+There is no above-shard configurability: everything coarser than the shard
+is the **fixed every-order ladder** — with `d` = coarsest leaf resolution −
+`parent_order`, every order from `parent_order − 1` down to 0 carries one
+member at `order + d`. A `/2` store is therefore inherently a
+**multiresolution statistical grid**: every HEALPix order from 0 through
+the base plus the native resolution, each level spec-guaranteed and
+individually addressable (`pyramid: false` is the single-resolution
+opt-out; skipping levels when *reading* is a reader-side choice, never a
+store property). Spelling `overviews` writes the manifest block as
+`zagg-pyramid/2` with the **fully expanded** `(node, cells)` list at block
+level — `pyramid.overviews`, the store-wide product declaration; readers
+never re-derive the ladder — while the singular `pyramid.overview` family
+dict keeps the sweep leg's execution regime (`all_time`, the #376 fold
+keys, `fields`, `materialized`) exactly as under `/1`; without the knob the
+block stays `/1` exactly as above. The grammar's **validation rules** and
+the ladder law are normative in
+[the specification §4.4–§4.5](specification.md); refusals are loud and
+named, never silently widened. Two practice points:
+
+- **Declaring is free.** A declared-but-unswept level costs nothing
+  (declared intent and swept actuals are separate — [#381 point
+  (11)](https://github.com/englacial/zagg/issues/381)), and the fixed
+  ladder makes every coarser level spec-guaranteed without spelling
+  anything. **Sweeping, not declaring, is the operational decision** — one
+  aggregation template serves both a state-scale AOI (sweep immediately)
+  and disjoint small deployments (sweep later, or never).
+- **A `/2` declaration is not yet sweepable by this zagg.** The overview
+  sweep refuses it loudly and generates nothing; materialization arrives
+  with the leaf columns
+  ([issue #383](https://github.com/englacial/zagg/issues/383)) and the
+  staged sweep
+  ([issue #384](https://github.com/englacial/zagg/issues/384)). `/1` stores
+  sweep exactly as before.
 
 A windowed store ([Time windows](#time-windows-morton-hive2)) additionally
 declares `spec: "morton-hive/2"` and a `temporal` block — schedule,
@@ -294,6 +392,16 @@ place as regenerable-cache debris (D24). After a retrofit, the overview
 family materializes the declared orders on the next sweep — it is in
 `DEFAULT_FAMILIES`, so a plain `python -m zagg.sweep <root>` picks it up
 (the fold itself is issue #201 / PR #344; the retrofit is issue #358).
+
+A config that spells `overviews`
+([Pyramid overviews](#pyramid-overviews-zagg-pyramid2)) retrofits the
+`zagg-pyramid/2` declaration through the same path: the level entries are
+re-validated against the **manifest's** own `shard_order`/`cell_order` (the
+store's truth wins over the config's grid block), and any `/1`-era
+`materialized` actuals are preserved verbatim across the revision bump. The
+next sweep then refuses loudly instead of materializing — a `/2` store is
+declared-but-not-yet-sweepable until issues #383/#384 land — which is a
+legal recorded state, not an error.
 
 ## The commit stamp
 

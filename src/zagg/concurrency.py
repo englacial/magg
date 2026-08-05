@@ -11,7 +11,9 @@ fan-out, and this module surfaces both *before* dispatch:
   never sees, so those cells drop while the run still "completes".
   :func:`fd_safe_max_workers` derives a worker ceiling from
   ``RLIMIT_NOFILE``; :func:`raise_for_fd_exhaustion` turns a raw errno-24 into
-  an actionable message.
+  an actionable message. This limit is specific to the **sync** transport: a
+  carrier that holds no per-shard connection (the event transport, issue #375)
+  opts out via ``compute_available_workers(..., fd_bound=False)``.
 
 * **Account Lambda concurrency.** Saturating the account-wide concurrent
   execution pool throttles this run *and* any other Lambda activity in the
@@ -277,6 +279,7 @@ def compute_available_workers(
     *,
     padding_pct: float = _CONCURRENCY_PADDING_PCT,
     padding_floor: int = _CONCURRENCY_PADDING_FLOOR,
+    fd_bound: bool = True,
 ) -> tuple[int, ConcurrencyReport]:
     """Clamp ``requested`` workers to FD- and account-concurrency-safe bounds.
 
@@ -297,6 +300,19 @@ def compute_available_workers(
         Dispatch target (for the concurrency probe).
     padding_pct, padding_floor
         Forwarded to :func:`probe_concurrency`.
+    fd_bound : bool
+        Whether the local file-descriptor ceiling bounds the result. ``True``
+        (default) is the v1 sync transport, which holds one socket per
+        in-flight shard, so the ceiling is load-bearing. Pass ``False`` for a
+        caller that holds NO connection per unit of work — the event transport
+        (issue #375), whose window is pure dispatch pacing bounded by account
+        headroom, not client fds. Clamping it at ``RLIMIT_NOFILE`` strands paid
+        -for headroom (observed: window pinned to ~1,000 against ~1,898
+        available). The FD ceiling still applies as the fallback when account
+        headroom is UNREADABLE, since it is then the only bound left — an
+        unbounded window would fire the whole shard set at once and the fleet's
+        60 s ``MaximumEventAgeInSeconds`` would silently drop what it cannot
+        start.
 
     Returns
     -------
@@ -310,7 +326,10 @@ def compute_available_workers(
         padding_pct=padding_pct,
         padding_floor=padding_floor,
     )
-    workers = min(requested, fd_safe_max_workers())
     if report.available is not None:
-        workers = min(workers, report.available)
+        workers = min(requested, report.available)
+        if fd_bound:
+            workers = min(workers, fd_safe_max_workers())
+    else:
+        workers = min(requested, fd_safe_max_workers())
     return max(1, workers), report

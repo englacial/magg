@@ -439,6 +439,29 @@ reader plans against (espg/moczarr#15, the 8b seam). Any divergence
 discovered while landing #201 is resolved **on this section first** — the
 implementation conforms to the spec, never the reverse.
 
+The **level grammar** is revision `zagg-pyramid/2`
+([#382](https://github.com/englacial/zagg/issues/382); design record
+[#381](https://github.com/englacial/zagg/issues/381), points (2)–(5), as
+collapsed by the espg grammar ruling on the declaring PR): the config
+declares **leaf cell resolutions only**, and everything above the shard is
+the **fixed every-order ladder** of §4.4; the manifest records the fully
+expanded `(node, cells)` list, of which the original constant-depth
+`zagg-pyramid/1` grammar is the special case
+`cells = [node + (cell_order - shard_order)]`. `/1` stores stay readable
+under their own rule forever (§4.5 — we are the sole consumer; there is no
+migration machinery). A `/2` declaration is **declared but not yet
+sweepable** — a legal recorded state (#381 point (11): declaring is free,
+sweeping is the operational decision) — until the leaf columns
+([#383](https://github.com/englacial/zagg/issues/383)) and the staged sweep
+([#384](https://github.com/englacial/zagg/issues/384)) land.
+
+A `zagg-pyramid/2` store is therefore inherently a **multiresolution
+statistical grid**: every HEALPix order from 0 through the declared base,
+plus the native resolution, each level spec-guaranteed and individually
+addressable — a reader picks its resolution and reads it; skipping levels
+is a reader-side choice, never a store property. `output.pyramid: false`
+is the degenerate single-resolution opt-out.
+
 ### 4.1 Overview zarrs at ancestor nodes
 
 An **overview zarr** is a sweep-built coarse materialization of a subtree's
@@ -571,14 +594,35 @@ MUST ignore unstamped overview prefixes.
 
 ### 4.4 Structure
 
-**Contract.** An overview at ancestor order `k` of a product with shard
-order `s` and cell order `c` is the leaf structure "one order family up":
-the same group layout as a source leaf, holding cells at order
-`k_cell = c - (s - k)` (cells coarsen 4× per order of ascent — the pyramid
-is the store's resolution axis, partially materialized). Concretely:
+**Contract.** A pyramid is an ordered list of **level entries**
+`{node, cells}` (§4.5): `node` is the hive-tree **ancestor-or-self** order
+whose artifact carries the level — one artifact per `(node, window)`, named
+by §4.2 — and `cells` the **reader-facing cell resolutions** stored there.
+The list is not free-form; it is determined by two declarations and one
+law:
 
-- the `morton` coordinate array holds the `4^(k_cell - k)` order-`k_cell`
-  descendant words of the node, in canonical nested order;
+- the **leaf entry** — `node == shard_order` (not an ancestor artifact at
+  all: the leaf's own level column, #381 point (2)) carries every declared
+  leaf resolution, each strictly between `shard_order` and `cell_order`;
+- the **fixed every-order ladder** — with `d = base - shard_order` (`base`
+  the coarsest leaf resolution, so `d >= 1`), every order `k` from
+  `shard_order - 1` down to **0 inclusive** carries exactly one member at
+  resolution `k + d`. Two numbers — `shard_order` and `d` — determine
+  everything above the shard; every store roots at order 0. (Non-normative:
+  the ladder is cheap by construction — cell counts shrink 4× per rung, and
+  digest bytes are cap-bounded per cell — which is why it is law rather
+  than a knob.)
+
+For each member resolution `r` the artifact holds one **resolution group**:
+the zarr group named `str(r)`, with the same layout as a source leaf's cell
+group. Concretely, for a member `r` at an order-`k` node:
+
+- the group's `morton` coordinate array holds the `4^(r - k)` order-`r`
+  descendant words of the node, in canonical nested order (`r > k` always,
+  by the window and ladder rules above; the writer-side whole-footprint
+  aggregate of #381 point (2) is an implementation detail of the #383 leaf
+  columns, never a recorded member — and no separate partial grammar or
+  `partial/` path exists anywhere);
 - each **included** field is the same array kind as at the leaves: dense
   fields as dense arrays, digest fields as `zagg-ragged/1` (or `/2`) vlen
   arrays — §1–§3 of this page apply to overview arrays unchanged, **including
@@ -587,6 +631,19 @@ is the store's resolution axis, partially materialized). Concretely:
   true count rather than the count itself;
 - field inclusion is gated by the field's **composability class** (§4.5):
   `exact` and `approximate` fields appear, `none` fields are **absent**.
+
+Under `zagg-pyramid/1` every artifact holds exactly **one** resolution
+group, at the constant depth `k_cell = c - (s - k)` for shard order `s` and
+cell order `c` (cells coarsen 4× per order of ascent — the pyramid is the
+store's resolution axis, partially materialized): the `/1` grammar is the
+special case `cells = [node + (c - s)]`, and §4.1–§4.2 apply to both
+revisions unchanged. §4.3's per-artifact `zagg_overview` attrs block — in
+particular its single scalar `cell_order = c - (s - k)` — is specified for
+`/1`'s single-group artifacts; the `/2` per-artifact attrs, which must
+describe an artifact holding one group per member of `cells`, are pinned
+when the writers land (issues #383/#384). Multi-group `/2` artifacts arrive
+with the issue #383 leaf columns and the issue #384 staged sweep; until then
+a `/2` store is declared-but-unmaterialized, which is legal (§4.5).
 
 An overview's variable set may therefore be a *subset* of the leaf's —
 heterogeneous variable sets across level nodes are in contract, and a reader
@@ -598,6 +655,17 @@ cascaded level has exactly the layout above. It differs in the values its
 `approximate` fields carry and, when it under-covers its subtree, in *which
 cells are populated at all* — §4.3's `source_children` is the key that says
 so, in every class.
+
+**Accuracy doctrine (`/2`).** For `/2` levels the #376-era "display
+artifacts, no precision guarantee past the exact levels" posture is
+superseded (espg ruling on the declaring PR): **exact-class** fields are
+exactly correct at every order — the reductions are associative, so the
+pyramid is a true downsampling pyramid for them — and **approximate-class**
+fields are **analysis-grade at their recorded generation**: the per-entry
+merges-from-raw count (#381 point (7), recorded when the writers land) is
+the contract a reader holds them to, not a blanket display-only caveat.
+The `/1` operational caveats about the deprecated leaves/cascade regimes
+(§4.3, §4.5) stay as written for `/1` artifacts.
 
 ### 4.5 The manifest `pyramid` block
 
@@ -626,10 +694,62 @@ overview family under the versioned `pyramid` block:
 }
 ```
 
-- **`orders`** — the ancestor orders that carry overviews (descending; empty
-  = pyramid declared off). `spacing` records the schedule step (default 2 —
-  the ratified display schedule). Schedules are per artifact family and
-  deliberately decoupled from the tree's `path_grouping`.
+Under revision `/2` ([#382](https://github.com/englacial/zagg/issues/382))
+the schedule is the **block-level `overviews`** list instead — the FULLY
+EXPANDED form of §4.4's leaf entry + fixed ladder; `orders` and `spacing`
+do not exist in a `/2` block; every other key is unchanged:
+
+```json
+"pyramid": {
+  "spec": "zagg-pyramid/2",
+  "overviews": [
+    {"node": 3, "cells": [5, 4]},
+    {"node": 2, "cells": [3]},
+    {"node": 1, "cells": [2]},
+    {"node": 0, "cells": [1]}
+  ],
+  "overview": {
+    "all_time": false,
+    "fold_source": "cascade",
+    "exact_levels": 1,
+    "fields": {"…": "…"}
+  }
+}
+```
+
+The split is deliberate: the block-level `overviews` list is the
+**store-wide product declaration** — what fleet writers, stage sweeps,
+declare-time forecasts, and external readers consume — while the singular
+`overview` dict remains the **overview sweep family's execution regime**
+(D22 per-family bookkeeping: `all_time`, the #376 fold keys, `fields`, the
+sweep's `materialized` actuals), so the two never re-nest. Per-entry
+materialization actuals (#381 point (7)) will nest inside the block-level
+entries themselves when the writers land (#383/#384).
+
+- **`orders`** (`/1`) — the ancestor orders that carry overviews
+  (descending; empty = pyramid declared off). `spacing` records the schedule
+  step (default 2 — the ratified display schedule). Schedules are per
+  artifact family and deliberately decoupled from the tree's
+  `path_grouping`.
+- **`overviews`** (`/2`) — the level entries of §4.4, recorded at **block
+  level** (a sibling of `spec` and `overview`, never inside the family
+  dict) and always **fully expanded**: the leaf entry first, then the fixed
+  every-order ladder down to node 0 — a reader never re-derives the ladder,
+  the recorded list IS the contract. Every entry is a `{node, cells}`
+  mapping with `cells` a list. The corresponding **config grammar** is leaf
+  resolutions only: `output.pyramid.overviews` is an int (sugar for one) or
+  a strictly descending list of ints, each **strictly between**
+  `shard_order` and `cell_order` (a member at the shard's own order is the
+  writer-side aggregate, never declared; a member at the base data's own
+  order would *be* the base data); omitted, the default is one resolution
+  at the grid's resolved chunk order — informative, since today zagg emits
+  a `/2` block only for an explicit `overviews:` knob, and the default
+  becomes the writer default when `/2` becomes sweepable
+  ([#383](https://github.com/englacial/zagg/issues/383),
+  [#384](https://github.com/englacial/zagg/issues/384)). There is no
+  above-shard configurability: no per-node spelling, no gather declaration,
+  no member promotion — the ladder makes every within-footprint member
+  spec-guaranteed (espg grammar-collapse ruling on the declaring PR).
 - **The declared-off form is smaller, and `orders` is the only key a reader
   may bind unconditionally.** With the pyramid knob off the block is exactly
 
@@ -638,13 +758,17 @@ overview family under the versioned `pyramid` block:
   ```
 
   — `spacing`, `all_time`, `fold_source`, `exact_levels`, `fields`, and
-  `summarize` are **absent**, not empty.
-  A reader MUST branch on `orders` first: an empty `orders` (or no `pyramid`
-  block at all — pre-pyramid manifests) means no overview family exists and no
-  other key of the block may be assumed. When `orders` is **non-empty**,
-  `spacing`, `all_time`, and `fields` MUST all be present (`summarize` stays
-  optional), so the zero-open field query of §4.4 is well-defined exactly when
-  there is something to query.
+  `summarize` are **absent**, not empty. Recording absence never needs the
+  new grammar, so the declared-off form is always this `/1` shape — a `/2`
+  block's `overviews` list is **never empty**.
+  A reader MUST branch on `spec` first, then on the revision's schedule key:
+  under `/1` that is `orders` — an empty `orders` (or no `pyramid` block at
+  all — pre-pyramid manifests) means no overview family exists and no other
+  key of the block may be assumed — and under `/2` it is the block-level
+  `overviews`. When the schedule key is non-empty, `all_time` and `fields`
+  MUST be present in the `overview` family dict (`spacing` too under `/1`;
+  `summarize` stays optional), so the zero-open field query of §4.4 is
+  well-defined exactly when there is something to query.
 - **`fold_source` / `exact_levels`** — the declared fold regime
   ([#376](https://github.com/englacial/zagg/issues/376)): `"cascade"` (the
   default) folds each declared level from the next **finer** declared level's
@@ -660,6 +784,12 @@ overview family under the versioned `pyramid` block:
   before. They declare what the **next** sweep will do — what is on disk is
   `materialized.fold_sources` below and, per artifact, §4.3's
   `zagg_overview.fold_source`, which is authoritative for a given overview.
+  Under `/2` the pair is declared identically; `exact_levels` counts **level
+  entries** from the finest end, exactly as it counts `orders` under `/1`.
+  (`exact_levels` predates the `overviews` key-naming convention and is
+  deliberately untouched by it — ruled vestigial-in-waiting under the #381
+  regime law, which makes the exact/approximate boundary structural; the
+  `/2` accuracy contract is §4.4's doctrine, not this pair.)
 - **`fields`** — every aggregation field, keyed by name, with its
   **composability class**: `exact` (folds byte-equal — count/sum/min/max),
   `approximate` (t-digest merge — `np.isclose` equality class), or `none`
@@ -707,7 +837,15 @@ overview family under the versioned `pyramid` block:
   informative rather than an error. It is a convenience — a reader MAY
   instead open the overviews and read §4.3 — and, like every other actual,
   it says nothing about an overview still being present (overviews are
-  regenerable caches, §4.1).
+  regenerable caches, §4.1). On a `/2` store this family-dict `materialized`
+  map is the **`/1`-era inventory**, preserved verbatim across a declaration
+  revision bump: a retrofit never discards actuals, and the overviews it
+  names stay on disk as regenerable-cache debris. `/2` materialization
+  actuals will instead nest **inside the level entry that owns them**
+  (per-`(node, cells)` provenance — regime, `source_children` coverage, and
+  a merges-from-raw integer, #381 point (7)); that shape lands with the
+  writers (#383/#384), so a reader MUST tolerate additional keys on a level
+  entry.
 
 ### 4.6 What §4 does not cover (informative)
 
@@ -942,9 +1080,10 @@ drift fails zagg's own suite (`tests/test_spec_conformance.py`) on
 whichever side moved. moczarr vendors the same fixtures for its parity
 gates (espg/moczarr#19/#20).
 
-Two tiny single-shard hive stores, both on the same deliberately small
-geometry — shard order 4, inner-chunk order 5, cell order 6 (16 cells,
-K = 4 inner chunks of 4 cells), sharded (the hive default):
+Two tiny single-shard hive stores plus one manifest-only declaration, all
+on the same deliberately small geometry — shard order 4, inner-chunk order
+5, cell order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the
+hive default):
 
 - **`minimal/`** — one *unlocated* digest field (`h_tdigest`) plus `count`.
   The smallest thing that is a conforming store.
@@ -954,6 +1093,22 @@ K = 4 inner chunks of 4 cells), sharded (the hive default):
   (including a single-photon cell packing the §3.1 golden word
   `0xFF000000FF0000FF` and a noise-only cell whose signal payload is the
   empty `(0, 2)` array), and `count`.
+- **`pyramid/`** — MANIFEST ONLY: the §4.5 `zagg-pyramid/2` declaration
+  grammar. The committed `morton_hive.json` was produced by the production
+  declaration paths end to end — templated `/1` (`hive.build_manifest`),
+  given sweep actuals by the production bookkeeping writer, then retrofitted
+  to `/2` with `declare_pyramid` — and carries every `/2` reading a decoder
+  must tell apart: a multi-resolution leaf entry (`{"node": 3, "cells":
+  [5, 4]}` — this fixture is shard order 3, not the leaf fixtures' 4, so
+  the leaf window has two interior resolutions), the §4.4 fixed every-order
+  ladder rooted at node 0, the #376 fold keys (`fold_source`,
+  `exact_levels`), and the preserved `/1`-era `materialized.fold_sources`
+  actuals — and, via the committed `pyramid.expected.json`, which records
+  the raw config knob, the leaf-resolution declaration the expansion was
+  derived from. It writes no store beneath it on purpose: the pyramid block
+  is a template-time manifest artifact, decodable from `morton_hive.json`
+  alone, and `/2` artifacts are not yet writable (#383/#384) — a third leaf
+  would pin nothing the other two do not.
 
 Both stores pin the layout edge cases a reader must handle: inner chunk
 ordinal 2 is **empty** (absent from the shard index — the §1.5 sentinel, and

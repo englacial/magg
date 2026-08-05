@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import zagg.client
+import zagg.concurrency
 from zagg.client import Run, RunHandle, ShardError
 from zagg.config import PipelineConfig, default_config
 
@@ -339,7 +340,13 @@ class TestConcurrencyPreflight:
 
     @staticmethod
     def _dispatch(catalog, monkeypatch, *, probe=None, **dispatch_kwargs):
-        """Dispatch with NO injected client; return (pool_width, probe_calls)."""
+        """Dispatch with NO injected client.
+
+        Returns ``(pool_width, probe_calls, declared_pool)`` -- the fan-out
+        width the ``ThreadPoolExecutor`` was built with, the probe's call
+        record, and the ``max_pool_connections`` handed to the shared client's
+        ``Config`` (``None`` if no client was built).
+        """
         from unittest.mock import MagicMock
 
         import boto3
@@ -347,17 +354,24 @@ class TestConcurrencyPreflight:
         from zagg import runner
 
         stub = StubLambdaClient()
+        seen: dict = {}
+
+        def _client(service, **k):
+            if service != "lambda":
+                return MagicMock()
+            if "config" in k:  # the fan-out client; the probe's carries none
+                seen["pool"] = k["config"].max_pool_connections
+            return stub
+
         session = MagicMock()
-        session.client.side_effect = lambda service, **k: (
-            stub if service == "lambda" else MagicMock()
-        )
+        session.client.side_effect = _client
         monkeypatch.setattr(boto3, "Session", lambda *a, **k: session)
 
         calls: list = []
         if probe is not None:
 
             def _probe(requested, lambda_client, cloudwatch_client, function_name, **k):
-                calls.append((requested, function_name))
+                calls.append((requested, function_name, k.get("fd_bound")))
                 return probe(requested)
 
             monkeypatch.setattr(runner, "compute_available_workers", _probe)
@@ -378,7 +392,7 @@ class TestConcurrencyPreflight:
             source_credentials=_CREDS,
         )
         run.dispatch(**dispatch_kwargs).results()
-        return widths[0], calls
+        return widths[0], calls, seen.get("pool")
 
     @staticmethod
     def _report():
@@ -393,12 +407,12 @@ class TestConcurrencyPreflight:
         )
 
     def test_probe_sizes_the_pool(self, catalog, monkeypatch):
-        width, calls = self._dispatch(
+        width, calls, _ = self._dispatch(
             catalog, monkeypatch, probe=lambda requested: (2, self._report())
         )
         assert width == 2  # the probe's clamp, not _DEFAULT_MAX_WORKERS
         # It asks for the work size and names the dispatch target.
-        assert calls == [(3, "process-shard-test")]
+        assert calls == [(3, "process-shard-test", True)]
 
     def test_probe_denial_falls_back_with_a_warning(self, catalog, monkeypatch):
         # Distinguish the fallback from the shard-count clamp by shrinking the
@@ -414,15 +428,15 @@ class TestConcurrencyPreflight:
             )
 
         with pytest.warns(RuntimeWarning, match="AccessDenied"):
-            width, calls = self._dispatch(catalog, monkeypatch, probe=_denied)
+            width, calls, _ = self._dispatch(catalog, monkeypatch, probe=_denied)
         assert width == 2  # degraded to the default, run still dispatched
-        assert calls == [(3, "process-shard-test")]
+        assert calls == [(3, "process-shard-test", True)]
 
     def test_explicit_max_workers_skips_the_probe(self, catalog, monkeypatch):
         def _must_not_run(requested):
             raise AssertionError("probe ran despite an explicit max_workers")
 
-        width, calls = self._dispatch(catalog, monkeypatch, probe=_must_not_run, max_workers=1)
+        width, calls, _ = self._dispatch(catalog, monkeypatch, probe=_must_not_run, max_workers=1)
         assert width == 1
         assert calls == []
 
@@ -438,6 +452,108 @@ class TestConcurrencyPreflight:
         handle = _run(catalog, client=StubLambdaClient()).dispatch()
         handle.results()
         assert len(handle) == 3
+
+    def test_sync_probes_fd_bound(self, catalog, monkeypatch):
+        # The sync pool holds one socket per in-flight shard: FD-bounded.
+        assert self._probe_fd_bound(catalog, monkeypatch, transport="sync") is True
+
+    def test_event_window_is_not_fd_bound(self, catalog, monkeypatch):
+        # The event transport holds no connections, so its pacing window is
+        # sized by account headroom alone (issue #375).
+        assert self._probe_fd_bound(catalog, monkeypatch, transport="event") is False
+
+    def test_probe_body_forwards_fd_bound(self, catalog, monkeypatch):
+        # The seam the two tests above bracket without crossing: they pin what
+        # `dispatch` hands `_probe_workers`, and `TestFdBound` pins what
+        # `compute_available_workers` does with it -- but neither runs the real
+        # `_probe_workers` body, so deleting `fd_bound=fd_bound` at
+        # `client.py:664` left the suite green (review finding). Drive the real
+        # body and assert the value it forwards.
+        from unittest.mock import MagicMock
+
+        from zagg import runner
+
+        seen: list = []
+
+        def _probe(requested, lambda_client, cloudwatch_client, function_name, **k):
+            seen.append(k.get("fd_bound"))
+            return 7, self._report()
+
+        run = Run.from_config(
+            default_config("atl06"),
+            shardmap=catalog,
+            store=_STORE,
+            function_name="process-shard-test",
+            source_credentials=_CREDS,
+        )
+        monkeypatch.setattr(runner, "compute_available_workers", _probe)
+        assert run._probe_workers(MagicMock(), 3, fd_bound=False) == 7
+        assert run._probe_workers(MagicMock(), 3, fd_bound=True) == 7
+        # Not `[None, None]`: the kwarg reaches the probe, and it is the
+        # caller's value, not `compute_available_workers`' own default.
+        assert seen == [False, True]
+
+    def test_pool_cap_clamped_when_window_exceeds_fd_bound(self, catalog, monkeypatch):
+        # A fan-out width above RLIMIT_NOFILE must not reach the shared
+        # client's DECLARED pool (PR #378, question (5) ruling). Forced here
+        # by an explicit max_workers, which skips the probe so `workers`
+        # carries no fd term at all -- the same shape the event transport
+        # reaches through the probe when it passes fd_bound=False (issue
+        # #375; that wiring is pinned by test_event_window_is_not_fd_bound,
+        # which this test deliberately does not re-derive). The cap is a
+        # RETENTION bound, not an EMFILE guard: botocore passes only
+        # `maxsize` to urllib3 (block=False), so an oversized declaration
+        # allocates nothing on its own -- it is the number of sockets the
+        # pool would KEEP once a concurrent dispatch loop opened them.
+        monkeypatch.setattr(zagg.concurrency, "fd_safe_max_workers", lambda: 2)
+        width, _, pool = self._dispatch(catalog, monkeypatch, max_workers=5)
+        # The clamp stops at the DECLARED pool: the fan-out width is still the
+        # shard-count clamp of the requested 5, un-touched by the fd bound --
+        # re-clamping it there would undo issue #375.
+        assert (pool, width) == (2, 3)
+
+    def test_pool_cap_unchanged_below_fd_bound(self, catalog, monkeypatch):
+        monkeypatch.setattr(zagg.concurrency, "fd_safe_max_workers", lambda: 100)
+        width, _, pool = self._dispatch(catalog, monkeypatch, max_workers=2)
+        assert (pool, width) == (2, 2)
+
+    @staticmethod
+    def _probe_fd_bound(catalog, monkeypatch, *, transport):
+        """The ``fd_bound`` ``dispatch`` hands the probe for ``transport``.
+
+        Intercepts at ``_probe_workers`` and aborts the dispatch there with a
+        sentinel: the wiring under test is decided before any invoke, so the
+        event transport's runtime (status store + poller) need not be stood up
+        to observe it.
+        """
+        from unittest.mock import MagicMock
+
+        import boto3
+
+        class _ProbeReachedError(Exception):
+            pass
+
+        session = MagicMock()
+        session.client.side_effect = lambda service, **k: MagicMock()
+        monkeypatch.setattr(boto3, "Session", lambda *a, **k: session)
+
+        seen: dict = {}
+
+        def _probe(self, session, n, *, fd_bound=True):
+            seen["fd_bound"] = fd_bound
+            raise _ProbeReachedError
+
+        monkeypatch.setattr(Run, "_probe_workers", _probe)
+        run = Run.from_config(
+            default_config("atl06"),
+            shardmap=catalog,
+            store=_STORE,
+            function_name="process-shard-test",
+            source_credentials=_CREDS,
+        )
+        with pytest.raises(_ProbeReachedError):
+            run.dispatch(transport=transport)
+        return seen["fd_bound"]
 
 
 # -- parity with the runner's lambda path -------------------------------------
