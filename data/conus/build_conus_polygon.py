@@ -44,13 +44,19 @@ EQUAL_AREA_CRS = "EPSG:5070"  # NAD83 / CONUS Albers, metres
 def load_states(states_json: str | None) -> dict:
     if states_json:
         return json.loads(Path(states_json).read_text())
-    with urllib.request.urlopen(SOURCE_URL, timeout=60) as resp:  # noqa: S310 (trusted raw source)
+    # SOURCE_URL is a fixed https raw-content URL, not caller-supplied.
+    with urllib.request.urlopen(SOURCE_URL, timeout=60) as resp:
         return json.loads(resp.read())
 
 
 def build_conus(states: dict):
+    # ``f.get("id")``: a --states-json without top-level FIPS ids keeps every
+    # feature rather than raising KeyError -- the n_source_states count
+    # recorded in the output properties is what shows the filter applied.
     geoms = [
-        shape(f["geometry"]).buffer(0) for f in states["features"] if f["id"] not in NON_CONUS_FIPS
+        shape(f["geometry"]).buffer(0)
+        for f in states["features"]
+        if f.get("id") not in NON_CONUS_FIPS
     ]
     conus = unary_union(geoms).buffer(0)
     return conus, len(geoms)
