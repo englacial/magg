@@ -421,7 +421,7 @@ class TestWriteColumn:
 
         monkeypatch.setattr("zagg.hive.stamp_commit", _boom)
         slabs = _cell_slabs(self.CELLS)
-        folded = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3])
+        folded = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3, SHARD_ORDER])
         with pytest.raises(RuntimeError, match="interrupted"):
             write_column(
                 str(tmp_path),
@@ -482,12 +482,46 @@ class TestWriteColumn:
         }
         assert before == after
 
+    def test_missing_node_member_refuses_by_name(self, tmp_path):
+        # The node-order member is the universal partial #384's gather may
+        # assume (#381 point (2)); a column without it would stamp complete
+        # and fold short, so the writer refuses before anything lands.
+        from zagg.column import fold_column, write_column
+
+        slabs = _cell_slabs(self.CELLS)
+        folded = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3])
+        with pytest.raises(ValueError, match="node-order member"):
+            write_column(
+                str(tmp_path),
+                morton_word("-311"),
+                folded,
+                FIELDS,
+                node_order=SHARD_ORDER,
+                cell_order=CELL_ORDER,
+            )
+        assert not (tmp_path / "-3").exists()
+
+    def test_empty_fold_refuses_by_name(self, tmp_path):
+        # Same guard, the degenerate input: an empty `folded` used to reach
+        # `folded[resolutions[0]]` and IndexError past the template write.
+        from zagg.column import write_column
+
+        with pytest.raises(ValueError, match="node-order member"):
+            write_column(
+                str(tmp_path),
+                morton_word("-311"),
+                {},
+                FIELDS,
+                node_order=SHARD_ORDER,
+                cell_order=CELL_ORDER,
+            )
+
     def test_none_class_fields_never_reach_the_template(self, tmp_path):
         from zagg.column import fold_column, write_column
 
         fields = dict(FIELDS, h_mean={"class": "none"})
         slabs = _cell_slabs(self.CELLS)
-        folded = fold_column(slabs, fields, cell_order=CELL_ORDER, resolutions=[3])
+        folded = fold_column(slabs, fields, cell_order=CELL_ORDER, resolutions=[3, SHARD_ORDER])
         basename = write_column(
             str(tmp_path),
             morton_word("-311"),
