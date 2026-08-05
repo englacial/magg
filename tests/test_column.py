@@ -889,6 +889,21 @@ class TestWorkerIntegration:
         assert meta["column_error"] == "column write exploded"
         assert "column" not in meta
 
+    def test_gate_refusal_names_the_shard_and_window(self, tmp_path, monkeypatch):
+        # The gate re-validates a declaration the templating path already
+        # accepted, so a divergence fires on EVERY shard at once — the wrap is
+        # what makes one Lambda log line attributable to a unit and a seam.
+        def boom(*a, **k):
+            raise ValueError("resolution 7 is not strictly between")
+
+        monkeypatch.setattr("zagg.column.leaf_column_plan", boom)
+        meta, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        shard = morton_word(_generator().SHARD_KEY)
+        assert meta["error"] == (
+            f"leaf column: column gate refused shard {shard} window None: "
+            "resolution 7 is not strictly between"
+        )
+
     def test_errored_shard_writes_neither_leaf_nor_column(self, tmp_path, monkeypatch):
         meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID, fail=True)
         assert meta.get("error") == "synthetic failure"
