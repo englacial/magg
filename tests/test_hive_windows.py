@@ -246,8 +246,10 @@ class TestWindowingConfig:
                 "2018-01-01T00:00:00+00:00",
                 "500000",
             ),
-            # The fraction survives a non-UTC declaration: the offset is whole
-            # minutes, so only the sub-second part is ever what iso_utc drops.
+            # The fraction survives a non-UTC declaration: the guard compares
+            # INSTANTS, not spellings, so it is the dropped fraction that
+            # refuses this — never the offset (Python accepts sub-minute
+            # offsets, and a whole-second one of those round-trips clean).
             (
                 "2018-01-01T05:30:00.001+05:30",
                 "2018-01-01T00:00:00.001000+00:00",
@@ -309,6 +311,21 @@ class TestWindowingConfig:
         _windowed(cfg, epoch=epoch)
         validate_config(cfg)
         assert get_windowing(cfg)["epoch"] == "2018-01-01T00:00:00+00:00"
+
+    def test_schedule_none_keeps_subsecond_epoch(self, cfg):
+        # The guard sits AFTER the ``schedule: none`` early return, and must:
+        # an inert block is equivalent to an absent one (test_absent_is_none),
+        # get_windowing returns None, and the epoch is never rendered — so
+        # there is no conversion to shift and nothing to refuse.
+        cfg.output["store_layout"] = "hive"
+        cfg.output["windowing"] = {
+            "schedule": "none",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00.5Z",
+            "scale": "gps",
+        }
+        validate_config(cfg)
+        assert get_windowing(cfg) is None
 
     def test_bad_scale_and_units(self, cfg):
         _windowed(cfg, scale="tt")
