@@ -398,6 +398,9 @@ class TestWriteColumn:
             "3": {"regime": LEAF_REGIME, "merges_from_raw": 1, "n_cells": 4},
             str(SHARD_ORDER): {"regime": LEAF_REGIME, "merges_from_raw": 1, "n_cells": 1},
         }
+        # A column has N grids, so the stamp's count needs its denominator
+        # named: the finest group, which is declaration-dependent.
+        assert attrs["cells_with_data_order"] == 3
 
     def test_stamp_covers_the_column_and_is_last(self, tmp_path, monkeypatch):
         from zagg.column import fold_column, write_column

@@ -247,6 +247,13 @@ def write_column(
     stats sidecar is a SIBLING object PUT after the stamp (fail-open,
     telemetry class), so the stamp stays the column's own final write.
 
+    The commit stamp's ``cells_with_data`` counts the populated mask of the
+    column's FINEST group — the one denominator a leaf or an overview has
+    implicitly, but a column (N grids) does not, so the group it counts is
+    recorded as ``cells_with_data_order`` in the ``zagg_column`` attrs: the
+    number is declaration-dependent (a coarser base declaration yields a
+    different count for the same leaf) and a reader cannot infer it.
+
     A ``folded`` without the node-order member is refused by name: that
     member is the leaf's universal partial for every coarser cell (#381
     point (2)), the one group #384's gather may assume, so stamping a
@@ -329,6 +336,7 @@ def write_column(
                     }
                     for res in resolutions
                 },
+                "cells_with_data_order": resolutions[0],
                 "generated_at": _utcnow(),
             },
         }
