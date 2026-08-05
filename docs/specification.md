@@ -946,7 +946,23 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
 - **Write discipline.** The leaf's own D4 order: template (wholesale — the
   column prefix, and any stale stats sidecar, are deleted first) → every
   group's arrays → `role`/`zagg_column` attrs → **one commit stamp last
-  covering the whole column**. An unstamped column prefix is debris and
+  covering the whole column**. The stamp is the D15 `morton_hive_commit`
+  root-attrs block, the same key and grammar a leaf carries:
+
+```json
+"morton_hive_commit": {"spec": "morton-hive/1", "complete": true,
+                       "cells_with_data": 3, "granule_count": 1,
+                       "written_at": "2026-08-05T00:00:00+00:00"}
+```
+
+  `cells_with_data` is the populated-cell count of the group named by
+  `cells_with_data_order`; `granule_count` is the **leaf's** granule count,
+  not a column quantity; and a column stamp carries **no `coverage`
+  payload** (a leaf's does), so a stamp reader MUST NOT require one. On a
+  **windowed** store the column's stamp is `spec: "morton-hive/2"` and
+  carries the D15 half exactly as the leaf's does — `window` plus the
+  observed `time_range` — so a reader that strict-checks the `spec` marker
+  must accept both revisions here. An unstamped column prefix is debris and
   MUST be ignored; an idempotent re-run rewrites the whole column to the
   same array bytes (provenance timestamps move). The D20 stats sidecar —
   `{stem}.stats.json`, e.g. `all.pyramid.stats.json`, carrying the §5
