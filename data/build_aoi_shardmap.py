@@ -35,25 +35,32 @@ DEFAULT_CONFIG = "tests/data/benchmark/configs/atl03_tdigest_healpix_o9_hive_k8.
 
 
 def _polygon_parts(geojson_path: str):
-    """Return (polygon_parts, bbox) from an AOI GeoJSON FeatureCollection.
+    """Return (polygon_parts, bbox, properties) from an AOI GeoJSON.
 
     ``polygon_parts`` is ``[(lats, lons), ...]`` -- one exterior ring per part
     of every feature, the form ``HealpixGrid.coverage`` consumes. ``bbox`` is
-    ``(lon_min, lat_min, lon_max, lat_max)`` over all features.
+    ``(lon_min, lat_min, lon_max, lat_max)`` over all features. ``properties``
+    is the first feature's ``properties`` (decoration for the stats JSON: the
+    provenance string and any ``area_km2*`` keys).
+
+    A FeatureCollection, a bare Feature and a raw geometry are all accepted;
+    the file is read once here so the caller cannot re-parse it under a
+    different assumption about which of the three it is.
     """
     from shapely.geometry import shape
     from shapely.ops import unary_union
 
     fc = json.loads(Path(geojson_path).read_text())
     feats = fc["features"] if fc.get("type") == "FeatureCollection" else [fc]
-    geom = unary_union([shape(f["geometry"]).buffer(0) for f in feats])
+    geom = unary_union([shape(f.get("geometry", f)).buffer(0) for f in feats])
     polys = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
     parts = []
     for p in polys:
         x, y = p.exterior.coords.xy
         parts.append((np.asarray(y), np.asarray(x)))
     minx, miny, maxx, maxy = geom.bounds
-    return parts, (float(minx), float(miny), float(maxx), float(maxy))
+    props = dict(feats[0].get("properties") or {}) if feats else {}
+    return parts, (float(minx), float(miny), float(maxx), float(maxy)), props
 
 
 def _part_bboxes(parts, pad_deg: float):
@@ -213,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"loading catalog {args.catalog} ...", flush=True)
     catalog = Catalog.from_geoparquet(args.catalog)
-    parts, bbox = _polygon_parts(args.polygon)
+    parts, bbox, props = _polygon_parts(args.polygon)
     print(f"AOI bbox={tuple(round(b, 3) for b in bbox)}, {len(parts)} polygon part(s)", flush=True)
 
     boxes = _part_bboxes(parts, args.pad_deg)
@@ -255,7 +262,6 @@ def main(argv: list[str] | None = None) -> int:
     # unit accounting via the dispatch path, priced at the configured worker.
     preview = max_cost_preview(config, catalog=str(shardmap_path))
 
-    props = json.loads(Path(args.polygon).read_text())["features"][0].get("properties", {})
     dist = _distribution(counts)
     # Distinct granules assigned to >=1 shard, as ShardMap.build records it.
     n_intersecting = int(sm.metadata["granules_assigned"])
