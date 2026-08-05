@@ -247,6 +247,13 @@ def write_column(
     stats sidecar is a SIBLING object PUT after the stamp (fail-open,
     telemetry class), so the stamp stays the column's own final write.
 
+    A ``folded`` without the node-order member is refused by name: that
+    member is the leaf's universal partial for every coarser cell (#381
+    point (2)), the one group #384's gather may assume, so stamping a
+    column without it would publish a complete-looking artifact that folds
+    short. The same guard covers an empty ``folded`` (the
+    ``column_resolutions() == []`` gate belongs to the caller).
+
     Single-writer law (#381 point (2)): the column lives only under its
     leaf's node prefix and has exactly one writer, ever — no locking.
     """
@@ -274,6 +281,12 @@ def write_column(
     node_order, cell_order = int(node_order), int(cell_order)
     fields = composable_fields(fields)
     resolutions = sorted((int(r) for r in folded), reverse=True)
+    if node_order not in resolutions:
+        raise ValueError(
+            f"a column must carry the node-order member ({node_order}) — it is the leaf's "
+            f"universal partial for every coarser cell (#381 point (2)), and no coarse level "
+            f"ever rewrites a leaf; got resolutions {resolutions}"
+        )
     leaf_path = shard_leaf_path(store_root, shard_key, window=window)
     node_prefix = leaf_path.rstrip("/").rsplit("/", 1)[0]
     basename = column_name(window)
