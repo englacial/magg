@@ -833,4 +833,4 @@ class TestColumnArtifact:
         block = manifest["pyramid"]
         assert block["spec"] == "zagg-pyramid/2"
         assert block["overviews"][0] == {"node": exp["shard_order"], "cells": [5]}
-        assert exp["pyramid_knob"] == {"overviews": 5}
+        assert exp["declared"] == {"overviews": 5}
