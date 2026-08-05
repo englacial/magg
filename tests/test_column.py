@@ -338,6 +338,17 @@ class TestSweepParity:
         _assert_group_matches(node_overview, folded[SHARD_ORDER], 1)
 
 
+def _root_meta_sans_timestamps(store) -> dict:
+    """The column root's attrs with the wall-clock provenance stripped."""
+    from zagg.column import COLUMN_ATTR
+    from zagg.hive import COMMIT_ATTR
+
+    attrs = dict(zarr.open_group(store, mode="r", zarr_format=3).attrs)
+    attrs[COLUMN_ATTR] = {k: v for k, v in attrs[COLUMN_ATTR].items() if k != "generated_at"}
+    attrs[COMMIT_ATTR] = {k: v for k, v in attrs[COMMIT_ATTR].items() if k != "written_at"}
+    return attrs
+
+
 class TestWriteColumn:
     """Phase 2: the column writer — D4 order, attrs, naming, sidecar."""
 
@@ -468,7 +479,17 @@ class TestWriteColumn:
         assert read_commit(open_store(f"{tmp_path}/-3/1/1/{basename}")) is not None
         assert not sidecar.exists()
 
-    def test_idempotent_rewrite_same_bytes(self, tmp_path):
+    def test_idempotent_rewrite_same_array_bytes(self, tmp_path):
+        """A re-run reproduces the DATA bytes; provenance timestamps move.
+
+        What is pinned: every resolution group's array bytes, and the root
+        attrs + commit stamp modulo their timestamps. What is NOT: the root
+        ``zarr.json`` byte-for-byte, nor the sidecar — ``generated_at``, the
+        stamp's ``written_at`` and the sidecar's ``timestamp`` are wall-clock
+        provenance and legitimately differ (the same posture as
+        ``_write_overview``). Comparing raw objects would make the outcome
+        clock-dependent: identical inside one second, different a second later.
+        """
         basename, first = self._write(tmp_path)
         store = open_store(f"{tmp_path}/-3/1/1/{basename}")
         before = {
@@ -476,6 +497,7 @@ class TestWriteColumn:
             for res in (3, SHARD_ORDER)
             for name, arr in zarr.open_group(store, path=str(res), mode="r", zarr_format=3).arrays()
         }
+        meta_before = _root_meta_sans_timestamps(store)
         basename2, _second = self._write(tmp_path)
         assert basename2 == basename
         after = {
@@ -484,6 +506,9 @@ class TestWriteColumn:
             for name, arr in zarr.open_group(store, path=str(res), mode="r", zarr_format=3).arrays()
         }
         assert before == after
+        # The root object is rewritten too: same attrs and same stamp CONTENT
+        # (a regression that changed either would pass a data-bytes-only check).
+        assert _root_meta_sans_timestamps(store) == meta_before
 
     def test_missing_node_member_refuses_by_name(self, tmp_path):
         # The node-order member is the universal partial #384's gather may
