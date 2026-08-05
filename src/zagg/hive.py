@@ -1396,6 +1396,32 @@ def process_and_write_hive(
             # the timing rides an existing dict, never seeds one.
             if "phase_timings" in metadata:
                 metadata["phase_timings"]["hash"] = time.time() - _t0
+    # Leaf pyramid column (issue #383): written AFTER the leaf's own commit,
+    # from the same resident staged slabs — the fleet side of #381 points
+    # (1)-(3). Gated inside on the /2 declaration carrying leaf-node levels
+    # (``output.pyramid.overviews``); a failure RAISES like any leaf-write
+    # failure, and the idempotent retry rewrites leaf + column wholesale.
+    # The window filter injection above never touches ``config.output``, so
+    # the windowed per-unit config copy carries the declaration unchanged.
+    if not metadata.get("error") and "store" in box:
+        from zagg.column import write_leaf_column
+
+        _t0 = time.time()
+        column = write_leaf_column(
+            store_root,
+            shard_key,
+            grid,
+            config,
+            staged,
+            window=window["label"] if window else None,
+            time_range=time_range,
+            granule_count=metadata.get("granule_count", 0),
+            store_kwargs=store_kwargs,
+        )
+        if column is not None:
+            metadata["column"] = column
+            if "phase_timings" in metadata:
+                metadata["phase_timings"]["column"] = time.time() - _t0
     return metadata
 
 

@@ -689,3 +689,172 @@ class TestWriteColumn:
         assert "h_mean" not in group
         root = zarr.open_group(open_store(f"{tmp_path}/-3/1/1/{basename}"), mode="r", zarr_format=3)
         assert "h_mean" not in root.attrs["zagg_column"]["fields"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: worker integration — the real leaf write path grows a column.
+# ---------------------------------------------------------------------------
+
+GENERATOR = (
+    __import__("pathlib").Path(__file__).parent.parent / "tools" / "generate_spec_fixtures.py"
+)
+
+
+def _generator():
+    """The spec fixture generator, loaded as a module (test_content_hash precedent)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("zagg_column_fixture_generator", GENERATOR)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _run_unit(root, monkeypatch, *, pyramid=None, window=None, windowing=None, fail=False):
+    """One shard through the REAL ``process_and_write_hive`` (generator inputs).
+
+    Returns ``(metadata, leaf_dir)``; the generator's fake ``process_shard``
+    feeds the production sharded leaf write, so the staged sink the column
+    folds from is exactly what the leaf stored.
+    """
+    from dataclasses import replace
+
+    import zagg.processing as processing
+    from zagg import hive
+    from zagg.grids import HealpixGrid
+
+    gen = _generator()
+    cfg = gen._config(kitchen_sink=False, pyramid=pyramid)
+    if windowing is not None:
+        # The window filter injection (windowed_cell_config) needs the
+        # time_field's base-rate dataset path; the fake reader ignores it.
+        ds = {**cfg.data_source, "variables": {windowing["time_field"]: "g/t"}}
+        cfg = replace(cfg, data_source=ds, output={**cfg.output, "windowing": windowing})
+    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    shard = morton_word(gen.SHARD_KEY)
+    by_chunk, _cells = gen._build_cells(grid, shard, kitchen_sink=False)
+    hive.ensure_manifest(
+        str(root), hive.build_manifest(grid, dataset={"short_name": "COL_TEST", "version": "1"})
+    )
+    inner = gen._fake_process_shard(grid, by_chunk, kitchen_sink=False)
+
+    def fake(*args, **kwargs):
+        if fail:
+            return None, {"error": "synthetic failure", "shard_key": int(args[1])}
+        df, meta = inner(*args, **kwargs)
+        meta["phase_timings"] = {"read": 0.0, "index": 0.0, "aggregate": 0.0}
+        return df, meta
+
+    monkeypatch.setattr(processing, "process_shard", fake)
+    meta = hive.process_and_write_hive(
+        shard,
+        ["s3://fixture/a.h5"],
+        grid,
+        {},
+        str(root),
+        cfg,
+        store_kwargs={},
+        window=window,
+    )
+    label = window["label"] if window else None
+    leaf_rel = hive.shard_leaf_path("", shard, window=label).lstrip("/")
+    return meta, root / leaf_rel
+
+
+class TestWorkerIntegration:
+    PYRAMID = {"overviews": 5}
+
+    def test_column_rides_the_leaf_write(self, tmp_path, monkeypatch):
+        from zagg.hive import read_commit
+        from zagg.sweep_overview import fold_dense
+
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        assert meta.get("error") is None
+        assert meta["column"] == "all.pyramid.zarr"
+        assert "column" in meta["phase_timings"]
+        assert read_commit(open_store(str(leaf))) is not None
+        column = leaf.parent / "all.pyramid.zarr"
+        col_store = open_store(str(column))
+        assert read_commit(col_store) is not None
+        # End-to-end parity, disk to disk: the column's groups equal a fold of
+        # the COMMITTED leaf's read-back arrays (the sweep's own kernels).
+        leaf_group = zarr.open_group(open_store(str(leaf)), path="6", mode="r", zarr_format=3)
+        for res in (5, 4):
+            got = zarr.open_group(col_store, path=str(res), mode="r", zarr_format=3)
+            factor = 4 ** (6 - res)
+            np.testing.assert_array_equal(
+                got["count"][:], fold_dense(leaf_group["count"][:], factor, "sum", 0)
+            )
+            oracle = _refold_digests(leaf_group["h_tdigest"][:], factor, delta=16)
+            assert [bytes(p) for p in got["h_tdigest"][:]] == oracle
+
+    def test_no_column_without_the_overviews_knob(self, tmp_path, monkeypatch):
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=None)
+        assert meta.get("error") is None and "column" not in meta
+        assert not list(leaf.parent.glob("*.pyramid.zarr"))
+
+    def test_windowed_unit_gets_a_window_named_column(self, tmp_path, monkeypatch):
+        from zagg.hive import read_commit
+
+        meta, leaf = _run_unit(
+            tmp_path,
+            monkeypatch,
+            pyramid=self.PYRAMID,
+            window={"label": "2019", "start": 0.0, "end": 1.0},
+            windowing={
+                "schedule": "yearly",
+                "time_field": "t",
+                "epoch": "2018-01-01T00:00:00Z",
+            },
+        )
+        assert meta.get("error") is None
+        assert meta["column"] == "2019.pyramid.zarr"
+        stamp = read_commit(open_store(str(leaf.parent / "2019.pyramid.zarr")))
+        assert stamp is not None and stamp["window"] == "2019"
+
+    def test_rerun_rewrites_the_column_to_the_same_bytes(self, tmp_path, monkeypatch):
+        def snapshot(column):
+            store = open_store(str(column))
+            out = {}
+            for res in (5, 4):
+                group = zarr.open_group(store, path=str(res), mode="r", zarr_format=3)
+                for name, arr in group.arrays():
+                    v = arr[:]
+                    out[(res, name)] = [bytes(p) for p in v] if v.dtype == object else v.tobytes()
+            return out
+
+        _meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        column = leaf.parent / "all.pyramid.zarr"
+        before = snapshot(column)
+        _meta, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        assert snapshot(column) == before
+
+    def test_column_failure_fails_the_unit(self, tmp_path, monkeypatch):
+        def boom(*a, **k):
+            raise RuntimeError("column write exploded")
+
+        monkeypatch.setattr("zagg.column.write_column", boom)
+        with pytest.raises(RuntimeError, match="column write exploded"):
+            _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+
+    def test_errored_shard_writes_neither_leaf_nor_column(self, tmp_path, monkeypatch):
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID, fail=True)
+        assert meta.get("error") == "synthetic failure"
+        assert "column" not in meta
+        assert not leaf.exists()
+        assert not list(leaf.parent.glob("*.pyramid.zarr")) if leaf.parent.exists() else True
+
+
+def _refold_digests(payloads, factor, *, delta):
+    """The sweep-shaped digest oracle: per target cell, k-way over children."""
+    from zagg.sweep_overview import decode_digest, fold_digests
+
+    out = []
+    for j in range(len(payloads) // factor):
+        cell = [
+            decode_digest(bytes(p), "float32", (2,))
+            for p in payloads[j * factor : (j + 1) * factor]
+            if p is not None and len(p)
+        ]
+        out.append(fold_digests(cell, delta=delta, dtype="float32") if cell else b"")
+    return out

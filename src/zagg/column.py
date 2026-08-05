@@ -18,11 +18,13 @@ the issue #370 fold law) — the same kernels the sweep's from-leaves fold
 runs over the same per-cell inputs in the same ascending order, so column
 bytes are parity-equal with that fold by construction.
 
-This module owns the fold core (pure functions over in-memory slabs) and the
+This module owns the fold core (pure functions over in-memory slabs), the
 column writer (one artifact per ``(leaf, window)``, D4 write discipline: a
 wholesale template, every resolution group, the role/provenance attrs, ONE
 commit stamp last covering the whole column, and the D20 stats sidecar after
-the stamp). The worker integration is the last phase of issue #383.
+the stamp), and the worker seam (:func:`write_leaf_column` — gate on the
+declaration, fold from the #342 staged sink, write), which
+``hive.process_and_write_hive`` calls after the leaf's own commit.
 """
 
 from __future__ import annotations
@@ -451,3 +453,98 @@ def _write_sidecar(
         )
     except Exception as e:
         logger.warning(f"column stats sidecar failed (fail-open, issue #383): {e}")
+
+
+def leaf_column_plan(config, grid) -> tuple[list[int], dict] | None:
+    """The leaf's column plan from its own config: ``(resolutions, fields)`` or None.
+
+    The issue #383 gate, decided worker-side from the config both backends
+    already carry: a column is written iff the declaration carries leaf-node
+    levels — an explicit ``output.pyramid.overviews`` knob (the
+    ``zagg-pyramid/2`` grammar; its expansion always places the declared
+    resolutions at the shard node). ``/1`` schedules (``orders``/``spacing``,
+    or no pyramid knob at all) declare no leaf columns. The declaration is
+    re-validated against the grid here — cheap, and the Lambda worker builds
+    its config without ``validate_config`` — with the same refusals the
+    templating path raises. The D24 field map is the declaration's own
+    (:func:`zagg.pyramid.declared_fields`) filtered to the composable
+    classes; the template-time warning for excluded fields is NOT repeated
+    per shard (``build_pyramid_block`` owns the loud warning).
+    """
+    from zagg.config import get_pyramid
+    from zagg.pyramid import (
+        declared_fields,
+        expand_overviews,
+        normalize_overviews,
+        validate_overviews,
+    )
+
+    knob = get_pyramid(config)
+    if not knob or knob.get("overviews") is None:
+        return None
+    declared = normalize_overviews(knob["overviews"])
+    validate_overviews(
+        declared, parent_order=int(grid.parent_order), child_order=int(grid.child_order)
+    )
+    levels = expand_overviews(declared, parent_order=int(grid.parent_order))
+    resolutions = column_resolutions(levels, grid.parent_order)
+    if not resolutions:
+        return None
+    fields = composable_fields(declared_fields(config)[0])
+    if not fields:
+        return None
+    return resolutions, fields
+
+
+def write_leaf_column(
+    store_root: str,
+    shard_key,
+    grid,
+    config,
+    staged: dict,
+    *,
+    window: str | None = None,
+    time_range=None,
+    granule_count: int = 0,
+    store_kwargs: dict | None = None,
+) -> str | None:
+    """Fold and write one leaf's column from its resident staged slabs.
+
+    The worker seam ``hive.process_and_write_hive`` calls after the leaf's
+    own commit stamp: gate (:func:`leaf_column_plan`) -> fold inputs from the
+    issue #342 staged sink (:func:`leaf_slabs` — the exact in-memory values
+    the leaf write PUT) -> per-resolution folds (:func:`fold_column`) ->
+    :func:`write_column` (D4). Returns the column basename, or ``None`` when
+    the declaration carries no leaf-node levels. Failures RAISE: the caller
+    treats a column failure like any other leaf-write failure — the unit
+    reports failed, and the idempotent retry rewrites leaf and column
+    wholesale (both writers clear their own prefix first).
+
+    Memory note (the PR #391 phase 1 review measurement): the node-order
+    member's k-way merge concatenates every resident digest once — at the
+    ~17.6M-centroid scale ``hive.process_and_write_hive`` already cites for
+    its ~200 MB ragged accumulation, the fold's transient peak measured
+    ~2.0 GB (float64 copies + sort temporaries inside
+    ``merge_tdigests_kway``), alongside 4 GB workers (issue #193). The bound
+    is transient, single-threaded, and dies with the call; a digest load
+    ~2x that scale does not fit and needs the kernel-side preallocation
+    named on the PR thread before the column can carry it.
+    """
+    plan = leaf_column_plan(config, grid)
+    if plan is None:
+        return None
+    resolutions, fields = plan
+    slabs = leaf_slabs(staged, fields, group_path=grid.group_path, n_cells=grid.cells_per_shard)
+    folded = fold_column(slabs, fields, cell_order=grid.child_order, resolutions=resolutions)
+    return write_column(
+        store_root,
+        shard_key,
+        folded,
+        fields,
+        node_order=grid.parent_order,
+        cell_order=grid.child_order,
+        window=window,
+        time_range=time_range,
+        granule_count=granule_count,
+        store_kwargs=store_kwargs,
+    )
