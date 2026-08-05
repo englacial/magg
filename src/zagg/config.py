@@ -2691,15 +2691,16 @@ def get_windowing(config: PipelineConfig) -> dict | None:
         {"schedule", "time_field", "epoch", "scale", "units", "windows"}
 
     ``epoch`` and explicit-window boundaries are canonicalized to ISO-8601
-    UTC strings. The ``epoch`` canonicalization is lossless — ``timespec=
-    "seconds"`` would otherwise truncate a sub-second epoch and shift every
-    window conversion, so :func:`_validate_windowing` refuses one outright
-    (issue #390); explicit bounds do truncate, documented on
-    :func:`_explicit_window_bounds`. ``windows`` is ``None`` except for
-    ``schedule: explicit``,
-    where a ``{label, timestamp}`` point entry is desugared to its second-wide
-    range (issue #355) so the normalized list is uniformly ``{label, start,
-    end}``.
+    UTC strings. The ``epoch`` canonicalization is lossless on any config that
+    passed ``validate_config`` — ``timespec="seconds"`` would otherwise truncate
+    a sub-second epoch and shift every window conversion, so
+    :func:`_validate_windowing` refuses one outright (issue #390). A config
+    built without that check (``load_config_from_dict``, a hand-rolled worker
+    payload) still truncates here; explicit bounds truncate either way,
+    documented on :func:`_explicit_window_bounds`. ``windows`` is ``None``
+    except for ``schedule: explicit``, where a ``{label, timestamp}`` point
+    entry is desugared to its second-wide range (issue #355) so the normalized
+    list is uniformly ``{label, start, end}``.
     On the raster branch (``reader: raster``) ``time_field`` is the fixed STAC
     ``datetime`` and ``epoch``/``scale``/``units`` are hardcoded to the
     Unix-epoch UTC-seconds encoding any ISO instant normalizes to, rather than
