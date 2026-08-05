@@ -468,13 +468,18 @@ class TestWriteColumn:
         hashes = record["content_hashes"]["arrays"]
         assert set(hashes) >= {"3/morton", "3/count", "3/h_tdigest", f"{SHARD_ORDER}/morton"}
 
-        # Fail-open: a hashing failure costs the sidecar, never the column.
+        # Fail-open: a hashing failure costs the sidecar, never the column —
+        # and on a REWRITE the outcome is ABSENT, not the previous run's
+        # record. A stale sidecar verifies as a mismatch (a false tamper
+        # signal), the one outcome D20 exists to prevent; the wholesale clear
+        # drops it before the template lands, so this rewrite is over a
+        # sidecar that is still on disk.
         monkeypatch.setattr(
             "zagg.content_hash.hash_arrays",
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
         )
-        sidecar.unlink()
-        basename, _folded = self._write(tmp_path)
+        assert sidecar.exists()
+        basename, _folded = self._write(tmp_path, cells={0: [1.0]})
         from zagg.hive import read_commit
 
         assert read_commit(open_store(f"{tmp_path}/-3/1/1/{basename}")) is not None

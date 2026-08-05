@@ -241,7 +241,11 @@ def write_column(
     column entirely and a prior torn write never survives) -> every
     resolution group's ``morton`` + ``{order}/{field}`` arrays -> the
     role/provenance attrs -> ONE commit stamp LAST covering the whole
-    column. There is no partial-column failure state: an interrupted writer
+    column. The clear also removes any PRIOR sidecar (fail-open, sibling to
+    the prefix it cannot reach): a rewrite whose fresh sidecar PUT then fails
+    leaves the record ABSENT — unverifiable, §5.3 — never STALE, which would
+    verify as a mismatch and read as a false tamper signal (D20).
+    There is no partial-column failure state: an interrupted writer
     leaves an unstamped prefix — ignorable debris, and repair is re-invoking
     the idempotent leaf (never a sweep-side fallback to raw cells). The D20
     stats sidecar is a SIBLING object PUT after the stamp (fail-open,
@@ -307,6 +311,7 @@ def write_column(
     staged: dict = {}
     with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
         sync(store.delete_dir(""))
+        _delete_sidecar(node_prefix, _sidecar_name(basename), store_kwargs)
         spec.to_zarr(store, "", overwrite=True)
     for res in resolutions:
         words = np.asarray(generate_morton_children(int(shard_key), res), dtype=np.uint64)
@@ -355,6 +360,23 @@ def write_column(
     return basename
 
 
+def _sidecar_name(basename: str) -> str:
+    """The column's D20 sidecar basename: its own stem + ``.stats.json``."""
+    return basename.removesuffix(".zarr") + ".stats.json"
+
+
+def _delete_sidecar(prefix: str, name: str, store_kwargs: dict) -> None:
+    """Drop a prior run's column sidecar, fail-open (absent beats stale)."""
+    try:
+        import obstore
+
+        from zagg.store import open_object_store
+
+        obstore.delete(open_object_store(prefix, **store_kwargs), name)
+    except Exception as e:
+        logger.debug(f"column stats sidecar clear skipped at {prefix}/{name}: {e}")
+
+
 def _write_sidecar(
     store, path, shard_key, staged, cells_with_data, granule_count, window, store_kwargs
 ) -> None:
@@ -393,7 +415,10 @@ def _write_sidecar(
             window=window,
         )
         prefix, _, name = path.rstrip("/").rpartition("/")
-        sidecar = name.removesuffix(".zarr") + ".stats.json"
-        obstore.put(open_object_store(prefix, **store_kwargs), sidecar, json.dumps(record).encode())
+        obstore.put(
+            open_object_store(prefix, **store_kwargs),
+            _sidecar_name(name),
+            json.dumps(record).encode(),
+        )
     except Exception as e:
         logger.warning(f"column stats sidecar failed (fail-open, issue #383): {e}")
