@@ -271,6 +271,16 @@ def build_record(
         # so run-record-driven discovery (D22) sees columns without a tree
         # listing. The column's resolution set lives in the artifact's own
         # ``zagg_column`` attrs — read the column, not this row, for it.
+        # READ IT AS: "the column basename this UNIT wrote alongside its
+        # leaf" — NOT "the column this record describes". ``None`` means no
+        # column was recorded by this unit; it is never a denial that the
+        # described artifact is one. The pyramid column's OWN stats sidecar
+        # records ``None`` here (``zagg.column`` builds it from a hand-made
+        # metadata dict with no ``column`` key — only the leaf record carries
+        # the basename, via ``hive.py``), and so does any cross-leaf rollup,
+        # where the equal-or-None merge collapses it. So a sidecar scan for
+        # column-bearing units must key on the LEAF records, not on the
+        # column artifacts' own.
         "column": metadata.get("column"),
         "gb_seconds": gb_seconds,
         "est_cost_usd": est_cost,
