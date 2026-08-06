@@ -191,9 +191,21 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
       a semantic change over covered inputs, or an unverifiable leaf
       (``no-sidecar``; ``unknown-planned``, no planned set to diff; or
       ``unrecorded-ids``, a pre-#388 sidecar with no recorded set to diff):
-      wholesale D4 rewrite exactly as today. Conservative like
-      :func:`shard_status`: every ambiguity degrades toward recompute,
-      never toward a false skip.
+      wholesale D4 rewrite exactly as today.
+
+    Conservatism here is ONE-SIDED, not the symmetric rule
+    :func:`shard_status` follows. For the *skip* decision rewrite is the
+    safe direction — a false skip strands a stale leaf, so every ambiguity
+    degrades toward recompute. For the *contraction guard* it is not: a
+    rewrite over a contracted input set destroys aggregated data the
+    operator was never told about, which is the loss issue #388 exists to
+    prevent. ``unrecorded-ids`` sits exactly on that seam — the recorded
+    hash already says something changed, while the direction is unknowable
+    — so it carries its OWN classification rather than sharing
+    ``no-sidecar``/``expansion``: callers must count and surface it apart
+    from the ordinary rewrites (the phase-2 run stats, the phase-4 operator
+    docs), because the guard cannot protect any leaf written before this
+    release — no fleet sidecar predating issue #388 records ``granule_ids``.
 
     Parameters
     ----------
@@ -234,7 +246,12 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
     if rec_ids is None:
         # Pre-#388 sidecar (or a cross-leaf rollup, where the field collapses
         # to None): something mismatched, but there is no recorded set to
-        # diff — undecidable, so today's rewrite.
+        # diff — undecidable, so today's rewrite. NOT a benign ambiguity: on
+        # a contracted rerun this is the wholesale rewrite the guard exists to
+        # stop, and every leaf written before this release lands here. Its own
+        # classification for exactly that reason — count it apart from the
+        # ordinary rewrites and say so in the operator docs (see the class
+        # docstring's one-sided-conservatism note).
         return {"action": "rewrite", "classification": "unrecorded-ids", "missing": []}
     recorded_set = {str(g) for g in rec_ids}
     missing = sorted(recorded_set - set(planned))
