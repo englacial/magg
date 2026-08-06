@@ -46,6 +46,16 @@ SIDECAR_NAME = "stats.json"
 #: uses. An unmapped/absent arch falls back to the flat default rate.
 _ARCH_ALIASES = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x86_64", "amd64": "x86_64"}
 
+#: D19 digest shape (:func:`zagg.semantics.semantic_hash`): a full sha256 hex
+#: digest. Only the ``metadata`` FALLBACK in :func:`build_record` is checked
+#: against it — that dict is not always locally built: the dispatcher's
+#: stale-worker path (``zagg.runner._lambda_result_rows``) passes the JSON body
+#: the remote worker returned, so an unchecked value would let a version-skewed
+#: worker plant an identity that ``dedup.shard_status`` and
+#: ``dedup.classify_leaf_identity`` later trust to skip. Malformed reads as no
+#: recorded identity (``None`` — never provably current), never a wrong one.
+_SEMANTIC_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
 # Merge dispositions (associative + commutative by construction). Floats sum,
 # so equality across fold orders holds up to FP summation order.
 _SUM_KEYS = ("n_shards", "n_granules", "n_obs", "cells_with_data", "duration_s")
@@ -159,7 +169,10 @@ def build_record(
     caller passes none, ``metadata["semantic_hash"]`` fills in (issue #388):
     the shared hive seams stamp it there, so a caller that never resolved
     the hash itself (the Lambda handler) still records the identity a later
-    skip-if-current comparison needs.
+    skip-if-current comparison needs. That fallback is VALIDATED against the
+    D19 digest shape (:data:`_SEMANTIC_HASH_RE`) because ``metadata`` is not
+    always locally built — see the constant; a caller-passed ``semantic_hash``
+    is the caller's own value and is trusted as given.
     ``lambda_config`` is :func:`lambda_env` on Lambda, ``None`` locally;
     when present it prices ``gb_seconds`` / ``est_cost_usd`` from
     ``duration_s`` (the billed-duration approximation the dispatcher's cost
@@ -167,7 +180,9 @@ def build_record(
     """
     error = metadata.get("error")
     if semantic_hash is None:
-        semantic_hash = metadata.get("semantic_hash")
+        fallback = metadata.get("semantic_hash")
+        if isinstance(fallback, str) and _SEMANTIC_HASH_RE.match(fallback):
+            semantic_hash = fallback
     duration_s = float(metadata.get("duration_s") or 0.0)
     gb_seconds = est_cost = None
     if lambda_config and lambda_config.get("memory_mb"):

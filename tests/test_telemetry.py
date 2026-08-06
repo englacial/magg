@@ -688,6 +688,15 @@ class TestRecordedIdentity:
         rec = build_record(shard_key=1, metadata={"duration_s": 1.0, "semantic_hash": "f" * 64})
         assert rec["semantic_hash"] == "f" * 64
 
+    def test_junk_metadata_semantic_hash_is_rejected(self):
+        # ``metadata`` is the worker's returned BODY on the dispatcher's
+        # stale-worker path (runner._lambda_result_rows), so the fallback is
+        # validated against the D19 digest shape: a version-skewed worker
+        # cannot plant an identity that a later skip check would trust.
+        for junk in ["not-a-hash", "F" * 64, "a" * 63, "a" * 65, "", 12345, {"x": 1}, None]:
+            rec = build_record(shard_key=1, metadata={"duration_s": 1.0, "semantic_hash": junk})
+            assert rec["semantic_hash"] is None, junk
+
     def test_explicit_semantic_hash_wins_over_metadata(self):
         rec = build_record(
             shard_key=1,
