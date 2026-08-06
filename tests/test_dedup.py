@@ -7,6 +7,7 @@ absent leaves are plain misses.
 
 import copy
 
+import numpy as np
 import zarr
 
 from zagg import hive
@@ -280,6 +281,24 @@ class TestClassifyLeafIdentity:
         assert got["action"] == "refuse"
         assert got["classification"] == "contraction"
         assert got["missing"] == sorted(self.IDS)
+
+    def test_unknown_planned_set_rewrites_rather_than_refusing(self):
+        # None is UNKNOWN, not empty: it must not diff to "every recorded id
+        # was dropped" and refuse — the maximally ambiguous input takes the
+        # conservative rewrite, the same direction as every other ambiguity.
+        got = classify_leaf_identity(self._recorded(), semantic_hash=self.SEM, planned_ids=None)
+        assert got == {"action": "rewrite", "classification": "unknown-planned", "missing": []}
+
+    def test_planned_ids_are_iterated_not_truth_tested(self):
+        # A numpy id array raises ValueError on a bare truthiness test; the
+        # planned set is iterated instead, so array-shaped callers work.
+        planned = np.array(self.IDS)
+        got = classify_leaf_identity(self._recorded(), semantic_hash=self.SEM, planned_ids=planned)
+        assert got["action"] == "skip"
+        empty = classify_leaf_identity(
+            self._recorded(), semantic_hash=self.SEM, planned_ids=np.array([], dtype=object)
+        )
+        assert empty["action"] == "refuse"  # an empty ARRAY is still empty, not unknown
 
     def test_duplicate_drift_with_equal_sets_rewrites(self):
         # granules_sha256 keeps duplicates; the set diff dedups. Same set,

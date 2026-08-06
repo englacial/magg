@@ -188,10 +188,12 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
       Judged on the id sets alone — a semantic mismatch does not excuse
       dropping inputs.
     - ``rewrite`` / everything else — expansion (``planned >= recorded``),
-      a semantic change over covered inputs, or an unverifiable leaf (no
-      sidecar; or a pre-#388 sidecar without recorded ids): wholesale D4
-      rewrite exactly as today. Conservative like :func:`shard_status`:
-      every ambiguity degrades toward recompute, never toward a false skip.
+      a semantic change over covered inputs, or an unverifiable leaf
+      (``no-sidecar``; ``unknown-planned``, no planned set to diff; or
+      ``unrecorded-ids``, a pre-#388 sidecar with no recorded set to diff):
+      wholesale D4 rewrite exactly as today. Conservative like
+      :func:`shard_status`: every ambiguity degrades toward recompute,
+      never toward a false skip.
 
     Parameters
     ----------
@@ -204,7 +206,10 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
         The unit's planned granule ids, in the id space the sidecars record
         (resolved granule URLs on the aggregation path, STAC item
         ids/datetimes for raster — cf. :func:`zagg.telemetry.granules_sha256`,
-        and the id-space warning on :func:`shard_status`).
+        and the id-space warning on :func:`shard_status`). ``None`` means the
+        planned set is UNKNOWN and never refuses (``unknown-planned``); the
+        empty list means the unit genuinely plans no inputs, which against a
+        non-empty recorded set is a full contraction and does refuse.
 
     Returns
     -------
@@ -213,9 +218,14 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
         :data:`IDENTITY_ACTIONS`; ``missing`` the sorted ``recorded -
         planned`` difference (non-empty exactly on ``refuse``).
     """
-    planned = [str(g) for g in planned_ids] if planned_ids else []
     if recorded is None:
         return {"action": "rewrite", "classification": "no-sidecar", "missing": []}
+    if planned_ids is None:
+        # An UNKNOWN planned set is not the empty one: diffing against it would
+        # name every recorded id as dropped and refuse the loudest way there is.
+        # Ambiguity degrades to rewrite; ``[]`` below stays a real contraction.
+        return {"action": "rewrite", "classification": "unknown-planned", "missing": []}
+    planned = [str(g) for g in planned_ids]
     rec_hash = recorded.get("granules_sha256")
     semantic_match = semantic_hash is not None and recorded.get("semantic_hash") == semantic_hash
     if rec_hash is not None and rec_hash == granules_sha256(planned) and semantic_match:
