@@ -87,7 +87,8 @@ _EQ_OR_NONE_KEYS = (
     "granule_ids",
     # Leaf pyramid column basename (issue #383's deferred run-record key,
     # landed with #388): D22 discovery is run-record-driven, so column
-    # existence must be discoverable without a tree listing.
+    # existence must be discoverable without a tree listing. The name is
+    # SQL-reserved where this reaches parquet — see _ROW_SCALARS below.
     "column",
     "zagg_version",
     "lambda",
@@ -394,8 +395,15 @@ _ROW_SCALARS = (
     "raster_px_sampled",
     # Column basename (issue #383's deferred run-record key): a scalar
     # string, so D22 run-record discovery can find column-bearing leaves
-    # with a plain column filter. ``granule_ids`` (a list) stays out — the
-    # parquet join key for catalog identity is granules_sha256.
+    # from the run parquet alone, without a tree listing. Mind the spelling
+    # at the query: ``column`` is SQL-reserved and reserved in both engines
+    # this parquet targets (DuckDB, Trino/Athena), so a filter on it must
+    # quote the identifier — ``WHERE "column" IS NOT NULL``, not
+    # ``WHERE column IS NOT NULL``, which is a parse error. Renaming the key
+    # (``column_name`` / ``leaf_column``) is open for review while the
+    # schema is unreleased — see the PR's Questions for review.
+    # ``granule_ids`` (a list) stays out — the parquet join key for catalog
+    # identity is granules_sha256.
     "column",
     "max_memory_mb",
     "container_hwm_mb",
