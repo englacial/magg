@@ -1240,7 +1240,11 @@ def process_and_write_raster_hive(
     raster id space (:func:`zagg.telemetry.raster_granule_ids`) as the
     planned set. A skipped/refused unit returns early with ``timesteps: 0``
     and ``leaf_written: False``, having written nothing. Default off keeps
-    this seam byte-identical for callers that have not opted in.
+    this seam byte-identical for callers that have not opted in — except for
+    the granule-id SIBLING written after the stamp
+    (:func:`zagg.telemetry.write_granule_ids`), which is unconditional: it is
+    what a LATER run's contraction guard diffs against, so a leaf must record
+    it whether or not the run that wrote the leaf had the gate armed.
     """
     from zagg.hive import (
         COVERAGE_SIDECAR,
@@ -1432,6 +1436,15 @@ def process_and_write_raster_hive(
             time_range=time_range,
         )
         write_s += time.time() - _t0
+        # The recorded granule-id list as this leaf's sibling object (issue
+        # #388), after the stamp and in the raster id space the gate plans
+        # against — the vector seam's posture, same rationale (one source for
+        # the recorded id space; fail-open inside).
+        from zagg.telemetry import write_granule_ids
+
+        write_granule_ids(
+            leaf_path, raster_granule_ids(granules), spec=sidecar_spec, **store_kwargs
+        )
     # Phase split (issues #100/#249; always-on collection since issue #297 —
     # the stats sidecar needs complete timings by default): only a unit that
     # actually wrote carries it, so a no-data unit stays write-less and

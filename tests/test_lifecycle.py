@@ -25,7 +25,7 @@ def _fresh_client_cache(monkeypatch):
     monkeypatch.setattr(lifecycle, "_CLIENTS", {})
 
 
-def _make_unit(tmp_path, *, submap=True, column=False):
+def _make_unit(tmp_path, *, submap=True, column=False, granule_ids=True):
     """A committed-looking local unit: leaf tree + sidecar siblings."""
     node = tmp_path / "store" / "-5" / "1"
     leaf = node / LEAF
@@ -34,6 +34,8 @@ def _make_unit(tmp_path, *, submap=True, column=False):
     (leaf / "m" / "c" / "0").write_bytes(b"\x00\x01")
     (leaf / "coverage.moc").write_bytes(b"moc")
     (node / "stats.json").write_bytes(b"{}")
+    if granule_ids:
+        (node / "granules.json").write_bytes(b"{}")
     if submap:
         (node / "shardmap.json").write_bytes(b"{}")
     column_path = None
@@ -68,8 +70,9 @@ class TestTouchLocal:
         aged = _age(node)
         counts = lifecycle.touch_current_unit(str(leaf))
         after = _mtimes(node)
-        # Leaf tree (coverage.moc included) + stats.json + shardmap.json.
-        assert counts == {"touched": 5, "failed": 0}
+        # Leaf tree (coverage.moc included) + stats.json + granules.json +
+        # shardmap.json.
+        assert counts == {"touched": 6, "failed": 0}
         assert all(mtime > aged for mtime in after.values())
 
     def test_column_tree_and_sidecar_ride_the_footprint(self, tmp_path):
@@ -78,7 +81,7 @@ class TestTouchLocal:
         counts = lifecycle.touch_current_unit(str(leaf), column_path=str(column))
         after = _mtimes(node)
         # + the column's two objects and its own stats sidecar.
-        assert counts == {"touched": 8, "failed": 0}
+        assert counts == {"touched": 9, "failed": 0}
         assert all(mtime > aged for mtime in after.values())
 
     def test_absent_column_is_left_out(self, tmp_path):
@@ -86,13 +89,20 @@ class TestTouchLocal:
         # of the footprint — nothing to touch, nothing to fail.
         node, leaf, _column = _make_unit(tmp_path)
         counts = lifecycle.touch_current_unit(str(leaf), column_path=None)
-        assert counts["failed"] == 0 and counts["touched"] == 5
+        assert counts["failed"] == 0 and counts["touched"] == 6
 
     def test_missing_submap_is_neither_touched_nor_failed(self, tmp_path):
         # A unit legitimately has no sub-map (non-HEALPix, id-less entries).
         _node, leaf, _column = _make_unit(tmp_path, submap=False)
         counts = lifecycle.touch_current_unit(str(leaf))
-        assert counts == {"touched": 4, "failed": 0}
+        assert counts == {"touched": 5, "failed": 0}
+
+    def test_missing_granule_ids_sibling_is_neither_touched_nor_failed(self, tmp_path):
+        # A leaf written before issue #388 (or one whose fail-open sibling PUT
+        # was lost) has no granules.json: absent, not a failure.
+        _node, leaf, _column = _make_unit(tmp_path, granule_ids=False)
+        counts = lifecycle.touch_current_unit(str(leaf))
+        assert counts == {"touched": 5, "failed": 0}
 
     def test_a_failing_utime_counts_and_never_raises(self, tmp_path, monkeypatch):
         node, leaf, _column = _make_unit(tmp_path)
@@ -106,7 +116,7 @@ class TestTouchLocal:
 
         monkeypatch.setattr(lifecycle.os, "utime", flaky)
         counts = lifecycle.touch_current_unit(str(leaf))
-        assert counts == {"touched": 4, "failed": 1}
+        assert counts == {"touched": 5, "failed": 1}
 
     def test_footprint_assembly_failure_is_fail_open(self):
         # A leaf name the spec-keyed naming seam refuses (not a .zarr name)
@@ -128,6 +138,7 @@ class TestTouchLocal:
         outsiders = [
             node / "123_2020.zarr" / "zarr.json",  # the sibling window's leaf
             node / "stats_2020.json",  # ...and its sidecar
+            node / "granules_2020.json",  # ...and its recorded id list
             node / "shardmap_2020.json",  # ...and its sub-map
             # A key that is a STRING prefix extension of the leaf's: matched
             # by a prefix-less LIST, excluded by the trailing slash.
@@ -233,6 +244,7 @@ class TestTouchS3:
         calls = client.copy_object.call_args_list
         assert {c.kwargs["Key"] for c in calls} == set(self.TREE_KEYS) | {
             "store/-5/1/stats.json",
+            "store/-5/1/granules.json",
             "store/-5/1/shardmap.json",
         }
         for c in calls:
@@ -242,7 +254,7 @@ class TestTouchS3:
             # LIST/HEAD omit the class for STANDARD; the copy must still name
             # one, or REPLACE resets whatever the object had.
             assert c.kwargs["StorageClass"] == "STANDARD"
-        assert counts == {"touched": 5, "failed": 0}
+        assert counts == {"touched": 6, "failed": 0}
 
     def test_the_storage_class_is_preserved_not_reset_to_standard(self, monkeypatch):
         # MetadataDirective=REPLACE covers SYSTEM metadata, so a copy with no
@@ -266,10 +278,11 @@ class TestTouchS3:
             self.TREE_KEYS[1]: "STANDARD_IA",
             # The siblings have no LIST entry: one HEAD each buys the class.
             "store/-5/1/stats.json": "STANDARD_IA",
+            "store/-5/1/granules.json": "STANDARD_IA",
             "store/-5/1/shardmap.json": "STANDARD_IA",
         }
-        assert client.head_object.call_count == 2  # named objects only
-        assert counts == {"touched": 4, "failed": 0}
+        assert client.head_object.call_count == 3  # named objects only
+        assert counts == {"touched": 5, "failed": 0}
 
     def test_absent_sibling_is_neither_touched_nor_failed(self, monkeypatch):
         # copy of a missing key (e.g. no sub-map was ever written) NoSuchKey-s;
@@ -283,7 +296,7 @@ class TestTouchS3:
         err = ClientError({"Error": {"Code": "AccessDenied"}}, "CopyObject")
         self._client(monkeypatch, copy_error=err)
         counts = lifecycle.touch_current_unit(f"s3://{self.BUCKET}/store/-5/1/{LEAF}")
-        assert counts == {"touched": 0, "failed": 5}
+        assert counts == {"touched": 0, "failed": 6}
 
     def test_a_list_fault_aborts_fail_open(self, monkeypatch):
         client = self._client(monkeypatch)

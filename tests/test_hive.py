@@ -981,9 +981,13 @@ class TestProcessAndWriteHive:
                 continue
             if dirpath.endswith(".zarr") or ".zarr" + os.sep in dirpath:
                 continue  # inside a leaf: vanilla zarr v3, its own business
-            # An intermediate digit node: no objects (zarr.json or otherwise),
-            # only digit children and leaf dirs.
-            assert filenames == [], f"object above the leaf at {dirpath}: {filenames}"
+            # An intermediate digit node: no ZARR metadata, only digit
+            # children, leaf dirs, and the leaf's own JSON siblings (the D20
+            # stats sidecar, its issue #388 granule-id list, the D22 sub-map).
+            assert all(f.endswith(".json") for f in filenames), (
+                f"non-JSON object above the leaf at {dirpath}: {filenames}"
+            )
+            assert "zarr.json" not in filenames, f"zarr metadata above the leaf at {dirpath}"
             for d in dirnames:
                 assert d.endswith(".zarr") or (len(d) == 1 and d in "1234"), (
                     f"non-hive child {d!r} at {dirpath}"
@@ -1248,13 +1252,14 @@ class TestLeafSkipIfCurrent:
         assert meta["semantic_hash"] == "f" * 64
 
     def test_unrecorded_ids_rewrites_with_its_own_classification(self, monkeypatch, cfg, tmp_path):
-        # A pre-#388 sidecar records no granule_ids: any mismatch classifies
-        # ``unrecorded-ids`` and rewrites — the guard is INERT there, and the
-        # classification is what the run stats count apart (cells_unrecorded).
-        from zagg.telemetry import write_sidecar
+        # A leaf written before issue #388 has no granule-id sibling beside
+        # its sidecar, so any mismatch classifies ``unrecorded-ids`` and
+        # rewrites — the guard is INERT there, and the classification is what
+        # the run stats count apart (cells_unrecorded).
+        from zagg.telemetry import granule_ids_path
 
         grid, shard, root, record = self._write_leaf(monkeypatch, cfg, tmp_path)
-        write_sidecar(hive.shard_leaf_path(root, shard), {**record, "granule_ids": None})
+        os.remove(granule_ids_path(hive.shard_leaf_path(root, shard)))
         calls = self._counting_fake(monkeypatch, grid)
         meta = hive.process_and_write_hive(
             shard, [self.URLS[0]], grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
@@ -2066,7 +2071,7 @@ class TestRunnerWiring:
         from zagg import runner
         from zagg.grids import from_config
         from zagg.runner import agg
-        from zagg.telemetry import read_sidecar
+        from zagg.telemetry import read_granule_ids, read_sidecar
 
         cfg.output["store_layout"] = "hive"
         catalog_path, shard = self._catalog(tmp_path)
@@ -2087,7 +2092,9 @@ class TestRunnerWiring:
         assert (s1["objects_touched"], s1["touch_failures"]) == (0, 0)
         leaf = hive.shard_leaf_path(root, shard)
         sidecar = read_sidecar(leaf)
-        assert sidecar["granule_ids"] == [_rec(1)["s3"]]
+        # The id LIST is the sidecar's sibling, never a record key (issue #388).
+        assert "granule_ids" not in sidecar
+        assert read_granule_ids(leaf)["granule_ids"] == [_rec(1)["s3"]]
 
         # Age the store-ROOT objects: ensure_manifest early-returns on a
         # frozen-key match, so without the phase-3 root touch they would keep
@@ -2144,7 +2151,7 @@ class TestRunnerWiring:
         from zagg import runner
         from zagg.grids import from_config
         from zagg.runner import agg
-        from zagg.telemetry import read_sidecar
+        from zagg.telemetry import read_granule_ids, read_sidecar
 
         cfg.output["store_layout"] = "hive"
         shard = _shard_word()
@@ -2182,17 +2189,20 @@ class TestRunnerWiring:
         agg(cfg, catalog=full, store=root, backend="local")
         leaf = hive.shard_leaf_path(root, shard)
         sidecar = read_sidecar(leaf)
-        assert len(calls) == 1 and len(sidecar["granule_ids"]) == 2
+        recorded_ids = read_granule_ids(leaf)
+        assert len(calls) == 1 and len(recorded_ids["granule_ids"]) == 2
 
         s2 = agg(cfg, catalog=contracted, store=root, backend="local")
         assert len(calls) == 1  # refused: the fold never ran
         assert s2["cells_refused"] == 1 and s2["cells_error"] == 0
-        assert read_sidecar(leaf) == sidecar  # leaf + sidecar untouched
+        # leaf, sidecar and recorded id list all untouched by the refusal
+        assert read_sidecar(leaf) == sidecar
+        assert read_granule_ids(leaf) == recorded_ids
 
         s3 = agg(cfg, catalog=contracted, store=root, backend="local", allow_contraction=True)
         assert len(calls) == 2  # the flag proceeds as a normal D4 rewrite
         assert s3["cells_refused"] == 0 and s3["cells_with_data"] == 1
-        assert read_sidecar(leaf)["granule_ids"] == [_rec(1)["s3"]]
+        assert read_granule_ids(leaf)["granule_ids"] == [_rec(1)["s3"]]
 
     def test_lambda_hive_fires_async_setup_after_ping(self, monkeypatch, cfg, tmp_path):
         # Issue #252 hybrid: a hive lambda run dispatches NO synchronous

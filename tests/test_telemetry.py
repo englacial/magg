@@ -8,12 +8,16 @@ from zagg.telemetry import (
     build_record,
     failure_record,
     flatten_record,
+    granule_ids_key,
+    granule_ids_path,
     granules_sha256,
     merge,
+    read_granule_ids,
     read_sidecar,
     run_parquet_key,
     sidecar_key,
     sidecar_path,
+    write_granule_ids,
     write_run_parquet,
     write_sidecar,
 )
@@ -477,6 +481,59 @@ class TestSidecarIO:
         assert read_sidecar(str(tmp_path / "-4" / "-4.zarr")) is None
 
 
+class TestGranuleIdsSibling:
+    """The recorded id list is its own sibling (issue #388, ruled (6)(c)):
+    same spec-keyed grammar as the sidecar, self-pairing, fail-open."""
+
+    IDS = ["s3://b/g2.h5", "s3://b/g1.h5"]
+
+    def test_key_shares_the_sidecar_grammar(self):
+        from zagg.windows import leaf_name_v3
+
+        assert granule_ids_key("-4211322.zarr") == "granules.json"
+        assert granule_ids_key("-4211322_20260713.zarr") == "granules_20260713.json"
+        assert granule_ids_key(leaf_name_v3("2019"), SPEC_V3) == "2019.granules.json"
+        # And the same strictness: an unknown spec cannot silently fall back.
+        with pytest.raises(ValueError, match="unknown store spec"):
+            granule_ids_key("-4211322.zarr", "morton-hive/4")
+
+    def test_path_is_a_sibling_beside_the_sidecar(self):
+        leaf = "/root/-4/2/1/1/3/2/2/-4211322.zarr"
+        assert granule_ids_path(leaf) == "/root/-4/2/1/1/3/2/2/granules.json"
+
+    def test_write_read_roundtrip_sorted_and_self_hashing(self, tmp_path):
+        leaf = str(tmp_path / "-4" / "2" / "-42.zarr")
+        assert write_granule_ids(leaf, self.IDS) is True
+        got = read_granule_ids(leaf)
+        assert got["granule_ids"] == sorted(self.IDS)
+        # Self-pairing: the object carries the hash of the list it holds, so a
+        # reader can reject a sibling that does not belong to the sidecar.
+        assert got["granules_sha256"] == granules_sha256(self.IDS)
+        assert (tmp_path / "-4" / "2" / "granules.json").exists()
+
+    def test_empty_id_set_records_an_empty_list(self, tmp_path):
+        leaf = str(tmp_path / "-4" / "2" / "-42.zarr")
+        write_granule_ids(leaf, [])
+        got = read_granule_ids(leaf)
+        assert got["granule_ids"] == [] and got["granules_sha256"] is None
+
+    def test_write_is_fail_open(self, tmp_path, monkeypatch):
+        # Called from the seam with the leaf already COMMITTED: a failed PUT
+        # must count as "no recorded set" on a later run, never fail the unit.
+        import obstore
+
+        def boom(*a, **k):
+            raise RuntimeError("nope")
+
+        monkeypatch.setattr(obstore, "put", boom)
+        leaf = str(tmp_path / "-4" / "2" / "-42.zarr")
+        assert write_granule_ids(leaf, self.IDS) is False
+
+    def test_read_absent_returns_none(self, tmp_path):
+        (tmp_path / "-4").mkdir()
+        assert read_granule_ids(str(tmp_path / "-4" / "-4.zarr")) is None
+
+
 class TestRunParquet:
     """Run-level parquet rows (issue #297 phase 3): flattened records plus
     dispatcher-built failure rows, round-trippable by fastparquet and pyarrow."""
@@ -690,23 +747,27 @@ class TestRunParquetShardKeyExactness:
 
 
 class TestRecordedIdentity:
-    """Issue #388 record keys: the granule-id list behind granules_sha256,
-    the #383 column basename, and the metadata semantic-hash fallback."""
+    """Issue #388 record keys: the catalog hash (the id LIST is a sibling
+    object, not a record key), the #383 column basename, and the metadata
+    semantic-hash fallback."""
 
-    def test_granule_ids_recorded_sorted_with_duplicates(self):
-        # The hash's own canonical form: sorted, duplicates kept — so the
-        # recorded list regenerates the recorded hash exactly.
+    def test_the_id_list_is_never_a_record_key(self):
+        # Ruled (question (6)(c)): the record carries the HASH only, so the
+        # per-shard identity GETs and the response envelope stay small.
         rec = build_record(
             shard_key=1,
             metadata={"duration_s": 1.0},
             granule_ids=["s3://b/g2.h5", "s3://b/g1.h5", "s3://b/g1.h5"],
         )
-        assert rec["granule_ids"] == ["s3://b/g1.h5", "s3://b/g1.h5", "s3://b/g2.h5"]
-        assert rec["granules_sha256"] == granules_sha256(rec["granule_ids"])
+        assert "granule_ids" not in rec
+        # Duplicates are kept: the hash is over the sorted multiset.
+        assert rec["granules_sha256"] == granules_sha256(
+            ["s3://b/g1.h5", "s3://b/g1.h5", "s3://b/g2.h5"]
+        )
+        assert rec["n_granules"] == 3
 
-    def test_granule_ids_absent_reads_none(self):
+    def test_granules_sha256_absent_reads_none(self):
         rec = build_record(shard_key=1, metadata={"duration_s": 1.0})
-        assert rec["granule_ids"] is None
         assert rec["granules_sha256"] is None
 
     def test_leaf_column_rides_metadata(self):
@@ -747,10 +808,10 @@ class TestRecordedIdentity:
         b = _record()
         b["timestamp"] = a["timestamp"]
         folded = merge([a, b])
-        assert folded["granule_ids"] == a["granule_ids"]
+        assert folded["granules_sha256"] == a["granules_sha256"]
         assert folded["leaf_column"] is None  # absent in both -> stays None
         mismatched = _record(granules=("s3://b/other.h5",))
-        assert merge([a, mismatched])["granule_ids"] is None
+        assert merge([a, mismatched])["granules_sha256"] is None
 
     def test_merge_folds_leaf_column_equal_or_none(self):
         # The reading that matters for a windowed node: two windows of one
@@ -769,14 +830,14 @@ class TestRecordedIdentity:
         # with one that wrote none reads as "no common column").
         assert merge([with_column("all.pyramid.zarr"), _record()])["leaf_column"] is None
 
-    def test_merge_single_record_does_not_alias_the_id_list(self):
+    def test_merge_single_record_does_not_alias_nested_dicts(self):
         a = _record()
+        a["content_hashes"] = {"arrays": {"h_li": "ab"}, "combined": "cd"}
         folded = merge([a])
-        assert folded["granule_ids"] == a["granule_ids"]
-        folded["granule_ids"].append("mutated")
-        assert a["granule_ids"][-1] != "mutated"
+        folded["content_hashes"]["arrays"]["h_li"] = "mutated"
+        assert a["content_hashes"]["arrays"]["h_li"] == "ab"
 
-    def test_flatten_carries_leaf_column_not_granule_ids(self):
+    def test_flatten_carries_leaf_column_not_the_id_list(self):
         rec = build_record(
             shard_key=1, metadata={"duration_s": 1.0, "leaf_column": "all.pyramid.zarr"}
         )

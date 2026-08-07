@@ -8,8 +8,9 @@ across the unit's WHOLE footprint (lifecycle rules act per object):
 
 - the leaf ``.zarr`` tree — commit stamp, arrays, and the in-leaf
   ``coverage.moc`` sidecar included (they are objects under the prefix);
-- the D20 stats sidecar and D22 sub-map SIBLINGS of the leaf
-  (:func:`zagg.telemetry.sidecar_key` / :func:`zagg.sweep.submap_key`, the
+- the D20 stats sidecar, its issue #388 granule-id list, and the D22 sub-map
+  SIBLINGS of the leaf (:func:`zagg.telemetry.sidecar_key` /
+  :func:`zagg.telemetry.granule_ids_key` / :func:`zagg.sweep.submap_key`, the
   spec-keyed naming seams);
 - the issue #383 leaf column tree plus its own stats sidecar, when the run
   declares one — the identity gate has already verified declaration and
@@ -114,12 +115,16 @@ def touch_current_unit(
     try:
         from zagg.column import _sidecar_name as column_sidecar_name
         from zagg.sweep import submap_key
-        from zagg.telemetry import sidecar_path
+        from zagg.telemetry import granule_ids_path, sidecar_path
 
         prefix, _, name = str(leaf_path).rstrip("/").rpartition("/")
         trees = [str(leaf_path)]
         objects = [
             sidecar_path(str(leaf_path), sidecar_spec),
+            # The recorded id list (issue #388) ages with the sidecar it
+            # pairs with: losing it to a lifecycle rule would silently
+            # disarm the contraction guard on a leaf that is otherwise fresh.
+            granule_ids_path(str(leaf_path), sidecar_spec),
             f"{prefix}/{submap_key(name, sidecar_spec)}",
         ]
         if column_path:

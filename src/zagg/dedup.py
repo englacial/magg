@@ -25,7 +25,10 @@ silently ships wrong data; a wrong "recompute" costs one shard's work.
 :func:`classify_leaf_identity` (issue #388) is the worker-side flavor of the
 same comparison: pure (the caller supplies the recorded sidecar), with the
 id-set reading — equal / expansion / contraction / mixed — that the leaf
-skip-if-current and contraction-guard decisions key on.
+skip-if-current and contraction-guard decisions key on. The recorded id LIST
+it diffs against is NOT in the sidecar: it sits in a sibling object read
+lazily, on hash mismatch only, through :func:`leaf_recorded_ids` — so both
+comparisons above keep their one small GET per shard.
 """
 
 from __future__ import annotations
@@ -166,13 +169,53 @@ def has_run(
 IDENTITY_ACTIONS = ("skip", "rewrite", "refuse")
 
 
-def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
+def leaf_recorded_ids(leaf_path, recorded, *, spec=None, store_kwargs=None):
+    """The leaf's recorded granule-id list, or ``None`` (issue #388).
+
+    Reads the sidecar's ``granules.json`` SIBLING
+    (:func:`zagg.telemetry.read_granule_ids`) — the object the id list moved
+    to so identity EQUALITY stays a ``granules_sha256`` compare against the
+    small sidecar. Call it only on a hash mismatch: this is the one read the
+    split exists to avoid paying per shard.
+
+    ``recorded`` is the sidecar record it must PAIR with: the sibling is
+    accepted only when its own ``granules_sha256`` equals the sidecar's, so a
+    torn rewrite (one of the two PUTs lost, or a stale sibling beside a fresh
+    sidecar) reads as no recorded set rather than as ids that could name the
+    wrong granules as dropped — or, worse, hide real ones. Fail-open on every
+    other fault (absent, unreadable, malformed): ``None``, which the caller
+    classifies ``unrecorded-ids`` and rewrites.
+    """
+    from zagg.telemetry import read_granule_ids
+
+    try:
+        sibling = read_granule_ids(str(leaf_path), spec, **(store_kwargs or {}))
+    except Exception as e:
+        logger.warning(f"granule-id sibling read failed (degrading to rewrite, issue #388): {e}")
+        return None
+    if not isinstance(sibling, dict):
+        return None
+    ids = sibling.get("granule_ids")
+    if not isinstance(ids, list):
+        return None
+    if sibling.get("granules_sha256") != (recorded or {}).get("granules_sha256"):
+        logger.warning(
+            f"granule-id sibling at {leaf_path} does not pair with the stats sidecar "
+            f"(hash mismatch) — treating the recorded id set as unrecorded (issue #388)"
+        )
+        return None
+    return ids
+
+
+def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorded_ids=None) -> dict:
     """Classify one planned unit against its leaf's recorded identity (#388).
 
     Identity is the ruled PAIR: the run's ``semantic_hash`` (what/how, D19)
     x the unit's planned granule-id set (over what). The recorded side is
-    the leaf's D20 stats sidecar (``semantic_hash``, ``granules_sha256``,
-    and — from issue #388 on — ``granule_ids``).
+    the leaf's D20 stats sidecar (``semantic_hash``, ``granules_sha256``) —
+    and, only when those disagree, the recorded id LIST, which lives in the
+    sidecar's own sibling object and is fetched through
+    ``load_recorded_ids`` (:func:`leaf_recorded_ids`).
 
     Fast path: ``granules_sha256`` equality (one compare — the common rerun
     case). The id-set difference runs ONLY on a mismatch, classifying:
@@ -205,7 +248,8 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
     ``no-sidecar``/``expansion``: callers must count and surface it apart
     from the ordinary rewrites (the phase-2 run stats, the phase-4 operator
     docs), because the guard cannot protect any leaf written before this
-    release — no fleet sidecar predating issue #388 records ``granule_ids``.
+    release — no leaf written before issue #388 has the granule-id sibling
+    that records its input set.
 
     Parameters
     ----------
@@ -222,6 +266,12 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
         planned set is UNKNOWN and never refuses (``unknown-planned``); the
         empty list means the unit genuinely plans no inputs, which against a
         non-empty recorded set is a full contraction and does refuse.
+    load_recorded_ids : callable, optional
+        Zero-argument loader for the leaf's RECORDED id list, called at most
+        once and ONLY after the ``granules_sha256`` fast path failed — the
+        laziness is the whole point of keeping the list out of the record
+        (issue #388's ruling). ``None`` (or a loader returning ``None``)
+        means no recorded set is available: ``unrecorded-ids``.
 
     Returns
     -------
@@ -242,13 +292,17 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
     semantic_match = semantic_hash is not None and recorded.get("semantic_hash") == semantic_hash
     if rec_hash is not None and rec_hash == granules_sha256(planned) and semantic_match:
         return {"action": "skip", "classification": "equal", "missing": []}
-    rec_ids = recorded.get("granule_ids")
+    # The ONE read the fast path exists to avoid: the recorded id list lives
+    # beside the sidecar, not in it (issue #388's ruling on question (6)), and
+    # is fetched only now that the hashes disagree.
+    rec_ids = load_recorded_ids() if load_recorded_ids is not None else None
     if rec_ids is None:
-        # Pre-#388 sidecar (or a cross-leaf rollup, where the field collapses
-        # to None): something mismatched, but there is no recorded set to
-        # diff — undecidable, so today's rewrite. NOT a benign ambiguity: on
-        # a contracted rerun this is the wholesale rewrite the guard exists to
-        # stop, and every leaf written before this release lands here. Its own
+        # No recorded set to diff — a pre-#388 leaf, a lost sibling PUT, or a
+        # sibling that does not pair with the sidecar. Something mismatched,
+        # but the direction is undecidable, so today's rewrite. NOT a benign
+        # ambiguity: on a contracted rerun this is the wholesale rewrite the
+        # guard exists to stop, and every leaf written before this release
+        # lands here. Its own
         # classification for exactly that reason — count it apart from the
         # ordinary rewrites and say so in the operator docs (see the class
         # docstring's one-sided-conservatism note).
@@ -271,4 +325,11 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
     return {"action": "rewrite", "classification": "expansion", "missing": []}
 
 
-__all__ = ["IDENTITY_ACTIONS", "STATUSES", "classify_leaf_identity", "has_run", "shard_status"]
+__all__ = [
+    "IDENTITY_ACTIONS",
+    "STATUSES",
+    "classify_leaf_identity",
+    "has_run",
+    "leaf_recorded_ids",
+    "shard_status",
+]
