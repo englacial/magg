@@ -726,10 +726,35 @@ periodically to keep them alive" workaround silently no-ops. The store-root
 trio, separately, is touched by the
 **local backend only** (D8 keeps the Lambda dispatcher from writing to the
 store, and the handler has no root-touch mode yet — PR #397 question (10)).
-Until those close, do not scope a hard-expiry rule over the whole store
-prefix and rely on skip re-runs alone to keep it alive: scope expiry to the
-leaf data planes, or give root and pyramid objects their own (longer)
-retention.
+
+**There is no lifecycle rule that separates leaves from the ancestor
+artifacts above them.** An S3 lifecycle filter keys on prefix, object tags,
+and size only; zagg's writers set no object tags; and per
+[the specification §4.1–§4.2](specification.md) an overview lives at an
+**ancestor digit node inside the same prefix tree** as the leaves it
+summarizes, where "nothing about the *name* distinguishes an overview from a
+leaf" (classification is by root-group attrs, which no lifecycle engine
+reads). So "scope expiry to the leaf data planes"
+is not writable as a rule: the only prefix that selects leaves while
+excluding ancestors is a per-shard-node prefix, against a 1,000-rule bucket
+cap. The honest options today are:
+
+1. **No expiry rule on a pyramid-declaring hive store.** The safe default
+   while the gaps above are open.
+2. **Accept expiry over the digit tree**, understanding that it takes the
+   ancestor artifacts with it. Those are regenerable caches, never
+   load-bearing ([specification §4.1](specification.md)), so the cost is a
+   full rebuild by a
+   sweep — not data loss. Exclude the store-root trio by name (three known
+   objects at a known prefix); `morton_hive.json` is REQUIRED reader-facing
+   schema and expiring it bricks the store.
+3. **The levers that would make a leaf-scoped rule writable do not exist
+   yet**: object tags stamped at write time (nothing in zagg writes any), or
+   a scheduled refresher that re-PUTs the ancestor layer — the staged sweep
+   of [issue #384](https://github.com/englacial/zagg/issues/384) is the
+   obvious candidate, but nothing about it promises a refresh today. Both
+   are open; see PR #397 question (10) for the related fleet-side root
+   touch.
 
 ## Raster hive stores (issue #247)
 
