@@ -87,9 +87,9 @@ _EQ_OR_NONE_KEYS = (
     "granule_ids",
     # Leaf pyramid column basename (issue #383's deferred run-record key,
     # landed with #388): D22 discovery is run-record-driven, so column
-    # existence must be discoverable without a tree listing. The name is
-    # SQL-reserved where this reaches parquet — see _ROW_SCALARS below.
-    "column",
+    # existence must be discoverable without a tree listing. Named
+    # ``leaf_column``, not ``column`` — see _ROW_SCALARS below.
+    "leaf_column",
     "zagg_version",
     "lambda",
     "invoked_by",
@@ -271,17 +271,23 @@ def build_record(
         # so run-record-driven discovery (D22) sees columns without a tree
         # listing. The column's resolution set lives in the artifact's own
         # ``zagg_column`` attrs — read the column, not this row, for it.
-        # READ IT AS: "the column basename this UNIT wrote alongside its
-        # leaf" — NOT "the column this record describes". ``None`` means no
-        # column was recorded by this unit; it is never a denial that the
-        # described artifact is one. The pyramid column's OWN stats sidecar
-        # records ``None`` here (``zagg.column`` builds it from a hand-made
-        # metadata dict with no ``column`` key — only the leaf record carries
-        # the basename, via ``hive.py``), and so does any cross-leaf rollup,
-        # where the equal-or-None merge collapses it. So a sidecar scan for
-        # column-bearing units must key on the LEAF records, not on the
-        # column artifacts' own.
-        "column": metadata.get("column"),
+        #
+        # Named ``leaf_column`` (espg ruling on issue #388, question (5)(c);
+        # renamed before the schema released) for two reasons. (1) ``column``
+        # is SQL-reserved in both engines this record's parquet targets
+        # (DuckDB, Trino/Athena): the unquoted ``WHERE column IS NOT NULL``
+        # is a parse error, so every filter would have to quote it. (2) It
+        # reads correctly on the pyramid column's OWN record: "the column
+        # this LEAF carries" — NOT "the column this record describes".
+        # ``None`` means no column was recorded by this unit; it is never a
+        # denial that the described artifact is one. The pyramid column's own
+        # stats sidecar records ``None`` here (``zagg.column`` builds it from
+        # a hand-made metadata dict with no ``leaf_column`` key — only the
+        # leaf record carries the basename, via ``hive.py``), and so does any
+        # cross-leaf rollup, where the equal-or-None merge collapses it. So a
+        # sidecar scan for column-bearing units must key on the LEAF records,
+        # not on the column artifacts' own.
+        "leaf_column": metadata.get("leaf_column"),
         "gb_seconds": gb_seconds,
         "est_cost_usd": est_cost,
         "max_memory_mb": _opt_float(metadata.get("max_memory_mb")),
@@ -403,18 +409,19 @@ _ROW_SCALARS = (
     "raster_bytes_read",
     "raster_px_decoded",
     "raster_px_sampled",
-    # Column basename (issue #383's deferred run-record key): a scalar
+    # Leaf column basename (issue #383's deferred run-record key): a scalar
     # string, so D22 run-record discovery can find column-bearing leaves
-    # from the run parquet alone, without a tree listing. Mind the spelling
-    # at the query: ``column`` is SQL-reserved and reserved in both engines
-    # this parquet targets (DuckDB, Trino/Athena), so a filter on it must
-    # quote the identifier — ``WHERE "column" IS NOT NULL``, not
-    # ``WHERE column IS NOT NULL``, which is a parse error. Renaming the key
-    # (``column_name`` / ``leaf_column``) is open for review while the
-    # schema is unreleased — see the PR's Questions for review.
+    # from the run parquet alone, without a tree listing. The name is
+    # ``leaf_column`` and not the bare ``column`` precisely because this is
+    # the form the query engines see: ``column`` is SQL-reserved in DuckDB
+    # and Trino/Athena, where ``WHERE column IS NOT NULL`` is a parse error
+    # and every filter would need ``WHERE "column" IS NOT NULL``. It also
+    # reads right on the pyramid column's own row ("the column this LEAF
+    # carries"). Renamed pre-release under the issue #388 ruling; nothing
+    # published this schema under the old spelling.
     # ``granule_ids`` (a list) stays out — the parquet join key for catalog
     # identity is granules_sha256.
-    "column",
+    "leaf_column",
     "max_memory_mb",
     "container_hwm_mb",
     "timestamp",

@@ -834,7 +834,7 @@ class TestWorkerIntegration:
 
         meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
         assert meta.get("error") is None
-        assert meta["column"] == "all.pyramid.zarr"
+        assert meta["leaf_column"] == "all.pyramid.zarr"
         assert "column" in meta["phase_timings"]
         assert read_commit(open_store(str(leaf))) is not None
         column = leaf.parent / "all.pyramid.zarr"
@@ -854,18 +854,18 @@ class TestWorkerIntegration:
 
     def test_no_column_without_the_overviews_knob(self, tmp_path, monkeypatch):
         meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=None)
-        assert meta.get("error") is None and "column" not in meta
+        assert meta.get("error") is None and "leaf_column" not in meta
         assert not list(leaf.parent.glob("*.pyramid.zarr"))
 
     def test_dropping_the_knob_clears_the_previous_column(self, tmp_path, monkeypatch):
         meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
-        assert meta["column"] == "all.pyramid.zarr"
+        assert meta["leaf_column"] == "all.pyramid.zarr"
         assert (leaf.parent / "all.pyramid.zarr").exists()
         assert (leaf.parent / "all.pyramid.stats.json").exists()
         # Same leaf, declaration removed: the fresh leaf must not keep a
         # STAMPED column folded from the superseded run's cells.
         meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=None)
-        assert meta.get("error") is None and "column" not in meta
+        assert meta.get("error") is None and "leaf_column" not in meta
         assert not (leaf.parent / "all.pyramid.zarr").exists()
         assert not (leaf.parent / "all.pyramid.stats.json").exists()
         assert (leaf / "zarr.json").exists()
@@ -882,7 +882,7 @@ class TestWorkerIntegration:
             time_range=[31536000.0, 31536060.0],
         )
         assert meta.get("error") is None
-        assert meta["column"] == "2019.pyramid.zarr"
+        assert meta["leaf_column"] == "2019.pyramid.zarr"
         stamp = read_commit(open_store(str(leaf.parent / "2019.pyramid.zarr")))
         assert stamp is not None and stamp["window"] == "2019"
         # The D15 truth half: the worker's observed extent, converted to the
@@ -903,10 +903,10 @@ class TestWorkerIntegration:
             )
 
         meta, leaf = run("2019", 0.0, 1.0)
-        assert meta["column"] == "2019.pyramid.zarr"
+        assert meta["leaf_column"] == "2019.pyramid.zarr"
         first = _column_bytes(leaf.parent / "2019.pyramid.zarr")
         meta = run("2020", 1.0, 2.0)[0]
-        assert meta["column"] == "2020.pyramid.zarr"
+        assert meta["leaf_column"] == "2020.pyramid.zarr"
         # The D13 case: the second window's WHOLESALE clear is scoped to its
         # own basename, so the first window's column and sidecar are untouched.
         assert _column_bytes(leaf.parent / "2019.pyramid.zarr") == first
@@ -936,7 +936,7 @@ class TestWorkerIntegration:
         meta, stream_leaf = _run_unit(
             tmp_path / "stream", monkeypatch, pyramid=self.PYRAMID, sharded=False
         )
-        assert meta.get("error") is None and meta["column"] == "all.pyramid.zarr"
+        assert meta.get("error") is None and meta["leaf_column"] == "all.pyramid.zarr"
         assert _column_bytes(stream_leaf.parent / "all.pyramid.zarr") == _column_bytes(
             leaf.parent / "all.pyramid.zarr"
         )
@@ -953,7 +953,7 @@ class TestWorkerIntegration:
         # build its failure record from, and the unit still reports FAILED.
         assert meta["error"] == "leaf column: column write exploded"
         assert meta["column_error"] == "column write exploded"
-        assert "column" not in meta
+        assert "leaf_column" not in meta
         # The state the retry has to repair (§4.6 failure identity): the leaf
         # is COMMITTED and stamped, and no column stands beside it.
         assert read_commit(open_store(str(leaf))) is not None
@@ -977,7 +977,7 @@ class TestWorkerIntegration:
     def test_errored_shard_writes_neither_leaf_nor_column(self, tmp_path, monkeypatch):
         meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID, fail=True)
         assert meta.get("error") == "synthetic failure"
-        assert "column" not in meta
+        assert "leaf_column" not in meta
         assert not leaf.exists()
         assert not list(leaf.parent.glob("*.pyramid.zarr"))
 
@@ -1046,7 +1046,7 @@ class TestColumnDefeatsTheSkipGate:
         # Same inputs, same D19 hash; only the declaration changed.
         redo, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID, skip_if_current=True)
         assert redo["identity"] == "column-drift" and "current" not in redo
-        assert redo["column"] == "all.pyramid.zarr"
+        assert redo["leaf_column"] == "all.pyramid.zarr"
         assert (leaf.parent / "all.pyramid.zarr").exists()
 
     def test_dropping_the_column_defeats_the_skip(self, tmp_path, monkeypatch):
@@ -1095,7 +1095,7 @@ class TestColumnDefeatsTheSkipGate:
             time_range=[31536000.0, 31536060.0],
             skip_if_current=True,
         )
-        assert redo["identity"] == "column-drift" and redo["column"] == "2019.pyramid.zarr"
+        assert redo["identity"] == "column-drift" and redo["leaf_column"] == "2019.pyramid.zarr"
         assert (leaf.parent / "2019.pyramid.zarr").exists()
 
     def test_a_skip_touches_the_column_family_too(self, tmp_path, monkeypatch):
