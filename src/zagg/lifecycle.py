@@ -75,8 +75,20 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 logger = logging.getLogger(__name__)
+
+#: Process-wide S3 clients, keyed by the store kwargs that built them. The
+#: touch runs once per (shard, window) unit and the local dispatcher runs
+#: those units in a ThreadPoolExecutor, so a per-call client would mean one
+#: ~0.1-0.3 s ``boto3.client()`` construction per unit (minutes of pure
+#: construction on a few-thousand-shard all-skip rerun) AND concurrent
+#: construction off the shared default session, which botocore does not
+#: guarantee is thread-safe. A BUILT client is safe to share across threads;
+#: building is what needs the lock (and its own ``Session``).
+_CLIENTS: dict = {}
+_CLIENT_LOCK = threading.Lock()
 
 
 def touch_current_unit(
@@ -149,17 +161,16 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
     fault) counts one failure and abandons the remainder (best-effort).
     """
     counts = {"touched": 0, "failed": 0}
-    box: dict = {}
     try:
         for tree in trees:
             if _is_s3(tree):
-                _touch_s3_tree(_client(box, store_kwargs), tree, counts)
+                _touch_s3_tree(_client(store_kwargs), tree, counts)
             else:
                 _touch_local_tree(tree, counts)
         for obj in objects:
             if _is_s3(obj):
                 bucket, key = _split_s3(obj)
-                _touch_s3_object(_client(box, store_kwargs), bucket, key, counts)
+                _touch_s3_object(_client(store_kwargs), bucket, key, counts)
             else:
                 _touch_local_object(obj, counts)
     except Exception as e:
@@ -177,15 +188,36 @@ def _split_s3(path) -> tuple:
     return bucket, key
 
 
-def _client(box: dict, store_kwargs):
-    """One lazily built S3 client per touch call (never built for local stores)."""
-    if "s3" not in box:
-        box["s3"] = _s3_client(store_kwargs or {})
-    return box["s3"]
+def _client(store_kwargs):
+    """The process-wide S3 client for these store kwargs (never built locally).
+
+    Built once per distinct store-kwargs identity and shared thereafter, with
+    construction serialized — see ``_CLIENTS``.
+    """
+    store_kwargs = store_kwargs or {}
+    creds = store_kwargs.get("credentials") or {}
+    key = (
+        store_kwargs.get("region"),
+        store_kwargs.get("endpoint_url"),
+        creds.get("accessKeyId"),
+        creds.get("secretAccessKey"),
+        creds.get("sessionToken"),
+    )
+    with _CLIENT_LOCK:
+        if key not in _CLIENTS:
+            _CLIENTS[key] = _s3_client(store_kwargs)
+        return _CLIENTS[key]
 
 
 def _s3_client(store_kwargs: dict):
-    """boto3 S3 client from the writers' store-kwargs (camelCase credentials)."""
+    """boto3 S3 client from the writers' store-kwargs (camelCase credentials).
+
+    Built through its OWN ``boto3.session.Session()`` rather than the module
+    -level default session: callers reach here from worker threads, and
+    concurrent construction off the shared default session is the documented
+    botocore hazard (its failure would be swallowed by the fail-open counting
+    into a silently unrefreshed object). ``_CLIENT_LOCK`` serializes this.
+    """
     import boto3
 
     kwargs: dict = {}
@@ -199,7 +231,7 @@ def _s3_client(store_kwargs: dict):
         kwargs["aws_secret_access_key"] = creds["secretAccessKey"]
         if creds.get("sessionToken"):
             kwargs["aws_session_token"] = creds["sessionToken"]
-    return boto3.client("s3", **kwargs)
+    return boto3.session.Session().client("s3", **kwargs)
 
 
 def _touch_local_tree(root, counts) -> None:

@@ -17,6 +17,14 @@ from zagg import lifecycle
 LEAF = "-5112333.zarr"
 
 
+@pytest.fixture(autouse=True)
+def _fresh_client_cache(monkeypatch):
+    """``lifecycle._CLIENTS`` is process-wide by design (one client per store
+    kwargs, not per unit); give each test its own so a patched ``_s3_client``
+    cannot leak a mock into the next one."""
+    monkeypatch.setattr(lifecycle, "_CLIENTS", {})
+
+
 def _make_unit(tmp_path, *, submap=True, column=False):
     """A committed-looking local unit: leaf tree + sidecar siblings."""
     node = tmp_path / "store" / "-5" / "1"
@@ -253,41 +261,72 @@ class TestTouchS3:
         counts = lifecycle.touch_current_unit(f"s3://{self.BUCKET}/store/-5/1/{LEAF}")
         assert counts["failed"] == 1 and counts["touched"] == 0
 
+    KWARGS = {
+        "region": "eu-west-1",
+        "endpoint_url": "https://r2.example",
+        "credentials": {"accessKeyId": "AK", "secretAccessKey": "SK", "sessionToken": "ST"},
+    }
+
+    def _session_spy(self, monkeypatch):
+        """Patch ``boto3.session.Session`` and record every client built."""
+        from unittest.mock import MagicMock
+
+        built = []
+
+        class FakeSession:
+            def client(self, service, **kwargs):
+                built.append({"service": service, **kwargs})
+                client = MagicMock()
+                client.get_paginator.return_value.paginate.return_value = []
+                client.head_object.return_value = {}
+                return client
+
+        monkeypatch.setattr("boto3.session.Session", FakeSession)
+        return built
+
     def test_client_is_keyed_by_the_store_kwargs(self, monkeypatch):
-        seen = {}
-
-        def fake_boto3_client(service, **kwargs):
-            from unittest.mock import MagicMock
-
-            seen["service"] = service
-            seen.update(kwargs)
-            client = MagicMock()
-            client.get_paginator.return_value.paginate.return_value = []
-            return client
-
-        import boto3
-
-        monkeypatch.setattr(boto3, "client", fake_boto3_client)
-        lifecycle.touch_current_unit(
-            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
-            store_kwargs={
-                "region": "eu-west-1",
+        # The store kwargs reach boto3 in their translated (snake_case) form,
+        # and they are the cache key: same kwargs -> the SAME client across
+        # units, different kwargs -> a second one.
+        built = self._session_spy(monkeypatch)
+        leaf = f"s3://{self.BUCKET}/store/-5/1/{LEAF}"
+        lifecycle.touch_current_unit(leaf, store_kwargs=dict(self.KWARGS))
+        assert built == [
+            {
+                "service": "s3",
+                "region_name": "eu-west-1",
                 "endpoint_url": "https://r2.example",
-                "credentials": {
-                    "accessKeyId": "AK",
-                    "secretAccessKey": "SK",
-                    "sessionToken": "ST",
-                },
-            },
-        )
-        assert seen == {
-            "service": "s3",
-            "region_name": "eu-west-1",
-            "endpoint_url": "https://r2.example",
-            "aws_access_key_id": "AK",
-            "aws_secret_access_key": "SK",
-            "aws_session_token": "ST",
-        }
+                "aws_access_key_id": "AK",
+                "aws_secret_access_key": "SK",
+                "aws_session_token": "ST",
+            }
+        ]
+        # A second unit under the same run: no second construction. (A
+        # per-call cache meant one ~0.1-0.3 s client build per unit — minutes
+        # of it on a few-thousand-shard all-skip rerun.)
+        lifecycle.touch_current_unit(leaf, store_kwargs=dict(self.KWARGS))
+        assert len(built) == 1
+        lifecycle.touch_current_unit(leaf, store_kwargs={"region": "us-west-2"})
+        assert len(built) == 2 and built[1] == {"service": "s3", "region_name": "us-west-2"}
+
+    def test_concurrent_units_share_one_client(self, monkeypatch):
+        # The local dispatcher runs units in a ThreadPoolExecutor; building a
+        # client per thread off the shared default session is the documented
+        # botocore hazard, and fail-open would swallow it into silently
+        # unrefreshed objects. One client, built under the lock, shared.
+        from concurrent.futures import ThreadPoolExecutor
+
+        built = self._session_spy(monkeypatch)
+        leaf = f"s3://{self.BUCKET}/store/-5/1/{LEAF}"
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            counts = list(
+                pool.map(
+                    lambda _i: lifecycle.touch_current_unit(leaf, store_kwargs=dict(self.KWARGS)),
+                    range(16),
+                )
+            )
+        assert len(built) == 1
+        assert all(c["failed"] == 0 for c in counts)
 
     def test_local_unit_builds_no_client(self, tmp_path, monkeypatch):
         # A local store must never construct a boto3 client (no AWS reach).
