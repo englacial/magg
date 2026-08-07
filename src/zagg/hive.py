@@ -1725,7 +1725,7 @@ def process_and_write_hive(
             metadata["column_error"] = str(e)
         else:
             if column is not None:
-                metadata["column"] = column
+                metadata["leaf_column"] = column
                 if "phase_timings" in metadata:
                     metadata["phase_timings"]["column"] = time.time() - _t0
     return metadata

@@ -581,7 +581,7 @@ class TestRunParquet:
         assert table.num_rows == 3
         assert "invoked_by" in table.column_names
 
-    def test_column_round_trips_all_null_and_mixed(self, tmp_path):
+    def test_leaf_column_round_trips_all_null_and_mixed(self, tmp_path):
         """Issue #383's deferred key is the first ``_ROW_SCALARS`` string that
         is all-null in the overwhelming majority of runs; ``object_encoding=
         "utf8"`` is what keeps fastparquet from choking on that column (the
@@ -591,7 +591,7 @@ class TestRunParquet:
         def with_column(key, name=None):
             meta = {"duration_s": 1.0}
             if name is not None:
-                meta["column"] = name
+                meta["leaf_column"] = name
             return flatten_record(build_record(shard_key=key, metadata=meta))
 
         # All-null: the ordinary run, where no unit wrote a column.
@@ -599,7 +599,7 @@ class TestRunParquet:
             str(tmp_path / "none"), [with_column(1), with_column(2)], run_id="bb01"
         )
         df = pd.read_parquet(allnull, engine="fastparquet")
-        assert "column" in df.columns and df["column"].isna().all()
+        assert "leaf_column" in df.columns and df["leaf_column"].isna().all()
 
         # Mixed: one column-bearing leaf among plain ones, the shape D22
         # discovery actually queries.
@@ -609,12 +609,12 @@ class TestRunParquet:
             run_id="bb02",
         )
         df = pd.read_parquet(mixed, engine="fastparquet").set_index("shard_key")
-        assert df.loc[2, "column"] == "all.pyramid.zarr"
-        assert pd.isna(df.loc[1, "column"]) and pd.isna(df.loc[3, "column"])
+        assert df.loc[2, "leaf_column"] == "all.pyramid.zarr"
+        assert pd.isna(df.loc[1, "leaf_column"]) and pd.isna(df.loc[3, "leaf_column"])
         # pyarrow (the duckdb/Athena reader family) sees it as a string column.
         pa_parquet = pytest.importorskip("pyarrow.parquet")
         table = pa_parquet.read_table(mixed)
-        assert "column" in table.column_names
+        assert "leaf_column" in table.column_names
 
     def test_empty_rows_raise(self, tmp_path):
         with pytest.raises(ValueError, match="at least one"):
@@ -709,12 +709,14 @@ class TestRecordedIdentity:
         assert rec["granule_ids"] is None
         assert rec["granules_sha256"] is None
 
-    def test_column_rides_metadata(self):
+    def test_leaf_column_rides_metadata(self):
         # The #383 deferred run-record key: the worker stamps
-        # metadata["column"] iff the unit wrote a column artifact.
-        assert _record()["column"] is None
-        rec = build_record(shard_key=1, metadata={"duration_s": 1.0, "column": "all.pyramid.zarr"})
-        assert rec["column"] == "all.pyramid.zarr"
+        # metadata["leaf_column"] iff the unit wrote a column artifact.
+        assert _record()["leaf_column"] is None
+        rec = build_record(
+            shard_key=1, metadata={"duration_s": 1.0, "leaf_column": "all.pyramid.zarr"}
+        )
+        assert rec["leaf_column"] == "all.pyramid.zarr"
 
     def test_semantic_hash_falls_back_to_metadata(self):
         # Issue #388: the shared seams stamp metadata["semantic_hash"], so a
@@ -746,26 +748,26 @@ class TestRecordedIdentity:
         b["timestamp"] = a["timestamp"]
         folded = merge([a, b])
         assert folded["granule_ids"] == a["granule_ids"]
-        assert folded["column"] is None  # absent in both -> stays None
+        assert folded["leaf_column"] is None  # absent in both -> stays None
         mismatched = _record(granules=("s3://b/other.h5",))
         assert merge([a, mismatched])["granule_ids"] is None
 
-    def test_merge_folds_column_equal_or_none(self):
+    def test_merge_folds_leaf_column_equal_or_none(self):
         # The reading that matters for a windowed node: two windows of one
         # shard, each having written a column, roll up. Equal survives the
         # fold; a mismatch collapses, like every other identity field.
         def with_column(name):
             return build_record(
-                shard_key=1, metadata={"duration_s": 1.0, "column": name}, window="2019"
+                shard_key=1, metadata={"duration_s": 1.0, "leaf_column": name}, window="2019"
             )
 
         same = [with_column("all.pyramid.zarr"), with_column("all.pyramid.zarr")]
-        assert merge(same)["column"] == "all.pyramid.zarr"
+        assert merge(same)["leaf_column"] == "all.pyramid.zarr"
         mixed = [with_column("all.pyramid.zarr"), with_column("h_li.pyramid.zarr")]
-        assert merge(mixed)["column"] is None
+        assert merge(mixed)["leaf_column"] is None
         # None is absorbing on this key too (a column-writing unit rolled up
         # with one that wrote none reads as "no common column").
-        assert merge([with_column("all.pyramid.zarr"), _record()])["column"] is None
+        assert merge([with_column("all.pyramid.zarr"), _record()])["leaf_column"] is None
 
     def test_merge_single_record_does_not_alias_the_id_list(self):
         a = _record()
@@ -774,8 +776,10 @@ class TestRecordedIdentity:
         folded["granule_ids"].append("mutated")
         assert a["granule_ids"][-1] != "mutated"
 
-    def test_flatten_carries_column_not_granule_ids(self):
-        rec = build_record(shard_key=1, metadata={"duration_s": 1.0, "column": "all.pyramid.zarr"})
+    def test_flatten_carries_leaf_column_not_granule_ids(self):
+        rec = build_record(
+            shard_key=1, metadata={"duration_s": 1.0, "leaf_column": "all.pyramid.zarr"}
+        )
         row = flatten_record(rec)
-        assert row["column"] == "all.pyramid.zarr"
+        assert row["leaf_column"] == "all.pyramid.zarr"
         assert "granule_ids" not in row
