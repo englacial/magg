@@ -636,7 +636,7 @@ Three verdicts:
 | verdict | when | what happens |
 |---|---|---|
 | **current** | both halves match, leaf stamped, column agrees with the declaration | fold no-ops; the unit writes **nothing** (no arrays, no stamp, no sidecar, no sub-map, no column — zero sweep dirtiness); the lifecycle touch below runs; counted as `cells_current` |
-| **refused** | the planned set drops recorded ids: `recorded ∖ planned ≠ ∅` — deliberately *not* strict-subset, so a shardmap that grew while silently dropping old granules (an upstream purge behind a fresh catalog query) still trips it | the unit refuses, logs the **first five** missing ids and their total count (the full list rides only the in-process `missing_granules` metadata, and a refused unit writes no run-record row — PR #397 question (9) — so plan triage around the count, not around recovering the set from durable artifacts), writes nothing, and counts as `cells_refused` — never as an error. `--allow-contraction` (`agg(allow_contraction=True)`; on Lambda an `allow_contraction` event field) turns it into a normal rewrite |
+| **refused** | the planned set drops recorded ids: `recorded ∖ planned ≠ ∅` — deliberately *not* strict-subset, so a shardmap that grew while silently dropping old granules (an upstream purge behind a fresh catalog query) still trips it | the unit refuses, writes nothing, and counts as `cells_refused` — never as an error. The log names the **first five** missing ids and their total; the **full per-unit diff is the refusal manifest** at the store root ([below](#the-refusal-manifest)). `--allow-contraction` (`agg(allow_contraction=True)`; on Lambda an `allow_contraction` event field) turns it into a normal rewrite |
 | **rewrite** | everything else — expansion (new cycles), a semantic change, no/unreadable sidecar, an unstamped leaf, column drift, or a pre-#388 sidecar (below) | today's wholesale D4 rewrite, column included |
 
 The gate is **on by default for the local backend**; `--overwrite` disables
@@ -703,6 +703,36 @@ beyond the column artifact (e.g. flipping `sharded` changes the leaf's
 object layout while both identity halves hold): changing those still needs
 `--overwrite` (PR #397 question (8)).
 
+### The refusal manifest
+
+A refused unit writes **nothing** — no leaf, no sidecar, no run-parquet row —
+so a run that refuses leaves the store byte-identical and the only in-band
+trace is a worker log line truncated to five missing ids. Since issue #388 a
+run that ends with `cells_refused > 0` also writes one small JSON object at
+the store root:
+
+```
+refusals_{YYYYmmddTHHMMSSZ}_{run_id}.json
+```
+
+Timestamp-first like the `stats_*.parquet` run records (and outside their
+glob, so run-record discovery never mistakes one for the other). It carries
+the run context needed to act on it — `run_id`, write timestamp, the run's
+`semantic_hash`, the zagg version — and one entry per refused unit: its
+`shard_key` and `window`, the classification (`contraction` or `mixed`), and
+the **complete** `missing_granules` list, which is exactly what the guard read
+from that leaf's granule-id sibling in order to name the drop. Triage the
+diff from this object, not from the logs.
+
+Two deliberate limits. A **pure-skip** run (nothing refused) writes nothing
+here and stays row-less — the counters and the leaf sidecars are the record of
+a no-op run, and an empty manifest per rerun would be litter. And the manifest
+is written by the **local backend only**: D8 keeps the Lambda dispatcher from
+writing to the store, and no once-per-run worker-side seam exists yet to carry
+it — the same gap, with the same resolution, as the store-root touch below
+(PR #397 question (10)). A fleet run's refusals are visible in its summary
+counters and worker logs, not in a durable object.
+
 ### The lifecycle touch
 
 A skipped unit still resets the purge clock: every object in its footprint
@@ -744,8 +774,10 @@ re-running the sweep does **not** refresh them: a second sweep over an
 unchanged tree recomputes but PUTs nothing, so the obvious "just sweep
 periodically to keep them alive" workaround silently no-ops. The store-root
 trio, separately, is touched by the
-**local backend only** (D8 keeps the Lambda dispatcher from writing to the
-store, and the handler has no root-touch mode yet — PR #397 question (10)).
+**local backend only** — as is the refusal manifest above, for the same reason
+(D8 keeps the Lambda dispatcher from writing to the store, and the handler has
+no once-per-run root-write mode yet; both wait on the same resolution — PR #397
+question (10)).
 
 **There is no lifecycle rule that separates leaves from the ancestor
 artifacts above them.** An S3 lifecycle filter keys on prefix, object tags,

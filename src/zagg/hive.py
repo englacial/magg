@@ -1184,6 +1184,7 @@ def leaf_identity_gate(
     sidecar_spec,
     store_kwargs,
     shard_key,
+    window=None,
     column_path=None,
     column_declared=None,
 ):
@@ -1280,6 +1281,10 @@ def leaf_identity_gate(
             identity = {"action": "rewrite", "classification": drift, "missing": []}
     base = {
         "shard_key": int(shard_key),
+        # The unit is (shard, WINDOW): a refusal manifest that named only the
+        # shard would be ambiguous on a windowed store, where the same shard
+        # holds one leaf per window (issue #388's ruling on question (9)).
+        "window": window,
         "identity": identity["classification"],
         "semantic_hash": semantic_hash,
         "cells_with_data": 0,
@@ -1446,6 +1451,7 @@ def process_and_write_hive(
             sidecar_spec=sidecar_spec,
             store_kwargs=store_kwargs,
             shard_key=shard_key,
+            window=window["label"] if window else None,
             column_path=column_path,
             column_declared=column_declared,
         )

@@ -490,16 +490,130 @@ def run_parquet_key(run_id: str, timestamp: str | None = None) -> str:
     ``validate_label``, a malformed value RAISES rather than composing a
     traversing key.
     """
+    return _run_scoped_key("stats", "parquet", run_id, timestamp, what="run parquet")
+
+
+#: Refusal manifest object name (issue #388, ruled question (9)(c)): the
+#: store-ROOT record of a run's contraction refusals. Timestamp-first like the
+#: run parquet and the sweep's own record, and deliberately outside the
+#: ``stats_*.parquet`` glob the sweep's run-record discovery scans.
+REFUSAL_SPEC = "zagg-refusals/1"
+
+
+def refusal_manifest_key(run_id: str, timestamp: str | None = None) -> str:
+    """Store-root object name of a run's refusal manifest (issue #388).
+
+    ``refusals_{ts}_{run_id}.json`` — the run parquet's grammar with its own
+    stem, so a listing of a store root sorts a run's artifacts together and
+    neither name can be mistaken for the other's.
+    """
+    return _run_scoped_key("refusals", "json", run_id, timestamp, what="refusal manifest")
+
+
+def _run_scoped_key(stem: str, ext: str, run_id: str, timestamp: str | None, *, what: str) -> str:
+    """``{stem}_{ts}_{run_id}.{ext}`` with both components validated.
+
+    Both flow into the object KEY, so both are checked against their frozen
+    grammar first — the D8 worker-invoke transport (issue #313) makes
+    ``timestamp`` a caller-supplied input, and an embedded ``/`` or ``..``
+    would escape the store root. Like :func:`sidecar_key`'s ``validate_label``,
+    a malformed value RAISES rather than composing a traversing key.
+    """
     ts = timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if not _RUN_TS_RE.match(ts):
         raise ValueError(
-            f"run parquet timestamp {ts!r} does not match the D20 grammar ({_RUN_TS_RE.pattern})"
+            f"{what} timestamp {ts!r} does not match the D20 grammar ({_RUN_TS_RE.pattern})"
         )
     if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
         raise ValueError(
             f"run_id {run_id!r} does not match the opaque key charset ({_RUN_ID_RE.pattern})"
         )
-    return f"stats_{ts}_{run_id}.parquet"
+    return f"{stem}_{ts}_{run_id}.{ext}"
+
+
+def write_refusal_manifest(
+    store_root: str,
+    refusals,
+    *,
+    run_id: str,
+    timestamp: str | None = None,
+    semantic_hash: str | None = None,
+    store_kwargs: dict | None = None,
+) -> str | None:
+    """PUT the run's refusal manifest at the store root; its path or ``None``.
+
+    A refused unit (the issue #388 contraction guard) writes NOTHING — no
+    leaf, no sidecar, no run-parquet row — so before this the only trace of
+    which granules a rerun would have dropped was a worker log line truncated
+    to five ids. This is the durable full list, ruled (question (9)(c)) as
+    ONE small root object per refusing run rather than a synthesized D20 row:
+    a refusal has no ``n_obs``, no ``content_hashes`` and no committed leaf to
+    describe, so a run-record row for it would change what a row IS.
+
+    ``refusals`` is the run's refused unit metadata dicts (the seams'
+    ``{"refused": True, "missing_granules": [...]}`` early returns). Each
+    contributes its unit identity, its classification (``contraction`` /
+    ``mixed``) and the FULL missing-id diff — which is exactly the id list the
+    guard read from the leaf's granule-id sibling to name the drop, composed
+    here into one place an operator can act from. Units sort by (shard,
+    window) so two runs over the same refusal set produce comparable objects.
+    Nothing is written when nothing refused: a pure-skip run stays row-less
+    and object-less at the root (ruled (9)(a)).
+
+    Fail-open (D9 telemetry class, the sweep run record's posture): a failed
+    PUT logs and returns ``None`` — the run's exit status and its
+    ``cells_refused`` count are unaffected. Callers must be store-writers in
+    their own right (D8): the local dispatcher is also the worker, which is
+    why this rides the same wrap-up seam as the root ``coverage.moc``.
+    """
+    import logging
+
+    units = []
+    for meta in refusals:
+        if not isinstance(meta, dict):
+            continue
+        missing = [str(g) for g in (meta.get("missing_granules") or [])]
+        units.append(
+            {
+                "shard_key": meta.get("shard_key"),
+                "window": meta.get("window"),
+                "identity": meta.get("identity"),
+                "n_missing": len(missing),
+                "missing_granules": missing,
+            }
+        )
+    if not units:
+        return None
+    units.sort(key=lambda u: (str(u["shard_key"]), str(u["window"])))
+    body = {
+        "spec": REFUSAL_SPEC,
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        # The run context needed to act on it: WHEN, and WHICH product
+        # (the D19 semantic core the refused units were dispatched under).
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "semantic_hash": semantic_hash,
+        "zagg_version": _zagg_version(),
+        "cells_refused": len(units),
+        "units": units,
+    }
+    try:
+        import obstore
+
+        from zagg.store import open_object_store
+
+        key = refusal_manifest_key(run_id, timestamp)
+        obstore.put(
+            open_object_store(store_root, **(store_kwargs or {})),
+            key,
+            json.dumps(body, indent=1).encode(),
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"refusal manifest write failed (fail-open, issue #388): {e}"
+        )
+        return None
+    return f"{store_root.rstrip('/')}/{key}"
 
 
 def write_run_parquet(

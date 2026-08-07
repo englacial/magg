@@ -1651,6 +1651,9 @@ class TestProcessAndWriteHiveWindowed:
             skip_if_current=True,
         )
         assert skipped["current"] is True and skipped["identity"] == "equal"
+        # The gate's verdict names the (shard, WINDOW) unit, not just the
+        # shard — what the refusal manifest keys its entries on (issue #388).
+        assert skipped["window"] == "2019"
         # ...and the touch moved exactly the 2019 unit's footprint.
         assert skipped["touched_objects"] > 0 and skipped["touch_failed"] == 0
         inside = [os.path.join(d, n) for d, _s, files in os.walk(leaf) for n in files] + [

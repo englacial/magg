@@ -1569,6 +1569,10 @@ class TestSummaryKeysByteIdentical:
         "backend",
         "results",
         "run_stats_path",  # run-level stats parquet (issue #297 phase 3)
+        # Store-root refusal manifest (issue #388): always present, None
+        # unless a unit refused. LOCAL-only — the fleet has no once-per-run
+        # worker-side write seam (D8), so _LAMBDA_KEYS below does not carry it.
+        "refusal_manifest_path",
     } | _IDENTITY_KEYS
     _LAMBDA_KEYS = {
         "total_cells",
@@ -4779,6 +4783,20 @@ class TestCliContractionGuardSurface:
         assert "Done: 0 cells with data" in out
         assert "3 refused" in out
         assert "--allow-contraction" in out
+
+    def test_refusals_point_at_the_durable_manifest(self, monkeypatch, capsys):
+        # The log truncates to five missing ids per unit; the manifest is the
+        # full diff, so the CLI must say where it is (issue #388, ruled (9)).
+        summary = {
+            **self.SUMMARY,
+            "cells_current": 0,
+            "cells_refused": 3,
+            "cells_unrecorded": 0,
+            "refusal_manifest_path": "/store/refusals_20260807T101112Z_cafe01.json",
+        }
+        self._run(monkeypatch, [], summary)
+        out = capsys.readouterr().out
+        assert "refusals_20260807T101112Z_cafe01.json" in out
 
     def test_skip_only_run_reports_current(self, monkeypatch, capsys):
         summary = {**self.SUMMARY, "cells_current": 7, "cells_refused": 0, "cells_unrecorded": 2}

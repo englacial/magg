@@ -1144,6 +1144,10 @@ class RasterStrategy:
                 root_touch = touch_store_root(store_path, store_kwargs=store_kwargs)
                 identity["objects_touched"] += root_touch["touched"]
                 identity["touch_failures"] += root_touch["failed"]
+        # Store-root refusal manifest (issue #388) — see _write_refusals.
+        refusal_manifest_path = _write_refusals(
+            store_path, ok_metas, identity, run_id, run_semantic_hash, store_kwargs
+        )
         # Run-level stats parquet (issue #297 phase 3), BEFORE the all-failed
         # raise below so the failure evidence persists at the store root.
         from zagg.telemetry import failure_record, flatten_record
@@ -1184,6 +1188,7 @@ class RasterStrategy:
             "cells_error": errors,
             # Skip-if-current run stats (issue #388) — see _identity_counts.
             **identity,
+            "refusal_manifest_path": refusal_manifest_path,
             # Shared summary key across strategies. For the raster path this is
             # the count of shard×timestep slabs written, not a per-cell obs tally
             # (see RasterStrategy docstring); ``timesteps`` is the datatake count.
@@ -2823,6 +2828,36 @@ def _identity_counts(metas) -> dict:
     }
 
 
+def _write_refusals(store_path, metas, identity, run_id, semantic_hash, store_kwargs) -> str | None:
+    """The run's store-root refusal manifest, or ``None`` (issue #388).
+
+    A refused unit writes nothing at all, so without this the missing-granule
+    diff lives only in a worker log line truncated to five ids. Ruled
+    (question (9)(c)): ONE small root object per run that refused, and — ruled
+    (9)(a) — nothing whatsoever for a pure-skip run, which stays row-less.
+
+    Rides the LOCAL wrap-up seam for the same reason the root ``coverage.moc``
+    union and the phase-3 ``touch_store_root`` do: this process is also the
+    worker and already PUTs every leaf with these credentials, so the D8
+    orchestrator-no-write rule (which sends the Lambda paths through a worker
+    invoke) does not constrain it. The FLEET has no once-per-run worker-side
+    seam to carry it, exactly as the store-root touch does not — the two share
+    a resolution (the PR #397 question (10) fork). Fail-open inside
+    ``write_refusal_manifest`` (D9).
+    """
+    if not identity["cells_refused"]:
+        return None
+    from zagg.telemetry import write_refusal_manifest
+
+    return write_refusal_manifest(
+        store_path,
+        [m for m in metas if isinstance(m, dict) and m.get("refused")],
+        run_id=run_id,
+        semantic_hash=semantic_hash,
+        store_kwargs=store_kwargs,
+    )
+
+
 def _run_local(
     config,
     catalog_data,
@@ -3174,6 +3209,9 @@ def _run_local(
         root_touch = touch_store_root(store_path, store_kwargs=store_kwargs)
         identity["objects_touched"] += root_touch["touched"]
         identity["touch_failures"] += root_touch["failed"]
+    refusal_manifest_path = _write_refusals(
+        store_path, report.results, identity, run_id, run_semantic_hash, store_kwargs
+    )
 
     summary = {
         "total_cells": len(cells),
@@ -3181,6 +3219,9 @@ def _run_local(
         "cells_error": report.cells_error,
         # Skip-if-current run stats (issue #388) — see _identity_counts.
         **identity,
+        # Store-root refusal manifest (issue #388), local-only like the root
+        # touch above; None when nothing refused — see _write_refusals.
+        "refusal_manifest_path": refusal_manifest_path,
         "total_obs": report.total_obs,
         "wall_time_s": wall_time,
         "store_path": store_path,
