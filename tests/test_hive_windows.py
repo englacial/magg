@@ -1591,6 +1591,8 @@ class TestProcessAndWriteHiveWindowed:
     def test_skip_if_current_is_per_window(self, monkeypatch, cfg, tmp_path):
         # Issue #388: the identity gate reads the (shard, window) unit's OWN
         # sidecar — window "2019" being current never skips window "2020".
+        import os
+
         import pandas as pd
 
         import zagg.processing as processing
@@ -1610,6 +1612,28 @@ class TestProcessAndWriteHiveWindowed:
         )
         write_sidecar(leaf, record)  # legacy naming -> stats_2019.json
 
+        # Over-touch pin (review finding): a hive node holds every window of
+        # the shard side by side, so the 2019 unit's touch must move 2019's
+        # objects and ONLY those — the property the tree walk's trailing slash
+        # carries, and one the "everything under the root moved" pins cannot
+        # see. ``leaf + ".bak"`` is the string-prefix extension a slash-less
+        # LIST prefix would sweep in.
+        node = os.path.dirname(leaf)
+        leaf_2020 = hive.shard_leaf_path(root, shard, window="2020")
+        os.makedirs(leaf_2020, exist_ok=True)
+        decoys = [
+            os.path.join(leaf_2020, "zarr.json"),
+            os.path.join(node, "stats_2020.json"),
+            leaf + ".bak",
+        ]
+        for path in decoys:
+            with open(path, "wb") as fh:
+                fh.write(b"x")
+        for dirpath, _dirs, files in os.walk(node):
+            for name in files:
+                os.utime(os.path.join(dirpath, name), (10_000, 10_000))
+        aged_ns = 10_000 * 10**9
+
         def boom(*_a, **_k):
             raise AssertionError("fold ran on a current windowed unit")
 
@@ -1627,6 +1651,13 @@ class TestProcessAndWriteHiveWindowed:
             skip_if_current=True,
         )
         assert skipped["current"] is True and skipped["identity"] == "equal"
+        # ...and the touch moved exactly the 2019 unit's footprint.
+        assert skipped["touched_objects"] > 0 and skipped["touch_failed"] == 0
+        inside = [os.path.join(d, n) for d, _s, files in os.walk(leaf) for n in files] + [
+            os.path.join(node, "stats_2019.json")
+        ]
+        assert all(os.stat(p).st_mtime_ns > aged_ns for p in inside)
+        assert [os.stat(p).st_mtime_ns for p in decoys] == [aged_ns] * len(decoys)
 
         # The SAME shard's other window has no sidecar: the gate reads absence
         # and the fold runs (classification no-sidecar -> rewrite).

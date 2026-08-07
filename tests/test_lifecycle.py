@@ -114,6 +114,36 @@ class TestTouchLocal:
         counts = lifecycle.touch_current_unit("/nowhere/not-a-leaf")
         assert counts == {"touched": 0, "failed": 1}
 
+    def test_the_footprint_does_not_spill_onto_node_neighbours(self, tmp_path):
+        # The OVER-touch direction (review finding): every other pin here is
+        # "all of the walked root moved", which cannot catch a footprint that
+        # is too WIDE. A hive node holds every window of a shard side by side
+        # plus their sidecars, so touching unit 2019 must leave 2020 alone —
+        # the property the tree walk's trailing slash carries.
+        node = tmp_path / "store" / "-5" / "1"
+        leaf = node / "123_2019.zarr"
+        (leaf / "m").mkdir(parents=True)
+        (leaf / "zarr.json").write_bytes(b"{}")
+        (node / "stats_2019.json").write_bytes(b"{}")
+        outsiders = [
+            node / "123_2020.zarr" / "zarr.json",  # the sibling window's leaf
+            node / "stats_2020.json",  # ...and its sidecar
+            node / "shardmap_2020.json",  # ...and its sub-map
+            # A key that is a STRING prefix extension of the leaf's: matched
+            # by a prefix-less LIST, excluded by the trailing slash.
+            node / "123_2019.zarr.bak",
+        ]
+        for path in outsiders:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
+        aged = _age(node)
+
+        counts = lifecycle.touch_current_unit(str(leaf), sidecar_spec=None)
+        after = _mtimes(node)
+        assert counts == {"touched": 2, "failed": 0}  # leaf tree + its sidecar
+        moved = {name for name, mtime in after.items() if mtime > aged}
+        assert moved == {os.path.join("123_2019.zarr", "zarr.json"), "stats_2019.json"}
+
 
 class TestTouchStoreRoot:
     """The root objects no unit footprint covers (review finding, phase 3)."""

@@ -108,20 +108,24 @@ def touch_current_unit(
     failure and the touch is skipped).
     """
     try:
+        from zagg.column import _sidecar_name as column_sidecar_name
         from zagg.sweep import submap_key
-        from zagg.telemetry import sidecar_key
+        from zagg.telemetry import sidecar_path
 
         prefix, _, name = str(leaf_path).rstrip("/").rpartition("/")
         trees = [str(leaf_path)]
         objects = [
-            f"{prefix}/{sidecar_key(name, sidecar_spec)}",
+            sidecar_path(str(leaf_path), sidecar_spec),
             f"{prefix}/{submap_key(name, sidecar_spec)}",
         ]
         if column_path:
             trees.append(str(column_path))
-            # The column's D20 sidecar: its own stem + ``.stats.json``
-            # (``zagg.column._sidecar_name``'s grammar).
-            objects.append(str(column_path).removesuffix(".zarr") + ".stats.json")
+            # The column's D20 sidecar, named by the seam that OWNS the
+            # grammar rather than re-derived here: a drifted name reads as
+            # ABSENT (neither touched nor failed, by design), so a second
+            # source would stop touching the sidecar in total silence.
+            col_prefix, _, col_name = str(column_path).rstrip("/").rpartition("/")
+            objects.append(f"{col_prefix}/{column_sidecar_name(col_name)}")
     except Exception as e:
         logger.warning(f"lifecycle touch skipped — footprint unresolved (fail-open): {e}")
         return {"touched": 0, "failed": 1}
