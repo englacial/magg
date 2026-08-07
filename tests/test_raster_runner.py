@@ -1996,12 +1996,18 @@ class TestRasterLocalRerun:
         s2 = agg(cfg, catalog=contracted, backend="local", max_workers=2)
         assert s2["cells_refused"] == 1 and s2["cells_error"] == 0
         assert s2["cells_with_data"] == 0
+        # The raster refusal is durable at the store root too (issue #388):
+        # same manifest, raster id space (STAC item ids, not granule urls).
+        manifest = json.loads(open(s2["refusal_manifest_path"]).read())
+        assert manifest["cells_refused"] == 1
+        assert manifest["units"][0]["missing_granules"] == ["g1"]
         # The committed leaf is protected: still the two-timestep axis.
         red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape[0] == 2
 
         s3 = agg(cfg, catalog=contracted, backend="local", max_workers=2, allow_contraction=True)
         assert s3["cells_refused"] == 0 and s3["cells_with_data"] == 1
+        assert s3["refusal_manifest_path"] is None
         red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape[0] == 1
 

@@ -1,5 +1,7 @@
 """Tests for the per-shard stats schema + merge fold (issue #297 phase 1)."""
 
+import pathlib
+
 import pytest
 
 from zagg.telemetry import (
@@ -14,10 +16,12 @@ from zagg.telemetry import (
     merge,
     read_granule_ids,
     read_sidecar,
+    refusal_manifest_key,
     run_parquet_key,
     sidecar_key,
     sidecar_path,
     write_granule_ids,
+    write_refusal_manifest,
     write_run_parquet,
     write_sidecar,
 )
@@ -479,6 +483,71 @@ class TestSidecarIO:
     def test_read_absent_returns_none(self, tmp_path):
         (tmp_path / "-4").mkdir()
         assert read_sidecar(str(tmp_path / "-4" / "-4.zarr")) is None
+
+
+class TestRefusalManifest:
+    """The store-root refusal record (issue #388, ruled (9)(c)+(a))."""
+
+    def _refused(self, shard, missing, *, window=None, identity="contraction"):
+        return {
+            "shard_key": shard,
+            "window": window,
+            "identity": identity,
+            "refused": True,
+            "missing_granules": missing,
+        }
+
+    def test_key_shape_and_traversal_guard(self):
+        key = refusal_manifest_key("abc123", timestamp="20260718T010203Z")
+        assert key == "refusals_20260718T010203Z_abc123.json"
+        # Outside the run-record glob: a refusal object must never read as a
+        # shard run record to the sweep's discovery scan.
+        assert not key.startswith("stats_") and not key.endswith(".parquet")
+        for run_id, ts in (("../../etc/passwd", "20260718T010203Z"), ("abc123", "../evil")):
+            with pytest.raises(ValueError):
+                refusal_manifest_key(run_id, timestamp=ts)
+
+    def test_writes_the_full_diff_per_unit(self, tmp_path):
+        import json
+
+        root = str(tmp_path / "store")
+        path = write_refusal_manifest(
+            root,
+            [
+                self._refused(7, ["s3://b/g9.h5", "s3://b/g8.h5"]),
+                self._refused(3, ["s3://b/g1.h5"], window="2019", identity="mixed"),
+            ],
+            run_id="cafe01",
+            timestamp="20260718T010203Z",
+            semantic_hash="a" * 64,
+        )
+        assert path.endswith("/refusals_20260718T010203Z_cafe01.json")
+        body = json.loads(pathlib.Path(path).read_bytes())
+        assert body["spec"] == "zagg-refusals/1"
+        assert body["run_id"] == "cafe01" and body["semantic_hash"] == "a" * 64
+        assert body["cells_refused"] == 2 and isinstance(body["zagg_version"], str)
+        # Sorted by (shard, window) so two runs over one refusal set compare.
+        assert [(u["shard_key"], u["window"]) for u in body["units"]] == [(3, "2019"), (7, None)]
+        mixed, contraction = body["units"]
+        assert mixed["identity"] == "mixed" and mixed["n_missing"] == 1
+        # The FULL list, not the log's first five — that is the whole point.
+        assert contraction["missing_granules"] == ["s3://b/g9.h5", "s3://b/g8.h5"]
+        assert contraction["n_missing"] == 2
+
+    def test_nothing_refused_writes_nothing(self, tmp_path):
+        # Ruled (9)(a): a pure-skip run stays row-less AND object-less.
+        root = tmp_path / "store"
+        assert write_refusal_manifest(str(root), [], run_id="cafe01") is None
+        assert not root.exists()
+
+    def test_write_is_fail_open(self, tmp_path, monkeypatch):
+        import obstore
+
+        monkeypatch.setattr(obstore, "put", lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+        got = write_refusal_manifest(
+            str(tmp_path / "store"), [self._refused(1, ["s3://b/g1.h5"])], run_id="cafe01"
+        )
+        assert got is None
 
 
 class TestGranuleIdsSibling:

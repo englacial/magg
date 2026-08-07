@@ -2198,11 +2198,21 @@ class TestRunnerWiring:
         # leaf, sidecar and recorded id list all untouched by the refusal
         assert read_sidecar(leaf) == sidecar
         assert read_granule_ids(leaf) == recorded_ids
+        # ...and the refusal's ONLY durable trace: the store-root manifest,
+        # carrying the full diff a truncated log line cannot (issue #388).
+        manifest = json.loads(open(s2["refusal_manifest_path"]).read())
+        assert manifest["cells_refused"] == 1
+        unit = manifest["units"][0]
+        assert unit["shard_key"] == int(shard) and unit["identity"] == "contraction"
+        assert unit["missing_granules"] == [_rec(2)["s3"]]
+        assert os.path.basename(s2["refusal_manifest_path"]).startswith("refusals_")
 
         s3 = agg(cfg, catalog=contracted, store=root, backend="local", allow_contraction=True)
         assert len(calls) == 2  # the flag proceeds as a normal D4 rewrite
         assert s3["cells_refused"] == 0 and s3["cells_with_data"] == 1
         assert read_granule_ids(leaf)["granule_ids"] == [_rec(1)["s3"]]
+        # Ruled (9)(a): a run with nothing refused writes no manifest.
+        assert s3["refusal_manifest_path"] is None
 
     def test_lambda_hive_fires_async_setup_after_ping(self, monkeypatch, cfg, tmp_path):
         # Issue #252 hybrid: a hive lambda run dispatches NO synchronous

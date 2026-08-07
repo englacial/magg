@@ -1285,6 +1285,7 @@ def process_and_write_raster_hive(
             sidecar_spec=sidecar_spec,
             store_kwargs=store_kwargs,
             shard_key=shard_key,
+            window=label,
         )
         if unit_meta is not None:
             out = {**unit_meta, "timesteps": 0, "skipped": 0, "leaf_written": False}

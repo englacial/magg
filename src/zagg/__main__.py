@@ -190,6 +190,10 @@ examples:
                 "Rerun with --allow-contraction to rewrite them; --overwrite "
                 "disables the guard instead of acknowledging it."
             )
+            # The log names only the first five missing ids per unit; the
+            # manifest is the durable full diff (issue #388).
+            if results.get("refusal_manifest_path"):
+                print(f"  Which granules, per unit: {results['refusal_manifest_path']}")
         # The lifecycle touch is fail-open, so a total failure (a read-scoped
         # role, an SCP, an ACL edge — s3:PutObject denied fails EVERY object
         # of EVERY unit) otherwise renders as an unqualified "N current" and
