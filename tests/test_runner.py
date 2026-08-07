@@ -4724,3 +4724,63 @@ class TestCliFunctionNameDefault:
         )
         cli.main()
         assert captured["function_name"] == "my-exact-fn"
+
+
+class TestCliContractionGuardSurface:
+    """Issue #388: the guard's audit trail and its escape hatch must both be
+    reachable from ``zagg agg``. An all-refused (or all-skipped) run writes no
+    run-record parquet — no unit produced a stats row — so the CLI summary is
+    the only place the counters surface, and ``--allow-contraction`` is the
+    only supported way to proceed (``--overwrite`` disables the guard)."""
+
+    SUMMARY = {
+        "cells_with_data": 0,
+        "total_obs": 0,
+        "cells_error": 0,
+        "wall_time_s": 3.2,
+        "store_path": "s3://b/store.zarr",
+        "run_stats_path": None,
+    }
+
+    def _run(self, monkeypatch, argv, summary):
+        import zagg.__main__ as cli
+
+        captured: dict = {}
+
+        def _fake_agg(config, **kwargs):
+            captured.update(kwargs)
+            return summary
+
+        monkeypatch.setattr(cli, "agg", _fake_agg)
+        monkeypatch.setattr(cli, "load_config", lambda path: object())
+        monkeypatch.setattr("sys.argv", ["zagg", "--config", "c.yaml", *argv])
+        cli.main()
+        return captured
+
+    def test_flag_defaults_off_and_threads_to_agg(self, monkeypatch, capsys):
+        captured = self._run(monkeypatch, [], dict(self.SUMMARY))
+        assert captured["allow_contraction"] is False
+        captured = self._run(monkeypatch, ["--allow-contraction"], dict(self.SUMMARY))
+        assert captured["allow_contraction"] is True
+        capsys.readouterr()
+
+    def test_all_refused_run_names_the_counters_and_the_remedy(self, monkeypatch, capsys):
+        summary = {**self.SUMMARY, "cells_current": 0, "cells_refused": 3, "cells_unrecorded": 0}
+        self._run(monkeypatch, [], summary)
+        out = capsys.readouterr().out
+        assert "Done: 0 cells with data" in out
+        assert "3 refused" in out
+        assert "--allow-contraction" in out
+
+    def test_skip_only_run_reports_current(self, monkeypatch, capsys):
+        summary = {**self.SUMMARY, "cells_current": 7, "cells_refused": 0, "cells_unrecorded": 2}
+        self._run(monkeypatch, [], summary)
+        out = capsys.readouterr().out
+        assert "7 current" in out and "2 rewritten with the guard inert" in out
+        # No refusals: the remedy line stays out of the way.
+        assert "--allow-contraction" not in out
+
+    def test_quiet_when_the_gate_did_nothing(self, monkeypatch, capsys):
+        summary = {**self.SUMMARY, "cells_current": 0, "cells_refused": 0, "cells_unrecorded": 0}
+        self._run(monkeypatch, [], summary)
+        assert "Skip-if-current" not in capsys.readouterr().out

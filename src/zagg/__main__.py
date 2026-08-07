@@ -58,6 +58,14 @@ examples:
     )
     parser.add_argument("--max-workers", type=int, default=None, help="Max concurrent workers")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing Zarr template")
+    parser.add_argument(
+        "--allow-contraction",
+        action="store_true",
+        help="Rewrite units whose planned inputs DROP granule ids the leaf "
+        "already recorded (issue #388). Without it such a unit refuses and is "
+        "counted in the run summary. --overwrite is NOT the substitute: it "
+        "disables the skip gate outright, so the contraction rewrites unannounced.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
     parser.add_argument(
         "--profile",
@@ -140,6 +148,7 @@ examples:
         morton_cell=args.morton_cell,
         max_workers=args.max_workers,
         overwrite=args.overwrite,
+        allow_contraction=args.allow_contraction,
         dry_run=args.dry_run,
         function_name=args.function_name,
         region=args.region,
@@ -162,6 +171,25 @@ examples:
             f"{results['total_obs']:,} obs, {results['cells_error']} errors, "
             f"{results['wall_time_s']:.1f}s"
         )
+        # Skip-if-current counters (issue #388). A run where every unit skipped
+        # or refused writes no run-record parquet and lands zero in the four
+        # keys above, so without this line the guard is invisible from the CLI
+        # — and the refusal's remedy (--allow-contraction) unfindable.
+        current = results.get("cells_current", 0)
+        refused = results.get("cells_refused", 0)
+        unrecorded = results.get("cells_unrecorded", 0)
+        if current or refused or unrecorded:
+            print(
+                f"Skip-if-current: {current} current (unchanged, not rewritten), "
+                f"{refused} refused, {unrecorded} rewritten with the guard inert "
+                f"(leaves predating issue #388)"
+            )
+        if refused:
+            print(
+                "  Refused units drop granule ids their leaf already recorded. "
+                "Rerun with --allow-contraction to rewrite them; --overwrite "
+                "disables the guard instead of acknowledging it."
+            )
         if "estimated_cost_usd" in results:
             print(
                 f"Lambda compute: {results['lambda_time_s']:.0f}s total, "
