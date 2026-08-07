@@ -1344,11 +1344,23 @@ def process_and_write_raster_hive(
         stage_stats=stage_stats,
         occupied_out=occupied,
     )
-    # The seam stamps the identity half (issue #388): a caller that never
-    # resolved the hash itself (the Lambda handler) still records it in the
-    # leaf sidecar via ``telemetry.build_record``'s validated metadata
-    # fallback; the classification lets run stats count ``unrecorded-ids``
-    # rewrites apart from ordinary ones.
+    # The seam stamps the identity half (issue #388) so a caller that never
+    # resolved the hash itself can record it in the leaf sidecar via
+    # ``telemetry.build_record``'s validated metadata fallback; the
+    # classification lets run stats count ``unrecorded-ids`` rewrites apart
+    # from ordinary ones.
+    #
+    # That fallback fires on the LOCAL raster path only. The Lambda handler's
+    # raster branch does NOT return this dict: it rebuilds a fresh ``body``
+    # from an explicit key list and hands THAT to ``build_record``
+    # (``deployment/aws/lambda_handler.py``, the ``if hive:`` branch), so
+    # ``semantic_hash`` / ``identity`` / ``current`` / ``refused`` are dropped
+    # and fleet raster sidecars keep recording ``null`` for the identity half.
+    # The aggregation handler returns the seam's own dict and does get it.
+    # Enabling the gate fleet-side therefore needs those four keys carried
+    # through as well as the opt-in kwargs — the PR #397 body's question (1)
+    # lists it; without it a raster leaf could never classify ``equal``,
+    # because the recorded ``null`` can never match a resolved hash.
     if semantic_hash is not None:
         meta.setdefault("semantic_hash", semantic_hash)
     if identity is not None:
