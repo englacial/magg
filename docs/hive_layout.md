@@ -643,9 +643,25 @@ The gate is **on by default for the local backend**; `--overwrite` disables
 it entirely (the operator's unconditional-rewrite hammer — it does not
 acknowledge a contraction, it bypasses the guard). The **deployed Lambda
 handler has not yet opted in**: the seams default off, so fleet re-runs
-still rewrite unconditionally today, and fleet sidecars written by current
-deployments feed the gate only after the handler enablement lands (PR #397
-question (1)).
+still rewrite unconditionally today (PR #397 question (1)). What fleet
+sidecars *record* splits by family, though, and only one half waits on that
+enablement:
+
+- **Vector — nothing to wait for.** The handler passes the seam's own
+  metadata dict straight to `build_record`, the seam stamps
+  `semantic_hash` into that dict, and the record's validated fallback picks
+  it up. So from this release's deploy onward — gate still off fleet-side,
+  zero handler changes — fleet vector sidecars carry **both** identity
+  halves, and a later local re-run over that store can skip.
+- **Raster — never, until the handler changes.** The raster branch rebuilds
+  its record body from a closed key list that omits `semantic_hash`, so
+  raster fleet sidecars keep recording `semantic_hash: null`. That fails the
+  fast path and classifies `semantic-mismatch` → rewrite on every run, with
+  no self-heal until the leaf has been rewritten under a handler that
+  carries the key. The consequence is **local**, not merely fleet-side:
+  re-running a fleet-built raster store locally — where the gate *is* on by
+  default — reports `cells_current: 0` indefinitely until question (1)'s
+  key-list fix lands.
 
 **The contraction guard cannot protect leaves written before this
 release.** The recorded granule-id *list* (`granule_ids` in the stats
