@@ -142,6 +142,7 @@ class TestTouchStoreRoot:
         from unittest.mock import MagicMock
 
         client = MagicMock()
+        client.head_object.return_value = {}
         monkeypatch.setattr(lifecycle, "_s3_client", lambda kw: client)
         counts = lifecycle.touch_store_root("s3://bkt/store/")
         assert {c.kwargs["Key"] for c in client.copy_object.call_args_list} == {
@@ -163,13 +164,16 @@ class TestTouchS3:
         f"store/-5/1/{LEAF}/coverage.moc",
     ]
 
-    def _client(self, monkeypatch, *, copy_error=None):
+    def _client(self, monkeypatch, *, copy_error=None, listed=None, head=None):
         from unittest.mock import MagicMock
 
         client = MagicMock()
         paginator = MagicMock()
-        paginator.paginate.return_value = [{"Contents": [{"Key": k} for k in self.TREE_KEYS]}]
+        contents = listed if listed is not None else [{"Key": k} for k in self.TREE_KEYS]
+        paginator.paginate.return_value = [{"Contents": contents}]
         client.get_paginator.return_value = paginator
+        # S3 omits StorageClass for STANDARD in both LIST and HEAD.
+        client.head_object.return_value = head if head is not None else {}
         if copy_error is not None:
             client.copy_object.side_effect = copy_error
         monkeypatch.setattr(lifecycle, "_s3_client", lambda kw: client)
@@ -197,7 +201,37 @@ class TestTouchS3:
             # The identity self-copy: S3 rejects it without REPLACE.
             assert c.kwargs["CopySource"] == {"Bucket": self.BUCKET, "Key": c.kwargs["Key"]}
             assert c.kwargs["MetadataDirective"] == "REPLACE"
+            # LIST/HEAD omit the class for STANDARD; the copy must still name
+            # one, or REPLACE resets whatever the object had.
+            assert c.kwargs["StorageClass"] == "STANDARD"
         assert counts == {"touched": 5, "failed": 0}
+
+    def test_the_storage_class_is_preserved_not_reset_to_standard(self, monkeypatch):
+        # MetadataDirective=REPLACE covers SYSTEM metadata, so a copy with no
+        # StorageClass silently promotes a STANDARD_IA/GLACIER_IR object back
+        # to STANDARD — defeating a lifecycle TRANSITION policy and re-paying
+        # the transition on every skip run (review finding).
+        client = self._client(
+            monkeypatch,
+            listed=[
+                {"Key": self.TREE_KEYS[0], "StorageClass": "GLACIER_IR"},
+                {"Key": self.TREE_KEYS[1], "StorageClass": "STANDARD_IA"},
+            ],
+            head={"StorageClass": "STANDARD_IA"},
+        )
+        counts = lifecycle.touch_current_unit(f"s3://{self.BUCKET}/store/-5/1/{LEAF}")
+        classes = {
+            c.kwargs["Key"]: c.kwargs["StorageClass"] for c in client.copy_object.call_args_list
+        }
+        assert classes == {
+            self.TREE_KEYS[0]: "GLACIER_IR",
+            self.TREE_KEYS[1]: "STANDARD_IA",
+            # The siblings have no LIST entry: one HEAD each buys the class.
+            "store/-5/1/stats.json": "STANDARD_IA",
+            "store/-5/1/shardmap.json": "STANDARD_IA",
+        }
+        assert client.head_object.call_count == 2  # named objects only
+        assert counts == {"touched": 4, "failed": 0}
 
     def test_absent_sibling_is_neither_touched_nor_failed(self, monkeypatch):
         # copy of a missing key (e.g. no sub-map was ever written) NoSuchKey-s;

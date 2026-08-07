@@ -20,11 +20,31 @@ Mechanism: local stores get ``os.utime``; S3 gets a server-side self-copy
 (``CopyObject`` onto itself with ``MetadataDirective="REPLACE"`` — S3
 rejects an identity copy without it; already a ``boto3`` dependency, and
 obstore's ``copy`` exposes no metadata directive). The self-copy preserves
-content (and the ETag for non-multipart objects) but REPLACES user metadata
-with none — zagg's writers attach none, so nothing is lost. Documented
-caveats, not solved here: a versioned bucket mints a new object version per
-touch, and an object >= 5 GB would need a multipart copy and simply counts
-as failed (leaf objects never approach it).
+content (and the ETag for non-multipart objects).
+
+``MetadataDirective="REPLACE"`` covers SYSTEM-defined metadata too, not just
+``x-amz-meta-*``, so the copy request is what decides the new object's
+properties. Exactly what that costs, and what this module does about it:
+
+- **user metadata** is replaced with none — zagg's writers attach none;
+- **storage class** would otherwise reset to STANDARD on every touch,
+  silently defeating a lifecycle *transition* policy and re-paying the
+  transition each skip run. SOLVED: the class is echoed back from the LIST
+  entry (tree arm) or a ``HeadObject`` (named objects). Still a caveat: an
+  object already in ``GLACIER``/``DEEP_ARCHIVE`` cannot be copied at all
+  (``InvalidObjectState``) and counts as failed;
+- **ACL**: NOT preserved — ``CopyObject`` grants the destination the
+  requester's default private ACL unless ``x-amz-acl``/``x-amz-grant-*``
+  rides the request. A no-op on a ``BucketOwnerEnforced`` bucket (the
+  default since 2023), but a public-read-BY-ACL bucket would have the
+  touched objects made private. Documented, not solved;
+- **SSE-KMS**: a self-copy re-encrypts under the BUCKET DEFAULT key, not
+  the source object's key, and needs ``kms:Decrypt`` +
+  ``kms:GenerateDataKey``. Fails loudly into ``failed`` when the role lacks
+  them. Documented, not solved;
+- a **versioned** bucket mints a new object version per touch, and an
+  object >= 5 GB would need a multipart copy and simply counts as failed
+  (leaf objects never approach it).
 
 The unit footprint is not the whole store: the STORE-ROOT objects have no
 unit that owns them, and an all-skip run re-PUTs none of them
@@ -206,16 +226,24 @@ def _touch_s3_tree(s3, path, counts) -> None:
     prefix = key.rstrip("/") + "/"
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for entry in page.get("Contents") or []:
-            _touch_s3_object(s3, bucket, entry["Key"], counts)
+            # The LIST already carries the class; echoing it back is what
+            # keeps the self-copy from demoting the object to STANDARD.
+            _touch_s3_object(s3, bucket, entry["Key"], counts, entry.get("StorageClass"))
 
 
-def _touch_s3_object(s3, bucket, key, counts) -> None:
+def _touch_s3_object(s3, bucket, key, counts, storage_class=None) -> None:
     try:
+        if storage_class is None:
+            # A named object has no LIST entry: one HEAD buys its class (and
+            # detects absence a request earlier than the copy would).
+            storage_class = s3.head_object(Bucket=bucket, Key=key).get("StorageClass")
         s3.copy_object(
             Bucket=bucket,
             Key=key,
             CopySource={"Bucket": bucket, "Key": key},
             MetadataDirective="REPLACE",
+            # S3 omits StorageClass for STANDARD in both LIST and HEAD.
+            StorageClass=storage_class or "STANDARD",
         )
         counts["touched"] += 1
     except Exception as e:
