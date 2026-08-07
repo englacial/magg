@@ -1292,12 +1292,34 @@ class TestRasterHiveWorker:
                 out[_os.path.relpath(p, root)] = _os.stat(p).st_mtime_ns
         return out
 
+    @staticmethod
+    def _contents(root):
+        import os as _os
+
+        out = {}
+        for dirpath, _dirs, files in _os.walk(root):
+            for name in files:
+                p = _os.path.join(dirpath, name)
+                with open(p, "rb") as fh:
+                    out[_os.path.relpath(p, root)] = fh.read()
+        return out
+
+    @staticmethod
+    def _age(root, epoch=10_000):
+        import os as _os
+
+        for dirpath, _dirs, files in _os.walk(root):
+            for name in files:
+                _os.utime(_os.path.join(dirpath, name), (epoch, epoch))
+        return epoch * 10**9
+
     def test_skip_if_current_no_ops_and_writes_nothing(self, tmp_path, monkeypatch):
         import zagg.processing.raster as raster_mod
         from zagg.processing.raster import process_and_write_raster_hive
 
         cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
-        before = self._tree(root)
+        before = self._contents(root)
+        aged_ns = self._age(root)
 
         def boom(*_a, **_k):
             raise AssertionError("sampling ran on a current unit")
@@ -1308,8 +1330,14 @@ class TestRasterHiveWorker:
         )
         assert skipped["current"] is True and skipped["identity"] == "equal"
         assert skipped["timesteps"] == 0 and skipped["leaf_written"] is False
-        # The unit wrote NOTHING: no object added, none rewritten.
-        assert self._tree(root) == before
+        # The unit wrote NOTHING: same object set, every byte identical...
+        assert self._contents(root) == before
+        # ...and the lifecycle touch refreshed every object under the unit
+        # (issue #388 phase 3): the purge clock resets on a skip.
+        after = self._tree(root)
+        assert set(after) == set(before)
+        assert all(mtime > aged_ns for mtime in after.values())
+        assert skipped["touched_objects"] == len(after) and skipped["touch_failed"] == 0
 
     def test_contraction_refuses_without_the_flag(self, tmp_path, monkeypatch):
         import zagg.processing.raster as raster_mod
@@ -1328,8 +1356,10 @@ class TestRasterHiveWorker:
         )
         assert refused["refused"] is True and refused["identity"] == "contraction"
         assert refused["missing_granules"] == [raster_granule_ids(granules)[1]]
-        # The committed leaf is protected: still stamped complete.
+        # The committed leaf is protected: still stamped complete — and NOT
+        # touched (only a certified-current unit resets the purge clock).
         assert hive.read_commit(leaf)["complete"] is True
+        assert "touched_objects" not in refused
 
     def test_allow_contraction_rewrites(self, tmp_path):
         from zagg.processing.raster import process_and_write_raster_hive

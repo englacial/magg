@@ -1097,3 +1097,31 @@ class TestColumnDefeatsTheSkipGate:
         )
         assert redo["identity"] == "column-drift" and redo["column"] == "2019.pyramid.zarr"
         assert (leaf.parent / "2019.pyramid.zarr").exists()
+
+    def test_a_skip_touches_the_column_family_too(self, tmp_path, monkeypatch):
+        # Phase 3 (issue #388): the lifecycle touch covers the WHOLE unit
+        # footprint — the declared column tree and its own stats sidecar
+        # included — so a purge rule scoped anywhere under the node sees the
+        # skip. The gate already certified declaration == artifact, so the
+        # touch cannot resurrect the column-drift ambiguity.
+        import os
+
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        self._seal(meta, leaf)
+        node = leaf.parent
+        epoch = 10_000
+        n_files = 0
+        for dirpath, _dirs, files in os.walk(node):
+            for name in files:
+                os.utime(os.path.join(dirpath, name), (epoch, epoch))
+                n_files += 1
+        redo, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID, skip_if_current=True)
+        assert redo["current"] is True
+        stale = [
+            os.path.join(dirpath, name)
+            for dirpath, _dirs, files in os.walk(node)
+            for name in files
+            if os.stat(os.path.join(dirpath, name)).st_mtime_ns <= epoch * 10**9
+        ]
+        assert stale == []  # column tree + column sidecar moved with the leaf
+        assert redo["touched_objects"] == n_files and redo["touch_failed"] == 0

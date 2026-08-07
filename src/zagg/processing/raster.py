@@ -1283,7 +1283,27 @@ def process_and_write_raster_hive(
             shard_key=shard_key,
         )
         if unit_meta is not None:
-            return {**unit_meta, "timesteps": 0, "skipped": 0, "leaf_written": False}
+            out = {**unit_meta, "timesteps": 0, "skipped": 0, "leaf_written": False}
+            if out.get("current"):
+                # Lifecycle touch (issue #388 phase 3): reset the purge clock
+                # on the skipped unit's footprint — leaf tree + sidecar and
+                # sub-map siblings (the raster seam writes no column).
+                # Fail-open: a failed touch logs and counts, never fails or
+                # un-skips the unit.
+                from zagg.lifecycle import touch_current_unit
+
+                try:
+                    counts = touch_current_unit(
+                        leaf_path, sidecar_spec=sidecar_spec, store_kwargs=store_kwargs
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"lifecycle touch failed for shard {shard_key} (fail-open, issue #388): {e}"
+                    )
+                    counts = {"touched": 0, "failed": 1}
+                out["touched_objects"] = counts["touched"]
+                out["touch_failed"] = counts["failed"]
+            return out
     # The leaf's own time axis, from the dispatched subset. Every group key in
     # the subset is in this index by construction, so the worker never trips
     # the foreign-manifest guard.

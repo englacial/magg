@@ -1549,8 +1549,16 @@ class TestSummaryKeysByteIdentical:
     """
 
     # Skip-if-current run stats (issue #388); additive, always-present zeros
-    # until units actually skip/refuse (deterministic key set).
-    _IDENTITY_KEYS = {"cells_current", "cells_refused", "cells_unrecorded"}
+    # until units actually skip/refuse (deterministic key set). The
+    # objects_touched/touch_failures pair is the phase-3 lifecycle-touch
+    # rollup, same posture.
+    _IDENTITY_KEYS = {
+        "cells_current",
+        "cells_refused",
+        "cells_unrecorded",
+        "objects_touched",
+        "touch_failures",
+    }
     _LOCAL_KEYS = {
         "total_cells",
         "cells_with_data",

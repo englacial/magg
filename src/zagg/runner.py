@@ -2794,12 +2794,18 @@ def _identity_counts(metas) -> dict:
       ordinary rewrites because the guard was INERT for them: a contracted
       rerun over such a leaf performs the wholesale rewrite the guard exists
       to prevent (see ``dedup.classify_leaf_identity``).
+    - ``objects_touched`` / ``touch_failures`` — the phase-3 lifecycle touch
+      rollup (``zagg.lifecycle``): objects whose ``LastModified`` the skipped
+      units refreshed, and touch failures (fail-open — logged and counted
+      here, never folded into ``cells_error``).
     """
     metas = [m for m in metas if isinstance(m, dict)]
     return {
         "cells_current": sum(1 for m in metas if m.get("current")),
         "cells_refused": sum(1 for m in metas if m.get("refused")),
         "cells_unrecorded": sum(1 for m in metas if m.get("identity") == "unrecorded-ids"),
+        "objects_touched": sum(int(m.get("touched_objects") or 0) for m in metas),
+        "touch_failures": sum(int(m.get("touch_failed") or 0) for m in metas),
     }
 
 

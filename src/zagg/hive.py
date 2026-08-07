@@ -1435,6 +1435,30 @@ def process_and_write_hive(
             column_declared=column_declared,
         )
         if unit_meta is not None:
+            if unit_meta.get("current"):
+                # Lifecycle touch (issue #388 phase 3): a skip must still
+                # reset the purge clock on the unit's whole footprint — leaf
+                # tree, sidecar/sub-map siblings, and the declared column
+                # (the gate already verified declaration and artifact agree,
+                # so the touch never resurrects the column-drift ambiguity).
+                # Fail-open both here and inside: a failed touch logs and
+                # counts, never fails or un-skips the unit.
+                from zagg.lifecycle import touch_current_unit
+
+                try:
+                    counts = touch_current_unit(
+                        leaf_path,
+                        column_path=column_path if column_declared else None,
+                        sidecar_spec=sidecar_spec,
+                        store_kwargs=store_kwargs,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"lifecycle touch failed for shard {shard_key} (fail-open, issue #388): {e}"
+                    )
+                    counts = {"touched": 0, "failed": 1}
+                unit_meta["touched_objects"] = counts["touched"]
+                unit_meta["touch_failed"] = counts["failed"]
             return unit_meta
 
     box: dict = {}

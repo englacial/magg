@@ -1106,9 +1106,31 @@ class TestLeafSkipIfCurrent:
                 out[os.path.relpath(p, root)] = os.stat(p).st_mtime_ns
         return out
 
+    @staticmethod
+    def _contents(root):
+        """Every file under ``root`` with its bytes — the no-content-change pin
+        (the phase-3 lifecycle touch legitimately moves mtimes on a skip)."""
+        out = {}
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                p = os.path.join(dirpath, name)
+                with open(p, "rb") as fh:
+                    out[os.path.relpath(p, root)] = fh.read()
+        return out
+
+    @staticmethod
+    def _age(root, epoch=10_000):
+        """Backdate every file under ``root`` so a touch is unambiguous even
+        on coarse-mtime filesystems."""
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                os.utime(os.path.join(dirpath, name), (epoch, epoch))
+        return epoch * 10**9  # ns threshold
+
     def test_identical_rerun_skips_and_writes_nothing(self, monkeypatch, cfg, tmp_path):
         grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
-        before = self._tree(root)
+        before = self._contents(root)
+        aged_ns = self._age(root)
         self._arm_boom(monkeypatch)
         meta = hive.process_and_write_hive(
             shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
@@ -1116,8 +1138,14 @@ class TestLeafSkipIfCurrent:
         assert meta["current"] is True and meta["identity"] == "equal"
         assert meta["shard_key"] == int(shard)
         assert meta["total_obs"] == 0 and meta.get("error") is None
-        # The unit wrote NOTHING: no object added, none rewritten.
-        assert self._tree(root) == before
+        # The unit wrote NOTHING: same object set, every byte identical.
+        assert self._contents(root) == before
+        # ...but the lifecycle touch refreshed every object's timestamp
+        # (issue #388 phase 3): the purge clock resets on a skip.
+        after = self._tree(root)
+        assert set(after) == set(before)
+        assert all(mtime > aged_ns for mtime in after.values())
+        assert meta["touched_objects"] == len(after) and meta["touch_failed"] == 0
 
     def test_gate_is_off_by_default(self, monkeypatch, cfg, tmp_path):
         # Byte-identical default: without skip_if_current the seam rewrites
@@ -1139,8 +1167,11 @@ class TestLeafSkipIfCurrent:
         )
         assert meta["refused"] is True and meta["identity"] == "contraction"
         assert meta["missing_granules"] == [self.URLS[1]]
-        # A refusal writes nothing either: the committed leaf is protected.
+        # A refusal writes nothing either: the committed leaf is protected —
+        # and it is NOT touched (only a certified-current unit resets the
+        # purge clock, issue #388 phase 3).
         assert self._tree(root) == before
+        assert "touched_objects" not in meta
 
     def test_mixed_add_and_drop_refuses(self, monkeypatch, cfg, tmp_path):
         # The ruled predicate is ``recorded ∖ planned ≠ ∅``, NOT strict-subset:
@@ -1299,6 +1330,24 @@ class TestLeafSkipIfCurrent:
             shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
         )
         assert calls == [int(shard)] and meta["identity"] == "unstamped-leaf"
+
+    def test_touch_failure_never_unskips_the_unit(self, monkeypatch, cfg, tmp_path):
+        # Fail-open (issue #388 phase 3): a touch failure logs and counts —
+        # it NEVER fails the unit and never degrades the skip to a rewrite.
+        import zagg.lifecycle as lifecycle
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        self._arm_boom(monkeypatch)
+
+        def explode(*_a, **_k):
+            raise RuntimeError("S3 down")
+
+        monkeypatch.setattr(lifecycle, "touch_current_unit", explode)
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert meta["current"] is True and meta.get("error") is None
+        assert meta["touched_objects"] == 0 and meta["touch_failed"] == 1
 
     def test_seam_stamps_semantic_hash(self, monkeypatch, cfg, tmp_path):
         # The seam stamps the D19 hash into its returned metadata so a caller
@@ -2035,6 +2084,7 @@ class TestRunnerWiring:
         s1 = agg(cfg, catalog=catalog_path, store=root, backend="local")
         assert calls == [shard]
         assert (s1["cells_current"], s1["cells_refused"], s1["cells_unrecorded"]) == (0, 0, 0)
+        assert (s1["objects_touched"], s1["touch_failures"]) == (0, 0)
         leaf = hive.shard_leaf_path(root, shard)
         sidecar = read_sidecar(leaf)
         assert sidecar["granule_ids"] == [_rec(1)["s3"]]
@@ -2043,6 +2093,8 @@ class TestRunnerWiring:
         assert calls == [shard]  # the fold did NOT run again
         assert s2["cells_current"] == 1 and s2["cells_with_data"] == 0
         assert read_sidecar(leaf) == sidecar  # a skip never clobbers the sidecar
+        # ...and the lifecycle touch rollup rides the summary (phase 3).
+        assert s2["objects_touched"] > 0 and s2["touch_failures"] == 0
         # A skipped unit contributes no run-parquet row: the rerun had no
         # rows at all, so the fail-open write skipped (path None).
         assert s2["run_stats_path"] is None
