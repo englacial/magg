@@ -1374,13 +1374,17 @@ def process_and_write_raster_hive(
     # raster branch does NOT return this dict: it rebuilds a fresh ``body``
     # from an explicit key list and hands THAT to ``build_record``
     # (``deployment/aws/lambda_handler.py``, the ``if hive:`` branch), so
-    # ``semantic_hash`` / ``identity`` / ``current`` / ``refused`` are dropped
-    # and fleet raster sidecars keep recording ``null`` for the identity half.
-    # The aggregation handler returns the seam's own dict and does get it.
-    # Enabling the gate fleet-side therefore needs those four keys carried
-    # through as well as the opt-in kwargs — the PR #397 body's question (1)
-    # lists it; without it a raster leaf could never classify ``equal``,
-    # because the recorded ``null`` can never match a resolved hash.
+    # ``semantic_hash`` / ``identity`` / ``current`` / ``refused`` — and the
+    # phase-3 pair ``touched_objects`` / ``touch_failed`` stamped on the skip
+    # arm above — are dropped, and fleet raster sidecars keep recording
+    # ``null`` for the identity half. The aggregation handler returns the
+    # seam's own dict and does get all six. Enabling the gate fleet-side
+    # therefore needs those SIX keys carried through as well as the opt-in
+    # kwargs — the PR #397 body's question (1) lists it. Without the first
+    # four a raster leaf could never classify ``equal`` (the recorded ``null``
+    # can never match a resolved hash); without the last two the fleet rollup
+    # reports ``objects_touched: 0`` on a working touch, indistinguishable
+    # from a touch that never ran.
     if semantic_hash is not None:
         meta.setdefault("semantic_hash", semantic_hash)
     if identity is not None:
