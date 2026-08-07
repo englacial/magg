@@ -527,6 +527,7 @@ class TestInvokeLambdaCellEvent:
         handoff="pandas",
         invoked_by=None,
         run_id=None,
+        allow_contraction=False,
     ):
         from unittest.mock import MagicMock
 
@@ -555,6 +556,7 @@ class TestInvokeLambdaCellEvent:
             handoff=handoff,
             invoked_by=invoked_by,
             run_id=run_id,
+            allow_contraction=allow_contraction,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
@@ -630,6 +632,18 @@ class TestInvokeLambdaCellEvent:
     def test_default_event_has_no_run_id_key(self):
         event = self._captured_event(child_order=12, run_id=None)
         assert "run_id" not in event
+
+    def test_allow_contraction_adds_event_key(self):
+        # issue #388: the contraction-guard escape hatch rides the cell event
+        # so the worker can act on it once it opts into the skip seam.
+        event = self._captured_event(child_order=12, allow_contraction=True)
+        assert event["allow_contraction"] is True
+
+    def test_default_event_has_no_allow_contraction_key(self):
+        # Default (guard armed): no key, so the event stays byte-identical to
+        # the pre-#388 payload.
+        event = self._captured_event(child_order=12)
+        assert "allow_contraction" not in event
 
 
 class TestResolveInvokedBy:
@@ -1534,6 +1548,9 @@ class TestSummaryKeysByteIdentical:
     are pinned separately in ``TestInvokeLambdaCellEvent``.
     """
 
+    # Skip-if-current run stats (issue #388); additive, always-present zeros
+    # until units actually skip/refuse (deterministic key set).
+    _IDENTITY_KEYS = {"cells_current", "cells_refused", "cells_unrecorded"}
     _LOCAL_KEYS = {
         "total_cells",
         "cells_with_data",
@@ -1544,7 +1561,7 @@ class TestSummaryKeysByteIdentical:
         "backend",
         "results",
         "run_stats_path",  # run-level stats parquet (issue #297 phase 3)
-    }
+    } | _IDENTITY_KEYS
     _LAMBDA_KEYS = {
         "total_cells",
         "cells_with_data",
@@ -1579,7 +1596,7 @@ class TestSummaryKeysByteIdentical:
         "worker_warm_starts",
         "worker_rss_start_max_by_gen",
         "run_stats_path",  # run-level stats parquet (issue #297 phase 3)
-    }
+    } | _IDENTITY_KEYS
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
         # Flat local path pinned explicitly (issue #253 defaults hive).

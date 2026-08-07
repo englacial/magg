@@ -1107,6 +1107,86 @@ def leaf_block_index(grid, block_index, shard_key) -> tuple:
     return tuple(int(s.start) // int(c) for s, c in zip(region, grid.chunk_shape))
 
 
+def leaf_identity_gate(
+    leaf_path,
+    planned_ids,
+    *,
+    semantic_hash,
+    allow_contraction,
+    sidecar_spec,
+    store_kwargs,
+    shard_key,
+):
+    """Skip-if-current / contraction-guard verdict for one leaf unit (issue #388).
+
+    The shared pre-fold gate for BOTH leaf seams (:func:`process_and_write_hive`
+    and ``zagg.processing.raster.process_and_write_raster_hive``): read the
+    leaf's D20 stats sidecar and classify the planned ``(semantic_hash,
+    granule-id set)`` identity pair against it
+    (:func:`zagg.dedup.classify_leaf_identity`). Returns ``(identity, meta)``:
+
+    - ``identity`` — the classification dict (``action`` / ``classification``
+      / ``missing``). The caller stamps ``classification`` on its returned
+      metadata as ``metadata["identity"]`` so run stats can count
+      ``unrecorded-ids`` rewrites apart from ordinary ones.
+    - ``meta`` — an early-return unit metadata dict when the unit must NOT
+      fold: ``{"current": True}`` on an identity match, ``{"refused": True,
+      "missing_granules": [...]}`` on a contraction without
+      ``allow_contraction``. ``None`` means proceed with the wholesale D4
+      rewrite exactly as today — including a contraction explicitly allowed
+      by the flag (a normal update; the classification still rides).
+
+    A skipped or refused unit writes NOTHING (no arrays, no stamp, no
+    sidecar, no sub-map, no column): the caller returns ``meta`` untouched,
+    so zero sweep dirtiness by construction. The sidecar read is fail-open —
+    a malformed or unreadable sidecar degrades to today's rewrite (the
+    ``no-sidecar`` classification), never blocks the unit.
+    """
+    from zagg.dedup import classify_leaf_identity
+    from zagg.telemetry import read_sidecar
+
+    t0 = time.time()
+    try:
+        recorded = read_sidecar(leaf_path, spec=sidecar_spec, **store_kwargs)
+    except Exception as e:
+        logger.warning(
+            f"skip-if-current: sidecar read failed for shard {shard_key} "
+            f"(degrading to rewrite, issue #388): {e}"
+        )
+        recorded = None
+    identity = classify_leaf_identity(
+        recorded, semantic_hash=semantic_hash, planned_ids=planned_ids
+    )
+    base = {
+        "shard_key": int(shard_key),
+        "identity": identity["classification"],
+        "semantic_hash": semantic_hash,
+        "cells_with_data": 0,
+        "total_obs": 0,
+        "granule_count": len(planned_ids) if planned_ids is not None else 0,
+        "duration_s": time.time() - t0,
+        "error": None,
+    }
+    if identity["action"] == "skip":
+        logger.info(f"shard {shard_key}: current (identity match, issue #388) — fold skipped")
+        return identity, {**base, "current": True}
+    if identity["action"] == "refuse":
+        missing = identity["missing"]
+        if allow_contraction:
+            logger.info(
+                f"shard {shard_key}: contraction allowed by flag — rewriting "
+                f"({len(missing)} recorded granule id(s) dropped)"
+            )
+            return identity, None
+        shown = ", ".join(missing[:5]) + (f", +{len(missing) - 5} more" if len(missing) > 5 else "")
+        logger.warning(
+            f"shard {shard_key}: REFUSED — planned inputs drop {len(missing)} recorded "
+            f"granule id(s) ({shown}); pass allow_contraction to rewrite (issue #388)"
+        )
+        return identity, {**base, "refused": True, "missing_granules": missing}
+    return identity, None
+
+
 def process_and_write_hive(
     shard_key,
     granule_urls,
@@ -1121,6 +1201,10 @@ def process_and_write_hive(
     aoi_payload=None,
     profile=False,
     window=None,
+    skip_if_current=False,
+    allow_contraction=False,
+    semantic_hash=None,
+    sidecar_spec=None,
 ):
     """Process one shard into its own hive leaf store (issue #199 phase 2).
 
@@ -1163,6 +1247,27 @@ def process_and_write_hive(
     ``metadata["time_range"]`` for the root-summary union), and arms the D14
     popcount (``encoding: "full"``). ``None`` is byte-identical to
     pre-windowing behavior.
+
+    ``skip_if_current`` (issue #388) arms the worker-side leaf identity gate
+    (:func:`leaf_identity_gate`) BEFORE any fold: a unit whose planned
+    ``(semantic_hash, granule-id set)`` pair matches the leaf's recorded D20
+    sidecar returns a ``{"current": True}`` metadata dict and writes nothing;
+    a contraction (``recorded ∖ planned ≠ ∅``, the ruled predicate) returns
+    ``{"refused": True, "missing_granules": [...]}`` unless
+    ``allow_contraction`` rides the call. Default ``False`` keeps this seam
+    byte-identical for callers that have not opted in (the Lambda handler).
+    ``semantic_hash`` is the RUN config's D19 digest when the caller holds it
+    (the local runner); ``None`` falls back to hashing this worker's own
+    ``config`` — the same digest except under the per-cell
+    ``granule_workers`` clamp (``runner._clamped_data_source``), where the
+    drift is one-sided: it can only miss a skip (degrading to today's
+    rewrite), never fake one. Either way the resolved hash is stamped into
+    ``metadata["semantic_hash"]`` so a caller that never resolved it (the
+    Lambda handler) still records the identity half via
+    ``telemetry.build_record``'s validated metadata fallback.
+    ``sidecar_spec`` is the manifest spec in effect, keying the sidecar name
+    (``telemetry.sidecar_key``); the gate reads with it and degrades to
+    rewrite when the sidecar is absent under that name.
     """
     from zagg.processing import (
         process_shard,
@@ -1171,6 +1276,17 @@ def process_and_write_hive(
         write_ragged_leaf_to_zarr,
     )
     from zagg.store import open_store
+
+    # D19 identity half (issue #388): resolve BEFORE the window filter
+    # injection below — recorded sidecars carry the RUN config's hash, and the
+    # per-unit windowed config copy must not perturb the comparison.
+    if semantic_hash is None:
+        try:
+            from zagg.semantics import semantic_hash as _semantic_hash
+
+            semantic_hash = _semantic_hash(config)
+        except Exception as e:
+            logger.warning(f"semantic hash unavailable (fail-open, issue #388): {e}")
 
     windowing = None
     time_range_of = None
@@ -1183,6 +1299,23 @@ def process_and_write_hive(
         time_range_of = windowing["time_field"]
 
     leaf_path = shard_leaf_path(store_root, shard_key, window=window["label"] if window else None)
+
+    # Leaf identity gate (issue #388): per (shard, window) unit, before any
+    # read or fold. A skipped/refused unit returns here having written NOTHING.
+    identity = None
+    if skip_if_current:
+        identity, unit_meta = leaf_identity_gate(
+            leaf_path,
+            [str(u) for u in granule_urls],
+            semantic_hash=semantic_hash,
+            allow_contraction=allow_contraction,
+            sidecar_spec=sidecar_spec,
+            store_kwargs=store_kwargs,
+            shard_key=shard_key,
+        )
+        if unit_meta is not None:
+            return unit_meta
+
     box: dict = {}
     _write_elapsed = 0.0
 
@@ -1303,6 +1436,15 @@ def process_and_write_hive(
 
         time_range = iso_time_range(metadata["time_range"], windowing)
         metadata["time_range"] = time_range
+    # The seam stamps the identity half (issue #388): a caller that never
+    # resolved the hash itself (the Lambda handler) still records it in the
+    # leaf sidecar via ``telemetry.build_record``'s validated metadata
+    # fallback. The identity classification rides so run stats can count
+    # ``unrecorded-ids`` rewrites apart from ordinary ones.
+    if semantic_hash is not None:
+        metadata.setdefault("semantic_hash", semantic_hash)
+    if identity is not None:
+        metadata["identity"] = identity["classification"]
     # Sharded leaf: ONE whole-leaf write per array (dense + ragged together,
     # issue #236), after the stream. The leaf template is emitted here (still
     # lazily, via ``_leaf``), so a shard that produced no chunks never creates
@@ -1477,6 +1619,7 @@ __all__ = [
     "encode_coverage_bitmap",
     "ensure_manifest",
     "leaf_block_index",
+    "leaf_identity_gate",
     "process_and_write_hive",
     "read_commit",
     "read_coverage",

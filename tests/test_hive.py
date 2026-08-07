@@ -1035,6 +1035,229 @@ class TestProcessAndWriteHive:
         assert ops == ["dense", "ragged", "sidecar", "stamp"]
 
 
+# ── leaf skip-if-current + contraction guard (issue #388 phase 2) ────────────
+
+
+class TestLeafSkipIfCurrent:
+    """The worker-side identity gate on ``process_and_write_hive``: a unit
+    whose planned ``(semantic_hash, granule-id set)`` pair matches the leaf's
+    recorded D20 sidecar no-ops the fold and writes NOTHING; an unflagged
+    contraction refuses; everything else rewrites exactly as today."""
+
+    URLS = ["s3://bucket/granule1.h5", "s3://bucket/granule2.h5"]
+
+    # Shared with the seam tests above (same fake-worker contract).
+    _grid = TestProcessAndWriteHive._grid
+    _carrier = TestProcessAndWriteHive._carrier
+    _meta = TestProcessAndWriteHive._meta
+    _streaming_fake = TestProcessAndWriteHive._streaming_fake
+
+    def _write_leaf(self, monkeypatch, cfg, tmp_path):
+        """First run: the REAL seam writes + stamps the leaf; then the sidecar
+        the runner would write (issue #297), carrying the #388 identity."""
+        import zagg.processing as processing
+        from zagg.telemetry import build_record, write_sidecar
+
+        grid = self._grid(cfg)
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid))
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}
+        )
+        record = build_record(
+            shard_key=int(shard),
+            metadata=meta,
+            granule_ids=list(self.URLS),
+            run_id="r1",
+            semantic_hash=meta["semantic_hash"],
+        )
+        write_sidecar(hive.shard_leaf_path(root, shard), record)
+        return grid, shard, root, record
+
+    def _counting_fake(self, monkeypatch, grid):
+        import zagg.processing as processing
+
+        calls: list = []
+        fake = self._streaming_fake(grid)
+
+        def counting(*a, **k):
+            calls.append(int(a[1]))
+            return fake(*a, **k)
+
+        monkeypatch.setattr(processing, "process_shard", counting)
+        return calls
+
+    def _arm_boom(self, monkeypatch):
+        import zagg.processing as processing
+
+        def boom(*_a, **_k):
+            raise AssertionError("fold ran on a gated unit")
+
+        monkeypatch.setattr(processing, "process_shard", boom)
+
+    @staticmethod
+    def _tree(root):
+        """Every file under ``root`` with its mtime — the wrote-nothing pin."""
+        out = {}
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                p = os.path.join(dirpath, name)
+                out[os.path.relpath(p, root)] = os.stat(p).st_mtime_ns
+        return out
+
+    def test_identical_rerun_skips_and_writes_nothing(self, monkeypatch, cfg, tmp_path):
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        before = self._tree(root)
+        self._arm_boom(monkeypatch)
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert meta["current"] is True and meta["identity"] == "equal"
+        assert meta["shard_key"] == int(shard)
+        assert meta["total_obs"] == 0 and meta.get("error") is None
+        # The unit wrote NOTHING: no object added, none rewritten.
+        assert self._tree(root) == before
+
+    def test_gate_is_off_by_default(self, monkeypatch, cfg, tmp_path):
+        # Byte-identical default: without skip_if_current the seam rewrites
+        # unconditionally, exactly as today (the deployed handler's posture).
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        calls = self._counting_fake(monkeypatch, grid)
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}
+        )
+        assert calls == [int(shard)]
+        assert "current" not in meta and "identity" not in meta
+
+    def test_contraction_refuses_and_names_missing(self, monkeypatch, cfg, tmp_path):
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        before = self._tree(root)
+        self._arm_boom(monkeypatch)
+        meta = hive.process_and_write_hive(
+            shard, [self.URLS[0]], grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert meta["refused"] is True and meta["identity"] == "contraction"
+        assert meta["missing_granules"] == [self.URLS[1]]
+        # A refusal writes nothing either: the committed leaf is protected.
+        assert self._tree(root) == before
+
+    def test_mixed_add_and_drop_refuses(self, monkeypatch, cfg, tmp_path):
+        # The ruled predicate is ``recorded ∖ planned ≠ ∅``, NOT strict-subset:
+        # a shardmap that GREW while silently dropping an old granule (an
+        # upstream purge behind a fresh catalog query) still trips the guard.
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        self._arm_boom(monkeypatch)
+        planned = [self.URLS[0], "s3://bucket/granule3.h5", "s3://bucket/granule4.h5"]
+        meta = hive.process_and_write_hive(
+            shard, planned, grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert meta["refused"] is True and meta["identity"] == "mixed"
+        assert meta["missing_granules"] == [self.URLS[1]]
+
+    def test_allow_contraction_rewrites_wholesale(self, monkeypatch, cfg, tmp_path):
+        from zagg.store import open_store
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        calls = self._counting_fake(monkeypatch, grid)
+        meta = hive.process_and_write_hive(
+            shard,
+            [self.URLS[0]],
+            grid,
+            {},
+            root,
+            cfg,
+            store_kwargs={},
+            skip_if_current=True,
+            allow_contraction=True,
+        )
+        # A flagged contraction is a NORMAL update: fold ran, leaf re-stamped,
+        # no refusal — the classification still rides for the run stats.
+        assert calls == [int(shard)]
+        assert "refused" not in meta and meta["identity"] == "contraction"
+        leaf = hive.shard_leaf_path(root, shard)
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_expansion_rewrites(self, monkeypatch, cfg, tmp_path):
+        # A new cycle's granules: planned ⊇ recorded never trips the guard.
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        calls = self._counting_fake(monkeypatch, grid)
+        meta = hive.process_and_write_hive(
+            shard,
+            list(self.URLS) + ["s3://bucket/granule3.h5"],
+            grid,
+            {},
+            root,
+            cfg,
+            store_kwargs={},
+            skip_if_current=True,
+        )
+        assert calls == [int(shard)] and meta["identity"] == "expansion"
+        assert "refused" not in meta and "current" not in meta
+
+    def test_semantic_mismatch_rewrites(self, monkeypatch, cfg, tmp_path):
+        # Same id set under a different semantic hash: never a skip, never a
+        # refusal — a semantic change over covered inputs is a normal rewrite.
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        calls = self._counting_fake(monkeypatch, grid)
+        meta = hive.process_and_write_hive(
+            shard,
+            list(self.URLS),
+            grid,
+            {},
+            root,
+            cfg,
+            store_kwargs={},
+            skip_if_current=True,
+            semantic_hash="f" * 64,
+        )
+        assert calls == [int(shard)]
+        assert meta["identity"] == "semantic-mismatch"
+        # A caller-passed hash is recorded as given (the run-config hash).
+        assert meta["semantic_hash"] == "f" * 64
+
+    def test_unrecorded_ids_rewrites_with_its_own_classification(self, monkeypatch, cfg, tmp_path):
+        # A pre-#388 sidecar records no granule_ids: any mismatch classifies
+        # ``unrecorded-ids`` and rewrites — the guard is INERT there, and the
+        # classification is what the run stats count apart (cells_unrecorded).
+        from zagg.telemetry import write_sidecar
+
+        grid, shard, root, record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        write_sidecar(hive.shard_leaf_path(root, shard), {**record, "granule_ids": None})
+        calls = self._counting_fake(monkeypatch, grid)
+        meta = hive.process_and_write_hive(
+            shard, [self.URLS[0]], grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert calls == [int(shard)]
+        assert meta["identity"] == "unrecorded-ids" and "refused" not in meta
+
+    def test_no_sidecar_rewrites(self, monkeypatch, cfg, tmp_path):
+        # No sidecar (fresh store): unverifiable, so today's rewrite.
+        grid = self._grid(cfg)
+        shard = _shard_word()
+        root = str(tmp_path / "store")
+        calls = self._counting_fake(monkeypatch, grid)
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert calls == [int(shard)] and meta["identity"] == "no-sidecar"
+
+    def test_seam_stamps_semantic_hash(self, monkeypatch, cfg, tmp_path):
+        # The seam stamps the D19 hash into its returned metadata so a caller
+        # that never resolved it (the Lambda handler) still records the
+        # identity half via build_record's validated metadata fallback.
+        import zagg.processing as processing
+        from zagg.semantics import semantic_hash as semhash
+
+        grid = self._grid(cfg)
+        shard = _shard_word()
+        monkeypatch.setattr(processing, "process_shard", self._streaming_fake(grid))
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, str(tmp_path / "store"), cfg, store_kwargs={}
+        )
+        assert meta["semantic_hash"] == semhash(cfg)
+
+
 def _sharded_accumulate_fake(
     grid, chunk_carrier, meta, ragged_by_local=None, occupied=None, error=None
 ):
@@ -1727,6 +1950,127 @@ class TestRunnerWiring:
             n_objects = sum(len(files) for _d, _s, files in os.walk(chunk_dir))
             assert n_objects == 1, name
         assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_local_rerun_skips_current_leaves(self, monkeypatch, cfg, tmp_path):
+        """Issue #388 acceptance (local backend): an identical rerun no-ops
+        every leaf — the fold never runs, the sidecar is NOT clobbered, and
+        the unit counts as ``cells_current``, never ``cells_with_data``."""
+        import zagg.processing as processing
+        from zagg import runner
+        from zagg.grids import from_config
+        from zagg.runner import agg
+        from zagg.telemetry import read_sidecar
+
+        cfg.output["store_layout"] = "hive"
+        catalog_path, shard = self._catalog(tmp_path)
+        root = str(tmp_path / "out")
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+        grid = from_config(cfg, parent_order=6)
+        helper = TestProcessAndWriteHive()
+        calls = []
+
+        def fake(g, shard_key, urls, **kwargs):
+            calls.append(int(shard_key))
+            return helper._streaming_fake(grid)(g, shard_key, urls, **kwargs)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        s1 = agg(cfg, catalog=catalog_path, store=root, backend="local")
+        assert calls == [shard]
+        assert (s1["cells_current"], s1["cells_refused"], s1["cells_unrecorded"]) == (0, 0, 0)
+        leaf = hive.shard_leaf_path(root, shard)
+        sidecar = read_sidecar(leaf)
+        assert sidecar["granule_ids"] == [_rec(1)["s3"]]
+
+        s2 = agg(cfg, catalog=catalog_path, store=root, backend="local")
+        assert calls == [shard]  # the fold did NOT run again
+        assert s2["cells_current"] == 1 and s2["cells_with_data"] == 0
+        assert read_sidecar(leaf) == sidecar  # a skip never clobbers the sidecar
+        # A skipped unit contributes no run-parquet row: the rerun had no
+        # rows at all, so the fail-open write skipped (path None).
+        assert s2["run_stats_path"] is None
+
+    def test_local_rerun_overwrite_disables_the_skip(self, monkeypatch, cfg, tmp_path):
+        # overwrite=True is the operator's big hammer: today's unconditional
+        # rewrite, no identity gate (PR question (2)'s documented posture).
+        import zagg.processing as processing
+        from zagg import runner
+        from zagg.grids import from_config
+        from zagg.runner import agg
+
+        cfg.output["store_layout"] = "hive"
+        catalog_path, shard = self._catalog(tmp_path)
+        root = str(tmp_path / "out")
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+        grid = from_config(cfg, parent_order=6)
+        helper = TestProcessAndWriteHive()
+        calls = []
+
+        def fake(g, shard_key, urls, **kwargs):
+            calls.append(int(shard_key))
+            return helper._streaming_fake(grid)(g, shard_key, urls, **kwargs)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        agg(cfg, catalog=catalog_path, store=root, backend="local")
+        s2 = agg(cfg, catalog=catalog_path, store=root, backend="local", overwrite=True)
+        assert calls == [shard, shard] and s2["cells_current"] == 0
+
+    def test_local_rerun_contraction_refuses_then_flag_rewrites(self, monkeypatch, cfg, tmp_path):
+        """Issue #388 acceptance: a contracted shardmap REFUSES per leaf
+        (``cells_refused``, never an error; sidecar and leaf intact), and
+        ``allow_contraction=True`` proceeds as a normal wholesale rewrite."""
+        import zagg.processing as processing
+        from zagg import runner
+        from zagg.grids import from_config
+        from zagg.runner import agg
+        from zagg.telemetry import read_sidecar
+
+        cfg.output["store_layout"] = "hive"
+        shard = _shard_word()
+
+        def _cat(name, granules):
+            catalog = {
+                "metadata": {"short_name": "ATL06", "version": "007"},
+                "grid_signature": {
+                    "type": "healpix",
+                    "indexing_scheme": "nested",
+                    "parent_order": 6,
+                    "child_order": 12,
+                    "layout": "fullsphere",
+                },
+                "shard_keys": [shard],
+                "granules": [granules],
+            }
+            p = tmp_path / name
+            p.write_text(json.dumps(catalog))
+            return str(p)
+
+        full = _cat("catalog_full.json", [_rec(1), _rec(2)])
+        contracted = _cat("catalog_contracted.json", [_rec(1)])
+        root = str(tmp_path / "out")
+        monkeypatch.setattr(runner, "get_nsidc_s3_credentials", lambda: {"accessKeyId": "a"})
+        grid = from_config(cfg, parent_order=6)
+        helper = TestProcessAndWriteHive()
+        calls = []
+
+        def fake(g, shard_key, urls, **kwargs):
+            calls.append(int(shard_key))
+            return helper._streaming_fake(grid)(g, shard_key, urls, **kwargs)
+
+        monkeypatch.setattr(processing, "process_shard", fake)
+        agg(cfg, catalog=full, store=root, backend="local")
+        leaf = hive.shard_leaf_path(root, shard)
+        sidecar = read_sidecar(leaf)
+        assert len(calls) == 1 and len(sidecar["granule_ids"]) == 2
+
+        s2 = agg(cfg, catalog=contracted, store=root, backend="local")
+        assert len(calls) == 1  # refused: the fold never ran
+        assert s2["cells_refused"] == 1 and s2["cells_error"] == 0
+        assert read_sidecar(leaf) == sidecar  # leaf + sidecar untouched
+
+        s3 = agg(cfg, catalog=contracted, store=root, backend="local", allow_contraction=True)
+        assert len(calls) == 2  # the flag proceeds as a normal D4 rewrite
+        assert s3["cells_refused"] == 0 and s3["cells_with_data"] == 1
+        assert read_sidecar(leaf)["granule_ids"] == [_rec(1)["s3"]]
 
     def test_lambda_hive_fires_async_setup_after_ping(self, monkeypatch, cfg, tmp_path):
         # Issue #252 hybrid: a hive lambda run dispatches NO synchronous
