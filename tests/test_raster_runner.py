@@ -1939,6 +1939,8 @@ class TestRasterLocalRerun:
     return and its own counter wiring, so it needs its own pins."""
 
     def test_identical_rerun_skips_and_keeps_the_sidecar(self, tmp_path, manifest):
+        import os
+
         from zagg import hive
         from zagg.telemetry import read_sidecar
 
@@ -1950,12 +1952,24 @@ class TestRasterLocalRerun:
         leaf = hive.shard_leaf_path(cfg.output["store"], shard)
         sidecar = read_sidecar(leaf)
 
+        # The store-ROOT objects age out otherwise: ensure_manifest
+        # early-returns on a frozen-key match and a skip-capable run is
+        # overwrite=False, so nothing else moves them (review finding).
+        roots = [
+            os.path.join(cfg.output["store"], hive.MANIFEST_NAME),
+            os.path.join(cfg.output["store"], hive.AGGREGATION_CORE_NAME),
+        ]
+        for path in roots:
+            os.utime(path, (10_000, 10_000))
+
         s2 = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
         assert s2["cells_current"] == 1 and s2["cells_with_data"] == 0
         # A skip never clobbers the good record, and produces no stats row —
         # so the rerun writes no run parquet at all.
         assert read_sidecar(leaf) == sidecar
         assert s2["run_stats_path"] is None
+        assert s2["objects_touched"] > 0 and s2["touch_failures"] == 0
+        assert all(os.stat(path).st_mtime_ns > 10_000 * 10**9 for path in roots)
 
     def test_overwrite_disables_the_skip(self, tmp_path, manifest):
         cfg, sm_path, _shard, _data = manifest

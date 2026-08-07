@@ -26,11 +26,29 @@ caveats, not solved here: a versioned bucket mints a new object version per
 touch, and an object >= 5 GB would need a multipart copy and simply counts
 as failed (leaf objects never approach it).
 
+The unit footprint is not the whole store: the STORE-ROOT objects have no
+unit that owns them, and an all-skip run re-PUTs none of them
+(:func:`zagg.hive.ensure_manifest` early-returns on a frozen-key match, and
+every skip-capable run has ``overwrite=False``). :func:`touch_store_root`
+covers them once per run — the D6 ``morton_hive.json``, the
+``aggregation.yaml`` semantic core, and the root ``coverage.moc`` — and the
+local backend calls it from the same post-units wrap-up that already unions
+the root MOC (that process is also the worker; the D8 orchestrator-no-write
+rule constrains only the Lambda paths, which therefore do NOT get this
+today — see the PR #397 question).
+
 Everything here is BEST-EFFORT and fail-open (the D9 posture): a failed
 touch logs and counts, and the run degrades to today's behavior — it never
 fails the unit, never un-skips it, and :func:`touch_current_unit` never
 raises out of the seam. An ABSENT path is neither touched nor failed: a
 unit legitimately has no sub-map (non-HEALPix grids, id-less entries).
+
+Documented gaps, not solved here: the §7 sweep's ancestor-node overviews
+and ``pyramid.json`` envelopes belong to no unit footprint and are not
+store-root objects either, and a skip produces zero sweep dirtiness by
+construction — so a skip-only store ages its pyramid above the leaves while
+the leaves and the root survive. Walking them would mean a store-wide walk
+this module deliberately does not own (PR #397 question).
 """
 
 from __future__ import annotations
@@ -76,6 +94,29 @@ def touch_current_unit(
         logger.warning(f"lifecycle touch skipped — footprint unresolved (fail-open): {e}")
         return {"touched": 0, "failed": 1}
     return touch_unit_footprint(trees, objects, store_kwargs=store_kwargs)
+
+
+def touch_store_root(store_root, *, store_kwargs=None) -> dict:
+    """Touch the store-ROOT objects no unit footprint covers (issue #388).
+
+    A run whose every unit skipped writes nothing at the root either:
+    :func:`zagg.hive.ensure_manifest` accepts a frozen-key-matching manifest
+    with no second PUT (and ``aggregation.yaml`` is written only inside that
+    PUT branch), and every skip-capable run has ``overwrite=False``. So the
+    REQUIRED reader-facing ``morton_hive.json`` (D6) would expire under a
+    lifecycle rule while 100% of the data objects it indexes are fresh.
+    Three objects, O(1) requests, all fail-open (an absent root
+    ``coverage.moc`` — ``output.coverage_moc`` off — is not a failure).
+    """
+    try:
+        from zagg.hive import AGGREGATION_CORE_NAME, MANIFEST_NAME, ROOT_COVERAGE_NAME
+
+        root = str(store_root).rstrip("/")
+        names = (MANIFEST_NAME, AGGREGATION_CORE_NAME, ROOT_COVERAGE_NAME)
+    except Exception as e:
+        logger.warning(f"store-root touch skipped — names unresolved (fail-open): {e}")
+        return {"touched": 0, "failed": 1}
+    return touch_unit_footprint([], [f"{root}/{name}" for name in names], store_kwargs=store_kwargs)
 
 
 def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
@@ -188,4 +229,4 @@ def _touch_s3_object(s3, bucket, key, counts) -> None:
         logger.warning(f"lifecycle touch failed for s3://{bucket}/{key} (fail-open): {e}")
 
 
-__all__ = ["touch_current_unit", "touch_unit_footprint"]
+__all__ = ["touch_current_unit", "touch_store_root", "touch_unit_footprint"]

@@ -1102,6 +1102,7 @@ class RasterStrategy:
                     _fold_raster_stages(stage_max, stage_counts, stage_stats, write_s)
 
         wall_time = time.time() - t0
+        identity = _identity_counts(ok_metas)
         if store_layout == "hive":
             # End-of-run manifest backstop (issue #252 hybrid, local flavor):
             # idempotent re-ensure — a frozen-key-matching manifest is
@@ -1132,6 +1133,17 @@ class RasterStrategy:
                         logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
                 except Exception as e:
                     logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
+            # Store-root lifecycle touch (issue #388 phase 3): no unit
+            # footprint covers a root object and an all-skip run re-PUTs none
+            # of them, so the D6 manifest would expire under a lifecycle rule
+            # with every leaf it indexes fresh. Rides this seam for the same
+            # reason the root coverage.moc above does: local = worker.
+            if identity["cells_current"]:
+                from zagg.lifecycle import touch_store_root
+
+                root_touch = touch_store_root(store_path, store_kwargs=store_kwargs)
+                identity["objects_touched"] += root_touch["touched"]
+                identity["touch_failures"] += root_touch["failed"]
         # Run-level stats parquet (issue #297 phase 3), BEFORE the all-failed
         # raise below so the failure evidence persists at the store root.
         from zagg.telemetry import failure_record, flatten_record
@@ -1171,7 +1183,7 @@ class RasterStrategy:
             "cells_with_data": shards_with_data,
             "cells_error": errors,
             # Skip-if-current run stats (issue #388) — see _identity_counts.
-            **_identity_counts(ok_metas),
+            **identity,
             # Shared summary key across strategies. For the raster path this is
             # the count of shard×timestep slabs written, not a per-cell obs tally
             # (see RasterStrategy docstring); ``timesteps`` is the datatake count.
@@ -2797,7 +2809,9 @@ def _identity_counts(metas) -> dict:
     - ``objects_touched`` / ``touch_failures`` — the phase-3 lifecycle touch
       rollup (``zagg.lifecycle``): objects whose ``LastModified`` the skipped
       units refreshed, and touch failures (fail-open — logged and counted
-      here, never folded into ``cells_error``).
+      here, never folded into ``cells_error``). The local paths ADD the
+      once-per-run ``touch_store_root`` counts to these after the fact — the
+      root objects belong to no unit, so they cannot come from ``metas``.
     """
     metas = [m for m in metas if isinstance(m, dict)]
     return {
@@ -3147,12 +3161,26 @@ def _run_local(
         except Exception as e:
             logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
 
+    # Store-root lifecycle touch (issue #388 phase 3): the unit touches cover
+    # no root object, and an all-skip run re-PUTs none of them (ensure_manifest
+    # early-returns on a frozen-key match, and a skip-capable run is by
+    # definition overwrite=False) — so the D6 manifest would expire under a
+    # lifecycle rule with every leaf it indexes fresh. Same seam and same
+    # justification as the root coverage.moc above: this process is the worker.
+    identity = _identity_counts(report.results)
+    if store_layout == "hive" and identity["cells_current"]:
+        from zagg.lifecycle import touch_store_root
+
+        root_touch = touch_store_root(store_path, store_kwargs=store_kwargs)
+        identity["objects_touched"] += root_touch["touched"]
+        identity["touch_failures"] += root_touch["failed"]
+
     summary = {
         "total_cells": len(cells),
         "cells_with_data": report.cells_with_data,
         "cells_error": report.cells_error,
         # Skip-if-current run stats (issue #388) — see _identity_counts.
-        **_identity_counts(report.results),
+        **identity,
         "total_obs": report.total_obs,
         "wall_time_s": wall_time,
         "store_path": store_path,

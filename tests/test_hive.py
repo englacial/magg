@@ -2089,12 +2089,24 @@ class TestRunnerWiring:
         sidecar = read_sidecar(leaf)
         assert sidecar["granule_ids"] == [_rec(1)["s3"]]
 
+        # Age the store-ROOT objects: ensure_manifest early-returns on a
+        # frozen-key match, so without the phase-3 root touch they would keep
+        # their original LastModified across arbitrarily many skip reruns
+        # (review finding) — the D6 manifest expiring is a bricked store.
+        roots = [
+            os.path.join(root, hive.MANIFEST_NAME),
+            os.path.join(root, hive.AGGREGATION_CORE_NAME),
+        ]
+        for path in roots:
+            os.utime(path, (10_000, 10_000))
+
         s2 = agg(cfg, catalog=catalog_path, store=root, backend="local")
         assert calls == [shard]  # the fold did NOT run again
         assert s2["cells_current"] == 1 and s2["cells_with_data"] == 0
         assert read_sidecar(leaf) == sidecar  # a skip never clobbers the sidecar
         # ...and the lifecycle touch rollup rides the summary (phase 3).
         assert s2["objects_touched"] > 0 and s2["touch_failures"] == 0
+        assert all(os.stat(path).st_mtime_ns > 10_000 * 10**9 for path in roots)
         # A skipped unit contributes no run-parquet row: the rerun had no
         # rows at all, so the fail-open write skipped (path None).
         assert s2["run_stats_path"] is None

@@ -107,6 +107,54 @@ class TestTouchLocal:
         assert counts == {"touched": 0, "failed": 1}
 
 
+class TestTouchStoreRoot:
+    """The root objects no unit footprint covers (review finding, phase 3)."""
+
+    def _root(self, tmp_path, *, moc=True):
+        from zagg.hive import AGGREGATION_CORE_NAME, MANIFEST_NAME, ROOT_COVERAGE_NAME
+
+        root = tmp_path / "store"
+        root.mkdir()
+        (root / MANIFEST_NAME).write_bytes(b"{}")
+        (root / AGGREGATION_CORE_NAME).write_bytes(b"a: 1\n")
+        if moc:
+            (root / ROOT_COVERAGE_NAME).write_bytes(b"{}")
+        return root
+
+    def test_touches_the_manifest_semantic_core_and_root_moc(self, tmp_path):
+        # ensure_manifest early-returns on a frozen-key match and every
+        # skip-capable run is overwrite=False, so nothing else moves these.
+        root = self._root(tmp_path)
+        aged = _age(root)
+        counts = lifecycle.touch_store_root(str(root))
+        assert counts == {"touched": 3, "failed": 0}
+        assert all(mtime > aged for mtime in _mtimes(root).values())
+
+    def test_an_absent_root_moc_is_neither_touched_nor_failed(self, tmp_path):
+        # output.coverage_moc off: the root MOC was never written.
+        root = self._root(tmp_path, moc=False)
+        assert lifecycle.touch_store_root(str(root)) == {"touched": 2, "failed": 0}
+
+    def test_a_missing_store_root_is_fail_open(self, tmp_path):
+        assert lifecycle.touch_store_root(str(tmp_path / "nope")) == {"touched": 0, "failed": 0}
+
+    def test_s3_root_objects_are_exact_keys(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        monkeypatch.setattr(lifecycle, "_s3_client", lambda kw: client)
+        counts = lifecycle.touch_store_root("s3://bkt/store/")
+        assert {c.kwargs["Key"] for c in client.copy_object.call_args_list} == {
+            "store/morton_hive.json",
+            "store/aggregation.yaml",
+            "store/coverage.moc",
+        }
+        # No LIST: the root is three named objects, not a tree walk (a walk
+        # would re-touch every leaf in the store).
+        client.get_paginator.assert_not_called()
+        assert counts == {"touched": 3, "failed": 0}
+
+
 class TestTouchS3:
     BUCKET = "bkt"
     TREE_KEYS = [
