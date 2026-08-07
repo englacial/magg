@@ -7,16 +7,17 @@ absent leaves are plain misses.
 
 import copy
 
+import numpy as np
 import zarr
 
 from zagg import hive
 from zagg.config import default_config
-from zagg.dedup import has_run, shard_status
+from zagg.dedup import classify_leaf_identity, has_run, shard_status
 from zagg.grids import HealpixGrid
 from zagg.grids.morton import morton_word
 from zagg.semantics import semantic_hash
 from zagg.store import open_store
-from zagg.telemetry import build_record, sidecar_key, write_sidecar
+from zagg.telemetry import build_record, granules_sha256, sidecar_key, write_sidecar
 
 WORD = morton_word("1121121")  # order-6 shard key
 GRANULES = ["s3://b/g1.h5", "s3://b/g2.h5"]
@@ -183,3 +184,125 @@ class TestHasRun:
         # A different window has no leaf: a plain miss (windows are disjoint).
         miss = has_run(root, cfg, {WORD: GRANULES}, window="2024")
         assert miss[WORD]["status"] == "miss"
+
+
+class TestClassifyLeafIdentity:
+    """Worker-side identity readings (issue #388): equal / expansion /
+    contraction / mixed, with every ambiguity degrading to rewrite."""
+
+    SEM = "a" * 64
+    IDS = ["s3://b/g1.h5", "s3://b/g2.h5", "s3://b/g3.h5"]
+
+    def _recorded(self, ids=None, semantic=SEM, with_ids=True):
+        ids = self.IDS if ids is None else ids
+        rec = {"semantic_hash": semantic, "granules_sha256": granules_sha256(ids)}
+        if with_ids:
+            rec["granule_ids"] = sorted(ids)
+        return rec
+
+    def test_equal_skips_on_the_hash_fast_path(self):
+        # Order must not matter: the hash is over the sorted ids.
+        got = classify_leaf_identity(
+            self._recorded(), semantic_hash=self.SEM, planned_ids=self.IDS[::-1]
+        )
+        assert got == {"action": "skip", "classification": "equal", "missing": []}
+
+    def test_equal_without_recorded_ids_still_skips(self):
+        # The fast path never needs the id list, so pre-#388 sidecars skip too.
+        got = classify_leaf_identity(
+            self._recorded(with_ids=False), semantic_hash=self.SEM, planned_ids=self.IDS
+        )
+        assert got["action"] == "skip"
+
+    def test_expansion_rewrites(self):
+        got = classify_leaf_identity(
+            self._recorded(), semantic_hash=self.SEM, planned_ids=self.IDS + ["s3://b/g4.h5"]
+        )
+        assert got == {"action": "rewrite", "classification": "expansion", "missing": []}
+
+    def test_pure_contraction_refuses_and_names_ids(self):
+        got = classify_leaf_identity(
+            self._recorded(), semantic_hash=self.SEM, planned_ids=self.IDS[:2]
+        )
+        assert got["action"] == "refuse"
+        assert got["classification"] == "contraction"
+        assert got["missing"] == ["s3://b/g3.h5"]
+
+    def test_mixed_add_and_drop_refuses(self):
+        # The ruled predicate is recorded - planned != {} — NOT strict subset:
+        # the planned set can even be LARGER while data drops (the upstream
+        # purge behind a fresh catalog query, the espg contraction ruling).
+        planned = self.IDS[:2] + ["s3://b/new1.h5", "s3://b/new2.h5"]
+        got = classify_leaf_identity(self._recorded(), semantic_hash=self.SEM, planned_ids=planned)
+        assert got["action"] == "refuse"
+        assert got["classification"] == "mixed"
+        assert got["missing"] == ["s3://b/g3.h5"]
+
+    def test_contraction_beats_semantic_mismatch(self):
+        # Dropping inputs refuses even when the semantic hash also changed —
+        # the guard is about data loss, not intent drift.
+        got = classify_leaf_identity(
+            self._recorded(semantic="b" * 64), semantic_hash=self.SEM, planned_ids=self.IDS[:1]
+        )
+        assert got["action"] == "refuse"
+        assert got["missing"] == sorted(self.IDS[1:])
+
+    def test_no_sidecar_rewrites(self):
+        got = classify_leaf_identity(None, semantic_hash=self.SEM, planned_ids=self.IDS)
+        assert got == {"action": "rewrite", "classification": "no-sidecar", "missing": []}
+
+    def test_pre388_sidecar_on_mismatch_rewrites(self):
+        # Hash mismatch + no recorded id list: undecidable, today's rewrite.
+        got = classify_leaf_identity(
+            self._recorded(with_ids=False), semantic_hash=self.SEM, planned_ids=self.IDS[:2]
+        )
+        assert got == {"action": "rewrite", "classification": "unrecorded-ids", "missing": []}
+
+    def test_semantic_mismatch_with_equal_sets_rewrites_not_refuses(self):
+        got = classify_leaf_identity(
+            self._recorded(semantic="b" * 64), semantic_hash=self.SEM, planned_ids=self.IDS
+        )
+        assert got == {"action": "rewrite", "classification": "semantic-mismatch", "missing": []}
+
+    def test_null_recorded_semantic_never_skips(self):
+        # Fleet-written pre-#388 vector sidecars record semantic_hash null
+        # (the Lambda handler passes none): never provably current.
+        got = classify_leaf_identity(
+            self._recorded(semantic=None), semantic_hash=self.SEM, planned_ids=self.IDS
+        )
+        assert got["action"] == "rewrite"
+
+    def test_caller_without_semantic_hash_never_skips(self):
+        got = classify_leaf_identity(self._recorded(), semantic_hash=None, planned_ids=self.IDS)
+        assert got["action"] == "rewrite"
+
+    def test_empty_planned_set_is_pure_contraction(self):
+        got = classify_leaf_identity(self._recorded(), semantic_hash=self.SEM, planned_ids=[])
+        assert got["action"] == "refuse"
+        assert got["classification"] == "contraction"
+        assert got["missing"] == sorted(self.IDS)
+
+    def test_unknown_planned_set_rewrites_rather_than_refusing(self):
+        # None is UNKNOWN, not empty: it must not diff to "every recorded id
+        # was dropped" and refuse — the maximally ambiguous input takes the
+        # conservative rewrite, the same direction as every other ambiguity.
+        got = classify_leaf_identity(self._recorded(), semantic_hash=self.SEM, planned_ids=None)
+        assert got == {"action": "rewrite", "classification": "unknown-planned", "missing": []}
+
+    def test_planned_ids_are_iterated_not_truth_tested(self):
+        # A numpy id array raises ValueError on a bare truthiness test; the
+        # planned set is iterated instead, so array-shaped callers work.
+        planned = np.array(self.IDS)
+        got = classify_leaf_identity(self._recorded(), semantic_hash=self.SEM, planned_ids=planned)
+        assert got["action"] == "skip"
+        empty = classify_leaf_identity(
+            self._recorded(), semantic_hash=self.SEM, planned_ids=np.array([], dtype=object)
+        )
+        assert empty["action"] == "refuse"  # an empty ARRAY is still empty, not unknown
+
+    def test_duplicate_drift_with_equal_sets_rewrites(self):
+        # granules_sha256 keeps duplicates; the set diff dedups. Same set,
+        # different multiset -> not current, not a contraction.
+        rec = self._recorded(ids=self.IDS + [self.IDS[0]])
+        got = classify_leaf_identity(rec, semantic_hash=self.SEM, planned_ids=self.IDS)
+        assert got == {"action": "rewrite", "classification": "id-multiset-drift", "missing": []}

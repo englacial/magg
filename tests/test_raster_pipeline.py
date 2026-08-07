@@ -1233,6 +1233,272 @@ class TestRasterHiveWorker:
         red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape == (1, grid.cells_per_shard)
 
+    # ── leaf skip-if-current + contraction guard (issue #388 phase 2) ────────
+
+    def _committed_leaf_with_sidecar(self, tmp_path, use=None):
+        """First run: the real seam commits the leaf; then the sidecar a
+        dispatcher would write (issue #297), carrying the #388 identity.
+        ``use`` seals the record over a PREFIX of the granules, so a later run
+        over the whole set reads as an expansion."""
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.telemetry import build_record, raster_granule_ids, write_sidecar
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        first = granules if use is None else granules[:use]
+        meta = process_and_write_raster_hive(shard, first, grid, root, cfg, store_kwargs={})
+        leaf = hive.shard_leaf_path(root, shard)
+        record = build_record(
+            shard_key=int(shard),
+            metadata={**meta, "total_obs": meta["timesteps"]},
+            granule_ids=raster_granule_ids(first),
+            run_id="r1",
+            semantic_hash=meta["semantic_hash"],
+        )
+        write_sidecar(leaf, record)
+        return cfg, grid, shard, granules, root, leaf
+
+    def _counting(self, monkeypatch):
+        """Count real ``process_raster_shard`` calls — the did-it-fold pin."""
+        import zagg.processing.raster as raster_mod
+
+        real = raster_mod.process_raster_shard
+        calls: list = []
+
+        def counting(*a, **k):
+            calls.append(1)
+            return real(*a, **k)
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", counting)
+        return calls
+
+    @staticmethod
+    def _boom(monkeypatch):
+        import zagg.processing.raster as raster_mod
+
+        def boom(*_a, **_k):
+            raise AssertionError("sampling ran on a gated unit")
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", boom)
+
+    @staticmethod
+    def _tree(root):
+        import os as _os
+
+        out = {}
+        for dirpath, _dirs, files in _os.walk(root):
+            for name in files:
+                p = _os.path.join(dirpath, name)
+                out[_os.path.relpath(p, root)] = _os.stat(p).st_mtime_ns
+        return out
+
+    @staticmethod
+    def _contents(root):
+        import os as _os
+
+        out = {}
+        for dirpath, _dirs, files in _os.walk(root):
+            for name in files:
+                p = _os.path.join(dirpath, name)
+                with open(p, "rb") as fh:
+                    out[_os.path.relpath(p, root)] = fh.read()
+        return out
+
+    @staticmethod
+    def _age(root, epoch=10_000):
+        import os as _os
+
+        for dirpath, _dirs, files in _os.walk(root):
+            for name in files:
+                _os.utime(_os.path.join(dirpath, name), (epoch, epoch))
+        return epoch * 10**9
+
+    def test_skip_if_current_no_ops_and_writes_nothing(self, tmp_path, monkeypatch):
+        import zagg.processing.raster as raster_mod
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        before = self._contents(root)
+        aged_ns = self._age(root)
+
+        def boom(*_a, **_k):
+            raise AssertionError("sampling ran on a current unit")
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", boom)
+        skipped = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert skipped["current"] is True and skipped["identity"] == "equal"
+        assert skipped["timesteps"] == 0 and skipped["leaf_written"] is False
+        # The unit wrote NOTHING: same object set, every byte identical...
+        assert self._contents(root) == before
+        # ...and the lifecycle touch refreshed every object under the unit
+        # (issue #388 phase 3): the purge clock resets on a skip.
+        after = self._tree(root)
+        assert set(after) == set(before)
+        assert all(mtime > aged_ns for mtime in after.values())
+        assert skipped["touched_objects"] == len(after) and skipped["touch_failed"] == 0
+
+    def test_contraction_refuses_without_the_flag(self, tmp_path, monkeypatch):
+        import zagg.processing.raster as raster_mod
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.telemetry import raster_granule_ids
+
+        cfg, grid, shard, granules, root, leaf = self._committed_leaf_with_sidecar(tmp_path)
+
+        def boom(*_a, **_k):
+            raise AssertionError("sampling ran on a refused unit")
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", boom)
+        refused = process_and_write_raster_hive(
+            shard, granules[:1], grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert refused["refused"] is True and refused["identity"] == "contraction"
+        assert refused["missing_granules"] == [raster_granule_ids(granules)[1]]
+        # The committed leaf is protected: still stamped complete — and NOT
+        # touched (only a certified-current unit resets the purge clock).
+        assert hive.read_commit(leaf)["complete"] is True
+        assert "touched_objects" not in refused
+
+    def test_allow_contraction_rewrites(self, tmp_path):
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, leaf = self._committed_leaf_with_sidecar(tmp_path)
+        redo = process_and_write_raster_hive(
+            shard,
+            granules[:1],
+            grid,
+            root,
+            cfg,
+            store_kwargs={},
+            skip_if_current=True,
+            allow_contraction=True,
+        )
+        # A flagged contraction is a normal wholesale rewrite (D13 semantics).
+        assert "refused" not in redo and redo["identity"] == "contraction"
+        assert redo["timesteps"] == 1 and redo["leaf_written"] is True
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (1, grid.cells_per_shard)
+
+    def test_seam_stamps_semantic_hash(self, tmp_path):
+        # The raster seam stamps the D19 hash for the sidecar fallback too.
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.semantics import semantic_hash as semhash
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        meta = process_and_write_raster_hive(shard, granules, grid, root, cfg, store_kwargs={})
+        assert meta["semantic_hash"] == semhash(cfg)
+
+    # The rest of the vector gate matrix (tests/test_hive.py::
+    # TestLeafSkipIfCurrent), mirrored: the raster seam has its own gate call
+    # site and its own early return, so every branch is pinned on both.
+
+    def test_gate_is_off_by_default(self, tmp_path, monkeypatch):
+        # The byte-identity pin for the deployed handler: without
+        # skip_if_current the seam rewrites unconditionally, exactly as today.
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(shard, granules, grid, root, cfg, store_kwargs={})
+        assert len(calls) == 1
+        assert "current" not in meta and "identity" not in meta
+
+    def test_no_sidecar_rewrites(self, tmp_path, monkeypatch):
+        # The raster sidecar is written only when ``leaf_written``, so this
+        # seam reaches ``no-sidecar`` over a strictly wider set of states than
+        # the vector one (a unit with acquisitions but no occupied cell writes
+        # no leaf, hence no record).
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert len(calls) == 1 and meta["identity"] == "no-sidecar"
+
+    def test_unrecorded_ids_rewrites_with_its_own_classification(self, tmp_path, monkeypatch):
+        # A pre-#388 sidecar records no granule_ids: the guard is INERT, and
+        # the classification is what the run stats count apart.
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.telemetry import read_sidecar, write_sidecar
+
+        cfg, grid, shard, granules, root, leaf = self._committed_leaf_with_sidecar(tmp_path)
+        write_sidecar(leaf, {**read_sidecar(leaf), "granule_ids": None})
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard, granules[:1], grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert len(calls) == 1
+        assert meta["identity"] == "unrecorded-ids" and "refused" not in meta
+
+    def test_expansion_rewrites(self, tmp_path, monkeypatch):
+        # A new acquisition: planned ⊇ recorded never trips the guard.
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path, use=1)
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert len(calls) == 1 and meta["identity"] == "expansion"
+        assert "refused" not in meta and "current" not in meta
+
+    def test_semantic_mismatch_rewrites(self, tmp_path, monkeypatch):
+        # Same id set under a different semantic hash: rewrite, never refuse.
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard,
+            granules,
+            grid,
+            root,
+            cfg,
+            store_kwargs={},
+            skip_if_current=True,
+            semantic_hash="f" * 64,
+        )
+        assert len(calls) == 1 and meta["identity"] == "semantic-mismatch"
+        assert meta["semantic_hash"] == "f" * 64
+
+    def test_mixed_add_and_drop_refuses(self, tmp_path, monkeypatch):
+        # The ruled predicate is ``recorded ∖ planned ≠ ∅``, NOT strict-subset.
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.telemetry import raster_granule_ids
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        fresh = _entry("g2", {"red": str(tmp_path / "h0.tif")}, T1, time_key="dt-3")
+        self._boom(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard, [granules[0], fresh], grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert meta["refused"] is True and meta["identity"] == "mixed"
+        assert meta["missing_granules"] == [raster_granule_ids(granules)[1]]
+
+    def test_destroyed_leaf_with_surviving_sidecar_rebuilds(self, tmp_path, monkeypatch):
+        # The sidecar is a SIBLING of the leaf, so a prefix-scoped lifecycle
+        # purge leaves the record over an absent leaf. The D4 stamp is the
+        # skip precondition on both seams (hive._leaf_is_committed).
+        import shutil
+
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, leaf = self._committed_leaf_with_sidecar(tmp_path)
+        shutil.rmtree(leaf)
+        assert hive.read_commit(leaf) is None
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert len(calls) == 1 and meta["identity"] == "unstamped-leaf"
+        assert "current" not in meta
+        assert hive.read_commit(leaf)["complete"] is True
+
 
 class TestRasterHiveContentHashes:
     """Issue #342 phase 5: O11 hashes accumulated incrementally as slabs stream.

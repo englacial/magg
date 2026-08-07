@@ -1928,3 +1928,129 @@ class TestRasterLambdaAsyncBackend:
         names = sorted(e["result_url"].rsplit("/", 1)[1] for e in procs)
         assert names == sorted([f"{lbl}_20260713.json", f"{lbl}_20260718.json"])
         assert summary["cells_with_data"] == 2 and summary["cells_error"] == 0
+
+
+class TestRasterLocalRerun:
+    """Issue #388 through the RASTER local dispatcher: the seam gate is armed
+    by default (``skip_if_current=not overwrite``), the dispatcher returns
+    early on a current/refused unit, and ``_identity_counts`` rolls the
+    counters into the raster summary. The vector twin lives in
+    ``tests/test_hive.py::TestHiveRunnerWiring``; this path has its own early
+    return and its own counter wiring, so it needs its own pins."""
+
+    def test_identical_rerun_skips_and_keeps_the_sidecar(self, tmp_path, manifest):
+        import os
+
+        from zagg import hive
+        from zagg.telemetry import read_sidecar
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        s1 = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert s1["cells_with_data"] == 1
+        assert (s1["cells_current"], s1["cells_refused"], s1["cells_unrecorded"]) == (0, 0, 0)
+        leaf = hive.shard_leaf_path(cfg.output["store"], shard)
+        sidecar = read_sidecar(leaf)
+
+        # The store-ROOT objects age out otherwise: ensure_manifest
+        # early-returns on a frozen-key match and a skip-capable run is
+        # overwrite=False, so nothing else moves them (review finding).
+        roots = [
+            os.path.join(cfg.output["store"], hive.MANIFEST_NAME),
+            os.path.join(cfg.output["store"], hive.AGGREGATION_CORE_NAME),
+        ]
+        for path in roots:
+            os.utime(path, (10_000, 10_000))
+
+        s2 = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert s2["cells_current"] == 1 and s2["cells_with_data"] == 0
+        # A skip never clobbers the good record, and produces no stats row —
+        # so the rerun writes no run parquet at all.
+        assert read_sidecar(leaf) == sidecar
+        assert s2["run_stats_path"] is None
+        assert s2["objects_touched"] > 0 and s2["touch_failures"] == 0
+        assert all(os.stat(path).st_mtime_ns > 10_000 * 10**9 for path in roots)
+
+    def test_overwrite_disables_the_skip(self, tmp_path, manifest):
+        cfg, sm_path, _shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        s2 = agg(cfg, catalog=sm_path, backend="local", max_workers=2, overwrite=True)
+        assert s2["cells_current"] == 0 and s2["cells_with_data"] == 1
+
+    def test_contraction_refuses_then_the_flag_rewrites(self, tmp_path, manifest):
+        from zagg import hive
+
+        cfg, sm_path, shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+
+        # The same shard with one acquisition dropped from the plan.
+        grid = from_config(cfg)
+        entries = [_entry("g0", str(tmp_path / "t0.tif"), T0, "dt-1")]
+        sm = ShardMap(grid.spatial_signature(), [shard], [entries], {"collection": "s2-test"})
+        contracted = str(tmp_path / "contracted.json")
+        sm.to_json(contracted)
+        leaf = hive.shard_leaf_path(cfg.output["store"], shard)
+
+        s2 = agg(cfg, catalog=contracted, backend="local", max_workers=2)
+        assert s2["cells_refused"] == 1 and s2["cells_error"] == 0
+        assert s2["cells_with_data"] == 0
+        # The committed leaf is protected: still the two-timestep axis.
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape[0] == 2
+
+        s3 = agg(cfg, catalog=contracted, backend="local", max_workers=2, allow_contraction=True)
+        assert s3["cells_refused"] == 0 and s3["cells_with_data"] == 1
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape[0] == 1
+
+
+class TestRasterAllowContractionEventKey:
+    """Issue #388: the raster dispatcher builds its OWN event dict, so its
+    only-when-true ``allow_contraction`` key needs its own pin — the vector
+    twin (``tests/test_runner.py::TestInvokeLambdaCellEvent``) covers
+    ``_build_cell_event`` alone. These also pin the ``agg(allow_contraction=)``
+    -> ``RasterStrategy.run`` -> ``_run_lambda_shards`` plumbing."""
+
+    def _process_events(self, manifest, monkeypatch, **agg_kwargs):
+        import boto3
+
+        cfg, sm_path, _shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+
+        def responder(event):
+            mode = event["mode"]
+            if mode == "ping":
+                body = {"ok": True, "mode": "ping", "zagg_version": "test"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            if mode in ("setup", "coverage"):
+                return {"statusCode": 200, "body": "{}"}  # Event invokes: unread
+            if mode == "finalize":
+                body = {"ok": True, "mode": "finalize", "layout": "hive"}
+                return {"statusCode": 200, "body": json.dumps(body)}
+            assert mode == "process_raster"
+            body = {"shard_key": event["shard_key"], "timesteps": 1, "cells_with_data": 7}
+            return {"statusCode": 200, "body": json.dumps(body)}
+
+        fake = _FakeLambdaClient(responder)
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        agg(
+            cfg,
+            catalog=sm_path,
+            store="s3://bucket/out.zarr",
+            backend="lambda",
+            max_workers=2,
+            invocation="sync",
+            **agg_kwargs,
+        )
+        return [e for e in fake.events if e["mode"] == "process_raster"]
+
+    def test_allow_contraction_adds_the_event_key(self, manifest, monkeypatch):
+        procs = self._process_events(manifest, monkeypatch, allow_contraction=True)
+        assert procs and all(ev["allow_contraction"] is True for ev in procs)
+
+    def test_default_event_has_no_allow_contraction_key(self, manifest, monkeypatch):
+        # Byte-identical to the pre-#388 payload when the guard is armed.
+        procs = self._process_events(manifest, monkeypatch)
+        assert procs and all("allow_contraction" not in ev for ev in procs)

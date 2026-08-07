@@ -1,0 +1,300 @@
+"""Lifecycle touch for skip-if-current leaf units (issue #388 phase 3).
+
+A skipped unit writes nothing — correct for the store, but invisible to
+bucket lifecycle policies: sliderule-public purges older objects, so a
+re-request that no-ops the pipeline must still reset the purge clock on the
+products it just certified current. The touch refreshes ``LastModified``
+across the unit's WHOLE footprint (lifecycle rules act per object):
+
+- the leaf ``.zarr`` tree — commit stamp, arrays, and the in-leaf
+  ``coverage.moc`` sidecar included (they are objects under the prefix);
+- the D20 stats sidecar and D22 sub-map SIBLINGS of the leaf
+  (:func:`zagg.telemetry.sidecar_key` / :func:`zagg.sweep.submap_key`, the
+  spec-keyed naming seams);
+- the issue #383 leaf column tree plus its own stats sidecar, when the run
+  declares one — the identity gate has already verified declaration and
+  artifact agree (``column-drift`` never reaches the touch), so the caller
+  simply passes the column path on the declared arm and ``None`` otherwise.
+
+Mechanism: local stores get ``os.utime``; S3 gets a server-side self-copy
+(``CopyObject`` onto itself with ``MetadataDirective="REPLACE"`` — S3
+rejects an identity copy without it; already a ``boto3`` dependency, and
+obstore's ``copy`` exposes no metadata directive). The self-copy preserves
+content (and the ETag for non-multipart objects).
+
+``MetadataDirective="REPLACE"`` covers SYSTEM-defined metadata too, not just
+``x-amz-meta-*``, so the copy request is what decides the new object's
+properties. Exactly what that costs, and what this module does about it:
+
+- **user metadata** is replaced with none — zagg's writers attach none;
+- **storage class** would otherwise reset to STANDARD on every touch,
+  silently defeating a lifecycle *transition* policy and re-paying the
+  transition each skip run. SOLVED: the class is echoed back from the LIST
+  entry (tree arm) or a ``HeadObject`` (named objects). Still a caveat: an
+  object already in ``GLACIER``/``DEEP_ARCHIVE`` cannot be copied at all
+  (``InvalidObjectState``) and counts as failed;
+- **ACL**: NOT preserved — ``CopyObject`` grants the destination the
+  requester's default private ACL unless ``x-amz-acl``/``x-amz-grant-*``
+  rides the request. A no-op on a ``BucketOwnerEnforced`` bucket (the
+  default since 2023), but a public-read-BY-ACL bucket would have the
+  touched objects made private. Documented, not solved;
+- **SSE-KMS**: a self-copy re-encrypts under the BUCKET DEFAULT key, not
+  the source object's key, and needs ``kms:Decrypt`` +
+  ``kms:GenerateDataKey``. Fails loudly into ``failed`` when the role lacks
+  them. Documented, not solved;
+- a **versioned** bucket mints a new object version per touch, and an
+  object >= 5 GB would need a multipart copy and simply counts as failed
+  (leaf objects never approach it).
+
+The unit footprint is not the whole store: the STORE-ROOT objects have no
+unit that owns them, and an all-skip run re-PUTs none of them
+(:func:`zagg.hive.ensure_manifest` early-returns on a frozen-key match, and
+every skip-capable run has ``overwrite=False``). :func:`touch_store_root`
+covers them once per run — the D6 ``morton_hive.json``, the
+``aggregation.yaml`` semantic core, and the root ``coverage.moc`` — and the
+local backend calls it from the same post-units wrap-up that already unions
+the root MOC (that process is also the worker; the D8 orchestrator-no-write
+rule constrains only the Lambda paths, which therefore do NOT get this
+today — see the PR #397 question).
+
+Everything here is BEST-EFFORT and fail-open (the D9 posture): a failed
+touch logs and counts, and the run degrades to today's behavior — it never
+fails the unit, never un-skips it, and :func:`touch_current_unit` never
+raises out of the seam. An ABSENT path is neither touched nor failed: a
+unit legitimately has no sub-map (non-HEALPix grids, id-less entries).
+
+Documented gaps, not solved here: the §7 sweep's ancestor-node rollup
+sidecars — ``{family}.rollup.json`` for every
+:data:`zagg.sweep.DEFAULT_FAMILIES` entry, plus each pass's root
+``sweep_stats_{ts}.json`` — belong to no unit footprint and are not
+store-root objects either, and a skip produces zero sweep dirtiness by
+construction, so a skip-only store ages its whole pyramid above the leaves
+while the leaves and the root survive. A repeat sweep does not refresh them
+either (an unchanged tree recomputes but PUTs nothing). Walking them would
+mean a store-wide walk this module deliberately does not own (PR #397
+question).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+
+logger = logging.getLogger(__name__)
+
+#: Process-wide S3 clients, keyed by the store kwargs that built them. The
+#: touch runs once per (shard, window) unit and the local dispatcher runs
+#: those units in a ThreadPoolExecutor, so a per-call client would mean one
+#: ~0.1-0.3 s ``boto3.client()`` construction per unit (minutes of pure
+#: construction on a few-thousand-shard all-skip rerun) AND concurrent
+#: construction off the shared default session, which botocore does not
+#: guarantee is thread-safe. A BUILT client is safe to share across threads;
+#: building is what needs the lock (and its own ``Session``).
+_CLIENTS: dict = {}
+_CLIENT_LOCK = threading.Lock()
+
+
+def touch_current_unit(
+    leaf_path,
+    *,
+    column_path=None,
+    sidecar_spec=None,
+    store_kwargs=None,
+) -> dict:
+    """The issue #388 skip-path touch for ONE ``(shard, window)`` unit.
+
+    Assembles the unit's footprint from its leaf path — the leaf tree, the
+    stats-sidecar and sub-map siblings named by ``sidecar_spec`` (the
+    manifest spec in effect), and ``column_path``'s tree + sidecar when the
+    caller passes one — then touches it via :func:`touch_unit_footprint`.
+    Returns the counts dict; NEVER raises (assembly errors count as one
+    failure and the touch is skipped).
+    """
+    try:
+        from zagg.column import _sidecar_name as column_sidecar_name
+        from zagg.sweep import submap_key
+        from zagg.telemetry import sidecar_path
+
+        prefix, _, name = str(leaf_path).rstrip("/").rpartition("/")
+        trees = [str(leaf_path)]
+        objects = [
+            sidecar_path(str(leaf_path), sidecar_spec),
+            f"{prefix}/{submap_key(name, sidecar_spec)}",
+        ]
+        if column_path:
+            trees.append(str(column_path))
+            # The column's D20 sidecar, named by the seam that OWNS the
+            # grammar rather than re-derived here: a drifted name reads as
+            # ABSENT (neither touched nor failed, by design), so a second
+            # source would stop touching the sidecar in total silence.
+            col_prefix, _, col_name = str(column_path).rstrip("/").rpartition("/")
+            objects.append(f"{col_prefix}/{column_sidecar_name(col_name)}")
+    except Exception as e:
+        logger.warning(f"lifecycle touch skipped — footprint unresolved (fail-open): {e}")
+        return {"touched": 0, "failed": 1}
+    return touch_unit_footprint(trees, objects, store_kwargs=store_kwargs)
+
+
+def touch_store_root(store_root, *, store_kwargs=None) -> dict:
+    """Touch the store-ROOT objects no unit footprint covers (issue #388).
+
+    A run whose every unit skipped writes nothing at the root either:
+    :func:`zagg.hive.ensure_manifest` accepts a frozen-key-matching manifest
+    with no second PUT (and ``aggregation.yaml`` is written only inside that
+    PUT branch), and every skip-capable run has ``overwrite=False``. So the
+    REQUIRED reader-facing ``morton_hive.json`` (D6) would expire under a
+    lifecycle rule while 100% of the data objects it indexes are fresh.
+    Three objects, O(1) requests, all fail-open (an absent root
+    ``coverage.moc`` — ``output.coverage_moc`` off — is not a failure).
+    """
+    try:
+        from zagg.hive import AGGREGATION_CORE_NAME, MANIFEST_NAME, ROOT_COVERAGE_NAME
+
+        root = str(store_root).rstrip("/")
+        names = (MANIFEST_NAME, AGGREGATION_CORE_NAME, ROOT_COVERAGE_NAME)
+    except Exception as e:
+        logger.warning(f"store-root touch skipped — names unresolved (fail-open): {e}")
+        return {"touched": 0, "failed": 1}
+    return touch_unit_footprint([], [f"{root}/{name}" for name in names], store_kwargs=store_kwargs)
+
+
+def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
+    """Touch every object under each of ``trees`` + each single ``objects`` path.
+
+    Paths are either local filesystem paths or ``s3://`` URLs; ``store_kwargs``
+    is the writers' store-kwargs dict (``region`` / ``credentials`` /
+    ``endpoint_url``) and keys the S3 client. Returns ``{"touched": n,
+    "failed": m}`` and never raises — an unexpected error (client build, LIST
+    fault) counts one failure and abandons the remainder (best-effort).
+    """
+    counts = {"touched": 0, "failed": 0}
+    try:
+        for tree in trees:
+            if _is_s3(tree):
+                _touch_s3_tree(_client(store_kwargs), tree, counts)
+            else:
+                _touch_local_tree(tree, counts)
+        for obj in objects:
+            if _is_s3(obj):
+                bucket, key = _split_s3(obj)
+                _touch_s3_object(_client(store_kwargs), bucket, key, counts)
+            else:
+                _touch_local_object(obj, counts)
+    except Exception as e:
+        counts["failed"] += 1
+        logger.warning(f"lifecycle touch aborted mid-footprint (fail-open, issue #388): {e}")
+    return counts
+
+
+def _is_s3(path) -> bool:
+    return str(path).startswith("s3://")
+
+
+def _split_s3(path) -> tuple:
+    bucket, _, key = str(path)[len("s3://") :].partition("/")
+    return bucket, key
+
+
+def _client(store_kwargs):
+    """The process-wide S3 client for these store kwargs (never built locally).
+
+    Built once per distinct store-kwargs identity and shared thereafter, with
+    construction serialized — see ``_CLIENTS``.
+    """
+    store_kwargs = store_kwargs or {}
+    creds = store_kwargs.get("credentials") or {}
+    key = (
+        store_kwargs.get("region"),
+        store_kwargs.get("endpoint_url"),
+        creds.get("accessKeyId"),
+        creds.get("secretAccessKey"),
+        creds.get("sessionToken"),
+    )
+    with _CLIENT_LOCK:
+        if key not in _CLIENTS:
+            _CLIENTS[key] = _s3_client(store_kwargs)
+        return _CLIENTS[key]
+
+
+def _s3_client(store_kwargs: dict):
+    """boto3 S3 client from the writers' store-kwargs (camelCase credentials).
+
+    Built through its OWN ``boto3.session.Session()`` rather than the module
+    -level default session: callers reach here from worker threads, and
+    concurrent construction off the shared default session is the documented
+    botocore hazard (its failure would be swallowed by the fail-open counting
+    into a silently unrefreshed object). ``_CLIENT_LOCK`` serializes this.
+    """
+    import boto3
+
+    kwargs: dict = {}
+    if store_kwargs.get("region"):
+        kwargs["region_name"] = store_kwargs["region"]
+    if store_kwargs.get("endpoint_url"):
+        kwargs["endpoint_url"] = store_kwargs["endpoint_url"]
+    creds = store_kwargs.get("credentials")
+    if creds:
+        kwargs["aws_access_key_id"] = creds["accessKeyId"]
+        kwargs["aws_secret_access_key"] = creds["secretAccessKey"]
+        if creds.get("sessionToken"):
+            kwargs["aws_session_token"] = creds["sessionToken"]
+    return boto3.session.Session().client("s3", **kwargs)
+
+
+def _touch_local_tree(root, counts) -> None:
+    if not os.path.isdir(root):
+        return
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            _touch_local_object(os.path.join(dirpath, name), counts)
+
+
+def _touch_local_object(path, counts) -> None:
+    if not os.path.isfile(path):
+        return
+    try:
+        os.utime(path, None)
+        counts["touched"] += 1
+    except OSError as e:
+        counts["failed"] += 1
+        logger.warning(f"lifecycle touch failed for {path} (fail-open): {e}")
+
+
+def _touch_s3_tree(s3, path, counts) -> None:
+    bucket, key = _split_s3(path)
+    prefix = key.rstrip("/") + "/"
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+        for entry in page.get("Contents") or []:
+            # The LIST already carries the class; echoing it back is what
+            # keeps the self-copy from demoting the object to STANDARD.
+            _touch_s3_object(s3, bucket, entry["Key"], counts, entry.get("StorageClass"))
+
+
+def _touch_s3_object(s3, bucket, key, counts, storage_class=None) -> None:
+    try:
+        if storage_class is None:
+            # A named object has no LIST entry: one HEAD buys its class (and
+            # detects absence a request earlier than the copy would).
+            storage_class = s3.head_object(Bucket=bucket, Key=key).get("StorageClass")
+        s3.copy_object(
+            Bucket=bucket,
+            Key=key,
+            CopySource={"Bucket": bucket, "Key": key},
+            MetadataDirective="REPLACE",
+            # S3 omits StorageClass for STANDARD in both LIST and HEAD.
+            StorageClass=storage_class or "STANDARD",
+        )
+        counts["touched"] += 1
+    except Exception as e:
+        code = ""
+        response = getattr(e, "response", None)
+        if isinstance(response, dict):
+            code = (response.get("Error") or {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return  # an absent sibling (e.g. no sub-map) is not a failure
+        counts["failed"] += 1
+        logger.warning(f"lifecycle touch failed for s3://{bucket}/{key} (fail-open): {e}")
+
+
+__all__ = ["touch_current_unit", "touch_store_root", "touch_unit_footprint"]

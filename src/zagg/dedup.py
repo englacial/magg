@@ -21,6 +21,11 @@ strictly increasing cost:
 Statuses are conservative by construction: every ambiguity degrades toward
 recompute (``stale``/``miss``), never toward a false ``hit`` — a wrong "skip"
 silently ships wrong data; a wrong "recompute" costs one shard's work.
+
+:func:`classify_leaf_identity` (issue #388) is the worker-side flavor of the
+same comparison: pure (the caller supplies the recorded sidecar), with the
+id-set reading — equal / expansion / contraction / mixed — that the leaf
+skip-if-current and contraction-guard decisions key on.
 """
 
 from __future__ import annotations
@@ -157,4 +162,113 @@ def has_run(
     }
 
 
-__all__ = ["STATUSES", "has_run", "shard_status"]
+#: Skip-if-current actions (issue #388): what the worker does with one unit.
+IDENTITY_ACTIONS = ("skip", "rewrite", "refuse")
+
+
+def classify_leaf_identity(recorded, *, semantic_hash, planned_ids) -> dict:
+    """Classify one planned unit against its leaf's recorded identity (#388).
+
+    Identity is the ruled PAIR: the run's ``semantic_hash`` (what/how, D19)
+    x the unit's planned granule-id set (over what). The recorded side is
+    the leaf's D20 stats sidecar (``semantic_hash``, ``granules_sha256``,
+    and — from issue #388 on — ``granule_ids``).
+
+    Fast path: ``granules_sha256`` equality (one compare — the common rerun
+    case). The id-set difference runs ONLY on a mismatch, classifying:
+
+    - ``skip`` / ``"equal"`` — both identity halves match: the leaf is
+      current; the caller no-ops the fold and touches the leaf.
+    - ``refuse`` / ``"contraction"`` or ``"mixed"`` — the recorded set has
+      ids the planned set no longer lists (``recorded - planned != {}``,
+      the ruled predicate — deliberately NOT strict-subset, so the mixed
+      add-and-drop signature of an upstream purge behind a fresh catalog
+      query trips it even when the planned set grew). ``missing`` names the
+      dropped ids; the caller proceeds only under ``allow_contraction``.
+      Judged on the id sets alone — a semantic mismatch does not excuse
+      dropping inputs.
+    - ``rewrite`` / everything else — expansion (``planned >= recorded``),
+      a semantic change over covered inputs, or an unverifiable leaf
+      (``no-sidecar``; ``unknown-planned``, no planned set to diff; or
+      ``unrecorded-ids``, a pre-#388 sidecar with no recorded set to diff):
+      wholesale D4 rewrite exactly as today.
+
+    Conservatism here is ONE-SIDED, not the symmetric rule
+    :func:`shard_status` follows. For the *skip* decision rewrite is the
+    safe direction — a false skip strands a stale leaf, so every ambiguity
+    degrades toward recompute. For the *contraction guard* it is not: a
+    rewrite over a contracted input set destroys aggregated data the
+    operator was never told about, which is the loss issue #388 exists to
+    prevent. ``unrecorded-ids`` sits exactly on that seam — the recorded
+    hash already says something changed, while the direction is unknowable
+    — so it carries its OWN classification rather than sharing
+    ``no-sidecar``/``expansion``: callers must count and surface it apart
+    from the ordinary rewrites (the phase-2 run stats, the phase-4 operator
+    docs), because the guard cannot protect any leaf written before this
+    release — no fleet sidecar predating issue #388 records ``granule_ids``.
+
+    Parameters
+    ----------
+    recorded : dict or None
+        The leaf's D20 sidecar record (:func:`zagg.telemetry.read_sidecar`),
+        or ``None`` when absent.
+    semantic_hash : str or None
+        The run's semantic-core hash (D19). ``None`` never skips.
+    planned_ids : iterable of str, or None
+        The unit's planned granule ids, in the id space the sidecars record
+        (resolved granule URLs on the aggregation path, STAC item
+        ids/datetimes for raster — cf. :func:`zagg.telemetry.granules_sha256`,
+        and the id-space warning on :func:`shard_status`). ``None`` means the
+        planned set is UNKNOWN and never refuses (``unknown-planned``); the
+        empty list means the unit genuinely plans no inputs, which against a
+        non-empty recorded set is a full contraction and does refuse.
+
+    Returns
+    -------
+    dict
+        ``{"action", "classification", "missing"}`` — ``action`` one of
+        :data:`IDENTITY_ACTIONS`; ``missing`` the sorted ``recorded -
+        planned`` difference (non-empty exactly on ``refuse``).
+    """
+    if recorded is None:
+        return {"action": "rewrite", "classification": "no-sidecar", "missing": []}
+    if planned_ids is None:
+        # An UNKNOWN planned set is not the empty one: diffing against it would
+        # name every recorded id as dropped and refuse the loudest way there is.
+        # Ambiguity degrades to rewrite; ``[]`` below stays a real contraction.
+        return {"action": "rewrite", "classification": "unknown-planned", "missing": []}
+    planned = [str(g) for g in planned_ids]
+    rec_hash = recorded.get("granules_sha256")
+    semantic_match = semantic_hash is not None and recorded.get("semantic_hash") == semantic_hash
+    if rec_hash is not None and rec_hash == granules_sha256(planned) and semantic_match:
+        return {"action": "skip", "classification": "equal", "missing": []}
+    rec_ids = recorded.get("granule_ids")
+    if rec_ids is None:
+        # Pre-#388 sidecar (or a cross-leaf rollup, where the field collapses
+        # to None): something mismatched, but there is no recorded set to
+        # diff — undecidable, so today's rewrite. NOT a benign ambiguity: on
+        # a contracted rerun this is the wholesale rewrite the guard exists to
+        # stop, and every leaf written before this release lands here. Its own
+        # classification for exactly that reason — count it apart from the
+        # ordinary rewrites and say so in the operator docs (see the class
+        # docstring's one-sided-conservatism note).
+        return {"action": "rewrite", "classification": "unrecorded-ids", "missing": []}
+    recorded_set = {str(g) for g in rec_ids}
+    missing = sorted(recorded_set - set(planned))
+    if missing:
+        added = set(planned) - recorded_set
+        return {
+            "action": "refuse",
+            "classification": "mixed" if added else "contraction",
+            "missing": missing,
+        }
+    if set(planned) == recorded_set:
+        # Same id set, yet the fast path failed: a semantic-core change over
+        # identical inputs, an unrecorded semantic hash, or duplicate/order
+        # drift in the hash's multiset. Not current, not a contraction.
+        classification = "id-multiset-drift" if semantic_match else "semantic-mismatch"
+        return {"action": "rewrite", "classification": classification, "missing": []}
+    return {"action": "rewrite", "classification": "expansion", "missing": []}
+
+
+__all__ = ["IDENTITY_ACTIONS", "STATUSES", "classify_leaf_identity", "has_run", "shard_status"]

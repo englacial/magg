@@ -527,6 +527,7 @@ class TestInvokeLambdaCellEvent:
         handoff="pandas",
         invoked_by=None,
         run_id=None,
+        allow_contraction=False,
     ):
         from unittest.mock import MagicMock
 
@@ -555,6 +556,7 @@ class TestInvokeLambdaCellEvent:
             handoff=handoff,
             invoked_by=invoked_by,
             run_id=run_id,
+            allow_contraction=allow_contraction,
         )
         return json.loads(client.invoke.call_args.kwargs["Payload"])
 
@@ -630,6 +632,18 @@ class TestInvokeLambdaCellEvent:
     def test_default_event_has_no_run_id_key(self):
         event = self._captured_event(child_order=12, run_id=None)
         assert "run_id" not in event
+
+    def test_allow_contraction_adds_event_key(self):
+        # issue #388: the contraction-guard escape hatch rides the cell event
+        # so the worker can act on it once it opts into the skip seam.
+        event = self._captured_event(child_order=12, allow_contraction=True)
+        assert event["allow_contraction"] is True
+
+    def test_default_event_has_no_allow_contraction_key(self):
+        # Default (guard armed): no key, so the event stays byte-identical to
+        # the pre-#388 payload.
+        event = self._captured_event(child_order=12)
+        assert "allow_contraction" not in event
 
 
 class TestResolveInvokedBy:
@@ -1534,6 +1548,17 @@ class TestSummaryKeysByteIdentical:
     are pinned separately in ``TestInvokeLambdaCellEvent``.
     """
 
+    # Skip-if-current run stats (issue #388); additive, always-present zeros
+    # until units actually skip/refuse (deterministic key set). The
+    # objects_touched/touch_failures pair is the phase-3 lifecycle-touch
+    # rollup, same posture.
+    _IDENTITY_KEYS = {
+        "cells_current",
+        "cells_refused",
+        "cells_unrecorded",
+        "objects_touched",
+        "touch_failures",
+    }
     _LOCAL_KEYS = {
         "total_cells",
         "cells_with_data",
@@ -1544,7 +1569,7 @@ class TestSummaryKeysByteIdentical:
         "backend",
         "results",
         "run_stats_path",  # run-level stats parquet (issue #297 phase 3)
-    }
+    } | _IDENTITY_KEYS
     _LAMBDA_KEYS = {
         "total_cells",
         "cells_with_data",
@@ -1579,7 +1604,7 @@ class TestSummaryKeysByteIdentical:
         "worker_warm_starts",
         "worker_rss_start_max_by_gen",
         "run_stats_path",  # run-level stats parquet (issue #297 phase 3)
-    }
+    } | _IDENTITY_KEYS
 
     def test_local_summary_keys_and_counts(self, monkeypatch, atl06_config):
         # Flat local path pinned explicitly (issue #253 defaults hive).
@@ -4707,3 +4732,94 @@ class TestCliFunctionNameDefault:
         )
         cli.main()
         assert captured["function_name"] == "my-exact-fn"
+
+
+class TestCliContractionGuardSurface:
+    """Issue #388: the guard's audit trail and its escape hatch must both be
+    reachable from ``zagg agg``. An all-refused (or all-skipped) run writes no
+    run-record parquet — no unit produced a stats row — so the CLI summary is
+    the only place the counters surface, and ``--allow-contraction`` is the
+    only supported way to proceed (``--overwrite`` disables the guard)."""
+
+    SUMMARY = {
+        "cells_with_data": 0,
+        "total_obs": 0,
+        "cells_error": 0,
+        "wall_time_s": 3.2,
+        "store_path": "s3://b/store.zarr",
+        "run_stats_path": None,
+    }
+
+    def _run(self, monkeypatch, argv, summary):
+        import zagg.__main__ as cli
+
+        captured: dict = {}
+
+        def _fake_agg(config, **kwargs):
+            captured.update(kwargs)
+            return summary
+
+        monkeypatch.setattr(cli, "agg", _fake_agg)
+        monkeypatch.setattr(cli, "load_config", lambda path: object())
+        monkeypatch.setattr("sys.argv", ["zagg", "--config", "c.yaml", *argv])
+        cli.main()
+        return captured
+
+    def test_flag_defaults_off_and_threads_to_agg(self, monkeypatch, capsys):
+        captured = self._run(monkeypatch, [], dict(self.SUMMARY))
+        assert captured["allow_contraction"] is False
+        captured = self._run(monkeypatch, ["--allow-contraction"], dict(self.SUMMARY))
+        assert captured["allow_contraction"] is True
+        capsys.readouterr()
+
+    def test_all_refused_run_names_the_counters_and_the_remedy(self, monkeypatch, capsys):
+        summary = {**self.SUMMARY, "cells_current": 0, "cells_refused": 3, "cells_unrecorded": 0}
+        self._run(monkeypatch, [], summary)
+        out = capsys.readouterr().out
+        assert "Done: 0 cells with data" in out
+        assert "3 refused" in out
+        assert "--allow-contraction" in out
+
+    def test_skip_only_run_reports_current(self, monkeypatch, capsys):
+        summary = {**self.SUMMARY, "cells_current": 7, "cells_refused": 0, "cells_unrecorded": 2}
+        self._run(monkeypatch, [], summary)
+        out = capsys.readouterr().out
+        assert "7 current" in out and "2 rewritten with the guard inert" in out
+        # No refusals: the remedy line stays out of the way.
+        assert "--allow-contraction" not in out
+
+    def test_quiet_when_the_gate_did_nothing(self, monkeypatch, capsys):
+        summary = {**self.SUMMARY, "cells_current": 0, "cells_refused": 0, "cells_unrecorded": 0}
+        self._run(monkeypatch, [], summary)
+        out = capsys.readouterr().out
+        assert "Skip-if-current" not in out and "lifecycle touch" not in out
+
+    def test_failed_touches_are_named_not_hidden_behind_a_success_line(self, monkeypatch, capsys):
+        # A denied s3:PutObject fails EVERY object of EVERY unit, and the
+        # touch is fail-open — so without this line the run prints "N current"
+        # and exits 0 while those products keep their old purge clock (review
+        # finding, the same rationale that gave the trio above a CLI line).
+        summary = {
+            **self.SUMMARY,
+            "cells_current": 7,
+            "cells_refused": 0,
+            "cells_unrecorded": 0,
+            "objects_touched": 0,
+            "touch_failures": 42,
+        }
+        self._run(monkeypatch, [], summary)
+        out = capsys.readouterr().out
+        assert "42 lifecycle touch(es) FAILED" in out
+        assert "did NOT have their purge clock reset" in out
+
+    def test_a_clean_touch_prints_no_failure_line(self, monkeypatch, capsys):
+        summary = {
+            **self.SUMMARY,
+            "cells_current": 7,
+            "cells_refused": 0,
+            "cells_unrecorded": 0,
+            "objects_touched": 91,
+            "touch_failures": 0,
+        }
+        self._run(monkeypatch, [], summary)
+        assert "FAILED" not in capsys.readouterr().out

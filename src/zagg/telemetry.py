@@ -46,6 +46,16 @@ SIDECAR_NAME = "stats.json"
 #: uses. An unmapped/absent arch falls back to the flat default rate.
 _ARCH_ALIASES = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x86_64", "amd64": "x86_64"}
 
+#: D19 digest shape (:func:`zagg.semantics.semantic_hash`): a full sha256 hex
+#: digest. Only the ``metadata`` FALLBACK in :func:`build_record` is checked
+#: against it — that dict is not always locally built: the dispatcher's
+#: stale-worker path (``zagg.runner._lambda_result_rows``) passes the JSON body
+#: the remote worker returned, so an unchecked value would let a version-skewed
+#: worker plant an identity that ``dedup.shard_status`` and
+#: ``dedup.classify_leaf_identity`` later trust to skip. Malformed reads as no
+#: recorded identity (``None`` — never provably current), never a wrong one.
+_SEMANTIC_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
 # Merge dispositions (associative + commutative by construction). Floats sum,
 # so equality across fold orders holds up to FP summation order.
 _SUM_KEYS = ("n_shards", "n_granules", "n_obs", "cells_with_data", "duration_s")
@@ -70,6 +80,16 @@ _EQ_OR_NONE_KEYS = (
     # collapses it to None (absence = unverifiable, §5.3) while merge([r])
     # stays r.
     "content_hashes",
+    # The recorded granule-id LIST (issue #388) — the id-set half of the
+    # skip-if-current identity pair, kept next to its hash so a contraction
+    # refusal can name the dropped ids. Per-leaf like content_hashes: a
+    # cross-leaf rollup collapses it to None.
+    "granule_ids",
+    # Leaf pyramid column basename (issue #383's deferred run-record key,
+    # landed with #388): D22 discovery is run-record-driven, so column
+    # existence must be discoverable without a tree listing. The name is
+    # SQL-reserved where this reaches parquet — see _ROW_SCALARS below.
+    "column",
     "zagg_version",
     "lambda",
     "invoked_by",
@@ -146,13 +166,24 @@ def build_record(
     merged equal-or-``None`` like the other identity fields, so a cross-window
     rollup reads ``None``. ``semantic_hash`` (issue #299, D19) is the run
     config's semantic-core hash — the identity half the ``has_run`` dedup
-    check compares; ``granules_sha256`` below is the catalog half.
+    check compares; ``granules_sha256`` below is the catalog half. When the
+    caller passes none, ``metadata["semantic_hash"]`` fills in (issue #388):
+    the shared hive seams stamp it there, so a caller that never resolved
+    the hash itself (the Lambda handler) still records the identity a later
+    skip-if-current comparison needs. That fallback is VALIDATED against the
+    D19 digest shape (:data:`_SEMANTIC_HASH_RE`) because ``metadata`` is not
+    always locally built — see the constant; a caller-passed ``semantic_hash``
+    is the caller's own value and is trusted as given.
     ``lambda_config`` is :func:`lambda_env` on Lambda, ``None`` locally;
     when present it prices ``gb_seconds`` / ``est_cost_usd`` from
     ``duration_s`` (the billed-duration approximation the dispatcher's cost
     estimate already uses).
     """
     error = metadata.get("error")
+    if semantic_hash is None:
+        fallback = metadata.get("semantic_hash")
+        if isinstance(fallback, str) and _SEMANTIC_HASH_RE.match(fallback):
+            semantic_hash = fallback
     duration_s = float(metadata.get("duration_s") or 0.0)
     gb_seconds = est_cost = None
     if lambda_config and lambda_config.get("memory_mb"):
@@ -197,6 +228,12 @@ def build_record(
         "n_shards": 1,
         "n_granules": int(n_granules),
         "granules_sha256": granules_sha256(granule_ids),
+        # The recorded id LIST behind that hash (issue #388), in the hash's
+        # own canonical order (sorted, duplicates kept) — the set a later
+        # rerun's contraction guard diffs against to NAME dropped ids.
+        # Envelope-borne and sidecar-recorded, never a run-parquet column
+        # (the join key there is granules_sha256).
+        "granule_ids": sorted(str(g) for g in granule_ids) if granule_ids else None,
         # O11 content hashes (issue #342, spec §5.3): the verification half of
         # the D19 identity split, computed by the hive leaf writer from the
         # staged arrays and ridden here off ``metadata``. None wherever no
@@ -229,6 +266,22 @@ def build_record(
         "raster_bytes_read": _opt_int(metadata.get("raster_bytes_read")),
         "raster_px_decoded": _opt_int(metadata.get("raster_px_decoded")),
         "raster_px_sampled": _opt_int(metadata.get("raster_px_sampled")),
+        # Leaf pyramid column basename (issue #383, recorded per its PR #391
+        # deferral): rides the worker metadata when the unit wrote a column,
+        # so run-record-driven discovery (D22) sees columns without a tree
+        # listing. The column's resolution set lives in the artifact's own
+        # ``zagg_column`` attrs — read the column, not this row, for it.
+        # READ IT AS: "the column basename this UNIT wrote alongside its
+        # leaf" — NOT "the column this record describes". ``None`` means no
+        # column was recorded by this unit; it is never a denial that the
+        # described artifact is one. The pyramid column's OWN stats sidecar
+        # records ``None`` here (``zagg.column`` builds it from a hand-made
+        # metadata dict with no ``column`` key — only the leaf record carries
+        # the basename, via ``hive.py``), and so does any cross-leaf rollup,
+        # where the equal-or-None merge collapses it. So a sidecar scan for
+        # column-bearing units must key on the LEAF records, not on the
+        # column artifacts' own.
+        "column": metadata.get("column"),
         "gb_seconds": gb_seconds,
         "est_cost_usd": est_cost,
         "max_memory_mb": _opt_float(metadata.get("max_memory_mb")),
@@ -266,12 +319,14 @@ def merge(records: Iterable[dict]) -> dict:
             # #297). One level deeper than a plain ``dict()``: flat values
             # (``lambda``/``invoked_by``) are unaffected, but
             # ``content_hashes`` nests an ``arrays`` map (issue #342) that a
-            # shallow copy would still alias.
-            out[key] = (
-                {k: dict(v) if isinstance(v, dict) else v for k, v in first.items()}
-                if isinstance(first, dict)
-                else first
-            )
+            # shallow copy would still alias. Lists (``granule_ids``, issue
+            # #388) copy shallow — their elements are strings.
+            if isinstance(first, dict):
+                out[key] = {k: dict(v) if isinstance(v, dict) else v for k, v in first.items()}
+            elif isinstance(first, list):
+                out[key] = list(first)
+            else:
+                out[key] = first
         else:
             out[key] = None
     for key in _SUM_KEYS:
@@ -348,6 +403,18 @@ _ROW_SCALARS = (
     "raster_bytes_read",
     "raster_px_decoded",
     "raster_px_sampled",
+    # Column basename (issue #383's deferred run-record key): a scalar
+    # string, so D22 run-record discovery can find column-bearing leaves
+    # from the run parquet alone, without a tree listing. Mind the spelling
+    # at the query: ``column`` is SQL-reserved and reserved in both engines
+    # this parquet targets (DuckDB, Trino/Athena), so a filter on it must
+    # quote the identifier — ``WHERE "column" IS NOT NULL``, not
+    # ``WHERE column IS NOT NULL``, which is a parse error. Renaming the key
+    # (``column_name`` / ``leaf_column``) is open for review while the
+    # schema is unreleased — see the PR's Questions for review.
+    # ``granule_ids`` (a list) stays out — the parquet join key for catalog
+    # identity is granules_sha256.
+    "column",
     "max_memory_mb",
     "container_hwm_mb",
     "timestamp",
