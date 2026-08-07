@@ -1107,6 +1107,36 @@ def leaf_block_index(grid, block_index, shard_key) -> tuple:
     return tuple(int(s.start) // int(c) for s, c in zip(region, grid.chunk_shape))
 
 
+def _leaf_is_committed(leaf_path, store_kwargs, shard_key) -> bool:
+    """Is a STAMPED leaf present at ``leaf_path``? (issue #388 skip precondition)
+
+    The D20 stats sidecar is a SIBLING of the leaf ``.zarr``
+    (:func:`zagg.telemetry.sidecar_path`), so the two diverge, and the
+    diverged state is one this module already documents as reachable: a torn
+    write clears the leaf and dies (``process_and_write_hive._leaf``'s
+    clear-then-die note — the dispatcher writes no sidecar for a cell that
+    raised, so the PRIOR run's record survives intact), and a lifecycle rule
+    scoped to the leaf prefix reaps the tree while the JSON stays. Identity
+    alone would then certify an absent leaf as ``current`` permanently —
+    nothing rewrites the sidecar, so every later rerun skips too.
+    :func:`zagg.dedup.shard_status`, the sibling identity check, already
+    treats the stamp as the precondition it is (``read_commit(...) is None ->
+    miss``); the gate follows it. ``leaf_path`` is the per-``(shard, window)``
+    leaf on both seams, so the windowed stamp is the one checked. Fail-open
+    toward RECOMPUTE: an unreadable store reads as uncommitted.
+    """
+    from zagg.store import open_store
+
+    try:
+        return read_commit(open_store(leaf_path, **store_kwargs)) is not None
+    except Exception as e:
+        logger.warning(
+            f"skip-if-current: leaf stamp unreadable for shard {shard_key} "
+            f"(rewriting, issue #388): {e}"
+        )
+        return False
+
+
 def leaf_identity_gate(
     leaf_path,
     planned_ids,
@@ -1141,6 +1171,14 @@ def leaf_identity_gate(
     so zero sweep dirtiness by construction. The sidecar read is fail-open —
     a malformed or unreadable sidecar degrades to today's rewrite (the
     ``no-sidecar`` classification), never blocks the unit.
+
+    A matched identity is NOT sufficient to skip: the leaf's own D4 commit
+    stamp is a precondition (:func:`_leaf_is_committed`), because the sidecar
+    outlives the leaf under a torn write or a prefix-scoped lifecycle purge.
+    A record that says ``equal`` over an absent/unstamped leaf classifies
+    ``unstamped-leaf`` and rewrites. The check runs ONLY on the skip arm — a
+    refusal writes nothing either way, and a contraction over debris is still
+    a contraction the operator should be told about.
     """
     from zagg.dedup import classify_leaf_identity
     from zagg.telemetry import read_sidecar
@@ -1157,6 +1195,12 @@ def leaf_identity_gate(
     identity = classify_leaf_identity(
         recorded, semantic_hash=semantic_hash, planned_ids=planned_ids
     )
+    if identity["action"] == "skip" and not _leaf_is_committed(leaf_path, store_kwargs, shard_key):
+        logger.warning(
+            f"shard {shard_key}: sidecar records a matching identity but the leaf is "
+            f"absent or unstamped — rewriting (issue #388)"
+        )
+        identity = {"action": "rewrite", "classification": "unstamped-leaf", "missing": []}
     base = {
         "shard_key": int(shard_key),
         "identity": identity["classification"],

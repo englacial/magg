@@ -1242,6 +1242,44 @@ class TestLeafSkipIfCurrent:
         )
         assert calls == [int(shard)] and meta["identity"] == "no-sidecar"
 
+    def test_destroyed_leaf_with_surviving_sidecar_rebuilds(self, monkeypatch, cfg, tmp_path):
+        # The sidecar is a SIBLING of the leaf .zarr, so a prefix-scoped
+        # lifecycle purge (the very reaping issue #388 exists to outrun) takes
+        # the leaf and leaves the record. Identity alone would certify the
+        # absent leaf ``current`` FOREVER — nothing rewrites the sidecar, so
+        # every later rerun would skip too. The D4 stamp is the precondition.
+        import shutil
+
+        from zagg.store import open_store
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        leaf = hive.shard_leaf_path(root, shard)
+        shutil.rmtree(leaf)
+        assert hive.read_commit(open_store(leaf)) is None
+        calls = self._counting_fake(monkeypatch, grid)
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert calls == [int(shard)] and meta["identity"] == "unstamped-leaf"
+        assert "current" not in meta
+        assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_unstamped_debris_with_surviving_sidecar_rebuilds(self, monkeypatch, cfg, tmp_path):
+        # The issue #341 clear-then-die state: the prefix is there, the stamp
+        # is not. ``dedup.shard_status`` calls that a miss; so does the gate.
+        from zagg.store import open_store
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        leaf = hive.shard_leaf_path(root, shard)
+        group = zarr.open_group(open_store(leaf), path="", mode="r+", zarr_format=3)
+        del group.attrs[hive.COMMIT_ATTR]
+        assert hive.read_commit(open_store(leaf)) is None
+        calls = self._counting_fake(monkeypatch, grid)
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert calls == [int(shard)] and meta["identity"] == "unstamped-leaf"
+
     def test_seam_stamps_semantic_hash(self, monkeypatch, cfg, tmp_path):
         # The seam stamps the D19 hash into its returned metadata so a caller
         # that never resolved it (the Lambda handler) still records the
