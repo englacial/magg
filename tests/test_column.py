@@ -753,6 +753,7 @@ def _run_unit(
     fail=False,
     sharded=True,
     time_range=None,
+    **seam_kwargs,
 ):
     """One shard through the REAL ``process_and_write_hive`` (generator inputs).
 
@@ -816,6 +817,7 @@ def _run_unit(
         cfg,
         store_kwargs={},
         window=window,
+        **seam_kwargs,
     )
     label = window["label"] if window else None
     leaf_rel = hive.shard_leaf_path("", shard, window=label).lstrip("/")
@@ -1001,3 +1003,97 @@ def _refold_digests(payloads, factor, *, delta):
         ]
         out.append(fold_digests(cell, delta=delta, dtype="float32") if cell else b"")
     return out
+
+
+class TestColumnDefeatsTheSkipGate:
+    """Issue #388: the identity PAIR does not move when the ``output.pyramid``
+    declaration is added or dropped — ``output`` is outside
+    ``semantics.semantic_core`` and ``pyramid`` is deliberately not a frozen
+    manifest key (D11) — so the leaf skip gate verifies the COLUMN ARTIFACT
+    itself. Without that, enabling the column over an existing store would
+    skip every leaf and never write a column."""
+
+    PYRAMID = {"overviews": 5}
+    URLS = ["s3://fixture/a.h5"]
+
+    def _seal(self, meta, leaf):
+        """The D20 sidecar the dispatcher writes after a successful unit (#297)."""
+        from zagg.telemetry import build_record, write_sidecar
+
+        record = build_record(
+            shard_key=int(meta["shard_key"]),
+            metadata=meta,
+            granule_ids=list(self.URLS),
+            run_id="r1",
+            semantic_hash=meta["semantic_hash"],
+        )
+        write_sidecar(str(leaf), record)
+
+    def test_the_declaration_moves_neither_identity_half(self):
+        # The premise: the recorded pair is blind to the declaration, so the
+        # gate cannot learn about the column from the record.
+        from zagg.semantics import semantic_hash
+
+        gen = _generator()
+        with_col = gen._config(kitchen_sink=False, pyramid=self.PYRAMID)
+        without = gen._config(kitchen_sink=False, pyramid=None)
+        assert semantic_hash(with_col) == semantic_hash(without)
+
+    def test_enabling_the_column_defeats_the_skip(self, tmp_path, monkeypatch):
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=None)
+        self._seal(meta, leaf)
+        assert not (leaf.parent / "all.pyramid.zarr").exists()
+        # Same inputs, same D19 hash; only the declaration changed.
+        redo, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID, skip_if_current=True)
+        assert redo["identity"] == "column-drift" and "current" not in redo
+        assert redo["column"] == "all.pyramid.zarr"
+        assert (leaf.parent / "all.pyramid.zarr").exists()
+
+    def test_dropping_the_column_defeats_the_skip(self, tmp_path, monkeypatch):
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        self._seal(meta, leaf)
+        assert (leaf.parent / "all.pyramid.zarr").exists()
+        redo, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=None, skip_if_current=True)
+        assert redo["identity"] == "column-drift" and "current" not in redo
+        # The rewrite runs _clear_column, so the superseded artifact is gone —
+        # a skip would have stranded a STAMPED column no run declares.
+        assert not (leaf.parent / "all.pyramid.zarr").exists()
+
+    def test_an_unchanged_declaration_still_skips(self, tmp_path, monkeypatch):
+        # Both arms of the check agree: the column exists and is declared.
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
+        self._seal(meta, leaf)
+        redo, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID, skip_if_current=True)
+        assert redo["current"] is True and redo["identity"] == "equal"
+
+    def test_no_column_declared_and_none_present_still_skips(self, tmp_path, monkeypatch):
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=None)
+        self._seal(meta, leaf)
+        redo, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=None, skip_if_current=True)
+        assert redo["current"] is True and redo["identity"] == "equal"
+
+    def test_the_column_check_is_per_window(self, tmp_path, monkeypatch):
+        # The column is named per window, so the gate must read THIS unit's
+        # column: a 2019 unit is not certified by a sibling window's artifact.
+        windowing = TestWorkerIntegration.WINDOWING
+        window = {"label": "2019", "start": 0.0, "end": 1.0}
+        meta, leaf = _run_unit(
+            tmp_path,
+            monkeypatch,
+            pyramid=None,
+            window=window,
+            windowing=windowing,
+            time_range=[31536000.0, 31536060.0],
+        )
+        self._seal(meta, leaf)
+        redo, _leaf = _run_unit(
+            tmp_path,
+            monkeypatch,
+            pyramid=self.PYRAMID,
+            window=window,
+            windowing=windowing,
+            time_range=[31536000.0, 31536060.0],
+            skip_if_current=True,
+        )
+        assert redo["identity"] == "column-drift" and redo["column"] == "2019.pyramid.zarr"
+        assert (leaf.parent / "2019.pyramid.zarr").exists()

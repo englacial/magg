@@ -1137,6 +1137,44 @@ def _leaf_is_committed(leaf_path, store_kwargs, shard_key) -> bool:
         return False
 
 
+def leaf_column_expectation(store_root, shard_key, grid, config, window):
+    """This unit's issue #383 column artifact: ``(path, declared)`` (issue #388).
+
+    The identity PAIR does not cover the leaf's ARTIFACT SET. The whole
+    ``output`` block is outside :func:`zagg.semantics.semantic_core`, and
+    ``pyramid`` is deliberately not a frozen manifest key (D11 — the §7 sweep
+    populates it), so turning the leaf column on (or off) over an existing
+    store moves neither identity half and every unit would read ``equal``
+    while the column was never written. The gate closes that by verifying the
+    artifact the way ``docs/specification.md`` §4.6 rules: a column exists
+    exactly when the run declares one (:func:`zagg.column.leaf_column_plan`,
+    the same gate the write site runs), so a disagreement between the
+    declaration and what is COMMITTED beside the leaf is not current, whatever
+    the record says. ``declared`` is ``None`` when the declaration cannot be
+    resolved at all — also not skippable, so the rewrite raises
+    ``write_leaf_column``'s named refusal instead of silently no-oping.
+
+    Scope: this covers the ONE output knob that adds a leaf artifact today.
+    Other ``output`` keys that change what a leaf CONTAINS rather than which
+    objects sit beside it (``sharded`` is the reviewed example) are still
+    outside the recorded identity — see the PR thread's standing question.
+    """
+    from zagg.column import column_name, leaf_column_plan
+
+    label = window["label"] if window else None
+    leaf = shard_leaf_path(store_root, shard_key, window=label)
+    node_prefix = leaf.rstrip("/").rsplit("/", 1)[0]
+    try:
+        declared = leaf_column_plan(config, grid) is not None
+    except Exception as e:
+        logger.warning(
+            f"skip-if-current: column declaration unresolved for shard {shard_key} "
+            f"(rewriting, issue #388): {e}"
+        )
+        declared = None
+    return f"{node_prefix}/{column_name(label)}", declared
+
+
 def leaf_identity_gate(
     leaf_path,
     planned_ids,
@@ -1146,6 +1184,8 @@ def leaf_identity_gate(
     sidecar_spec,
     store_kwargs,
     shard_key,
+    column_path=None,
+    column_declared=None,
 ):
     """Skip-if-current / contraction-guard verdict for one leaf unit (issue #388).
 
@@ -1172,13 +1212,24 @@ def leaf_identity_gate(
     a malformed or unreadable sidecar degrades to today's rewrite (the
     ``no-sidecar`` classification), never blocks the unit.
 
-    A matched identity is NOT sufficient to skip: the leaf's own D4 commit
-    stamp is a precondition (:func:`_leaf_is_committed`), because the sidecar
-    outlives the leaf under a torn write or a prefix-scoped lifecycle purge.
-    A record that says ``equal`` over an absent/unstamped leaf classifies
-    ``unstamped-leaf`` and rewrites. The check runs ONLY on the skip arm — a
-    refusal writes nothing either way, and a contraction over debris is still
-    a contraction the operator should be told about.
+    A matched identity is NOT sufficient to skip: the unit's ARTIFACTS must
+    be current too, verified by reading them rather than the record.
+
+    - the leaf's own D4 commit stamp is a precondition
+      (:func:`_leaf_is_committed`), because the sidecar outlives the leaf
+      under a torn write or a prefix-scoped lifecycle purge. A record that
+      says ``equal`` over an absent/unstamped leaf classifies
+      ``unstamped-leaf`` and rewrites.
+    - ``column_path``/``column_declared`` (from
+      :func:`leaf_column_expectation`; ``None`` on the raster seam, which
+      writes no column) pin the issue #383 leaf column, whose declaration
+      moves NEITHER identity half. A committed column where none is declared,
+      or a declaration with no committed column, classifies ``column-drift``
+      and rewrites.
+
+    Both checks run ONLY on the skip arm — a refusal writes nothing either
+    way, and a contraction over debris is still a contraction the operator
+    should be told about.
     """
     from zagg.dedup import classify_leaf_identity
     from zagg.telemetry import read_sidecar
@@ -1195,12 +1246,20 @@ def leaf_identity_gate(
     identity = classify_leaf_identity(
         recorded, semantic_hash=semantic_hash, planned_ids=planned_ids
     )
-    if identity["action"] == "skip" and not _leaf_is_committed(leaf_path, store_kwargs, shard_key):
-        logger.warning(
-            f"shard {shard_key}: sidecar records a matching identity but the leaf is "
-            f"absent or unstamped — rewriting (issue #388)"
-        )
-        identity = {"action": "rewrite", "classification": "unstamped-leaf", "missing": []}
+    if identity["action"] == "skip":
+        drift = None
+        if not _leaf_is_committed(leaf_path, store_kwargs, shard_key):
+            drift = "unstamped-leaf"
+        elif column_path is not None and column_declared is not _leaf_is_committed(
+            column_path, store_kwargs, shard_key
+        ):
+            drift = "column-drift"
+        if drift is not None:
+            logger.warning(
+                f"shard {shard_key}: sidecar records a matching identity but the unit's "
+                f"artifacts are not current ({drift}) — rewriting (issue #388)"
+            )
+            identity = {"action": "rewrite", "classification": drift, "missing": []}
     base = {
         "shard_key": int(shard_key),
         "identity": identity["classification"],
@@ -1348,6 +1407,12 @@ def process_and_write_hive(
     # read or fold. A skipped/refused unit returns here having written NOTHING.
     identity = None
     if skip_if_current:
+        # The issue #383 column rides this seam AFTER the gate, and its
+        # declaration moves neither identity half — so the gate verifies the
+        # artifact itself (leaf_column_expectation).
+        column_path, column_declared = leaf_column_expectation(
+            store_root, shard_key, grid, config, window
+        )
         identity, unit_meta = leaf_identity_gate(
             leaf_path,
             [str(u) for u in granule_urls],
@@ -1356,6 +1421,8 @@ def process_and_write_hive(
             sidecar_spec=sidecar_spec,
             store_kwargs=store_kwargs,
             shard_key=shard_key,
+            column_path=column_path,
+            column_declared=column_declared,
         )
         if unit_meta is not None:
             return unit_meta
@@ -1663,6 +1730,7 @@ __all__ = [
     "encode_coverage_bitmap",
     "ensure_manifest",
     "leaf_block_index",
+    "leaf_column_expectation",
     "leaf_identity_gate",
     "process_and_write_hive",
     "read_commit",
