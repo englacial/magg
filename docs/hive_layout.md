@@ -713,11 +713,17 @@ SSE-KMS the copy re-encrypts with the bucket-default key and needs
 `kms:Decrypt` + `kms:GenerateDataKey`.
 
 **Known gaps** — plan lifecycle rules around them, they are not promised
-away: the [design §7](design/sparse_coverage.md) sweep's **ancestor
-overviews and `pyramid.json` envelopes
-belong to no unit's footprint** and a skip produces zero sweep dirtiness by
-construction, so a skip-only store ages its pyramid above the leaves while
-the leaves and root stay fresh; and the store-root trio is touched by the
+away: the [design §7](design/sparse_coverage.md) sweep's **ancestor-node
+artifacts belong to no unit's footprint** and a skip produces zero sweep
+dirtiness by construction. That is the whole ancestor layer, not the
+overviews alone — all four rollup families age identically
+(`stats.rollup.json`, `moc.rollup.json`, `submap.rollup.json`,
+`overview.rollup.json` at every digit node, one per `sweep.DEFAULT_FAMILIES`
+entry), plus each pass's root `sweep_stats_{ts}.json` run record. And
+re-running the sweep does **not** refresh them: a second sweep over an
+unchanged tree recomputes but PUTs nothing, so the obvious "just sweep
+periodically to keep them alive" workaround silently no-ops. The store-root
+trio, separately, is touched by the
 **local backend only** (D8 keeps the Lambda dispatcher from writing to the
 store, and the handler has no root-touch mode yet — PR #397 question (10)).
 Until those close, do not scope a hard-expiry rule over the whole store

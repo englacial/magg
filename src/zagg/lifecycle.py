@@ -63,12 +63,16 @@ fails the unit, never un-skips it, and :func:`touch_current_unit` never
 raises out of the seam. An ABSENT path is neither touched nor failed: a
 unit legitimately has no sub-map (non-HEALPix grids, id-less entries).
 
-Documented gaps, not solved here: the §7 sweep's ancestor-node overviews
-and ``pyramid.json`` envelopes belong to no unit footprint and are not
+Documented gaps, not solved here: the §7 sweep's ancestor-node rollup
+sidecars — ``{family}.rollup.json`` for every
+:data:`zagg.sweep.DEFAULT_FAMILIES` entry, plus each pass's root
+``sweep_stats_{ts}.json`` — belong to no unit footprint and are not
 store-root objects either, and a skip produces zero sweep dirtiness by
-construction — so a skip-only store ages its pyramid above the leaves while
-the leaves and the root survive. Walking them would mean a store-wide walk
-this module deliberately does not own (PR #397 question).
+construction, so a skip-only store ages its whole pyramid above the leaves
+while the leaves and the root survive. A repeat sweep does not refresh them
+either (an unchanged tree recomputes but PUTs nothing). Walking them would
+mean a store-wide walk this module deliberately does not own (PR #397
+question).
 """
 
 from __future__ import annotations
