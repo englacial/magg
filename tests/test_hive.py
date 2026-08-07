@@ -1242,6 +1242,26 @@ class TestLeafSkipIfCurrent:
         )
         assert calls == [int(shard)] and meta["identity"] == "no-sidecar"
 
+    @pytest.mark.parametrize("body", [b"[]", b'"x"', b"5", b"not json"])
+    def test_a_non_object_sidecar_degrades_to_rewrite(self, monkeypatch, cfg, tmp_path, body):
+        # Fail-open means fail-open: ``read_sidecar`` returns whatever the JSON
+        # decoded to, so a valid-but-not-an-object body must not raise out of
+        # the seam and fail the unit.
+        import obstore
+
+        from zagg.store import open_object_store
+        from zagg.telemetry import sidecar_key
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        prefix, _, name = hive.shard_leaf_path(root, shard).rstrip("/").rpartition("/")
+        obstore.put(open_object_store(prefix), sidecar_key(name), body)
+        calls = self._counting_fake(monkeypatch, grid)
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert calls == [int(shard)] and meta["identity"] == "no-sidecar"
+        assert meta.get("error") is None
+
     def test_destroyed_leaf_with_surviving_sidecar_rebuilds(self, monkeypatch, cfg, tmp_path):
         # The sidecar is a SIBLING of the leaf .zarr, so a prefix-scoped
         # lifecycle purge (the very reaping issue #388 exists to outrun) takes

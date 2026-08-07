@@ -1209,8 +1209,8 @@ def leaf_identity_gate(
     A skipped or refused unit writes NOTHING (no arrays, no stamp, no
     sidecar, no sub-map, no column): the caller returns ``meta`` untouched,
     so zero sweep dirtiness by construction. The sidecar read is fail-open —
-    a malformed or unreadable sidecar degrades to today's rewrite (the
-    ``no-sidecar`` classification), never blocks the unit.
+    an unreadable, unparseable, or non-object sidecar degrades to today's
+    rewrite (the ``no-sidecar`` classification), never blocks the unit.
 
     A matched identity is NOT sufficient to skip: the unit's ARTIFACTS must
     be current too, verified by reading them rather than the record.
@@ -1241,6 +1241,16 @@ def leaf_identity_gate(
         logger.warning(
             f"skip-if-current: sidecar read failed for shard {shard_key} "
             f"(degrading to rewrite, issue #388): {e}"
+        )
+        recorded = None
+    if recorded is not None and not isinstance(recorded, dict):
+        # ``read_sidecar`` returns whatever the JSON decoded to, and the
+        # classifier dereferences it with ``.get`` — a valid non-object body
+        # (``[]``, ``"x"``, ``5``) would raise straight out of the seam and
+        # FAIL the unit, which is exactly what fail-open promises not to do.
+        logger.warning(
+            f"skip-if-current: sidecar for shard {shard_key} is not a JSON object "
+            f"({type(recorded).__name__}) — degrading to rewrite (issue #388)"
         )
         recorded = None
     identity = classify_leaf_identity(
