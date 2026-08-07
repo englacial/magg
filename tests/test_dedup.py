@@ -6,18 +6,27 @@ absent leaves are plain misses.
 """
 
 import copy
+import pathlib
 
 import numpy as np
 import zarr
 
 from zagg import hive
 from zagg.config import default_config
-from zagg.dedup import classify_leaf_identity, has_run, shard_status
+from zagg.dedup import classify_leaf_identity, has_run, leaf_recorded_ids, shard_status
 from zagg.grids import HealpixGrid
 from zagg.grids.morton import morton_word
 from zagg.semantics import semantic_hash
 from zagg.store import open_store
-from zagg.telemetry import build_record, granules_sha256, sidecar_key, write_sidecar
+from zagg.telemetry import (
+    build_record,
+    granule_ids_key,
+    granule_ids_path,
+    granules_sha256,
+    sidecar_key,
+    write_granule_ids,
+    write_sidecar,
+)
 
 WORD = morton_word("1121121")  # order-6 shard key
 GRANULES = ["s3://b/g1.h5", "s3://b/g2.h5"]
@@ -188,42 +197,75 @@ class TestHasRun:
 
 class TestClassifyLeafIdentity:
     """Worker-side identity readings (issue #388): equal / expansion /
-    contraction / mixed, with every ambiguity degrading to rewrite."""
+    contraction / mixed, with every ambiguity degrading to rewrite.
+
+    The recorded id LIST is not in the sidecar (the ruling on question (6)):
+    it comes from a sibling object through a lazy loader, so these fix the
+    sidecar's hash and hand the classifier a loader whose call count is
+    itself asserted."""
 
     SEM = "a" * 64
     IDS = ["s3://b/g1.h5", "s3://b/g2.h5", "s3://b/g3.h5"]
 
-    def _recorded(self, ids=None, semantic=SEM, with_ids=True):
-        ids = self.IDS if ids is None else ids
-        rec = {"semantic_hash": semantic, "granules_sha256": granules_sha256(ids)}
-        if with_ids:
-            rec["granule_ids"] = sorted(ids)
-        return rec
+    def _classify(self, planned_ids, *, ids=None, semantic=SEM, want=SEM, sibling=True):
+        """Classify ``planned_ids`` against a leaf recording ``ids``.
+
+        ``sibling=False`` models a leaf with no recorded id list at all — a
+        pre-#388 leaf, a lost PUT, or a sibling that failed to pair. The
+        loader's call count lands on ``self.loads``."""
+        recorded_ids = self.IDS if ids is None else ids
+        recorded = {
+            "semantic_hash": semantic,
+            "granules_sha256": granules_sha256(recorded_ids),
+        }
+        self.loads = 0
+
+        def _load():
+            self.loads += 1
+            return sorted(recorded_ids) if sibling else None
+
+        return classify_leaf_identity(
+            recorded,
+            semantic_hash=want,
+            planned_ids=planned_ids,
+            load_recorded_ids=_load,
+        )
 
     def test_equal_skips_on_the_hash_fast_path(self):
-        # Order must not matter: the hash is over the sorted ids.
-        got = classify_leaf_identity(
-            self._recorded(), semantic_hash=self.SEM, planned_ids=self.IDS[::-1]
-        )
+        # Order must not matter: the hash is over the sorted ids. And the
+        # sibling is NEVER read on this path — the whole point of the split.
+        got = self._classify(self.IDS[::-1])
         assert got == {"action": "skip", "classification": "equal", "missing": []}
+        assert self.loads == 0
 
-    def test_equal_without_recorded_ids_still_skips(self):
-        # The fast path never needs the id list, so pre-#388 sidecars skip too.
-        got = classify_leaf_identity(
-            self._recorded(with_ids=False), semantic_hash=self.SEM, planned_ids=self.IDS
-        )
+    def test_equal_without_a_recorded_sibling_still_skips(self):
+        # The fast path never needs the id list, so a leaf whose sibling is
+        # absent (pre-#388, or a lost PUT) still skips when the hash matches.
+        got = self._classify(self.IDS, sibling=False)
         assert got["action"] == "skip"
+        assert self.loads == 0
+
+    def test_the_sibling_is_read_once_on_mismatch(self):
+        # The one read the split pays for, and only once per classification.
+        self._classify(self.IDS[:2])
+        assert self.loads == 1
+
+    def test_missing_loader_reads_as_unrecorded(self):
+        # A caller that supplies none (or a pure caller with no store in
+        # scope) has no recorded set to diff: today's rewrite, counted apart.
+        got = classify_leaf_identity(
+            {"semantic_hash": self.SEM, "granules_sha256": granules_sha256(self.IDS)},
+            semantic_hash=self.SEM,
+            planned_ids=self.IDS[:2],
+        )
+        assert got == {"action": "rewrite", "classification": "unrecorded-ids", "missing": []}
 
     def test_expansion_rewrites(self):
-        got = classify_leaf_identity(
-            self._recorded(), semantic_hash=self.SEM, planned_ids=self.IDS + ["s3://b/g4.h5"]
-        )
+        got = self._classify(self.IDS + ["s3://b/g4.h5"])
         assert got == {"action": "rewrite", "classification": "expansion", "missing": []}
 
     def test_pure_contraction_refuses_and_names_ids(self):
-        got = classify_leaf_identity(
-            self._recorded(), semantic_hash=self.SEM, planned_ids=self.IDS[:2]
-        )
+        got = self._classify(self.IDS[:2])
         assert got["action"] == "refuse"
         assert got["classification"] == "contraction"
         assert got["missing"] == ["s3://b/g3.h5"]
@@ -232,8 +274,7 @@ class TestClassifyLeafIdentity:
         # The ruled predicate is recorded - planned != {} — NOT strict subset:
         # the planned set can even be LARGER while data drops (the upstream
         # purge behind a fresh catalog query, the espg contraction ruling).
-        planned = self.IDS[:2] + ["s3://b/new1.h5", "s3://b/new2.h5"]
-        got = classify_leaf_identity(self._recorded(), semantic_hash=self.SEM, planned_ids=planned)
+        got = self._classify(self.IDS[:2] + ["s3://b/new1.h5", "s3://b/new2.h5"])
         assert got["action"] == "refuse"
         assert got["classification"] == "mixed"
         assert got["missing"] == ["s3://b/g3.h5"]
@@ -241,9 +282,7 @@ class TestClassifyLeafIdentity:
     def test_contraction_beats_semantic_mismatch(self):
         # Dropping inputs refuses even when the semantic hash also changed —
         # the guard is about data loss, not intent drift.
-        got = classify_leaf_identity(
-            self._recorded(semantic="b" * 64), semantic_hash=self.SEM, planned_ids=self.IDS[:1]
-        )
+        got = self._classify(self.IDS[:1], semantic="b" * 64)
         assert got["action"] == "refuse"
         assert got["missing"] == sorted(self.IDS[1:])
 
@@ -251,33 +290,27 @@ class TestClassifyLeafIdentity:
         got = classify_leaf_identity(None, semantic_hash=self.SEM, planned_ids=self.IDS)
         assert got == {"action": "rewrite", "classification": "no-sidecar", "missing": []}
 
-    def test_pre388_sidecar_on_mismatch_rewrites(self):
+    def test_absent_sibling_on_mismatch_rewrites(self):
         # Hash mismatch + no recorded id list: undecidable, today's rewrite.
-        got = classify_leaf_identity(
-            self._recorded(with_ids=False), semantic_hash=self.SEM, planned_ids=self.IDS[:2]
-        )
+        got = self._classify(self.IDS[:2], sibling=False)
         assert got == {"action": "rewrite", "classification": "unrecorded-ids", "missing": []}
 
     def test_semantic_mismatch_with_equal_sets_rewrites_not_refuses(self):
-        got = classify_leaf_identity(
-            self._recorded(semantic="b" * 64), semantic_hash=self.SEM, planned_ids=self.IDS
-        )
+        got = self._classify(self.IDS, semantic="b" * 64)
         assert got == {"action": "rewrite", "classification": "semantic-mismatch", "missing": []}
 
     def test_null_recorded_semantic_never_skips(self):
         # Fleet-written pre-#388 vector sidecars record semantic_hash null
         # (the Lambda handler passes none): never provably current.
-        got = classify_leaf_identity(
-            self._recorded(semantic=None), semantic_hash=self.SEM, planned_ids=self.IDS
-        )
+        got = self._classify(self.IDS, semantic=None)
         assert got["action"] == "rewrite"
 
     def test_caller_without_semantic_hash_never_skips(self):
-        got = classify_leaf_identity(self._recorded(), semantic_hash=None, planned_ids=self.IDS)
+        got = self._classify(self.IDS, want=None)
         assert got["action"] == "rewrite"
 
     def test_empty_planned_set_is_pure_contraction(self):
-        got = classify_leaf_identity(self._recorded(), semantic_hash=self.SEM, planned_ids=[])
+        got = self._classify([])
         assert got["action"] == "refuse"
         assert got["classification"] == "contraction"
         assert got["missing"] == sorted(self.IDS)
@@ -286,23 +319,65 @@ class TestClassifyLeafIdentity:
         # None is UNKNOWN, not empty: it must not diff to "every recorded id
         # was dropped" and refuse — the maximally ambiguous input takes the
         # conservative rewrite, the same direction as every other ambiguity.
-        got = classify_leaf_identity(self._recorded(), semantic_hash=self.SEM, planned_ids=None)
+        got = self._classify(None)
         assert got == {"action": "rewrite", "classification": "unknown-planned", "missing": []}
+        assert self.loads == 0
 
     def test_planned_ids_are_iterated_not_truth_tested(self):
         # A numpy id array raises ValueError on a bare truthiness test; the
         # planned set is iterated instead, so array-shaped callers work.
-        planned = np.array(self.IDS)
-        got = classify_leaf_identity(self._recorded(), semantic_hash=self.SEM, planned_ids=planned)
-        assert got["action"] == "skip"
-        empty = classify_leaf_identity(
-            self._recorded(), semantic_hash=self.SEM, planned_ids=np.array([], dtype=object)
-        )
+        assert self._classify(np.array(self.IDS))["action"] == "skip"
+        empty = self._classify(np.array([], dtype=object))
         assert empty["action"] == "refuse"  # an empty ARRAY is still empty, not unknown
 
     def test_duplicate_drift_with_equal_sets_rewrites(self):
         # granules_sha256 keeps duplicates; the set diff dedups. Same set,
         # different multiset -> not current, not a contraction.
-        rec = self._recorded(ids=self.IDS + [self.IDS[0]])
-        got = classify_leaf_identity(rec, semantic_hash=self.SEM, planned_ids=self.IDS)
+        got = self._classify(self.IDS, ids=self.IDS + [self.IDS[0]])
         assert got == {"action": "rewrite", "classification": "id-multiset-drift", "missing": []}
+
+
+class TestLeafRecordedIds:
+    """The sibling read (issue #388): pairs with its sidecar or reads absent."""
+
+    IDS = ["s3://b/g2.h5", "s3://b/g1.h5"]
+
+    def _leaf(self, tmp_path):
+        leaf = hive.shard_leaf_path(str(tmp_path), WORD)
+        (pathlib.Path(leaf).parent).mkdir(parents=True, exist_ok=True)
+        return leaf
+
+    def _sidecar(self, ids):
+        return {"granules_sha256": granules_sha256(ids)}
+
+    def test_round_trips_the_recorded_set_sorted(self, tmp_path):
+        leaf = self._leaf(tmp_path)
+        assert write_granule_ids(leaf, self.IDS) is True
+        got = leaf_recorded_ids(leaf, self._sidecar(self.IDS))
+        assert got == sorted(self.IDS)
+
+    def test_absent_sibling_reads_none(self, tmp_path):
+        assert leaf_recorded_ids(self._leaf(tmp_path), self._sidecar(self.IDS)) is None
+
+    def test_unpaired_sibling_is_rejected(self, tmp_path):
+        # A torn rewrite (sibling from one run, sidecar from another) must
+        # read as unrecorded — a stale set would name the wrong granules as
+        # dropped, or hide real ones.
+        leaf = self._leaf(tmp_path)
+        write_granule_ids(leaf, self.IDS)
+        assert leaf_recorded_ids(leaf, self._sidecar(self.IDS + ["s3://b/g3.h5"])) is None
+
+    def test_malformed_sibling_reads_none(self, tmp_path):
+        leaf = self._leaf(tmp_path)
+        write_granule_ids(leaf, self.IDS)
+        path = pathlib.Path(granule_ids_path(leaf))
+        for body in ("[]", '"nope"', '{"granule_ids": "not-a-list"}', "{oh no"):
+            path.write_text(body)
+            assert leaf_recorded_ids(leaf, self._sidecar(self.IDS)) is None
+
+    def test_windowed_sibling_is_per_window(self, tmp_path):
+        # Same grammar as the sidecar: two windows of one shard cannot
+        # clobber each other's recorded set.
+        assert granule_ids_key("1121121.zarr") == "granules.json"
+        assert granule_ids_key("1121121_2025.zarr") == "granules_2025.json"
+        assert granule_ids_key("2025.zarr", "morton-hive/3") == "2025.granules.json"

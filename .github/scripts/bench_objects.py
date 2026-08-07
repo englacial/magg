@@ -197,14 +197,16 @@ def expected_object_counts(
         # Leaf fixed objects: leaf root zarr.json + group zarr.json + one
         # zarr.json per array, plus the in-leaf coverage.moc sidecar (written
         # for any populated leaf when the leaf has depth, i.e. child_order >
-        # parent_order), plus TWO node-dir siblings per successful shard: the
-        # stats.json sidecar (issue #297) and the shardmap.json leaf sub-map
-        # (issue #300 — same success gate; on the Lambda path it may be
-        # legitimately absent for a unit whose submap event block was dropped
-        # over the async payload cap, which then surfaces here as a mismatch
-        # worth seeing rather than a modeled window).
+        # parent_order), plus THREE node-dir siblings per successful shard:
+        # the stats.json sidecar (issue #297), its granules.json recorded
+        # id list (issue #388 — written by the leaf seam right after the
+        # commit stamp, so it lands on both backends) and the shardmap.json
+        # leaf sub-map (issue #300 — same success gate; on the Lambda path it
+        # may be legitimately absent for a unit whose submap event block was
+        # dropped over the async payload cap, which then surfaces here as a
+        # mismatch worth seeing rather than a modeled window).
         sidecar = 1 if grid.child_order > grid.parent_order else 0
-        lo = hi = 4 + len(members) + sidecar
+        lo = hi = 5 + len(members) + sidecar
         for m in members:
             blocks = m["blocks_per_shard"]
             hi += blocks
@@ -357,9 +359,10 @@ def store_object_counts(
             hive.shard_leaf_path("", int(k)).lstrip("/") + "/": grid.shard_label(int(k))
             for k in shard_keys
         }
-        # The per-shard stats sidecar (issue #297) and the leaf sub-map
-        # (issue #300) are SIBLINGS of the leaf .zarr — ``{node}/stats.json``
-        # and ``{node}/shardmap.json`` (``_{window}`` suffixed when windowed)
+        # The per-shard stats sidecar (issue #297), its recorded granule-id
+        # list (issue #388) and the leaf sub-map (issue #300) are SIBLINGS of
+        # the leaf .zarr — ``{node}/stats.json``, ``{node}/granules.json`` and
+        # ``{node}/shardmap.json`` (``_{window}`` suffixed when windowed)
         # — so attribute them to the node's shard rather than pooling them in
         # ``other``.
         stats_of = {
@@ -427,7 +430,7 @@ def store_object_counts(
                     name == f"{stem}.json"
                     or (name.startswith(f"{stem}_") and name.endswith(".json"))
                     or name.endswith(f".{stem}.json")
-                    for stem in ("stats", "shardmap")
+                    for stem in ("stats", "granules", "shardmap")
                 )
                 if is_sibling and node + "/" in stats_of:
                     per_shard[stats_of[node + "/"]] = per_shard.get(stats_of[node + "/"], 0) + 1

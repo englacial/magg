@@ -14,6 +14,13 @@ summation order. Identity-like fields (``shard_key``, ``granules_sha256``,
 ``invoked_by``, ...) merge as equal-or-``None``: a mismatch collapses to
 ``None`` (absorbing), which keeps the fold associative.
 
+The sidecar has one SIBLING of its own (issue #388): ``granules.json``, the
+recorded granule-id list behind the record's ``granules_sha256``, on the same
+spec-keyed naming grammar (:func:`granule_ids_key`). It is deliberately not a
+record key — identity equality is the hash compare every fan-out reader
+already makes, and the list is fetched only to name what a contraction
+dropped.
+
 ``build_record``/``merge`` are pure (no I/O); the sidecar/parquet helpers below
 them do object-store I/O and import their backends lazily.
 """
@@ -40,6 +47,17 @@ SCHEMA_VERSION = 1
 #: — mirroring the ``{full_id}_{window}.zarr`` leaf naming so two windows of one
 #: shard cannot clobber each other's sidecar.
 SIDECAR_NAME = "stats.json"
+
+#: Recorded granule-id list object (issue #388) — a SIBLING of the stats
+#: sidecar, on the same naming grammar (:func:`granule_ids_key`), holding the
+#: id list behind the sidecar's ``granules_sha256``. Split out of the record
+#: on the espg ruling (question (6)(c)): identity EQUALITY is the small
+#: sidecar's hash compare, which every fan-out reader already pays
+#: (``dedup.shard_status`` per shard, ``rows_from_status`` per envelope), so
+#: the list — ~4,600 ids ≈ 550 KB on a pole shard — must never ride the
+#: record, the response envelope, or those GETs. It is read exactly once, and
+#: only when the hash MISMATCHES: to NAME the granules a contraction dropped.
+GRANULE_IDS_NAME = "granules.json"
 
 #: ``platform.machine()`` spellings -> the #298 price-table arch keys, so the
 #: worker-side record prices with the same table the dispatcher's cost block
@@ -80,11 +98,6 @@ _EQ_OR_NONE_KEYS = (
     # collapses it to None (absence = unverifiable, §5.3) while merge([r])
     # stays r.
     "content_hashes",
-    # The recorded granule-id LIST (issue #388) — the id-set half of the
-    # skip-if-current identity pair, kept next to its hash so a contraction
-    # refusal can name the dropped ids. Per-leaf like content_hashes: a
-    # cross-leaf rollup collapses it to None.
-    "granule_ids",
     # Leaf pyramid column basename (issue #383's deferred run-record key,
     # landed with #388): D22 discovery is run-record-driven, so column
     # existence must be discoverable without a tree listing. Named
@@ -227,13 +240,11 @@ def build_record(
         "zagg_version": _zagg_version(),
         "n_shards": 1,
         "n_granules": int(n_granules),
+        # The catalog identity half, and the ONLY id-derived value the record
+        # carries: the id LIST behind it lives in its own sibling object
+        # (:data:`GRANULE_IDS_NAME`, issue #388) so it never rides this record,
+        # the response envelope, or any fan-out identity GET.
         "granules_sha256": granules_sha256(granule_ids),
-        # The recorded id LIST behind that hash (issue #388), in the hash's
-        # own canonical order (sorted, duplicates kept) — the set a later
-        # rerun's contraction guard diffs against to NAME dropped ids.
-        # Envelope-borne and sidecar-recorded, never a run-parquet column
-        # (the join key there is granules_sha256).
-        "granule_ids": sorted(str(g) for g in granule_ids) if granule_ids else None,
         # O11 content hashes (issue #342, spec §5.3): the verification half of
         # the D19 identity split, computed by the hive leaf writer from the
         # staged arrays and ridden here off ``metadata``. None wherever no
@@ -325,12 +336,9 @@ def merge(records: Iterable[dict]) -> dict:
             # #297). One level deeper than a plain ``dict()``: flat values
             # (``lambda``/``invoked_by``) are unaffected, but
             # ``content_hashes`` nests an ``arrays`` map (issue #342) that a
-            # shallow copy would still alias. Lists (``granule_ids``, issue
-            # #388) copy shallow — their elements are strings.
+            # shallow copy would still alias.
             if isinstance(first, dict):
                 out[key] = {k: dict(v) if isinstance(v, dict) else v for k, v in first.items()}
-            elif isinstance(first, list):
-                out[key] = list(first)
             else:
                 out[key] = first
         else:
@@ -419,8 +427,9 @@ _ROW_SCALARS = (
     # reads right on the pyramid column's own row ("the column this LEAF
     # carries"). Renamed pre-release under the issue #388 ruling; nothing
     # published this schema under the old spelling.
-    # ``granule_ids`` (a list) stays out — the parquet join key for catalog
-    # identity is granules_sha256.
+    # The granule-id LIST has no column here and never had: the parquet join
+    # key for catalog identity is granules_sha256, and since issue #388 the
+    # list is not even on the record (:data:`GRANULE_IDS_NAME`).
     "leaf_column",
     "max_memory_mb",
     "container_hwm_mb",
@@ -656,6 +665,28 @@ def sidecar_key(leaf_name: str, spec: str | None = None) -> str:
     a writer/reader spec mismatch would key the wrong sidecar name and read as
     absent instead of failing.
     """
+    return _sibling_key(leaf_name, SIDECAR_NAME, spec)
+
+
+def granule_ids_key(leaf_name: str, spec: str | None = None) -> str:
+    """Object name of a leaf's recorded granule-id list (issue #388).
+
+    The stats sidecar's grammar with :data:`GRANULE_IDS_NAME` as the base
+    name, so the two siblings are named by ONE rule and cannot drift:
+    ``granules.json`` / ``granules_{window}.json`` on the legacy specs,
+    ``{stem}.granules.json`` under :data:`SPEC_V3`. Unrecognized specs raise,
+    exactly as in :func:`sidecar_key`.
+    """
+    return _sibling_key(leaf_name, GRANULE_IDS_NAME, spec)
+
+
+def _sibling_key(leaf_name: str, base: str, spec: str | None) -> str:
+    """The spec-keyed name of a leaf SIBLING object; see :func:`sidecar_key`.
+
+    One grammar for the whole D20 sibling family — the sidecar and the issue
+    #388 granule-id list differ only in ``base``. Kept private so the family
+    stays closed: every sibling name has a named ``*_key`` owner above it.
+    """
     if spec == SPEC_V3:
         from zagg.windows import validate_label
 
@@ -667,7 +698,7 @@ def sidecar_key(leaf_name: str, spec: str | None = None) -> str:
         # malformed key. The ``all`` schedule-none token satisfies the explicit
         # grammar, so it keeps passing.
         validate_label(stem)
-        return f"{stem}.stats.json"
+        return f"{stem}.{base}"
     if spec not in _LEGACY_SPECS:
         raise ValueError(
             f"unknown store spec {spec!r} (one of {_LEGACY_SPECS} for legacy names "
@@ -677,8 +708,8 @@ def sidecar_key(leaf_name: str, spec: str | None = None) -> str:
 
     _full_id, window = split_leaf_name(leaf_name)
     if window is None:
-        return SIDECAR_NAME
-    stem, ext = SIDECAR_NAME.rsplit(".", 1)
+        return base
+    stem, ext = base.rsplit(".", 1)
     return f"{stem}_{window}.{ext}"
 
 
@@ -700,6 +731,82 @@ def write_sidecar(leaf_path: str, record: dict, spec: str | None = None, **store
         sidecar_key(name, spec),
         json.dumps(record).encode(),
     )
+
+
+def granule_ids_path(leaf_path: str, spec: str | None = None) -> str:
+    """Absolute path of a leaf's granule-id list object (issue #388)."""
+    prefix, _, name = leaf_path.rstrip("/").rpartition("/")
+    return f"{prefix}/{granule_ids_key(name, spec)}"
+
+
+def write_granule_ids(leaf_path: str, granule_ids, spec: str | None = None, **store_kwargs) -> bool:
+    """PUT the leaf's recorded granule-id list beside its sidecar (issue #388).
+
+    Written by the leaf SEAMS (``hive.process_and_write_hive`` /
+    ``processing.raster.process_and_write_raster_hive``) right after the D4
+    commit stamp, not by the dispatcher that writes the sidecar: the seam
+    holds the very list the identity gate compares as ``planned_ids``, so the
+    recorded and planned id SPACES have one source, and a worker-side write
+    is the D8-sanctioned one — which is also what carries this to the fleet
+    with no Lambda-handler change (the sidecar's own ``semantic_hash``
+    precedent).
+
+    The object is self-describing and self-pairing: it carries the
+    ``granules_sha256`` of the list it holds, and a reader must accept it
+    only when that matches the sidecar's (:func:`zagg.dedup.leaf_recorded_ids`).
+    A torn rewrite — new sidecar, lost sibling PUT, or the reverse — then
+    reads as "no recorded set" rather than as a stale set that could refuse
+    or excuse the wrong granules.
+
+    Fail-open INSIDE (the ``zagg.column`` sidecar precedent, D9 telemetry
+    class): the leaf is already committed when this runs, so a failed PUT
+    must never fail the unit. Returns whether the object landed; the cost of
+    it not landing is one wholesale rewrite (``unrecorded-ids``) on a later
+    mismatching rerun, never a wrong skip.
+    """
+    import logging
+
+    try:
+        import obstore
+
+        from zagg.store import open_object_store
+
+        prefix, _, name = leaf_path.rstrip("/").rpartition("/")
+        ids = sorted(str(g) for g in granule_ids) if granule_ids else []
+        obstore.put(
+            open_object_store(prefix, **store_kwargs),
+            granule_ids_key(name, spec),
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "granules_sha256": granules_sha256(ids),
+                    "granule_ids": ids,
+                }
+            ).encode(),
+        )
+        return True
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"granule-id sibling write failed (fail-open, issue #388): {e}"
+        )
+        return False
+
+
+def read_granule_ids(leaf_path: str, spec: str | None = None, **store_kwargs) -> dict | None:
+    """The leaf's granule-id list object, or ``None`` when absent (issue #388)."""
+    import obstore
+    from obstore.exceptions import NotFoundError
+
+    from zagg.store import open_object_store
+
+    prefix, _, name = leaf_path.rstrip("/").rpartition("/")
+    try:
+        data = obstore.get(
+            open_object_store(prefix, **store_kwargs), granule_ids_key(name, spec)
+        ).bytes()
+    except (FileNotFoundError, NotFoundError):
+        return None
+    return json.loads(bytes(data))
 
 
 def read_sidecar(leaf_path: str, spec: str | None = None, **store_kwargs) -> dict | None:

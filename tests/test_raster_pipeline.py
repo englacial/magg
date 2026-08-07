@@ -1420,13 +1420,15 @@ class TestRasterHiveWorker:
         assert len(calls) == 1 and meta["identity"] == "no-sidecar"
 
     def test_unrecorded_ids_rewrites_with_its_own_classification(self, tmp_path, monkeypatch):
-        # A pre-#388 sidecar records no granule_ids: the guard is INERT, and
-        # the classification is what the run stats count apart.
+        # A leaf written before issue #388 has no granule-id sibling: the
+        # guard is INERT, and the classification is what run stats count apart.
+        import os
+
         from zagg.processing.raster import process_and_write_raster_hive
-        from zagg.telemetry import read_sidecar, write_sidecar
+        from zagg.telemetry import granule_ids_path
 
         cfg, grid, shard, granules, root, leaf = self._committed_leaf_with_sidecar(tmp_path)
-        write_sidecar(leaf, {**read_sidecar(leaf), "granule_ids": None})
+        os.remove(granule_ids_path(leaf))
         calls = self._counting(monkeypatch)
         meta = process_and_write_raster_hive(
             shard, granules[:1], grid, root, cfg, store_kwargs={}, skip_if_current=True

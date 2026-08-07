@@ -1231,7 +1231,7 @@ def leaf_identity_gate(
     way, and a contraction over debris is still a contraction the operator
     should be told about.
     """
-    from zagg.dedup import classify_leaf_identity
+    from zagg.dedup import classify_leaf_identity, leaf_recorded_ids
     from zagg.telemetry import read_sidecar
 
     t0 = time.time()
@@ -1254,7 +1254,15 @@ def leaf_identity_gate(
         )
         recorded = None
     identity = classify_leaf_identity(
-        recorded, semantic_hash=semantic_hash, planned_ids=planned_ids
+        recorded,
+        semantic_hash=semantic_hash,
+        planned_ids=planned_ids,
+        # LAZY by construction (issue #388's ruling on question (6)): the
+        # recorded id list is a sibling object, GET only when the
+        # granules_sha256 fast path failed and the diff has to be named.
+        load_recorded_ids=lambda: leaf_recorded_ids(
+            leaf_path, recorded, spec=sidecar_spec, store_kwargs=store_kwargs
+        ),
     )
     if identity["action"] == "skip":
         drift = None
@@ -1367,8 +1375,11 @@ def process_and_write_hive(
     sidecar returns a ``{"current": True}`` metadata dict and writes nothing;
     a contraction (``recorded ∖ planned ≠ ∅``, the ruled predicate) returns
     ``{"refused": True, "missing_granules": [...]}`` unless
-    ``allow_contraction`` rides the call. Default ``False`` keeps this seam
-    byte-identical for callers that have not opted in (the Lambda handler).
+    ``allow_contraction`` rides the call. Default ``False`` keeps the GATE
+    inert for callers that have not opted in (the Lambda handler); the
+    granule-id sibling below is written either way, because it is what a
+    LATER run's guard diffs against — a leaf must record its input set
+    whether or not the run that wrote it had the gate armed.
     ``semantic_hash`` is the RUN config's D19 digest when the caller holds it
     (the local runner); ``None`` falls back to hashing this worker's own
     ``config`` — the same digest except under the per-cell
@@ -1380,7 +1391,11 @@ def process_and_write_hive(
     ``telemetry.build_record``'s validated metadata fallback.
     ``sidecar_spec`` is the manifest spec in effect, keying the sidecar name
     (``telemetry.sidecar_key``); the gate reads with it and degrades to
-    rewrite when the sidecar is absent under that name.
+    rewrite when the sidecar is absent under that name. It also keys the
+    granule-id SIBLING this seam writes after the commit stamp
+    (``telemetry.write_granule_ids``, issue #388) — the recorded id set the
+    contraction guard later diffs, kept out of the sidecar and the response
+    envelope so an identity check stays one small GET.
     """
     from zagg.processing import (
         process_shard,
@@ -1640,6 +1655,15 @@ def process_and_write_hive(
             time_range=time_range,
         )
         _write_elapsed += time.time() - _t0
+        # The recorded granule-id list, as this leaf's own sibling object
+        # (issue #388): AFTER the stamp, so it never certifies a leaf that
+        # did not land, and written here rather than at the caller's sidecar
+        # PUT because ``granule_urls`` is the very list the identity gate
+        # compares — one source for the recorded id space, on both backends.
+        # Fail-open inside (telemetry class, D9).
+        from zagg.telemetry import write_granule_ids
+
+        write_granule_ids(leaf_path, granule_urls, spec=sidecar_spec, **store_kwargs)
     # Write-phase split (issue #249): read/index/aggregate come from
     # ``process_shard``; ``write`` is the leaf write-out above (template +
     # dense chunks + ragged + coverage sidecar + stamp). Same gate as the flat

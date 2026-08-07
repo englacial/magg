@@ -663,11 +663,30 @@ enablement:
   default — reports `cells_current: 0` indefinitely until question (1)'s
   key-list fix lands.
 
+The *catalog* half needs no enablement in either family: the granule-id
+sibling is written by the **seam**, not by the dispatcher that writes the
+sidecar, so every leaf a fleet worker commits from this release on records
+its input set — which is what the contraction guard, running in whatever
+process re-dispatches that unit later, diffs against.
+
+**Where the recorded id list lives.** Not in the stats sidecar: in a
+**sibling object beside it** — `granules.json` (`granules_{window}.json`
+windowed), on the sidecar's own spec-keyed naming grammar — written by the
+leaf seam right after the commit stamp, carrying the ids *and* the
+`granules_sha256` they hash to. Identity equality never reads it: that is the
+sidecar's hash compare, which is what keeps a fan-out dedup check
+(`dedup.shard_status` per shard, one GET) and the worker-side run-record
+assembly small. The list is fetched exactly once, only when the hashes
+disagree, and only to **name** which granules a contraction dropped — a pole
+shard's ~4,600 ids are ≈550 KB, and they would otherwise ride every one of
+those GETs. A sibling whose `granules_sha256` does not match the sidecar's
+(a torn rewrite: one of the two writes lost) is rejected as unrecorded rather
+than trusted.
+
 **The contraction guard cannot protect leaves written before this
-release.** The recorded granule-id *list* (`granule_ids` in the stats
-sidecar) arrives with issue #388. A sidecar written before it records only
-the hash — there is no recorded set to diff — so any mismatch over such a
-leaf classifies `unrecorded-ids` and performs the **silent wholesale
+release.** That sibling arrives with issue #388. A leaf written before it has
+only the recorded hash — there is no recorded set to diff — so any mismatch
+over such a leaf classifies `unrecorded-ids` and performs the **silent wholesale
 rewrite the guard exists to prevent**, contraction or not. The guard only
 protects a leaf after that leaf has been rewritten at least once under this
 release. These rewrites are counted apart (`cells_unrecorded` in the run
@@ -688,8 +707,9 @@ object layout while both identity halves hold): changing those still needs
 
 A skipped unit still resets the purge clock: every object in its footprint
 gets a fresh `LastModified` (lifecycle rules act per object) — the leaf
-`.zarr` tree (stamp, arrays, in-leaf `coverage.moc`), the stats sidecar and
-sub-map siblings, and the declared column tree plus its own sidecar.
+`.zarr` tree (stamp, arrays, in-leaf `coverage.moc`), the stats sidecar, its
+granule-id sibling and the sub-map sibling, and the declared column tree plus
+its own sidecar.
 Local stores use `os.utime`; S3 uses a server-side self-copy (`CopyObject`
 onto itself, `MetadataDirective: REPLACE`) that preserves content, the ETag
 of non-multipart objects, and the object's storage class. A local run's
