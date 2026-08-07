@@ -190,6 +190,18 @@ examples:
                 "Rerun with --allow-contraction to rewrite them; --overwrite "
                 "disables the guard instead of acknowledging it."
             )
+        # The lifecycle touch is fail-open, so a total failure (a read-scoped
+        # role, an SCP, an ACL edge — s3:PutObject denied fails EVERY object
+        # of EVERY unit) otherwise renders as an unqualified "N current" and
+        # exits 0, while those products keep their old purge clock and get
+        # deleted on the bucket rule's schedule. Only trace is a per-object
+        # warning, buried in thousands of lines of per-cell progress.
+        if results.get("touch_failures"):
+            print(
+                f"  {results['touch_failures']} lifecycle touch(es) FAILED — those objects "
+                f"did NOT have their purge clock reset and a bucket lifecycle rule can "
+                f"still expire them (fail-open; see the warnings above)"
+            )
         if "estimated_cost_usd" in results:
             print(
                 f"Lambda compute: {results['lambda_time_s']:.0f}s total, "

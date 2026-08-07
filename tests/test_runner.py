@@ -4791,4 +4791,35 @@ class TestCliContractionGuardSurface:
     def test_quiet_when_the_gate_did_nothing(self, monkeypatch, capsys):
         summary = {**self.SUMMARY, "cells_current": 0, "cells_refused": 0, "cells_unrecorded": 0}
         self._run(monkeypatch, [], summary)
-        assert "Skip-if-current" not in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "Skip-if-current" not in out and "lifecycle touch" not in out
+
+    def test_failed_touches_are_named_not_hidden_behind_a_success_line(self, monkeypatch, capsys):
+        # A denied s3:PutObject fails EVERY object of EVERY unit, and the
+        # touch is fail-open — so without this line the run prints "N current"
+        # and exits 0 while those products keep their old purge clock (review
+        # finding, the same rationale that gave the trio above a CLI line).
+        summary = {
+            **self.SUMMARY,
+            "cells_current": 7,
+            "cells_refused": 0,
+            "cells_unrecorded": 0,
+            "objects_touched": 0,
+            "touch_failures": 42,
+        }
+        self._run(monkeypatch, [], summary)
+        out = capsys.readouterr().out
+        assert "42 lifecycle touch(es) FAILED" in out
+        assert "did NOT have their purge clock reset" in out
+
+    def test_a_clean_touch_prints_no_failure_line(self, monkeypatch, capsys):
+        summary = {
+            **self.SUMMARY,
+            "cells_current": 7,
+            "cells_refused": 0,
+            "cells_unrecorded": 0,
+            "objects_touched": 91,
+            "touch_failures": 0,
+        }
+        self._run(monkeypatch, [], summary)
+        assert "FAILED" not in capsys.readouterr().out
