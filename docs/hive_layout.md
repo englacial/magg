@@ -629,8 +629,9 @@ matched pair alone is **not** sufficient — the unit's artifacts must be
 current too, verified by reading them, never trusted from the record: the
 leaf must carry its commit stamp, and the [leaf
 column](#leaf-columns-zagg-column1) must agree with the run's declaration
-(the §4.6 config-decides gate: the declaration moves *neither* identity
-half, so the gate reads the artifact). Three verdicts:
+(the [specification §4.6](specification.md) config-decides gate: the
+declaration moves *neither* identity half, so the gate reads the artifact).
+Three verdicts:
 
 | verdict | when | what happens |
 |---|---|---|
@@ -696,7 +697,8 @@ SSE-KMS the copy re-encrypts with the bucket-default key and needs
 `kms:Decrypt` + `kms:GenerateDataKey`.
 
 **Known gaps** — plan lifecycle rules around them, they are not promised
-away: the §7 sweep's **ancestor overviews and `pyramid.json` envelopes
+away: the [design §7](design/sparse_coverage.md) sweep's **ancestor
+overviews and `pyramid.json` envelopes
 belong to no unit's footprint** and a skip produces zero sweep dirtiness by
 construction, so a skip-only store ages its pyramid above the leaves while
 the leaves and root stay fresh; and the store-root trio is touched by the
