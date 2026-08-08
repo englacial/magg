@@ -837,9 +837,12 @@ class TestFootprintCells:
         assert ShardMap.from_json(sm_out).metadata["footprint_cells"] is True
 
     def test_empty_inputs_short_circuit(self, hp_grid):
-        # An empty AOI must return ``{}`` the way the geometry path does, not
-        # reach ``compress_moc`` with a zero-length array (which panics in the
-        # rust core rather than raising a python exception).
+        # An empty AOI (or no records) must return ``{}`` the way the geometry
+        # path does -- ``_intersect_mortie``'s own ``if flat is None or not
+        # all_shards: return {}``, so the two paths agree on the same inputs.
+        # Not a mortie workaround: on 0.9.5 ``compress_moc`` and ``moc_and``
+        # both handle zero-length arrays cleanly (a malformed morton *word* is
+        # what panics -- see ``_intersect_footprint_cells``).
         cat = _overlapping_catalog().index_footprints(11)
         values, offsets, _ = cat.footprint_cells()
         rows = np.arange(len(cat.granule_records()), dtype=np.int64)

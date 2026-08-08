@@ -317,6 +317,13 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
             # before. The AOI intersection makes a refusal far less reachable
             # here (the expansion is bounded by the granule's own cells inside
             # the AOI), but the failure semantics stay the same either way.
+            #
+            # A *malformed* stored word is not covered by this: mortie panics on
+            # a non-morton word (``PanicException``, a ``BaseException``, not an
+            # ``Exception``), so it aborts the build rather than dropping the
+            # granule. That is the intended reading -- only ``index_footprints``
+            # writes this column and it writes mortie's own output, so a bad
+            # word means a corrupted catalog, which should not be built through.
             shards = np.unique(np.asarray(moc_to_order(hit, parent_order)))
         except Exception:
             continue
