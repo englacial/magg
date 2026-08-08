@@ -318,6 +318,9 @@ def run_cases(names, orders=None, arms=("serial", "batch"), reps=1):
     rayon-parallel, so a single-shot wall on a loaded machine scatters wider
     than some of the differences being read off this table. Peak and the
     correctness digest come from the first rep (peak is stable across them).
+
+    Returns the list of requested cases whose catalog is **absent**, so the
+    caller can exit non-zero rather than let a run over nothing read as clean.
     """
     print(
         f"{'case':>11} {'order':>5} {'granules':>9} {'shards':>7} {'pairs':>9} "
@@ -325,9 +328,11 @@ def run_cases(names, orders=None, arms=("serial", "batch"), reps=1):
         f"{'ser_MB':>7} {'bat_MB':>7} {'cel_MB':>7} {'ser_hw':>7} {'bat_hw':>7} {'cel_hw':>7}",
         flush=True,
     )
+    skipped = []
     for name in names:
         if not _available(name):
             print(f"{name:>11}  -- skipped: {CASES[name]['catalog']} not present", flush=True)
+            skipped.append(name)
             continue
         for order in orders or CASES[name].get("orders", ORDERS):
             got = {}
@@ -364,6 +369,7 @@ def run_cases(names, orders=None, arms=("serial", "batch"), reps=1):
             if len(got) < 2:
                 row.append(" no-assert (one arm only)")
             print(" ".join(row), flush=True)
+    return skipped
 
 
 def run_knee(name, order=13, blocks=KNEE_BLOCKS, reps=1):
@@ -377,7 +383,7 @@ def run_knee(name, order=13, blocks=KNEE_BLOCKS, reps=1):
     """
     if not _available(name):
         print(f"knee: skipped, {CASES[name]['catalog']} not present", flush=True)
-        return
+        return [name]
     print(f"\nblock-size knee -- {name} @order{order}, min of {reps} (real footprints)", flush=True)
     print(f"{'block':>7} {'wall_s':>8} {'peak_MB':>8} {'peak_hw':>8}", flush=True)
     for block in blocks:
@@ -387,6 +393,7 @@ def run_knee(name, order=13, blocks=KNEE_BLOCKS, reps=1):
             f"{block:>7} {wall:>8.2f} {_peak_mb(runs[0]):>8.0f} {_peak_hw_mb(runs[0]):>8.0f}",
             flush=True,
         )
+    return []
 
 
 def main(argv=None):
@@ -420,12 +427,23 @@ def main(argv=None):
         return 0
     orders = tuple(int(o) for o in args.orders.split(",")) if args.orders else None
     cases = args.cases if args.cases is not None else ("" if args.knee else "neon,88s,california")
-    if cases:
+    skipped = []
+    names = [c for c in cases.split(",") if c] if cases else []
+    unknown = [c for c in ([*names, args.knee] if args.knee else names) if c not in CASES]
+    if unknown:
+        raise SystemExit(f"unknown case(s) {unknown}; known: {sorted(CASES)}")
+    if names:
         arms = tuple(a for a in args.arms.split(",") if a)
-        run_cases([c for c in cases.split(",") if c], orders, arms, reps=args.reps)
+        skipped = run_cases(names, orders, arms, reps=args.reps)
     if args.knee:
         blocks = tuple(int(b) for b in args.blocks.split(",") if b)
-        run_knee(args.knee, order=args.order, blocks=blocks, reps=args.reps)
+        skipped += run_knee(args.knee, order=args.order, blocks=blocks, reps=args.reps)
+    # A requested case whose catalog is absent produced no row. Exiting 0 would
+    # read as a clean run over nothing, which is the wrong default for a harness
+    # whose output gets quoted.
+    if skipped:
+        n = len(names) + bool(args.knee)
+        raise SystemExit(f"skipped {len(skipped)}/{n} requested cases: {skipped}")
     return 0
 
 
