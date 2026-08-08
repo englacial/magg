@@ -591,6 +591,10 @@ class TestGranuleIdsSibling:
         assert write_granule_ids(leaf, self.IDS) is True
         got = read_granule_ids(leaf)
         assert got["granule_ids"] == sorted(self.IDS)
+        # Its OWN version marker, not the D20 record's schema_version: a
+        # record rev must not bump this object, nor this object the record.
+        assert got["spec"] == "zagg-granule-ids/1"
+        assert "schema_version" not in got
         # Self-pairing: the object carries the hash of the list it holds, so a
         # reader can reject a sibling that does not belong to the sidecar.
         assert got["granules_sha256"] == granules_sha256(self.IDS)

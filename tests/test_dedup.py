@@ -388,6 +388,22 @@ class TestLeafRecordedIds:
             path.write_text(body)
             assert leaf_recorded_ids(leaf, self._sidecar(self.IDS)) is None
 
+    def test_the_spec_marker_is_read_leniently(self, tmp_path):
+        # The hash pairing decides, not the marker: a sibling with an unknown
+        # or absent spec must still read (a future zagg-granule-ids/N that
+        # keeps these keys), and never raise — the ruled fallback posture is
+        # unrecorded-ids, not an error.
+        import json
+
+        leaf = self._leaf(tmp_path)
+        write_granule_ids(leaf, self.IDS)
+        path = pathlib.Path(granule_ids_path(leaf))
+        body = json.loads(path.read_text())
+        for spec in ("zagg-granule-ids/99", None):
+            body["spec"] = spec
+            path.write_text(json.dumps(body))
+            assert leaf_recorded_ids(leaf, self._sidecar(self.IDS)) == sorted(self.IDS)
+
     def test_record_borne_ids_are_read_when_no_sibling_exists(self, tmp_path):
         # The 3f13af2..this-PR window: PR #397 put the id list ON the record
         # and there is no sibling beside those leaves. Falling back to it
