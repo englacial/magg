@@ -388,6 +388,24 @@ class TestLeafRecordedIds:
             path.write_text(body)
             assert leaf_recorded_ids(leaf, self._sidecar(self.IDS)) is None
 
+    def test_record_borne_ids_are_read_when_no_sibling_exists(self, tmp_path):
+        # The 3f13af2..this-PR window: PR #397 put the id list ON the record
+        # and there is no sibling beside those leaves. Falling back to it
+        # keeps the guard armed over them instead of classifying every one
+        # unrecorded-ids forever.
+        recorded = dict(self._sidecar(self.IDS), granule_ids=sorted(self.IDS))
+        assert leaf_recorded_ids(self._leaf(tmp_path), recorded) == sorted(self.IDS)
+        # A malformed record-borne value is still no recorded set.
+        assert leaf_recorded_ids(self._leaf(tmp_path), {"granule_ids": "nope"}) is None
+
+    def test_the_sibling_wins_over_a_record_borne_list(self, tmp_path):
+        # A store rewritten under this release has both for one run; the
+        # sibling is the current writer, so it is what the diff must use.
+        leaf = self._leaf(tmp_path)
+        write_granule_ids(leaf, self.IDS)
+        recorded = dict(self._sidecar(self.IDS), granule_ids=["s3://b/stale.h5"])
+        assert leaf_recorded_ids(leaf, recorded) == sorted(self.IDS)
+
     def test_windowed_sibling_is_per_window(self, tmp_path):
         # Same grammar as the sidecar: two windows of one shard cannot
         # clobber each other's recorded set.
