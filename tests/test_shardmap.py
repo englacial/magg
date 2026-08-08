@@ -537,6 +537,40 @@ class TestMortieBatch:
         monkeypatch.setattr(mortie, "polygons_to_morton_mocs", boom)
         assert shardmap._intersect_mortie(records, hp_grid, all_shards, order=11) == serial
 
+    def test_fallback_is_scoped_to_the_failing_block(self, hp_grid, monkeypatch):
+        # ``_batch_ring_mocs`` claims the fallback is "for this block only": the
+        # surviving blocks stay on the batch path and the regroup still stitches
+        # every block into record order. The test above cannot see that -- one
+        # block, raising unconditionally -- so raise on the Nth call instead,
+        # with the block size cut to 5 so 12 granules make three blocks and each
+        # takes a turn as the failing one (including the last, partial, block).
+        import mortie
+
+        cat = _overlapping_catalog()
+        records, all_shards = self._inputs(cat, hp_grid)
+        serial = _intersect_mortie_serial(records, hp_grid, all_shards, order=11)
+        real = mortie.polygons_to_morton_mocs
+        monkeypatch.setattr(shardmap, "_MOC_BATCH_RINGS", 5)
+
+        def make_flaky(bad):
+            state = {"calls": 0, "batched": 0}
+
+            def flaky(*a, **kw):
+                state["calls"] += 1
+                if state["calls"] - 1 == bad:
+                    raise RuntimeError("polygon 3: polygon coverage panicked")
+                state["batched"] += 1
+                return real(*a, **kw)
+
+            return flaky, state
+
+        for bad_block in (0, 1, 2):
+            flaky, state = make_flaky(bad_block)
+            monkeypatch.setattr(mortie, "polygons_to_morton_mocs", flaky)
+            assert shardmap._intersect_mortie(records, hp_grid, all_shards, order=11) == serial
+            assert state["calls"] == 3, f"expected three blocks, saw {state['calls']}"
+            assert state["batched"] == 2, "the surviving blocks must stay on the batch path"
+
     def test_empty_inputs_short_circuit(self, hp_grid):
         cat = _overlapping_catalog(n=2)
         records, all_shards = self._inputs(cat, hp_grid)
