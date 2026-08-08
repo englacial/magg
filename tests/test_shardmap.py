@@ -535,7 +535,26 @@ class TestMortieBatch:
             raise RuntimeError("polygon 3: polygon coverage panicked")
 
         monkeypatch.setattr(mortie, "polygons_to_morton_mocs", boom)
-        assert shardmap._intersect_mortie(records, hp_grid, all_shards, order=11) == serial
+        with pytest.warns(RuntimeWarning, match="fell back to the per-ring path"):
+            assert shardmap._intersect_mortie(records, hp_grid, all_shards, order=11) == serial
+
+    def test_fallback_warns_once_per_build(self, hp_grid, monkeypatch):
+        # The fallback is correct but several times slower, so it must not be
+        # silent -- an operator whose build suddenly takes 4x needs to know a
+        # mortie-side failure caused it. Equally it must not shout per block:
+        # three blocks fall back here and exactly one warning comes out.
+        import mortie
+
+        records, all_shards = self._inputs(_overlapping_catalog(), hp_grid)
+
+        def boom(*a, **kw):
+            raise RuntimeError("polygon 3: polygon coverage panicked")
+
+        monkeypatch.setattr(shardmap, "_MOC_BATCH_RINGS", 5)
+        monkeypatch.setattr(mortie, "polygons_to_morton_mocs", boom)
+        with pytest.warns(RuntimeWarning, match="polygon coverage panicked") as rec:
+            shardmap._intersect_mortie(records, hp_grid, all_shards, order=11)
+        assert len(rec) == 1, f"three blocks fell back; expected one warning, got {len(rec)}"
 
     def test_fallback_is_scoped_to_the_failing_block(self, hp_grid, monkeypatch):
         # ``_batch_ring_mocs`` claims the fallback is "for this block only": the
@@ -567,7 +586,9 @@ class TestMortieBatch:
         for bad_block in (0, 1, 2):
             flaky, state = make_flaky(bad_block)
             monkeypatch.setattr(mortie, "polygons_to_morton_mocs", flaky)
-            assert shardmap._intersect_mortie(records, hp_grid, all_shards, order=11) == serial
+            with pytest.warns(RuntimeWarning, match="fell back to the per-ring path"):
+                out = shardmap._intersect_mortie(records, hp_grid, all_shards, order=11)
+            assert out == serial
             assert state["calls"] == 3, f"expected three blocks, saw {state['calls']}"
             assert state["batched"] == 2, "the surviving blocks must stay on the batch path"
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 import importlib
 import json
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -174,8 +175,12 @@ def _first_of_run(values) -> np.ndarray:
     return mask
 
 
-def _batch_ring_mocs(lats, lons, offsets, start, stop, order) -> list:
+def _batch_ring_mocs(lats, lons, offsets, start, stop, order) -> tuple:
     """MOCs for rings ``[start, stop)`` -- one batch call into mortie (#396).
+
+    Returns ``(mocs, batch_exc)``, where ``batch_exc`` is the exception that
+    forced the serial fallback for this block, or ``None`` when the batch call
+    succeeded. The caller surfaces it once per build rather than per block.
 
     ``polygons_to_morton_mocs`` (mortie >= 0.9.4, espg/mortie#153) covers the
     whole block in one crossing of the Python/Rust boundary with the GIL
@@ -198,7 +203,7 @@ def _batch_ring_mocs(lats, lons, offsets, start, stop, order) -> list:
         values, out_offsets = polygons_to_morton_mocs(
             lats[lo:hi], lons[lo:hi], offsets[start : stop + 1] - lo, order=order
         )
-    except Exception:
+    except Exception as exc:
         mocs = []
         for r in range(start, stop):
             a, b = int(offsets[r]), int(offsets[r + 1])
@@ -206,8 +211,8 @@ def _batch_ring_mocs(lats, lons, offsets, start, stop, order) -> list:
                 mocs.append(np.asarray(morton_coverage_moc(lats[a:b], lons[a:b], order=order)))
             except Exception:
                 mocs.append(np.empty(0, dtype=np.uint64))
-        return mocs
-    return [values[out_offsets[r] : out_offsets[r + 1]] for r in range(stop - start)]
+        return mocs, exc
+    return [values[out_offsets[r] : out_offsets[r + 1]] for r in range(stop - start)], None
 
 
 def _resolve_mortie_order(mortie_order, grid) -> int:
@@ -441,9 +446,24 @@ def _intersect_mortie(
         shard_arr.sort()
 
         hit_shards, hit_owners = [], []
+        warned = False
         for start in range(0, owners.size, _MOC_BATCH_RINGS):
             stop = min(start + _MOC_BATCH_RINGS, owners.size)
-            for r, moc in enumerate(_batch_ring_mocs(lats, lons, offsets, start, stop, order)):
+            mocs, batch_exc = _batch_ring_mocs(lats, lons, offsets, start, stop, order)
+            if batch_exc is not None and not warned:
+                # Silence would hide a mortie-side bug behind a several-times
+                # slower path (the serial loop is ~4x the batch on realistic
+                # footprints), but one warning per block is noise on a
+                # pathological catalog -- so say it once per build.
+                warned = True
+                warnings.warn(
+                    f"mortie's batch coverage raised ({batch_exc!r}); this build fell back "
+                    "to the per-ring path for the affected block(s). Results are unchanged, "
+                    "but the build is several times slower. Reported once per build (#396).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            for r, moc in enumerate(mocs):
                 if moc.size == 0:
                     continue
                 try:
