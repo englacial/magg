@@ -6,7 +6,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from importlib import resources
 from typing import Any, NotRequired, TypedDict
 
@@ -2681,6 +2681,16 @@ def _is_nan_fill(meta: dict) -> bool:
     return isinstance(fill, float) and np.isnan(fill)
 
 
+#: The raster branch's fixed windowing epoch (issue #247, ratified): raster
+#: window membership is the acquisition's STAC ``datetime``, already an ISO-8601
+#: UTC instant, so the encoding is the identity one and is never author-declared.
+#: Held as an *instant*, not a spelling — ``get_windowing`` renders it through
+#: ``windows.iso_utc``, the same renderer its point branch canonicalizes the
+#: declared epoch with, so the two branches cannot write different spellings of
+#: the same instant if that rendering ever changes (issue #390).
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
 def get_windowing(config: PipelineConfig) -> dict | None:
     """The normalized temporal windowing declaration, or ``None`` (issue #246).
 
@@ -2702,12 +2712,14 @@ def get_windowing(config: PipelineConfig) -> dict | None:
     entry is desugared to its second-wide range (issue #355) so the normalized
     list is uniformly ``{label, start, end}``.
     On the raster branch (``reader: raster``) ``time_field`` is the fixed STAC
-    ``datetime`` and ``epoch``/``scale``/``units`` are hardcoded to the
-    Unix-epoch UTC-seconds encoding any ISO instant normalizes to, rather than
+    ``datetime`` and ``epoch``/``scale``/``units`` are fixed to the Unix-epoch
+    UTC-seconds encoding any ISO instant normalizes to, rather than
     canonicalizing a declared ``epoch`` off the block (``_validate_windowing``
-    rejects those conversion knobs there). The same dict feeds the manifest
-    temporal block (:func:`zagg.hive.build_manifest`) and the dispatch fan-out,
-    so the two can never disagree.
+    rejects those conversion knobs there); the fixed epoch is still rendered
+    through the same ``windows.iso_utc`` as the declared one, so the branches
+    cannot spell one instant two ways (issue #390). The same dict feeds the
+    manifest temporal block (:func:`zagg.hive.build_manifest`) and the dispatch
+    fan-out, so the two can never disagree.
     """
     from zagg import windows as _windows
 
@@ -2731,11 +2743,16 @@ def get_windowing(config: PipelineConfig) -> dict | None:
         # #247, ratified): the manifest records the resolved field plus the
         # fixed encoding any ISO-8601 UTC instant normalizes to (UTC seconds
         # since the Unix epoch). _validate_windowing rejects the conversion
-        # knobs on raster configs, so nothing here can disagree with it.
+        # knobs on raster configs, so nothing here can disagree with it. The
+        # epoch is *rendered* through iso_utc rather than spelled out, for the
+        # reason _validate_windowing's #390 guard calls the renderer instead of
+        # restating its truncation rule: a literal here would be a copy of
+        # iso_utc's output format, free to drift from the spelling the point
+        # branch below gives the very same instant (see _UNIX_EPOCH).
         return {
             "schedule": block["schedule"],
             "time_field": "datetime",
-            "epoch": "1970-01-01T00:00:00+00:00",
+            "epoch": _windows.iso_utc(_UNIX_EPOCH),
             "scale": "utc",
             "units": "seconds",
             "windows": declared,

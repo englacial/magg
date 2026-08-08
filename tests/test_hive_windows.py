@@ -44,6 +44,21 @@ def _windowed(cfg, schedule="yearly", **over):
     return cfg
 
 
+def _raster_windowed(schedule="yearly"):
+    """A minimal raster + hive + windowing config (issue #247)."""
+    c = default_config("atl06")
+    c.data_source = {
+        "reader": "raster",
+        "bands": {"red": {"asset": "red", "dtype": "uint16"}},
+    }
+    c.aggregation = {}
+    c.output["grid"] = {"type": "healpix", "parent_order": 6, "child_order": 12}
+    c.output["store_layout"] = "hive"
+    c.output["windowing"] = {"schedule": schedule}
+    validate_config(c)
+    return c
+
+
 # ── config block (phase 2) ───────────────────────────────────────────────────
 
 
@@ -683,6 +698,20 @@ class TestWindowingConfig:
         validate_config(c)
         assert get_windowing(c)["time_field"] == "datetime"
 
+    def test_raster_epoch_renders_through_iso_utc(self):
+        # Issue #390: the raster epoch is FIXED (issue #247) but not SPELLED —
+        # get_windowing renders it with windows.iso_utc like every other
+        # instant it emits. Asserting against the renderer's own output rather
+        # than a literal is the point: this stays true through a change to
+        # iso_utc's precision or offset form, and only a re-introduced literal
+        # in config.py can break it.
+        from zagg import windows as _windows
+
+        c = _raster_windowed()
+        assert get_windowing(c)["epoch"] == _windows.iso_utc(
+            _windows.parse_utc(datetime(1970, 1, 1, tzinfo=timezone.utc))
+        )
+
 
 # ── manifest temporal block + spec bump (phase 2) ────────────────────────────
 
@@ -722,6 +751,21 @@ class TestManifestTemporal:
             "calendar": "proleptic_gregorian",
             "append_policy": "new-window",
         }
+
+    def test_raster_and_point_epochs_spell_one_instant_alike(self, cfg):
+        # The drift the rendered raster epoch prevents (issue #390): both
+        # branches of get_windowing feed the SAME manifest field, so a given
+        # instant has to reach it spelled one way. A point config declaring
+        # the Unix epoch and a raster config (whose epoch is fixed to it)
+        # therefore must produce byte-identical temporal epochs — this is the
+        # assertion a re-introduced literal on either branch breaks, since a
+        # literal is free to disagree with whatever iso_utc emits.
+        _windowed(cfg, epoch="1970-01-01T00:00:00Z", scale="utc")
+        validate_config(cfg)
+        point = hive.build_manifest(self._grid(cfg), windowing=get_windowing(cfg))
+        rcfg = _raster_windowed()
+        raster = hive.build_manifest(self._grid(rcfg), windowing=get_windowing(rcfg))
+        assert raster["temporal"]["epoch"] == point["temporal"]["epoch"]
 
     def test_explicit_manifest_carries_windows_and_retemplate_policy(self, cfg):
         _windowed(cfg, schedule="explicit")
