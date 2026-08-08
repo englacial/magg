@@ -298,6 +298,19 @@ class TestClassifyLeafIdentity:
     def test_semantic_mismatch_with_equal_sets_rewrites_not_refuses(self):
         got = self._classify(self.IDS, semantic="b" * 64)
         assert got == {"action": "rewrite", "classification": "semantic-mismatch", "missing": []}
+        # And it costs NO sibling read: equal hashes mean an identical id
+        # multiset, so the diff cannot change the verdict. This is the routine
+        # config-only rerun — one needless ~550 KB GET per shard otherwise.
+        assert self.loads == 0
+
+    def test_semantic_mismatch_without_a_sibling_is_not_unrecorded(self):
+        # Same quadrant over a pre-#388 leaf: the guard is NOT inert here (the
+        # hashes prove no contraction), so it must not report as unrecorded —
+        # a config-only rerun over a pre-#388 store would otherwise come back
+        # 100% cells_unrecorded.
+        got = self._classify(self.IDS, semantic="b" * 64, sibling=False)
+        assert got == {"action": "rewrite", "classification": "semantic-mismatch", "missing": []}
+        assert self.loads == 0
 
     def test_null_recorded_semantic_never_skips(self):
         # Fleet-written pre-#388 vector sidecars record semantic_hash null
