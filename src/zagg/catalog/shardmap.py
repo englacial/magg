@@ -168,7 +168,14 @@ def _flatten_rings(records, footprint, product):
 
 
 def _first_of_run(values) -> np.ndarray:
-    """Boolean mask marking the first element of every run of equal values."""
+    """Boolean mask marking the first element of every run of equal values.
+
+    Precondition: ``values.size >= 1`` (``mask[0] = True`` raises ``IndexError``
+    on an empty array). Both call sites in ``_intersect_mortie`` guarantee it --
+    the first runs only after the ``if not hit_shards: return {}`` short-circuit,
+    and the second slices a non-empty run of that same array -- so the empty case
+    is left as a documented contract rather than an untested branch.
+    """
     mask = np.empty(values.size, dtype=bool)
     mask[0] = True
     np.not_equal(values[1:], values[:-1], out=mask[1:])
