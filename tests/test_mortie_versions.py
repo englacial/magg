@@ -30,6 +30,7 @@ import tomllib
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 from zagg.grids.aoi import MIN_MORTIE_VERSION
@@ -93,11 +94,23 @@ def _above(sites, floor):
 
 def _mortie_floor():
     """The ``>=`` floor from ``[project.dependencies]``."""
-    deps = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    reqs = [Requirement(d) for d in deps["project"]["dependencies"]]
-    spec = next(r.specifier for r in reqs if r.name == "mortie")
-    lower = [Version(s.version) for s in spec if s.operator in (">=", "==", "~=")]
-    assert len(lower) == 1, f"expected one mortie lower bound in pyproject, got {lower}"
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    reqs = [Requirement(d) for d in pyproject["project"]["dependencies"]]
+    # Every mortie requirement, not the first: a marker-split pair would leave
+    # half the matrix measured against the other half's floor. Names are
+    # normalized so a legal ``Mortie>=…`` is found rather than raising blank.
+    mortie = [r for r in reqs if canonicalize_name(r.name) == "mortie"]
+    assert len(mortie) == 1, f"expected exactly one mortie requirement in pyproject, got {mortie}"
+    # ``"*" not in`` keeps a wildcard pin (``mortie==0.9.*``) out of
+    # ``Version`` — it reaches the assertion below instead of ``InvalidVersion``.
+    lower = [
+        Version(s.version)
+        for s in mortie[0].specifier
+        if s.operator in (">=", "==", "~=") and "*" not in s.version
+    ]
+    assert len(lower) == 1, (
+        f"expected one concrete mortie lower bound in pyproject, got {lower} from {mortie[0]}"
+    )
     return lower[0]
 
 
