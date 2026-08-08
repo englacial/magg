@@ -7,13 +7,21 @@ replaced, reporting **wall and peak RSS** for both.
 
 Why this file exists at all: the first cut of these numbers came from synthetic
 footprints, and the synthetic fixture was badly miscalibrated. A synthetic
-quadrilateral covers ~220 MOC cells at order 13; a real ATL03 CMR footprint
-covers ~10,000 (~47x more), and the whole memory profile of the batch path
-scales with that number. The synthetic figure is what produced a block size
-tuned an order of magnitude too large. Real catalogs are in the tree -- use
-them. (``benchmarks/mortie_order_sweep.py`` remains synthetic and says so; its
-real-catalog successor for the *order* question is ``bench/neon_order_sweep.py``,
-whose conventions this script follows.)
+quadrilateral covers ~220 MOC cells at order 13. Real ATL03 CMR footprints, 1,000
+sampled uniformly from the clone (seed 20260807) and covered at order 13, run::
+
+    min 4,373   p05 6,540   p25 7,179   median 9,266   mean 8,659
+    p75 10,238  p95 10,370  p99 10,618  max 10,881     (vertices/footprint: 27)
+
+-- ~40x the synthetic figure, with a 2.5x spread that a single median
+under-describes: the block's steady memory follows the **mean** (8,659) and its
+worst case the **p99/max** (10,618 / 10,881). The synthetic figure is what
+produced a block size tuned an order of magnitude too large; that the earlier
+"realistic" 32,127 is 3.0x the largest footprint in the sample is what confirms
+it was a 90-degree-of-latitude envelope rather than a CMR polygon. Real catalogs
+are in the tree -- use them. (``benchmarks/mortie_order_sweep.py`` remains
+synthetic and says so; its real-catalog successor for the *order* question is
+``bench/neon_order_sweep.py``.)
 
 Cases, smallest first. The first two are committed fixtures, so they run in any
 checkout (every path below is resolved relative to *this file*, so the benchmark
