@@ -313,7 +313,9 @@ def run_cases(names, orders=None, arms=("serial", "batch"), reps=1):
     run head to head on identical output (190,625 pairs / 2,721 shards), plus
     ``tests/test_shardmap.py``'s ``dict ==`` identity pins.
 
-    ``reps`` > 1 reports the **min** wall per arm over N processes. Quote it
+    ``reps`` > 1 reports the **min** wall per arm over N processes, ``idx_s``
+    included -- each ``cells`` rep re-runs ``index_footprints`` in its own child,
+    so min-ing it keeps every number in the row measured the same way. Quote them
     min-of-N for the same reason ``--knee`` does: the batch arm is
     rayon-parallel, so a single-shot wall on a loaded machine scatters wider
     than some of the differences being read off this table. Peak and the
@@ -342,6 +344,8 @@ def run_cases(names, orders=None, arms=("serial", "batch"), reps=1):
                 runs = [_measure(name, arm, order) for _ in range(reps)]
                 m = dict(runs[0])
                 m["wall_s"] = min(r["wall_s"] for r in runs)
+                if m.get("index_s") is not None:
+                    m["index_s"] = min(r["index_s"] for r in runs)
                 got[arm] = m
             digests = {a: m["digest"] for a, m in got.items()}
             assert len(set(digests.values())) <= 1, f"{name}@o{order}: arms disagree {digests}"
