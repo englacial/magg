@@ -58,7 +58,7 @@ _CITATION = re.compile(r"mortie\s*(?:>=|≥)?\s*v?(\d+\.\d+(?:\.\d+)*)")
 def _cited_versions(text):
     """Every mortie release ``text`` names, as ``(Version, line number)``."""
     return [
-        (Version(m.group(1)), text.count("\n", 0, m.start()) + 1) for m in _CITATION.finditer(text)
+        (Version(m.group(1)), text.count("\n", 0, m.start(1)) + 1) for m in _CITATION.finditer(text)
     ]
 
 
@@ -153,6 +153,12 @@ class TestGuardFires:
         sites = [("docs/synthetic.md", 1, Version("0.10.0"))]
         assert _above(sites, Version("0.9.5")) == sites
         assert _above(sites, Version("0.10.0")) == []
+
+    def test_a_wrapped_citation_reports_the_version_line(self):
+        # The word and the number can land on different lines (``_layout.py``,
+        # ``morton.py``). The site printed has to be where the *number* is, or
+        # a failure sends the reader to a line that carries no version at all.
+        assert _cited_versions("added in mortie\n0.9.0") == [(Version("0.9.0"), 2)]
 
     def test_issue_references_are_not_versions(self):
         assert _cited_versions("(espg/mortie#89, espg/mortie#100) and mortie 1.x") == []
