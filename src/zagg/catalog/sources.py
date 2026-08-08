@@ -560,6 +560,19 @@ class Catalog:
         the WKB once with vectorised ``shapely.from_wkb``; on the 35,639-granule
         88S catalog that is 0.02 s against 2.65 s for the order-9 cover, so it
         costs under 1% of a pass that runs once per catalog.
+
+        The screen is cheap in time but it is this pass's **peak in memory**, and
+        it is the term ``from_wkbs``'s chunking does not bound: on the
+        555,867-row ATL03 clone RSS goes 835 MB after the parquet read -> 1,169
+        MB after ``to_numpy`` (a full WKB copy) -> 1,794 MB with the shapely
+        objects live. ``del geoms`` keeps that from stacking with the cover, so
+        it is a peak rather than a leak, but a whole-clone index wants headroom
+        for it. The ``keep.all()`` short-circuit below avoids a second ~334 MB
+        WKB copy in the case that actually occurs (nothing screened out --
+        every catalog in the tree). Reading the geometry-type word straight out
+        of the WKB, or chunking the ``from_wkb`` call, would drop the screen's
+        peak entirely; not done here because it trades the shared shapely
+        predicate for a hand-rolled one.
         """
         import shapely
         from mortie.arrow import from_morton_index, from_wkbs
@@ -569,7 +582,9 @@ class Catalog:
         # geom_type ids 3 and 6 are Polygon and MultiPolygon.
         keep = ~shapely.is_empty(geoms) & np.isin(shapely.get_type_id(geoms), (3, 6))
         del geoms
-        if keep.any():
+        if keep.all():
+            values, kept_offsets = from_wkbs(column, order=int(order))
+        elif keep.any():
             values, kept_offsets = from_wkbs(column.filter(pa.array(keep)), order=int(order))
         else:
             values, kept_offsets = np.empty(0, dtype=np.uint64), np.zeros(1, dtype=np.int64)
