@@ -35,18 +35,24 @@ dependencies = [
     # register from it). 0.2.0 is not on PyPI yet — resolution fails until
     # upstream publishes it.
     "h5coro-hidefix>=0.3.1",
-    # Floor 0.9.4 for the batch coverage entry point (issue #396):
-    # polygons_to_morton_mocs, the many->many ragged sibling of
-    # morton_coverage_moc (espg/mortie#153) that ShardMap.build calls once for a
-    # whole catalog instead of once per granule. Earlier floors: 0.9.3 for the
-    # reader deinterleave (issue #336) — rank_to_xy / xy_to_rank, the
-    # nested-rank <-> face-local (x, y) pair the tensor readers place cells by
+    # Floor 0.9.5 for the WKB batch cover behind the ``footprint_cells`` catalog
+    # column (issue #396): mortie.arrow.from_wkbs, the pyarrow skin
+    # (espg/mortie#163) over the backend-free Rust WKB reader
+    # (espg/mortie#157), which covers a geoparquet geometry column in one
+    # crossing and is what Catalog.index_footprints builds the column from.
+    # 0.9.5 also deletes mortie/tools.py (espg/mortie#159's domain split); zagg
+    # imports nothing from it since englacial/zagg#411. Earlier floors: 0.9.4
+    # for the batch coverage entry point — polygons_to_morton_mocs, the
+    # many->many ragged sibling of morton_coverage_moc (espg/mortie#153) that
+    # ShardMap.build calls once for a whole catalog instead of once per
+    # granule; 0.9.3 for the reader deinterleave (issue #336) — rank_to_xy /
+    # xy_to_rank, the nested-rank <-> face-local (x, y) pair the readers place cells by
     # (espg/mortie#150; normative convention in mortie's docs/specification.md
     # §8, frozen for mortie 1.x); 0.9.0 ships the decimal-emit surface shard ids
     # route through (issue #199) — decimal_repr / to_decimal, the
     # _decimal_to_word parse-back, hive_path, and the MortonIndexScalar decimal
     # display.
-    "mortie>=0.9.4",
+    "mortie>=0.9.5",
     "earthaccess",
     "boto3",
     "fastparquet",
