@@ -72,10 +72,12 @@ MORTIE_MOC_ORDER_CAP = 18
 # 16, 0.66 at 32, 0.64 at 64, 0.58 at 1024).
 #
 # 32 is the size: it holds the block term to 57 MB on California -- 4.4x under
-# 64's 251 MB and 7x under 256's 412 MB -- for 2% wall there. The one case that
-# argues the other way is the far denser 88S catalog, where 32 costs 15% wall
-# (63.13 s vs 55.02 s, min of 3) for only 5% less peak (200 MB vs 210 MB); the
-# memory is worth more than the wall on a Lambda, so 32 stands.
+# 64's 251 MB and 7x under 256's 412 MB -- for 2% wall there. On the far denser
+# 88S catalog the two are much closer on both axes (32: 57.37 s / 192 MB,
+# 64: 55.02 s / 206 MB, min of 6 across two block orderings), so nothing there
+# argues against it. Block ordering matters when measuring this: a single
+# block-major sweep on a loaded machine put 88S's 32 at 63.13 s, and reversing
+# the order moved it to 57.37 s against 64's 56.55 s -- drift, not a knee.
 _MOC_BATCH_RINGS = 32
 
 # ── granule footprint helpers ────────────────────────────────────────────────
