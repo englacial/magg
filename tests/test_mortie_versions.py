@@ -17,12 +17,19 @@ an API the dependency floor does not guarantee, which reaches a user as an
 ``AttributeError`` where the docs said otherwise. So every mortie version
 quoted under ``docs/`` or ``src/`` must be at or below the floor, and the
 ``aoi_mask`` family — the sites that document (3) and therefore cannot be
-de-versioned — must quote the enforced constant exactly.
+de-versioned — must quote the enforced constant exactly wherever they state it
+as a *requirement* (``mortie >= 0.8.3``). Arrival voice in those same files
+("shipped in 0.8.2") is history, not a restatement of the gate, so it is held
+to the floor like any other citation and not to the constant.
 
-Scope note: a citation is recognized only where the release number is
-lexically attached to the word ``mortie``. A bare "shipped in 0.8.2" further
-along the same sentence (``src/zagg/grids/aoi.py``) is not matched, because no
-regex separates it from the other version numbers prose carries.
+Scope note — two blind spots, both deliberate and both needing a human eye on a
+``MIN_MORTIE_VERSION`` bump. A citation is recognized only where the release
+number is lexically attached to the word ``mortie``: bare literals further along
+a sentence ("espg/mortie#59 + #70, shipped in 0.8.2", ``src/zagg/grids/aoi.py``)
+are invisible here, because no regex separates them from the other version
+numbers prose carries. And whether a wrapped citation is seen depends on the
+words between ``mortie`` and the number, so reflowing a paragraph can move one
+in or out of scope.
 """
 
 import re
@@ -61,20 +68,26 @@ AOI_MASK_FILES = ("docs/aoi_mask.md", "src/zagg/grids/aoi.py")
 # version — ``#`` is outside the separator class), "frozen for mortie 1.x" (no
 # second numeric component), and upper bounds like ``mortie < 1.0``, which
 # promise no API and so are not citations this guard is about.
+#
+# Group 1 is the comparison operator, present only in **requirement** voice
+# ("zagg needs at least this"); arrival voice ("added in mortie 0.8.4") leaves
+# it ``None``. That distinction is what scopes the ``aoi_mask`` equality rule.
 _CITATION = re.compile(
-    r"mortie[\s(:,_-]*(?:version|release)?\s*(?:>=|==|~=|>|≥)?\s*v?(\d+\.\d+(?:\.\d+)*)",
+    r"mortie[\s(:,_-]*(?:version|release)?\s*(>=|==|~=|>|≥)?\s*v?(\d+\.\d+(?:\.\d+)*)",
     re.IGNORECASE,
 )
 
 
-def _cited_versions(text):
+def _cited_versions(text, requirement_voice_only=False):
     """Every mortie release ``text`` names, as ``(Version, line number)``."""
     return [
-        (Version(m.group(1)), text.count("\n", 0, m.start(1)) + 1) for m in _CITATION.finditer(text)
+        (Version(m.group(2)), text.count("\n", 0, m.start(2)) + 1)
+        for m in _CITATION.finditer(text)
+        if m.group(1) or not requirement_voice_only
     ]
 
 
-def _scan():
+def _scan(requirement_voice_only=False):
     """Every mortie citation under the scan roots, as ``(path, line, Version)``."""
     sites = []
     for root in SCAN_ROOTS:
@@ -82,7 +95,8 @@ def _scan():
             if path.suffix not in SCAN_SUFFIXES or not path.is_file():
                 continue
             rel = path.relative_to(REPO_ROOT).as_posix()
-            for version, line in _cited_versions(path.read_text(encoding="utf-8")):
+            text = path.read_text(encoding="utf-8")
+            for version, line in _cited_versions(text, requirement_voice_only):
                 sites.append((rel, line, version))
     return sites
 
@@ -148,7 +162,10 @@ class TestQuotedVersionsAgainstFloor:
     def test_aoi_mask_prose_matches_the_runtime_gate(self):
         # These six sites document a gate that raises (``aoi.py`` lines 66-80),
         # so they keep requirement voice — and must quote the constant itself.
-        family = [s for s in _scan() if s[0] in AOI_MASK_FILES]
+        # Requirement voice only: the same two files also carry arrival-voice
+        # history ("shipped in 0.8.2"), which is factually correct at a version
+        # *below* the gate and must not be dragged into an equality rule.
+        family = [s for s in _scan(requirement_voice_only=True) if s[0] in AOI_MASK_FILES]
         assert len(family) >= 6, f"aoi_mask citations vanished from the scan: {family}"
         wrong = [s for s in family if s[2] != Version(MIN_MORTIE_VERSION)]
         assert not wrong, (
@@ -217,6 +234,13 @@ class TestGuardFires:
             "tagged mortie v0.10.0",
         ):
             assert [str(v) for v, _ in _cited_versions(spelling)] == ["0.10.0"], spelling
+
+    def test_requirement_voice_is_told_from_arrival_voice(self):
+        # The split the ``aoi_mask`` equality rule rides on: only a citation
+        # carrying a comparison operator states an obligation.
+        text = "aoi_mask needs mortie >= 0.8.3; the MOC cap shipped in mortie 0.8.2"
+        assert [str(v) for v, _ in _cited_versions(text)] == ["0.8.3", "0.8.2"]
+        assert [str(v) for v, _ in _cited_versions(text, requirement_voice_only=True)] == ["0.8.3"]
 
     def test_the_floor_line_is_not_scanned_as_a_citation(self):
         # The regex would happily match ``mortie>=0.9.3`` in pyproject.toml, so
