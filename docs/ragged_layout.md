@@ -141,7 +141,7 @@ a row-major reshape of the 1-D axis scrambles the 2-D block spatially beyond
 2-cell runs. The readers instead place each cell at the **bit deinterleave**
 of its chunk-local nested rank
 ([issue #336](https://github.com/englacial/zagg/issues/336)):
-`mortie.rank_to_xy` / `xy_to_rank` (mortie ≥ 0.9.3), whose contract is
+`mortie.rank_to_xy` / `xy_to_rank` (added in mortie 0.9.3), whose contract is
 normative in mortie's `docs/specification.md` **§8** and frozen for mortie 1.x
 — `x` gathers the rank's even bits, `y` its odd bits, origin `(0, 0)` at the
 subtree's south corner, equal to healpy's face-local `pix2xyf` (nest)
