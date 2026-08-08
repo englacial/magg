@@ -45,19 +45,22 @@ import numpy as np
 MORTIE_MOC_ORDER_CAP = 18
 
 # Rings per batch call into mortie's ``polygons_to_morton_mocs`` (issue #396).
-# The batch call's fixed cost amortizes within a couple hundred rings -- a local
-# sweep at order 13 is flat from 256 rings/call up to the whole catalog in one
-# call -- so the block sits at the knee, which keeps the full batch speedup while
-# bounding peak memory to one block of MOC words rather than the whole catalog's.
+# Blocking keeps peak memory proportional to the block rather than the catalog,
+# and the size is set from a sweep over **real** CMR catalogs
+# (``bench/shardmap_batch_vs_serial.py``) -- the two earlier values (1024, then
+# 256) were both picked against synthetic footprints and were both too large.
 #
-# The block must be sized against the *real* input, not a synthetic one: a CMR
-# ATL03/ATL06 footprint is a coarse ~12 km-wide quarter-orbit swath envelope (see
-# ``beams.py``), which is ~32k MOC words at order 13 -- ~150x a compact synthetic
-# footprint. At 256 rings that is a ~66 MB block buffer; at 1024 it was ~263 MB,
-# and the block's cell-level intermediates on top of it took peak RSS to 1.2 GB
-# against the serial loop's 157 MB. Those intermediates are gone (the AOI filter
-# now runs per ring, below), and 256 keeps the remaining term small.
-_MOC_BATCH_RINGS = 256
+# A real ATL03 quarter-orbit footprint covers a median ~10,400 MOC words at order
+# 13, against ~220 for a compact synthetic quadrilateral, so a synthetic sweep
+# under-reads the block's memory by ~47x. On real footprints wall time is flat
+# from ~48 rings up (California at order 13: 8.6-8.8 s anywhere from 48 to 2048,
+# and order 9 is flat from 32), while peak RSS keeps climbing with the block:
+# 57 MB at 32, 250 MB at 64, 409 MB at 256, 612 MB at 2048 -- and on the denser
+# 88S catalog the same step is 210 MB at 64 against 1,057 MB at 256.
+#
+# 64 is therefore the knee: at or within ~6% of the flat wall asymptote in every
+# case measured, for 1.6-5x less peak than 256.
+_MOC_BATCH_RINGS = 64
 
 # ── granule footprint helpers ────────────────────────────────────────────────
 
