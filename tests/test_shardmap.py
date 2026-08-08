@@ -510,6 +510,16 @@ class TestMortieBatch:
         out = shardmap._intersect_mortie(records, hp_grid, all_shards, order=11)
         assigned = {i for v in out.values() for i in v}
         assert assigned == {0, 4}, f"only the two well-formed granules assign, got {assigned}"
+        # The screen in ``_flatten_rings`` is a Python *copy* of mortie's rejection
+        # rules, not a derivation from them, so it is the one place this PR can
+        # diverge from the oracle by construction. Pin it against mortie itself:
+        # if mortie's accept/reject set moves, the screen starts dropping rings
+        # mortie would have covered and only this assertion notices.
+        assert out == _intersect_mortie_serial(records, hp_grid, all_shards, order=11)
+        # All rings malformed: ``_flatten_rings`` returns None -> {}, and the
+        # serial loop swallows every granule -> {} too.
+        all_bad = shardmap._intersect_mortie(bad, hp_grid, all_shards, order=11)
+        assert all_bad == _intersect_mortie_serial(bad, hp_grid, all_shards, order=11) == {}
 
     def test_batch_failure_falls_back_to_serial(self, hp_grid, monkeypatch):
         # An undocumented mortie-side failure (e.g. a captured kernel panic)
