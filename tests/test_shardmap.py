@@ -682,6 +682,23 @@ class TestFootprintCells:
         fast = ShardMap.build(cat.index_footprints(11), hp_grid, backend="mortie")
         assert _shard_ids(fast) == _shard_ids(geometry)
 
+    def test_duplicate_granule_ids_are_refused(self, hp_grid):
+        # Alignment is by granule id, and a dict lookup is last-wins: with a
+        # repeated id every earlier record carrying it would be handed the last
+        # row's footprint. That is silent -- the shard count stays plausible
+        # (a disjoint-footprint repro gives 16 shards where geometry gives 25) --
+        # so refuse instead of misassigning. The geometry path is unaffected: it
+        # reads each record's own ring, so it still builds.
+        items = [
+            _item("DUP", -76.62, -76.60),
+            _item("OTHER", -76.56, -76.54),
+            _item("DUP", -76.10, -76.08),
+        ]
+        cat = _catalog(items)
+        assert len(ShardMap.build(cat, hp_grid, backend="mortie").shard_keys) > 0
+        with pytest.raises(ValueError, match="duplicate granule ids .*1 repeats over 3 rows"):
+            ShardMap.build(cat.index_footprints(11), hp_grid, backend="mortie")
+
     def test_plain_catalog_still_takes_the_geometry_path(self, hp_grid):
         sm = ShardMap.build(_overlapping_catalog(), hp_grid, backend="mortie")
         assert "footprint_cells" not in sm.metadata

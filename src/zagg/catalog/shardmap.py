@@ -351,6 +351,12 @@ def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_orde
         in ~every shard -- the #92 failure the order guard exists to stop -- and
         falling through to geometry would hide that the index the operator built
         is useless for this grid. Refuse and say which order to re-index at.
+
+        Also when the catalog has **duplicate granule ids**. The column is
+        aligned to records by id, so a repeated id makes the lookup last-wins and
+        hands every earlier record with that id another granule's footprint --
+        silently, since the shard count stays plausible. Refuse rather than
+        misassign; the geometry path reads each record's own ring and is unaffected.
     """
     if chosen != "mortie" or footprint != "swath" or mortie_order is not None:
         return None
@@ -371,6 +377,13 @@ def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_orde
     # ``granule_records`` skips rows with empty or non-polygonal geometry, so
     # record index != table row; align on the granule id both sides carry.
     row_of = {gid: i for i, gid in enumerate(catalog.table.column("id").to_pylist())}
+    if len(row_of) != catalog.table.num_rows:
+        raise ValueError(
+            f"catalog has duplicate granule ids ({catalog.table.num_rows - len(row_of)} "
+            f"repeats over {catalog.table.num_rows} rows); the footprint_cells column is "
+            f"aligned to records by id, so a repeat would hand records another granule's "
+            f"footprint. De-duplicate the catalog, or drop the column to build from geometry."
+        )
     rows = np.fromiter((row_of[r["id"]] for r in records), dtype=np.int64, count=len(records))
     return values, offsets, order, rows
 
