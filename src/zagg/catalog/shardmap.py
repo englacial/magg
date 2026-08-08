@@ -889,6 +889,8 @@ class ShardMap:
             )
         wall = time.perf_counter() - t0
 
+        from zagg.catalog.sources import FOOTPRINT_CELLS_ORDER
+
         shard_keys = sorted(shard_to_idx)
         granules = [[_granule_entry(records[i]) for i in shard_to_idx[k]] for k in shard_keys]
         meta = {
@@ -907,11 +909,15 @@ class ShardMap:
         }
         if chosen == "mortie":
             meta["mortie_order"] = mortie_order
-        if plan is not None:
-            # Says the stored index answered this build, which the catalog's own
-            # ``footprint_cells_order`` (carried in via the metadata spread
-            # above) does not: that key only says the column exists.
-            meta["footprint_cells"] = True
+        if plan is not None or FOOTPRINT_CELLS_ORDER in meta:
+            # Says whether the stored index answered *this* build, which the
+            # catalog's own ``footprint_cells_order`` (carried in via the
+            # metadata spread above) does not: that key only says the column
+            # exists. So an indexed catalog built through the geometry path
+            # (spherely, pinned order, beams) records ``False`` rather than
+            # leaving the order key beside no verdict, which reads as if the
+            # index had answered. A catalog with no column has neither key.
+            meta["footprint_cells"] = plan is not None
 
         # Strict-AOI mask (issue #101), default off: precompute a per-shard payload
         # so the worker can package the per-cell bool with no region plumbing. Only

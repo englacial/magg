@@ -533,6 +533,17 @@ class Catalog:
             extra resolution is invisible to order-9 shard cells. The column
             serves every grid whose ``parent_order`` is **at most** ``order``;
             a finer grid is refused by ``build`` rather than answered coarsely.
+            Bounded above by ``MORTIE_MOC_ORDER_CAP`` (mortie's order-18 coverage
+            cap), the same bound ``ShardMap.build`` clamps its own MOC order to,
+            so the two paths agree on what "too fine" means. ``build`` clamps
+            because its order is derived; this one is the operator's own number,
+            so it raises rather than silently indexing at another order than the
+            one recorded in ``footprint_cells_order``.
+
+        Raises
+        ------
+        ValueError
+            When ``order`` is above ``MORTIE_MOC_ORDER_CAP``.
 
         Returns
         -------
@@ -577,6 +588,15 @@ class Catalog:
         import shapely
         from mortie.arrow import from_morton_index, from_wkbs
 
+        from zagg.catalog.shardmap import MORTIE_MOC_ORDER_CAP
+
+        if int(order) > MORTIE_MOC_ORDER_CAP:
+            raise ValueError(
+                f"footprint_cells order {int(order)} is above mortie's coverage cap "
+                f"{MORTIE_MOC_ORDER_CAP}; ShardMap.build clamps its own MOC order there, so a "
+                f"finer column could not be the cover any build asks for. Index at "
+                f"order <= {MORTIE_MOC_ORDER_CAP} (the grid's parent_order is the right choice)."
+            )
         column = self.table.column("geometry")
         geoms = shapely.from_wkb(column.to_numpy(zero_copy_only=False))
         # geom_type ids 3 and 6 are Polygon and MultiPolygon.

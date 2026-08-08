@@ -72,7 +72,11 @@ the rows, and rewriting the geometry means rewriting the file.
 
 `ShardMap.build` against an indexed catalog does no geometry at all — each
 granule's stored MOC is intersected (`moc_and`) with the AOI's own shard MOC —
-and records `metadata["footprint_cells"] = True` when it took that path. The
+and records `metadata["footprint_cells"] = True` when it took that path, `False`
+when the catalog is indexed but the build took the geometry path anyway. The
+catalog's own `footprint_cells_order` rides into the manifest either way and only
+says the column exists, so read `footprint_cells` for the verdict; a manifest
+with neither key came from a catalog that was never indexed. The
 fast path engages only where the stored cover is exactly what the build asked
 for: the mortie backend, `footprint="swath"`, and no caller-pinned
 `mortie_order`. Anything else takes the geometry path unchanged, so an
@@ -91,7 +95,9 @@ today; antimeridian-split STAC footprints are the natural producer.
 than or equal to its own; a build against a grid whose `parent_order` is *finer*
 than the column is refused outright, because answering it would refine every
 cell onto all its descendants and put ~every granule in ~every shard
-([issue #92](https://github.com/englacial/zagg/issues/92)).
+([issue #92](https://github.com/englacial/zagg/issues/92)). The other end is
+mortie's order-18 coverage cap, which `index_footprints` refuses above — the
+same bound `ShardMap.build` clamps its own derived MOC order to.
 
 Going finer than you need is expensive in both directions — words per granule
 roughly double per order:

@@ -718,6 +718,17 @@ class TestFootprintCells:
         by_shard = dict(zip(fast.shard_keys, fast.granules, strict=True))
         assert all([g["id"] for g in by_shard[k]] == ["MULTI"] for k in extra)
 
+    def test_order_above_the_moc_cap_is_refused(self):
+        # ``_resolve_mortie_order`` clamps a derived order to
+        # ``MORTIE_MOC_ORDER_CAP``; an index order is the operator's own number,
+        # so clamping it would store a cover at an order other than the one
+        # ``footprint_cells_order`` records. Refuse instead, so the two paths
+        # agree on what "too fine" means.
+        cat = _overlapping_catalog(n=2)
+        with pytest.raises(ValueError, match="order 19 is above mortie's coverage cap 18"):
+            cat.index_footprints(19)
+        assert cat.index_footprints(shardmap.MORTIE_MOC_ORDER_CAP).footprint_cells()[2] == 18
+
     def test_duplicate_granule_ids_are_refused(self, hp_grid):
         # Alignment is by granule id, and a dict lookup is last-wins: with a
         # repeated id every earlier record carrying it would be handed the last
@@ -736,8 +747,11 @@ class TestFootprintCells:
             ShardMap.build(cat.index_footprints(11), hp_grid, backend="mortie")
 
     def test_plain_catalog_still_takes_the_geometry_path(self, hp_grid):
+        # No column, so neither key: absent means "this catalog was never
+        # indexed", which is a different statement from ``False``.
         sm = ShardMap.build(_overlapping_catalog(), hp_grid, backend="mortie")
         assert "footprint_cells" not in sm.metadata
+        assert "footprint_cells_order" not in sm.metadata
 
     @pytest.mark.parametrize(
         "kwargs",
@@ -751,8 +765,13 @@ class TestFootprintCells:
         # only answer a build that asked for exactly that: an exact-S2 spherely
         # run must not be silently swapped for a MOC one (espg/mortie#32), and a
         # caller-pinned ``mortie_order`` asks for a cover the column can't restate.
+        # And the manifest must SAY the index sat the build out. The catalog's
+        # ``footprint_cells_order`` rides in on the metadata spread either way,
+        # so a bare absent key next to it reads as if the index had answered.
         cat = _overlapping_catalog().index_footprints(11)
-        assert "footprint_cells" not in ShardMap.build(cat, hp_grid, **kwargs).metadata
+        meta = ShardMap.build(cat, hp_grid, **kwargs).metadata
+        assert meta["footprint_cells"] is False
+        assert meta["footprint_cells_order"] == 11
 
     def test_beams_footprint_leaves_the_index_unused(self):
         # The column covers the CMR swath, not the per-beam corridors (#65).
@@ -769,7 +788,7 @@ class TestFootprintCells:
         sm = ShardMap.build(
             cat.index_footprints(14), hp, region=region, backend="mortie", footprint="beams"
         )
-        assert "footprint_cells" not in sm.metadata
+        assert sm.metadata["footprint_cells"] is False
 
     def test_aoi_restricts_the_assignment(self, hp_grid):
         # ``moc_and`` against the AOI's own shard MOC is what does the
