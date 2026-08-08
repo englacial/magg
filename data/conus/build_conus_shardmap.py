@@ -107,7 +107,7 @@ def _leak_check(grid, shard_keys, bbox, margin_deg: float = 1.0) -> dict:
     Guards against a mortie #103-style base-cell fill regression. Returns the
     covered-cell lat/lon extent for the record.
     """
-    from mortie.tools import mort2polygon
+    from mortie import mort2polygon
 
     lon0, lat0, lon1, lat1 = bbox
     lats, lons = [], []

@@ -126,7 +126,7 @@ def _leak_check(grid, shard_keys, boxes, margin_deg: float = 1.0) -> dict:
     scattered multipart AOI the global box spans everything between the parts,
     where a fill leak would go undetected.
     """
-    from mortie.tools import mort2polygon
+    from mortie import mort2polygon
 
     lats, lons = [], []
     for k in shard_keys:
