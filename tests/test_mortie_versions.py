@@ -243,9 +243,12 @@ class TestGuardFires:
         assert [str(v) for v, _ in _cited_versions(text, requirement_voice_only=True)] == ["0.8.3"]
 
     def test_the_floor_line_is_not_scanned_as_a_citation(self):
-        # The regex would happily match ``mortie>=0.9.3`` in pyproject.toml, so
-        # the exclusion has to come from the scan roots — not from luck.
+        # The regex would happily match ``mortie>={floor}`` in pyproject.toml —
+        # reading the floor back as a citation would make the comparison
+        # self-satisfying — so assert the two mechanisms that actually exclude
+        # it, rather than a path check no scanned suffix could ever satisfy.
         floor = _mortie_floor()
         assert [v for v, _ in _cited_versions(f'    "mortie>={floor}",')] == [floor]
-        scanned = {path for path, _, _ in _scan()}
-        assert not any(path.endswith("pyproject.toml") for path in scanned)
+        assert ".toml" not in SCAN_SUFFIXES
+        pyproject = REPO_ROOT / "pyproject.toml"
+        assert not any(pyproject.is_relative_to(root) for root in SCAN_ROOTS)
