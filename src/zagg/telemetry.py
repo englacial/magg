@@ -561,43 +561,49 @@ def write_refusal_manifest(
     and object-less at the root (ruled (9)(a)).
 
     Fail-open (D9 telemetry class, the sweep run record's posture): a failed
-    PUT logs and returns ``None`` — the run's exit status and its
-    ``cells_refused`` count are unaffected. Callers must be store-writers in
-    their own right (D8): the local dispatcher is also the worker, which is
-    why this rides the same wrap-up seam as the root ``coverage.moc``.
+    write logs and returns ``None`` — the run's exit status and its
+    ``cells_refused`` count are unaffected. The COMPOSITION is inside the
+    same guard as the PUT (``write_granule_ids``'s posture), because this runs
+    before the summary and the run-stats parquet: a ``MemoryError`` on an
+    unbounded refusal set, or a malformed ``missing_granules``, must cost the
+    manifest, never the run record of a run that already did all its work.
+    Callers must be store-writers in their own right (D8): the local
+    dispatcher is also the worker, which is why this rides the same wrap-up
+    seam as the root ``coverage.moc``.
     """
     import logging
 
-    units = []
-    for meta in refusals:
-        if not isinstance(meta, dict):
-            continue
-        missing = [str(g) for g in (meta.get("missing_granules") or [])]
-        units.append(
-            {
-                "shard_key": meta.get("shard_key"),
-                "window": meta.get("window"),
-                "identity": meta.get("identity"),
-                "n_missing": len(missing),
-                "missing_granules": missing,
-            }
-        )
-    if not units:
-        return None
-    units.sort(key=lambda u: (str(u["shard_key"]), str(u["window"])))
-    body = {
-        "spec": REFUSAL_SPEC,
-        "schema_version": SCHEMA_VERSION,
-        "run_id": run_id,
-        # The run context needed to act on it: WHEN, and WHICH product
-        # (the D19 semantic core the refused units were dispatched under).
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "semantic_hash": semantic_hash,
-        "zagg_version": _zagg_version(),
-        "cells_refused": len(units),
-        "units": units,
-    }
     try:
+        units = []
+        for meta in refusals:
+            if not isinstance(meta, dict):
+                continue
+            missing = [str(g) for g in (meta.get("missing_granules") or [])]
+            units.append(
+                {
+                    "shard_key": meta.get("shard_key"),
+                    "window": meta.get("window"),
+                    "identity": meta.get("identity"),
+                    "n_missing": len(missing),
+                    "missing_granules": missing,
+                }
+            )
+        if not units:
+            return None
+        units.sort(key=lambda u: (str(u["shard_key"]), str(u["window"])))
+        body = {
+            "spec": REFUSAL_SPEC,
+            "schema_version": SCHEMA_VERSION,
+            "run_id": run_id,
+            # The run context needed to act on it: WHEN, and WHICH product
+            # (the D19 semantic core the refused units were dispatched under).
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "semantic_hash": semantic_hash,
+            "zagg_version": _zagg_version(),
+            "cells_refused": len(units),
+            "units": units,
+        }
+
         import obstore
 
         from zagg.store import open_object_store

@@ -549,6 +549,22 @@ class TestRefusalManifest:
         )
         assert got is None
 
+    def test_composition_is_fail_open_too(self, tmp_path):
+        # It runs BEFORE the summary and the run-stats parquet, so a raise
+        # while building the units would destroy the run record of a run that
+        # already did all its work. A malformed missing_granules (the shape
+        # the isinstance check one line up already anticipates) and the
+        # unbounded-size raiser must both cost only the manifest.
+        root = str(tmp_path / "store")
+        assert write_refusal_manifest(root, [self._refused(1, 7)], run_id="cafe01") is None
+
+        class Boom(list):
+            def __iter__(self):
+                raise MemoryError("units too big")
+
+        big = self._refused(1, Boom(["s3://b/g1.h5"]))
+        assert write_refusal_manifest(root, [big], run_id="cafe01") is None
+
 
 class TestGranuleIdsSibling:
     """The recorded id list is its own sibling (issue #388, ruled (6)(c)):
