@@ -856,8 +856,9 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     # + MOC (the run parquet / sweep record are telemetry — issue #362).
     n_arrays = len(grid.shard_spec().members)
     assert expected["exact"] is True
-    # ... + the stats.json AND shardmap.json siblings (issues #297/#300).
-    assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 2
+    # ... + the stats.json, granules.json and shardmap.json siblings
+    # (issues #297/#388/#300).
+    assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 3
     assert expected["metadata"] == 3
     # Sweep rollups (issue #300), overview zarrs (issue #201 — with the D20
     # `{window}.stats.json` sidecar each overview leaf carries since issue

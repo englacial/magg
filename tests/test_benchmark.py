@@ -2418,12 +2418,12 @@ def test_run_target_threads_store_layout():
 
 
 def test_hive_config_expected_counts_root_moc_optional():
-    # The committed hive arm's model: per-shard DATA is exact (11 objects/leaf,
+    # The committed hive arm's model: per-shard DATA is exact (12 objects/leaf,
     # the sharded-write-bypass tripwire), but the store-root coverage.moc is a
     # fail-open, regenerable D9 cache (runner.write_root_coverage) that may be
     # present OR absent -- so store-root metadata is a [1, 3] window (the
     # morton_hive.json manifest always; +coverage.moc and aggregation.yaml when
-    # they land) and the total is [12, 14]. Per-run root telemetry (the run
+    # they land) and the total is [13, 15]. Per-run root telemetry (the run
     # stats parquet, the sweep run record) is NOT in the window since issue
     # #362 -- per-run-unique names accumulate in a reused store, so they ride
     # the unbounded objects_telemetry bucket instead. A real bypass still fails
@@ -2439,17 +2439,17 @@ def test_hive_config_expected_counts_root_moc_optional():
     exp = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
     # 3 arrays (morton/count/h_tdigest — no legacy cell_ids since the D16
     # flip, issue #304): leaf root+group zarr.json (2) + 3 array zarr.json +
-    # 3 sharded data objects + coverage sidecar + stats.json AND
-    # shardmap.json siblings (issues #297/#300) = 11.
+    # 3 sharded data objects + coverage sidecar + the stats.json,
+    # granules.json and shardmap.json siblings (issues #297/#388/#300) = 12.
     # Store root: morton_hive.json (always) + coverage.moc (optional) +
     # aggregation.yaml (optional, issue #299) -> [1, 3].
     assert exp == {
         "metadata": 3,
         "metadata_min": 1,
-        "per_shard_min": 11,
-        "per_shard_max": 11,
-        "total_min": 12,
-        "total_max": 14,
+        "per_shard_min": 12,
+        "per_shard_max": 12,
+        "total_min": 13,
+        "total_max": 15,
         "exact": True,
     }
 

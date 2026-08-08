@@ -1183,6 +1183,10 @@ def process_and_write_raster_hive(
     region: str | None = None,
     anonymous: bool = True,
     stage_stats: dict | None = None,
+    skip_if_current: bool = False,
+    allow_contraction: bool = False,
+    semantic_hash: str | None = None,
+    sidecar_spec: str | None = None,
 ):
     """Process one raster shard into its own hive leaf store (issue #247).
 
@@ -1211,11 +1215,12 @@ def process_and_write_raster_hive(
 
     The stamp is the leaf's FINAL write: dense slabs (streamed) -> coverage
     sidecar (edge shards only; interior shards stamp ``"full"`` with no
-    sidecar PUT) -> stamp. ``cells_with_data`` counts the occupied-cell
+    sidecar PUT) -> stamp -> granule-id sibling (issue #388).
+    ``cells_with_data`` counts the occupied-cell
     union; ``granule_count`` the unit's acquisitions (asset-carrying
     entries). Phase timings are always collected (issue #297):
     ``metadata["phase_timings"] = {"sample", "write", "hash"}`` with the leaf
-    write-out (template + slabs + sidecar + stamp) as ``write``; the
+    write-out (template + slabs + sidecar + stamp + sibling) as ``write``; the
     per-stage ``stages`` block (issue #249) stays gated on ``profile`` /
     a passed ``stage_stats`` (the local dispatcher's debug-logging flavor).
 
@@ -1228,22 +1233,83 @@ def process_and_write_raster_hive(
     to hashing the assembled array by construction — pinned against
     ``content_hash.hash_arrays`` over a store read-back in
     ``tests/test_content_hash.py``.
+
+    ``skip_if_current`` / ``allow_contraction`` / ``semantic_hash`` /
+    ``sidecar_spec`` (issue #388) arm the same worker-side leaf identity gate
+    the aggregation seam runs (:func:`zagg.hive.leaf_identity_gate` — see
+    ``process_and_write_hive``'s docstring for the full semantics), with the
+    raster id space (:func:`zagg.telemetry.raster_granule_ids`) as the
+    planned set. A skipped/refused unit returns early with ``timesteps: 0``
+    and ``leaf_written: False``, having written nothing. Default off keeps
+    this seam byte-identical for callers that have not opted in — except for
+    the granule-id SIBLING written after the stamp
+    (:func:`zagg.telemetry.write_granule_ids`), which is unconditional: it is
+    what a LATER run's contraction guard diffs against, so a leaf must record
+    it whether or not the run that wrote the leaf had the gate armed.
     """
     from zagg.hive import (
         COVERAGE_SIDECAR,
         build_coverage,
         encode_coverage_bitmap,
+        leaf_identity_gate,
         shard_leaf_path,
         stamp_commit,
         write_coverage_sidecar,
     )
     from zagg.store import open_store
+    from zagg.telemetry import raster_granule_ids
 
     t_start = time.time()
     if profile and stage_stats is None:
         stage_stats = new_stage_stats()
     label = window["label"] if window else None
     leaf_path = shard_leaf_path(store_root, int(shard_key), window=label)
+    # D19 identity half (issue #388): the run hash when the caller holds it,
+    # else this worker's own config hash (fail-open — an unresolved hash can
+    # only miss a skip, never fake one).
+    if semantic_hash is None:
+        try:
+            from zagg.semantics import semantic_hash as _semantic_hash
+
+            semantic_hash = _semantic_hash(config)
+        except Exception as e:
+            logger.warning(f"semantic hash unavailable (fail-open, issue #388): {e}")
+    # Leaf identity gate (issue #388): per (shard, window) unit, before any
+    # sampling. A skipped/refused unit returns here having written NOTHING.
+    identity = None
+    if skip_if_current:
+        identity, unit_meta = leaf_identity_gate(
+            leaf_path,
+            raster_granule_ids(granules),
+            semantic_hash=semantic_hash,
+            allow_contraction=allow_contraction,
+            sidecar_spec=sidecar_spec,
+            store_kwargs=store_kwargs,
+            shard_key=shard_key,
+            window=label,
+        )
+        if unit_meta is not None:
+            out = {**unit_meta, "timesteps": 0, "skipped": 0, "leaf_written": False}
+            if out.get("current"):
+                # Lifecycle touch (issue #388 phase 3): reset the purge clock
+                # on the skipped unit's footprint — leaf tree + sidecar and
+                # sub-map siblings (the raster seam writes no column).
+                # Fail-open: a failed touch logs and counts, never fails or
+                # un-skips the unit.
+                from zagg.lifecycle import touch_current_unit
+
+                try:
+                    counts = touch_current_unit(
+                        leaf_path, sidecar_spec=sidecar_spec, store_kwargs=store_kwargs
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"lifecycle touch failed for shard {shard_key} (fail-open, issue #388): {e}"
+                    )
+                    counts = {"touched": 0, "failed": 1}
+                out["touched_objects"] = counts["touched"]
+                out["touch_failed"] = counts["failed"]
+            return out
     # The leaf's own time axis, from the dispatched subset. Every group key in
     # the subset is in this index by construction, so the worker never trips
     # the foreign-manifest guard.
@@ -1304,9 +1370,35 @@ def process_and_write_raster_hive(
         stage_stats=stage_stats,
         occupied_out=occupied,
     )
+    # The seam stamps the identity half (issue #388) so a caller that never
+    # resolved the hash itself can record it in the leaf sidecar via
+    # ``telemetry.build_record``'s validated metadata fallback; the
+    # classification lets run stats count ``unrecorded-ids`` rewrites apart
+    # from ordinary ones.
+    #
+    # That fallback fires on the LOCAL raster path only. The Lambda handler's
+    # raster branch does NOT return this dict: it rebuilds a fresh ``body``
+    # from an explicit key list and hands THAT to ``build_record``
+    # (``deployment/aws/lambda_handler.py``, the ``if hive:`` branch), so
+    # ``semantic_hash`` / ``identity`` / ``current`` / ``refused`` — and the
+    # phase-3 pair ``touched_objects`` / ``touch_failed`` stamped on the skip
+    # arm above — are dropped, and fleet raster sidecars keep recording
+    # ``null`` for the identity half. The aggregation handler returns the
+    # seam's own dict and does get all six. Enabling the gate fleet-side
+    # therefore needs those SIX keys carried through as well as the opt-in
+    # kwargs — the PR #397 body's question (1) lists it. Without the first
+    # four a raster leaf could never classify ``equal`` (the recorded ``null``
+    # can never match a resolved hash); without the last two the fleet rollup
+    # reports ``objects_touched: 0`` on a working touch, indistinguishable
+    # from a touch that never ran.
+    if semantic_hash is not None:
+        meta.setdefault("semantic_hash", semantic_hash)
+    if identity is not None:
+        meta["identity"] = identity["classification"]
     # Stamp ONLY a leaf that wrote slabs: a unit that streamed nothing has no
     # prefix, and a worker error raised out above, leaving debris (D4). Write
-    # order is pinned: dense slabs -> coverage sidecar -> stamp.
+    # order is pinned: dense slabs -> coverage sidecar -> stamp -> granule-id
+    # sibling (issue #388; after the stamp, inside the write bracket).
     meta["cells_with_data"] = 0
     # Accurate leaf-written signal for the stats-sidecar gate (issue #297): set
     # iff a slab streamed (``"store" in box``), so both dispatchers gate the
@@ -1345,6 +1437,16 @@ def process_and_write_raster_hive(
             ),
             window=label,
             time_range=time_range,
+        )
+        # The recorded granule-id list as this leaf's sibling object (issue
+        # #388), after the stamp and in the raster id space the gate plans
+        # against — the vector seam's posture, same rationale (one source for
+        # the recorded id space; fail-open inside; inside the write bracket,
+        # because the write phase must account for every PUT the seam makes).
+        from zagg.telemetry import write_granule_ids
+
+        write_granule_ids(
+            leaf_path, raster_granule_ids(granules), spec=sidecar_spec, **store_kwargs
         )
         write_s += time.time() - _t0
     # Phase split (issues #100/#249; always-on collection since issue #297 —

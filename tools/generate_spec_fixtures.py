@@ -424,10 +424,13 @@ def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None) -> None:
         # wrote the leaf's column; record the raw knob, the decoded groups,
         # and the column's own O11 hashes so a spec-text decoder can be
         # asserted against committed bytes.
-        assert meta.get("column"), meta
+        # ``meta["leaf_column"]`` is the seam's own key (issue #388 renamed it
+        # from the SQL-reserved ``column``); the fixture's ``column`` block
+        # below is the fixture schema's name and stays as published.
+        assert meta.get("leaf_column"), meta
         expected["declared"] = pyramid
         expected["column"] = _column_expected(
-            out / leaf_rel.rsplit("/", 1)[0] / meta["column"], meta["column"]
+            out / leaf_rel.rsplit("/", 1)[0] / meta["leaf_column"], meta["leaf_column"]
         )
     expected_path = out.parent / f"{out.name}.expected.json"
     expected_path.write_text(json.dumps(expected, indent=1) + "\n")

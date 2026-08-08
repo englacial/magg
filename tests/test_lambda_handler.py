@@ -1078,7 +1078,14 @@ class TestProcessHive:
         assert record == body["stats"]
         assert record["schema_version"] == 1
         assert record["shard_key"] == self._WORD
-        assert record["semantic_hash"] is None
+        # Issue #388: the seam stamps the D19 hash of the worker's config into
+        # its metadata, and build_record's validated fallback records it — the
+        # handler still passes no semantic_hash of its own, but fleet sidecars
+        # no longer carry null for the identity half.
+        from zagg.config import load_config_from_dict
+        from zagg.semantics import semantic_hash as semhash
+
+        assert record["semantic_hash"] == semhash(load_config_from_dict(event["config"]))
         assert record["run_id"] == "deadbeef"  # copied verbatim (issue #297)
         assert record["success"] is True and record["error"] is None
         assert record["n_obs"] == 7 and record["cells_with_data"] == 5

@@ -611,6 +611,206 @@ mirror, and no async redelivery — so the failure is fail-open by
 construction; the root object simply doesn't appear until the sweep or a
 refresh builds it.
 
+## Re-runs: skip-if-current, the contraction guard, and the lifecycle touch
+
+Re-dispatching a shard used to mean an unconditional wholesale rewrite (D4)
+— correct and deterministic, but wasted compute, and invisible to bucket
+lifecycle policies that purge "old" objects. Since
+[issue #388](https://github.com/englacial/zagg/issues/388) each
+`(shard, window)` unit runs a worker-side **identity gate** before any read
+or fold, on both leaf families (the aggregation seam
+`zagg.hive.process_and_write_hive` and the raster seam
+`zagg.processing.raster.process_and_write_raster_hive`).
+
+**Identity is a pair**: the run's `semantic_hash` (D19 — *what/how*) × the
+unit's planned granule-id set (*over what*), compared against the leaf's
+recorded stats sidecar (fast path: one `granules_sha256` compare). A
+matched pair alone is **not** sufficient — the unit's artifacts must be
+current too, verified by reading them, never trusted from the record: the
+leaf must carry its commit stamp, and the [leaf
+column](#leaf-columns-zagg-column1) must agree with the run's declaration
+(the [specification §4.6](specification.md) config-decides gate: the
+declaration moves *neither* identity half, so the gate reads the artifact).
+Three verdicts:
+
+| verdict | when | what happens |
+|---|---|---|
+| **current** | both halves match, leaf stamped, column agrees with the declaration | fold no-ops; the unit writes **nothing** (no arrays, no stamp, no sidecar, no sub-map, no column — zero sweep dirtiness); the lifecycle touch below runs; counted as `cells_current` |
+| **refused** | the planned set drops recorded ids: `recorded ∖ planned ≠ ∅` — deliberately *not* strict-subset, so a shardmap that grew while silently dropping old granules (an upstream purge behind a fresh catalog query) still trips it | the unit refuses, writes nothing, and counts as `cells_refused` — never as an error. The log names the **first five** missing ids and their total; the **full per-unit diff is the refusal manifest** at the store root ([below](#the-refusal-manifest)). `--allow-contraction` (`agg(allow_contraction=True)`; on Lambda an `allow_contraction` event field) turns it into a normal rewrite |
+| **rewrite** | everything else — expansion (new cycles), a semantic change, no/unreadable sidecar, an unstamped leaf, column drift, or a pre-#388 sidecar (below) | today's wholesale D4 rewrite, column included |
+
+The gate is **on by default for the local backend**; `--overwrite` disables
+it entirely (the operator's unconditional-rewrite hammer — it does not
+acknowledge a contraction, it bypasses the guard). The **deployed Lambda
+handler has not yet opted in**: the seams default off, so fleet re-runs
+still rewrite unconditionally today (PR #397 question (1)). What fleet
+sidecars *record* splits by family, though, and only one half waits on that
+enablement:
+
+- **Vector — nothing to wait for.** The handler passes the seam's own
+  metadata dict straight to `build_record`, the seam stamps
+  `semantic_hash` into that dict, and the record's validated fallback picks
+  it up. So from this release's deploy onward — gate still off fleet-side,
+  zero handler changes — fleet vector sidecars carry **both** identity
+  halves, and a later local re-run over that store can skip.
+- **Raster — never, until the handler changes.** The raster branch rebuilds
+  its record body from a closed key list that omits `semantic_hash`, so
+  raster fleet sidecars keep recording `semantic_hash: null`. That fails the
+  fast path and classifies `semantic-mismatch` → rewrite on every run, with
+  no self-heal until the leaf has been rewritten under a handler that
+  carries the key. The consequence is **local**, not merely fleet-side:
+  re-running a fleet-built raster store locally — where the gate *is* on by
+  default — reports `cells_current: 0` indefinitely until question (1)'s
+  key-list fix lands.
+
+The *catalog* half needs no enablement in either family: the granule-id
+sibling is written by the **seam**, not by the dispatcher that writes the
+sidecar, so every leaf a fleet worker commits from this release on records
+its input set — which is what the contraction guard, running in whatever
+process re-dispatches that unit later, diffs against.
+
+**Where the recorded id list lives.** Not in the stats sidecar: in a
+**sibling object beside it** — `granules.json` (`granules_{window}.json`
+windowed), on the sidecar's own spec-keyed naming grammar — written by the
+leaf seam right after the commit stamp, carrying the ids *and* the
+`granules_sha256` they hash to. Identity equality never reads it: that is the
+sidecar's hash compare, which is what keeps a fan-out dedup check
+(`dedup.shard_status` per shard, one GET) and the worker-side run-record
+assembly small. The list is fetched exactly once, only when the hashes
+disagree, and only to **name** which granules a contraction dropped — a pole
+shard's ~4,600 ids are ≈550 KB, and they would otherwise ride every one of
+those GETs. A sibling whose `granules_sha256` does not match the sidecar's
+(a torn rewrite: one of the two writes lost) is rejected as unrecorded rather
+than trusted.
+
+**The contraction guard cannot protect leaves written before this
+release.** That sibling arrives with issue #388. A leaf written before it has
+only the recorded hash — there is no recorded set to diff — so any
+*granule-hash* mismatch over such a leaf classifies `unrecorded-ids` and
+performs the **silent wholesale rewrite the guard exists to prevent**,
+contraction or not. (A config-only rerun — same inputs, changed semantic core
+— is not one of these: the hashes agree, so it reads `semantic-mismatch`
+without any sibling read, and never inflates `cells_unrecorded`.) The guard only
+protects a leaf after that leaf has been rewritten at least once under this
+release. These rewrites are counted apart (`cells_unrecorded` in the run
+summary; the CLI prints them as "rewritten with the guard inert") so an
+operator can see how much of a store is still unguarded; making them refuse
+instead is a standing design fork (PR #397 question (4)).
+
+Two identity caveats operators hit in practice. The recorded id space is
+**driver-dependent** on the aggregation path (resolved `s3://` vs `https://`
+hrefs): flipping the driver between runs reads as a full mixed contraction
+and refuses per leaf — `--allow-contraction` is the escape hatch. And the
+identity pair deliberately does **not** cover leaf-*shaping* `output` knobs
+beyond the column artifact (e.g. flipping `sharded` changes the leaf's
+object layout while both identity halves hold): changing those still needs
+`--overwrite` (PR #397 question (8)).
+
+### The refusal manifest
+
+A refused unit writes **nothing** — no leaf, no sidecar, no run-parquet row —
+so a run that refuses leaves the store byte-identical and the only in-band
+trace is a worker log line truncated to five missing ids. Since issue #388 a
+run that ends with `cells_refused > 0` also writes one small JSON object at
+the store root:
+
+```
+refusals_{YYYYmmddTHHMMSSZ}_{run_id}.json
+```
+
+Timestamp-first like the `stats_*.parquet` run records (and outside their
+glob, so run-record discovery never mistakes one for the other). It carries
+the run context needed to act on it — `run_id`, write timestamp, the run's
+`semantic_hash`, the zagg version — and one entry per refused unit: its
+`shard_key` and `window`, the classification (`contraction` or `mixed`), and
+the **complete** `missing_granules` list, which is exactly what the guard read
+from that leaf's granule-id sibling in order to name the drop. Triage the
+diff from this object, not from the logs.
+
+Two deliberate limits. A **pure-skip** run (nothing refused) writes nothing
+here and stays row-less — the counters and the leaf sidecars are the record of
+a no-op run, and an empty manifest per rerun would be litter. And the manifest
+is written by the **local backend only**: D8 keeps the Lambda dispatcher from
+writing to the store, and no once-per-run worker-side seam exists yet to carry
+it — the same gap, with the same resolution, as the store-root touch below
+(PR #397 question (10)). A fleet run's refusals are visible in its summary
+counters and worker logs, not in a durable object.
+
+### The lifecycle touch
+
+A skipped unit still resets the purge clock: every object in its footprint
+gets a fresh `LastModified` (lifecycle rules act per object) — the leaf
+`.zarr` tree (stamp, arrays, in-leaf `coverage.moc`), the stats sidecar, its
+granule-id sibling and the sub-map sibling, and the declared column tree plus
+its own sidecar.
+Local stores use `os.utime`; S3 uses a server-side self-copy (`CopyObject`
+onto itself, `MetadataDirective: REPLACE`) that preserves content, the ETag
+of non-multipart objects, and the object's storage class. A local run's
+wrap-up also touches the **store-root trio** no unit owns
+(`morton_hive.json`, `aggregation.yaml`, root `coverage.moc`) — an all-skip
+run re-PUTs none of them, and the manifest is REQUIRED reader-facing schema
+that would otherwise expire first, bricking a store whose data objects are
+all fresh.
+
+The touch is **best-effort and fail-open**: a failed touch logs, counts,
+and degrades to today's behavior — it never fails the unit and never
+un-skips it. Watch the counters: `objects_touched` / `touch_failures` ride
+the run summary, and the CLI warns explicitly when touches failed, because
+those objects **did not** get their purge clock reset (the run still exits
+0). S3 caveats, documented rather than solved: a versioned bucket mints a
+new object version per touch; an object already transitioned to
+`GLACIER`/`DEEP_ARCHIVE` cannot be self-copied (counts as failed); ACLs are
+not preserved (moot under `BucketOwnerEnforced`, the modern default, but a
+public-read-**by-ACL** bucket would see touched objects go private); under
+SSE-KMS the copy re-encrypts with the bucket-default key and needs
+`kms:Decrypt` + `kms:GenerateDataKey`.
+
+**Known gaps** — plan lifecycle rules around them, they are not promised
+away: the [design §7](design/sparse_coverage.md) sweep's **ancestor-node
+artifacts belong to no unit's footprint** and a skip produces zero sweep
+dirtiness by construction. That is the whole ancestor layer, not the
+overviews alone — all four rollup families age identically
+(`stats.rollup.json`, `moc.rollup.json`, `submap.rollup.json`,
+`overview.rollup.json` at every digit node, one per `sweep.DEFAULT_FAMILIES`
+entry), plus each pass's root `sweep_stats_{ts}.json` run record. And
+re-running the sweep does **not** refresh them: a second sweep over an
+unchanged tree recomputes but PUTs nothing, so the obvious "just sweep
+periodically to keep them alive" workaround silently no-ops. The store-root
+trio, separately, is touched by the
+**local backend only** — as is the refusal manifest above, for the same reason
+(D8 keeps the Lambda dispatcher from writing to the store, and the handler has
+no once-per-run root-write mode yet; both wait on the same resolution — PR #397
+question (10)).
+
+**There is no lifecycle rule that separates leaves from the ancestor
+artifacts above them.** An S3 lifecycle filter keys on prefix, object tags,
+and size only; zagg's writers set no object tags; and per
+[the specification §4.1–§4.2](specification.md) an overview lives at an
+**ancestor digit node inside the same prefix tree** as the leaves it
+summarizes, where "nothing about the *name* distinguishes an overview from a
+leaf" (classification is by root-group attrs, which no lifecycle engine
+reads). So "scope expiry to the leaf data planes"
+is not writable as a rule: the only prefix that selects leaves while
+excluding ancestors is a per-shard-node prefix, against a 1,000-rule bucket
+cap. The honest options today are:
+
+1. **No expiry rule on a pyramid-declaring hive store.** The safe default
+   while the gaps above are open.
+2. **Accept expiry over the digit tree**, understanding that it takes the
+   ancestor artifacts with it. Those are regenerable caches, never
+   load-bearing ([specification §4.1](specification.md)), so the cost is a
+   full rebuild by a
+   sweep — not data loss. Exclude the store-root trio by name (three known
+   objects at a known prefix); `morton_hive.json` is REQUIRED reader-facing
+   schema and expiring it bricks the store.
+3. **The levers that would make a leaf-scoped rule writable do not exist
+   yet**: object tags stamped at write time (nothing in zagg writes any), or
+   a scheduled refresher that re-PUTs the ancestor layer — the staged sweep
+   of [issue #384](https://github.com/englacial/zagg/issues/384) is the
+   obvious candidate, but nothing about it promises a refresh today. Both
+   are open; see PR #397 question (10) for the related fleet-side root
+   touch.
+
 ## Raster hive stores (issue #247)
 
 Raster (pull-NN) pipelines write the same tree with **windowed `(time, cells)`
@@ -723,5 +923,11 @@ under D9/O7). The §7 sweep remains the authoritative rebuilder.
   [issue #209](https://github.com/englacial/zagg/issues/209)), the default at
   K > 1, so a leaf costs one PUT per dense array instead of K per-inner-chunk
   PUTs concentrated on a single prefix.
+- **Skip-if-current re-runs** ship for the local backend
+  ([issue #388](https://github.com/englacial/zagg/issues/388)): the
+  worker-side identity gate, the contraction guard, and the lifecycle touch
+  — see [Re-runs](#re-runs-skip-if-current-the-contraction-guard-and-the-lifecycle-touch).
+  The Lambda handler enablement is a named follow-up (the seams default
+  off, so deployed workers are byte-identical until it lands).
 - Write-throughput validation at fleet scale is tracked with the benchmark
   machinery in [issue #202](https://github.com/englacial/zagg/issues/202).
