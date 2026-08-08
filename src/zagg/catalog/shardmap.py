@@ -45,12 +45,18 @@ MORTIE_MOC_ORDER_CAP = 18
 
 # Rings per batch call into mortie's ``polygons_to_morton_mocs`` (issue #396).
 # The batch call's fixed cost amortizes within a couple hundred rings -- a local
-# sweep at order 13 over 20k synthetic footprints is flat (0.72-0.75 s) from 256
-# rings/call up to the whole 20k in one call -- so a small block keeps the full
-# batch speedup while bounding peak memory to one block of MOC words rather than
-# the whole catalog's (a 556k-granule catalog's MOCs are ~1 GB at order 13, and
-# an order-19 leaf grid multiplies that).
-_MOC_BATCH_RINGS = 1024
+# sweep at order 13 is flat from 256 rings/call up to the whole catalog in one
+# call -- so the block sits at the knee, which keeps the full batch speedup while
+# bounding peak memory to one block of MOC words rather than the whole catalog's.
+#
+# The block must be sized against the *real* input, not a synthetic one: a CMR
+# ATL03/ATL06 footprint is a coarse ~12 km-wide quarter-orbit swath envelope (see
+# ``beams.py``), which is ~32k MOC words at order 13 -- ~150x a compact synthetic
+# footprint. At 256 rings that is a ~66 MB block buffer; at 1024 it was ~263 MB,
+# and the block's cell-level intermediates on top of it took peak RSS to 1.2 GB
+# against the serial loop's 157 MB. Those intermediates are gone (the AOI filter
+# now runs per ring, below), and 256 keeps the remaining term small.
+_MOC_BATCH_RINGS = 256
 
 # ── granule footprint helpers ────────────────────────────────────────────────
 
@@ -437,7 +443,6 @@ def _intersect_mortie(
         hit_shards, hit_owners = [], []
         for start in range(0, owners.size, _MOC_BATCH_RINGS):
             stop = min(start + _MOC_BATCH_RINGS, owners.size)
-            blk_shards, blk_owners = [], []
             for r, moc in enumerate(_batch_ring_mocs(lats, lons, offsets, start, stop, order)):
                 if moc.size == 0:
                     continue
@@ -448,17 +453,21 @@ def _intersect_mortie(
                     shards = np.unique(np.asarray(moc_to_order(moc, parent_order)))
                 except Exception:
                     continue
-                blk_shards.append(shards.astype(np.uint64, copy=False))
-                blk_owners.append(np.full(shards.size, owners[start + r], dtype=np.int64))
-            if not blk_shards:
-                continue
-            cand = np.concatenate(blk_shards)
-            pos = np.searchsorted(shard_arr, cand)
-            np.clip(pos, 0, shard_arr.size - 1, out=pos)
-            keep = shard_arr[pos] == cand
-            if keep.any():
-                hit_shards.append(cand[keep])
-                hit_owners.append(np.concatenate(blk_owners)[keep])
+                # Filter to the AOI here, per ring, rather than accumulating the
+                # block's densified cells and filtering once: a real quarter-orbit
+                # footprint densifies to ~17k order-11 cells, so a block-level
+                # buffer (plus its concatenate copies) dwarfs the AOI hits it
+                # exists to produce. Per-ring keeps the accumulator bounded by
+                # hits, as the pre-#396 loop was, and is just as vectorized --
+                # ``owners`` is non-decreasing in ``r``, so appending in ring
+                # order leaves the sort/dedup invariant below untouched.
+                cand = shards.astype(np.uint64, copy=False)
+                pos = np.searchsorted(shard_arr, cand)
+                np.clip(pos, 0, shard_arr.size - 1, out=pos)
+                kept = cand[shard_arr[pos] == cand]
+                if kept.size:
+                    hit_shards.append(kept)
+                    hit_owners.append(np.full(kept.size, owners[start + r], dtype=np.int64))
 
         if not hit_shards:
             return {}
