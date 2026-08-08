@@ -243,6 +243,138 @@ def _batch_ring_mocs(lats, lons, offsets, start, stop, order) -> tuple:
     return [values[out_offsets[r] : out_offsets[r + 1]] for r in range(stop - start)], None
 
 
+def _regroup_hits(hit_shards, hit_owners) -> Dict[int, List[int]]:
+    """Per-shard granule lists from parallel (shard, owner) hit arrays.
+
+    Shared by both mortie paths (issue #396) so they cannot drift: a stable sort
+    by shard, then run boundaries, then a consecutive-run dedup of owners inside
+    each run. Owners are non-decreasing globally (records are visited in order,
+    a granule's beam rings adjacent), so a stable sort leaves each shard's owners
+    non-decreasing too and every repeat of a granule within a shard is adjacent
+    -- making the run dedup exactly the ``dict.fromkeys`` the pre-#396 serial
+    path ended with, same set and same order.
+    """
+    if not hit_shards:
+        return {}
+    cand = np.concatenate(hit_shards)
+    own = np.concatenate(hit_owners)
+    srt = np.argsort(cand, kind="stable")
+    cand, own = cand[srt], own[srt]
+    out: Dict[int, List[int]] = {}
+    bounds = np.flatnonzero(_first_of_run(cand))
+    for a, b in zip(bounds, np.append(bounds[1:], cand.size)):
+        granules = own[a:b]
+        out[int(cand[a])] = [int(g) for g in granules[_first_of_run(granules)]]
+    return out
+
+
+def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[int, List[int]]:
+    """Shard assignment from the catalog's stored MOCs -- no geometry (issue #396).
+
+    The phase-3 fast path. Where ``_intersect_mortie`` covers every footprint
+    from its vertices on every build, this reads the cover the catalog already
+    carries (``Catalog.index_footprints``) and does set algebra only: the AOI's
+    shard keys are themselves a MOC at ``parent_order``, so a granule's shards
+    are ``moc_to_order(moc_and(granule_moc, aoi_moc), parent_order)`` -- no
+    ``searchsorted`` filter either, since intersecting with the AOI first is
+    what restricts the result to shards in it.
+
+    ``rows`` maps record index -> catalog table row (``rows[i]`` is the row
+    record ``i`` came from); it is not the identity, because
+    ``granule_records`` drops rows whose geometry is empty or not polygonal
+    while the column has one entry per row.
+
+    The per-granule ``moc_and`` loop is the remaining Python-side per-call cost:
+    mortie 0.9.5 has no N-way variadic fold and no ``mocs_intersect`` predicate
+    (both are on espg/mortie#156's roster, unimplemented), so this loops in
+    Python. What it removes is the WKB parse and the coverage walk, which is the
+    dominant term -- see ``bench/shardmap_batch_vs_serial.py --arms cells``.
+    """
+    from mortie import compress_moc, moc_and, moc_to_order
+
+    if len(rows) == 0 or not all_shards:
+        return {}
+    parent_order = grid.parent_order
+    shard_arr = np.fromiter(all_shards, dtype=np.uint64, count=len(all_shards))
+    shard_arr.sort()
+    # Uniform-order cells, so no cell contains another and the sorted array is
+    # already a well-formed MOC; compressing it just folds complete sibling
+    # quadruples into their parent, shrinking the operand of every ``moc_and``
+    # below without changing any result.
+    aoi_moc = np.asarray(compress_moc(shard_arr))
+
+    hit_shards, hit_owners = [], []
+    for i, row in enumerate(rows):
+        moc = values[offsets[row] : offsets[row + 1]]
+        if moc.size == 0:
+            continue
+        hit = np.asarray(moc_and(moc, aoi_moc))
+        if hit.size == 0:
+            continue
+        try:
+            # Kept in step with the geometry path: ``moc_to_order``'s cell budget
+            # can refuse an expansion, which drops that granule exactly as it did
+            # before. The AOI intersection makes a refusal far less reachable
+            # here (the expansion is bounded by the granule's own cells inside
+            # the AOI), but the failure semantics stay the same either way.
+            shards = np.unique(np.asarray(moc_to_order(hit, parent_order)))
+        except Exception:
+            continue
+        if shards.size:
+            hit_shards.append(shards.astype(np.uint64, copy=False))
+            hit_owners.append(np.full(shards.size, i, dtype=np.int64))
+    return _regroup_hits(hit_shards, hit_owners)
+
+
+def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_order):
+    """Inputs for the :func:`_intersect_footprint_cells` fast path, or ``None``.
+
+    Engages only on the shape the stored column can answer *exactly*, so a build
+    that takes it is the build that would have run anyway, minus the geometry:
+
+    - the resolved backend is ``mortie`` -- the column holds mortie MOCs, and
+      silently substituting them for an exact-S2 spherely run would swap the
+      backend's semantics (a ~0.01% polar omission, espg/mortie#32) behind the
+      caller's back;
+    - ``footprint="swath"`` -- the column covers the CMR footprint, not the
+      per-beam corridors ``footprint="beams"`` decomposes it into (issue #65);
+    - ``mortie_order`` was not pinned by the caller -- an explicit order asks for
+      a cover at *that* order, which the column cannot restate;
+    - the grid is HEALPix and the catalog carries the column.
+
+    Raises
+    ------
+    ValueError
+        When the column is present and would otherwise be used but is **coarser
+        than the grid's shard order**. Answering anyway would refine every cell
+        onto all ``4^(parent_order - order)`` descendants and put ~every granule
+        in ~every shard -- the #92 failure the order guard exists to stop -- and
+        falling through to geometry would hide that the index the operator built
+        is useless for this grid. Refuse and say which order to re-index at.
+    """
+    if chosen != "mortie" or footprint != "swath" or mortie_order is not None:
+        return None
+    parent_order = getattr(grid, "parent_order", None)
+    cells = getattr(catalog, "footprint_cells", None)
+    cells = cells() if callable(cells) else None
+    if cells is None or parent_order is None:
+        return None
+    values, offsets, order = cells
+    if order < parent_order:
+        raise ValueError(
+            f"catalog's footprint_cells column is at order {order}, coarser than the "
+            f"grid's parent_order {parent_order}; answering from it would upsample every "
+            f"footprint onto all shards under each cell (#92). Re-index the catalog with "
+            f"Catalog.index_footprints(order>={parent_order}), or build against a grid "
+            f"with parent_order <= {order}."
+        )
+    # ``granule_records`` skips rows with empty or non-polygonal geometry, so
+    # record index != table row; align on the granule id both sides carry.
+    row_of = {gid: i for i, gid in enumerate(catalog.table.column("id").to_pylist())}
+    rows = np.fromiter((row_of[r["id"]] for r in records), dtype=np.int64, count=len(records))
+    return values, offsets, order, rows
+
+
 def _resolve_mortie_order(mortie_order, grid) -> int:
     """Choose the MOC order for the mortie backend.
 
@@ -517,21 +649,7 @@ def _intersect_mortie(
                     hit_shards.append(kept)
                     hit_owners.append(np.full(kept.size, owners[start + r], dtype=np.int64))
 
-        if not hit_shards:
-            return {}
-        cand = np.concatenate(hit_shards)
-        own = np.concatenate(hit_owners)
-        srt = np.argsort(cand, kind="stable")
-        cand, own = cand[srt], own[srt]
-        bounds = np.flatnonzero(_first_of_run(cand))
-        for a, b in zip(bounds, np.append(bounds[1:], cand.size)):
-            # Owners are non-decreasing within a shard (records visited in order,
-            # a granule's beam rings adjacent), so dropping repeats of the run
-            # dedups a granule reached via several rings -- the ``dict.fromkeys``
-            # the serial path ended with.
-            granules = own[a:b]
-            out[int(cand[a])] = [int(g) for g in granules[_first_of_run(granules)]]
-        return out
+        return _regroup_hits(hit_shards, hit_owners)
 
     # Non-HEALPix: flat order-`order` granule cell index + per-shard lookup.
     cell_arrays, rec_idx = [], []
@@ -631,7 +749,10 @@ class ShardMap:
         Parameters
         ----------
         catalog : Catalog
-            Fetched granule metadata (provides ``granule_records()``).
+            Fetched granule metadata (provides ``granule_records()``). A catalog
+            indexed by ``Catalog.index_footprints`` additionally carries every
+            granule's morton MOC, which takes the geometry-free fast path
+            described in the Notes (issue #396).
         grid : OutputGrid
             Output grid (provides ``coverage``, ``shard_footprint``,
             ``spatial_signature``).
@@ -672,6 +793,18 @@ class ShardMap:
         Returns
         -------
         ShardMap
+
+        Notes
+        -----
+        **Indexed catalogs skip the geometry entirely** (issue #396). When the
+        catalog carries the ``footprint_cells`` column, the backend resolves to
+        ``mortie``, ``footprint="swath"`` and ``mortie_order`` is left at its
+        default, the intersection becomes ``moc_and`` of each stored granule MOC
+        with the AOI's own shard MOC -- no WKB parse, no coverage walk. The
+        result is the mortie backend's, unchanged; ``metadata["footprint_cells"]``
+        records that the index answered the build. A column **coarser** than the
+        grid's ``parent_order`` raises rather than answering (see
+        :func:`_footprint_cells_plan`).
         """
         if footprint not in ("swath", "beams"):
             raise ValueError(f"footprint must be 'swath' or 'beams' (got {footprint!r})")
@@ -703,7 +836,15 @@ class ShardMap:
             raise ValueError(f"unknown backend: {backend!r} (resolved to {chosen!r})")
 
         t0 = time.perf_counter()
-        if chosen == "mortie":
+        # Fast path (issue #396): an indexed catalog already carries every
+        # granule's MOC, so the build is set algebra against the AOI with no
+        # geometry work. Resolved before the geometry backends because it is the
+        # same mortie intersection they would run, minus the cover.
+        plan = _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_order)
+        if plan is not None:
+            values, offsets, mortie_order, rows = plan
+            shard_to_idx = _intersect_footprint_cells(rows, values, offsets, grid, all_shards)
+        elif chosen == "mortie":
             mortie_order = _resolve_mortie_order(mortie_order, grid)
             shard_to_idx = _intersect_mortie(
                 records,
@@ -741,6 +882,11 @@ class ShardMap:
         }
         if chosen == "mortie":
             meta["mortie_order"] = mortie_order
+        if plan is not None:
+            # Says the stored index answered this build, which the catalog's own
+            # ``footprint_cells_order`` (carried in via the metadata spread
+            # above) does not: that key only says the column exists.
+            meta["footprint_cells"] = True
 
         # Strict-AOI mask (issue #101), default off: precompute a per-shard payload
         # so the worker can package the per-cell bool with no region plumbing. Only

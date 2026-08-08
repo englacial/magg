@@ -1,9 +1,12 @@
-"""Batch-vs-serial mortie intersection on REAL catalogs (issue #396, PR #400).
+"""Serial vs batch vs stored-index intersection on REAL catalogs (issue #396, PR #400).
 
 Measures the phase-1 rewire of ``_intersect_mortie`` -- one batched
 ``mortie.polygons_to_morton_mocs`` call per block of rings, replacing one
 ``morton_coverage_moc`` call per granule -- against the per-granule loop it
-replaced, reporting **wall and peak RSS** for both.
+replaced, and both against the phase-3 ``cells`` arm, which reads the MOC the
+catalog already carries (``Catalog.index_footprints``) and does no geometry at
+all. **Wall and peak RSS** for every arm; the phase-3 indexing pass is timed
+separately as ``idx_s`` because it is one-time per catalog, not per build.
 
 Why this file exists at all: the first cut of these numbers came from synthetic
 footprints, and the synthetic fixture was badly miscalibrated. A synthetic
@@ -64,6 +67,10 @@ Run::
     uv run python bench/shardmap_batch_vs_serial.py
     uv run python bench/shardmap_batch_vs_serial.py --cases neon,88s
     uv run python bench/shardmap_batch_vs_serial.py --cases full   # slow, needs the clone
+
+    # phase 3: the stored-index arm against the geometry it replaces, min-of-3
+    uv run python bench/shardmap_batch_vs_serial.py --cases neon,88s \
+        --arms serial,batch,cells --orders 9 --reps 3
 
     # the order a default build actually resolves to, at operator scale: batch
     # only, because the serial arm of this one is ~1 h. It is the single row in
@@ -166,8 +173,14 @@ def _intersect_serial(records, grid, all_shards, order):
     return {k: list(dict.fromkeys(v)) for k, v in out.items()}
 
 
-def _load_case(name):
-    """Return ``(records, grid, all_shards)`` for one case, as ``build`` would."""
+def _load_case(name, index_order=None):
+    """Return ``(records, grid, all_shards, cat, index_s)`` for one case, as ``build`` would.
+
+    ``index_order`` precomputes the ``footprint_cells`` column (phase 3) before
+    the records are decoded, and reports its wall separately: it is the
+    **one-time** cost the ``cells`` arm amortizes, not part of a build, so
+    counting it in the intersection wall would measure the wrong thing.
+    """
     from zagg.catalog import load_polygon
     from zagg.catalog.shardmap import _region_parts
     from zagg.catalog.sources import Catalog
@@ -196,9 +209,14 @@ def _load_case(name):
     # objects 151 MB, id 49 MB, the two datetimes 63 MB. So the large cheap lever
     # is not vectorizing shapely.from_wkb (<=15% of the plateau) but projecting
     # the two href fields in Arrow / batching the to_pylist() calls.
+    index_s = None
+    if index_order is not None:
+        t_idx = time.perf_counter()
+        cat = cat.index_footprints(index_order)
+        index_s = time.perf_counter() - t_idx
     records = cat.granule_records()
     all_shards = {int(s) for s in grid.coverage(_region_parts(parts, cat.metadata))}
-    return records, grid, all_shards
+    return records, grid, all_shards, cat, index_s
 
 
 def _measure_child(name, path, order, block):
@@ -207,10 +225,22 @@ def _measure_child(name, path, order, block):
 
     if block is not None:
         shardmap._MOC_BATCH_RINGS = block
-    records, grid, all_shards = _load_case(name)
+    records, grid, all_shards, cat, index_s = _load_case(
+        name, index_order=order if path == "cells" else None
+    )
     rss_load = _rss_mb()
     res_load = _resident_mb()
-    fn = _intersect_serial if path == "serial" else shardmap._intersect_mortie
+    if path == "cells":
+        # Both halves of the phase-3 build path are timed: resolving the plan
+        # (which includes the id -> table-row alignment ``build`` pays every
+        # time) and the moc_and loop itself. Only ``index_footprints`` above is
+        # outside, because only it is one-time.
+        def fn(records, grid, all_shards, order):  # noqa: ARG001 (arm signature)
+            plan = shardmap._footprint_cells_plan(cat, records, grid, "mortie", "swath", None)
+            values, offsets, _order, rows = plan
+            return shardmap._intersect_footprint_cells(rows, values, offsets, grid, all_shards)
+    else:
+        fn = _intersect_serial if path == "serial" else shardmap._intersect_mortie
     t0 = time.perf_counter()
     out = fn(records, grid, all_shards, order=order)
     wall = time.perf_counter() - t0
@@ -223,6 +253,7 @@ def _measure_child(name, path, order, block):
                 "pairs": sum(len(v) for v in out.values()),
                 "digest": hash(tuple(sorted((k, tuple(v)) for k, v in out.items()))),
                 "wall_s": round(wall, 2),
+                "index_s": None if index_s is None else round(index_s, 2),
                 "rss_load_mb": round(rss_load, 1),
                 "res_load_mb": round(res_load, 1),
                 "rss_peak_mb": round(_rss_mb(), 1),
@@ -255,21 +286,43 @@ def _peak_hw_mb(m) -> float:
     return m["rss_peak_mb"] - m["rss_load_mb"]
 
 
-def run_cases(names, orders=None, arms=("serial", "batch")):
-    """Serial vs batch per (case, order), asserting batch == serial on every row.
+ARMS = ("serial", "batch", "cells")
 
-    ``arms`` drops one side. ``--arms batch`` exists for exactly one row --
+
+def run_cases(names, orders=None, arms=("serial", "batch"), reps=1):
+    """One row per (case, order), asserting every arm present agrees exactly.
+
+    Three arms, each the whole intersection for one implementation:
+
+    ``serial``
+        the pre-#396 per-granule ``morton_coverage_moc`` loop -- the oracle.
+    ``batch``
+        phase 1: ``polygons_to_morton_mocs`` a block of rings at a time.
+    ``cells``
+        phase 3: no geometry at all -- ``moc_and`` of each granule's **stored**
+        MOC (``Catalog.index_footprints``) with the AOI's own shard MOC. The
+        indexing pass runs in the same child but is timed separately and
+        reported as ``idx_s``, because it is one-time per catalog where the
+        others are per build.
+
+    ``arms`` drops sides. ``--arms batch`` exists for exactly one row --
     ``full`` at order 13, where the serial arm is ~1 h -- and it is the only way
     to get a row **without** the oracle assert, so it prints ``no-assert`` to say
     so rather than letting a bare number imply a verified one. What backs that
-    row instead is ``california`` at the same order and AOI, where serial and
-    batch do run head to head on identical output (190,625 pairs / 2,721 shards),
-    plus ``tests/test_shardmap.py::TestMortieBatch``'s ``dict ==`` identity pins.
+    row instead is ``california`` at the same order and AOI, where the arms do
+    run head to head on identical output (190,625 pairs / 2,721 shards), plus
+    ``tests/test_shardmap.py``'s ``dict ==`` identity pins.
+
+    ``reps`` > 1 reports the **min** wall per arm over N processes. Quote it
+    min-of-N for the same reason ``--knee`` does: the batch arm is
+    rayon-parallel, so a single-shot wall on a loaded machine scatters wider
+    than some of the differences being read off this table. Peak and the
+    correctness digest come from the first rep (peak is stable across them).
     """
     print(
         f"{'case':>11} {'order':>5} {'granules':>9} {'shards':>7} {'pairs':>9} "
-        f"{'serial_s':>9} {'batch_s':>8} {'x':>5} {'ser_MB':>7} {'bat_MB':>7} "
-        f"{'ser_hw':>7} {'bat_hw':>7}",
+        f"{'serial_s':>9} {'batch_s':>8} {'cells_s':>8} {'idx_s':>7} {'b/c':>5} "
+        f"{'ser_MB':>7} {'bat_MB':>7} {'cel_MB':>7} {'ser_hw':>7} {'bat_hw':>7} {'cel_hw':>7}",
         flush=True,
     )
     for name in names:
@@ -277,27 +330,38 @@ def run_cases(names, orders=None, arms=("serial", "batch")):
             print(f"{name:>11}  -- skipped: {CASES[name]['catalog']} not present", flush=True)
             continue
         for order in orders or CASES[name].get("orders", ORDERS):
-            ser = _measure(name, "serial", order) if "serial" in arms else None
-            bat = _measure(name, "batch", order) if "batch" in arms else None
-            if ser and bat:
-                assert ser["digest"] == bat["digest"], f"{name}@o{order}: batch != serial"
-            ref = ser or bat
-            speedup = f"{ser['wall_s'] / max(bat['wall_s'], 1e-9):>4.1f}x" if ser and bat else "--"
+            got = {}
+            for arm in ARMS:
+                if arm not in arms:
+                    continue
+                runs = [_measure(name, arm, order) for _ in range(reps)]
+                m = dict(runs[0])
+                m["wall_s"] = min(r["wall_s"] for r in runs)
+                got[arm] = m
+            digests = {a: m["digest"] for a, m in got.items()}
+            assert len(set(digests.values())) <= 1, f"{name}@o{order}: arms disagree {digests}"
+            ref = next(iter(got.values()))
+            bat, cel = got.get("batch"), got.get("cells")
+            gain = f"{bat['wall_s'] / max(cel['wall_s'], 1e-9):>4.1f}x" if bat and cel else "--"
             row = [
                 f"{name:>11}",
                 f"{order:>5}",
                 f"{ref['granules']:>9,}",
                 f"{ref['shards_hit']:>7,}",
                 f"{ref['pairs']:>9,}",
-                f"{ser['wall_s']:>9.2f}" if ser else f"{'--':>9}",
-                f"{bat['wall_s']:>8.2f}" if bat else f"{'--':>8}",
-                f"{speedup:>5}",
-                f"{_peak_mb(ser):>7.0f}" if ser else f"{'--':>7}",
-                f"{_peak_mb(bat):>7.0f}" if bat else f"{'--':>7}",
-                f"{_peak_hw_mb(ser):>7.0f}" if ser else f"{'--':>7}",
-                f"{_peak_hw_mb(bat):>7.0f}" if bat else f"{'--':>7}",
+                *(
+                    f"{got[a]['wall_s']:>{w}.2f}" if a in got else f"{'--':>{w}}"
+                    for a, w in (("serial", 9), ("batch", 8), ("cells", 8))
+                ),
+                f"{cel['index_s']:>7.2f}" if cel else f"{'--':>7}",
+                f"{gain:>5}",
+                *(
+                    f"{peak(got[a]):>7.0f}" if a in got else f"{'--':>7}"
+                    for peak in (_peak_mb, _peak_hw_mb)
+                    for a in ARMS
+                ),
             ]
-            if not (ser and bat):
+            if len(got) < 2:
                 row.append(" no-assert (one arm only)")
             print(" ".join(row), flush=True)
 
@@ -336,7 +400,7 @@ def main(argv=None):
     ap.add_argument(
         "--arms",
         default="serial,batch",
-        help="which arms to run; 'batch' alone skips the oracle assert and says so",
+        help="any of serial,batch,cells; a single arm skips the oracle assert and says so",
     )
     ap.add_argument("--knee", default=None, help="case to sweep _MOC_BATCH_RINGS on")
     ap.add_argument(
@@ -344,9 +408,9 @@ def main(argv=None):
         default=",".join(str(b) for b in KNEE_BLOCKS),
         help="block sizes for --knee",
     )
-    ap.add_argument("--reps", type=int, default=1, help="--knee repeats; wall is min-of-N")
+    ap.add_argument("--reps", type=int, default=1, help="repeats for --cases and --knee; min-of-N")
     ap.add_argument("--measure", default=None, help=argparse.SUPPRESS)
-    ap.add_argument("--path", choices=("serial", "batch"), default="batch")
+    ap.add_argument("--path", choices=ARMS, default="batch")
     ap.add_argument("--order", type=int, default=13, help="MOC order for --knee (and --measure)")
     ap.add_argument("--block", type=int, default=None)
     args = ap.parse_args(argv)
@@ -358,7 +422,7 @@ def main(argv=None):
     cases = args.cases if args.cases is not None else ("" if args.knee else "neon,88s,california")
     if cases:
         arms = tuple(a for a in args.arms.split(",") if a)
-        run_cases([c for c in cases.split(",") if c], orders, arms)
+        run_cases([c for c in cases.split(",") if c], orders, arms, reps=args.reps)
     if args.knee:
         blocks = tuple(int(b) for b in args.blocks.split(",") if b)
         run_knee(args.knee, order=args.order, blocks=blocks, reps=args.reps)

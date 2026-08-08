@@ -618,6 +618,182 @@ class TestMortieBatch:
         assert _flatten_rings([], "swath", "ATL03") is None
 
 
+def _shard_ids(sm):
+    """``(shard_keys, per-shard granule ids)`` -- the manifest's whole assignment."""
+    return sm.shard_keys, [[g["id"] for g in shard] for shard in sm.granules]
+
+
+class TestFootprintCells:
+    """Phase 3: an indexed catalog answers ``build`` with set algebra (issue #396).
+
+    The oracle here is the **phase-2 geometry path itself**: every test asserts
+    the fast path reproduces the mortie build it replaces, shard keys and
+    per-shard granule order included, so the index can only ever be faster, not
+    different. What is genuinely new and therefore pinned on its own is the
+    engagement gate (which builds may take it) and the refusal (which must not).
+    """
+
+    @pytest.fixture
+    def hp_grid(self):
+        return HealpixGrid(11, 17, layout="fullsphere")
+
+    def test_indexed_build_matches_the_geometry_build(self, hp_grid):
+        cat = _overlapping_catalog()
+        geometry = ShardMap.build(cat, hp_grid, backend="mortie")
+        fast = ShardMap.build(cat.index_footprints(11), hp_grid, backend="mortie")
+        assert len(geometry.shard_keys) > 4, "fixture must span multiple shards"
+        assert _shard_ids(fast) == _shard_ids(geometry)
+        assert fast.metadata["footprint_cells"] is True
+        assert fast.metadata["mortie_order"] == 11
+
+    def test_finer_column_coarsens_to_the_same_build(self, hp_grid):
+        # A column may be finer than the shard order -- ``moc_to_order``
+        # coarsens it -- and an order-13 index must land the same assignment an
+        # order-11 cover does at parent_order 11.
+        cat = _overlapping_catalog()
+        geometry = ShardMap.build(cat, hp_grid, backend="mortie")
+        fast = ShardMap.build(cat.index_footprints(13), hp_grid, backend="mortie")
+        assert _shard_ids(fast) == _shard_ids(geometry)
+        assert fast.metadata["mortie_order"] == 13
+
+    def test_column_coarser_than_the_shard_order_is_refused(self):
+        # The one thing the column cannot answer: a shard order FINER than it.
+        # Refining each cell onto all its descendants would put ~every granule
+        # in ~every shard (#92), so this raises rather than answering, and
+        # rather than quietly falling back to geometry -- which would hide that
+        # the index the operator paid for is useless for this grid.
+        cat = _overlapping_catalog().index_footprints(9)
+        with pytest.raises(ValueError, match="order 9, coarser than.*parent_order 11"):
+            ShardMap.build(cat, HealpixGrid(11, 17, layout="fullsphere"), backend="mortie")
+
+    def test_row_alignment_survives_rows_granule_records_drops(self, hp_grid):
+        # The column has one entry per TABLE row; ``granule_records`` skips rows
+        # with empty or non-polygonal geometry. Record index is therefore not
+        # the row index, and a fast path that assumed it would silently hand
+        # every granule after the gap its neighbour's footprint.
+        good = [_item(f"G{i:02d}", -76.62 + 0.008 * i, -76.60 + 0.008 * i) for i in range(6)]
+        pt = _item("PT", -76.62, -76.60)
+        pt["geometry"] = {"type": "Point", "coordinates": [-76.61, 38.89]}
+        empty = _item("EMPTY", -76.62, -76.60)
+        empty["geometry"] = {"type": "Polygon", "coordinates": []}
+        cat = _catalog(good[:2] + [pt] + good[2:4] + [empty] + good[4:])
+        assert [r["id"] for r in cat.granule_records()] == [g["id"] for g in good]
+        geometry = ShardMap.build(cat, hp_grid, backend="mortie")
+        fast = ShardMap.build(cat.index_footprints(11), hp_grid, backend="mortie")
+        assert _shard_ids(fast) == _shard_ids(geometry)
+
+    def test_plain_catalog_still_takes_the_geometry_path(self, hp_grid):
+        sm = ShardMap.build(_overlapping_catalog(), hp_grid, backend="mortie")
+        assert "footprint_cells" not in sm.metadata
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            pytest.param({"backend": "spherely"}, id="spherely-backend"),
+            pytest.param({"backend": "mortie", "mortie_order": 11}, id="pinned-order"),
+        ],
+    )
+    def test_gates_leave_the_index_unused(self, hp_grid, fake_spherely, kwargs):
+        # The index is mortie MOCs covered at the column's own order, so it may
+        # only answer a build that asked for exactly that: an exact-S2 spherely
+        # run must not be silently swapped for a MOC one (espg/mortie#32), and a
+        # caller-pinned ``mortie_order`` asks for a cover the column can't restate.
+        cat = _overlapping_catalog().index_footprints(11)
+        assert "footprint_cells" not in ShardMap.build(cat, hp_grid, **kwargs).metadata
+
+    def test_beams_footprint_leaves_the_index_unused(self):
+        # The column covers the CMR swath, not the per-beam corridors (#65).
+        hp = HealpixGrid(12, 14, layout="fullsphere")
+        cat = _atl03_catalog(
+            [_swath_item(gid, lon, 38.89) for gid, lon in (("Ga", -76.52), ("Gb", -76.50))]
+        )
+        region = [
+            (
+                np.array([38.74, 38.74, 39.04, 39.04, 38.74]),
+                np.array([-76.62, -76.42, -76.42, -76.62, -76.62]),
+            )
+        ]
+        sm = ShardMap.build(
+            cat.index_footprints(14), hp, region=region, backend="mortie", footprint="beams"
+        )
+        assert "footprint_cells" not in sm.metadata
+
+    def test_aoi_restricts_the_assignment(self, hp_grid):
+        # ``moc_and`` against the AOI's own shard MOC is what does the
+        # restricting here (there is no searchsorted filter after it), so a
+        # region smaller than the catalog must cut shards off the result.
+        cat = _overlapping_catalog().index_footprints(11)
+        region = [
+            (
+                np.array([38.85, 38.85, 38.93, 38.93, 38.85]),
+                np.array([-76.62, -76.59, -76.59, -76.62, -76.62]),
+            )
+        ]
+        wide = ShardMap.build(cat, hp_grid, backend="mortie")
+        narrow = ShardMap.build(cat, hp_grid, region=region, backend="mortie")
+        assert narrow.metadata["footprint_cells"] is True
+        assert 0 < len(narrow.shard_keys) < len(wide.shard_keys)
+        assert set(narrow.shard_keys) <= set(wide.shard_keys)
+        assert _shard_ids(narrow) == _shard_ids(
+            ShardMap.build(_overlapping_catalog(), hp_grid, region=region, backend="mortie")
+        )
+
+    def test_cli_index_footprints_indexes_the_saved_catalog(self, tmp_path, monkeypatch):
+        # ``--index-footprints`` is how an operator ships a pre-indexed clone,
+        # so it must both index the catalog it persists AND have this build take
+        # the fast path -- indexing after the write would leave the saved file
+        # unindexed, and indexing after the build would waste the pass.
+        from zagg.catalog import main, sources
+
+        cat = _overlapping_catalog()
+
+        class _FakeCMR:
+            def fetch(self, query, **kw):  # noqa: ARG002 (mirror the real signature)
+                return cat
+
+        monkeypatch.setattr(sources, "CMRSource", _FakeCMR)
+        cat_out, sm_out = str(tmp_path / "cat.parquet"), str(tmp_path / "sm.json")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "zagg-catalog",
+                "--config",
+                "tests/data/benchmark/configs/atl03_tdigest_healpix_o9.yaml",
+                "--short-name",
+                "ATL03",
+                "--start-date",
+                "2025-06-01",
+                "--end-date",
+                "2025-06-02",
+                "--bbox=-76.62,38.84,-76.50,38.94",
+                "--backend",
+                "mortie",
+                "--index-footprints",
+                "9",
+                "--catalog-out",
+                cat_out,
+                "--output",
+                sm_out,
+            ],
+        )
+        main()
+        saved = Catalog.from_geoparquet(cat_out)
+        assert saved.metadata[sources.FOOTPRINT_CELLS_ORDER] == 9
+        assert saved.footprint_cells()[2] == 9
+        assert ShardMap.from_json(sm_out).metadata["footprint_cells"] is True
+
+    def test_empty_inputs_short_circuit(self, hp_grid):
+        # An empty AOI must return ``{}`` the way the geometry path does, not
+        # reach ``compress_moc`` with a zero-length array (which panics in the
+        # rust core rather than raising a python exception).
+        cat = _overlapping_catalog().index_footprints(11)
+        values, offsets, _ = cat.footprint_cells()
+        rows = np.arange(len(cat.granule_records()), dtype=np.int64)
+        assert shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, set()) == {}
+        assert shardmap._intersect_footprint_cells(rows[:0], values, offsets, hp_grid, {1}) == {}
+
+
 class TestIO:
     def test_round_trip(self, catalog, grid, fake_spherely):
         sm = ShardMap.build(catalog, grid, backend="spherely")

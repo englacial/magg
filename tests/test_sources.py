@@ -438,3 +438,110 @@ class TestFilterBbox:
     def test_no_overlap_empty(self):
         cat = self._catalog()
         assert len(cat.filter_bbox((50.0, 50.0, 51.0, 51.0))) == 0
+
+
+class TestFootprintCells:
+    """The ``footprint_cells`` convention column (issue #396, phase 3).
+
+    A per-granule morton MOC precomputed once per catalog so every later
+    ``ShardMap.build`` is set algebra instead of geometry. The column rides in
+    the same geoparquet file as the ``geometry`` it was covered from, so it has
+    no way to go stale against it — the tests below pin that the column *is*
+    that cover, that its order travels with it, and that a subset carries it.
+    """
+
+    def _catalog(self, n=3):
+        items = []
+        for i in range(n):
+            it = dict(_item(f"g{i}", _h5_assets(f"g{i}")))
+            lon0 = -76.6 + 0.05 * i
+            it["geometry"] = {
+                "type": "Polygon",
+                "coordinates": [
+                    [
+                        [lon0, 38.85],
+                        [lon0 + 0.04, 38.85],
+                        [lon0 + 0.04, 38.93],
+                        [lon0, 38.93],
+                        [lon0, 38.85],
+                    ]
+                ],
+            }
+            it["bbox"] = [lon0, 38.85, lon0 + 0.04, 38.93]
+            items.append(it)
+        return _catalog(items, {"bbox": list(BBOX)})
+
+    def test_absent_column_reads_as_none(self):
+        assert self._catalog().footprint_cells() is None
+
+    def test_column_is_the_scalar_cover_of_each_footprint(self):
+        # The pin that makes the column trustworthy: each row's stored MOC is
+        # exactly what ``morton_coverage_moc`` returns for the ring
+        # ``granule_records`` reads, so a build off the column and a build off
+        # the geometry are the same computation.
+        import mortie
+
+        cat = self._catalog()
+        values, offsets, order = cat.index_footprints(9).footprint_cells()
+        assert order == 9
+        assert offsets[0] == 0 and offsets[-1] == len(values)
+        for i, rec in enumerate(cat.granule_records()):
+            scalar = np.asarray(mortie.morton_coverage_moc(rec["lats"], rec["lons"], order=9))
+            assert np.array_equal(values[offsets[i] : offsets[i + 1]], scalar)
+
+    def test_non_polygonal_rows_get_an_empty_moc(self):
+        # mortie's coverage refuses a Point outright, and ``granule_records``
+        # skips such a row; the column must stay one entry per table row so the
+        # two still line up (a zero-length run), not raise.
+        pt = dict(_item("pt", _h5_assets("pt")))
+        pt["geometry"] = {"type": "Point", "coordinates": [-76.55, 38.89]}
+        cat = _catalog([_item("a", _h5_assets("a")), pt], {"bbox": list(BBOX)})
+        values, offsets, _ = cat.index_footprints(9).footprint_cells()
+        assert len(offsets) == 3
+        assert offsets[1] > 0 and offsets[2] == offsets[1]
+        assert [r["id"] for r in cat.granule_records()] == ["a"]
+
+    def test_all_rows_screened_yields_an_empty_column(self):
+        pt = dict(_item("pt", _h5_assets("pt")))
+        pt["geometry"] = {"type": "Point", "coordinates": [-76.55, 38.89]}
+        values, offsets, _ = _catalog([pt]).index_footprints(9).footprint_cells()
+        assert values.size == 0 and offsets.tolist() == [0, 0]
+
+    def test_reindex_replaces_rather_than_appends(self):
+        cat = self._catalog().index_footprints(6).index_footprints(8)
+        assert cat.table.column_names.count(sources.FOOTPRINT_CELLS) == 1
+        assert cat.footprint_cells()[2] == 8
+        assert cat.metadata[sources.FOOTPRINT_CELLS_ORDER] == 8
+
+    def test_geoparquet_round_trip_keeps_column_and_order(self, tmp_path):
+        cat = self._catalog().index_footprints(9)
+        path = str(tmp_path / "indexed.parquet")
+        cat.to_geoparquet(path)
+        back = Catalog.from_geoparquet(path)
+        assert back.metadata[sources.FOOTPRINT_CELLS_ORDER] == 9
+        v0, o0, _ = cat.footprint_cells()
+        v1, o1, _ = back.footprint_cells()
+        assert np.array_equal(v0, v1) and np.array_equal(o0, o1)
+
+    def test_column_is_morton_typed_on_disk(self, tmp_path):
+        # Same typed-morton convention the ShardMap parquet manifest uses
+        # (docs/morton_arrow.md): the words are a mortie extension type, not
+        # anonymous u64, so an Arrow-aware reader sees what they are.
+        import pyarrow.parquet as pq
+
+        path = str(tmp_path / "indexed.parquet")
+        self._catalog().index_footprints(6).to_geoparquet(path)
+        field = pq.read_table(path).schema.field(sources.FOOTPRINT_CELLS)
+        assert isinstance(field.type, pa.LargeListType)
+        assert field.type.value_type.extension_name == "mortie.morton_index"
+
+    def test_filter_bbox_carries_the_column_aligned(self):
+        cat = self._catalog().index_footprints(9)
+        values, offsets, _ = cat.footprint_cells()
+        kept = cat.filter_bbox((-76.61, 38.8, -76.57, 39.0))
+        assert kept.table.column("id").to_pylist() == ["g0"]
+        k_values, k_offsets, k_order = kept.footprint_cells()
+        assert k_order == 9
+        assert np.array_equal(
+            k_values[k_offsets[0] : k_offsets[1]], values[offsets[0] : offsets[1]]
+        )
