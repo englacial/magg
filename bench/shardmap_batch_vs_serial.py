@@ -183,6 +183,18 @@ def _load_case(name):
         # The demo/01_query.ipynb path: cut the global clone to the AOI's
         # shard-complete bbox first, then let the exact intersection prune.
         cat = cat.filter_bbox([grid.coverage_bbox(parts)])
+    # This line, not the intersection, is the memory story at operator scale, and
+    # it is worth being precise about *which* part of it. On the full clone:
+    # 137 MB interpreter -> 1,353 MB after from_geoparquet -> 4,038 MB resident
+    # here, so granule_records() itself adds ~2,684 MB. The coordinate arrays it
+    # returns are only 282.9 MB of that (17,681,679 vertices), 7%. The dominant
+    # term is the seven whole-table ``to_pylist()`` calls at sources.py:525-552,
+    # which are all live simultaneously (~1.8 GB): ``assets`` alone is 1,147 MB
+    # (2,064 B/row, 28% of the plateau) and the loop reads exactly two hrefs out
+    # of each dict; geometry WKB is 305 MB, the str values 304 MB, the dict
+    # objects 151 MB, id 49 MB, the two datetimes 63 MB. So the large cheap lever
+    # is not vectorizing shapely.from_wkb (<=15% of the plateau) but projecting
+    # the two href fields in Arrow / batching the to_pylist() calls.
     records = cat.granule_records()
     all_shards = {int(s) for s in grid.coverage(_region_parts(parts, cat.metadata))}
     return records, grid, all_shards
