@@ -1629,7 +1629,8 @@ def process_and_write_hive(
     # sidecar is PUT just before it (issue #200 phase 2), and both inherit
     # its debris semantics: a torn worker's coverage never becomes visible.
     # The leaf write order is pinned: dense (streamed, or one object each when
-    # sharded) -> ragged (one object, issue #209) -> coverage sidecar -> stamp.
+    # sharded) -> ragged (one object, issue #209) -> coverage sidecar -> stamp
+    # -> granule-id sibling (issue #388; after the stamp, inside the bracket).
     if "store" in box and not metadata.get("error"):
         _t0 = time.time()
         if not sharded:
@@ -1660,16 +1661,18 @@ def process_and_write_hive(
             window=window["label"] if window else None,
             time_range=time_range,
         )
-        _write_elapsed += time.time() - _t0
         # The recorded granule-id list, as this leaf's own sibling object
         # (issue #388): AFTER the stamp, so it never certifies a leaf that
         # did not land, and written here rather than at the caller's sidecar
         # PUT because ``granule_urls`` is the very list the identity gate
         # compares — one source for the recorded id space, on both backends.
-        # Fail-open inside (telemetry class, D9).
+        # Fail-open inside (telemetry class, D9). Inside the write bracket:
+        # it is a write this seam performs, so ``phase_timings["write"]``
+        # must account for it.
         from zagg.telemetry import write_granule_ids
 
         write_granule_ids(leaf_path, granule_urls, spec=sidecar_spec, **store_kwargs)
+        _write_elapsed += time.time() - _t0
     # Write-phase split (issue #249): read/index/aggregate come from
     # ``process_shard``; ``write`` is the leaf write-out above (template +
     # dense chunks + ragged + coverage sidecar + stamp). Same gate as the flat

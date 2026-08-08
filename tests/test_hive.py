@@ -7,6 +7,7 @@ retry semantics (D4), and the local runner's hive write path.
 
 import json
 import os
+import time
 from dataclasses import asdict
 
 import numpy as np
@@ -1790,6 +1791,23 @@ class TestHiveProfileWritePhase:
 
         leaf = hive.shard_leaf_path(root, shard)
         assert hive.read_commit(open_store(leaf))["complete"] is True
+
+    def test_write_phase_covers_the_granule_id_sibling(self, monkeypatch, cfg, tmp_path):
+        # The bracket must account for EVERY PUT the seam makes (issue #388):
+        # phase_timings["write"] flattens to phase_write on the D20 record and
+        # into every run parquet, so a PUT outside it silently under-reports.
+        import zagg.telemetry as telemetry
+
+        real = telemetry.write_granule_ids
+
+        def slow(*a, **k):
+            time.sleep(0.05)
+            return real(*a, **k)
+
+        monkeypatch.setattr(telemetry, "write_granule_ids", slow)
+        fake = self._profiled_fake(self._grid(cfg), ragged={"h": ([np.array([1.0, 2.0])], [0])})
+        _grid, _shard, _root, meta = self._run(monkeypatch, cfg, tmp_path, fake)
+        assert meta["phase_timings"]["write"] >= 0.05
 
     def test_sharded_default_path_stamps_write_when_timed(self, monkeypatch, cfg, tmp_path):
         # Sharded edition: the post-stream write_leaf_to_zarr bracket lands in

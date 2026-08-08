@@ -1215,11 +1215,12 @@ def process_and_write_raster_hive(
 
     The stamp is the leaf's FINAL write: dense slabs (streamed) -> coverage
     sidecar (edge shards only; interior shards stamp ``"full"`` with no
-    sidecar PUT) -> stamp. ``cells_with_data`` counts the occupied-cell
+    sidecar PUT) -> stamp -> granule-id sibling (issue #388).
+    ``cells_with_data`` counts the occupied-cell
     union; ``granule_count`` the unit's acquisitions (asset-carrying
     entries). Phase timings are always collected (issue #297):
     ``metadata["phase_timings"] = {"sample", "write", "hash"}`` with the leaf
-    write-out (template + slabs + sidecar + stamp) as ``write``; the
+    write-out (template + slabs + sidecar + stamp + sibling) as ``write``; the
     per-stage ``stages`` block (issue #249) stays gated on ``profile`` /
     a passed ``stage_stats`` (the local dispatcher's debug-logging flavor).
 
@@ -1396,7 +1397,8 @@ def process_and_write_raster_hive(
         meta["identity"] = identity["classification"]
     # Stamp ONLY a leaf that wrote slabs: a unit that streamed nothing has no
     # prefix, and a worker error raised out above, leaving debris (D4). Write
-    # order is pinned: dense slabs -> coverage sidecar -> stamp.
+    # order is pinned: dense slabs -> coverage sidecar -> stamp -> granule-id
+    # sibling (issue #388; after the stamp, inside the write bracket).
     meta["cells_with_data"] = 0
     # Accurate leaf-written signal for the stats-sidecar gate (issue #297): set
     # iff a slab streamed (``"store" in box``), so both dispatchers gate the
@@ -1436,16 +1438,17 @@ def process_and_write_raster_hive(
             window=label,
             time_range=time_range,
         )
-        write_s += time.time() - _t0
         # The recorded granule-id list as this leaf's sibling object (issue
         # #388), after the stamp and in the raster id space the gate plans
         # against — the vector seam's posture, same rationale (one source for
-        # the recorded id space; fail-open inside).
+        # the recorded id space; fail-open inside; inside the write bracket,
+        # because the write phase must account for every PUT the seam makes).
         from zagg.telemetry import write_granule_ids
 
         write_granule_ids(
             leaf_path, raster_granule_ids(granules), spec=sidecar_spec, **store_kwargs
         )
+        write_s += time.time() - _t0
     # Phase split (issues #100/#249; always-on collection since issue #297 —
     # the stats sidecar needs complete timings by default): only a unit that
     # actually wrote carries it, so a no-data unit stays write-less and
