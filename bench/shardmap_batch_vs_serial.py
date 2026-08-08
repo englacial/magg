@@ -314,11 +314,14 @@ def run_knee(name, order=13, blocks=KNEE_BLOCKS, reps=1):
         print(f"knee: skipped, {CASES[name]['catalog']} not present", flush=True)
         return
     print(f"\nblock-size knee -- {name} @order{order}, min of {reps} (real footprints)", flush=True)
-    print(f"{'block':>7} {'wall_s':>8} {'peak_MB':>8}", flush=True)
+    print(f"{'block':>7} {'wall_s':>8} {'peak_MB':>8} {'peak_hw':>8}", flush=True)
     for block in blocks:
         runs = [_measure(name, "batch", order, block=block) for _ in range(reps)]
         wall = min(m["wall_s"] for m in runs)
-        print(f"{block:>7} {wall:>8.2f} {_peak_mb(runs[0]):>8.0f}", flush=True)
+        print(
+            f"{block:>7} {wall:>8.2f} {_peak_mb(runs[0]):>8.0f} {_peak_hw_mb(runs[0]):>8.0f}",
+            flush=True,
+        )
 
 
 def main(argv=None):
