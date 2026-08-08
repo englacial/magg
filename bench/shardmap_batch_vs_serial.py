@@ -54,9 +54,15 @@ Run::
 
     uv run python bench/shardmap_batch_vs_serial.py
     uv run python bench/shardmap_batch_vs_serial.py --cases neon,88s
-    uv run python bench/shardmap_batch_vs_serial.py --knee 88s
     uv run python bench/shardmap_batch_vs_serial.py --cases full   # slow, needs the clone
-    uv run python bench/shardmap_batch_vs_serial.py --cases full --orders 13   # ~30 min
+
+    # block-size knee: blocks, order and repeat count are all CLI-settable, so
+    # every column of the PR body's sweep is reproducible from here
+    uv run python bench/shardmap_batch_vs_serial.py --knee california --order 13 --reps 3
+    uv run python bench/shardmap_batch_vs_serial.py --knee california --order 9 \
+        --blocks 16,32,64,1024 --reps 3
+    uv run python bench/shardmap_batch_vs_serial.py --knee 88s --order 13 \
+        --blocks 32,64,256,1024 --reps 3
 """
 
 from __future__ import annotations
@@ -82,6 +88,11 @@ CFG9 = f"{BENCH}/configs/atl03_tdigest_healpix_o9.yaml"
 # default MOC order resolves to 13 (#92). Both orders are swept: 13 is what a
 # default build actually runs, 9 is the legal floor the issue's baselines used.
 ORDERS = (9, 13)
+
+# Default ``--blocks`` for the knee sweep; every block quoted in the PR body is
+# reachable from the CLI (``--blocks``/``--order``/``--reps``), so no claim about
+# the block size rests on a run this script cannot regenerate.
+KNEE_BLOCKS = (8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 2048)
 
 CASES = {
     "neon": {"catalog": f"{BENCH}/catalogs/cat_neon.parquet", "aoi": f"{BENCH}/AOP_NEON.geojson"},
@@ -243,26 +254,44 @@ def run_cases(names, orders=None):
             )
 
 
-def run_knee(name, order=13):
-    """Re-validate ``_MOC_BATCH_RINGS`` on real footprints, not synthetic ones."""
+def run_knee(name, order=13, blocks=KNEE_BLOCKS, reps=1):
+    """Re-validate ``_MOC_BATCH_RINGS`` on real footprints, not synthetic ones.
+
+    ``reps`` > 1 reports the **min** wall over N runs of each block.
+    ``polygons_to_morton_mocs`` is rayon-parallel and so the most load-sensitive
+    number here: single-shot walls scatter by tens of percent on a busy machine,
+    which is wider than the block-to-block effect being measured. Peak is stable
+    across reps and is reported from the first.
+    """
     if not _available(name):
         print(f"knee: skipped, {CASES[name]['catalog']} not present", flush=True)
         return
-    print(f"\nblock-size knee -- {name} @order{order} (real footprints)", flush=True)
+    print(f"\nblock-size knee -- {name} @order{order}, min of {reps} (real footprints)", flush=True)
     print(f"{'block':>7} {'wall_s':>8} {'peak_MB':>8}", flush=True)
-    for block in (32, 64, 128, 256, 512, 1024, 2048):
-        m = _measure(name, "batch", order, block=block)
-        print(f"{block:>7} {m['wall_s']:>8.2f} {_peak_mb(m):>8.0f}", flush=True)
+    for block in blocks:
+        runs = [_measure(name, "batch", order, block=block) for _ in range(reps)]
+        wall = min(m["wall_s"] for m in runs)
+        print(f"{block:>7} {wall:>8.2f} {_peak_mb(runs[0]):>8.0f}", flush=True)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--cases", default="neon,88s,california")
+    ap.add_argument(
+        "--cases",
+        default=None,
+        help="default neon,88s,california -- or nothing when --knee is given",
+    )
     ap.add_argument("--orders", default=None, help="override the swept MOC orders, e.g. 13")
     ap.add_argument("--knee", default=None, help="case to sweep _MOC_BATCH_RINGS on")
+    ap.add_argument(
+        "--blocks",
+        default=",".join(str(b) for b in KNEE_BLOCKS),
+        help="block sizes for --knee",
+    )
+    ap.add_argument("--reps", type=int, default=1, help="--knee repeats; wall is min-of-N")
     ap.add_argument("--measure", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--path", choices=("serial", "batch"), default="batch")
-    ap.add_argument("--order", type=int, default=13)
+    ap.add_argument("--order", type=int, default=13, help="MOC order for --knee (and --measure)")
     ap.add_argument("--block", type=int, default=None)
     args = ap.parse_args(argv)
 
@@ -270,9 +299,12 @@ def main(argv=None):
         _measure_child(args.measure, args.path, args.order, args.block)
         return 0
     orders = tuple(int(o) for o in args.orders.split(",")) if args.orders else None
-    run_cases([c for c in args.cases.split(",") if c], orders)
+    cases = args.cases if args.cases is not None else ("" if args.knee else "neon,88s,california")
+    if cases:
+        run_cases([c for c in cases.split(",") if c], orders)
     if args.knee:
-        run_knee(args.knee)
+        blocks = tuple(int(b) for b in args.blocks.split(",") if b)
+        run_knee(args.knee, order=args.order, blocks=blocks, reps=args.reps)
     return 0
 
 
