@@ -44,15 +44,25 @@ import numpy as np
 # order past the cap and silently lose coverage (#92).
 MORTIE_MOC_ORDER_CAP = 18
 
-# Rings per batch call into mortie's ``polygons_to_morton_mocs`` (issue #396).
-# Blocking keeps peak memory proportional to the block rather than the catalog,
-# and the size is set from a sweep over **real** CMR catalogs
-# (``bench/shardmap_batch_vs_serial.py``) -- the two earlier values (1024, then
-# 256) were both picked against synthetic footprints and were both too large.
+# Rings per batch call into mortie's ``polygons_to_morton_mocs`` (issue #396),
+# set from a sweep over **real** CMR catalogs
+# (``bench/shardmap_batch_vs_serial.py --knee``) -- the two earlier values (1024,
+# then 256) were both picked against synthetic footprints and were both too
+# large. A real ATL03 quarter-orbit footprint covers a median 9,266 MOC words at
+# order 13 (mean 8,659, max 10,881 over 1,000 granules sampled from the clone)
+# against ~220 for a compact synthetic quadrilateral, so a synthetic sweep
+# under-reads the block's memory by ~40x.
 #
-# A real ATL03 quarter-orbit footprint covers a median ~10,400 MOC words at order
-# 13, against ~220 for a compact synthetic quadrilateral, so a synthetic sweep
-# under-reads the block's memory by ~47x. On real footprints wall time is flat
+# Peak has **two** terms and blocking bounds only one of them. The block term is
+# this constant x per-ring MOC words: California at order 13 peaks 57 MB at
+# block 32, 251 at 64, 412 at 256, 616 at 2048. The catalog term is
+# ``_flatten_rings``' up-front concatenate -- ~0.5 KB of vertices per granule,
+# so 283 MB of lat/lon plus 9 MB of offsets/owners across the 555,867-granule
+# clone -- which no block size removes, and which is why the same 190,625-pair
+# build peaks well above California's 4,354-granule figure at the same block.
+# Sizing a build's memory means adding both, not reading the block alone.
+#
+# On real footprints wall time is flat
 # from ~48 rings up (California at order 13: 8.6-8.8 s anywhere from 48 to 2048,
 # and order 9 is flat from 32), while peak RSS keeps climbing with the block:
 # 57 MB at 32, 250 MB at 64, 409 MB at 256, 612 MB at 2048 -- and on the denser
