@@ -183,9 +183,30 @@ def leaf_recorded_ids(leaf_path, recorded, *, spec=None, store_kwargs=None):
     torn rewrite (one of the two PUTs lost, or a stale sibling beside a fresh
     sidecar) reads as no recorded set rather than as ids that could name the
     wrong granules as dropped — or, worse, hide real ones. Fail-open on every
-    other fault (absent, unreadable, malformed): ``None``, which the caller
-    classifies ``unrecorded-ids`` and rewrites.
+    other fault (absent, unreadable, malformed): the RECORD's own
+    ``granule_ids`` if it carries one (the back-compat window below), else
+    ``None``, which the caller classifies ``unrecorded-ids`` and rewrites.
+
+    The sibling is also read leniently on its ``spec`` marker — an absent or
+    unknown one is not a rejection. Only the hash pairing decides, so a future
+    ``zagg-granule-ids/N`` that keeps these two keys stays readable, and an
+    unrecognized one degrades to the ruled ``unrecorded-ids`` fallback rather
+    than to an error.
     """
+    ids = _sibling_ids(leaf_path, recorded, spec, store_kwargs)
+    if ids is not None:
+        return ids
+    # Back-compat (issue #388): leaves written in the window between PR #397's
+    # merge (``3f13af2``) and the commit that moved the list out carry it ON
+    # the record with no sibling at all. Without this they classify
+    # ``unrecorded-ids`` forever; with it those stores self-heal, and the list
+    # pairs by construction (``build_record`` hashed the very ids it embedded).
+    legacy = (recorded or {}).get("granule_ids")
+    return legacy if isinstance(legacy, list) else None
+
+
+def _sibling_ids(leaf_path, recorded, spec, store_kwargs):
+    """The paired granule-id sibling's list, or ``None``; see above."""
     from zagg.telemetry import read_granule_ids
 
     try:
