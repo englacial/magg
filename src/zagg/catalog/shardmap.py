@@ -62,15 +62,21 @@ MORTIE_MOC_ORDER_CAP = 18
 # build peaks well above California's 4,354-granule figure at the same block.
 # Sizing a build's memory means adding both, not reading the block alone.
 #
-# On real footprints wall time is flat
-# from ~48 rings up (California at order 13: 8.6-8.8 s anywhere from 48 to 2048,
-# and order 9 is flat from 32), while peak RSS keeps climbing with the block:
-# 57 MB at 32, 250 MB at 64, 409 MB at 256, 612 MB at 2048 -- and on the denser
-# 88S catalog the same step is 210 MB at 64 against 1,057 MB at 256.
+# Wall is where the block earns nothing above ~32. Quote it min-of-N only:
+# ``polygons_to_morton_mocs`` is rayon-parallel, so single-shot walls scatter by
+# tens of percent on a loaded machine -- wider than the effect. Min of 3,
+# California at order 13: 12.62 s at block 8, 11.06 at 16, 9.89 at 32, 9.84 at
+# 48, 9.67 at 64, then 9.5-9.8 flat out to 2048. So the batch's fixed cost is
+# amortized by ~32 rings (within 4% of the asymptote), against the order of
+# magnitude the synthetic sweep suggested. Order 9 is flatter still (0.73 s at
+# 16, 0.66 at 32, 0.64 at 64, 0.58 at 1024).
 #
-# 64 is therefore the knee: at or within ~6% of the flat wall asymptote in every
-# case measured, for 1.6-5x less peak than 256.
-_MOC_BATCH_RINGS = 64
+# 32 is the size: it holds the block term to 57 MB on California -- 4.4x under
+# 64's 251 MB and 7x under 256's 412 MB -- for 2% wall there. The one case that
+# argues the other way is the far denser 88S catalog, where 32 costs 15% wall
+# (63.13 s vs 55.02 s, min of 3) for only 5% less peak (200 MB vs 210 MB); the
+# memory is worth more than the wall on a Lambda, so 32 stands.
+_MOC_BATCH_RINGS = 32
 
 # ── granule footprint helpers ────────────────────────────────────────────────
 
