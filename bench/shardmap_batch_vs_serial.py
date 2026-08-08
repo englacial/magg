@@ -15,10 +15,14 @@ them. (``benchmarks/mortie_order_sweep.py`` remains synthetic and says so; its
 real-catalog successor for the *order* question is ``bench/neon_order_sweep.py``,
 whose conventions this script follows.)
 
-Cases, smallest first. The first two are committed fixtures, so they run
-anywhere in the repo; the last two need the 305 MB full-mission ATL03 clone
-(``data/atl03_v007/``, not committed) and skip cleanly when it is absent, as the
-other real-catalog benches do.
+Cases, smallest first. The first two are committed fixtures, so they run in any
+checkout (every path below is resolved relative to *this file*, so the benchmark
+reads its inputs from the same tree as the code under test); the last two need
+the 305 MB full-mission ATL03 clone (``data/atl03_v007/``, not committed) and
+skip cleanly when it is absent via ``_available()``. That guard is new here --
+``bench/neon_order_sweep.py`` reads the clone with an unguarded ``pq.read_table``
+and raises when it is missing, so this is an improvement on that file rather
+than a convention copied from it.
 
   neon        2,089 granules   committed  cat_neon.parquet  x AOP_NEON
   88s        35,639 granules   committed  cat_88s.parquet   x antarctic_88s
@@ -56,7 +60,7 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = "/Users/espg/software/zagg"
+REPO = str(Path(__file__).resolve().parents[1])
 BENCH = f"{REPO}/tests/data/benchmark"
 FULL = f"{REPO}/data/atl03_v007/atl03_v007_full.parquet"
 CFG9 = f"{BENCH}/configs/atl03_tdigest_healpix_o9.yaml"
