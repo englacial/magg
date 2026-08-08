@@ -801,7 +801,7 @@ class TestFootprintCells:
         cat = _overlapping_catalog()
 
         class _FakeCMR:
-            def fetch(self, query, **kw):  # noqa: ARG002 (mirror the real signature)
+            def fetch(self, query, **kw):  # unused args: mirrors the real signature
                 return cat
 
         monkeypatch.setattr(sources, "CMRSource", _FakeCMR)

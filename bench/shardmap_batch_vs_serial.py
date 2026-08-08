@@ -235,7 +235,7 @@ def _measure_child(name, path, order, block):
         # (which includes the id -> table-row alignment ``build`` pays every
         # time) and the moc_and loop itself. Only ``index_footprints`` above is
         # outside, because only it is one-time.
-        def fn(records, grid, all_shards, order):  # noqa: ARG001 (arm signature)
+        def fn(records, grid, all_shards, order):  # unused args: the shared arm signature
             plan = shardmap._footprint_cells_plan(cat, records, grid, "mortie", "swath", None)
             values, offsets, _order, rows = plan
             return shardmap._intersect_footprint_cells(rows, values, offsets, grid, all_shards)
