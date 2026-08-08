@@ -685,9 +685,12 @@ than trusted.
 
 **The contraction guard cannot protect leaves written before this
 release.** That sibling arrives with issue #388. A leaf written before it has
-only the recorded hash — there is no recorded set to diff — so any mismatch
-over such a leaf classifies `unrecorded-ids` and performs the **silent wholesale
-rewrite the guard exists to prevent**, contraction or not. The guard only
+only the recorded hash — there is no recorded set to diff — so any
+*granule-hash* mismatch over such a leaf classifies `unrecorded-ids` and
+performs the **silent wholesale rewrite the guard exists to prevent**,
+contraction or not. (A config-only rerun — same inputs, changed semantic core
+— is not one of these: the hashes agree, so it reads `semantic-mismatch`
+without any sibling read, and never inflates `cells_unrecorded`.) The guard only
 protects a leaf after that leaf has been rewritten at least once under this
 release. These rewrites are counted apart (`cells_unrecorded` in the run
 summary; the CLI prints them as "rewritten with the guard inert") so an

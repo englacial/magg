@@ -268,7 +268,9 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorde
         non-empty recorded set is a full contraction and does refuse.
     load_recorded_ids : callable, optional
         Zero-argument loader for the leaf's RECORDED id list, called at most
-        once and ONLY after the ``granules_sha256`` fast path failed — the
+        once and ONLY when the recorded and planned ``granules_sha256``
+        DISAGREE — never on the skip path, and never on the equal-hash /
+        changed-semantic quadrant, whose verdict the hashes alone decide. The
         laziness is the whole point of keeping the list out of the record
         (issue #388's ruling). ``None`` (or a loader returning ``None``)
         means no recorded set is available: ``unrecorded-ids``.
@@ -290,8 +292,20 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorde
     planned = [str(g) for g in planned_ids]
     rec_hash = recorded.get("granules_sha256")
     semantic_match = semantic_hash is not None and recorded.get("semantic_hash") == semantic_hash
-    if rec_hash is not None and rec_hash == granules_sha256(planned) and semantic_match:
+    hashes_match = rec_hash is not None and rec_hash == granules_sha256(planned)
+    if hashes_match and semantic_match:
         return {"action": "skip", "classification": "equal", "missing": []}
+    if hashes_match:
+        # Equal hashes mean an identical sorted id multiset, so the diff is
+        # provably empty and the ONLY reachable verdict is semantic-mismatch:
+        # decide it here rather than paying the sibling GET for a read that
+        # cannot change the answer. This is the ordinary config-only rerun
+        # (same inputs, changed semantic core) — at CA o9 that would be 2,721
+        # needless GETs of up to ~550 KB each, which is exactly the per-shard
+        # cost the id list was split out of the sidecar to avoid. It also
+        # keeps this quadrant OFF ``unrecorded-ids`` when the sibling is
+        # absent: the guard is not inert here, it has proved no contraction.
+        return {"action": "rewrite", "classification": "semantic-mismatch", "missing": []}
     # The ONE read the fast path exists to avoid: the recorded id list lives
     # beside the sidecar, not in it (issue #388's ruling on question (6)), and
     # is fetched only now that the hashes disagree.
