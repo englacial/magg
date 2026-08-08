@@ -59,6 +59,16 @@ SIDECAR_NAME = "stats.json"
 #: only when the hash MISMATCHES: to NAME the granules a contraction dropped.
 GRANULE_IDS_NAME = "granules.json"
 
+#: The granule-id sibling's OWN version marker (issue #388), on the refusal
+#: manifest's precedent. Deliberately not :data:`SCHEMA_VERSION`: that number
+#: versions the D20 run RECORD, which this object exists to not be — welding
+#: them would bump the sibling on every record rev and make a sibling format
+#: change unversionable without revving the record. Readers must treat it
+#: leniently (:func:`zagg.dedup.leaf_recorded_ids`): the hash pairing is what
+#: decides, and an unknown marker degrades to ``unrecorded-ids``, never to an
+#: error.
+GRANULE_IDS_SPEC = "zagg-granule-ids/1"
+
 #: ``platform.machine()`` spellings -> the #298 price-table arch keys, so the
 #: worker-side record prices with the same table the dispatcher's cost block
 #: uses. An unmapped/absent arch falls back to the flat default rate.
@@ -871,9 +881,11 @@ def write_granule_ids(leaf_path: str, granule_ids, spec: str | None = None, **st
     with no Lambda-handler change (the sidecar's own ``semantic_hash``
     precedent).
 
-    The object is self-describing and self-pairing: it carries the
-    ``granules_sha256`` of the list it holds, and a reader must accept it
-    only when that matches the sidecar's (:func:`zagg.dedup.leaf_recorded_ids`).
+    The object is self-describing and self-pairing: it carries its own
+    :data:`GRANULE_IDS_SPEC` marker (not the D20 record's ``schema_version``
+    — this is deliberately not that schema) and the ``granules_sha256`` of the
+    list it holds, and a reader must accept it only when that hash matches the
+    sidecar's (:func:`zagg.dedup.leaf_recorded_ids`).
     A torn rewrite — new sidecar, lost sibling PUT, or the reverse — then
     reads as "no recorded set" rather than as a stale set that could refuse
     or excuse the wrong granules.
@@ -898,7 +910,7 @@ def write_granule_ids(leaf_path: str, granule_ids, spec: str | None = None, **st
             granule_ids_key(name, spec),
             json.dumps(
                 {
-                    "schema_version": SCHEMA_VERSION,
+                    "spec": GRANULE_IDS_SPEC,
                     "granules_sha256": granules_sha256(ids),
                     "granule_ids": ids,
                 }
