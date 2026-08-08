@@ -46,13 +46,24 @@ SCAN_SUFFIXES = {".md", ".py", ".yaml", ".yml"}
 # The ``aoi_mask`` family: the six sites documenting the runtime gate.
 AOI_MASK_FILES = ("docs/aoi_mask.md", "src/zagg/grids/aoi.py")
 
-# ``mortie`` followed by a release number, in every voice the tree uses:
-# ``mortie >= 0.8.3``, ``mortie ≥ 0.8.4``, ``mortie>=0.8.3``, bare
-# ``mortie 0.8.1``, and the backticked variants (the backticks fall outside
-# the match). Whitespace spans newlines so a wrapped citation is not a blind
-# spot. ``espg/mortie#89`` does not match: an issue reference is not a
-# version, and neither is "frozen for mortie 1.x".
-_CITATION = re.compile(r"mortie\s*(?:>=|≥)?\s*v?(\d+\.\d+(?:\.\d+)*)")
+# ``mortie`` followed by a release number. A missed spelling is a *silent*
+# pass, the one failure mode a drift guard cannot afford, so the separator and
+# operator sets are deliberately loose: ``mortie >= 0.8.3``, ``mortie ≥ 0.8.4``,
+# ``mortie>=0.8.3``, ``mortie==0.9.3`` (how a pin gets written up — the
+# ``lambda`` extra is nothing but ``==`` pins), ``mortie ~= 0.9``, bare
+# ``mortie 0.8.1``, ``mortie (0.9.0)`` / ``mortie: 0.9.0`` / ``mortie-0.9.0``,
+# ``mortie version 0.9.0``, sentence-initial ``Mortie 0.9.0``, and the
+# backticked variants (the backticks fall outside the match). Whitespace spans
+# newlines so a wrapped citation is not a blind spot.
+#
+# Deliberately *not* matched: ``espg/mortie#89`` (an issue reference is not a
+# version — ``#`` is outside the separator class), "frozen for mortie 1.x" (no
+# second numeric component), and upper bounds like ``mortie < 1.0``, which
+# promise no API and so are not citations this guard is about.
+_CITATION = re.compile(
+    r"mortie[\s(:,_-]*(?:version|release)?\s*(?:>=|==|~=|>|≥)?\s*v?(\d+\.\d+(?:\.\d+)*)",
+    re.IGNORECASE,
+)
 
 
 def _cited_versions(text):
@@ -162,6 +173,10 @@ class TestGuardFires:
 
     def test_issue_references_are_not_versions(self):
         assert _cited_versions("(espg/mortie#89, espg/mortie#100) and mortie 1.x") == []
+        # Widening the operator set must not drag these in: an issue number is
+        # not a release, and an upper bound is not a promise about an API.
+        assert _cited_versions("gated on mortie#116, and frozen for mortie 1.x") == []
+        assert _cited_versions("pinned mortie < 1.0 while the API settles") == []
 
     def test_every_citation_spelling_is_recognized(self):
         text = (
@@ -175,6 +190,24 @@ class TestGuardFires:
             "0.8.1",
             "0.9.0",
         ]
+
+    def test_the_spellings_that_used_to_pass_silently_are_caught(self):
+        # Each of these read as no citation at all before the pattern was
+        # widened — a doc could promise an unshipped API and stay green.
+        for spelling in (
+            "Mortie 0.10.0 adds the flat export",  # sentence-initial
+            "the layer pins mortie==0.10.0",  # how a pin gets written up
+            "mortie ~= 0.10.0",
+            "mortie > 0.10.0",
+            "the cover entry points (mortie (0.10.0))",
+            "see mortie: 0.10.0",
+            "shipped in mortie, 0.10.0",
+            "the mortie-0.10.0 wheel",
+            "needs mortie version 0.10.0",
+            "requires at least mortie release 0.10.0",
+            "tagged mortie v0.10.0",
+        ):
+            assert [str(v) for v, _ in _cited_versions(spelling)] == ["0.10.0"], spelling
 
     def test_the_floor_line_is_not_scanned_as_a_citation(self):
         # The regex would happily match ``mortie>=0.9.3`` in pyproject.toml, so
