@@ -120,18 +120,14 @@ class TestQuotedVersionsAgainstFloor:
     def test_scan_finds_the_versioned_sites(self):
         # A regex that silently matched nothing would let every other test in
         # this module pass forever, so pin that the scan has real work to do.
+        # Only the count, deliberately: naming the files would ratchet them in
+        # place, and *deleting* an unenforced per-feature minimum is the very
+        # edit this PR argues for. The actual is 16, across docs/aoi_mask.md,
+        # docs/design/sparse_coverage.md, docs/morton_arrow.md,
+        # docs/ragged_layout.md, src/zagg/configs/atl03_tdigest_healpix.yaml,
+        # and src/zagg/{grids/aoi,grids/healpix,grids/morton,readers/_layout}.py.
         sites = _scan()
         assert len(sites) >= 12, f"mortie citation scan went blind: {sites}"
-        files = {path for path, _, _ in sites}
-        for expected in (
-            "docs/aoi_mask.md",
-            "docs/morton_arrow.md",
-            "docs/ragged_layout.md",
-            "src/zagg/grids/aoi.py",
-            "src/zagg/grids/morton.py",
-            "src/zagg/grids/healpix.py",
-        ):
-            assert expected in files, f"{expected} no longer reached by the scan"
 
     def test_no_citation_outruns_the_floor(self):
         floor = _mortie_floor()
