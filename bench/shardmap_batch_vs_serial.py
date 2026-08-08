@@ -19,8 +19,9 @@ worst case the **p99/max** (10,618 / 10,881). The synthetic figure is what
 produced a block size tuned an order of magnitude too large; that the earlier
 "realistic" 32,127 is 3.0x the largest footprint in the sample is what confirms
 it was a 90-degree-of-latitude envelope rather than a CMR polygon. Real catalogs
-are in the tree -- use them. (``benchmarks/mortie_order_sweep.py`` remains
-synthetic and says so; its real-catalog successor for the *order* question is
+are in the tree -- use them. (The synthetic ``benchmarks/mortie_order_sweep.py``
+was retired with this change, espg's ruling: if we keep a benchmark at all it
+runs on real data. The *order* question is answered by the real-catalog
 ``bench/neon_order_sweep.py``.)
 
 Cases, smallest first. The first two are committed fixtures, so they run in any

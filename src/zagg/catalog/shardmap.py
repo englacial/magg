@@ -261,8 +261,8 @@ def _resolve_mortie_order(mortie_order, grid) -> int:
     order resolves to 13. Keying the MOC to the chunk order matches the unit work
     is dispatched at: footprints resolve no finer than the chunk the worker reads,
     which is enough to keep ``moc_to_order`` from upsampling onto neighbor shards
-    (#92) at near-minimal compute -- the order-sweep benchmark
-    (``benchmarks/mortie_order_sweep.py``) shows granules/shard flat for every
+    (#92) at near-minimal compute -- the real-catalog order sweep
+    (``bench/neon_order_sweep.py``) shows granules/shard flat for every
     order >= ``parent_order`` while wall-time grows with order, so a finer MOC
     buys precision the order-``parent_order`` shard cells can't see.
     The order is still clamped to ``MORTIE_MOC_ORDER_CAP`` (mortie's order-18
