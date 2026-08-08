@@ -56,6 +56,11 @@ Run::
     uv run python bench/shardmap_batch_vs_serial.py --cases neon,88s
     uv run python bench/shardmap_batch_vs_serial.py --cases full   # slow, needs the clone
 
+    # the order a default build actually resolves to, at operator scale: batch
+    # only, because the serial arm of this one is ~1 h. It is the single row in
+    # the table with no oracle assert and it prints ``no-assert`` to say so
+    uv run python bench/shardmap_batch_vs_serial.py --cases full --orders 13 --arms batch
+
     # block-size knee: blocks, order and repeat count are all CLI-settable, so
     # every column of the PR body's sweep is reproducible from here
     uv run python bench/shardmap_batch_vs_serial.py --knee california --order 13 --reps 3
@@ -229,7 +234,17 @@ def _peak_hw_mb(m) -> float:
     return m["rss_peak_mb"] - m["rss_load_mb"]
 
 
-def run_cases(names, orders=None):
+def run_cases(names, orders=None, arms=("serial", "batch")):
+    """Serial vs batch per (case, order), asserting batch == serial on every row.
+
+    ``arms`` drops one side. ``--arms batch`` exists for exactly one row --
+    ``full`` at order 13, where the serial arm is ~1 h -- and it is the only way
+    to get a row **without** the oracle assert, so it prints ``no-assert`` to say
+    so rather than letting a bare number imply a verified one. What backs that
+    row instead is ``california`` at the same order and AOI, where serial and
+    batch do run head to head on identical output (190,625 pairs / 2,721 shards),
+    plus ``tests/test_shardmap.py::TestMortieBatch``'s ``dict ==`` identity pins.
+    """
     print(
         f"{'case':>11} {'order':>5} {'granules':>9} {'shards':>7} {'pairs':>9} "
         f"{'serial_s':>9} {'batch_s':>8} {'x':>5} {'ser_MB':>7} {'bat_MB':>7} "
@@ -241,17 +256,29 @@ def run_cases(names, orders=None):
             print(f"{name:>11}  -- skipped: {CASES[name]['catalog']} not present", flush=True)
             continue
         for order in orders or CASES[name].get("orders", ORDERS):
-            ser = _measure(name, "serial", order)
-            bat = _measure(name, "batch", order)
-            assert ser["digest"] == bat["digest"], f"{name}@o{order}: batch != serial"
-            print(
-                f"{name:>11} {order:>5} {ser['granules']:>9,} {ser['shards_hit']:>7,} "
-                f"{ser['pairs']:>9,} {ser['wall_s']:>9.2f} {bat['wall_s']:>8.2f} "
-                f"{ser['wall_s'] / max(bat['wall_s'], 1e-9):>4.1f}x "
-                f"{_peak_mb(ser):>7.0f} {_peak_mb(bat):>7.0f} "
-                f"{_peak_hw_mb(ser):>7.0f} {_peak_hw_mb(bat):>7.0f}",
-                flush=True,
-            )
+            ser = _measure(name, "serial", order) if "serial" in arms else None
+            bat = _measure(name, "batch", order) if "batch" in arms else None
+            if ser and bat:
+                assert ser["digest"] == bat["digest"], f"{name}@o{order}: batch != serial"
+            ref = ser or bat
+            speedup = f"{ser['wall_s'] / max(bat['wall_s'], 1e-9):>4.1f}x" if ser and bat else "--"
+            row = [
+                f"{name:>11}",
+                f"{order:>5}",
+                f"{ref['granules']:>9,}",
+                f"{ref['shards_hit']:>7,}",
+                f"{ref['pairs']:>9,}",
+                f"{ser['wall_s']:>9.2f}" if ser else f"{'--':>9}",
+                f"{bat['wall_s']:>8.2f}" if bat else f"{'--':>8}",
+                f"{speedup:>5}",
+                f"{_peak_mb(ser):>7.0f}" if ser else f"{'--':>7}",
+                f"{_peak_mb(bat):>7.0f}" if bat else f"{'--':>7}",
+                f"{_peak_hw_mb(ser):>7.0f}" if ser else f"{'--':>7}",
+                f"{_peak_hw_mb(bat):>7.0f}" if bat else f"{'--':>7}",
+            ]
+            if not (ser and bat):
+                row.append(" no-assert (one arm only)")
+            print(" ".join(row), flush=True)
 
 
 def run_knee(name, order=13, blocks=KNEE_BLOCKS, reps=1):
@@ -282,6 +309,11 @@ def main(argv=None):
         help="default neon,88s,california -- or nothing when --knee is given",
     )
     ap.add_argument("--orders", default=None, help="override the swept MOC orders, e.g. 13")
+    ap.add_argument(
+        "--arms",
+        default="serial,batch",
+        help="which arms to run; 'batch' alone skips the oracle assert and says so",
+    )
     ap.add_argument("--knee", default=None, help="case to sweep _MOC_BATCH_RINGS on")
     ap.add_argument(
         "--blocks",
@@ -301,7 +333,8 @@ def main(argv=None):
     orders = tuple(int(o) for o in args.orders.split(",")) if args.orders else None
     cases = args.cases if args.cases is not None else ("" if args.knee else "neon,88s,california")
     if cases:
-        run_cases([c for c in cases.split(",") if c], orders)
+        arms = tuple(a for a in args.arms.split(",") if a)
+        run_cases([c for c in cases.split(",") if c], orders, arms)
     if args.knee:
         blocks = tuple(int(b) for b in args.blocks.split(",") if b)
         run_knee(args.knee, order=args.order, blocks=blocks, reps=args.reps)
