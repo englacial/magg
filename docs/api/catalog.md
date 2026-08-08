@@ -78,6 +78,13 @@ for: the mortie backend, `footprint="swath"`, and no caller-pinned
 `mortie_order`. Anything else takes the geometry path unchanged, so an
 exact-S2 spherely run is never silently swapped for a MOC one.
 
+The assignment it produces is the geometry path's, with one intended exception:
+a **MultiPolygon** footprint. `index_footprints` covers the union of the rings in
+each blob, while `granule_records` reads only the largest part's exterior ring —
+so for a multi-part granule the column is a superset and the index can place it
+in shards the geometry path misses. No CMR ATL03/06 footprint is multi-part
+today; antimeridian-split STAC footprints are the natural producer.
+
 ### Choosing the order
 
 **Index at the grid's `parent_order`.** A MOC answers any shard order coarser

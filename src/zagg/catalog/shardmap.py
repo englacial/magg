@@ -814,8 +814,13 @@ class ShardMap:
         ``mortie``, ``footprint="swath"`` and ``mortie_order`` is left at its
         default, the intersection becomes ``moc_and`` of each stored granule MOC
         with the AOI's own shard MOC -- no WKB parse, no coverage walk. The
-        result is the mortie backend's, unchanged; ``metadata["footprint_cells"]``
-        records that the index answered the build. A column **coarser** than the
+        result is the mortie backend's, unchanged on the single-part footprints
+        every CMR ATL03/06 granule has; ``metadata["footprint_cells"]`` records
+        that the index answered the build. The one intended divergence is a
+        **MultiPolygon** footprint, where the column is a superset: it covers
+        every part, while :meth:`~zagg.catalog.Catalog.granule_records` reads
+        only the largest part's exterior ring, so the index can place such a
+        granule in shards the geometry path misses. A column **coarser** than the
         grid's ``parent_order`` raises rather than answering (see
         :func:`_footprint_cells_plan`).
         """

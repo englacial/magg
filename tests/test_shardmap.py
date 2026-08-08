@@ -626,10 +626,12 @@ def _shard_ids(sm):
 class TestFootprintCells:
     """Phase 3: an indexed catalog answers ``build`` with set algebra (issue #396).
 
-    The oracle here is the **phase-2 geometry path itself**: every test asserts
-    the fast path reproduces the mortie build it replaces, shard keys and
-    per-shard granule order included, so the index can only ever be faster, not
-    different. What is genuinely new and therefore pinned on its own is the
+    The oracle here is the **phase-2 geometry path itself**: on single-part
+    footprints -- every CMR ATL03/06 granule -- each test asserts the fast path
+    reproduces the mortie build it replaces, shard keys and per-shard granule
+    order included, so the index can only ever be faster, not different. The one
+    intended divergence, a MultiPolygon superset, is pinned separately below.
+    What is otherwise genuinely new and therefore pinned on its own is the
     engagement gate (which builds may take it) and the refusal (which must not).
     """
 
@@ -681,6 +683,40 @@ class TestFootprintCells:
         geometry = ShardMap.build(cat, hp_grid, backend="mortie")
         fast = ShardMap.build(cat.index_footprints(11), hp_grid, backend="mortie")
         assert _shard_ids(fast) == _shard_ids(geometry)
+
+    def test_multipolygon_is_a_superset_not_an_identity(self, hp_grid):
+        # The one place the fast path is deliberately NOT the geometry path.
+        # ``index_footprints`` covers the union of the rings in each blob;
+        # ``granule_records`` reads the largest part's exterior ring only. So a
+        # two-part footprint gets the second part's shards from the index and
+        # not from geometry -- a superset, and the intended answer. Alignment is
+        # unaffected: every geometry shard is still present, with the same ids.
+        multi = _item("MULTI", -76.62, -76.60)
+
+        def _ring(lon0, lon1):
+            return [
+                [lon0, 38.85],
+                [lon1, 38.85],
+                [lon1, 38.93],
+                [lon0, 38.93],
+                [lon0, 38.85],
+            ]
+
+        # Both parts sit inside the catalog bbox (so the AOI is not what
+        # separates them); the second is the smaller, so it is the one
+        # ``granule_records`` drops.
+        multi["geometry"] = {
+            "type": "MultiPolygon",
+            "coordinates": [[_ring(-76.62, -76.60)], [_ring(-76.53, -76.52)]],
+        }
+        cat = _catalog([_item("G00", -76.56, -76.54), multi])
+        geometry = ShardMap.build(cat, hp_grid, backend="mortie")
+        fast = ShardMap.build(cat.index_footprints(11), hp_grid, backend="mortie")
+        extra = set(fast.shard_keys) - set(geometry.shard_keys)
+        assert extra, "the second part must contribute shards geometry never sees"
+        assert set(geometry.shard_keys) <= set(fast.shard_keys)
+        by_shard = dict(zip(fast.shard_keys, fast.granules, strict=True))
+        assert all([g["id"] for g in by_shard[k]] == ["MULTI"] for k in extra)
 
     def test_duplicate_granule_ids_are_refused(self, hp_grid):
         # Alignment is by granule id, and a dict lookup is last-wins: with a
