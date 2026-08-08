@@ -35,9 +35,20 @@ it is slow by construction and opt-in via ``--cases full``.
 Peak RSS needs process isolation -- ``ru_maxrss`` is a monotone high-water mark,
 so serial and batch cannot be measured in one process. Each measurement
 therefore re-executes this file as a child (``--measure``) that prints one JSON
-line. The child reports its high-water mark both *before* the intersection (the
-catalog-load plateau) and after, so the intersection's own peak is the
-difference rather than the load's floor.
+line.
+
+Two baselines are reported, because they are not the same number and the
+difference is 173 MB at operator scale. ``ru_maxrss`` before the intersection is
+the *high-water* of the load, not its resident plateau: on the ``full`` case
+``granule_records()`` leaves a 173 MB transient above the plateau it settles at
+(resident 4,033.6 MB vs maxrss 4,206.8 MB), so a maxrss-vs-maxrss delta silently
+absorbs the intersection's first 173 MB and floors at 0. The ``MB`` columns are
+therefore ``maxrss_after - resident_before`` -- the intersection's real
+increment -- and the ``hw`` columns are the old ``maxrss_after - maxrss_before``,
+kept so the clamped floor stays visible. They coincide wherever the load has no
+transient: on ``california`` ``rss_load == maxrss_load`` exactly, because
+``filter_bbox`` cuts before ``granule_records`` runs, so the knee sweep and the
+California rows read the same either way.
 
 Run::
 
@@ -52,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import resource
 import subprocess
 import sys
@@ -86,6 +98,17 @@ def _rss_mb() -> float:
     """Process high-water RSS in MB (``ru_maxrss`` is bytes on macOS, KB on Linux)."""
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return peak / 1e6 if sys.platform == "darwin" else peak / 1e3
+
+
+def _resident_mb() -> float:
+    """Process *resident* RSS in MB right now -- the plateau, not the high-water."""
+    if sys.platform == "darwin":
+        out = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())], capture_output=True, text=True
+        )
+        return int(out.stdout.strip()) / 1e3
+    pages = int(Path("/proc/self/statm").read_text().split()[1])
+    return pages * os.sysconf("SC_PAGE_SIZE") / 1e6
 
 
 def _intersect_serial(records, grid, all_shards, order):
@@ -149,6 +172,7 @@ def _measure_child(name, path, order, block):
         shardmap._MOC_BATCH_RINGS = block
     records, grid, all_shards = _load_case(name)
     rss_load = _rss_mb()
+    res_load = _resident_mb()
     fn = _intersect_serial if path == "serial" else shardmap._intersect_mortie
     t0 = time.perf_counter()
     out = fn(records, grid, all_shards, order=order)
@@ -163,6 +187,7 @@ def _measure_child(name, path, order, block):
                 "digest": hash(tuple(sorted((k, tuple(v)) for k, v in out.items()))),
                 "wall_s": round(wall, 2),
                 "rss_load_mb": round(rss_load, 1),
+                "res_load_mb": round(res_load, 1),
                 "rss_peak_mb": round(_rss_mb(), 1),
             }
         )
@@ -183,10 +208,21 @@ def _available(name) -> bool:
     return Path(CASES[name]["catalog"]).exists()
 
 
+def _peak_mb(m) -> float:
+    """The intersection's own peak, above the load's *resident* plateau."""
+    return m["rss_peak_mb"] - m["res_load_mb"]
+
+
+def _peak_hw_mb(m) -> float:
+    """The same peak above the load's high-water -- clamps at 0, kept for contrast."""
+    return m["rss_peak_mb"] - m["rss_load_mb"]
+
+
 def run_cases(names, orders=None):
     print(
         f"{'case':>11} {'order':>5} {'granules':>9} {'shards':>7} {'pairs':>9} "
-        f"{'serial_s':>9} {'batch_s':>8} {'x':>5} {'ser_MB':>7} {'bat_MB':>7}",
+        f"{'serial_s':>9} {'batch_s':>8} {'x':>5} {'ser_MB':>7} {'bat_MB':>7} "
+        f"{'ser_hw':>7} {'bat_hw':>7}",
         flush=True,
     )
     for name in names:
@@ -201,8 +237,8 @@ def run_cases(names, orders=None):
                 f"{name:>11} {order:>5} {ser['granules']:>9,} {ser['shards_hit']:>7,} "
                 f"{ser['pairs']:>9,} {ser['wall_s']:>9.2f} {bat['wall_s']:>8.2f} "
                 f"{ser['wall_s'] / max(bat['wall_s'], 1e-9):>4.1f}x "
-                f"{ser['rss_peak_mb'] - ser['rss_load_mb']:>7.0f} "
-                f"{bat['rss_peak_mb'] - bat['rss_load_mb']:>7.0f}",
+                f"{_peak_mb(ser):>7.0f} {_peak_mb(bat):>7.0f} "
+                f"{_peak_hw_mb(ser):>7.0f} {_peak_hw_mb(bat):>7.0f}",
                 flush=True,
             )
 
@@ -216,10 +252,7 @@ def run_knee(name, order=13):
     print(f"{'block':>7} {'wall_s':>8} {'peak_MB':>8}", flush=True)
     for block in (32, 64, 128, 256, 512, 1024, 2048):
         m = _measure(name, "batch", order, block=block)
-        print(
-            f"{block:>7} {m['wall_s']:>8.2f} {m['rss_peak_mb'] - m['rss_load_mb']:>8.0f}",
-            flush=True,
-        )
+        print(f"{block:>7} {m['wall_s']:>8.2f} {_peak_mb(m):>8.0f}", flush=True)
 
 
 def main(argv=None):
