@@ -53,6 +53,7 @@ def sweep_stage_pass(
     run_started: str | None = None,
     store_kwargs: dict | None = None,
     on_stage=None,
+    on_node=None,
     level_actuals: dict | None = None,
 ) -> dict:
     """One staged pass over the dirty set: every tuple, finest first.
@@ -65,8 +66,11 @@ def sweep_stage_pass(
     siblings, recorded as ``root_moc_stale``, never discovery, which is
     listing-based upstream). ``scope`` (a normalized MOC) filters DISPATCH
     nodes; a dispatched worker folds all children on disk. ``on_stage`` is
-    called after each tuple (the lease heartbeat's seam). Returns the pass
-    summary with per-stage rows.
+    called after each tuple and ``on_node`` after each dispatch node — the
+    lease heartbeat's seams: a tuple is unbounded work (the finest tuple of
+    an o9 store is ~49k dispatch nodes), so a per-tuple-only beat would let
+    the holder's own lease expire mid-tuple (review finding). Returns the
+    pass summary with per-stage rows.
     """
     from zagg.hive import _utcnow
     from zagg.store import open_object_store
@@ -143,6 +147,8 @@ def sweep_stage_pass(
                     store_kwargs=store_kwargs,
                     level_actuals=level_actuals,
                 )
+            if on_node is not None:
+                on_node(node)
         row = {
             "dispatch_order": stage["dispatch"],
             "orders": list(stage["orders"]),
@@ -350,6 +356,17 @@ def run_stage_sweep(
         store_kwargs=store_kwargs,
     )
     run_started = _utcnow()
+    # Heartbeat throttled by wall clock, fired per dispatch node AND per
+    # tuple: a beat must land well inside the TTL however long a tuple (or
+    # one node's fold) runs, without one PUT per node on a large store.
+    ttl_s = int(lease_ttl_s or DEFAULT_TTL_S)
+    last_beat = [time.monotonic()]
+
+    def _maybe_beat(*_args):
+        if time.monotonic() - last_beat[0] >= ttl_s / 3:
+            heartbeat_lease(store_root, lease, store_kwargs=store_kwargs)
+            last_beat[0] = time.monotonic()
+
     summary: dict = {
         "run_id": run_id,
         "store_root": store_root,
@@ -389,6 +406,7 @@ def run_stage_sweep(
                 run_started=run_started,
                 store_kwargs=store_kwargs,
                 on_stage=lambda row: heartbeat_lease(store_root, lease, store_kwargs=store_kwargs),
+                on_node=_maybe_beat,
                 level_actuals=level_actuals,
             )
             rows = part["stages"]
@@ -401,6 +419,7 @@ def run_stage_sweep(
         summary["levels"] = {
             str(k): dict(v) for k, v in sorted(level_actuals.items(), reverse=True)
         }
+        _maybe_beat()  # the finisher's RMW must not start on a stale beat
         summary["finisher"] = run_finisher(
             store_root,
             manifest,
