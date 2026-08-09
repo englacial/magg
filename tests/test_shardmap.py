@@ -856,12 +856,15 @@ class TestFootprintCells:
         # zero-width slots), and a dropped non-polygonal row mid-catalog so
         # ``rows`` is not the identity and the block gather walks non-contiguous
         # column spans. Swept block sizes cross the 24-record count both ways:
-        # 1, 5 and 7 exercise slot re-basing and the ``start + i`` owner mapping
+        # 1, 5 and 7 exercise slot re-basing and the ``own[i]`` owner mapping
         # across many (ragged-tail) blocks, 24 is the one-block case the shipped
-        # ``_CELLS_BATCH_RECORDS = 512`` collapses to at this size. Block 1 is
-        # also the only cover of the ``flat.size == 0: continue`` branch, which
-        # is why the empty-slot assertion below is load-bearing: some record
-        # must be unassigned, so some single-record block must come back empty.
+        # ``_CELLS_BATCH_RECORDS = 512`` collapses to at this size. The
+        # empty-slot assertion below is load-bearing: some record must be
+        # unassigned, so the ``mocs_intersect`` prefilter genuinely drops
+        # records here and the survivor blocks are cut at *survivor* counts,
+        # not record counts -- a block-local owner mapping would misassign and
+        # fail the dict equality. (The all-empty/all-hit/leading-empty edges
+        # get their own test below.)
         #
         # Both column orders run, because they hit ``mocs_to_orders``
         # differently. At index 11 == ``parent_order`` it only ever refines
@@ -902,6 +905,51 @@ class TestFootprintCells:
                     rows, values, offsets, hp_grid, all_shards
                 )
                 assert got == oracle, f"order {index_order} block {block} diverged from scalar"
+
+    def test_prefilter_edges_all_empty_all_hit_and_interleaved(self, hp_grid, monkeypatch):
+        # The ``mocs_intersect`` prefilter's three edge shapes, each against
+        # the scalar oracle and swept across survivor-block boundaries. The
+        # granules are spaced 0.05 deg apart -- well over an order-11 cell
+        # (~0.03 deg) -- so the middle AOI's coverage cannot bleed onto the
+        # end granules and the ends-unassigned assertions are not flaky on
+        # cell quantization.
+        #
+        # - all-empty: a disjoint (but non-empty) AOI, so the ``not
+        #   all_shards`` short-circuit does NOT fire and the predicate itself
+        #   must drop every record before the materializing pass.
+        # - all-hit: every record survives, pinned exactly; the survivor
+        #   gather is the identity and the result is still the oracle's.
+        # - interleaved: survivors exclude record 0 and the last record, so
+        #   ``surv[0] != 0`` -- the leading-empty edge where a block-local
+        #   owner mapping (``start + i`` instead of ``own[i]``) would
+        #   misassign every hit to an earlier record and fail the equality.
+        items = [_item(f"G{i}", -76.62 + 0.05 * i, -76.60 + 0.05 * i) for i in range(10)]
+        cat = _catalog(items).index_footprints(11)
+        records = cat.granule_records()
+        values, offsets, _order, rows = shardmap._footprint_cells_plan(
+            cat, records, hp_grid, "mortie", "swath", None
+        )
+
+        def box(w, e, s=38.84, n=38.94):
+            return [(np.array([s, s, n, n, s]), np.array([w, e, e, w, w]))]
+
+        def run(region, block):
+            shards = {
+                int(s) for s in hp_grid.coverage(shardmap._region_parts(region, cat.metadata))
+            }
+            assert shards, "every case must exercise the prefilter, not the empty-AOI gate"
+            oracle = _intersect_cells_serial(rows, values, offsets, hp_grid, shards)
+            monkeypatch.setattr(shardmap, "_CELLS_BATCH_RECORDS", block)
+            got = shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, shards)
+            assert got == oracle, f"block {block} diverged from scalar"
+            return {g for v in got.values() for g in v}
+
+        for block in (1, 3, 4, 10):
+            assert run(box(-76.63, -76.14, s=-40.0, n=-39.9), block) == set()
+            assert run(box(-76.63, -76.14), block) == set(range(len(records)))
+            mid = run(box(-76.41, -76.36), block)
+            assert mid, "the middle AOI must hit some granule"
+            assert 0 not in mid and len(records) - 1 not in mid
 
     def test_batch_refusal_names_the_record_range(self, hp_grid, monkeypatch):
         # mortie's cell-budget ``ValueError`` names the offending MOC by its

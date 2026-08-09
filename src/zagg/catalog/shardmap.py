@@ -113,6 +113,24 @@ _MOC_BATCH_RINGS = 32
 # The per-block cost of rebuilding the shared AOI operand's BMOC is measured,
 # not assumed, negligible: 104 us/call at the 2,721-cell California operand,
 # ~113 ms across the clone's 1,086 blocks, ~4% of wall.
+#
+# The ``mocs_intersect`` prefilter (the later phase) reuses this constant for
+# both of its passes, and the blocking survives the prefilter for measured
+# reasons on each:
+# - the *predicate* pass walks every row, so its input copy is
+#   catalog-proportional exactly like the unblocked ``mocs_and`` was: the
+#   whole-column single call measured 1,096 MB over plateau on the clone's
+#   order-9 column (values are 1,551 MB -- the binding's documented copy)
+#   against 184 MB blocked at 512, for ~0.1 s of predicate wall (0.88 s
+#   whole-column vs 0.98 s blocked, min-of-3 in-process). Same bytes-not-
+#   records argument as above: 512 rows is ~1.2 MB/slice on an order-9 column
+#   and ~30 MB on an order-13 one.
+# - the *survivor* pass is bounded by hits, ~0.4% of the clone against a
+#   regional AOI (2,356 of 555,867 records) -- five blocks, where one call
+#   would also be fine. But survivors are AOI-proportional, not
+#   catalog-proportional: an AOI covering the catalog passes everything and
+#   an unblocked survivor pass is then the ~5.2 GB whole-catalog call again.
+#   Blocking is at worst free on wall (measured above), so it stays.
 _CELLS_BATCH_RECORDS = 512
 
 # ── granule footprint helpers ────────────────────────────────────────────────
@@ -324,14 +342,19 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     keep zero-width slots), chained into one ``mocs_to_orders`` (empty in,
     empty out) -- two boundary crossings per block instead of two calls per
     granule, and the AOI operand is normalized once per block instead of per
-    granule. ``mocs_intersect`` is not used: every call site here needs the
-    intersection's cells (they *are* the shards), not just the emptiness test.
-    The batch is blocked by ``_CELLS_BATCH_RECORDS`` (see the constant) because
-    the whole-catalog single call held a record-aligned gather copy plus
-    mortie's documented input copy live at once -- catalog-proportional peak
-    for a block-boundable term.
+    granule. A ``mocs_intersect`` prefilter runs first: the predicate walks
+    the row-aligned column in contiguous slices (no gather), and only the
+    surviving records -- ~0.4% at clone scale against a regional AOI -- reach
+    the materializing gather + ``mocs_and`` pass. The predicate is exact
+    (``hits[i]`` iff ``mocs_and``'s slot ``i`` would be non-empty, mortie's
+    documented contract), so survivors' results are byte-identical to running
+    every record through. Both passes are blocked by ``_CELLS_BATCH_RECORDS``
+    (see the constant): the survivor pass because its gather copy plus
+    mortie's input copy are all-hit-proportional, the predicate because the
+    binding's input copy alone measured ~1.1 GB over plateau on the
+    whole-column clone call against ~184 MB blocked.
     """
-    from mortie import compress_moc, mocs_and, mocs_to_orders
+    from mortie import compress_moc, mocs_and, mocs_intersect, mocs_to_orders
 
     if len(rows) == 0 or not all_shards:
         return {}
@@ -369,12 +392,38 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     rows = np.asarray(rows, dtype=np.int64)
     offsets = np.asarray(offsets, dtype=np.int64)
     values = np.asarray(values)
+
+    # Prefilter (espg/mortie#173's range-walk predicate, this PR its first
+    # production consumer): one bool per table row, materializing nothing.
+    # It walks the *column* rather than the records because the column's own
+    # arrow offsets make every block a contiguous zero-copy slice -- gathering
+    # per record is exactly the copy the predicate exists to avoid. Rows
+    # ``granule_records`` dropped are walked too; they cost nothing
+    # (``index_footprints`` gives them zero-width runs) and ``hits[rows]``
+    # discards them. Blocked, not whole-column: mortie's binding copies
+    # ``values`` before releasing the GIL, and that copy alone measured
+    # ~1.1 GB over plateau at clone scale (see ``_CELLS_BATCH_RECORDS``).
+    n_rows = offsets.size - 1
+    hits = np.empty(n_rows, dtype=bool)
+    for a in range(0, n_rows, _CELLS_BATCH_RECORDS):
+        b = min(a + _CELLS_BATCH_RECORDS, n_rows)
+        base = offsets[a]
+        hits[a:b] = mocs_intersect(aoi_moc, values[base : offsets[b]], offsets[a : b + 1] - base)
+    # ``surv`` holds *original record indices* (``np.flatnonzero`` of a
+    # record-aligned mask, so it is strictly increasing) -- the owner mapping
+    # below must come from it, never from block-local positions.
+    surv = np.flatnonzero(hits[rows])
+    if surv.size == 0:
+        return {}
+    surv_rows = rows[surv]
+
     hit_shards, hit_owners = [], []
-    for start in range(0, rows.size, _CELLS_BATCH_RECORDS):
-        blk = rows[start : start + _CELLS_BATCH_RECORDS]
+    for start in range(0, surv_rows.size, _CELLS_BATCH_RECORDS):
+        blk = surv_rows[start : start + _CELLS_BATCH_RECORDS]
+        own = surv[start : start + _CELLS_BATCH_RECORDS]
         # Gather the block's spans out of the row-aligned column (ragged fancy
         # index), so dropped rows never reach the batch call and slot ``i`` of
-        # the block is record ``start + i``.
+        # the block is record ``own[i]``.
         starts = offsets[blk]
         lens = offsets[blk + 1] - starts
         rec_off = np.zeros(blk.size + 1, dtype=np.int64)
@@ -391,21 +440,21 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
             # rather than obviously failing. Re-raise, never swallow.
             raise ValueError(
                 f"footprint_cells batch failed on records "
-                f"{start}-{start + blk.size - 1} (MOC index in the message is "
-                f"relative to that range): {exc}. Re-index the catalog at a "
-                f"coarser order, or drop the footprint_cells column to build "
-                f"from geometry."
+                f"{own[0]}-{own[-1]} (MOC index in the message counts the "
+                f"prefilter's surviving records in that range): {exc}. "
+                f"Re-index the catalog at a coarser order, or drop the "
+                f"footprint_cells column to build from geometry."
             ) from exc
+        # Every slot in this block is non-empty by the predicate's contract,
+        # so ``flat`` is never empty here and each owner repeats >= 1 time.
         flat = np.asarray(flat)
-        if flat.size == 0:
-            continue
-        owners = np.repeat(np.arange(start, start + blk.size, dtype=np.int64), np.diff(flat_off))
+        owners = np.repeat(own, np.diff(flat_off))
         # No per-granule ``np.unique``: ``_regroup_hits``'s stable sort keeps
         # any repeated (shard, owner) pair adjacent, and its run dedup
         # collapses it -- same dict, same order as the scalar loop this
-        # replaces. Owners stay non-decreasing across blocks (blocks walk the
-        # records in order), so the regroup's sort/dedup invariant holds on the
-        # concatenation exactly as it did on one array.
+        # replaces. Owners stay non-decreasing across blocks (``surv`` is
+        # increasing and blocks walk it in order), so the regroup's sort/dedup
+        # invariant holds on the concatenation exactly as it did on one array.
         hit_shards.append(flat.astype(np.uint64, copy=False))
         hit_owners.append(owners)
     return _regroup_hits(hit_shards, hit_owners)
