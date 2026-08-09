@@ -3252,6 +3252,14 @@ def _run_local(
         leaves = leaves_from_stats_records([m.get("stats") for m in report.results])
         if leaves:
             sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
+            # Post-fleet staged chaining (issue #384) — OPT-IN via
+            # `output.sweep: "stages"` (the recorded lean for open question
+            # (c); flipping it to the default is espg's call). Runs AFTER the
+            # families sweep, auto-scoped to this run's footprint; fail-open.
+            if config.output.get("sweep") == "stages":
+                from zagg.sweep_stages import stage_sweep_after_run
+
+                stage_sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )

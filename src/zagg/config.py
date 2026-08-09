@@ -897,9 +897,11 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
     # End-of-run rollup sweep trigger (issue #300), same posture as
     # coverage_moc: boolean when present, default ON for hive (get_sweep
     # resolves it), explicit true on a non-hive store is a config mistake.
+    # "stages" (issue #384) additionally chains the STAGED pyramid sweep
+    # after the families pass — the recorded opt-in for /2 stores.
     sweep = config.output.get("sweep")
-    if sweep is not None and not isinstance(sweep, bool):
-        raise ValueError(f"output.sweep must be a boolean (got {sweep!r})")
+    if sweep is not None and not isinstance(sweep, bool) and sweep != "stages":
+        raise ValueError(f"output.sweep must be a boolean or 'stages' (got {sweep!r})")
     if sweep and get_store_layout(config) != "hive":
         raise ValueError(
             "output.sweep requires output.store_layout: hive (the rollup sweep "
