@@ -224,7 +224,13 @@ def _measure_child(name, path, order, block):
     from zagg.catalog import shardmap
 
     if block is not None:
-        shardmap._MOC_BATCH_RINGS = block
+        # ``--block`` overrides the arm's own blocking constant: rings per
+        # ``polygons_to_morton_mocs`` call on the batch arm, records per
+        # ``mocs_and``/``mocs_to_orders`` call on the cells arm (phase 4).
+        if path == "cells":
+            shardmap._CELLS_BATCH_RECORDS = block
+        else:
+            shardmap._MOC_BATCH_RINGS = block
     records, grid, all_shards, cat, index_s = _load_case(
         name, index_order=order if path == "cells" else None
     )
@@ -376,11 +382,17 @@ def run_cases(names, orders=None, arms=("serial", "batch"), reps=1):
     return skipped
 
 
-def run_knee(name, order=13, blocks=KNEE_BLOCKS, reps=1):
-    """Re-validate ``_MOC_BATCH_RINGS`` on real footprints, not synthetic ones.
+def run_knee(name, order=13, blocks=KNEE_BLOCKS, reps=1, arm="batch"):
+    """Re-validate a blocking constant on real footprints, not synthetic ones.
+
+    ``arm="batch"`` sweeps ``_MOC_BATCH_RINGS`` (rings per
+    ``polygons_to_morton_mocs`` call); ``arm="cells"`` sweeps
+    ``_CELLS_BATCH_RECORDS`` (records per ``mocs_and``/``mocs_to_orders`` call
+    on the phase-4 stored-index path -- pass record-scaled ``--blocks``, the
+    ring-scaled defaults are far too small for it).
 
     ``reps`` > 1 reports the **min** wall over N runs of each block.
-    ``polygons_to_morton_mocs`` is rayon-parallel and so the most load-sensitive
+    Both batch entry points are rayon-parallel and so the most load-sensitive
     number here: single-shot walls scatter by tens of percent on a busy machine,
     which is wider than the block-to-block effect being measured. Peak is stable
     across reps and is reported from the first.
@@ -388,10 +400,13 @@ def run_knee(name, order=13, blocks=KNEE_BLOCKS, reps=1):
     if not _available(name):
         print(f"knee: skipped, {CASES[name]['catalog']} not present", flush=True)
         return [name]
-    print(f"\nblock-size knee -- {name} @order{order}, min of {reps} (real footprints)", flush=True)
+    print(
+        f"\nblock-size knee -- {name} @order{order}, arm {arm}, min of {reps} (real footprints)",
+        flush=True,
+    )
     print(f"{'block':>7} {'wall_s':>8} {'peak_MB':>8} {'peak_hw':>8}", flush=True)
     for block in blocks:
-        runs = [_measure(name, "batch", order, block=block) for _ in range(reps)]
+        runs = [_measure(name, arm, order, block=block) for _ in range(reps)]
         wall = min(m["wall_s"] for m in runs)
         print(
             f"{block:>7} {wall:>8.2f} {_peak_mb(runs[0]):>8.0f} {_peak_hw_mb(runs[0]):>8.0f}",
@@ -413,7 +428,14 @@ def main(argv=None):
         default="serial,batch",
         help="any of serial,batch,cells; a single arm skips the oracle assert and says so",
     )
-    ap.add_argument("--knee", default=None, help="case to sweep _MOC_BATCH_RINGS on")
+    ap.add_argument("--knee", default=None, help="case to sweep a blocking constant on")
+    ap.add_argument(
+        "--knee-arm",
+        choices=("batch", "cells"),
+        default="batch",
+        help="which blocking constant --knee sweeps: batch=_MOC_BATCH_RINGS, "
+        "cells=_CELLS_BATCH_RECORDS (phase 4)",
+    )
     ap.add_argument(
         "--blocks",
         default=",".join(str(b) for b in KNEE_BLOCKS),
@@ -441,7 +463,9 @@ def main(argv=None):
         skipped = run_cases(names, orders, arms, reps=args.reps)
     if args.knee:
         blocks = tuple(int(b) for b in args.blocks.split(",") if b)
-        skipped += run_knee(args.knee, order=args.order, blocks=blocks, reps=args.reps)
+        skipped += run_knee(
+            args.knee, order=args.order, blocks=blocks, reps=args.reps, arm=args.knee_arm
+        )
     # A requested case whose catalog is absent produced no row. Exiting 0 would
     # read as a clean run over nothing, which is the wrong default for a harness
     # whose output gets quoted.
