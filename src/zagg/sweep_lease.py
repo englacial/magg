@@ -142,9 +142,18 @@ def acquire_lease(
             f"{existing.get('heartbeat_at')}, ttl {existing.get('ttl_s')}s) — sweeps "
             f"serialize per store; wait for it, or claim after the heartbeat expires"
         )
-    # Expired (or debris): claim. delete + conditional create + verify — the
-    # pair is not atomic, so read back and confirm ownership; a lost race
-    # refuses exactly like a live lease.
+    # Expired (or debris): claim. Re-read immediately before the delete and
+    # refuse if the intent MOVED since the expiry read (review finding: an
+    # unconditional delete could remove a sibling claimant's already-verified
+    # fresh intent, admitting two holders) — then delete + conditional create
+    # + verify. The remaining GET->DELETE window is the documented residual
+    # the stage workers' foreign-fresh-stamp abort backstops.
+    recheck = read_lease(store_root, store_kwargs=store_kwargs)
+    if (recheck or None) != (existing or None):
+        raise SweepRefusedError(
+            f"lost the claim race for {store_root}: the intent moved while claiming "
+            f"(now held by run {None if recheck is None else recheck.get('run_id')!r})"
+        )
     prior = (existing or {}).get("run_id")
     try:
         obstore.delete(store, LEASE_NAME)
