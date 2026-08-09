@@ -90,12 +90,17 @@ _MOC_BATCH_RINGS = 32
 # what makes that number add up: the clone's order-9 column is ~288 words per
 # granule, so ~1.28 GB apiece, and two arrays over the floor would predict
 # ~4.3 GB, three ~5.5 GB. Blocking bounds that term by the block, and it costs
-# no wall -- blocked is *faster* than one giant call. Clone sweep at order 9
-# (min-of-3 at the finalists): 2.53 s / 1,736.9 MB at 512, 2.50 s / 1,770 MB at
-# 2048, 2.55 s / 1,828 MB at 4096, 2.49-3.10 s / 2,080-3,650 MB at 8192-65536,
-# 3.27 s / 6,407 MB at 262144, 3.83 s / 5,198 MB unblocked. Peak is *not*
-# monotone in block size: 262144 is 3 blocks on this catalog and peaks above the
-# single call. Recorded as measured, not explained -- once the block is itself
+# no wall: blocking is at worst free. Quote that like for like -- the two
+# sessions that measured the same unblocked code on the same case disagree by
+# more than the effect (3.83 s min-of-3 in the sweep below, 3.04 s min /
+# 3.57 s median of 3 in the PR's measurement comment), against 2.53 s blocked.
+# Blocked wins on both sessions' min and median, but by 0.5 s, not 1.3 s; this
+# arm's walls scatter by tens of percent on a loaded machine. Clone sweep at
+# order 9 (min-of-3 at the finalists): 2.53 s / 1,736.9 MB at 512, 2.50 s /
+# 1,770 MB at 2048, 2.55 s / 1,828 MB at 4096, 2.49-3.10 s / 2,080-3,650 MB at
+# 8192-65536, 3.27 s / 6,407 MB at 262144, 3.83 s / 5,198 MB unblocked. Peak is
+# *not* monotone in block size: 262144 is 3 blocks on this catalog and peaks
+# *above* the single call. Recorded as measured, not explained -- once a block is
 # catalog-scale the peak is allocator scatter, not a term blocking controls.
 # What the sweep supports is the small-block end, where the peak sits on the
 # floor. That floor is the sweep's own minimum rather than a separate baseline
