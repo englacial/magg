@@ -88,3 +88,30 @@ class TestHeartbeatAndRelease:
         assert release_lease(root, run_id="A") is True
         assert read_lease(root) is None
         assert release_lease(root, run_id="A") is False  # already gone
+
+    def test_claim_refuses_if_the_intent_moved_before_the_delete(self, tmp_path, monkeypatch):
+        # Review finding: the claim's delete must not remove a sibling
+        # claimant's fresh intent — the pre-delete re-read refuses on ANY
+        # movement since the expiry read.
+        import zagg.sweep_lease as lease_mod
+
+        root = _root(tmp_path)
+        lease = acquire_lease(root, run_id="A")
+        stale = dict(lease, heartbeat_at="2020-01-01T00:00:00+00:00")
+        (tmp_path / "store" / LEASE_NAME).write_text(json.dumps(stale))
+        real = lease_mod.read_lease
+        calls = {"n": 0}
+
+        def racing(store_root, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:  # between the expiry read and the delete,
+                # a sibling claimant C lands its own fresh intent.
+                (tmp_path / "store" / LEASE_NAME).write_text(
+                    json.dumps(dict(stale, run_id="C", heartbeat_at="2999-01-01T00:00:00+00:00"))
+                )
+            return real(store_root, **kwargs)
+
+        monkeypatch.setattr(lease_mod, "read_lease", racing)
+        with pytest.raises(SweepRefusedError, match="intent moved"):
+            acquire_lease(root, run_id="B")
+        assert read_lease(root)["run_id"] == "C"  # C's claim survived intact
