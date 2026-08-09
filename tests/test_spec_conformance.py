@@ -600,7 +600,10 @@ class TestPyramidV2Declaration:
         # leaf resolutions only.
         exp = _expected(PYRAMID)
         levels = _pyramid_block()["overviews"]
-        assert levels == exp["overviews"]
+        # `actuals` is the ADDITIVE per-entry key of §4.5 (issue #384; a
+        # reader MUST tolerate additional keys) — the declaration itself is
+        # the (node, cells) pair, compared exactly.
+        assert [{"node": e["node"], "cells": e["cells"]} for e in levels] == exp["overviews"]
         assert all(isinstance(e["cells"], list) for e in levels)
         assert isinstance(exp["declared"]["overviews"], list)  # the raw knob: ints only
         assert all(isinstance(r, int) for r in exp["declared"]["overviews"])
@@ -625,7 +628,9 @@ class TestPyramidV2Declaration:
         s = exp["shard_order"]
         d = levels[0]["cells"][-1] - s
         assert d >= 1
-        assert levels[1:] == [{"node": k, "cells": [k + d]} for k in range(s - 1, -1, -1)]
+        assert [{"node": e["node"], "cells": e["cells"]} for e in levels[1:]] == [
+            {"node": k, "cells": [k + d]} for k in range(s - 1, -1, -1)
+        ]
         assert levels[-1]["node"] == 0
 
     def test_slab_lengths_decode_per_spec(self):
@@ -633,6 +638,25 @@ class TestPyramidV2Declaration:
         exp = _expected(PYRAMID)
         for entry, slabs in zip(_pyramid_block()["overviews"], exp["slabs"]):
             assert [4 ** (r - entry["node"]) for r in entry["cells"]] == slabs
+
+    def test_per_entry_actuals_decode_per_spec(self):
+        # §4.5 (issue #384): materialization actuals nest inside the level
+        # entry that owns them — regime, merges-from-raw (2 for every
+        # upfront merge level, NEVER 3; 1 for gathers and the leaf column),
+        # `source_children` on the stage regimes only, and unpinned
+        # timestamp/run-id values a reader tolerates.
+        exp = _expected(PYRAMID)
+        for entry in _pyramid_block()["overviews"]:
+            expected = exp["actuals"][str(entry["node"])]
+            actuals = entry["actuals"]
+            assert actuals["regime"] == expected["regime"]
+            assert actuals["merges_from_raw"] == expected["merges_from_raw"]
+            assert actuals["merges_from_raw"] <= 2  # gen 3 is append-later only
+            if expected["regime"] == "leaf-column":
+                assert "source_children" not in actuals
+            else:
+                assert actuals["source_children"] == expected["source_children"]
+            assert "generated_at" in actuals
 
     def test_fold_declaration_keys_ride_along(self):
         # PR #379's declaration keys are revision-independent (§4.5).

@@ -15,8 +15,62 @@
  ],
  "path_grouping": 1,
  "pyramid": {
-  "orders": [],
-  "aggregation": {}
+  "spec": "zagg-pyramid/2",
+  "overviews": [
+   {
+    "node": 4,
+    "cells": [
+     5
+    ]
+   },
+   {
+    "node": 3,
+    "cells": [
+     4
+    ]
+   },
+   {
+    "node": 2,
+    "cells": [
+     3
+    ]
+   },
+   {
+    "node": 1,
+    "cells": [
+     2
+    ]
+   },
+   {
+    "node": 0,
+    "cells": [
+     1
+    ]
+   }
+  ],
+  "overview": {
+   "all_time": false,
+   "fold_source": "cascade",
+   "exact_levels": 1,
+   "fields": {
+    "count": {
+     "class": "exact",
+     "method": "sum",
+     "nan_policy": "skip",
+     "dtype": "int32",
+     "fill_value": 0
+    },
+    "h_tdigest": {
+     "class": "approximate",
+     "method": "tdigest_kway",
+     "dtype": "float32",
+     "inner_shape": [
+      2
+     ],
+     "delta": 16
+    }
+   }
+  }
  },
- "generated_at": "2026-07-30T06:38:23+00:00"
+ "generated_at": "2026-08-09T07:45:46+00:00"
 }

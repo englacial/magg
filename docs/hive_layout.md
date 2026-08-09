@@ -302,8 +302,11 @@ store property). Spelling `overviews` writes the manifest block as
 level — `pyramid.overviews`, the store-wide product declaration; readers
 never re-derive the ladder — while the singular `pyramid.overview` family
 dict keeps the sweep leg's execution regime (`all_time`, the #376 fold
-keys, `fields`, `materialized`) exactly as under `/1`; without the knob the
-block stays `/1` exactly as above. The grammar's **validation rules** and
+keys, `fields`, `materialized`) exactly as under `/1`. Since the issue #384
+default flip, **omitting the knob also declares `/2`** — at the grid's
+resolved chunk order — whenever that order is strictly interior to the
+shard's resolution window; raster configs, explicit legacy
+`orders`/`spacing` schedules, and K == 1 grids keep `/1`. The grammar's **validation rules** and
 the ladder law are normative in
 [the specification §4.4–§4.5](specification.md); refusals are loud and
 named, never silently widened. Two practice points:
@@ -315,11 +318,13 @@ named, never silently widened. Two practice points:
   anything. **Sweeping, not declaring, is the operational decision** — one
   aggregation template serves both a state-scale AOI (sweep immediately)
   and disjoint small deployments (sweep later, or never).
-- **A `/2` declaration is not yet sweepable by this zagg.** The overview
-  sweep refuses it loudly and generates nothing; sweep-side materialization
-  arrives with the staged sweep
-  ([issue #384](https://github.com/englacial/zagg/issues/384)). `/1` stores
-  sweep exactly as before.
+- **A `/2` store is swept by the [staged sweep](#the-staged-sweep-issue-384)**
+  ([issue #384](https://github.com/englacial/zagg/issues/384)) — the
+  `/1` overview family generates nothing for it (its per-level leaf fold is
+  exactly what the column regime ends) and reports the routing in its
+  counts (`regime: "stages"`). `/1` stores sweep exactly as before — the
+  #379 cascade remains the path for pre-column stores, and stays the regime
+  for finer-than-base appends (where gen 3 lives).
 
 A windowed store ([Time windows](#time-windows-morton-hive2)) additionally
 declares `spec: "morton-hive/2"` and a `temporal` block — schedule,
@@ -428,9 +433,11 @@ A config that spells `overviews`
 re-validated against the **manifest's** own `shard_order`/`cell_order` (the
 store's truth wins over the config's grid block), and any `/1`-era
 `materialized` actuals are preserved verbatim across the revision bump. The
-next sweep then refuses loudly instead of materializing — a `/2` store is
-declared-but-not-yet-sweepable until issues #383/#384 land — which is a
-legal recorded state, not an error.
+staged sweep ([below](#the-staged-sweep-issue-384)) then materializes the
+ladder from the leaf columns; a retrofit onto a store whose leaves predate
+the column regime under-covers loudly (`source_children`) until the leaves
+are re-run — declared-but-unswept stays a legal recorded state, not an
+error, and the #379 cascade remains the `/1` path for pre-column stores.
 
 ### Partitioning a sweep that will not fit
 
@@ -476,9 +483,85 @@ finisher that carries them. Leaves-fold levels are not only the deprecated
 exists to remove: under `cascade` the finest `exact_levels` levels fold from
 the leaves too, as does any level declared a wider gap than the node slab can
 divide. Prefer the finisher for the overview family. (A `zagg-pyramid/2`
-store never gets that far:
-a partitioned pass refuses at the declared-not-yet-sweepable gate exactly
-like an unpartitioned one.)
+store never gets that far: its overview materialization is the staged
+sweep's, [below](#the-staged-sweep-issue-384) — which retires this
+two-call recipe wholesale for `/2` stores, since the stage run carries its
+own designated finisher.)
+
+### The staged sweep (issue #384)
+
+A `zagg-pyramid/2` store's above-shard ladder is materialized by **stage
+workers over the leaf columns** — a raw leaf is never read above the shard:
+
+```
+python -m zagg.sweep s3://bucket/store --stages            # CLI backstop
+python -m zagg.sweep s3://bucket/store --stages --partitions 16
+```
+
+or in code `zagg.sweep_stages.run_stage_sweep(root, leaves, scope=...)`, or
+chained immediately after a fleet run with the opt-in `output.sweep:
+"stages"` (auto-scoped to the run's own footprint). Work is discovered from
+the **run records** (listing-based; the root `coverage.moc` is an
+accelerator for sibling candidates, never the source of truth — a fleet
+append with no subsequent sweep leaves it stale, and discovery still finds
+the new leaves).
+
+**Cadence.** Ladder orders are grouped into dispatch tuples of
+`tuple_width` consecutive orders (default 3: `[8,7,6] → [5,4,3] → [2,1,0]`
+on an o9 store). Each stage worker reads exactly its `4^width` immediate
+child columns, emits its tuple's level artifacts, and writes its own column
+carrying — as a pure gather — the **relayed gen-1 leaf partials** for its
+subtree. Every merge, at every level, consumes only that relayed gen-1
+tier (the espg merge-source ruling), so **the cadence changes no bytes**:
+`--tuple-width 1` and `--tuple-width 3` build byte-identical ladders, and
+every upfront merge level is uniformly 2 merges from raw (gathers are 1;
+gen 3 is append-later cascade territory only).
+
+**Scope.** The only argument a sweep takes about *where* is an optional
+node-prefix set — a MOC; a shardmap is accepted as sugar (its keys are the
+prefixes). Scope selects which dispatch nodes are invoked; a dispatched
+worker folds **all** children on disk, so an update adjacent to prior data
+folds the old neighbors in automatically, and clean nodes no-op under the
+generation ratchet. `--partitions` composes with scope by intersection,
+swept under one admission.
+
+**Concurrency** (the ruled matrix):
+
+| regime | allowed? | governed by |
+|---|---|---|
+| fleet ∥ fleet | yes, iff their (window, shard) write sets are disjoint | the existing leaf single-writer law |
+| fleet ∥ sweep | yes | disjoint object sets; the stage worker validates every column stamp before and after reading its groups and re-reads on movement, so a mid-read leaf rewrite never feeds a torn column into a merge; a mid-sweep append is recorded-and-healed under-coverage |
+| sweep ∥ sweep | **no — serialized per store** | the admission lease |
+
+Only pyramid sweeps serialize. Admission is one conditional PUT of the
+store-root intent object `sweep.lease.json` (spec §4.8): a live intent
+refuses **naming the running sweep**; an expired heartbeat is claimable,
+and the claimant simply completes the partial prior run. The lease is
+**control plane** — no data object is ever locked; it is what makes "every
+data object has exactly one writer, ever" true *across* runs. It is
+store-granular by correctness: scope-disjoint sweeps still converge on
+shared coarse ancestors (base cells, the root MOC, the manifest). The
+**designated finisher-worker** (never the 12 base cells) owns the root
+singletons after the root tuple — the root `coverage.moc` refresh, the
+manifest RMW writing the per-entry `actuals`, the `aggregation.yaml`
+lifecycle touch — and deletes the intent as its final act. A run that dies
+mid-sweep leaves its intent to expire into claimability; stage stamps carry
+the run id, and a worker that sees a foreign fresh stamp aborts loudly (the
+residual-race backstop).
+
+**Soft barriers.** Stage order is a scheduling preference, not
+correctness: a tuple run before its finer tuple landed under-covers loudly
+(`source_children`) and self-heals on the next pass — the skip gate keys on
+summed child generations, so a healed child forces the parent rewrite.
+
+**Aging.** Stage reruns refresh the ancestor artifacts they revisit (a
+rewrite is a fresh PUT), and the finisher's manifest RMW + root-MOC write
+refresh the store-root objects every run — so a store swept on any cadence
+keeps its pyramid's `LastModified` moving. A store that only ever SKIPS
+(all-current fleet runs, no sweeps) still ages its sweep-written ancestor
+overviews out under a bucket lifecycle rule: the per-unit lifecycle touch
+covers leaf footprints, not ancestor artifacts (the PR #397 finding — this
+is the recorded posture, not an oversight; re-sweeping is the refresh).
 
 ## The commit stamp
 
