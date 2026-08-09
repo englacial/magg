@@ -439,9 +439,10 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
             # record index, so it would send the operator to the wrong granule
             # rather than obviously failing. Re-raise, never swallow.
             raise ValueError(
-                f"footprint_cells batch failed on records "
-                f"{own[0]}-{own[-1]} (MOC index in the message counts the "
-                f"prefilter's surviving records in that range): {exc}. "
+                f"footprint_cells batch failed within records "
+                f"{own[0]}-{own[-1]} (the MOC index in the message counts this "
+                f"block's {own.size} prefilter survivors inside that range, "
+                f"which are generally not contiguous records): {exc}. "
                 f"Re-index the catalog at a coarser order, or drop the "
                 f"footprint_cells column to build from geometry."
             ) from exc

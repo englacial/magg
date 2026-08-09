@@ -1019,6 +1019,40 @@ class TestFootprintCells:
         assert "MOC 2 exceeds max_cells" in str(exc.value)
         assert isinstance(exc.value.__cause__, ValueError)
 
+    def test_batch_refusal_range_reads_the_survivor_owners(self, hp_grid, monkeypatch):
+        # The shape that tells the re-based message apart from a block-local
+        # one. Above, every record survives the prefilter, so ``own`` is
+        # ``arange`` and ``start + i`` prints the same range -- the test cannot
+        # see the difference. Here a two-box AOI leaves survivors ``[3, 6]``:
+        # not 0-based, not contiguous. The message can only name records 3-6 by
+        # reading ``own``, and it must say how many survivors the MOC index
+        # counts rather than let "3-6" read as four records in the call.
+        import mortie
+
+        items = [_item(f"G{i}", -76.62 + 0.15 * i, -76.60 + 0.15 * i) for i in range(8)]
+        cat = _catalog(items).index_footprints(11)
+        records = cat.granule_records()
+        values, offsets, _order, rows = shardmap._footprint_cells_plan(
+            cat, records, hp_grid, "mortie", "swath", None
+        )
+
+        def box(w, e):
+            return [(np.array([38.84, 38.84, 38.94, 38.94, 38.84]), np.array([w, e, e, w, w]))]
+
+        region = box(-76.18, -76.14) + box(-75.73, -75.69)
+        shards = {int(s) for s in hp_grid.coverage(shardmap._region_parts(region, cat.metadata))}
+        got = shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, shards)
+        assert {g for v in got.values() for g in v} == {3, 6}, "survivors must be [3, 6]"
+
+        def boom(*args, **kwargs):
+            raise ValueError("MOC 1 exceeds max_cells")
+
+        monkeypatch.setattr(mortie, "mocs_to_orders", boom)
+        with pytest.raises(ValueError, match=r"records 3-6") as exc:
+            shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, shards)
+        assert "2 prefilter survivors" in str(exc.value)
+        assert "MOC 1 exceeds max_cells" in str(exc.value)
+
     def test_cli_index_footprints_indexes_the_saved_catalog(self, tmp_path, monkeypatch):
         # ``--index-footprints`` is how an operator ships a pre-indexed clone,
         # so it must both index the catalog it persists AND have this build take
