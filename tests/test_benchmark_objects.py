@@ -815,6 +815,11 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     cfg = default_config("atl06")
     cfg.output["store_layout"] = "hive"
     cfg.output["grid"]["chunk_inner"] = 8  # K = 16; sharded defaults True (#236)
+    # The bench_objects model audits the BASE write path; since the issue #384
+    # /2 default flip a default declaration also writes the leaf column, which
+    # the model (a CI-owned script) has no term for yet — pin the audited
+    # posture explicitly. Flagged on the PR for the model's own column term.
+    cfg.output["pyramid"] = False
     cfg.aggregation["variables"]["h"] = {
         "function": "np.sort",
         "source": "h_li",

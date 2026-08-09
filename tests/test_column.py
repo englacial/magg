@@ -852,8 +852,17 @@ class TestWorkerIntegration:
             oracle = _refold_digests(leaf_group["h_tdigest"][:], factor, delta=_generator().DELTA)
             assert [bytes(p) for p in got["h_tdigest"][:]] == oracle
 
-    def test_no_column_without_the_overviews_knob(self, tmp_path, monkeypatch):
+    def test_default_declaration_writes_the_column(self, tmp_path, monkeypatch):
+        # The ruled issue #384 /2 default flip: no knob now means overviews at
+        # the grid's resolved chunk order (5 on the fixture grid) — the same
+        # column an explicit ``overviews: 5`` writes.
         meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=None)
+        assert meta.get("error") is None
+        assert meta["leaf_column"] == "all.pyramid.zarr"
+        assert (leaf.parent / "all.pyramid.zarr").exists()
+
+    def test_no_column_when_pyramid_declared_off(self, tmp_path, monkeypatch):
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=False)
         assert meta.get("error") is None and "leaf_column" not in meta
         assert not list(leaf.parent.glob("*.pyramid.zarr"))
 
@@ -862,9 +871,11 @@ class TestWorkerIntegration:
         assert meta["leaf_column"] == "all.pyramid.zarr"
         assert (leaf.parent / "all.pyramid.zarr").exists()
         assert (leaf.parent / "all.pyramid.stats.json").exists()
-        # Same leaf, declaration removed: the fresh leaf must not keep a
-        # STAMPED column folded from the superseded run's cells.
-        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=None)
+        # Same leaf, declaration turned OFF (since the issue #384 default
+        # flip, absent means declared — ``pyramid: false`` is the off state):
+        # the fresh leaf must not keep a STAMPED column folded from the
+        # superseded run's cells.
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=False)
         assert meta.get("error") is None and "leaf_column" not in meta
         assert not (leaf.parent / "all.pyramid.zarr").exists()
         assert not (leaf.parent / "all.pyramid.stats.json").exists()
@@ -1040,7 +1051,7 @@ class TestColumnDefeatsTheSkipGate:
         assert semantic_hash(with_col) == semantic_hash(without)
 
     def test_enabling_the_column_defeats_the_skip(self, tmp_path, monkeypatch):
-        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=None)
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=False)
         self._seal(meta, leaf)
         assert not (leaf.parent / "all.pyramid.zarr").exists()
         # Same inputs, same D19 hash; only the declaration changed.
@@ -1053,7 +1064,7 @@ class TestColumnDefeatsTheSkipGate:
         meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=self.PYRAMID)
         self._seal(meta, leaf)
         assert (leaf.parent / "all.pyramid.zarr").exists()
-        redo, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=None, skip_if_current=True)
+        redo, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=False, skip_if_current=True)
         assert redo["identity"] == "column-drift" and "current" not in redo
         # The rewrite runs _clear_column, so the superseded artifact is gone —
         # a skip would have stranded a STAMPED column no run declares.
@@ -1067,9 +1078,9 @@ class TestColumnDefeatsTheSkipGate:
         assert redo["current"] is True and redo["identity"] == "equal"
 
     def test_no_column_declared_and_none_present_still_skips(self, tmp_path, monkeypatch):
-        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=None)
+        meta, leaf = _run_unit(tmp_path, monkeypatch, pyramid=False)
         self._seal(meta, leaf)
-        redo, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=None, skip_if_current=True)
+        redo, _leaf = _run_unit(tmp_path, monkeypatch, pyramid=False, skip_if_current=True)
         assert redo["current"] is True and redo["identity"] == "equal"
 
     def test_the_column_check_is_per_window(self, tmp_path, monkeypatch):
@@ -1080,7 +1091,7 @@ class TestColumnDefeatsTheSkipGate:
         meta, leaf = _run_unit(
             tmp_path,
             monkeypatch,
-            pyramid=None,
+            pyramid=False,
             window=window,
             windowing=windowing,
             time_range=[31536000.0, 31536060.0],

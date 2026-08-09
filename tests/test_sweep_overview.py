@@ -666,7 +666,14 @@ class TestPyramidBlock:
 
 
 class TestPyramidV2Gate:
-    """zagg-pyramid/2 is declared-but-not-yet-sweepable (issues #382/#383/#384)."""
+    """The /1 overview family generates nothing for /2 stores (issue #384).
+
+    The declared-not-yet-sweepable REFUSAL is retired: /2 stores are fully
+    sweepable via the STAGED sweep (``zagg.sweep_stages.run_stage_sweep``).
+    This family still writes nothing for them — the /1 fold reads raw leaves
+    per level, which the column regime exists to end — so these tests keep
+    pinning the no-write posture, now under ``sweepable: True`` and the
+    ``regime: "stages"`` pointer."""
 
     def _v2_manifest(self, root, *, windowed=False, all_time=False):
         manifest = _write_manifest(root, orders=(1, 0), windowed=windowed)
@@ -692,10 +699,12 @@ class TestPyramidV2Gate:
 
         manifest = self._v2_manifest(tmp_path)
         _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        caplog.set_level("INFO")  # the /2 pointer is informational, not a refusal
         counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
-        assert counts["sweepable"] is False and counts["declared"] is True
+        assert counts["sweepable"] is True and counts["regime"] == "stages"
+        assert counts["declared"] is True
         assert counts["written"] == 0 and counts["failed"] == 0
-        assert "NOT yet sweepable" in caplog.text
+        assert "staged sweep" in caplog.text
         # Declared-unswept is a recorded state, not a partial write: no
         # overview artifacts, no envelopes, the declaration untouched.
         assert not list(tmp_path.rglob("overview.rollup.json"))
@@ -709,9 +718,10 @@ class TestPyramidV2Gate:
         # marker is still the (node, cells) grammar — never fold it as orders.
         manifest = self._v2_manifest(tmp_path)
         manifest["pyramid"]["spec"] = PYRAMID_SPEC
+        caplog.set_level("INFO")
         counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
-        assert counts["sweepable"] is False and counts["written"] == 0
-        assert "NOT yet sweepable" in caplog.text
+        assert counts["regime"] == "stages" and counts["written"] == 0
+        assert "staged sweep" in caplog.text
 
     def test_a_windowed_v2_store_writes_no_all_time_fold(self, tmp_path, caplog):
         from zagg.sweep_overview import sweep_overviews
@@ -722,10 +732,11 @@ class TestPyramidV2Gate:
         # all.zarr writes too, not a partial cross-window fold.
         manifest = self._v2_manifest(tmp_path, windowed=True, all_time=True)
         _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]}, window="2019")
+        caplog.set_level("INFO")
         counts = sweep_overviews(str(tmp_path), manifest, {"-311": {"2019"}})
-        assert counts["sweepable"] is False and counts["declared"] is True
+        assert counts["sweepable"] is True and counts["declared"] is True
         assert counts["written"] == 0 and counts["failed"] == 0
-        assert "NOT yet sweepable" in caplog.text
+        assert "staged sweep" in caplog.text
         for node in ("-3", "-3/1"):
             assert not (tmp_path / node / "all.zarr").exists()
             assert not (tmp_path / node / "2019.zarr").exists()
@@ -741,7 +752,7 @@ class TestPyramidV2Gate:
         manifest = self._v2_manifest(tmp_path)
         manifest["pyramid"] = {"spec": "zagg-pyramid/2"}
         counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
-        assert counts["declared"] is False and counts["sweepable"] is False
+        assert counts["declared"] is False and counts["regime"] == "stages"
 
 
 class TestOverviewWriter:
@@ -2226,8 +2237,9 @@ class TestDeclarePyramid:
         cfg = _leaf_cfg()
         cfg.output["pyramid"] = {"overviews": [3]}
         declare_pyramid(str(tmp_path), cfg)
+        caplog.set_level("INFO")
         result = run_sweep(str(tmp_path), discover_leaves(str(tmp_path)), families=("overview",))
         counts = result["families"]["overview"]
-        assert counts["sweepable"] is False and counts["written"] == 0
-        assert "NOT yet sweepable" in caplog.text
+        assert counts["regime"] == "stages" and counts["written"] == 0
+        assert "staged sweep" in caplog.text
         assert not list(tmp_path.rglob("overview.rollup.json"))

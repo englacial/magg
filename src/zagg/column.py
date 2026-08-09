@@ -508,14 +508,20 @@ def leaf_column_plan(config, grid) -> tuple[list[int], dict] | None:
     already carry: a column is written iff the declaration carries leaf-node
     levels — an explicit ``output.pyramid.overviews`` knob (the
     ``zagg-pyramid/2`` grammar; its expansion always places the declared
-    resolutions at the shard node). ``/1`` schedules (``orders``/``spacing``,
-    or no pyramid knob at all) declare no leaf columns. The declaration is
-    re-validated against the grid here — cheap, and the Lambda worker builds
-    its config without ``validate_config`` — with the same refusals the
-    templating path raises. The D24 field map is the declaration's own
-    (:func:`zagg.pyramid.declared_fields`) filtered to the composable
-    classes; the template-time warning for excluded fields is NOT repeated
-    per shard (``build_pyramid_block`` owns the loud warning).
+    resolutions at the shard node), or — the ruled issue #384 default flip —
+    a DEFAULT declaration (no ``overviews``, no legacy ``orders``/``spacing``
+    spelled), which now means ``/2`` at the grid's resolved chunk order
+    whenever that order is strictly interior. This mirrors
+    ``build_pyramid_block``'s manifest default EXACTLY: the two gates must
+    agree, or a default-flipped store would declare leaf levels no worker
+    writes. Explicit ``orders``/``spacing`` schedules stay ``/1`` (no
+    column), as does a grid with no strictly-interior chunk order (K == 1).
+    The declaration is re-validated against the grid here — cheap, and the
+    Lambda worker builds its config without ``validate_config`` — with the
+    same refusals the templating path raises. The D24 field map is the
+    declaration's own (:func:`zagg.pyramid.declared_fields`) filtered to the
+    composable classes; the template-time warning for excluded fields is NOT
+    repeated per shard (``build_pyramid_block`` owns the loud warning).
     """
     from zagg.config import get_pyramid
     from zagg.pyramid import (
@@ -526,9 +532,17 @@ def leaf_column_plan(config, grid) -> tuple[list[int], dict] | None:
     )
 
     knob = get_pyramid(config)
-    if not knob or knob.get("overviews") is None:
+    if knob is None:
         return None
-    declared = normalize_overviews(knob["overviews"])
+    raw = knob.get("overviews")
+    if raw is None:
+        if knob.get("orders") is not None or knob.get("spacing") is not None:
+            return None  # an explicit legacy /1 schedule declares no columns
+        chunk = getattr(grid, "chunk_order", None)
+        if not (isinstance(chunk, int) and int(grid.parent_order) < chunk < int(grid.child_order)):
+            return None  # no strictly-interior default exists (K == 1)
+        raw = chunk  # the ruled /2 default flip (issue #384)
+    declared = normalize_overviews(raw)
     validate_overviews(
         declared, parent_order=int(grid.parent_order), child_order=int(grid.child_order)
     )

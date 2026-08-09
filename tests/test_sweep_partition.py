@@ -602,10 +602,11 @@ class TestOverviewOrdersAreClamped:
         assert parted["materialized_fold_sources"] == {"2": "leaves", "1": "cascade"}
 
     def test_a_v2_declaration_refuses_identically_under_a_partition(self, tmp_path):
-        # zagg-pyramid/2 is declared-but-not-yet-sweepable (issue #382). The
-        # gate fires BEFORE the partition clamp, so a partitioned pass
-        # refuses exactly like an unpartitioned one: nothing is folded, so
-        # nothing is deferred and no partition key rides the counts.
+        # The /1 family generates nothing for /2 (the STAGED sweep owns it,
+        # issue #384). The gate fires BEFORE the partition clamp, so a
+        # partitioned pass no-ops exactly like an unpartitioned one: nothing
+        # is folded, so nothing is deferred and no partition key rides the
+        # counts.
         refs = _overview_store(tmp_path)
         manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
         manifest["pyramid"] = {
@@ -624,7 +625,7 @@ class TestOverviewOrdersAreClamped:
             "overview"
         ]
         for counts in (parted, whole):
-            assert counts["sweepable"] is False and counts["written"] == 0
+            assert counts["regime"] == "stages" and counts["written"] == 0
         assert "deferred_orders" not in parted and "manifest_deferred" not in parted
         assert {k: v for k, v in parted.items() if k != "duration_s"} == {
             k: v for k, v in whole.items() if k != "duration_s"
