@@ -37,8 +37,10 @@ dependencies = [
     "h5coro-hidefix>=0.3.1",
     # Floor 0.9.6 for the MOC batch twins on ShardMap.build's stored-index path
     # (issue #396 phase 4): mocs_and, the 1xN broadcast intersection of the AOI
-    # cover against the footprint_cells column, chained into mocs_to_orders
-    # (espg/mortie#173, landed in espg/mortie#174) — two Rust crossings per
+    # cover against the footprint_cells column (espg/mortie#173, landed in
+    # espg/mortie#174) — the piece 0.9.5 lacks, and the only reason for this
+    # bump — chained into mocs_to_orders, itself a 0.9.5 arrival
+    # (espg/mortie#156). Together: two Rust crossings per
     # block of records where 0.9.5 forced a Python loop of scalar
     # moc_and/moc_to_order per granule. Earlier floors: 0.9.5
     # for the WKB batch cover behind the ``footprint_cells`` catalog
