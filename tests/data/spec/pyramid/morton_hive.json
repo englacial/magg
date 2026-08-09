@@ -21,25 +21,63 @@
     "cells": [
      5,
      4
-    ]
+    ],
+    "actuals": {
+     "regime": "leaf-column",
+     "merges_from_raw": 1,
+     "generated_at": "2026-08-09T07:45:46+00:00"
+    }
    },
    {
     "node": 2,
     "cells": [
      3
-    ]
+    ],
+    "actuals": {
+     "regime": "stage-gather",
+     "merges_from_raw": 1,
+     "source_children": {
+      "folded": 4,
+      "missing": 0,
+      "unreadable": 0
+     },
+     "run_id": "spec-fixture",
+     "generated_at": "2026-08-09T07:45:46+00:00"
+    }
    },
    {
     "node": 1,
     "cells": [
      2
-    ]
+    ],
+    "actuals": {
+     "regime": "stage-merge",
+     "merges_from_raw": 2,
+     "source_children": {
+      "folded": 4,
+      "missing": 0,
+      "unreadable": 0
+     },
+     "run_id": "spec-fixture",
+     "generated_at": "2026-08-09T07:45:46+00:00"
+    }
    },
    {
     "node": 0,
     "cells": [
      1
-    ]
+    ],
+    "actuals": {
+     "regime": "stage-merge",
+     "merges_from_raw": 2,
+     "source_children": {
+      "folded": 4,
+      "missing": 0,
+      "unreadable": 0
+     },
+     "run_id": "spec-fixture",
+     "generated_at": "2026-08-09T07:45:46+00:00"
+    }
    }
   ],
   "overview": {
@@ -83,9 +121,9 @@
      "1": "leaves",
      "0": "cascade"
     },
-    "generated_at": "2026-08-05T00:50:53+00:00"
+    "generated_at": "2026-08-09T07:45:46+00:00"
    }
   }
  },
- "generated_at": "2026-08-05T00:50:53+00:00"
+ "generated_at": "2026-08-09T07:45:46+00:00"
 }

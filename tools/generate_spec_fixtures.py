@@ -96,6 +96,31 @@ PYRAMID_GRID = {
     "chunk_inner": 5,
     "sharded": True,
 }
+#: The synthetic per-level stage actuals the ``pyramid/`` fixture's finisher
+#: RMW records (issue #384): the §4.5 regimes this geometry derives — d = 1,
+#: node 2 a gather of gen-1 members, nodes 1/0 merges of the relayed gen-1
+#: partials (merges-from-raw 2, never 3 for an upfront level).
+PYRAMID_STAGE_ACTUALS = {
+    2: {
+        "cells": 3,
+        "regime": "stage-gather",
+        "merges_from_raw": 1,
+        "source_children": {"folded": 4, "missing": 0, "unreadable": 0},
+    },
+    1: {
+        "cells": 2,
+        "regime": "stage-merge",
+        "merges_from_raw": 2,
+        "source_children": {"folded": 4, "missing": 0, "unreadable": 0},
+    },
+    0: {
+        "cells": 1,
+        "regime": "stage-merge",
+        "merges_from_raw": 2,
+        "source_children": {"folded": 4, "missing": 0, "unreadable": 0},
+    },
+}
+
 #: Fields the ``pyramid/`` fixture declares beyond the ``minimal`` pair, so
 #: one manifest carries every composability class: exact (``count`` +
 #: ``h_min``), approximate (``h_tdigest``), and ``none`` (``h_mean`` — no
@@ -515,6 +540,20 @@ def build_pyramid(out: Path) -> None:
     assert _update_manifest_pyramid(str(out), dict(PYRAMID_V1_ACTUALS), {})
     summary = declare_pyramid(str(out), cfg_v2)
     assert summary["updated"] is True, summary
+    # Per-entry actuals (issue #384): the finisher's manifest RMW is the
+    # production writer. The per-level inputs are synthetic (no leaves exist
+    # here) but their regimes are the §4.5 law for this geometry — d = 1, so
+    # node 2 gathers (cells 3 == shard) and nodes 1/0 merge the relayed
+    # gen-1 partials at exactly 2 merges from raw.
+    from zagg.sweep_stages import run_finisher
+
+    run_finisher(
+        str(out),
+        hive.read_manifest(str(out)),
+        {},
+        dict(PYRAMID_STAGE_ACTUALS),
+        run_id="spec-fixture",
+    )
     # The fully expanded (node, cells) list, spelled from the KNOB by the
     # §4.5 leaf-entry rule plus the §4.4 fixed-ladder law (d = base - shard;
     # one member per order from shard - 1 down to 0), and §4.4's slab rule.
@@ -543,6 +582,20 @@ def build_pyramid(out: Path) -> None:
             "h_tdigest": "approximate",
             "h_min": "exact",
             "h_mean": "none",
+        },
+        # §4.5 per-entry actuals (issue #384) — regimes/counts from the
+        # synthetic finisher inputs above; the leaf entry records the
+        # leaf-column law. Timestamp/run-id values are not pinned.
+        "actuals": {
+            str(s): {"regime": "leaf-column", "merges_from_raw": 1},
+            **{
+                str(k): {
+                    "regime": v["regime"],
+                    "merges_from_raw": v["merges_from_raw"],
+                    "source_children": v["source_children"],
+                }
+                for k, v in PYRAMID_STAGE_ACTUALS.items()
+            },
         },
         # The §4.5 omitted-knob default for this geometry ([chunk_order] at
         # the leaf, then the same fixed ladder), pinned so zagg's derivation

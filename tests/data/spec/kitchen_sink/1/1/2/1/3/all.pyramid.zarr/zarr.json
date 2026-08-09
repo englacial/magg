@@ -12,15 +12,6 @@
           "class": "exact",
           "method": "sum",
           "nan_policy": "skip"
-        },
-        "h_tdigest": {
-          "class": "approximate",
-          "method": "tdigest_kway",
-          "delta": 16,
-          "dtype": "float32",
-          "inner_shape": [
-            2
-          ]
         }
       },
       "groups": {

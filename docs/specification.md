@@ -449,11 +449,15 @@ expanded `(node, cells)` list, of which the original constant-depth
 `zagg-pyramid/1` grammar is the special case
 `cells = [node + (cell_order - shard_order)]`. `/1` stores stay readable
 under their own rule forever (§4.5 — we are the sole consumer; there is no
-migration machinery). A `/2` declaration is **declared but not yet
-sweepable** — a legal recorded state (#381 point (11): declaring is free,
-sweeping is the operational decision) — until the leaf columns
-([#383](https://github.com/englacial/zagg/issues/383)) and the staged sweep
-([#384](https://github.com/englacial/zagg/issues/384)) land.
+migration machinery). A `/2` declaration is materialized by the leaf
+columns ([#383](https://github.com/englacial/zagg/issues/383), §4.6) and the
+**staged sweep** ([#384](https://github.com/englacial/zagg/issues/384)):
+declared-but-unswept remains a legal recorded state (#381 point (11):
+declaring is free, sweeping is the operational decision), and since the
+issue #384 default flip a **default declaration** (no schedule spelled) is
+`/2` at the grid's resolved chunk order whenever that order is strictly
+interior to the shard's resolution window (raster configs, explicit legacy
+`orders`/`spacing` schedules, and K == 1 grids keep `/1`).
 
 A `zagg-pyramid/2` store is therefore inherently a **multiresolution
 statistical grid**: every HEALPix order from 0 through the declared base,
@@ -642,11 +646,23 @@ store's resolution axis, partially materialized): the `/1` grammar is the
 special case `cells = [node + (c - s)]`, and §4.1–§4.2 apply to both
 revisions unchanged. §4.3's per-artifact `zagg_overview` attrs block — in
 particular its single scalar `cell_order = c - (s - k)` — is specified for
-`/1`'s single-group artifacts; the `/2` per-artifact attrs, which must
-describe an artifact holding one group per member of `cells`, are pinned
-when the writers land (issues #383/#384). Multi-group `/2` artifacts arrive
-with the issue #383 leaf columns and the issue #384 staged sweep; until then
-a `/2` store is declared-but-unmaterialized, which is legal (§4.5).
+`/1`'s single-group artifacts. Stage-written `/2` ladder artifacts (issue
+#384) carry attrs revision **`zagg-overview/2`**: the same keys with
+`cell_order` the entry's own `cells` member (`k + d`, not the constant-depth
+formula), the `fold_source`/`fold_from_order` pair replaced by the #381
+point (7) provenance — `regime` (`stage-gather` | `stage-merge`),
+`merges_from_raw` (1 for a gather of gen-1 members, 2 for a merge of the
+relayed gen-1 partials — never 3 for an upfront level; gen 3 belongs only
+to the append-later cascade regime), and `source_children` (present in both
+stage regimes: a gather that under-covers says so exactly like a merge) —
+plus `run_id`, the sweep run that wrote the artifact, and a `generation`
+block summing the consumed children (the stage skip gate's ratchet key).
+The commit stamp of a stage-written artifact carries the same `run_id` key
+(additive to the stamp grammar; fleet-written stamps never carry it, and a
+reader treats its absence as "not a stage artifact", never an error): it is
+the residual-race backstop of the sweep-admission lease. The `/2` leaf
+entry's artifact is the §4.6 column — declared-but-unmaterialized remains
+legal (§4.5).
 
 An overview's variable set may therefore be a *subset* of the leaf's —
 heterogeneous variable sets across level nodes are in contract, and a reader
@@ -665,7 +681,8 @@ superseded (espg ruling on the declaring PR): **exact-class** fields are
 exactly correct at every order — the reductions are associative, so the
 pyramid is a true downsampling pyramid for them — and **approximate-class**
 fields are **analysis-grade at their recorded generation**: the per-entry
-merges-from-raw count (#381 point (7), recorded when the writers land) is
+merges-from-raw count (#381 point (7), recorded in the §4.5 `actuals` and
+per artifact in `zagg_overview`) is
 the contract a reader holds them to, not a blanket display-only caveat.
 The `/1` operational caveats about the deprecated leaves/cascade regimes
 (§4.3, §4.5) stay as written for `/1` artifacts.
@@ -726,8 +743,9 @@ declare-time forecasts, and external readers consume — while the singular
 `overview` dict remains the **overview sweep family's execution regime**
 (D22 per-family bookkeeping: `all_time`, the #376 fold keys, `fields`, the
 sweep's `materialized` actuals), so the two never re-nest. Per-entry
-materialization actuals (#381 point (7)) will nest inside the block-level
-entries themselves when the writers land (#383/#384).
+materialization actuals (#381 point (7)) nest inside the block-level
+entries themselves — the `actuals` key below, written by the issue #384
+staged sweep's finisher.
 
 - **`orders`** (`/1`) — the ancestor orders that carry overviews
   (descending; empty = pyramid declared off). `spacing` records the schedule
@@ -745,11 +763,12 @@ entries themselves when the writers land (#383/#384).
   `shard_order` and `cell_order` (a member at the shard's own order is the
   writer-side aggregate, never declared; a member at the base data's own
   order would *be* the base data); omitted, the default is one resolution
-  at the grid's resolved chunk order — informative, since today zagg emits
-  a `/2` block only for an explicit `overviews:` knob, and the default
-  becomes the writer default when `/2` becomes sweepable
-  ([#383](https://github.com/englacial/zagg/issues/383),
-  [#384](https://github.com/englacial/zagg/issues/384)). There is no
+  at the grid's resolved chunk order — normative since the issue #384
+  default flip: a default declaration emits this `/2` block for every new
+  store whose resolved chunk order is strictly interior (raster configs,
+  explicit legacy `orders`/`spacing` schedules, and K == 1 grids keep
+  `/1`), and the worker column gate (§4.6) derives the SAME default from
+  the grid, so declaration and artifact can never disagree. There is no
   above-shard configurability: no per-node spelling, no gather declaration,
   no member promotion — the ladder makes every within-footprint member
   spec-guaranteed (espg grammar-collapse ruling on the declaring PR).
@@ -843,12 +862,31 @@ entries themselves when the writers land (#383/#384).
   regenerable caches, §4.1). On a `/2` store this family-dict `materialized`
   map is the **`/1`-era inventory**, preserved verbatim across a declaration
   revision bump: a retrofit never discards actuals, and the overviews it
-  names stay on disk as regenerable-cache debris. `/2` materialization
-  actuals will instead nest **inside the level entry that owns them**
-  (per-`(node, cells)` provenance — regime, `source_children` coverage, and
-  a merges-from-raw integer, #381 point (7)); that shape lands with the
-  writers (#383/#384), so a reader MUST tolerate additional keys on a level
-  entry.
+  names stay on disk as regenerable-cache debris; the staged sweep never
+  writes this family-dict map on a `/2` store — the per-entry `actuals`
+  below are the one source of truth for `/2` materialization. `/2`
+  materialization actuals nest **inside the level entry that owns them**
+  (#381 point (7)), written by the issue #384 finisher's manifest RMW:
+
+  ```json
+  {"node": 2, "cells": [3],
+   "actuals": {"regime": "stage-merge", "merges_from_raw": 2,
+               "source_children": {"folded": 3, "missing": 0, "unreadable": 0},
+               "run_id": "stage-20260809T000000Z-ab12cd",
+               "generated_at": "2026-08-09T00:00:00+00:00"}}
+  ```
+
+  — `regime` is `leaf-column` (the leaf entry: the fleet's own column,
+  merges-from-raw 1, no `source_children` — its source is complete by
+  construction), `stage-gather` (a concatenation of gen-1 members,
+  merges-from-raw 1) or `stage-merge` (a k-way fold of the relayed gen-1
+  node-order partials, merges-from-raw 2 — **never 3 for an upfront level**;
+  gen 3 belongs only to the append-later cascade regime). `source_children`
+  accumulates the run's per-artifact coverage counts; `run_id` names the
+  sweep run (stage entries only). The key is **additive**: a reader MUST
+  tolerate additional keys on a level entry, and `actuals` says nothing
+  about artifacts still being present (overviews are regenerable caches,
+  §4.1).
 
 ### 4.6 Leaf column artifacts (`zagg-column/1`)
 
@@ -994,15 +1032,72 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   known to carry leaf-node levels, absence is the torn-worker signature
   and the repair is re-invoking the idempotent leaf.
 
+**Stage columns (issue #384).** The staged sweep writes the SAME artifact
+shape at its dispatch nodes (`{window}.pyramid.zarr` under an ancestor
+node's prefix, `zagg-column/1` attrs, D4 order, one commit stamp last, D20
+sidecar after): every group is a **pure gather** of the child columns'
+members at the same resolution — `groups` entries record `regime:
+"stage-gather"` with `merges_from_raw: 1` — and the artifact MUST carry the
+**relay member** (the group at `shard_order`: the subtree's leaf node-order
+partials, the merge-source tier every coarser merge consumes — the espg
+merge-source ruling on the #384 thread). Stage-column attrs additionally
+carry `generation` (`{n_leaves, max_leaf_timestamp}` summed over the
+consumed children — the parent's skip-gate key), `source_children` (a
+gather that under-covered says so in the artifact), and `run_id`; the
+commit stamp carries `run_id` too. Cadence decides placement (columns sit
+at dispatch orders), so column EXISTENCE at a given ancestor order is
+orchestration, never contract — a reader binds to the ladder artifacts of
+§4.4, not to stage columns. The root tuple writes no column (nothing
+consumes it). Raster hive stores are column-less by construction: nothing
+in this section applies to them (issue #399 owns their overview regime).
+
 ### 4.7 What §4 does not cover (informative)
 
 The sweep's *other* derived-artifact families (MOC regeneration, stats and
 sub-shardmap rollups, debris collection) are operational concerns recorded
 in [`design/sparse_coverage.md`](design/sparse_coverage.md) D22 — they add
 no new byte layouts (the stats rollup reuses the D20 sidecar schema; the
-sub-shardmap is ShardMap JSON). The fold *algebra* for overview contents is
-zagg-owned per §2.3; a reader consumes overview arrays exactly as it
-consumes leaf arrays.
+sub-shardmap is ShardMap JSON) — except the §4.8 sweep-admission lease,
+which is control plane rather than data. The fold *algebra* for overview
+contents is zagg-owned per §2.3; a reader consumes overview arrays exactly
+as it consumes leaf arrays.
+
+### 4.8 The sweep-admission lease (`zagg-sweep-lease/1`)
+
+**Status: contract — issue #384 (espg admission ruling).** Pyramid sweeps
+**serialize per store**: a column is a multi-object artifact whose D4
+stamp-last discipline proves completeness only under a single writer, so
+two concurrent sweeps could interleave PUTs into a *chimera* column that
+validates as complete. Admission is one atomic conditional PUT
+(`If-None-Match: *`) of the store-root **intent object** `sweep.lease.json`:
+
+```json
+{
+  "spec": "zagg-sweep-lease/1",
+  "run_id": "stage-20260809T000000Z-ab12cd",
+  "scope": null,
+  "acquired_at": "2026-08-09T00:00:00+00:00",
+  "heartbeat_at": "2026-08-09T00:05:00+00:00",
+  "ttl_s": 900,
+  "claimed_from": "stage-20260808T230000Z-9f00aa"
+}
+```
+
+— `scope` is the admitted run's node-prefix set (informative; the lease is
+**store-granular by correctness**: scope-disjointness does not imply
+write-disjointness, because disjoint-leaf sweeps converge on shared coarse
+ancestors). A live intent refuses admission naming the runner; a
+`heartbeat_at` older than `ttl_s` is **claimable** (crash recovery —
+`claimed_from` records the takeover), and the claimant simply completes the
+partial prior run under the ratchet. The finisher deletes the intent as its
+final act. **Control plane, explicitly**: no data object is ever locked —
+the lease is what makes "every data object has exactly one writer, ever"
+true *across* runs, extending (never amending) the no-locking law. Fleets
+are unaffected: fleet ∥ fleet is governed by the leaf single-writer law and
+fleet ∥ sweep is allowed (the stage workers validate every column stamp
+before and after reading its groups and re-read on movement; stage stamps
+carry `run_id`, and a skip-if-current read that sees a foreign stamp
+written after the run started aborts loudly).
 
 ## 5. O11 content hashes
 
