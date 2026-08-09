@@ -1142,6 +1142,21 @@ def main(argv=None) -> int:
         f"registered: {', '.join(sorted(FAMILIES))})",
     )
     parser.add_argument(
+        "--stages",
+        action="store_true",
+        help="Run the STAGED pyramid sweep for zagg-pyramid/2 stores (issue #384): "
+        "tuple-grouped stage workers over the leaf columns, lease-admitted, with the "
+        "designated finisher. Composes with --partitions (swept under one lease). "
+        "The families sweep does not run in this mode.",
+    )
+    parser.add_argument(
+        "--tuple-width",
+        type=int,
+        default=3,
+        help="Stage dispatch cadence for --stages: orders per tuple (default: 3). "
+        "Grouping is orchestration-only — it changes no bytes (issue #381 point (6))",
+    )
+    parser.add_argument(
         "--partitions",
         type=int,
         default=1,
@@ -1198,6 +1213,18 @@ def main(argv=None) -> int:
     leaves = discover_leaves(args.store_root, store_kwargs=store_kwargs)
     if not leaves:
         print("No completed leaves found in the store's run records; nothing to sweep.")
+        return 0
+    if args.stages:
+        from zagg.sweep_stages import run_stage_sweep
+
+        summary = run_stage_sweep(
+            args.store_root,
+            leaves,
+            tuple_width=args.tuple_width,
+            partitions=args.partitions if args.partitions != 1 else None,
+            store_kwargs=store_kwargs,
+        )
+        print(json.dumps(summary, indent=2))
         return 0
     if args.partitions != 1:
         from zagg.sweep_partition import sweep_partitions

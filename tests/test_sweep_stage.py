@@ -24,6 +24,7 @@ import pytest
 import zarr
 
 import zagg.sweep_stage as stage_mod
+import zagg.sweep_stages as stages_mod
 from zagg.grids.morton import morton_word
 from zagg.hive import MANIFEST_NAME, _utcnow, build_root_coverage, write_root_coverage
 from zagg.pyramid import PYRAMID_SPEC_V2, expand_overviews
@@ -41,8 +42,8 @@ from zagg.sweep_stage import (
     partition_words,
     scope_admits,
     stage_tuples,
-    sweep_stage_pass,
 )
+from zagg.sweep_stages import run_finisher, sweep_stage_pass
 
 
 def _pyramid_block(resolutions, shard_order):
@@ -574,7 +575,7 @@ class TestDisjointness:
             per_worker[current["worker"]].add(f"{node}/{basename}")
             return basename
 
-        monkeypatch.setattr(stage_mod, "stage_node", spy_node)
+        monkeypatch.setattr(stages_mod, "stage_node", spy_node)
         monkeypatch.setattr(stage_mod, "_write_stage_overview", spy_ov)
         monkeypatch.setattr(stage_mod, "write_stage_column", spy_col)
         _sweep(tmp_path / "s", m, width=1)
@@ -583,3 +584,360 @@ class TestDisjointness:
         for i, a in enumerate(written):
             for b in written[i + 1 :]:
                 assert not (a & b)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: the designated finisher-worker + the ruled /2 default flip.
+# ---------------------------------------------------------------------------
+
+
+class TestFinisher:
+    def _run(self, root, m, *, run_id="A", released=None):
+        from zagg.hive import read_manifest
+
+        summary = sweep_stage_pass(str(root), m, _by_shard(), run_id=run_id, tuple_width=3)
+        actuals = {int(k): v for k, v in summary["levels"].items()}
+        out = run_finisher(
+            str(root),
+            m,
+            _by_shard(),
+            actuals,
+            run_id=run_id,
+            release=released,
+        )
+        return out, read_manifest(str(root)), summary
+
+    def test_per_entry_actuals_land_in_the_manifest(self, tmp_path):
+        m = _stage_store(tmp_path / "s")
+        out, fresh, _ = self._run(tmp_path / "s", m)
+        assert out["manifest_updated"] and out["root_moc"]
+        entries = {e["node"]: e for e in fresh["pyramid"]["overviews"]}
+        # The leaf entry records the leaf-column law.
+        assert entries[3]["actuals"]["regime"] == "leaf-column"
+        assert entries[3]["actuals"]["merges_from_raw"] == 1
+        # Gather level: gen-1, merges-from-raw 1; merge levels: 2, NEVER 3
+        # (3 is append-later cascade territory — the corrected acceptance).
+        assert entries[2]["actuals"]["regime"] == "stage-gather"
+        assert entries[2]["actuals"]["merges_from_raw"] == 1
+        for node in (1, 0):
+            assert entries[node]["actuals"]["regime"] == "stage-merge"
+            assert entries[node]["actuals"]["merges_from_raw"] == 2
+        assert entries[0]["actuals"]["source_children"]["missing"] == 0
+        # The family dict's /1-era keys are untouched; no `materialized` is
+        # written on /2 (one source of truth — the recorded lean).
+        assert "materialized" not in fresh["pyramid"]["overview"]
+
+    def test_root_moc_refreshed_with_sweep_source(self, tmp_path):
+        from zagg.hive import read_root_coverage
+
+        m = _stage_store(tmp_path / "s")
+        self._run(tmp_path / "s", m)
+        env = read_root_coverage(str(tmp_path / "s"))
+        assert env["source"] == "sweep" and env["order"] == 3
+
+    def test_lease_release_is_the_final_act(self, tmp_path):
+        m = _stage_store(tmp_path / "s")
+        calls = []
+        out, _, _ = self._run(tmp_path / "s", m, released=lambda: calls.append(1) or True)
+        assert out["lease_released"] and calls == [1]
+
+    def test_finisher_is_idempotent(self, tmp_path):
+        m = _stage_store(tmp_path / "s")
+        _, first, _ = self._run(tmp_path / "s", m)
+        _, second, _ = self._run(tmp_path / "s", m, run_id="B")
+        e1 = {e["node"]: e.get("actuals") for e in first["pyramid"]["overviews"]}
+        e2 = {e["node"]: e.get("actuals") for e in second["pyramid"]["overviews"]}
+        for node in e1:
+            for key in ("regime", "merges_from_raw"):
+                assert e1[node][key] == e2[node][key]
+
+
+class TestDefaultFlip:
+    """The ruled /2 default flip: every new store declares the multiresolution
+    grammar (build_pyramid_block) and its workers write the columns it
+    promises (leaf_column_plan) — the two gates must agree."""
+
+    def _config(self, **grid):
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            aggregation={
+                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+                "variables": {
+                    "count": {"function": "sum", "dtype": "int32", "fill_value": 0},
+                },
+            },
+            output={"grid": {"type": "healpix", **grid}},
+        )
+
+    def test_default_declaration_is_v2_at_the_chunk_order(self):
+        from zagg.sweep_overview import build_pyramid_block
+
+        cfg = self._config(parent_order=4, child_order=6, chunk_inner=5)
+        block = build_pyramid_block(cfg, 4, chunk_order=5)
+        assert block["spec"] == PYRAMID_SPEC_V2
+        assert block["overviews"][0] == {"node": 4, "cells": [5]}
+        assert block["overviews"][-1] == {"node": 0, "cells": [1]}
+
+    def test_k1_grid_keeps_the_v1_fallback(self):
+        from zagg.sweep_overview import PYRAMID_SPEC, build_pyramid_block
+
+        cfg = self._config(parent_order=4, child_order=6)
+        block = build_pyramid_block(cfg, 4, chunk_order=4)  # K == 1: no interior
+        assert block["spec"] == PYRAMID_SPEC
+
+    def test_explicit_legacy_schedule_stays_v1(self):
+        from zagg.sweep_overview import PYRAMID_SPEC, build_pyramid_block
+
+        cfg = self._config(parent_order=4, child_order=6, chunk_inner=5)
+        cfg.output["pyramid"] = {"orders": [2]}
+        block = build_pyramid_block(cfg, 4, chunk_order=5)
+        assert block["spec"] == PYRAMID_SPEC and block["overview"]["orders"] == [2]
+
+    def test_raster_is_exempt(self):
+        from zagg.sweep_overview import PYRAMID_SPEC, build_pyramid_block
+
+        cfg = self._config(parent_order=4, child_order=6, chunk_inner=5)
+        cfg.data_source = {"reader": "raster"}
+        block = build_pyramid_block(cfg, 4, chunk_order=5)
+        assert block["spec"] == PYRAMID_SPEC
+
+    def test_worker_gate_mirrors_the_default(self):
+        from zagg.column import leaf_column_plan
+        from zagg.grids import from_config
+
+        cfg = self._config(parent_order=4, child_order=6, chunk_inner=5)
+        plan = leaf_column_plan(cfg, from_config(cfg))
+        assert plan is not None
+        resolutions, fields = plan
+        assert resolutions == [5, 4] and "count" in fields
+
+    def test_worker_gate_declines_without_interior_chunk(self):
+        from zagg.column import leaf_column_plan
+        from zagg.grids import from_config
+
+        cfg = self._config(parent_order=4, child_order=6)
+        cfg.output["sharded"] = False  # K == 1 stays K == 1
+        assert leaf_column_plan(cfg, from_config(cfg)) is None
+
+    def test_worker_gate_declines_legacy_schedule(self):
+        from zagg.column import leaf_column_plan
+        from zagg.grids import from_config
+
+        cfg = self._config(parent_order=4, child_order=6, chunk_inner=5)
+        cfg.output["pyramid"] = {"orders": [2]}
+        assert leaf_column_plan(cfg, from_config(cfg)) is None
+
+    def test_manifest_and_worker_gate_agree_end_to_end(self):
+        from zagg.column import leaf_column_plan
+        from zagg.grids import from_config
+        from zagg.hive import build_manifest
+
+        cfg = self._config(parent_order=4, child_order=6, chunk_inner=5)
+        grid = from_config(cfg)
+        manifest = build_manifest(grid)
+        declared = manifest["pyramid"]["spec"] == PYRAMID_SPEC_V2
+        assert declared == (leaf_column_plan(cfg, grid) is not None) is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: orchestration — admission, discovery, partitions, chaining, CLI.
+# ---------------------------------------------------------------------------
+
+
+def _write_run_record(root, leaves):
+    """A minimal stats parquet the listing-based discovery reads."""
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "shard_key": pd.array([morton_word(d) for d in leaves], dtype="UInt64"),
+            "success": [True] * len(leaves),
+            "window": [None] * len(leaves),
+        }
+    )
+    df.to_parquet(root / "stats_20260809T000000Z_test.parquet", engine="fastparquet")
+
+
+class TestRunStageSweep:
+    def test_end_to_end_with_lease_and_finisher(self, tmp_path):
+        from zagg.hive import read_manifest
+        from zagg.sweep_lease import read_lease
+        from zagg.sweep_stages import run_stage_sweep
+
+        _stage_store(tmp_path / "s")
+        summary = run_stage_sweep(str(tmp_path / "s"), [(morton_word(d), None) for d in LEAVES])
+        assert summary["stages"] and summary["finisher"]["manifest_updated"]
+        assert summary["lease"]["released"] and read_lease(str(tmp_path / "s")) is None
+        entries = {e["node"]: e for e in read_manifest(str(tmp_path / "s"))["pyramid"]["overviews"]}
+        assert entries[0]["actuals"]["merges_from_raw"] == 2
+        # The record landed outside the stats_*.parquet glob, mode-tagged.
+        assert summary["record"].startswith("sweep_stats_") and summary["record"].endswith(
+            "_stages.json"
+        )
+        record = json.loads((tmp_path / "s" / summary["record"]).read_text())
+        assert record["mode"] == "stages" and record["lease"]["released"] is True
+
+    def test_second_sweep_refused_naming_the_runner(self, tmp_path):
+        from zagg.sweep_lease import SweepRefused, acquire_lease
+        from zagg.sweep_stages import run_stage_sweep
+
+        _stage_store(tmp_path / "s")
+        acquire_lease(str(tmp_path / "s"), run_id="live-runner")
+        with pytest.raises(SweepRefused, match="live-runner"):
+            run_stage_sweep(str(tmp_path / "s"), [(morton_word(d), None) for d in LEAVES])
+
+    def test_expired_claim_completes_a_partial_prior_run(self, tmp_path):
+        from zagg.sweep_lease import LEASE_NAME, acquire_lease, read_lease
+        from zagg.sweep_stages import run_stage_sweep
+
+        m = _stage_store(tmp_path / "s")
+        # Run A swept only base cell '1', then died holding the lease.
+        sweep_stage_pass(
+            str(tmp_path / "s"),
+            m,
+            _by_shard(),
+            run_id="A",
+            scope=normalize_scope(["1"]),
+        )
+        lease = acquire_lease(str(tmp_path / "s"), run_id="A")
+        stale = dict(lease, heartbeat_at="2020-01-01T00:00:00+00:00")
+        (tmp_path / "s" / LEASE_NAME).write_text(json.dumps(stale))
+        summary = run_stage_sweep(
+            str(tmp_path / "s"), [(morton_word(d), None) for d in LEAVES], run_id="C"
+        )
+        assert summary["lease"]["claimed_from"] == "A"
+        assert summary["lease"]["released"] and read_lease(str(tmp_path / "s")) is None
+        # The claimant finished what A left: '-2' materialized, '1' current.
+        assert (tmp_path / "s" / "-2" / "all.zarr").exists()
+        (row,) = summary["stages"]
+        assert row["current"] > 0 and row["written"] > 0
+
+    def test_unscoped_discovery_survives_a_stale_root_moc(self, tmp_path):
+        from zagg.sweep_stages import run_stage_sweep
+
+        # Fleet appended '-2111' (run record + column) but NO sweep ran, so
+        # the root MOC only knows the '1*' leaves — the ruled acceptance case:
+        # discovery is listing-based; the MOC is an accelerator, never truth.
+        root = tmp_path / "s"
+        _stage_store(root, write_moc=False)
+        write_root_coverage(
+            str(root),
+            build_root_coverage([morton_word(d) for d in LEAVES if d != "-2111"], 3),
+        )
+        _write_run_record(root, LEAVES)
+        summary = run_stage_sweep(str(root))  # leaves=None: discovery
+        assert summary["n_leaves"] == len(LEAVES)
+        # The stale MOC did not hide the new base cell from the sweep.
+        assert (root / "-2" / "all.zarr").exists()
+
+    def test_partitions_compose_under_one_lease(self, tmp_path):
+        from zagg.sweep_stages import run_stage_sweep
+
+        _stage_store(tmp_path / "s")
+        summary = run_stage_sweep(
+            str(tmp_path / "s"),
+            [(morton_word(d), None) for d in LEAVES],
+            partitions=4,
+        )
+        assert summary["lease"]["released"]
+        # Every leaf here has first digit '1', so partition 0 owns ALL the
+        # writing; coarse dispatch nodes span partitions (their subtrees
+        # intersect every partition MOC), so later partitions re-visit them
+        # and read current — the ratchet is the in-process dedupe.
+        by_part: dict = {}
+        for row in summary["stages"]:
+            index = row.get("partition", {}).get("index")
+            by_part[index] = by_part.get(index, 0) + row["written"]
+        assert by_part[0] > 0
+        assert all(v == 0 for i, v in by_part.items() if i != 0)
+        assert (tmp_path / "s" / "1" / "all.zarr").exists()
+        assert (tmp_path / "s" / "-2" / "all.zarr").exists()
+
+    def test_failure_leaves_the_lease_held(self, tmp_path, monkeypatch):
+        import zagg.sweep_stages as stages_mod
+        from zagg.sweep_lease import read_lease
+        from zagg.sweep_stages import run_stage_sweep
+
+        _stage_store(tmp_path / "s")
+
+        def boom(*a, **k):
+            raise RuntimeError("stage died")
+
+        monkeypatch.setattr(stages_mod, "sweep_stage_pass", boom)
+        with pytest.raises(RuntimeError, match="stage died"):
+            run_stage_sweep(str(tmp_path / "s"), [(morton_word(d), None) for d in LEAVES])
+        held = read_lease(str(tmp_path / "s"))
+        assert held is not None  # claimable after TTL; never released mid-wreck
+
+    def test_v1_store_refuses_loudly(self, tmp_path):
+        from zagg.sweep_stages import run_stage_sweep
+
+        root = tmp_path / "s"
+        root.mkdir()
+        manifest = {
+            "spec": "morton-hive/1",
+            "dataset": {"short_name": "TEST", "version": "001"},
+            "semantic_hash": "t",
+            "cell_order": 5,
+            "shard_order": 3,
+            "split_schedule": [1, 1, 1],
+            "pyramid": {"spec": "zagg-pyramid/1", "overview": {"orders": [1]}},
+            "generated_at": _utcnow(),
+        }
+        (root / MANIFEST_NAME).write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="zagg-pyramid/2"):
+            run_stage_sweep(str(root), [(morton_word("1111"), None)])
+
+
+class TestChainingAndCli:
+    def test_stage_sweep_after_run_scopes_to_the_fleet_footprint(self, tmp_path):
+        from zagg.sweep_stages import stage_sweep_after_run
+
+        _stage_store(tmp_path / "s")
+        summary = stage_sweep_after_run(
+            str(tmp_path / "s"), [(morton_word("1111"), None), (morton_word("1112"), None)]
+        )
+        assert summary is not None and summary["lease"]["released"]
+        # Scoped to base '1': the untouched '-2' base was not invoked.
+        assert not (tmp_path / "s" / "-2" / "all.zarr").exists()
+
+    def test_stage_sweep_after_run_is_fail_open(self, tmp_path):
+        from zagg.sweep_lease import acquire_lease
+        from zagg.sweep_stages import stage_sweep_after_run
+
+        _stage_store(tmp_path / "s")
+        acquire_lease(str(tmp_path / "s"), run_id="other")
+        assert stage_sweep_after_run(str(tmp_path / "s"), [(morton_word("1111"), None)]) is None
+
+    def test_cli_stages_backstop(self, tmp_path, capsys):
+        from zagg.sweep import main
+
+        root = tmp_path / "s"
+        _stage_store(root)
+        _write_run_record(root, LEAVES)
+        assert main([str(root), "--stages"]) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["mode" if "mode" in out else "run_id"]  # summary printed
+        assert out["lease"]["released"] is True
+        assert (root / "1" / "all.zarr").exists()
+
+    def test_sweep_knob_accepts_stages(self):
+        from zagg.config import PipelineConfig, validate_config
+
+        cfg = PipelineConfig(
+            data_source={"reader": "generic", "variables": {"h_li": "gt1l/h_li"}},
+            aggregation={
+                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+                "variables": {"count": {"function": "sum", "dtype": "int32", "fill_value": 0}},
+            },
+            output={
+                "grid": {"type": "healpix", "parent_order": 4, "child_order": 6},
+                "store_layout": "hive",
+                "sweep": "stages",
+            },
+        )
+        validate_config(cfg)  # must not raise
+        cfg.output["sweep"] = "bogus"
+        with pytest.raises(ValueError, match="boolean or 'stages'"):
+            validate_config(cfg)
