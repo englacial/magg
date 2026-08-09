@@ -1008,3 +1008,30 @@ class TestSoftBarrierReadFaults:
         assert row["failed"] > 0 and row["written"] > 0
         attrs = dict(_artifact(tmp_path / "s", "1/1/1/all.zarr").attrs)["zagg_overview"]
         assert attrs["source_children"] == {"folded": 1, "missing": 0, "unreadable": 1}
+
+
+class TestForeignStampAtReread:
+    def test_reread_reruns_the_foreign_guard(self, tmp_path, monkeypatch):
+        # Review finding: the stamp-validation re-read must re-run the
+        # foreign-fresh guard — a column rewritten mid-read by a FOREIGN
+        # sweep is exactly the residual race the backstop exists for.
+        m = _stage_store(tmp_path / "s")
+        state = {"fired": False}
+        orig = stage_mod._ColumnReader.read
+
+        def racy(self, res, name):
+            if not state["fired"] and self.path.endswith("1/1/1/1/all.pyramid.zarr"):
+                state["fired"] = True
+                _write_leaf(tmp_path / "s", "1111", 9, granules=7)
+                store = open_store(str(tmp_path / "s/1/1/1/1/all.pyramid.zarr"))
+                g = zarr.open_group(store, path="", mode="r+", zarr_format=3)
+                stamp = dict(g.attrs["morton_hive_commit"])
+                stamp["run_id"] = "intruder"
+                stamp["written_at"] = "2999-01-01T00:00:00+00:00"
+                g.attrs["morton_hive_commit"] = stamp
+            return orig(self, res, name)
+
+        monkeypatch.setattr(stage_mod._ColumnReader, "read", racy)
+        with pytest.raises(ForeignSweepError, match="intruder"):
+            sweep_stage_pass(str(tmp_path / "s"), m, _by_shard(), run_id="A")
+        assert state["fired"]
