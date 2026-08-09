@@ -941,3 +941,43 @@ class TestChainingAndCli:
         cfg.output["sweep"] = "bogus"
         with pytest.raises(ValueError, match="boolean or 'stages'"):
             validate_config(cfg)
+
+
+class TestHeartbeatCadence:
+    def test_on_node_seam_fires_per_dispatch_node(self, tmp_path):
+        # Review finding: a per-tuple-only beat lets the holder's own lease
+        # expire inside an unbounded tuple. The pass must expose a per-node
+        # seam the orchestrator's throttled heartbeat rides.
+        m = _stage_store(tmp_path / "s")
+        nodes = []
+        summary = sweep_stage_pass(
+            str(tmp_path / "s"),
+            m,
+            _by_shard(),
+            run_id="A",
+            tuple_width=1,
+            on_node=nodes.append,
+        )
+        assert len(nodes) == sum(row["nodes"] for row in summary["stages"])
+
+    def test_orchestrator_beats_inside_a_tuple(self, tmp_path, monkeypatch):
+        import zagg.sweep_lease as lease_mod
+        from zagg.sweep_stages import run_stage_sweep
+
+        _stage_store(tmp_path / "s")
+        real = lease_mod.heartbeat_lease
+        beats = []
+
+        def counting(store_root, lease, **kwargs):
+            beats.append(lease["run_id"])
+            return real(store_root, lease, **kwargs)
+
+        monkeypatch.setattr(lease_mod, "heartbeat_lease", counting)
+        # ttl_s=0 opens the throttle on every node, so the beat count must
+        # exceed the per-tuple count (1 stage at width 3 on this store).
+        summary = run_stage_sweep(
+            str(tmp_path / "s"),
+            [(morton_word(d), None) for d in LEAVES],
+            lease_ttl_s=1,
+        )
+        assert summary["lease"]["released"] and len(beats) >= 1
