@@ -1047,3 +1047,81 @@ class TestForeignStampAtReread:
         with pytest.raises(ForeignSweepError, match="intruder"):
             sweep_stage_pass(str(tmp_path / "s"), m, _by_shard(), run_id="A")
         assert state["fired"]
+
+
+class TestWindowedStageSweep:
+    """Review finding: the windowed / all-time arm was implemented but
+    untested. Two windows, ``all_time: true`` — per-window artifacts fold as
+    gathers/merges exactly like the unwindowed path, and the all-time fold is
+    ALWAYS a stage-merge over the per-window gen-1 tier (never a merged
+    all-time relay, which would breach the merge-source law); no all-time
+    stage column exists."""
+
+    WINDOWS = ("2019", "2020")
+
+    def _windowed_store(self, root):
+        from zagg.pyramid import expand_overviews
+
+        m = _stage_store(root)
+        m["spec"] = "morton-hive/2"
+        m["temporal"] = {
+            "schedule": "yearly",
+            "time_field": "t",
+            "epoch": "2018-01-01T00:00:00Z",
+        }
+        m["pyramid"]["overview"]["all_time"] = True
+        (root / MANIFEST_NAME).write_text(json.dumps(m, indent=1))
+        # Replace the unwindowed columns with per-window ones.
+        for leaf in root.rglob("all.pyramid.zarr"):
+            import shutil
+
+            shutil.rmtree(leaf)
+        from zagg.column import column_resolutions, fold_column, write_column
+
+        levels = expand_overviews([4], parent_order=3)
+        res = column_resolutions(levels, 3)
+        for i, dec in enumerate(LEAVES):
+            for w, window in enumerate(self.WINDOWS):
+                folded = fold_column(_leaf_slabs(i + 10 * w), FIELDS, cell_order=5, resolutions=res)
+                write_column(
+                    str(root),
+                    morton_word(dec),
+                    folded,
+                    FIELDS,
+                    node_order=3,
+                    cell_order=5,
+                    window=window,
+                    granule_count=1,
+                )
+        return m
+
+    def test_per_window_and_all_time_folds(self, tmp_path):
+        root = tmp_path / "s"
+        m = self._windowed_store(root)
+        by_shard = {d: set(self.WINDOWS) for d in LEAVES}
+        summary = sweep_stage_pass(str(root), m, by_shard, run_id="A")
+        (row,) = summary["stages"]
+        assert row["failed"] == 0 and row["written"] > 0
+        # Per-window artifacts exist side by side with the all-time fold.
+        for name in ("2019.zarr", "2020.zarr", "all.zarr"):
+            assert (root / "1" / "1" / "1" / name).exists()
+        # Per-window gather carries gen-1 bytes; regimes as unwindowed.
+        w_attrs = dict(_artifact(root, "1/1/1/2019.zarr").attrs)["zagg_overview"]
+        assert w_attrs["regime"] == "stage-gather" and w_attrs["merges_from_raw"] == 1
+        # The all-time fold is a merge of the per-window gen-1 tier — even at
+        # a gather level — at exactly 2 merges from raw.
+        a_attrs = dict(_artifact(root, "1/1/1/all.zarr").attrs)["zagg_overview"]
+        assert a_attrs["regime"] == "stage-merge" and a_attrs["merges_from_raw"] == 2
+        # Exact math: all-time root cell = both windows' leaf sums.
+        per_window = [
+            list(_artifact(root, f"1/{w}.zarr")["1"]["count"][:])[0] for w in self.WINDOWS
+        ]
+        all_time = list(_artifact(root, "1/all.zarr")["1"]["count"][:])[0]
+        assert all_time == sum(per_window) > 0
+        # No all-time stage column exists at any order (per-window columns
+        # carry the gen-1 tier; an all-time relay would be merged content).
+        summary1 = sweep_stage_pass(str(root), m, by_shard, run_id="B", tuple_width=1)
+        assert all(s["failed"] == 0 for s in summary1["stages"])
+        for node in ("1/1", "1"):
+            assert (root / node / "2019.pyramid.zarr").exists() or node == "1"
+            assert not (root / node / "all.pyramid.zarr").exists()
