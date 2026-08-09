@@ -83,15 +83,24 @@ _MOC_BATCH_RINGS = 32
 # Records per ``mocs_and``/``mocs_to_orders`` call on the stored-index path
 # (``_intersect_footprint_cells``, mortie 0.9.6's batch twins, espg/mortie#173).
 # Same shape of argument as ``_MOC_BATCH_RINGS`` above: the whole-catalog single
-# call holds a record-aligned gather copy of the column plus mortie's documented
-# input copy live at once -- measured 5,198 MB over the load plateau on the
-# 555,867-granule clone against the pre-swap scalar loop's ~1.7 GB. Blocking
-# bounds that term by the block, and it costs no wall -- blocked is *faster*
-# than one giant call. Clone sweep at order 9 (min-of-3 at the finalists):
-# 2.53 s / 1,737 MB at 512, 2.50 s / 1,770 MB at 2048, 2.55 s / 1,828 MB at
-# 4096, 2.49-3.10 s / 2,080-3,650 MB at 8192-65536, 3.83 s / 5,198 MB
-# unblocked. ~1,736 MB is the o9 floor (column materialization plus plan
-# bookkeeping) no block size removes. 512 over 2048 is bytes, not records:
+# call holds *three* catalog-proportional arrays live at once -- the int64
+# ``idx`` gather index, the ``values[idx]`` record-aligned copy it produces, and
+# mortie's documented input copy -- measured 5,198 MB over the load plateau on
+# the 555,867-granule clone against the pre-swap scalar loop's ~1.7 GB. Three is
+# what makes that number add up: the clone's order-9 column is ~288 words per
+# granule, so ~1.28 GB apiece, and two arrays over the floor would predict
+# ~4.3 GB, three ~5.5 GB. Blocking bounds that term by the block, and it costs
+# no wall -- blocked is *faster* than one giant call. Clone sweep at order 9
+# (min-of-3 at the finalists): 2.53 s / 1,736.9 MB at 512, 2.50 s / 1,770 MB at
+# 2048, 2.55 s / 1,828 MB at 4096, 2.49-3.10 s / 2,080-3,650 MB at 8192-65536,
+# 3.27 s / 6,407 MB at 262144, 3.83 s / 5,198 MB unblocked. Peak is *not*
+# monotone in block size: 262144 is 3 blocks on this catalog and peaks above the
+# single call. Recorded as measured, not explained -- once the block is itself
+# catalog-scale the peak is allocator scatter, not a term blocking controls.
+# What the sweep supports is the small-block end, where the peak sits on the
+# floor. That floor is the sweep's own minimum rather than a separate baseline
+# run: 1,736.5 MB at 1024, 1,736.9 at 512 -- column materialization plus plan
+# bookkeeping, which no block size removes. 512 over 2048 is bytes, not records:
 # per-record MOC size grows ~40x from an order-9 column to an order-13 one, so
 # a record-count block only bounds the worst case if it is sized against the
 # fat-column end -- on 88S indexed at order 13 the peak is 2,627 MB at 512 vs
