@@ -117,14 +117,20 @@ _MOC_BATCH_RINGS = 32
 # The ``mocs_intersect`` prefilter (the later phase) reuses this constant for
 # both of its passes, and the blocking survives the prefilter for measured
 # reasons on each:
-# - the *predicate* pass walks every row, so its input copy is
-#   catalog-proportional exactly like the unblocked ``mocs_and`` was: the
-#   whole-column single call measured 1,096 MB over plateau on the clone's
-#   order-9 column (values are 1,551 MB -- the binding's documented copy)
-#   against 184 MB blocked at 512, for ~0.1 s of predicate wall (0.88 s
-#   whole-column vs 0.98 s blocked, min-of-3 in-process). Same bytes-not-
-#   records argument as above: 512 rows is ~1.2 MB/slice on an order-9 column
-#   and ~30 MB on an order-13 one.
+# - the *predicate* pass walks every row, so what it hands mortie is
+#   catalog-proportional exactly like the unblocked ``mocs_and`` was. The
+#   mechanism is the binding's documented input copy; the figures below are
+#   RSS over plateau -- that copy plus whatever the allocator keeps -- so
+#   they are observations of the peak, not measurements of the copy. On the
+#   clone's order-9 column (1,551 MB of values) the whole-column single call
+#   measured 1,096 MB over plateau in-process against 184 MB blocked at 512,
+#   the latter a high-water over the whole loop rather than one slice.
+#   Neither reconciles 1:1 with the bytes handed over, and the decision only
+#   needs the ordering they agree on: whole-column spikes ~1.1 GB, blocked
+#   stays near the floor, for ~0.1 s of predicate wall (0.88 s whole-column
+#   vs 0.98 s blocked, min-of-3 in-process). Same bytes-not-records argument
+#   as above: 512 rows is ~1.2 MB of column per slice at order 9 and ~30 MB
+#   at order 13.
 # - the *survivor* pass is bounded by hits, ~0.4% of the clone against a
 #   regional AOI (2,356 of 555,867 records) -- five blocks, where one call
 #   would also be fine. But survivors are AOI-proportional, not
@@ -351,8 +357,8 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     every record through. Both passes are blocked by ``_CELLS_BATCH_RECORDS``
     (see the constant): the survivor pass because its gather copy plus
     mortie's input copy are all-hit-proportional, the predicate because the
-    binding's input copy alone measured ~1.1 GB over plateau on the
-    whole-column clone call against ~184 MB blocked.
+    whole-column clone call measured ~1.1 GB of RSS over plateau against
+    ~184 MB blocked.
     """
     from mortie import compress_moc, mocs_and, mocs_intersect, mocs_to_orders
 
@@ -401,8 +407,9 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     # ``granule_records`` dropped are walked too; they cost nothing
     # (``index_footprints`` gives them zero-width runs) and ``hits[rows]``
     # discards them. Blocked, not whole-column: mortie's binding copies
-    # ``values`` before releasing the GIL, and that copy alone measured
-    # ~1.1 GB over plateau at clone scale (see ``_CELLS_BATCH_RECORDS``).
+    # ``values`` before releasing the GIL, and the whole-column call measured
+    # ~1.1 GB of RSS over plateau at clone scale against ~184 MB blocked (see
+    # ``_CELLS_BATCH_RECORDS`` for what those numbers do and do not say).
     n_rows = offsets.size - 1
     hits = np.empty(n_rows, dtype=bool)
     for a in range(0, n_rows, _CELLS_BATCH_RECORDS):
