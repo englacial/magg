@@ -779,12 +779,12 @@ class TestRunStageSweep:
         assert record["mode"] == "stages" and record["lease"]["released"] is True
 
     def test_second_sweep_refused_naming_the_runner(self, tmp_path):
-        from zagg.sweep_lease import SweepRefused, acquire_lease
+        from zagg.sweep_lease import SweepRefusedError, acquire_lease
         from zagg.sweep_stages import run_stage_sweep
 
         _stage_store(tmp_path / "s")
         acquire_lease(str(tmp_path / "s"), run_id="live-runner")
-        with pytest.raises(SweepRefused, match="live-runner"):
+        with pytest.raises(SweepRefusedError, match="live-runner"):
             run_stage_sweep(str(tmp_path / "s"), [(morton_word(d), None) for d in LEAVES])
 
     def test_expired_claim_completes_a_partial_prior_run(self, tmp_path):

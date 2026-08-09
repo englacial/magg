@@ -15,7 +15,7 @@ import pytest
 from zagg.sweep_lease import (
     DEFAULT_TTL_S,
     LEASE_NAME,
-    SweepRefused,
+    SweepRefusedError,
     acquire_lease,
     heartbeat_lease,
     read_lease,
@@ -40,7 +40,7 @@ class TestAcquire:
     def test_live_foreign_intent_refuses_naming_the_runner(self, tmp_path):
         root = _root(tmp_path)
         acquire_lease(root, run_id="A")
-        with pytest.raises(SweepRefused, match="'A'"):
+        with pytest.raises(SweepRefusedError, match="'A'"):
             acquire_lease(root, run_id="B")
 
     def test_reacquire_by_the_holder_is_idempotent(self, tmp_path):
@@ -77,7 +77,7 @@ class TestHeartbeatAndRelease:
         lease = acquire_lease(root, run_id="A")
         stolen = dict(lease, run_id="B")
         (tmp_path / "store" / LEASE_NAME).write_text(json.dumps(stolen))
-        with pytest.raises(SweepRefused, match="another run claimed"):
+        with pytest.raises(SweepRefusedError, match="another run claimed"):
             heartbeat_lease(root, lease)
 
     def test_release_deletes_only_our_own(self, tmp_path):
