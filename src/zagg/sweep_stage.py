@@ -71,7 +71,9 @@ reducer-keyed folds join this orchestration later under the same schema.
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 
 import numpy as np
 
@@ -273,3 +275,980 @@ def scope_admits(decimal: str, scope: np.ndarray | None) -> bool:
     # TODO(espg/mortie#173, espg/mortie PR 174): batch ``mocs_and`` replaces
     # this per-node scalar call once mortie 0.9.6 releases.
     return moc_and(np.asarray([morton_word(decimal)], dtype=np.uint64), scope).size > 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: the stage worker — fold one dispatch node's tuple from its columns.
+# ---------------------------------------------------------------------------
+
+
+def _same_stamp(a: dict | None, b: dict | None) -> bool:
+    """Whether two commit-stamp reads witness the same write."""
+    return (a or None) == (b or None)
+
+
+def _foreign_fresh(stamp: dict | None, run_id: str, run_started: str) -> bool:
+    """A stage stamp from ANOTHER run, written since this run started.
+
+    Fleet stamps carry no ``run_id`` and are never foreign (fleet ∥ sweep is
+    allowed by the concurrency matrix); a foreign STAGE stamp older than this
+    run is a completed prior sweep — ordinary input, not a conflict. The
+    comparison is STRICT: stamps resolve to whole seconds, so a prior run
+    that completed in the second this run started would otherwise read as
+    live. A true same-second race escapes the backstop — admission is the
+    LEASE's job; this predicate only has to catch the long-lived residuals
+    (zombie workers, TTL clock skew), which keep writing well past our start.
+    """
+    if not isinstance(stamp, dict):
+        return False
+    rid = stamp.get("run_id")
+    return rid is not None and rid != run_id and str(stamp.get("written_at") or "") > run_started
+
+
+class _ColumnReader:
+    """Stamp-validated reads over one child column (leaf or stage).
+
+    One root-metadata GET serves the D4 stamp gate, the provenance attrs, and
+    the generation basis together. Every group read is bracketed by the
+    **optimistic stamp validation** the lease ruling requires: stamp before,
+    read, stamp after — if the stamp moved (a fleet worker rewrote the leaf
+    mid-read, the allowed fleet ∥ sweep regime), the read retries against the
+    fresh stamp, so a merge never consumes a torn (mixed-generation) column.
+    A stamp that keeps moving reads as unreadable, never as data. A stage
+    column stamped by a foreign run SINCE this run started raises
+    :class:`ForeignSweepError` (two live sweeps — the lease backstop).
+    """
+
+    def __init__(self, path: str, *, run_id: str, run_started: str, store_kwargs: dict):
+        from zagg.store import open_store
+
+        self.path = path
+        self.revalidated = 0
+        self._store = open_store(path, read_only=True, **store_kwargs)
+        self.stamp, self.attrs = self._root()
+        if _foreign_fresh(self.stamp, run_id, run_started):
+            raise ForeignSweepError(
+                f"column {path} carries a fresh stamp from foreign sweep run "
+                f"{self.stamp.get('run_id')!r} (written {self.stamp.get('written_at')}); "
+                f"two sweeps are live on this store — aborting (lease backstop)"
+            )
+
+    def _root(self) -> tuple[dict | None, dict]:
+        import zarr
+
+        from zagg.hive import COMMIT_ATTR
+
+        try:
+            attrs = dict(zarr.open_group(self._store, path="", mode="r", zarr_format=3).attrs)
+        except Exception:
+            return None, {}
+        stamp = attrs.get(COMMIT_ATTR)
+        return (dict(stamp) if isinstance(stamp, dict) else None), attrs
+
+    @property
+    def committed(self) -> bool:
+        return self.stamp is not None
+
+    def generation(self) -> dict:
+        """This column's generation basis: its own, or the leaf identity.
+
+        Stage columns record a ``generation`` block in their attrs (the
+        summed ratchet); a leaf column is one leaf — ``n_leaves: 1`` at its
+        stamp timestamp. The parent's skip gate keys on the SUM of these.
+        """
+        from zagg.column import COLUMN_ATTR
+
+        block = (self.attrs.get(COLUMN_ATTR) or {}).get("generation")
+        if isinstance(block, dict):
+            return {
+                "n_leaves": int(block.get("n_leaves") or 0),
+                "max_leaf_timestamp": block.get("max_leaf_timestamp"),
+            }
+        return {"n_leaves": 1, "max_leaf_timestamp": (self.stamp or {}).get("written_at")}
+
+    def read(self, res: int, name: str) -> np.ndarray | None:
+        """One group array, stamp-validated; ``None`` for an absent field."""
+        import zarr
+
+        for _attempt in range(3):
+            before = self.stamp
+            try:
+                group = zarr.open_group(self._store, path=str(res), mode="r", zarr_format=3)
+                values = group[name][:]
+            except KeyError:
+                return None  # schema evolution: the field postdates this column
+            after, attrs = self._root()
+            if _same_stamp(before, after):
+                return values
+            logger.info(f"stage sweep: column {self.path} moved mid-read; re-reading")
+            self.stamp, self.attrs = after, attrs
+            self.revalidated += 1
+        raise ValueError(f"column {self.path} stamp kept moving across re-reads")
+
+
+def _readers_for(
+    store_root: str,
+    children: list,
+    windows: list,
+    *,
+    run_id: str,
+    run_started: str,
+    store_kwargs: dict,
+    counts: dict,
+) -> dict:
+    """``{child decimal: [reader-or-None per window]}``, stamp-gated.
+
+    An absent or unstamped column reads ``None`` — under-coverage, recorded
+    by the caller (the soft-barrier posture: fold what is on disk, loudly).
+    An unreadable one counts ``failed`` and also reads ``None``.
+    """
+    from zagg.column import column_name
+    from zagg.sweep import _node_rel
+
+    readers: dict = {}
+    for child in children:
+        row = []
+        for window in windows:
+            path = f"{store_root}/{_node_rel(child)}/{column_name(window)}"
+            try:
+                reader = _ColumnReader(
+                    path, run_id=run_id, run_started=run_started, store_kwargs=store_kwargs
+                )
+            except ForeignSweepError:
+                raise
+            except Exception as e:
+                logger.warning(f"stage sweep: unreadable column {path} ({e})")
+                counts["failed"] += 1
+                row.append(None)
+                continue
+            row.append(reader if reader.committed else None)
+        readers[child] = row
+    return readers
+
+
+def _summed_generation(rows: list) -> dict:
+    """The ratchet key: child generations summed (skip-if-current basis)."""
+    n, stamps = 0, []
+    for row in rows:
+        for reader in row:
+            if reader is not None:
+                gen = reader.generation()
+                n += gen["n_leaves"]
+                stamps.append(gen["max_leaf_timestamp"])
+    stamps = [t for t in stamps if t is not None]
+    return {"n_leaves": int(n), "max_leaf_timestamp": max(stamps) if stamps else None}
+
+
+def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) -> tuple:
+    """Concatenate child members at ``res`` — gen-1 content, untouched.
+
+    ``rows`` is the DENSE rank-ordered child range: ``None`` for a child no
+    candidate leaf inhabits (genuinely empty — fill, uncounted), else the
+    child's reader row (gathers are per-window by construction, one reader,
+    itself ``None`` when the candidate's column is missing — under-coverage,
+    counted). Payloads are ASSIGNED, never decoded or re-folded — the
+    acceptance contract that gather levels carry gen-1 bytes untouched.
+    Returns ``(slabs, folded, missing)``.
+    """
+    from zagg.sweep_overview import _empty_slab
+
+    slabs = {name: _empty_slab(meta, n_out) for name, meta in fields.items()}
+    folded = missing = 0
+    for i, row in enumerate(rows):
+        if row is None:
+            continue
+        reader = row[0]
+        if reader is None:
+            missing += 1
+            continue
+        folded += 1
+        seg = slice(i * span, (i + 1) * span)
+        for name in fields:
+            values = reader.read(res, name)
+            if values is not None:
+                slabs[name][seg] = values
+    return slabs, folded, missing
+
+
+def _merge_slabs(
+    rows: list, fields: dict, *, res_src: int, src_per_child: int, factor: int, n_out: int
+) -> tuple:
+    """K-way fold of the gen-1 tier, ``factor``-to-one — the ruled merge.
+
+    ``rows`` is the DENSE rank-ordered child range (``None`` for uninhabited
+    children, else ``[reader-or-None per window]``). The sources are the
+    relayed node-order partials (``res_src == shard_order``) or, for the
+    all-time fold on a windowed store, the per-window members at the level's
+    own resolution (``factor == 1``, windows folding across). Either way the
+    inputs are gen-1 leaf-tier content, and each output cell folds in ONE
+    flat k-way call — what makes the merge tree independent of
+    ``tuple_width`` (the merge-source law; ``merge_tdigests_kway`` is
+    order-independent by its sort, #370).
+
+    Memory bound: exact classes accumulate one dense source vector per
+    window (scalars); digest classes stream child by child, holding one
+    child's slab plus the open output cells' decoded digests (~``factor``
+    digests per cell — the envelope the ruling priced). Missing candidates
+    contribute fill and are counted (``source_children.missing``).
+    """
+    from zagg.sweep_overview import (
+        _empty_slab,
+        combine_dense,
+        decode_digest,
+        fold_dense,
+        fold_digests,
+    )
+
+    windows = next((len(row) for row in rows if row is not None), 1)
+    n_src = src_per_child * len(rows)
+    folded = sum(1 for row in rows if row is not None and any(r is not None for r in row))
+    missing = sum(1 for row in rows if row is not None and not any(r is not None for r in row))
+    slabs: dict = {}
+    for name, meta in fields.items():
+        if meta["class"] != "exact":
+            continue
+        law, fill = meta.get("method"), meta.get("fill_value", "NaN")
+        out = None
+        for w in range(windows):
+            acc = _empty_slab(meta, n_src)
+            for i, row in enumerate(rows):
+                reader = row[w] if row is not None else None
+                if reader is None:
+                    continue
+                values = reader.read(res_src, name)
+                if values is not None:
+                    acc[i * src_per_child : (i + 1) * src_per_child] = values
+            part = fold_dense(acc, factor, law, fill)
+            out = part if out is None else combine_dense(out, part, law, fill)
+        slabs[name] = out
+    for name, meta in fields.items():
+        if meta["class"] == "exact":
+            continue
+        dtype = meta.get("dtype") or "float32"
+        inner = tuple(meta.get("inner_shape") or (2,))
+        delta = int(meta.get("delta") or 512)
+        out = np.full(n_out, b"", dtype=object)
+        pending: dict[int, list] = {}
+        for i, row in enumerate(rows):
+            base = i * src_per_child
+            for reader in row or ():
+                if reader is None:
+                    continue
+                slab = reader.read(res_src, name)
+                if slab is None:
+                    continue
+                for p, payload in enumerate(slab):
+                    if payload is not None and len(payload):
+                        cell = pending.setdefault((base + p) // factor, [])
+                        cell.append(decode_digest(payload, dtype, inner))
+            # Cells wholly covered by children 0..i are complete: fold and
+            # free them, so resident state never exceeds the open boundary.
+            done = ((i + 1) * src_per_child) // factor
+            for j in [j for j in pending if j < done]:
+                out[j] = fold_digests(pending.pop(j), delta=delta, dtype=dtype)
+        for j, cell in pending.items():
+            out[j] = fold_digests(cell, delta=delta, dtype=dtype)
+        slabs[name] = out
+    return slabs, folded, missing
+
+
+def _dense_rows(readers: dict, node: str, *, depth: int) -> list:
+    """The full rank range of ``node``'s children: reader rows or ``None``."""
+    from zagg.sweep_overview import _rel_rank
+
+    rows: list = [None] * (4**depth)
+    for child, row in readers.items():
+        if child.startswith(node) and len(child) == len(node) + depth:
+            rows[_rel_rank(child, node)] = row
+    return rows
+
+
+def _stage_fold(
+    node: str,
+    k: int,
+    r: int,
+    readers: dict,
+    fields: dict,
+    *,
+    shard_order: int,
+    child_order: int,
+    all_time: bool,
+) -> dict | None:
+    """Fold one ``(artifact node, level)`` from the dispatch worker's readers.
+
+    ``readers`` is the dispatch node's ``{child decimal: [reader per
+    window]}``; this densifies to the rank range under ``node`` and folds per
+    the level's derived regime. Returns the fold dict (slabs + generation +
+    provenance) or ``None`` when no child contributed. The all-time fold on
+    a windowed store is ALWAYS a merge — its inputs are the per-window gen-1
+    members at the level's own resolution (never a merged all-time relay,
+    which would breach the merge-source law) — so it records ``stage-merge``
+    at gen 2 even where the per-window level is a gather.
+    """
+    from zagg.sweep_overview import _content_hash
+    from zagg.windows import union_time_range
+
+    rows = _dense_rows(readers, node, depth=child_order - k)
+    n_out = 4 ** (r - k)
+    regime = classify_level(r, shard_order=shard_order)
+    if regime == STAGE_GATHER and not all_time:
+        slabs, folded, missing = _gather_slabs(
+            rows, fields, res=r, span=4 ** (r - child_order), n_out=n_out
+        )
+        merges_from_raw = 1
+    else:
+        res_src = r if (all_time and regime == STAGE_GATHER) else shard_order
+        slabs, folded, missing = _merge_slabs(
+            rows,
+            fields,
+            res_src=res_src,
+            src_per_child=4 ** (res_src - child_order),
+            factor=4 ** (res_src - r) if res_src != r else 1,
+            n_out=n_out,
+        )
+        regime, merges_from_raw = STAGE_MERGE, 2
+    if folded == 0:
+        return None
+    granules, ranges = 0, []
+    for row in rows:
+        for reader in row or ():
+            if reader is not None and reader.stamp:
+                granules += int(reader.stamp.get("granule_count") or 0)
+                if reader.stamp.get("time_range") is not None:
+                    ranges.append(reader.stamp["time_range"])
+    return {
+        "slabs": slabs,
+        "generation": _summed_generation([row for row in rows if row is not None]),
+        "content_hash": _content_hash(node, k, r, fields, slabs),
+        "granule_count": granules,
+        "time_range": union_time_range(*ranges) if ranges else None,
+        "regime": regime,
+        "merges_from_raw": merges_from_raw,
+        "source_children": {"folded": int(folded), "missing": int(missing), "unreadable": 0},
+    }
+
+
+def _write_stage_overview(
+    store_root,
+    node,
+    k,
+    key,
+    r,
+    fold,
+    fields,
+    shard_order,
+    cell_order,
+    windowed,
+    run_id,
+    store_kwargs,
+) -> str:
+    """Write one ``/2`` ladder overview zarr at its node; returns the basename.
+
+    The ``zagg-overview/2`` per-artifact shape §4.4 deferred to the writers:
+    ONE resolution group at the entry's own ``cells`` member (``r = k + d``,
+    not the ``/1`` constant-depth formula), attrs carrying the #381 point (7)
+    provenance (regime, merges-from-raw, ``source_children``) and the run id.
+    Write order is the D4 discipline: template (wholesale) -> arrays ->
+    role/provenance attrs -> commit stamp LAST (carrying ``run_id`` — the
+    lease ruling's backstop), then the D20 sidecar as a fail-open sibling.
+    """
+    import zarr
+    from mortie import generate_morton_children
+    from zarr import open_array
+
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.grids.morton import morton_word
+    from zagg.hive import _utcnow, stamp_commit
+    from zagg.store import open_store
+    from zagg.sweep_overview import (
+        OVERVIEW_ATTR,
+        ROLE_ATTR,
+        _field_provenance,
+        _overview_basename,
+        _overview_config,
+        _populated_mask,
+    )
+
+    basename = _overview_basename(key)
+    path = f"{store_root}/{_node_rel(node)}/{basename}"
+    grid = HealpixGrid(int(k), int(r), config=_overview_config(fields), sharded=True)
+    store = open_store(path, **store_kwargs)
+    grid.emit_shard_template(store, overwrite=True)
+    words = np.asarray(generate_morton_children(morton_word(node), int(r)), dtype=np.uint64)
+    arr = open_array(store, path=f"{r}/morton", zarr_format=3, consolidated=False)
+    arr[:] = words
+    for name, slab in fold["slabs"].items():
+        arr = open_array(store, path=f"{r}/{name}", zarr_format=3, consolidated=False)
+        arr[:] = slab
+    populated = _populated_mask(fold["slabs"], fields)
+    root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
+    root.attrs.update(
+        {
+            ROLE_ATTR: "overview",
+            OVERVIEW_ATTR: {
+                "spec": OVERVIEW_SPEC_V2,
+                "node": node,
+                "order": int(k),
+                "cell_order": int(r),
+                "source_shard_order": int(shard_order),
+                "source_cell_order": int(cell_order),
+                "window": key,
+                "fields": {n: _field_provenance(m) for n, m in fields.items()},
+                "regime": fold["regime"],
+                "merges_from_raw": int(fold["merges_from_raw"]),
+                "source_children": dict(fold["source_children"]),
+                "generation": fold["generation"],
+                "content_hash": fold["content_hash"],
+                "run_id": run_id,
+                "generated_at": _utcnow(),
+            },
+        }
+    )
+    stamp_window = key if windowed else None
+    stamp_commit(
+        store,
+        cells_with_data=int(populated.sum()),
+        granule_count=int(fold["granule_count"]),
+        window=stamp_window,
+        time_range=fold["time_range"] if stamp_window is not None else None,
+        run_id=run_id,
+    )
+    try:  # D20 sidecar: fail-open telemetry, §5 O11 record (the /1 writer's posture)
+        from zagg.content_hash import content_hashes_record, hash_arrays
+        from zagg.telemetry import SPEC_V3, build_record, write_sidecar
+
+        staged = {f"{r}/morton": words}
+        staged.update({f"{r}/{name}": slab for name, slab in fold["slabs"].items()})
+        group = zarr.open_group(store, path="", mode="r", zarr_format=3)
+        record = build_record(
+            shard_key=morton_word(node),
+            metadata={
+                "cells_with_data": int(populated.sum()),
+                "granule_count": int(fold["granule_count"]),
+                "content_hashes": content_hashes_record(hash_arrays(group, staged=staged)),
+            },
+            window=stamp_window,
+        )
+        write_sidecar(path, record, spec=SPEC_V3, **store_kwargs)
+    except Exception as e:
+        logger.warning(f"stage sweep: O11 sidecar failed at {node}/{basename} ({e})")
+    return basename
+
+
+def write_stage_column(
+    store_root,
+    node,
+    folded: dict,
+    fields: dict,
+    *,
+    node_order: int,
+    shard_order: int,
+    cell_order: int,
+    generation: dict,
+    source_children: dict,
+    window: str | None = None,
+    time_range=None,
+    granule_count: int = 0,
+    run_id: str | None = None,
+    store_kwargs: dict | None = None,
+) -> str:
+    """Write one stage column at its dispatch node; returns the basename.
+
+    The §4.6 column artifact shape (``zagg-column/1``) with the stage
+    regime: every group is a PURE GATHER of the child columns' members at
+    the same resolution — the relay (``shard_order``: the subtree's leaf
+    node-order partials, the ruled merge-source tier) plus the gatherable
+    members coarser tuples need — so ``merges_from_raw`` stays 1 for every
+    group and the artifact carries gen-1 content only. The relay member is
+    the one group a parent merge may assume; a ``folded`` without it is
+    refused by name. Attrs additionally record the summed ``generation``
+    (the parent's skip-gate basis), ``source_children`` (a gather that
+    under-covered says so in the artifact), and the run id; the commit stamp
+    carries ``run_id`` too (lease backstop). D4 order throughout; the D20
+    sidecar lands after the stamp, fail-open. Single-writer law: the column
+    lives under its own node prefix, one writer per lease-serialized run.
+    """
+    import zarr
+    from mortie import generate_morton_children
+    from pydantic_zarr.experimental.v3 import GroupSpec
+    from zarr import config as zarr_config
+    from zarr import open_array
+    from zarr.core.sync import sync
+
+    from zagg.column import (
+        COLUMN_ATTR,
+        COLUMN_ROLE,
+        COLUMN_SPEC,
+        _column_provenance,
+        _delete_sidecar,
+        _sidecar_name,
+        _write_sidecar,
+        column_name,
+        composable_fields,
+    )
+    from zagg.grids.base import vlen_dtype_warning_suppressed
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.grids.morton import morton_word
+    from zagg.hive import _utcnow, stamp_commit
+    from zagg.store import open_store
+    from zagg.sweep_overview import ROLE_ATTR, _overview_config, _populated_mask
+    from zagg.windows import SCHEDULE_NONE_TOKEN
+
+    store_kwargs = dict(store_kwargs or {})
+    node_order = int(node_order)
+    fields = composable_fields(fields)
+    resolutions = sorted((int(r) for r in folded), reverse=True)
+    if int(shard_order) not in resolutions:
+        raise ValueError(
+            f"a stage column must carry the relay member ({shard_order} — the subtree's "
+            f"leaf node-order partials, the ruled merge-source tier); got {resolutions}"
+        )
+    node_prefix = f"{store_root}/{_node_rel(node)}"
+    basename = column_name(window)
+    path = f"{node_prefix}/{basename}"
+    cfg = _overview_config(fields)
+    grids = {res: HealpixGrid(node_order, res, config=cfg, sharded=True) for res in resolutions}
+    spec = GroupSpec(
+        members={str(res): grids[res].shard_spec() for res in resolutions}, attributes={}
+    )
+    store = open_store(path, **store_kwargs)
+    staged: dict = {}
+    with zarr_config.set({"async.concurrency": 128}), vlen_dtype_warning_suppressed():
+        sync(store.delete_dir(""))
+        _delete_sidecar(node_prefix, _sidecar_name(basename), store_kwargs)
+        spec.to_zarr(store, "", overwrite=True)
+        for res in resolutions:
+            words = np.asarray(generate_morton_children(morton_word(node), res), dtype=np.uint64)
+            arr = open_array(store, path=f"{res}/morton", zarr_format=3, consolidated=False)
+            arr[:] = words
+            staged[f"{res}/morton"] = words
+            for name, slab in folded[res].items():
+                arr = open_array(store, path=f"{res}/{name}", zarr_format=3, consolidated=False)
+                arr[:] = slab
+                staged[f"{res}/{name}"] = slab
+    root = zarr.open_group(store, path="", mode="r+", zarr_format=3)
+    root.attrs.update(
+        {
+            ROLE_ATTR: COLUMN_ROLE,
+            COLUMN_ATTR: {
+                "spec": COLUMN_SPEC,
+                "node": node,
+                "order": node_order,
+                "source_cell_order": int(cell_order),
+                "window": window if window is not None else SCHEDULE_NONE_TOKEN,
+                "fields": {n: _column_provenance(m) for n, m in fields.items()},
+                "groups": {
+                    str(res): {
+                        "regime": STAGE_GATHER,
+                        "merges_from_raw": 1,
+                        "n_cells": 4 ** (res - node_order),
+                    }
+                    for res in resolutions
+                },
+                "generation": dict(generation),
+                "source_children": dict(source_children),
+                "cells_with_data_order": resolutions[0],
+                "run_id": run_id,
+                "generated_at": _utcnow(),
+            },
+        }
+    )
+    populated = _populated_mask(folded[resolutions[0]], fields)
+    stamp_commit(
+        store,
+        cells_with_data=int(populated.sum()),
+        granule_count=int(granule_count),
+        window=window,
+        time_range=time_range if window is not None else None,
+        run_id=run_id,
+    )
+    _write_sidecar(
+        store,
+        path,
+        morton_word(node),
+        staged,
+        int(populated.sum()),
+        granule_count,
+        window,
+        store_kwargs,
+    )
+    return basename
+
+
+def _node_rel(decimal: str) -> str:
+    from zagg.sweep import _node_rel as rel
+
+    return rel(decimal)
+
+
+def _artifact_stamp(store_root, node, basename, run_id, run_started, store_kwargs) -> dict | None:
+    """A stage artifact's commit stamp (``None`` when absent), foreign-gated.
+
+    The ruled backstop lives here: a skip-if-current read that encounters a
+    FOREIGN stamp written since this run started aborts loudly rather than
+    trusting or overwriting a live sibling sweep's output.
+    """
+    from zagg.hive import read_commit
+    from zagg.store import open_store
+
+    if not basename:
+        return None
+    try:
+        stamp = read_commit(
+            open_store(f"{store_root}/{_node_rel(node)}/{basename}", **store_kwargs)
+        )
+    except Exception as e:
+        logger.debug(f"stage sweep: cannot confirm {node}/{basename} ({e})")
+        return None
+    if _foreign_fresh(stamp, run_id, run_started):
+        raise ForeignSweepError(
+            f"stage artifact {node}/{basename} carries a fresh stamp from foreign sweep run "
+            f"{stamp.get('run_id')!r} (written {stamp.get('written_at')}); two sweeps are "
+            f"live on this store — aborting (lease backstop)"
+        )
+    return stamp
+
+
+def stage_node(
+    store,
+    store_root,
+    node,
+    stage,
+    levels,
+    fields,
+    *,
+    key,
+    fold_windows,
+    all_time,
+    windowed,
+    shard_order,
+    cell_order,
+    candidates,
+    run_id,
+    run_started,
+    counts,
+    store_kwargs,
+) -> None:
+    """One stage worker: fold a dispatch node's tuple for one window item.
+
+    Reads the node's candidate child columns once (stamp-validated), then per
+    tuple order materializes every dirty artifact node beneath the dispatch
+    node — skip-if-current keyed on SUMMED CHILD GENERATIONS (the ratchet:
+    a healed or appended child moves the sum and forces the rewrite; a
+    content hash cannot be had without folding, so the generation pair is
+    the gate) — and finally its own stage column (relay + gatherables),
+    unless this is the root tuple (no parent consumes it) or the all-time
+    item (the per-window columns carry the gen-1 tier; an all-time column
+    would relay merged content, breaching the merge-source law).
+    """
+    from zagg.sweep_overview import ENVELOPE_NAME, _read_envelope
+    from zagg.windows import union_time_range
+
+    dispatch, child_order = int(stage["dispatch"]), int(stage["child_order"])
+    level_by_order = {int(e["node"]): int(e["cells"][0]) for e in levels}
+    orders = [k for k in stage["orders"] if k in level_by_order]
+    children = sorted({_node_at(d, child_order) for d in candidates if d.startswith(node)})
+    readers = _readers_for(
+        store_root,
+        children,
+        fold_windows,
+        run_id=run_id,
+        run_started=run_started,
+        store_kwargs=store_kwargs,
+        counts=counts,
+    )
+    dispatch_level_current = False
+    for k in orders:
+        r = level_by_order[k]
+        regime_plan = (
+            STAGE_MERGE
+            if (all_time or classify_level(r, shard_order=shard_order) == STAGE_MERGE)
+            else STAGE_GATHER
+        )
+        for target in sorted({_node_at(d, k) for d in candidates if d.startswith(node)}):
+            rows = [row for c, row in readers.items() if c.startswith(target)]
+            fresh_gen = _summed_generation(rows)
+            envelope = _read_envelope(store, target)
+            entries = dict((envelope or {}).get("windows") or {})
+            entry = entries.get(key)
+            if (
+                isinstance(entry, dict)
+                and entry.get("generation") == fresh_gen
+                and entry.get("regime") == regime_plan
+                and _artifact_stamp(
+                    store_root, target, entry.get("object"), run_id, run_started, store_kwargs
+                )
+                is not None
+            ):
+                counts["current"] += 1
+                if k == dispatch and target == node:
+                    dispatch_level_current = True
+                continue
+            fold = _stage_fold(
+                target,
+                k,
+                r,
+                readers,
+                fields,
+                shard_order=shard_order,
+                child_order=child_order,
+                all_time=all_time,
+            )
+            if fold is None:
+                counts["empty"] += 1
+                continue
+            if fold["source_children"]["missing"]:
+                counts["under_covered"] += 1
+            try:
+                basename = _write_stage_overview(
+                    store_root,
+                    target,
+                    k,
+                    key,
+                    r,
+                    fold,
+                    fields,
+                    shard_order,
+                    cell_order,
+                    windowed,
+                    run_id,
+                    store_kwargs,
+                )
+            except Exception as e:
+                logger.warning(f"stage sweep: write failed at node {target} window {key!r} ({e})")
+                counts["failed"] += 1
+                continue
+            counts["written"] += 1
+            entries[key] = {
+                "object": basename,
+                "generation": fold["generation"],
+                "content_hash": fold["content_hash"],
+                "regime": fold["regime"],
+                "merges_from_raw": int(fold["merges_from_raw"]),
+                "source_children": dict(fold["source_children"]),
+                "run_id": run_id,
+            }
+            fresh = {
+                "spec": _sweep_spec(),
+                "family": "overview",
+                "node": target,
+                "order": int(k),
+                "windows": entries,
+            }
+            if fresh != envelope:
+                import obstore
+
+                obstore.put(
+                    store,
+                    f"{_node_rel(target)}/{ENVELOPE_NAME}",
+                    json.dumps(fresh, indent=1).encode(),
+                )
+    counts["revalidated"] += sum(
+        r.revalidated for row in readers.values() for r in row if r is not None
+    )
+    if dispatch == 0 or (windowed and all_time):
+        return
+    members = column_members(levels, dispatch, shard_order=shard_order)
+    fresh_gen = _summed_generation(list(readers.values()))
+    if dispatch_level_current and _stage_column_current(
+        store_root, node, fold_windows[0], fresh_gen, run_id, run_started, store_kwargs
+    ):
+        counts["columns_current"] += 1
+        return
+    folded: dict = {}
+    relay_sc = None
+    for res in members:
+        slabs, folded_n, missing = _gather_slabs(
+            _dense_rows(readers, node, depth=child_order - dispatch),
+            fields,
+            res=res,
+            span=4 ** (res - child_order),
+            n_out=4 ** (res - dispatch),
+        )
+        folded[res] = slabs
+        if res == shard_order:
+            relay_sc = {"folded": int(folded_n), "missing": int(missing), "unreadable": 0}
+    if relay_sc is None or relay_sc["folded"] == 0:
+        return
+    granules, ranges = 0, []
+    for row in readers.values():
+        for reader in row:
+            if reader is not None and reader.stamp:
+                granules += int(reader.stamp.get("granule_count") or 0)
+                if reader.stamp.get("time_range") is not None:
+                    ranges.append(reader.stamp["time_range"])
+    try:
+        write_stage_column(
+            store_root,
+            node,
+            folded,
+            fields,
+            node_order=dispatch,
+            shard_order=shard_order,
+            cell_order=cell_order,
+            generation=fresh_gen,
+            source_children=relay_sc,
+            window=fold_windows[0],
+            time_range=union_time_range(*ranges) if ranges else None,
+            granule_count=granules,
+            run_id=run_id,
+            store_kwargs=store_kwargs,
+        )
+        counts["columns_written"] += 1
+        if relay_sc["missing"]:
+            counts["under_covered"] += 1
+    except Exception as e:
+        logger.warning(f"stage sweep: column write failed at node {node} window {key!r} ({e})")
+        counts["failed"] += 1
+
+
+def _stage_column_current(
+    store_root, node, window, fresh_gen, run_id, run_started, store_kwargs
+) -> bool:
+    """Whether the dispatch node's column is committed at the fresh generation."""
+    import zarr
+
+    from zagg.column import COLUMN_ATTR, column_name
+    from zagg.hive import COMMIT_ATTR
+    from zagg.store import open_store
+
+    path = f"{store_root}/{_node_rel(node)}/{column_name(window)}"
+    try:
+        attrs = dict(
+            zarr.open_group(
+                open_store(path, read_only=True, **store_kwargs), path="", mode="r", zarr_format=3
+            ).attrs
+        )
+    except Exception:
+        return False
+    stamp = attrs.get(COMMIT_ATTR)
+    if not isinstance(stamp, dict):
+        return False
+    if _foreign_fresh(stamp, run_id, run_started):
+        raise ForeignSweepError(
+            f"stage column {path} carries a fresh stamp from foreign sweep run "
+            f"{stamp.get('run_id')!r}; two sweeps are live on this store — aborting"
+        )
+    return (attrs.get(COLUMN_ATTR) or {}).get("generation") == fresh_gen
+
+
+def _sweep_spec() -> str:
+    from zagg.sweep import SWEEP_SPEC
+
+    return SWEEP_SPEC
+
+
+def _node_at(decimal: str, order: int) -> str:
+    from zagg.sweep_overview import _node_at as at
+
+    return at(decimal, order)
+
+
+def sweep_stage_pass(
+    store_root: str,
+    manifest: dict,
+    by_shard: dict,
+    *,
+    scope: np.ndarray | None = None,
+    tuple_width: int = DEFAULT_TUPLE_WIDTH,
+    run_id: str,
+    run_started: str | None = None,
+    store_kwargs: dict | None = None,
+    on_stage=None,
+) -> dict:
+    """One staged pass over the dirty set: every tuple, finest first.
+
+    The in-process driver the orchestration (phase 4) wraps with admission,
+    discovery, the finisher and the run record. ``by_shard`` is the
+    normalized dirty set (``{shard_decimal: {window, ...}}``); candidate
+    children per node come from it unioned with the root ``coverage.moc``
+    (an ACCELERATOR — a stale root MOC degrades coverage of untouched
+    siblings, recorded as ``root_moc_stale``, never discovery, which is
+    listing-based upstream). ``scope`` (a normalized MOC) filters DISPATCH
+    nodes; a dispatched worker folds all children on disk. ``on_stage`` is
+    called after each tuple (the lease heartbeat's seam). Returns the pass
+    summary with per-stage rows.
+    """
+    from zagg.hive import _utcnow
+    from zagg.store import open_object_store
+    from zagg.sweep_overview import _candidate_decimals, _window_work
+
+    store_kwargs = dict(store_kwargs or {})
+    run_started = run_started or _utcnow()
+    pyramid = manifest.get("pyramid") or {}
+    shard_order = int(manifest["shard_order"])
+    cell_order = int(manifest["cell_order"])
+    levels = ladder_entries(pyramid, shard_order)
+    decl = pyramid.get("overview") if isinstance(pyramid.get("overview"), dict) else {}
+    fields = {
+        n: dict(m)
+        for n, m in (decl.get("fields") or {}).items()
+        if isinstance(m, dict) and m.get("class") in ("exact", "approximate")
+    }
+    summary: dict = {"run_id": run_id, "tuple_width": int(tuple_width), "stages": []}
+    if not fields:
+        logger.info("stage sweep: no composable fields declared; nothing to generate")
+        return summary
+    windowed = manifest.get("temporal") is not None
+    candidates, moc_stale = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
+    if moc_stale:
+        summary["root_moc_stale"] = True
+    if not candidates:
+        return summary
+    store = open_object_store(store_root, **store_kwargs)
+    from zagg.windows import SCHEDULE_NONE_TOKEN
+
+    for stage in stage_tuples(shard_order, tuple_width=tuple_width):
+        t0 = time.perf_counter()
+        counts = {
+            "written": 0,
+            "current": 0,
+            "empty": 0,
+            "failed": 0,
+            "under_covered": 0,
+            "columns_written": 0,
+            "columns_current": 0,
+            "revalidated": 0,
+        }
+        nodes = sorted({_node_at(d, stage["dispatch"]) for d in candidates})
+        nodes = [n for n in nodes if scope_admits(n, scope)]
+        for node in nodes:
+            dirty_windows: set = set()
+            for d in by_shard:
+                if d.startswith(node):
+                    dirty_windows |= by_shard[d]
+            from zagg.sweep_overview import _read_envelope
+
+            envelope = _read_envelope(store, node)
+            entries = dict((envelope or {}).get("windows") or {})
+            for key, fold_windows in _window_work(decl, windowed, dirty_windows, entries):
+                stage_node(
+                    store,
+                    store_root,
+                    node,
+                    stage,
+                    levels,
+                    fields,
+                    key=key,
+                    fold_windows=fold_windows,
+                    all_time=bool(windowed and key == SCHEDULE_NONE_TOKEN),
+                    windowed=windowed,
+                    shard_order=shard_order,
+                    cell_order=cell_order,
+                    candidates=candidates,
+                    run_id=run_id,
+                    run_started=run_started,
+                    counts=counts,
+                    store_kwargs=store_kwargs,
+                )
+        row = {
+            "dispatch_order": stage["dispatch"],
+            "orders": list(stage["orders"]),
+            "nodes": len(nodes),
+            **counts,
+            "duration_s": time.perf_counter() - t0,
+        }
+        summary["stages"].append(row)
+        if on_stage is not None:
+            on_stage(row)
+    return summary
