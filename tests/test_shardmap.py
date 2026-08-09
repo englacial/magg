@@ -910,24 +910,28 @@ class TestFootprintCells:
                 )
                 assert got == oracle, f"order {index_order} block {block} diverged from scalar"
 
-    def test_prefilter_edges_all_empty_all_hit_and_interleaved(self, hp_grid, monkeypatch):
+    def test_prefilter_edges_all_empty_all_hit_and_middle_run(self, hp_grid, monkeypatch):
         # The ``mocs_intersect`` prefilter's three edge shapes, each against
-        # the scalar oracle and swept across survivor-block boundaries. The
-        # granules are spaced 0.05 deg apart -- well over an order-11 cell
-        # (~0.03 deg) -- so the middle AOI's coverage cannot bleed onto the
-        # end granules and the ends-unassigned assertions are not flaky on
-        # cell quantization.
+        # the scalar oracle and swept across survivor-block boundaries. What
+        # has to clear a cell is the *gap* between granules, not the spacing:
+        # 0.02-deg-wide footprints every 0.15 deg leave 0.13 deg of empty
+        # longitude, which at lat 38.89 is 0.13 * cos(lat) = 0.101 deg of arc
+        # against an order-11 cell of ~0.0286 deg -- ~3.5 cells. Both the AOI
+        # box and each granule round out by up to a cell, so the middle AOI's
+        # coverage still cannot bleed onto its neighbours and the
+        # ends-unassigned assertions do not ride on quantization.
         #
         # - all-empty: a disjoint (but non-empty) AOI, so the ``not
         #   all_shards`` short-circuit does NOT fire and the predicate itself
         #   must drop every record before the materializing pass.
         # - all-hit: every record survives, pinned exactly; the survivor
         #   gather is the identity and the result is still the oracle's.
-        # - interleaved: survivors exclude record 0 and the last record, so
-        #   ``surv[0] != 0`` -- the leading-empty edge where a block-local
-        #   owner mapping (``start + i`` instead of ``own[i]``) would
-        #   misassign every hit to an earlier record and fail the equality.
-        items = [_item(f"G{i}", -76.62 + 0.05 * i, -76.60 + 0.05 * i) for i in range(10)]
+        # - middle run: one contiguous run of survivors (records 4 and 5) with
+        #   every record before and after it dropped, so ``surv[0] != 0`` --
+        #   the leading-empty edge where a block-local owner mapping
+        #   (``start + i`` instead of ``own[i]``) would misassign every hit to
+        #   an earlier record and fail the equality.
+        items = [_item(f"G{i}", -76.62 + 0.15 * i, -76.60 + 0.15 * i) for i in range(10)]
         cat = _catalog(items).index_footprints(11)
         records = cat.granule_records()
         values, offsets, _order, rows = shardmap._footprint_cells_plan(
@@ -949,11 +953,11 @@ class TestFootprintCells:
             return {g for v in got.values() for g in v}
 
         for block in (1, 3, 4, 10):
-            assert run(box(-76.63, -76.14, s=-40.0, n=-39.9), block) == set()
-            assert run(box(-76.63, -76.14), block) == set(range(len(records)))
-            mid = run(box(-76.41, -76.36), block)
-            assert mid, "the middle AOI must hit some granule"
-            assert 0 not in mid and len(records) - 1 not in mid
+            assert run(box(-76.63, -75.24, s=-40.0, n=-39.9), block) == set()
+            assert run(box(-76.63, -75.24), block) == set(range(len(records)))
+            # Records 4 and 5 exactly -- a middle run, so ``surv[0] != 0`` and
+            # the trailing records are dropped too.
+            assert run(box(-76.03, -75.84), block) == {4, 5}
 
     def test_predicate_overreport_still_returns_empty(self, hp_grid, monkeypatch):
         # The survivor loop's ``flat.size`` guard. mortie documents
