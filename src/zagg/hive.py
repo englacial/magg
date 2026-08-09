@@ -323,7 +323,11 @@ def build_manifest(grid, dataset: dict | None = None, windowing: dict | None = N
         # stores are retroactively 1 (the _frozen normalization); new stores
         # declare it explicitly.
         "path_grouping": 1,
-        "pyramid": build_pyramid_block(grid.config, int(grid.parent_order)),
+        # chunk_order feeds the ruled issue #384 /2 default flip; the raster
+        # and K==1 exemptions live inside build_pyramid_block.
+        "pyramid": build_pyramid_block(
+            grid.config, int(grid.parent_order), chunk_order=getattr(grid, "chunk_order", None)
+        ),
         "generated_at": _utcnow(),
     }
     if windowing:

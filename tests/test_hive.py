@@ -1561,7 +1561,10 @@ class TestProcessAndWriteHiveSharded:
         hive.process_and_write_hive(
             shard, ["s3://b/g1.h5"], grid, {}, str(tmp_path / "store"), cfg, store_kwargs={}
         )
-        assert ops == ["leaf", "sidecar", "stamp"]
+        # The trailing second stamp is the LEAF COLUMN's own commit (§4.6 —
+        # written after the leaf's, stamp-last in its own D4 order): since the
+        # issue #384 /2 default flip, a default declaration writes the column.
+        assert ops == ["leaf", "sidecar", "stamp", "stamp"]
 
     def test_error_shard_leaves_no_prefix(self, monkeypatch, cfg, tmp_path):
         # An errored shard skips the whole-leaf write; the template is lazy, so
@@ -1770,7 +1773,16 @@ class TestHiveProfileWritePhase:
             store_kwargs={},
         )
         assert meta["phase_timings"]["write"] >= 0.0
-        assert set(meta["phase_timings"]) == {"read", "index", "aggregate", "write", "hash"}
+        # "column" rides the sharded default since the issue #384 /2 flip
+        # (the sharded grid resolves an interior chunk order).
+        assert set(meta["phase_timings"]) == {
+            "read",
+            "index",
+            "aggregate",
+            "write",
+            "hash",
+            "column",
+        }
 
     def test_errored_shard_omits_write(self, monkeypatch, cfg, tmp_path):
         # Same gate as the flat handler (issue #100): a shard that wrote no

@@ -73,7 +73,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 
 import numpy as np
 
@@ -928,6 +927,7 @@ def stage_node(
     run_started,
     counts,
     store_kwargs,
+    level_actuals=None,
 ) -> None:
     """One stage worker: fold a dispatch node's tuple for one window item.
 
@@ -981,6 +981,15 @@ def stage_node(
                 is not None
             ):
                 counts["current"] += 1
+                if not all_time:
+                    _accumulate_actuals(
+                        level_actuals,
+                        k,
+                        r,
+                        entry.get("regime"),
+                        entry.get("merges_from_raw"),
+                        entry.get("source_children"),
+                    )
                 if k == dispatch and target == node:
                     dispatch_level_current = True
                 continue
@@ -1019,6 +1028,15 @@ def stage_node(
                 counts["failed"] += 1
                 continue
             counts["written"] += 1
+            if not all_time:
+                _accumulate_actuals(
+                    level_actuals,
+                    k,
+                    r,
+                    fold["regime"],
+                    fold["merges_from_raw"],
+                    fold["source_children"],
+                )
             entries[key] = {
                 "object": basename,
                 "generation": fold["generation"],
@@ -1144,111 +1162,25 @@ def _node_at(decimal: str, order: int) -> str:
     return at(decimal, order)
 
 
-def sweep_stage_pass(
-    store_root: str,
-    manifest: dict,
-    by_shard: dict,
-    *,
-    scope: np.ndarray | None = None,
-    tuple_width: int = DEFAULT_TUPLE_WIDTH,
-    run_id: str,
-    run_started: str | None = None,
-    store_kwargs: dict | None = None,
-    on_stage=None,
-) -> dict:
-    """One staged pass over the dirty set: every tuple, finest first.
+def _accumulate_actuals(level_actuals, k, r, regime, merges_from_raw, source_children) -> None:
+    """Fold one artifact's provenance into the run's per-LEVEL actuals.
 
-    The in-process driver the orchestration (phase 4) wraps with admission,
-    discovery, the finisher and the run record. ``by_shard`` is the
-    normalized dirty set (``{shard_decimal: {window, ...}}``); candidate
-    children per node come from it unioned with the root ``coverage.moc``
-    (an ACCELERATOR — a stale root MOC degrades coverage of untouched
-    siblings, recorded as ``root_moc_stale``, never discovery, which is
-    listing-based upstream). ``scope`` (a normalized MOC) filters DISPATCH
-    nodes; a dispatched worker folds all children on disk. ``on_stage`` is
-    called after each tuple (the lease heartbeat's seam). Returns the pass
-    summary with per-stage rows.
+    The finisher's manifest RMW writes these into the level entry that owns
+    them (#381 point (7)). Per-window folds only — the all-time fold is a
+    separate family of artifacts whose regime rides their own attrs, and
+    letting its ``stage-merge`` override a gather level's recorded regime
+    would misdescribe the product declaration the entry stands for.
     """
-    from zagg.hive import _utcnow
-    from zagg.store import open_object_store
-    from zagg.sweep_overview import _candidate_decimals, _window_work
-
-    store_kwargs = dict(store_kwargs or {})
-    run_started = run_started or _utcnow()
-    pyramid = manifest.get("pyramid") or {}
-    shard_order = int(manifest["shard_order"])
-    cell_order = int(manifest["cell_order"])
-    levels = ladder_entries(pyramid, shard_order)
-    decl = pyramid.get("overview") if isinstance(pyramid.get("overview"), dict) else {}
-    fields = {
-        n: dict(m)
-        for n, m in (decl.get("fields") or {}).items()
-        if isinstance(m, dict) and m.get("class") in ("exact", "approximate")
-    }
-    summary: dict = {"run_id": run_id, "tuple_width": int(tuple_width), "stages": []}
-    if not fields:
-        logger.info("stage sweep: no composable fields declared; nothing to generate")
-        return summary
-    windowed = manifest.get("temporal") is not None
-    candidates, moc_stale = _candidate_decimals(store_root, shard_order, by_shard, store_kwargs)
-    if moc_stale:
-        summary["root_moc_stale"] = True
-    if not candidates:
-        return summary
-    store = open_object_store(store_root, **store_kwargs)
-    from zagg.windows import SCHEDULE_NONE_TOKEN
-
-    for stage in stage_tuples(shard_order, tuple_width=tuple_width):
-        t0 = time.perf_counter()
-        counts = {
-            "written": 0,
-            "current": 0,
-            "empty": 0,
-            "failed": 0,
-            "under_covered": 0,
-            "columns_written": 0,
-            "columns_current": 0,
-            "revalidated": 0,
-        }
-        nodes = sorted({_node_at(d, stage["dispatch"]) for d in candidates})
-        nodes = [n for n in nodes if scope_admits(n, scope)]
-        for node in nodes:
-            dirty_windows: set = set()
-            for d in by_shard:
-                if d.startswith(node):
-                    dirty_windows |= by_shard[d]
-            from zagg.sweep_overview import _read_envelope
-
-            envelope = _read_envelope(store, node)
-            entries = dict((envelope or {}).get("windows") or {})
-            for key, fold_windows in _window_work(decl, windowed, dirty_windows, entries):
-                stage_node(
-                    store,
-                    store_root,
-                    node,
-                    stage,
-                    levels,
-                    fields,
-                    key=key,
-                    fold_windows=fold_windows,
-                    all_time=bool(windowed and key == SCHEDULE_NONE_TOKEN),
-                    windowed=windowed,
-                    shard_order=shard_order,
-                    cell_order=cell_order,
-                    candidates=candidates,
-                    run_id=run_id,
-                    run_started=run_started,
-                    counts=counts,
-                    store_kwargs=store_kwargs,
-                )
-        row = {
-            "dispatch_order": stage["dispatch"],
-            "orders": list(stage["orders"]),
-            "nodes": len(nodes),
-            **counts,
-            "duration_s": time.perf_counter() - t0,
-        }
-        summary["stages"].append(row)
-        if on_stage is not None:
-            on_stage(row)
-    return summary
+    if level_actuals is None:
+        return
+    entry = level_actuals.setdefault(
+        int(k),
+        {
+            "cells": int(r),
+            "regime": regime,
+            "merges_from_raw": int(merges_from_raw or 0),
+            "source_children": {"folded": 0, "missing": 0, "unreadable": 0},
+        },
+    )
+    for name in entry["source_children"]:
+        entry["source_children"][name] += int((source_children or {}).get(name) or 0)

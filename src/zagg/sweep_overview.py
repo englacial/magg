@@ -216,23 +216,33 @@ def fold_digests(cell_digests: list, *, delta: int, dtype="float32") -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def build_pyramid_block(config, shard_order: int) -> dict:
+def build_pyramid_block(config, shard_order: int, chunk_order: int | None = None) -> dict:
     """The manifest ``pyramid`` block: the template-time declaration (D22).
 
-    Declares the overview family's order schedule (``output.pyramid`` knob;
-    default every :data:`DEFAULT_SPACING` orders below the shard order —
-    espg-ratified), how each level is folded (:data:`DEFAULT_FOLD_SOURCE` /
+    Declares the overview family's order schedule (``output.pyramid`` knob),
+    how each level is folded (:data:`DEFAULT_FOLD_SOURCE` /
     :data:`DEFAULT_EXACT_LEVELS`, issue #376), and each field's composability
     class + fold method (D24).
     ``none`` fields are declared with their class ONLY — the recorded absence
     that gives readers zero-open filtering (option A, the ruled default) —
     and warned about loudly at template time, per the D24 ruling. The sweep
-    later adds ``materialized`` actuals; it never rewrites the declaration.
+    later adds actuals; it never rewrites the declaration.
 
     An explicit ``output.pyramid.overviews`` knob (issue #382) declares the
-    ``zagg-pyramid/2`` grouped ``(node, cells)`` grammar instead — built in
+    ``zagg-pyramid/2`` grouped ``(node, cells)`` grammar — built in
     :mod:`zagg.pyramid` (:func:`zagg.pyramid.overview_block_v2`), replacing
-    the ``orders``/``spacing`` schedule wholesale.
+    the ``orders``/``spacing`` schedule wholesale. Since the issue #384
+    acceptance ruling (recorded on the #384 thread), the DEFAULT declaration
+    is ``/2`` too: with no schedule spelled at all, a new store declares
+    ``overviews: [chunk_order]`` whenever the caller passes the grid's
+    resolved ``chunk_order`` (``build_manifest`` does) and it is strictly
+    interior to the shard's resolution window. Raster configs are exempt
+    (column-less by construction, issue #399), an explicit
+    ``orders``/``spacing`` schedule stays ``/1`` deliberately, and the
+    grid-less retrofit path (``declare_pyramid``) passes no ``chunk_order``
+    and keeps its ``/1`` fallback. :func:`zagg.column.leaf_column_plan`
+    mirrors this default from the grid, so declaration and worker gate can
+    never disagree.
     """
     from zagg.config import get_pyramid
     from zagg.pyramid import (
@@ -247,6 +257,21 @@ def build_pyramid_block(config, shard_order: int) -> dict:
     knob = get_pyramid(config)
     if knob is None:  # output.pyramid: false — declared off
         return {"spec": PYRAMID_SPEC, "overview": {"orders": []}}
+    default_child = (config.output.get("grid") or {}).get("child_order")
+    if (
+        knob.get("overviews") is None
+        and knob.get("orders") is None
+        and knob.get("spacing") is None
+        and isinstance(chunk_order, int)
+        and int(shard_order) < int(chunk_order)
+        and (default_child is None or int(chunk_order) < int(default_child))
+        and (config.data_source or {}).get("reader") != "raster"
+    ):
+        # The ruled /2 default flip (issue #384): every new store declares the
+        # multiresolution grammar. Strictly-interior only — a K == 1 grid, or
+        # one whose chunks are the cells themselves, has no valid /2 default
+        # and keeps the /1 fallback below.
+        knob = {**knob, "overviews": int(chunk_order)}
     fields, excluded = declared_fields(config)
     if knob.get("overviews") is not None:
         resolutions = normalize_overviews(knob["overviews"])
@@ -796,23 +821,24 @@ def sweep_overviews(
     spec = pyramid.get("spec") if isinstance(pyramid, dict) else None
     declared_v2 = isinstance(pyramid, dict) and pyramid.get("overviews") is not None
     if spec == PYRAMID_SPEC_V2 or declared_v2:
-        # Declared-but-not-yet-sweepable is a legal recorded state (#381
-        # point (11)): the /2 (node, cells) declaration stands at BLOCK
-        # level (``pyramid.overviews``, the espg shape ruling), and
-        # materialization arrives with the leaf columns (issue #383) and the
-        # staged sweep (issue #384). Refusing loudly here — never folding a
-        # schedule this sweep does not understand — is the /1-vs-/2 gate;
-        # /1 stores sweep exactly as before.
-        counts["sweepable"] = False
+        # The /2 (node, cells) grammar is swept by the STAGED sweep (issue
+        # #384: zagg.sweep_stage.run_stage_sweep, `python -m zagg.sweep
+        # <root> --stages`, or the post-fleet `output.sweep: "stages"`
+        # chaining) — the declared-not-yet-sweepable gate of PR #389 is
+        # retired. This family generates nothing for /2: its /1 fold reads
+        # raw leaves per level, which the column regime exists to end, and
+        # the two regimes must never mix. /1 stores sweep exactly as before.
+        counts["sweepable"] = True
+        counts["regime"] = "stages"
         # The `spec`-only arm reaches here with no list checked: a /2 marker
         # carrying no overviews list declares nothing, and must report the
         # same `declared: False` the /1 branch below would give it.
         counts["declared"] = bool(declared_v2 and pyramid.get("overviews"))
-        logger.warning(
-            f"sweep[overview]: the manifest pyramid declaration is {spec!r} — the "
-            f"(node, cells) level grammar (issue #382) is declared but NOT yet "
-            f"sweepable by this zagg (leaf columns: issue #383; staged sweep: "
-            f"issue #384); the declaration stands, nothing was generated"
+        logger.info(
+            f"sweep[overview]: the manifest pyramid declaration is {spec!r} — /2 "
+            f"stores are swept by the staged sweep (issue #384: run_stage_sweep, "
+            f"`python -m zagg.sweep --stages`, or output.sweep 'stages'); the "
+            f"overview family generates nothing here"
         )
         return counts
     if not isinstance(decl, dict) or not decl.get("orders"):
