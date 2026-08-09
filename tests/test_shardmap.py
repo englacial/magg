@@ -951,6 +951,41 @@ class TestFootprintCells:
             assert mid, "the middle AOI must hit some granule"
             assert 0 not in mid and len(records) - 1 not in mid
 
+    def test_predicate_overreport_still_returns_empty(self, hp_grid, monkeypatch):
+        # The survivor loop's ``flat.size`` guard. mortie documents
+        # ``mocs_intersect`` as exact (``hits[i]`` iff ``mocs_and``'s slot ``i``
+        # would be non-empty), so in a correct stack every survivor block
+        # materializes something and the guard never fires. Simulate that
+        # contract drifting -- over-report every row as a hit against a
+        # disjoint AOI -- and the answer must still be the oracle's ``{}``:
+        # without the guard the all-empty concatenation clears
+        # ``_regroup_hits``'s ``if not hit_shards`` gate and dies with an
+        # ``IndexError`` inside ``_first_of_run``, which names the wrong
+        # function.
+        import mortie
+
+        items = [_item(f"G{i}", -76.62 + 0.05 * i, -76.60 + 0.05 * i) for i in range(6)]
+        cat = _catalog(items).index_footprints(11)
+        records = cat.granule_records()
+        values, offsets, _order, rows = shardmap._footprint_cells_plan(
+            cat, records, hp_grid, "mortie", "swath", None
+        )
+        far = [
+            (
+                np.array([-40.0, -40.0, -39.9, -39.9, -40.0]),
+                np.array([-76.63, -76.14, -76.14, -76.63, -76.63]),
+            )
+        ]
+        shards = {int(s) for s in hp_grid.coverage(shardmap._region_parts(far, cat.metadata))}
+        assert shards, "the disjoint AOI must be non-empty, or the empty-AOI gate answers"
+        assert _intersect_cells_serial(rows, values, offsets, hp_grid, shards) == {}
+        monkeypatch.setattr(
+            mortie, "mocs_intersect", lambda _a, _v, off: np.ones(off.size - 1, bool)
+        )
+        for block in (1, 4, 6):
+            monkeypatch.setattr(shardmap, "_CELLS_BATCH_RECORDS", block)
+            assert shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, shards) == {}
+
     def test_batch_refusal_names_the_record_range(self, hp_grid, monkeypatch):
         # mortie's cell-budget ``ValueError`` names the offending MOC by its
         # index *within the call*, which blocking makes block-local: an

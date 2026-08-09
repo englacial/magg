@@ -447,6 +447,12 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
             ) from exc
         # Every slot in this block is non-empty by the predicate's contract,
         # so ``flat`` is never empty here and each owner repeats >= 1 time.
+        # The ``flat.size`` guard is belt-and-suspenders against that contract
+        # drifting: appending all-empty blocks clears ``_regroup_hits``'s
+        # ``if not hit_shards`` gate with an empty concatenation, which trips
+        # ``_first_of_run``'s documented ``size >= 1`` precondition and raises
+        # ``IndexError`` there -- a failure naming the wrong function. One
+        # branch per block keeps the ``{}`` no-hits returns everywhere else.
         flat = np.asarray(flat)
         owners = np.repeat(own, np.diff(flat_off))
         # No per-granule ``np.unique``: ``_regroup_hits``'s stable sort keeps
@@ -455,8 +461,9 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
         # replaces. Owners stay non-decreasing across blocks (``surv`` is
         # increasing and blocks walk it in order), so the regroup's sort/dedup
         # invariant holds on the concatenation exactly as it did on one array.
-        hit_shards.append(flat.astype(np.uint64, copy=False))
-        hit_owners.append(owners)
+        if flat.size:
+            hit_shards.append(flat.astype(np.uint64, copy=False))
+            hit_owners.append(owners)
     return _regroup_hits(hit_shards, hit_owners)
 
 
