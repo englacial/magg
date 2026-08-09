@@ -819,6 +819,7 @@ def stamp_commit(
     coverage: dict | None = None,
     window: str | None = None,
     time_range: tuple | list | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Stamp a shard leaf complete — the shard's FINAL write (D4).
 
@@ -835,6 +836,12 @@ def stamp_commit(
     the manifest keeps only the static schedule). A windowed stamp declares
     ``spec: "morton-hive/2"``; unwindowed stamps stay ``/1`` byte-identical.
     ``time_range`` without ``window`` is rejected (no unwindowed extent claim).
+
+    ``run_id`` (issue #384, additive): STAGE-written artifacts stamp the
+    sweep run that wrote them, the backstop the admission lease ruling
+    requires — a skip-if-current read that sees a foreign FRESH stamp aborts
+    loudly. Fleet-written leaves and columns never carry it; readers treat
+    absence as "not a stage artifact", never as an error.
     """
     if window is None and time_range is not None:
         raise ValueError(
@@ -876,6 +883,8 @@ def stamp_commit(
             stamp["time_range"] = [str(t) for t in time_range]
     if coverage is not None:
         stamp["coverage"] = coverage
+    if run_id is not None:
+        stamp["run_id"] = str(run_id)
     group.attrs[COMMIT_ATTR] = stamp
 
 
