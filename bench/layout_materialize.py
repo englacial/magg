@@ -50,7 +50,7 @@ def fake_antarctic_parents(parent_order: int, n_parents: int = 1300, seed: int =
     Mimics realistic Antarctic AOI density without a CMR query.
     """
     rng = np.random.default_rng(seed)
-    parents_per_base = 4 ** parent_order
+    parents_per_base = 4**parent_order
     out = []
     for base in (8, 9, 10, 11):
         n = max(1, n_parents // 4)
@@ -109,9 +109,12 @@ def write_layout(
 
     n_parent_cells = len(parents) if layout == "dense" else None
     xdggs_zarr_template(
-        store, parent_order, child_order,
+        store,
+        parent_order,
+        child_order,
         n_parent_cells=n_parent_cells,
-        overwrite=True, config=config,
+        overwrite=True,
+        config=config,
     )
 
     chunk_size = 4 ** (child_order - parent_order)
@@ -119,8 +122,7 @@ def write_layout(
 
     # Pre-open arrays once
     arrays = {
-        name: open_array(store, path=f"{child_order}/{name}",
-                         zarr_format=3, consolidated=False)
+        name: open_array(store, path=f"{child_order}/{name}", zarr_format=3, consolidated=False)
         for name in var_names
     }
 
@@ -132,6 +134,7 @@ def write_layout(
             arr.set_block_selection((block_idx,), chunk[name])
 
     from concurrent.futures import ThreadPoolExecutor
+
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=32) as ex:
         list(ex.map(lambda args: _write_one(*args), enumerate(parents)))
@@ -147,14 +150,8 @@ def write_layout(
         "child_order": child_order,
         "n_populated_chunks": len(parents),
         "chunk_size": chunk_size,
-        "n_total_chunks": (
-            len(parents) if layout == "dense"
-            else 12 * 4 ** parent_order
-        ),
-        "array_shape": (
-            chunk_size * len(parents) if layout == "dense"
-            else 12 * 4 ** child_order
-        ),
+        "n_total_chunks": (len(parents) if layout == "dense" else 12 * 4**parent_order),
+        "array_shape": (chunk_size * len(parents) if layout == "dense" else 12 * 4**child_order),
         "write_s": write_s,
         "consolidate_s": consolidate_s,
         "path": store_path,
@@ -166,16 +163,26 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--base", required=True,
-                        help="Output base (local dir or s3://bucket/prefix)")
-    parser.add_argument("--orders", type=int, nargs="+", default=[8, 10, 12],
-                        help="child_orders to materialize (parent_order = child - 6)")
-    parser.add_argument("--parent-offset", type=int, default=6,
-                        help="parent_order = child_order - parent_offset (default 6)")
-    parser.add_argument("--n-parents", type=int, default=1300,
-                        help="synthetic AOI cell count")
-    parser.add_argument("--layouts", nargs="+", default=["dense", "fullsphere"],
-                        choices=["dense", "fullsphere"])
+    parser.add_argument(
+        "--base", required=True, help="Output base (local dir or s3://bucket/prefix)"
+    )
+    parser.add_argument(
+        "--orders",
+        type=int,
+        nargs="+",
+        default=[8, 10, 12],
+        help="child_orders to materialize (parent_order = child - 6)",
+    )
+    parser.add_argument(
+        "--parent-offset",
+        type=int,
+        default=6,
+        help="parent_order = child_order - parent_offset (default 6)",
+    )
+    parser.add_argument("--n-parents", type=int, default=1300, help="synthetic AOI cell count")
+    parser.add_argument(
+        "--layouts", nargs="+", default=["dense", "fullsphere"], choices=["dense", "fullsphere"]
+    )
     parser.add_argument("--region", default="us-west-2")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -186,16 +193,22 @@ def main():
     for child_order in args.orders:
         parent_order = max(0, child_order - args.parent_offset)
         parents = fake_antarctic_parents(
-            parent_order, n_parents=args.n_parents, seed=args.seed,
+            parent_order,
+            n_parents=args.n_parents,
+            seed=args.seed,
         )
         logger.info(
             f"\n=== child_order={child_order} parent_order={parent_order} "
-            f"n_parents={len(parents)} chunk_size={4**(child_order-parent_order)} ==="
+            f"n_parents={len(parents)} chunk_size={4 ** (child_order - parent_order)} ==="
         )
         for layout in args.layouts:
             try:
                 path, stats = write_layout(
-                    args.base, layout, parent_order, child_order, parents,
+                    args.base,
+                    layout,
+                    parent_order,
+                    child_order,
+                    parents,
                     region=args.region,
                 )
                 rows.append(stats)
@@ -210,8 +223,10 @@ def main():
                 logger.error(f"  {layout}: FAILED ({e})")
 
     print("\n=== Summary ===")
-    print(f"{'layout':12s} {'p':>2s} {'c':>2s} {'shape':>13s} "
-          f"{'chunks':>10s} {'pop':>5s} {'write_s':>8s} {'path'}")
+    print(
+        f"{'layout':12s} {'p':>2s} {'c':>2s} {'shape':>13s} "
+        f"{'chunks':>10s} {'pop':>5s} {'write_s':>8s} {'path'}"
+    )
     for r in rows:
         print(
             f"{r['layout']:12s} {r['parent_order']:>2d} {r['child_order']:>2d} "

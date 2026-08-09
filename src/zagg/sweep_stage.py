@@ -90,6 +90,17 @@ STAGE_MERGE = "stage-merge"
 DEFAULT_TUPLE_WIDTH = 3
 
 
+#: Row marker for a candidate child whose column could not be READ (open or
+#: root-metadata fault) — distinct from ``None`` (no committed column at all,
+#: i.e. missing): the two land in different ``source_children`` counters, and
+#: a log line in an exited process cannot make that distinction for a reader.
+UNREADABLE = object()
+
+
+def _is_reader(entry) -> bool:
+    return isinstance(entry, _ColumnReader)
+
+
 class ForeignSweepError(RuntimeError):
     """A foreign run's FRESH stamp was seen mid-run: two sweeps are live.
 
@@ -324,23 +335,35 @@ class _ColumnReader:
 
         self.path = path
         self.revalidated = 0
+        self._run_id, self._run_started = run_id, run_started
         self._store = open_store(path, read_only=True, **store_kwargs)
         self.stamp, self.attrs = self._root()
-        if _foreign_fresh(self.stamp, run_id, run_started):
+        self._foreign_guard(self.stamp)
+
+    def _foreign_guard(self, stamp: dict | None) -> None:
+        if _foreign_fresh(stamp, self._run_id, self._run_started):
             raise ForeignSweepError(
-                f"column {path} carries a fresh stamp from foreign sweep run "
-                f"{self.stamp.get('run_id')!r} (written {self.stamp.get('written_at')}); "
+                f"column {self.path} carries a fresh stamp from foreign sweep run "
+                f"{stamp.get('run_id')!r} (written {stamp.get('written_at')}); "
                 f"two sweeps are live on this store — aborting (lease backstop)"
             )
 
     def _root(self) -> tuple[dict | None, dict]:
+        """Root attrs + stamp; absent reads ``(None, {})``, corrupt RAISES.
+
+        The distinction feeds ``source_children``: a cleanly absent column is
+        ``missing`` (never generated, or a fleet still in flight); a column
+        whose root metadata exists but cannot be read is ``unreadable``
+        (review finding — the two must not launder into one counter).
+        """
         import zarr
+        from zarr.errors import GroupNotFoundError
 
         from zagg.hive import COMMIT_ATTR
 
         try:
             attrs = dict(zarr.open_group(self._store, path="", mode="r", zarr_format=3).attrs)
-        except Exception:
+        except (FileNotFoundError, GroupNotFoundError):
             return None, {}
         stamp = attrs.get(COMMIT_ATTR)
         return (dict(stamp) if isinstance(stamp, dict) else None), attrs
@@ -367,19 +390,30 @@ class _ColumnReader:
         return {"n_leaves": 1, "max_leaf_timestamp": (self.stamp or {}).get("written_at")}
 
     def read(self, res: int, name: str) -> np.ndarray | None:
-        """One group array, stamp-validated; ``None`` for an absent field."""
+        """One group array, stamp-validated; ``None`` for an absent member.
+
+        An absent FIELD or an absent GROUP both read ``None`` — schema (or
+        declaration) evolution: the member postdates this column, and its
+        cells contribute fill until the leaf re-runs (review finding: a
+        deepened ``overviews`` declaration over existing columns must
+        under-cover, never abort the sweep). Every re-read re-runs the
+        foreign-fresh guard: a column rewritten mid-read by a FOREIGN sweep
+        is the exact race the backstop exists for (review finding).
+        """
         import zarr
+        from zarr.errors import GroupNotFoundError
 
         for _attempt in range(3):
             before = self.stamp
             try:
                 group = zarr.open_group(self._store, path=str(res), mode="r", zarr_format=3)
                 values = group[name][:]
-            except KeyError:
-                return None  # schema evolution: the field postdates this column
+            except (KeyError, FileNotFoundError, GroupNotFoundError):
+                return None  # the member postdates this column: fill
             after, attrs = self._root()
             if _same_stamp(before, after):
                 return values
+            self._foreign_guard(after)
             logger.info(f"stage sweep: column {self.path} moved mid-read; re-reading")
             self.stamp, self.attrs = after, attrs
             self.revalidated += 1
@@ -419,7 +453,7 @@ def _readers_for(
             except Exception as e:
                 logger.warning(f"stage sweep: unreadable column {path} ({e})")
                 counts["failed"] += 1
-                row.append(None)
+                row.append(UNREADABLE)
                 continue
             row.append(reader if reader.committed else None)
         readers[child] = row
@@ -431,7 +465,7 @@ def _summed_generation(rows: list) -> dict:
     n, stamps = 0, []
     for row in rows:
         for reader in row:
-            if reader is not None:
+            if _is_reader(reader):
                 gen = reader.generation()
                 n += gen["n_leaves"]
                 stamps.append(gen["max_leaf_timestamp"])
@@ -453,13 +487,14 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
     from zagg.sweep_overview import _empty_slab
 
     slabs = {name: _empty_slab(meta, n_out) for name, meta in fields.items()}
-    folded = missing = 0
+    folded = missing = unreadable = 0
     for i, row in enumerate(rows):
         if row is None:
             continue
         reader = row[0]
-        if reader is None:
-            missing += 1
+        if not _is_reader(reader):
+            missing += reader is None
+            unreadable += reader is not None
             continue
         folded += 1
         seg = slice(i * span, (i + 1) * span)
@@ -467,7 +502,7 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
             values = reader.read(res, name)
             if values is not None:
                 slabs[name][seg] = values
-    return slabs, folded, missing
+    return slabs, folded, missing, unreadable
 
 
 def _merge_slabs(
@@ -501,8 +536,9 @@ def _merge_slabs(
 
     windows = next((len(row) for row in rows if row is not None), 1)
     n_src = src_per_child * len(rows)
-    folded = sum(1 for row in rows if row is not None and any(r is not None for r in row))
-    missing = sum(1 for row in rows if row is not None and not any(r is not None for r in row))
+    folded = sum(1 for row in rows if row is not None and any(_is_reader(r) for r in row))
+    missing = sum(1 for row in rows if row is not None and all(r is None for r in row))
+    unreadable = len([r for r in rows if r is not None]) - folded - missing
     slabs: dict = {}
     for name, meta in fields.items():
         if meta["class"] != "exact":
@@ -513,7 +549,7 @@ def _merge_slabs(
             acc = _empty_slab(meta, n_src)
             for i, row in enumerate(rows):
                 reader = row[w] if row is not None else None
-                if reader is None:
+                if not _is_reader(reader):
                     continue
                 values = reader.read(res_src, name)
                 if values is not None:
@@ -532,7 +568,7 @@ def _merge_slabs(
         for i, row in enumerate(rows):
             base = i * src_per_child
             for reader in row or ():
-                if reader is None:
+                if not _is_reader(reader):
                     continue
                 slab = reader.read(res_src, name)
                 if slab is None:
@@ -549,7 +585,7 @@ def _merge_slabs(
         for j, cell in pending.items():
             out[j] = fold_digests(cell, delta=delta, dtype=dtype)
         slabs[name] = out
-    return slabs, folded, missing
+    return slabs, folded, missing, unreadable
 
 
 def _dense_rows(readers: dict, node: str, *, depth: int) -> list:
@@ -592,13 +628,13 @@ def _stage_fold(
     n_out = 4 ** (r - k)
     regime = classify_level(r, shard_order=shard_order)
     if regime == STAGE_GATHER and not all_time:
-        slabs, folded, missing = _gather_slabs(
+        slabs, folded, missing, unreadable = _gather_slabs(
             rows, fields, res=r, span=4 ** (r - child_order), n_out=n_out
         )
         merges_from_raw = 1
     else:
         res_src = r if (all_time and regime == STAGE_GATHER) else shard_order
-        slabs, folded, missing = _merge_slabs(
+        slabs, folded, missing, unreadable = _merge_slabs(
             rows,
             fields,
             res_src=res_src,
@@ -612,7 +648,7 @@ def _stage_fold(
     granules, ranges = 0, []
     for row in rows:
         for reader in row or ():
-            if reader is not None and reader.stamp:
+            if _is_reader(reader) and reader.stamp:
                 granules += int(reader.stamp.get("granule_count") or 0)
                 if reader.stamp.get("time_range") is not None:
                     ranges.append(reader.stamp["time_range"])
@@ -624,7 +660,11 @@ def _stage_fold(
         "time_range": union_time_range(*ranges) if ranges else None,
         "regime": regime,
         "merges_from_raw": merges_from_raw,
-        "source_children": {"folded": int(folded), "missing": int(missing), "unreadable": 0},
+        "source_children": {
+            "folded": int(folded),
+            "missing": int(missing),
+            "unreadable": int(unreadable),
+        },
     }
 
 
@@ -1063,7 +1103,7 @@ def stage_node(
                     json.dumps(fresh, indent=1).encode(),
                 )
     counts["revalidated"] += sum(
-        r.revalidated for row in readers.values() for r in row if r is not None
+        r.revalidated for row in readers.values() for r in row if _is_reader(r)
     )
     if dispatch == 0 or (windowed and all_time):
         return
@@ -1077,7 +1117,7 @@ def stage_node(
     folded: dict = {}
     relay_sc = None
     for res in members:
-        slabs, folded_n, missing = _gather_slabs(
+        slabs, folded_n, missing, unreadable = _gather_slabs(
             _dense_rows(readers, node, depth=child_order - dispatch),
             fields,
             res=res,
@@ -1086,13 +1126,17 @@ def stage_node(
         )
         folded[res] = slabs
         if res == shard_order:
-            relay_sc = {"folded": int(folded_n), "missing": int(missing), "unreadable": 0}
+            relay_sc = {
+                "folded": int(folded_n),
+                "missing": int(missing),
+                "unreadable": int(unreadable),
+            }
     if relay_sc is None or relay_sc["folded"] == 0:
         return
     granules, ranges = 0, []
     for row in readers.values():
         for reader in row:
-            if reader is not None and reader.stamp:
+            if _is_reader(reader) and reader.stamp:
                 granules += int(reader.stamp.get("granule_count") or 0)
                 if reader.stamp.get("time_range") is not None:
                     ranges.append(reader.stamp["time_range"])
