@@ -366,8 +366,22 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
         rec_off = np.zeros(blk.size + 1, dtype=np.int64)
         np.cumsum(lens, out=rec_off[1:])
         idx = np.repeat(starts - rec_off[:-1], lens) + np.arange(rec_off[-1], dtype=np.int64)
-        hit_vals, hit_off = mocs_and(aoi_moc, values[idx], rec_off)
-        flat, flat_off = mocs_to_orders(np.asarray(hit_vals), np.asarray(hit_off), parent_order)
+        try:
+            hit_vals, hit_off = mocs_and(aoi_moc, values[idx], rec_off)
+            flat, flat_off = mocs_to_orders(np.asarray(hit_vals), np.asarray(hit_off), parent_order)
+        except ValueError as exc:
+            # mortie names the offending MOC by its index *within the call*,
+            # which is a slot in this block, not a record. Re-base it: an
+            # un-rebased "MOC 400" out of a 512-record block is a plausible
+            # record index, so it would send the operator to the wrong granule
+            # rather than obviously failing. Re-raise, never swallow.
+            raise ValueError(
+                f"footprint_cells batch failed on records "
+                f"{start}-{start + blk.size - 1} (MOC index in the message is "
+                f"relative to that range): {exc}. Re-index the catalog at a "
+                f"coarser order, or drop the footprint_cells column to build "
+                f"from geometry."
+            ) from exc
         flat = np.asarray(flat)
         if flat.size == 0:
             continue

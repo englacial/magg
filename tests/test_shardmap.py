@@ -884,6 +884,35 @@ class TestFootprintCells:
             got = shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, all_shards)
             assert got == oracle, f"block {block} diverged from the scalar loop"
 
+    def test_batch_refusal_names_the_record_range(self, hp_grid, monkeypatch):
+        # mortie's cell-budget ``ValueError`` names the offending MOC by its
+        # index *within the call*, which blocking makes block-local: an
+        # un-rebased "MOC 2" out of the second block of 5 is a plausible record
+        # index and would send the operator to the wrong granule. The wrapper
+        # must re-base it to the block's record range and chain the original.
+        import mortie
+
+        cat = _overlapping_catalog().index_footprints(11)
+        records = cat.granule_records()
+        all_shards = {int(s) for s in hp_grid.coverage(shardmap._region_parts(None, cat.metadata))}
+        values, offsets, _order, rows = shardmap._footprint_cells_plan(
+            cat, records, hp_grid, "mortie", "swath", None
+        )
+        real, calls = mortie.mocs_to_orders, []
+
+        def boom(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise ValueError("MOC 2 exceeds max_cells")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(shardmap, "_CELLS_BATCH_RECORDS", 5)
+        monkeypatch.setattr(mortie, "mocs_to_orders", boom)
+        with pytest.raises(ValueError, match=r"records 5-9") as exc:
+            shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, all_shards)
+        assert "MOC 2 exceeds max_cells" in str(exc.value)
+        assert isinstance(exc.value.__cause__, ValueError)
+
     def test_cli_index_footprints_indexes_the_saved_catalog(self, tmp_path, monkeypatch):
         # ``--index-footprints`` is how an operator ships a pre-indexed clone,
         # so it must both index the catalog it persists AND have this build take
