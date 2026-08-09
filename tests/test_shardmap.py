@@ -859,12 +859,16 @@ class TestFootprintCells:
         # 1, 5 and 7 exercise slot re-basing and the ``own[i]`` owner mapping
         # across many (ragged-tail) blocks, 24 is the one-block case the shipped
         # ``_CELLS_BATCH_RECORDS = 512`` collapses to at this size. The
-        # empty-slot assertion below is load-bearing: some record must be
-        # unassigned, so the ``mocs_intersect`` prefilter genuinely drops
-        # records here and the survivor blocks are cut at *survivor* counts,
-        # not record counts -- a block-local owner mapping would misassign and
-        # fail the dict equality. (The all-empty/all-hit/leading-empty edges
-        # get their own test below.)
+        # empty-slot assertion below is load-bearing for what it does pin:
+        # some record must be unassigned, so the ``mocs_intersect`` prefilter
+        # genuinely drops records here and the survivor blocks are cut at
+        # *survivor* counts, not record counts. It does **not** pin the owner
+        # mapping -- survivors happen to be a contiguous 0-based prefix at both
+        # index orders here, so ``own[i] == start + i`` and a block-local
+        # mapping passes this test unchanged. The pin for that is
+        # ``test_prefilter_edges_...`` below, whose middle-AOI case starts
+        # survivors above record 0; the all-empty and all-hit edges live there
+        # too.
         #
         # Both column orders run, because they hit ``mocs_to_orders``
         # differently. At index 11 == ``parent_order`` it only ever refines
