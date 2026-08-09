@@ -56,8 +56,12 @@ def print_cost_summary(summary: dict, arch: str, price_per_gb_sec: float):
     print(f"      GB-seconds: {gb_seconds:,.1f}")
     print(f"      Cost: ${cost:.4f}")
 
-    return {"gb_seconds": gb_seconds, "architecture": arch,
-            "price_per_gb_sec": price_per_gb_sec, "estimated_cost_usd": cost}
+    return {
+        "gb_seconds": gb_seconds,
+        "architecture": arch,
+        "price_per_gb_sec": price_per_gb_sec,
+        "estimated_cost_usd": cost,
+    }
 
 
 def save_results(summary: dict, cost_info: dict, args, output_dir: str):
@@ -109,15 +113,29 @@ examples:
   python deployment/aws/invoke_lambda.py --config atl06.yaml --catalog catalog.json --dry-run
 """,
     )
-    parser.add_argument("--config", default=None, help="Pipeline config YAML (default: built-in atl06)")
-    parser.add_argument("--catalog", default=None, help="Path to granule catalog JSON (overrides config)")
+    parser.add_argument(
+        "--config", default=None, help="Pipeline config YAML (default: built-in atl06)"
+    )
+    parser.add_argument(
+        "--catalog", default=None, help="Path to granule catalog JSON (overrides config)"
+    )
     parser.add_argument("--store", default=None, help="Output store path (overrides config)")
-    parser.add_argument("--max-workers", type=int, default=1700, help="Max concurrent Lambda invocations")
-    parser.add_argument("--max-cells", type=int, default=None, help="Limit number of cells (for testing)")
-    parser.add_argument("--morton-cell", type=str, default=None, help="Process a specific morton cell")
+    parser.add_argument(
+        "--max-workers", type=int, default=1700, help="Max concurrent Lambda invocations"
+    )
+    parser.add_argument(
+        "--max-cells", type=int, default=None, help="Limit number of cells (for testing)"
+    )
+    parser.add_argument(
+        "--morton-cell", type=str, default=None, help="Process a specific morton cell"
+    )
     parser.add_argument("--dry-run", action="store_true", help="Show what would be processed")
-    parser.add_argument("--overwrite-template", action="store_true", default=False,
-                        help="Overwrite existing Zarr template")
+    parser.add_argument(
+        "--overwrite-template",
+        action="store_true",
+        default=False,
+        help="Overwrite existing Zarr template",
+    )
     parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
     parser.add_argument("--output-dir", default=".", help="Directory for output results JSON")
     parser.add_argument(
@@ -167,9 +185,11 @@ examples:
 
     if args.dry_run:
         print(f"\n[DRY RUN] Would process {summary['total_cells']} cells")
-        print(f"  Granules per cell: min={summary['granules_per_cell_min']}, "
-              f"max={summary['granules_per_cell_max']}, "
-              f"avg={summary['granules_per_cell_avg']:.1f}")
+        print(
+            f"  Granules per cell: min={summary['granules_per_cell_min']}, "
+            f"max={summary['granules_per_cell_max']}, "
+            f"avg={summary['granules_per_cell_avg']:.1f}"
+        )
         return
 
     # Cost reporting (CLI-only, not in the library)
@@ -182,7 +202,9 @@ examples:
     print(f"      With data:           {summary['cells_with_data']}")
     print(f"      Errors:              {summary['cells_error']}")
     print(f"      Total observations:  {summary['total_obs']:,}")
-    print(f"      Wall clock time:     {summary['wall_time_s']:.1f}s ({summary['wall_time_s'] / 60:.1f}m)")
+    print(
+        f"      Wall clock time:     {summary['wall_time_s']:.1f}s ({summary['wall_time_s'] / 60:.1f}m)"
+    )
     print(f"      Estimated cost:      ${cost_info['estimated_cost_usd']:.4f}")
     print(f"      Output:              {summary['store_path']}")
     print("=" * 70)

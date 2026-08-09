@@ -981,3 +981,30 @@ class TestHeartbeatCadence:
             lease_ttl_s=1,
         )
         assert summary["lease"]["released"] and len(beats) >= 1
+
+
+class TestSoftBarrierReadFaults:
+    def test_missing_member_group_fills_never_aborts(self, tmp_path):
+        # Review finding: a declaration deepened over existing columns (or a
+        # transient object fault) leaves a column short a group — the sweep
+        # must under-fill and complete, never abort.
+        import shutil
+
+        m = _stage_store(tmp_path / "s")
+        shutil.rmtree(tmp_path / "s" / "1" / "1" / "1" / "1" / "all.pyramid.zarr" / "3")
+        summary = sweep_stage_pass(str(tmp_path / "s"), m, _by_shard(), run_id="A")
+        (row,) = summary["stages"]
+        assert row["written"] > 0
+        payloads = _artifact(tmp_path / "s", "1/1/1/all.zarr")["3"]["h_tdigest"][:]
+        assert bytes(payloads[0]) == b""  # the short child's cell: fill
+        assert bytes(payloads[1]) != b""  # its sibling folded normally
+
+    def test_corrupt_column_counts_unreadable_not_missing(self, tmp_path):
+        m = _stage_store(tmp_path / "s")
+        garbage = tmp_path / "s" / "1" / "1" / "1" / "2" / "all.pyramid.zarr" / "zarr.json"
+        garbage.write_text("not zarr metadata")
+        summary = sweep_stage_pass(str(tmp_path / "s"), m, _by_shard(), run_id="A")
+        (row,) = summary["stages"]
+        assert row["failed"] > 0 and row["written"] > 0
+        attrs = dict(_artifact(tmp_path / "s", "1/1/1/all.zarr").attrs)["zagg_overview"]
+        assert attrs["source_children"] == {"folded": 1, "missing": 0, "unreadable": 1}

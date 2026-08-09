@@ -1057,7 +1057,7 @@ neither gap and is safe now.
   == hashes recomputed from a full store read-back).
 - **O12 — retention/expiration (proposal, espg-directed to record
   2026-07-20)**: **product-level** retention is a *prefix* lifecycle rule
-  (one rule per `{name}/` — delete or transition a whole product); 
+  (one rule per `{name}/` — delete or transition a whole product);
   **window-level** retention within a product is the *tag* mechanism —
   the expiration rule filters on an object tag (e.g. `ephemeral=true`)
   and keep-alive is a retag (`PutObjectTagging`), never an access-refresh
