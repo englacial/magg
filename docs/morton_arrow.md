@@ -8,7 +8,7 @@ across every surface it crosses (issue
 | Surface | Carrier | Form |
 | --- | --- | --- |
 | pandas carrier (worker) | `pandas.DataFrame` | `mortie.MortonIndexArray` extension array (#71) |
-| arro3 carrier (worker) | `arro3.core.Table` | `morton_index` Arrow **extension type** over the PyCapsule C Data Interface (mortie ≥ 0.8.4) |
+| arro3 carrier (worker) | `arro3.core.Table` | `morton_index` Arrow **extension type** over the PyCapsule C Data Interface (added in mortie 0.8.4) |
 | catalog / shardmap parquet | `pyarrow.Table` | `morton_index` pyarrow extension type (registered by mortie on import) |
 | Zarr store (on disk) | Zarr v3 array | plain `uint64` — the packed words, byte-for-byte |
 

@@ -4,11 +4,11 @@ The ``morton`` output coordinate is carried in memory as a mortie
 :class:`~mortie.morton_index.MortonIndexArray` (a pandas ExtensionArray over the
 packed ``uint64`` Morton words), and crosses the Arrow carrier boundary as
 mortie's ``morton_index`` Arrow **extension type** over the PyCapsule C Data
-Interface (:func:`morton_to_arrow` / :func:`morton_from_arrow`; mortie >= 0.8.4,
-issue #135) — typed on both the pandas and arro3 surfaces, no pyarrow on the
-worker path. On disk it is stored as plain ``uint64`` — Zarr stores numpy
-dtypes, and the extension metadata lives at the interchange layer only — and
-reconstructed as a ``MortonIndexArray`` on read.
+Interface (:func:`morton_to_arrow` / :func:`morton_from_arrow`; added in
+mortie 0.8.4, issue #135) — typed on both the pandas and arro3 surfaces, no
+pyarrow on the worker path. On disk it is stored as plain ``uint64`` — Zarr
+stores numpy dtypes, and the extension metadata lives at the interchange layer
+only — and reconstructed as a ``MortonIndexArray`` on read.
 
 This is the contained #71 migration: only the ``morton`` coordinate adopts the
 type — and since the D16 flip (issue #304) it is the only stored cell
@@ -199,7 +199,7 @@ def morton_to_arrow(values):
     The Arrow leg of the boundary: the returned array carries mortie's
     ``morton_index`` extension type in its field metadata
     (:data:`MORTON_EXTENSION_NAME`), pulled zero-copy over the PyCapsule C Data
-    Interface (``MortonIndexArray.__arrow_c_array__``; mortie >= 0.8.4) — no
+    Interface (``MortonIndexArray.__arrow_c_array__``; added in mortie 0.8.4) — no
     pyarrow on the path. Accepts a ``MortonIndexArray`` or any
     ``uint64``-coercible array-like of packed words; the all-zero empty sentinel
     is exported as an Arrow null.
