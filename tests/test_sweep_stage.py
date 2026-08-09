@@ -36,14 +36,17 @@ from zagg.sweep_stage import (
     ForeignSweepError,
     classify_level,
     column_members,
-    compose_scope,
     ladder_entries,
-    normalize_scope,
-    partition_words,
-    scope_admits,
     stage_tuples,
 )
-from zagg.sweep_stages import run_finisher, sweep_stage_pass
+from zagg.sweep_stages import (
+    compose_scope,
+    normalize_scope,
+    partition_words,
+    run_finisher,
+    scope_admits,
+    sweep_stage_pass,
+)
 
 
 def _pyramid_block(resolutions, shard_order):

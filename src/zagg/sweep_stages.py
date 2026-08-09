@@ -31,16 +31,95 @@ from zagg.sweep_stage import (
     DEFAULT_TUPLE_WIDTH,
     _node_at,
     aggregate_actuals,
-    compose_scope,
     ladder_entries,
-    normalize_scope,
-    partition_words,
-    scope_admits,
     stage_node,
     stage_tuples,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Scope planning (pure): the dispatch-side spellings and their composition.
+# Lives with the RUN (its only consumer) so the worker module stays inside
+# the section 4 module cap; the functions are pure and import nothing of the
+# run machinery.
+# ---------------------------------------------------------------------------
+
+
+def normalize_scope(scope) -> np.ndarray | None:
+    """An optional sweep scope, canonicalized to a morton-word MOC.
+
+    ``None`` means whole store. Accepted spellings: an iterable of morton
+    words (ints) or D1 decimal strings — a node-prefix set at any mix of
+    orders — or a mapping (a shardmap: its KEYS are the prefixes, already
+    ancestor-coarsened by construction; values are ignored). Returns sorted
+    unique ``uint64`` words. Empty scopes refuse by name: an empty MOC means
+    "sweep nothing", which is never what an operator typed on purpose.
+    """
+    from zagg.grids.morton import morton_word
+
+    if scope is None:
+        return None
+    if isinstance(scope, dict):
+        scope = list(scope.keys())
+    words = [morton_word(s) if isinstance(s, str) else int(s) for s in scope]
+    if not words:
+        raise ValueError("an empty sweep scope selects nothing — pass None for whole-store")
+    return np.unique(np.asarray(words, dtype=np.uint64))
+
+
+def partition_words(partitions: int, index: int) -> np.ndarray:
+    """One ``2^n`` partition as a MOC: its 12 order-``k`` subtree roots.
+
+    The :mod:`zagg.sweep_partition` ownership predicate spelled as words, so
+    ``partitions=`` composes with a scope by plain MOC intersection
+    (:func:`compose_scope`). ``partitions=1`` returns the 12 base cells —
+    the identity scope.
+    """
+    from zagg.grids.morton import morton_word
+    from zagg.hive import _rank_tail
+    from zagg.sweep_partition import normalize_partition, partition_split_order
+
+    normalize_partition({"index": index, "of": partitions})
+    k = partition_split_order(partitions)
+    tail = _rank_tail(int(index), k)
+    bases = [str(b) for b in range(1, 7)] + [f"-{b}" for b in range(1, 7)]
+    return np.unique(np.asarray([morton_word(b + tail) for b in bases], dtype=np.uint64))
+
+
+def compose_scope(scope: np.ndarray | None, partition: np.ndarray | None) -> np.ndarray | None:
+    """Scope ∩ partition (either may be ``None`` — the identity)."""
+    from mortie import moc_and
+
+    if scope is None:
+        return partition
+    if partition is None:
+        return scope
+    # TODO(espg/mortie#173, espg/mortie PR 174): swap the per-pair scalar
+    # ``moc_and`` for the batch ``mocs_and`` (1xN broadcast with the hoisted
+    # shared operand) once a mortie release ships it; never depend on an
+    # unreleased mortie.
+    return moc_and(scope, partition)
+
+
+def scope_admits(decimal: str, scope: np.ndarray | None) -> bool:
+    """Whether a node's subtree intersects the scope MOC (``None`` admits all).
+
+    Containment resolves in either direction (mortie's ``moc_and`` semantics
+    over mixed-order covers), so a scope spelled as shard prefixes admits
+    every ancestor node above them — "only ancestor prefixes of the touched
+    shardmap are invoked" (#381 point (11)).
+    """
+    from mortie import moc_and
+
+    from zagg.grids.morton import morton_word
+
+    if scope is None:
+        return True
+    # TODO(espg/mortie#173, espg/mortie PR 174): batch ``mocs_and`` replaces
+    # this per-node scalar call once a mortie release ships it.
+    return moc_and(np.asarray([morton_word(decimal)], dtype=np.uint64), scope).size > 0
 
 
 def sweep_stage_pass(
