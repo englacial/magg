@@ -339,9 +339,19 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     # granule) has no batch equivalent -- ``mocs_to_orders`` applies the same
     # per-MOC budget but refuses the *whole call* (``ValueError`` naming the
     # lowest-index offender), so a refusal now fails the build loudly instead
-    # of quietly losing one granule. The AOI intersection bounds every
-    # expansion by the granule's own cells inside the AOI, so a refusal should
-    # be unreachable here; loud-over-silent is the intended trade.
+    # of quietly losing one granule. This is a real divergence from the
+    # geometry path, which still swallows the same refusal per ring
+    # (``_intersect_mortie``, below): the same catalog + grid can now raise
+    # where it built, depending on whether the column is present. Deliberate,
+    # and narrow -- refusal is not unreachable, but it is remote. ``aoi_moc``
+    # is compressed, so the intersection can keep cells *coarser* than
+    # ``parent_order`` and ``mocs_to_orders`` can genuinely expand; the bound
+    # is the AOI-clipped footprint densified at ``parent_order``, so tripping
+    # the 1<<20 flat-cell budget takes a single granule covering >1e6 shard
+    # cells inside the AOI. At that size the silent drop is the worse
+    # outcome -- it removes a granule that covers a millionth-scale chunk of
+    # the AOI without a word -- so loud-over-silent is the intended trade, and
+    # the raise below says which records and what to do about it.
     rows = np.asarray(rows, dtype=np.int64)
     offsets = np.asarray(offsets, dtype=np.int64)
     values = np.asarray(values)
@@ -377,7 +387,10 @@ def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_orde
     """Inputs for the :func:`_intersect_footprint_cells` fast path, or ``None``.
 
     Engages only on the shape the stored column can answer *exactly*, so a build
-    that takes it is the build that would have run anyway, minus the geometry:
+    that takes it is the build that would have run anyway, minus the geometry
+    (with one disclosed exception: a cell-budget refusal raises here where the
+    geometry path drops that granule silently -- see
+    :func:`_intersect_footprint_cells`):
 
     - the resolved backend is ``mortie`` -- the column holds mortie MOCs, and
       silently substituting them for an exact-S2 spherely run would swap the
