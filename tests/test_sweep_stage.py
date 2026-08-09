@@ -853,6 +853,18 @@ class TestRunStageSweep:
         assert all(v == 0 for i, v in by_part.items() if i != 0)
         assert (tmp_path / "s" / "1" / "all.zarr").exists()
         assert (tmp_path / "s" / "-2" / "all.zarr").exists()
+        # Review finding: the re-visits later partitions make (skip-if-current
+        # on shared coarse ancestors) must not inflate the manifest actuals —
+        # per-artifact rows are assigned, then summed once. Node 0 sums its
+        # two base-cell artifacts: 3 + 1 candidate children.
+        from zagg.hive import read_manifest
+
+        entries = {e["node"]: e for e in read_manifest(str(tmp_path / "s"))["pyramid"]["overviews"]}
+        assert entries[0]["actuals"]["source_children"] == {
+            "folded": 4,
+            "missing": 0,
+            "unreadable": 0,
+        }
 
     def test_failure_leaves_the_lease_held(self, tmp_path, monkeypatch):
         import zagg.sweep_stages as stages_mod

@@ -30,6 +30,7 @@ import numpy as np
 from zagg.sweep_stage import (
     DEFAULT_TUPLE_WIDTH,
     _node_at,
+    aggregate_actuals,
     compose_scope,
     ladder_entries,
     normalize_scope,
@@ -159,7 +160,9 @@ def sweep_stage_pass(
         summary["stages"].append(row)
         if on_stage is not None:
             on_stage(row)
-    summary["levels"] = {str(k): dict(v) for k, v in sorted(level_actuals.items(), reverse=True)}
+    summary["levels"] = {
+        str(k): v for k, v in sorted(aggregate_actuals(level_actuals).items(), reverse=True)
+    }
     return summary
 
 
@@ -172,7 +175,7 @@ def run_finisher(
     store_root: str,
     manifest: dict,
     by_shard: dict,
-    level_actuals: dict,
+    level_actuals: dict,  # the AGGREGATED per-level map (aggregate_actuals)
     *,
     run_id: str,
     store_kwargs: dict | None = None,
@@ -416,15 +419,14 @@ def run_stage_sweep(
             summary["stages"].extend(rows)
             if part.get("root_moc_stale"):
                 summary["root_moc_stale"] = True
-        summary["levels"] = {
-            str(k): dict(v) for k, v in sorted(level_actuals.items(), reverse=True)
-        }
+        aggregated = aggregate_actuals(level_actuals)
+        summary["levels"] = {str(k): v for k, v in sorted(aggregated.items(), reverse=True)}
         _maybe_beat()  # the finisher's RMW must not start on a stale beat
         summary["finisher"] = run_finisher(
             store_root,
             manifest,
             by_shard,
-            level_actuals,
+            aggregated,
             run_id=run_id,
             store_kwargs=store_kwargs,
             release=lambda: release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs),

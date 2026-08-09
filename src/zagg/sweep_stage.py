@@ -1027,6 +1027,8 @@ def stage_node(
                         level_actuals,
                         k,
                         r,
+                        target,
+                        key,
                         entry.get("regime"),
                         entry.get("merges_from_raw"),
                         entry.get("source_children"),
@@ -1074,6 +1076,8 @@ def stage_node(
                     level_actuals,
                     k,
                     r,
+                    target,
+                    key,
                     fold["regime"],
                     fold["merges_from_raw"],
                     fold["source_children"],
@@ -1207,14 +1211,20 @@ def _node_at(decimal: str, order: int) -> str:
     return at(decimal, order)
 
 
-def _accumulate_actuals(level_actuals, k, r, regime, merges_from_raw, source_children) -> None:
-    """Fold one artifact's provenance into the run's per-LEVEL actuals.
+def _accumulate_actuals(
+    level_actuals, k, r, target, key, regime, merges_from_raw, source_children
+) -> None:
+    """Record one artifact's provenance into the run's per-LEVEL actuals.
 
-    The finisher's manifest RMW writes these into the level entry that owns
-    them (#381 point (7)). Per-window folds only — the all-time fold is a
-    separate family of artifacts whose regime rides their own attrs, and
-    letting its ``stage-merge`` override a gather level's recorded regime
-    would misdescribe the product declaration the entry stands for.
+    Keyed per ``(artifact node, window)`` and ASSIGNED, never added — a
+    partitioned or multi-pass run re-visits shared coarse ancestors
+    (skip-if-current makes that cheap), and summing per visit would inflate
+    the manifest's coverage counts by the visit count (review finding).
+    :func:`aggregate_actuals` sums the per-artifact rows once, at the end.
+    Per-window folds only — the all-time fold is a separate family of
+    artifacts whose regime rides their own attrs, and letting its
+    ``stage-merge`` override a gather level's recorded regime would
+    misdescribe the product declaration the entry stands for.
     """
     if level_actuals is None:
         return
@@ -1224,8 +1234,27 @@ def _accumulate_actuals(level_actuals, k, r, regime, merges_from_raw, source_chi
             "cells": int(r),
             "regime": regime,
             "merges_from_raw": int(merges_from_raw or 0),
-            "source_children": {"folded": 0, "missing": 0, "unreadable": 0},
+            "children": {},
         },
     )
-    for name in entry["source_children"]:
-        entry["source_children"][name] += int((source_children or {}).get(name) or 0)
+    entry["children"][f"{target}|{key}"] = {
+        name: int((source_children or {}).get(name) or 0)
+        for name in ("folded", "missing", "unreadable")
+    }
+
+
+def aggregate_actuals(level_actuals: dict) -> dict:
+    """The per-level view the finisher records: per-artifact rows summed."""
+    out: dict = {}
+    for k, entry in level_actuals.items():
+        summed = {"folded": 0, "missing": 0, "unreadable": 0}
+        for row in entry["children"].values():
+            for name in summed:
+                summed[name] += row[name]
+        out[int(k)] = {
+            "cells": entry["cells"],
+            "regime": entry["regime"],
+            "merges_from_raw": entry["merges_from_raw"],
+            "source_children": summed,
+        }
+    return out
