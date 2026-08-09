@@ -253,7 +253,8 @@ def compose_scope(scope: np.ndarray | None, partition: np.ndarray | None) -> np.
         return scope
     # TODO(espg/mortie#173, espg/mortie PR 174): swap the per-pair scalar
     # ``moc_and`` for the batch ``mocs_and`` (1xN broadcast with the hoisted
-    # shared operand) when mortie 0.9.6 releases; do not depend on it before.
+    # shared operand) once a mortie release ships it; never depend on an
+    # unreleased mortie.
     return moc_and(scope, partition)
 
 
@@ -272,7 +273,7 @@ def scope_admits(decimal: str, scope: np.ndarray | None) -> bool:
     if scope is None:
         return True
     # TODO(espg/mortie#173, espg/mortie PR 174): batch ``mocs_and`` replaces
-    # this per-node scalar call once mortie 0.9.6 releases.
+    # this per-node scalar call once a mortie release ships it.
     return moc_and(np.asarray([morton_word(decimal)], dtype=np.uint64), scope).size > 0
 
 
