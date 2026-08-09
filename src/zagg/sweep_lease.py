@@ -49,7 +49,7 @@ LEASE_SPEC = "zagg-sweep-lease/1"
 DEFAULT_TTL_S = 900
 
 
-class SweepRefused(RuntimeError):
+class SweepRefusedError(RuntimeError):
     """Admission refused: another sweep holds a live lease on this store.
 
     The message names the running sweep (run id, acquisition time, heartbeat
@@ -116,7 +116,7 @@ def acquire_lease(
     """Admit one sweep: conditional-PUT the intent object, or refuse loudly.
 
     Returns the payload written (with ``claimed_from`` naming the expired
-    prior holder on a crash-recovery claim). Raises :class:`SweepRefused`
+    prior holder on a crash-recovery claim). Raises :class:`SweepRefusedError`
     when a live foreign intent holds the store — the refusal names it.
     """
     import obstore
@@ -136,7 +136,7 @@ def acquire_lease(
     if existing is not None and existing.get("run_id") == str(run_id):
         return existing  # already ours (an idempotent re-admission)
     if existing is not None and not _expired(existing):
-        raise SweepRefused(
+        raise SweepRefusedError(
             f"a sweep already holds this store: run {existing.get('run_id')!r} "
             f"(acquired {existing.get('acquired_at')}, last heartbeat "
             f"{existing.get('heartbeat_at')}, ttl {existing.get('ttl_s')}s) — sweeps "
@@ -159,7 +159,7 @@ def acquire_lease(
         pass
     verify = read_lease(store_root, store_kwargs=store_kwargs)
     if verify is None or verify.get("run_id") != str(run_id):
-        raise SweepRefused(
+        raise SweepRefusedError(
             f"lost the claim race for {store_root}: run "
             f"{None if verify is None else verify.get('run_id')!r} holds the lease now"
         )
@@ -175,7 +175,7 @@ def heartbeat_lease(store_root: str, lease: dict, *, store_kwargs: dict | None =
     store_kwargs = dict(store_kwargs or {})
     current = read_lease(store_root, store_kwargs=store_kwargs)
     if current is None or current.get("run_id") != lease.get("run_id"):
-        raise SweepRefused(
+        raise SweepRefusedError(
             f"sweep lease on {store_root} is no longer held by run "
             f"{lease.get('run_id')!r} (found {None if current is None else current.get('run_id')!r})"
             f" — another run claimed an expired heartbeat; aborting"

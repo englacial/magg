@@ -303,7 +303,7 @@ def run_stage_sweep(
     UNDER THE SAME LEASE (the lease is store-granular by correctness: scope
     disjointness does not imply write disjointness). Admission is the
     :mod:`zagg.sweep_lease` conditional PUT — a live foreign intent raises
-    :class:`zagg.sweep_lease.SweepRefused` naming the runner; an expired
+    :class:`zagg.sweep_lease.SweepRefusedError` naming the runner; an expired
     heartbeat is claimed and the claimant simply completes the partial prior
     run (the ratchet's ordinary posture). The lease heartbeats after every
     stage; the finisher releases it as its final act. On ANY failure the
