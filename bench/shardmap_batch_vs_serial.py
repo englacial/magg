@@ -237,10 +237,11 @@ def _measure_child(name, path, order, block):
     rss_load = _rss_mb()
     res_load = _resident_mb()
     if path == "cells":
-        # Both halves of the phase-3 build path are timed: resolving the plan
-        # (which includes the id -> table-row alignment ``build`` pays every
-        # time) and the moc_and loop itself. Only ``index_footprints`` above is
-        # outside, because only it is one-time.
+        # Both halves of the stored-index build path are timed: resolving the
+        # plan (which includes the id -> table-row alignment ``build`` pays
+        # every time) and the blocked ``mocs_and``/``mocs_to_orders`` batch
+        # itself. Only ``index_footprints`` above is outside, because only it
+        # is one-time.
         def fn(records, grid, all_shards, order):  # unused args: the shared arm signature
             plan = shardmap._footprint_cells_plan(cat, records, grid, "mortie", "swath", None)
             values, offsets, _order, rows = plan
@@ -305,9 +306,11 @@ def run_cases(names, orders=None, arms=("serial", "batch"), reps=1):
     ``batch``
         phase 1: ``polygons_to_morton_mocs`` a block of rings at a time.
     ``cells``
-        phase 3: no geometry at all -- ``moc_and`` of each granule's **stored**
-        MOC (``Catalog.index_footprints``) with the AOI's own shard MOC. The
-        indexing pass runs in the same child but is timed separately and
+        phases 3-4: no geometry at all -- ``mocs_and`` of the AOI's own shard
+        MOC against a block of granules' **stored** MOCs
+        (``Catalog.index_footprints``), chained into ``mocs_to_orders``,
+        ``_CELLS_BATCH_RECORDS`` records per call. The indexing
+        pass runs in the same child but is timed separately and
         reported as ``idx_s``, because it is one-time per catalog where the
         others are per build.
 
