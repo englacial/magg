@@ -623,6 +623,41 @@ def _shard_ids(sm):
     return sm.shard_keys, [[g["id"] for g in shard] for shard in sm.granules]
 
 
+def _intersect_cells_serial(rows, values, offsets, grid, all_shards):
+    """The pre-phase-4 per-granule stored-MOC loop, verbatim -- the parity oracle.
+
+    Kept here rather than in ``shardmap.py`` so exactly one implementation
+    ships, while the mortie 0.9.6 batch swap (``mocs_and``/``mocs_to_orders``,
+    espg/mortie#173) stays pinned against the scalar logic it replaced:
+    ``moc_and`` + ``moc_to_order`` + ``np.unique`` once per record
+    (``shardmap.py:293-333`` at a74a4fc9, the phase-3 tip of this PR). The one
+    behavior deliberately not carried over is the ``except Exception: continue``
+    around ``moc_to_order``: the batch call refuses the whole build loudly where
+    this dropped one granule silently (see ``_intersect_footprint_cells``).
+    """
+    from mortie import compress_moc, moc_and, moc_to_order
+
+    if len(rows) == 0 or not all_shards:
+        return {}
+    parent_order = grid.parent_order
+    shard_arr = np.fromiter(all_shards, dtype=np.uint64, count=len(all_shards))
+    shard_arr.sort()
+    aoi_moc = np.asarray(compress_moc(shard_arr))
+    hit_shards, hit_owners = [], []
+    for i, row in enumerate(rows):
+        moc = values[offsets[row] : offsets[row + 1]]
+        if moc.size == 0:
+            continue
+        hit = np.asarray(moc_and(moc, aoi_moc))
+        if hit.size == 0:
+            continue
+        shards = np.unique(np.asarray(moc_to_order(hit, parent_order)))
+        if shards.size:
+            hit_shards.append(shards.astype(np.uint64, copy=False))
+            hit_owners.append(np.full(shards.size, i, dtype=np.int64))
+    return shardmap._regroup_hits(hit_shards, hit_owners)
+
+
 class TestFootprintCells:
     """Phase 3: an indexed catalog answers ``build`` with set algebra (issue #396).
 
@@ -810,6 +845,45 @@ class TestFootprintCells:
             ShardMap.build(_overlapping_catalog(), hp_grid, region=region, backend="mortie")
         )
 
+    def test_batched_cells_equal_the_scalar_loop(self, hp_grid, monkeypatch):
+        # Phase 4's parity pin -- the PR 400 measurement comment's in-process
+        # assertion made permanent: mortie 0.9.6's ``mocs_and``/``mocs_to_orders``
+        # over blocks of records return the exact dict (same keys, same granule
+        # lists, same order) as the per-granule scalar loop they replaced. The
+        # fixture is California-shaped in miniature: a long overlapping granule
+        # chain crossing many shards, an AOI narrower than the catalog (so a
+        # good fraction of stored MOCs intersect empty and ride through as
+        # zero-width slots), and a dropped non-polygonal row mid-catalog so
+        # ``rows`` is not the identity and the block gather walks non-contiguous
+        # column spans. Swept block sizes cross the record count both ways:
+        # 1 and 5 exercise slot re-basing and the ``start + i`` owner mapping
+        # across many (ragged-tail) blocks, 4096 is the one-block case.
+        items = [_item(f"G{i:02d}", -76.62 + 0.008 * i, -76.60 + 0.008 * i) for i in range(24)]
+        pt = _item("PT", -76.60, -76.58)
+        pt["geometry"] = {"type": "Point", "coordinates": [-76.59, 38.89]}
+        cat = _catalog(items[:11] + [pt] + items[11:]).index_footprints(11)
+        region = [
+            (
+                np.array([38.85, 38.85, 38.93, 38.93, 38.85]),
+                np.array([-76.62, -76.55, -76.55, -76.62, -76.62]),
+            )
+        ]
+        records = cat.granule_records()
+        all_shards = {
+            int(s) for s in hp_grid.coverage(shardmap._region_parts(region, cat.metadata))
+        }
+        values, offsets, _order, rows = shardmap._footprint_cells_plan(
+            cat, records, hp_grid, "mortie", "swath", None
+        )
+        oracle = _intersect_cells_serial(rows, values, offsets, hp_grid, all_shards)
+        assigned = {g for v in oracle.values() for g in v}
+        assert len(oracle) > 4, "fixture must span multiple shards"
+        assert 0 < len(assigned) < len(records), "AOI must leave some slots empty"
+        for block in (1, 5, 4096):
+            monkeypatch.setattr(shardmap, "_CELLS_BATCH_RECORDS", block)
+            got = shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, all_shards)
+            assert got == oracle, f"block {block} diverged from the scalar loop"
+
     def test_cli_index_footprints_indexes_the_saved_catalog(self, tmp_path, monkeypatch):
         # ``--index-footprints`` is how an operator ships a pre-indexed clone,
         # so it must both index the catalog it persists AND have this build take
@@ -859,9 +933,9 @@ class TestFootprintCells:
         # An empty AOI (or no records) must return ``{}`` the way the geometry
         # path does -- ``_intersect_mortie``'s own ``if flat is None or not
         # all_shards: return {}``, so the two paths agree on the same inputs.
-        # Not a mortie workaround: on 0.9.5 ``compress_moc`` and ``moc_and``
-        # both handle zero-length arrays cleanly (a malformed morton *word* is
-        # what panics -- see ``_intersect_footprint_cells``).
+        # Not a mortie workaround: on 0.9.6 ``compress_moc`` and the batch
+        # twins all handle zero-length arrays cleanly (a malformed morton
+        # *word* is what panics -- see ``_intersect_footprint_cells``).
         cat = _overlapping_catalog().index_footprints(11)
         values, offsets, _ = cat.footprint_cells()
         rows = np.arange(len(cat.granule_records()), dtype=np.int64)

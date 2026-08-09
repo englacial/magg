@@ -80,6 +80,27 @@ MORTIE_MOC_ORDER_CAP = 18
 # the order moved it to 57.37 s against 64's 56.55 s -- drift, not a knee.
 _MOC_BATCH_RINGS = 32
 
+# Records per ``mocs_and``/``mocs_to_orders`` call on the stored-index path
+# (``_intersect_footprint_cells``, mortie 0.9.6's batch twins, espg/mortie#173).
+# Same shape of argument as ``_MOC_BATCH_RINGS`` above: the whole-catalog single
+# call holds a record-aligned gather copy of the column plus mortie's documented
+# input copy live at once -- measured 5,198 MB over the load plateau on the
+# 555,867-granule clone against the pre-swap scalar loop's ~1.7 GB. Blocking
+# bounds that term by the block, and it costs no wall -- blocked is *faster*
+# than one giant call. Clone sweep at order 9 (min-of-3 at the finalists):
+# 2.53 s / 1,737 MB at 512, 2.50 s / 1,770 MB at 2048, 2.55 s / 1,828 MB at
+# 4096, 2.49-3.10 s / 2,080-3,650 MB at 8192-65536, 3.83 s / 5,198 MB
+# unblocked. ~1,736 MB is the o9 floor (column materialization plus plan
+# bookkeeping) no block size removes. 512 over 2048 is bytes, not records:
+# per-record MOC size grows ~40x from an order-9 column to an order-13 one, so
+# a record-count block only bounds the worst case if it is sized against the
+# fat-column end -- on 88S indexed at order 13 the peak is 2,627 MB at 512 vs
+# 4,063 at 2048 (walls 4.62/4.59 s), and California o13 drops 1,261 -> 295 MB.
+# The per-block cost of rebuilding the shared AOI operand's BMOC is measured,
+# not assumed, negligible: 104 us/call at the 2,721-cell California operand,
+# ~113 ms across the clone's 1,086 blocks, ~4% of wall.
+_CELLS_BATCH_RECORDS = 512
+
 # ── granule footprint helpers ────────────────────────────────────────────────
 
 
@@ -284,13 +305,19 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     ``granule_records`` drops rows whose geometry is empty or not polygonal
     while the column has one entry per row.
 
-    The per-granule ``moc_and`` loop is the remaining Python-side per-call cost:
-    mortie 0.9.5 has no N-way variadic fold and no ``mocs_intersect`` predicate
-    (both are on espg/mortie#156's roster, unimplemented), so this loops in
-    Python. What it removes is the WKB parse and the coverage walk, which is the
-    dominant term -- see ``bench/shardmap_batch_vs_serial.py --arms cells``.
+    mortie 0.9.6's batch twins (espg/mortie#173) remove the per-granule Python
+    loop: one ``mocs_and(aoi_moc, ...)`` per block of records (empty results
+    keep zero-width slots), chained into one ``mocs_to_orders`` (empty in,
+    empty out) -- two boundary crossings per block instead of two calls per
+    granule, and the AOI operand is normalized once per block instead of per
+    granule. ``mocs_intersect`` is not used: every call site here needs the
+    intersection's cells (they *are* the shards), not just the emptiness test.
+    The batch is blocked by ``_CELLS_BATCH_RECORDS`` (see the constant) because
+    the whole-catalog single call held a record-aligned gather copy plus
+    mortie's documented input copy live at once -- catalog-proportional peak
+    for a block-boundable term.
     """
-    from mortie import compress_moc, moc_and, moc_to_order
+    from mortie import compress_moc, mocs_and, mocs_to_orders
 
     if len(rows) == 0 or not all_shards:
         return {}
@@ -299,37 +326,50 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     shard_arr.sort()
     # Uniform-order cells, so no cell contains another and the sorted array is
     # already a well-formed MOC; compressing it just folds complete sibling
-    # quadruples into their parent, shrinking the operand of every ``moc_and``
-    # below without changing any result.
+    # quadruples into their parent, shrinking the shared ``mocs_and`` operand
+    # without changing any result.
     aoi_moc = np.asarray(compress_moc(shard_arr))
 
+    # A *malformed* stored word still panics in Rust (``PanicException``, a
+    # ``BaseException``) and aborts the build, as before: only
+    # ``index_footprints`` writes this column, so a bad word means a corrupted
+    # catalog, which should not be built through. One semantic change rides on
+    # the batch: the scalar loop's per-granule ``except Exception: continue``
+    # around ``moc_to_order`` (cell-budget refusal -> silently drop that
+    # granule) has no batch equivalent -- ``mocs_to_orders`` applies the same
+    # per-MOC budget but refuses the *whole call* (``ValueError`` naming the
+    # lowest-index offender), so a refusal now fails the build loudly instead
+    # of quietly losing one granule. The AOI intersection bounds every
+    # expansion by the granule's own cells inside the AOI, so a refusal should
+    # be unreachable here; loud-over-silent is the intended trade.
+    rows = np.asarray(rows, dtype=np.int64)
+    offsets = np.asarray(offsets, dtype=np.int64)
+    values = np.asarray(values)
     hit_shards, hit_owners = [], []
-    for i, row in enumerate(rows):
-        moc = values[offsets[row] : offsets[row + 1]]
-        if moc.size == 0:
+    for start in range(0, rows.size, _CELLS_BATCH_RECORDS):
+        blk = rows[start : start + _CELLS_BATCH_RECORDS]
+        # Gather the block's spans out of the row-aligned column (ragged fancy
+        # index), so dropped rows never reach the batch call and slot ``i`` of
+        # the block is record ``start + i``.
+        starts = offsets[blk]
+        lens = offsets[blk + 1] - starts
+        rec_off = np.zeros(blk.size + 1, dtype=np.int64)
+        np.cumsum(lens, out=rec_off[1:])
+        idx = np.repeat(starts - rec_off[:-1], lens) + np.arange(rec_off[-1], dtype=np.int64)
+        hit_vals, hit_off = mocs_and(aoi_moc, values[idx], rec_off)
+        flat, flat_off = mocs_to_orders(np.asarray(hit_vals), np.asarray(hit_off), parent_order)
+        flat = np.asarray(flat)
+        if flat.size == 0:
             continue
-        hit = np.asarray(moc_and(moc, aoi_moc))
-        if hit.size == 0:
-            continue
-        try:
-            # Kept in step with the geometry path: ``moc_to_order``'s cell budget
-            # can refuse an expansion, which drops that granule exactly as it did
-            # before. The AOI intersection makes a refusal far less reachable
-            # here (the expansion is bounded by the granule's own cells inside
-            # the AOI), but the failure semantics stay the same either way.
-            #
-            # A *malformed* stored word is not covered by this: mortie panics on
-            # a non-morton word (``PanicException``, a ``BaseException``, not an
-            # ``Exception``), so it aborts the build rather than dropping the
-            # granule. That is the intended reading -- only ``index_footprints``
-            # writes this column and it writes mortie's own output, so a bad
-            # word means a corrupted catalog, which should not be built through.
-            shards = np.unique(np.asarray(moc_to_order(hit, parent_order)))
-        except Exception:
-            continue
-        if shards.size:
-            hit_shards.append(shards.astype(np.uint64, copy=False))
-            hit_owners.append(np.full(shards.size, i, dtype=np.int64))
+        owners = np.repeat(np.arange(start, start + blk.size, dtype=np.int64), np.diff(flat_off))
+        # No per-granule ``np.unique``: ``_regroup_hits``'s stable sort keeps
+        # any repeated (shard, owner) pair adjacent, and its run dedup
+        # collapses it -- same dict, same order as the scalar loop this
+        # replaces. Owners stay non-decreasing across blocks (blocks walk the
+        # records in order), so the regroup's sort/dedup invariant holds on the
+        # concatenation exactly as it did on one array.
+        hit_shards.append(flat.astype(np.uint64, copy=False))
+        hit_owners.append(owners)
     return _regroup_hits(hit_shards, hit_owners)
 
 
