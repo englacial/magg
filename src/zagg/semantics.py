@@ -141,7 +141,11 @@ GRID_SPATIAL_KEYS = ("crs", "resolution", "bounds")
 #:     hashes equal — the object-layout hole is narrowed here, not closed.
 #: - ``emit_cell_ids`` (issue #304) — the D16 transition hatch writes an
 #:   ADDITIONAL ``cell_ids`` array into every leaf, which is a leaf-content
-#:   difference by the same test, not a display preference.
+#:   difference by the same test, not a display preference. **Inferred from
+#:   the criterion, not named by issue #415** (and previously excluded here
+#:   by name), so it is flagged for ruling on the epoch PR alongside
+#:   ``shard_workers``. Note the hatch is scheduled for removal: after that,
+#:   a store built with it ON has a hash no legal config reproduces.
 GRID_LEAF_SHAPING_KEYS = ("sharded", "emit_cell_ids")
 
 #: ``output`` keys outside ``grid`` that shape the LEAF (issue #415 epoch).
