@@ -1296,6 +1296,34 @@ class TestLeafSkipIfCurrent:
         )
         assert meta["current"] is True and meta["identity"] == "equal"
 
+    def test_a_sharded_flip_defeats_the_skip(self, monkeypatch, cfg, tmp_path):
+        # The issue #415 epoch's (8)(c) half, at the gate: flipping
+        # output.grid.sharded over an existing store changes the leaf's
+        # object set while the granule set holds, so PRE-epoch both identity
+        # halves agreed and the unit read `equal` — the store kept its old
+        # layout forever. The widened core makes it a semantic change.
+        import copy
+
+        _grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        flipped = copy.deepcopy(cfg)
+        # HEALPix output defaults to sharded (issue #215), so this is a real
+        # flip; the grid is rebuilt from the flipped config, since reusing the
+        # leaf's grid would carry the OLD sharding into the rewrite.
+        flipped.output["grid"]["sharded"] = False
+        flipped_grid = self._grid(flipped)
+        calls = self._counting_fake(monkeypatch, flipped_grid)
+        meta = hive.process_and_write_hive(
+            shard,
+            list(self.URLS),
+            flipped_grid,
+            {},
+            root,
+            flipped,
+            store_kwargs={},
+            skip_if_current=True,
+        )
+        assert calls == [int(shard)] and meta["identity"] == "semantic-mismatch"
+
     def test_no_sidecar_rewrites(self, monkeypatch, cfg, tmp_path):
         # No sidecar (fresh store): unverifiable, so today's rewrite.
         grid = self._grid(cfg)
