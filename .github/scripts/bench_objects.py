@@ -51,10 +51,20 @@ on Lambda, so its artifacts may or may not have landed at measurement time;
 its column *placement* is dispatch cadence, which §4.6 declares
 "orchestration, never contract", so no fixed count could be right; and a
 partial or scoped sweep is a legal store state. The leaf column is on the
-other side of that line — one deterministic artifact per populated
-``(leaf, window)`` unit, written inside the same worker whose object count
-the issue #215 tripwire guards — so it is audited exactly, and a column that
-goes missing or arrives multiplied trips the per-shard assertion.
+other side of that line — one deterministic artifact per populated leaf,
+written inside the same worker whose object count the issue #215 tripwire
+guards — so it is audited exactly, and a column that goes missing or arrives
+multiplied trips the per-shard assertion.
+
+**The hive model assumes the UNWINDOWED leaf** (review finding), as the flat
+model assumes fullsphere HEALPix (:func:`_require_fullsphere`). One populated
+shard is one leaf and one column; a windowed store writes one of each per
+``(leaf, window)``, which this model does not count — and would not reach in
+any case, since the per-shard attribution builds its leaf prefixes from
+``hive.shard_leaf_path("", key)`` with no ``window=``, so a windowed leaf
+matches no prefix and surfaces as a loud ``other`` first. Widening the model
+to windows is its own change, with its own test surface; it is not smuggled
+in here.
 
 Determinism caveats (documented, not modeled): a populated shard is assumed to
 write every array — true when every field aggregates the same observations
