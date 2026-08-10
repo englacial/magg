@@ -102,6 +102,30 @@ class TestCanonicalization:
         cfg.output["grid"]["emit_cell_ids"] = True
         assert semantic_hash(cfg) == base
 
+    def test_worker_fan_out_width_is_packaging(self):
+        # The issue #415 epoch, half (7)(b): D19's ratified exclusion list
+        # already named "worker size" as packaging, but the keys were never in
+        # DATA_SOURCE_PACKAGING_KEYS — so the seams' fallback hash was
+        # CLAMP-sensitive (PR #397 question (7)). Both spellings are excluded:
+        # canonical shard_workers (issue #232) and legacy granule_workers.
+        base = semantic_hash(_cfg())
+        assert semantic_hash(_cfg(data_source__granule_workers=1)) == base
+        assert semantic_hash(_cfg(data_source__shard_workers=8)) == base
+
+    def test_dispatch_clamp_never_moves_the_hash(self):
+        # The exact mechanism question (7) reported: the dispatcher hands each
+        # cell a data_source clamped to min(K, n_granules) (issue #184), and
+        # the worker-side fallback hashes THAT config. A 2-granule cell must
+        # not hash differently from the run.
+        from dataclasses import replace
+
+        from zagg.runner import _clamped_data_source
+
+        cfg = _cfg()
+        clamped = _clamped_data_source(cfg.data_source, 2)
+        assert clamped is not None and clamped["granule_workers"] == 2
+        assert semantic_hash(replace(cfg, data_source=clamped)) == semantic_hash(cfg)
+
     def test_semantic_edits_always_change_hash(self):
         base = semantic_hash(_cfg())
         cfg = _cfg()

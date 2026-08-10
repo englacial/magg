@@ -15,8 +15,9 @@ Included (the semantic core):
 - the ``data_source`` **semantics** — which groups/variables/coordinates are
   read and how observations are filtered (``filters``/``quality_filter``,
   photon ``base_level``/``levels``, raster ``bands``/``nodata``/
-  ``collections``/``static_data``) — minus the read machinery (``reader``,
-  ``driver``, ``read_plan``, ``anonymous``);
+  ``collections``/``static_data``) — minus the read machinery and fan-out
+  sizing (``reader``, ``driver``, ``read_plan``, ``anonymous``,
+  ``shard_workers``/``granule_workers``);
 - the grid **type + indexing scheme** (D19: cell order is a resolution axis
   (D24), parent/shard order and chunking are packaging — hashing the whole
   template would have made o8 and o9 runs different products and blocked
@@ -54,7 +55,27 @@ from zagg.config import PipelineConfig, get_pipeline_type
 
 #: ``data_source`` keys that are read machinery, not output semantics (D19).
 #: Changing any of these must never change the ``semantic_hash``.
-DATA_SOURCE_PACKAGING_KEYS = ("reader", "driver", "read_plan", "anonymous")
+#:
+#: The granule fan-out width joined at the issue #415 hash epoch, under BOTH
+#: its spellings — canonical ``shard_workers`` (issue #232) and the legacy
+#: ``granule_workers`` (issue #180) the config still honors. D19's ratified
+#: exclusion list already named "worker size" as packaging; the keys were
+#: simply never listed here, which made the seams' fallback hash
+#: **clamp-sensitive** (PR #397 question (7)): both dispatchers send a
+#: per-cell ``data_source`` whose ``granule_workers`` is clamped to
+#: ``min(K, n_granules)`` (:func:`zagg.runner._clamped_data_source`, issue
+#: #184), so a small shard's worker-side hash differed from the run-level
+#: hash — and ``semantic_hash`` being in :data:`zagg.telemetry._EQ_OR_NONE_KEYS`
+#: then collapsed the identity half to ``None`` in any rollup mixing clamped
+#: and unclamped shards.
+DATA_SOURCE_PACKAGING_KEYS = (
+    "reader",
+    "driver",
+    "read_plan",
+    "anonymous",
+    "shard_workers",
+    "granule_workers",
+)
 
 #: ``aggregation`` keys that are packaging: the per-cell carrier choice
 #: (issue #132) transports identical values either way.
