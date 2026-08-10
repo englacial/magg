@@ -55,6 +55,31 @@ COLUMN_ROLE = "column"
 LEAF_REGIME = "leaf-column"
 
 
+def generation_key(block) -> tuple:
+    """The staged sweep's skip-gate key over a summed ``generation`` block.
+
+    ``(n_leaves, max_leaf_timestamp, run ids)`` — the block the stage worker
+    records in these attrs and in the ladder entries it writes (§4.4/§4.6).
+    The run ids are the issue #417 term: stamps resolve to **one second**, so
+    the count/timestamp pair alone reads a same-second rewrite of a child at
+    an unchanged leaf count as *current* and serves stale content. Every
+    stage stamp carries its ``run_id`` (PR #416 phase 2), so a foreign
+    rewrite moves the id set, and the single-writer law forbids a run
+    rewriting its own object mid-run. A block without ``run_ids`` (pre-#417,
+    or children that are all fleet-written leaf columns — those stamps carry
+    no run id) keys on the empty tuple, never on a wildcard: an upgraded
+    store re-folds once rather than inheriting the blind spot. A non-block
+    keys on ``()``, which matches no generation.
+    """
+    if not isinstance(block, dict):
+        return ()
+    return (
+        int(block.get("n_leaves") or 0),
+        block.get("max_leaf_timestamp"),
+        tuple(block.get("run_ids") or ()),
+    )
+
+
 def column_resolutions(levels: list, node_order: int) -> list[int]:
     """The resolutions a leaf-node column carries, finest first (issue #383).
 
