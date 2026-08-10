@@ -1268,6 +1268,34 @@ class TestLeafSkipIfCurrent:
         assert calls == [int(shard)]
         assert meta["identity"] == "unrecorded-ids" and "refused" not in meta
 
+    def test_a_clamped_per_cell_config_still_reads_current(self, monkeypatch, cfg, tmp_path):
+        # The issue #415 epoch's (7)(b) half, pinned at the seam where the
+        # drift actually bit rather than in ``semantics`` alone: the
+        # dispatcher hands a 2-granule cell a data_source clamped to
+        # ``granule_workers: 2`` (``runner._clamped_data_source``, issue #184)
+        # and the seam hashes THAT config through its ``semantic_hash=None``
+        # fallback. Pre-epoch the clamp moved the hash, so a small shard read
+        # its own leaf as ``semantic-mismatch`` and rewrote on every rerun.
+        from dataclasses import replace
+
+        from zagg.runner import _clamped_data_source
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        clamped = _clamped_data_source(cfg.data_source, len(self.URLS))
+        assert clamped is not None and clamped["granule_workers"] == len(self.URLS)
+        self._arm_boom(monkeypatch)
+        meta = hive.process_and_write_hive(
+            shard,
+            list(self.URLS),
+            grid,
+            {},
+            root,
+            replace(cfg, data_source=clamped),
+            store_kwargs={},
+            skip_if_current=True,
+        )
+        assert meta["current"] is True and meta["identity"] == "equal"
+
     def test_no_sidecar_rewrites(self, monkeypatch, cfg, tmp_path):
         # No sidecar (fresh store): unverifiable, so today's rewrite.
         grid = self._grid(cfg)
