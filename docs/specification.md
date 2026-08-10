@@ -144,7 +144,9 @@ A vlen array without a well-formed `element` declaration is **not** a
 `zagg-ragged/1` array; a reader MUST refuse it with a pointed error rather
 than decode under a guessed layout (pre-issue-209 CSR stores are a hard
 break). The `ragged` attrs key is reserved: config-declared field attrs MUST
-NOT shadow it (enforced at config validation). A located field's provenance
+NOT shadow it (enforced at config validation). The §2.0 `weights` key is
+likewise spec-owned on a ragged payload array — writer-stamped from the
+field's declaration, never author-transcribed. A located field's provenance
 attrs (e.g. `stratum`, `signal_threshold` — §3.3) land on the **payload array
 only**; the `{field}_locations` sibling carries no user attrs.
 
@@ -239,15 +241,48 @@ A t-digest field is a `zagg-ragged/1` (or `/2`) array whose element
 declaration is `{"dtype": "float32", "shape": [-1, 2]}`. Source of truth in
 code: `zagg.stats.tdigest`.
 
+### 2.0 The `weights` declaration
+
+**Contract** ([issue #422](https://github.com/englacial/zagg/issues/422)).
+A digest payload array declares the semantics of its weight column under the
+**`weights`** attrs key — a **sibling** of the §1.2 `ragged` block on the
+payload array, never a key inside it (the `ragged` block is retired wholesale
+under `/2` — §1.6/§6.3 — so a sibling key survives that metadata-only
+migration untouched). Two values are defined:
+
+- **`"counts"`** — weights are observation counts: integers ≥ 1 whose sum is
+  the cell's exact observation count, per §2.1. **An absent `weights` key
+  MUST be read as `"counts"`** — every store written before this revision is
+  conformant verbatim, no byte rewritten.
+- **`"flux"`** — weights are calibrated flux: positive finite float32 reals
+  (a zero-weight observation carries no flux and MUST NOT produce a row);
+  `sum(weights)` estimates the cell's detected **photoelectrons**, not an
+  observation count. A flux-declared array MUST record its calibration
+  provenance in the same attrs: a `gain` key carrying at minimum the gain
+  constant's `name` and `version` (the operating point of any write-time
+  clip rides alongside, writer-defined).
+
+A reader MUST strict-check the value: an unknown declaration is a future
+revision of this section and MUST be refused, never read as either defined
+value. **Merges are legal only between payloads carrying the same
+declaration** (counts with counts, flux with flux — an absent key is
+`"counts"` for this rule too): a mixed merge would produce a weight column
+whose sum means neither thing, so a merging reader or writer MUST refuse it.
+The declaration rides the payload array only; a located field's
+`{field}_locations` sibling carries no `weights` key (§1.2's no-user-attrs
+rule for siblings is unchanged).
+
 ### 2.1 Centroid array
 
 **Contract.** A populated cell's decoded payload is a `(k, 2)` **float32**
 array of weighted centroids:
 
-- column 0 is the centroid **mean**; column 1 is the centroid **weight**
-  (the number of observations merged into it, ≥ 1);
+- column 0 is the centroid **mean**; column 1 is the centroid **weight** —
+  under the `"counts"` declaration (§2.0, the default) the number of
+  observations merged into it, an integer ≥ 1; under `"flux"` a positive
+  real per §2.0;
 - rows MUST be sorted **ascending by mean**;
-- `sum(weights)` MUST equal the cell's **exact** observation count — the
+- under `"counts"`, `sum(weights)` MUST equal the cell's **exact** observation count — the
   number of finite `source` values the digest was built over (non-finite
   source rows are dropped before building) — **while that count is
   representable in float32, i.e. `<= 2^24` (16,777,216)**; above that bound
@@ -258,6 +293,9 @@ array of weighted centroids:
   watch at coarse overview orders (§4.4). For a stratified product (§3) each
   stratum digest's total weight is the exact stratum count, under the same
   bound;
+- under `"flux"` (§2.0) `sum(weights)` is a float32 photoelectron estimate,
+  not a count: the exact-count recovery above (and §3.3's) is undefined for
+  a flux payload, and no integrality holds;
 - an absent cell decodes as the zero-length `(0, 2)` array (the `b""` fill).
 
 ### 2.2 The location channel
@@ -823,7 +861,13 @@ staged sweep's finisher.
   method on an excluded field would declare a t-digest array that does not
   exist. `exact`/`approximate` entries carry the fold `method`, any further
   fold provenance (an `exact` fold's `nan_policy`), and enough dtype/shape
-  metadata to know the overview array's form up front. This map is the
+  metadata to know the overview array's form up front. An `approximate`
+  entry MAY additionally carry `overview_delta` — the compression budget
+  overview folds run at when it is split from the leaf `delta`
+  ([issue #424](https://github.com/englacial/zagg/issues/424); both budgets
+  are fold algebra, informative per §2.3) — and, for a non-default §2.0
+  declaration, `weights`; a reader MUST tolerate entry keys it does not
+  bind. This map is the
   **all-fields** view; the per-overview `zagg_overview.fields` attrs map
   (§4.3) is the materialized subset.
 - **`all_time`** — whether the `all.zarr` all-time fold is materialized at
@@ -1322,13 +1366,20 @@ drift fails zagg's own suite (`tests/test_spec_conformance.py`) on
 whichever side moved. moczarr vendors the same fixtures for its parity
 gates (espg/moczarr#19/#20).
 
-Three tiny single-shard hive stores plus one manifest-only declaration, all
+Four tiny single-shard hive stores plus one manifest-only declaration, all
 on the same deliberately small geometry — shard order 4, inner-chunk order
 5, cell order 6 (16 cells, K = 4 inner chunks of 4 cells), sharded (the
 hive default):
 
 - **`minimal/`** — one *unlocated* digest field (`h_tdigest`) plus `count`.
   The smallest thing that is a conforming store.
+- **`flux/`** — the §2.0 `weights` declaration surface: one flux-declared
+  digest field (`rx_flux`, `weights: "flux"` stamped beside the `ragged`
+  block, `gain` provenance attrs) plus `count`. Its payloads carry
+  fractional positive weights whose per-cell sums are **not** integers —
+  the pin that a flux reader must not round-trip weights through counts —
+  while `minimal/` (committed before this revision, unregenerated) pins the
+  absent-key ⇒ `"counts"` default.
 - **`kitchen_sink/`** — the full stratified-product surface: located
   signal/noise digest strata (payload + `{field}_locations` siblings,
   `stratum`/`signal_threshold` provenance attrs), the `composition` word
