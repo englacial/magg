@@ -770,15 +770,28 @@ on either side, so they stay resumable exactly as before.
    one stays readable, and nothing is rewritten or lost.
 2. **Rebuild.** Clear the store root and rerun. Correct and simple; you pay
    the full aggregation again.
-3. **Restamp in place.** The data really was produced by this config, so
-   rewriting the manifest's `semantic_hash` to the new digest
-   (`python -c "from zagg.config import load_config; from zagg.semantics import
-   semantic_hash; print(semantic_hash(load_config('cfg.yaml')))"`) is
-   *semantically* correct. Be aware of the cost: every leaf's D20 stats
-   sidecar records the **old** digest too, so a rerun then classifies each
-   unit `semantic-mismatch` and rewrites it wholesale — the store self-heals,
-   leaf by leaf, at the price of one full re-aggregation spread over reruns.
-   There is no zagg tool for this; it is a deliberate operator action.
+3. **Restamp the manifest in place — expert path, read the whole entry.**
+   The data really was produced by this config, so writing the new digest
+   into `morton_hive.json` is *semantically* correct. It is also the only
+   path that can make things worse, in three ways:
+   - **It is not one field.** `semantic_hash` is recorded in leaf attrs and
+     in every D20 stats sidecar as well as the manifest, and `dedup`'s
+     identity checks read the *sidecar's* copy, not the manifest's. A
+     manifest-only restamp therefore leaves a **mixed-identity store** — root
+     says one thing, leaves say another — until every leaf has been
+     rewritten. Nothing else in zagg expects that state to persist.
+   - **The rewrite is not a heal, it is the same re-aggregation as (2)**,
+     paid unpredictably across future runs instead of once deliberately:
+     each unit classifies `semantic-mismatch` and rewrites wholesale.
+   - **It manually defeats the guard that catches a wrong config.** Nothing
+     verifies that the config you hash is the one that built the store, and
+     once a foreign digest is installed the frozen-key check will never fire
+     for that store again. Before restamping, confirm the config is the
+     store's own by recomputing its **pre-epoch** digest under the previous
+     zagg and matching it against the recorded one.
+
+   There is no zagg tool for any of this; it is a deliberate operator action,
+   and paths (1) and (2) have none of these failure modes.
 
 Whichever path you take, the first post-epoch run over a store is a **full
 rewrite** of everything it touches. The skip gate cannot certify a leaf as
