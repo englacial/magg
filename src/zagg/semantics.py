@@ -153,10 +153,16 @@ GRID_LEAF_SHAPING_KEYS = ("sharded", "emit_cell_ids")
 #: - ``aoi_mask`` (issue #101) — masks cells outside the AOI, so the leaf's
 #:   VALUES differ. The plainest semantic knob that was outside the core.
 #: - ``windowing`` (issue #246, D13) — partitions observations by time into
-#:   per-window leaves; a windowed and an unwindowed store over the same
-#:   granules shared a hash before the epoch. Folded in its NORMALIZED form
-#:   (:func:`zagg.config.get_windowing`), so ``epoch`` spellings and the
-#:   issue #355 point-window sugar canonicalize.
+#:   per-window leaves, so a windowed and an unwindowed store over the same
+#:   granules shared a hash before the epoch. What this buys is **product
+#:   identity and the D20 sidecar's identity half**, not the manifest guard:
+#:   ``temporal`` is already a frozen manifest key (:data:`zagg.hive.
+#:   _FROZEN_MANIFEST_KEYS`) and a schedule change also lands the unit on a
+#:   ``{window}.zarr`` path with no sidecar (D23), so pre-dispatch refusal and
+#:   the leaf gate were already covered — the hash is what a multi-product
+#:   root and a fleet leaf's recorded identity compare. Folded in its
+#:   NORMALIZED form (:func:`zagg.config.get_windowing`), so ``epoch``
+#:   spellings and the issue #355 point-window sugar canonicalize.
 #:
 #: ``output.pyramid`` is deliberately NOT here, though it does shape the leaf
 #: (issue #383's column artifact), for three reasons that all point the same
