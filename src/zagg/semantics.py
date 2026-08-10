@@ -53,7 +53,8 @@ import json
 
 from zagg.config import PipelineConfig, get_pipeline_type
 
-#: ``data_source`` keys that are read machinery, not output semantics (D19).
+#: ``data_source`` keys that are read machinery or worker sizing, not output
+#: semantics (D19 names the two as separate packaging categories).
 #: Changing any of these must never change the ``semantic_hash``.
 #:
 #: The granule fan-out width joined at the issue #415 hash epoch, under BOTH
