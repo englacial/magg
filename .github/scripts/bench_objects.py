@@ -29,6 +29,32 @@ so it cannot drift from what the template actually emits:
   default), making the sharded hive count EXACT like the flat sharded one; an
   unsharded K>1 leaf keeps the bounded 1..K dense estimate. (The commit stamp
   rewrites the leaf root ``zarr.json`` in place — no extra object.)
+- **hive leaf pyramid column** (issue #418): since the issue #384 ``/2``
+  default flip a default declaration also makes every leaf worker write its
+  own column artifact — ``{node}/{window}.pyramid.zarr``, a SIBLING of the
+  leaf (specification §4.6) — plus its D20 stats sidecar. It is modeled
+  exactly, per populated leaf, off the store's own ``pyramid`` declaration
+  (see :func:`_column_objects`): a column with no declared leaf levels costs
+  nothing, and a ``/1`` (or declared-off) store keeps the pre-#384 count.
+
+**Scope of the model: LEAF-ONLY — the fleet write path, never a swept
+ladder** (issue #418, the decision that issue asks to be made explicitly).
+What the model claims to predict exactly is what the *leaf workers* write:
+the leaf zarr, its sidecars, and — new — the leaf's own pyramid column.
+Everything the SWEEP writes stays outside the audited total, in the
+unbounded ``objects_rollups`` / ``objects_overviews`` buckets: the D9
+rollups (issue #300), the ladder overview zarrs above the shard node (issue
+#201/#384), and **stage columns** — the ``{window}.pyramid.zarr`` artifacts
+the staged sweep writes at ANCESTOR nodes (specification §4.6). Three
+reasons, all structural rather than convenient: the sweep is fire-and-forget
+on Lambda, so its artifacts may or may not have landed at measurement time;
+its column *placement* is dispatch cadence, which §4.6 declares
+"orchestration, never contract", so no fixed count could be right; and a
+partial or scoped sweep is a legal store state. The leaf column is on the
+other side of that line — one deterministic artifact per populated
+``(leaf, window)`` unit, written inside the same worker whose object count
+the issue #215 tripwire guards — so it is audited exactly, and a column that
+goes missing or arrives multiplied trips the per-shard assertion.
 
 Determinism caveats (documented, not modeled): a populated shard is assumed to
 write every array — true when every field aggregates the same observations
@@ -60,6 +86,33 @@ import re
 _MORTON_ID_RE = re.compile(r"-?[1-6][1-4]*")
 
 
+def _column_suffix() -> str:
+    """``zagg.column.COLUMN_SUFFIX`` — the ONE definition of the name seam."""
+    from zagg.column import COLUMN_SUFFIX
+
+    return COLUMN_SUFFIX
+
+
+def _column_node(key: str) -> str | None:
+    """The node dir holding ``key``'s pyramid COLUMN zarr, or ``None``.
+
+    A column artifact is ``{node}/{window}.pyramid.zarr`` (specification
+    §4.6): the leaf worker's own contribution at a leaf node, and the staged
+    sweep's relay at an ancestor node — the SAME basename grammar at both, so
+    the node the caller resolves it against is what tells them apart (a
+    dispatched leaf's node makes it write-path; anything else makes it a
+    sweep artifact). Keyed off ``COLUMN_SUFFIX`` rather than a second literal,
+    and checked on the FIRST ``.zarr`` segment for the same reason
+    :func:`_overview_node` is: an object nested under a real leaf's zarr is
+    that shard's, never a sibling artifact's.
+    """
+    parts = key.split("/")
+    for i, part in enumerate(parts):
+        if part.endswith(".zarr"):
+            return "/".join(parts[:i]) if part.endswith(_column_suffix()) else None
+    return None
+
+
 def _overview_node(key: str) -> str | None:
     """The node dir holding ``key``'s sweep overview zarr, or ``None``.
 
@@ -70,11 +123,18 @@ def _overview_node(key: str) -> str | None:
     (see :data:`_MORTON_ID_RE`). Taking the FIRST segment keeps the hive walk's
     leaf-membership-first ordering: anything nested under a real leaf's zarr is
     that shard's object, never an overview.
+
+    A COLUMN zarr is excluded (issue #418): its stem does not parse as a
+    morton id either, so it would otherwise read as an overview — but a
+    column is a different artifact family with a different audit posture
+    (:func:`_column_node`), and the two buckets must stay disjoint.
     """
     parts = key.split("/")
     for i, part in enumerate(parts):
         if not part.endswith(".zarr"):
             continue
+        if part.endswith(_column_suffix()):
+            return None
         stem = part.removesuffix(".zarr").split("_", 1)[0]
         return None if _MORTON_ID_RE.fullmatch(stem) else "/".join(parts[:i])
     return None
@@ -128,11 +188,48 @@ def _member_layouts(grid, *, leaf: bool = False) -> list[dict]:
     return members
 
 
+def _column_objects(pyramid, node_order: int) -> int:
+    """Objects ONE leaf's pyramid column costs, or 0 when none is declared.
+
+    The issue #384 ``/2`` default flip made this a term every default store
+    pays (issue #418). Derived from the store's own ``pyramid`` declaration
+    through the writer's own functions — :func:`zagg.column.column_resolutions`
+    for the groups and :func:`zagg.column.composable_fields` for the arrays —
+    so the model cannot drift from what ``write_column`` emits, the same
+    posture :func:`_member_layouts` takes toward the template spec.
+
+    Per :func:`zagg.column.write_column`'s D4 order, one column is: the root
+    ``zarr.json`` (the template, the attrs and the commit stamp all REWRITE
+    it — three PUTs, one object), then per resolution group a group
+    ``zarr.json`` plus, per array (``morton`` + one per composable field),
+    one ``zarr.json`` and one chunk object — the groups are one chunk each
+    (``chunks_per_shard == 1`` turns the inert sharding back off), so the
+    count is deterministic exactly as the #236 sharded leaf's is. The D20
+    stats sidecar written after the stamp is the ``+ 1``, counted like the
+    leaf's own ``stats.json`` sibling.
+
+    Zero for a ``/1`` (or declared-off) block, and zero when the declaration
+    carries no leaf-node entry — both are stores whose leaves write no column.
+    """
+    from zagg.column import column_resolutions, composable_fields
+    from zagg.pyramid import PYRAMID_SPEC_V2
+
+    if not isinstance(pyramid, dict) or pyramid.get("spec") != PYRAMID_SPEC_V2:
+        return 0
+    resolutions = column_resolutions(pyramid.get("overviews") or [], node_order)
+    if not resolutions:
+        return 0
+    fields = (pyramid.get("overview") or {}).get("fields") or {}
+    arrays = 1 + len(composable_fields(fields))
+    return 1 + len(resolutions) * (1 + 2 * arrays) + 1
+
+
 def expected_object_counts(
     grid,
     *,
     n_shards: int,
     store_layout: str = "flat",
+    pyramid: dict | None = None,
 ) -> dict:
     """Expected store object counts for ``n_shards`` populated shards.
 
@@ -141,6 +238,11 @@ def expected_object_counts(
     object count; ``exact`` is True when every per-shard count is
     deterministic (the flat sharded live matrix), in which case
     ``total_min == total_max`` is the asserted total.
+
+    ``pyramid`` is the store manifest's ``pyramid`` block (hive only) — the
+    declaration that decides whether each leaf also writes a column
+    (:func:`_column_objects`). :func:`measure_objects` reads it off the store
+    it is measuring; ``None`` models the pre-#384 shape, i.e. no column.
     """
     if store_layout == "flat":
         _require_fullsphere(grid)
@@ -205,8 +307,10 @@ def expected_object_counts(
         # may be legitimately absent for a unit whose submap event block was
         # dropped over the async payload cap, which then surfaces here as a
         # mismatch worth seeing rather than a modeled window).
+        # ... plus the leaf's own pyramid column and its sidecar (issue #418),
+        # exact per populated leaf and zero when none is declared.
         sidecar = 1 if grid.child_order > grid.parent_order else 0
-        lo = hi = 5 + len(members) + sidecar
+        lo = hi = 5 + len(members) + sidecar + _column_objects(pyramid, grid.parent_order)
         for m in members:
             blocks = m["blocks_per_shard"]
             hi += blocks
@@ -377,6 +481,14 @@ def store_object_counts(
         # at an UNDISPATCHED leaf's node stays a loud ``other``, which is the
         # "the model knows every object the run writes" contract.
         overview_nodes = {n for n in map(_overview_node, keys) if n is not None}
+        # ... and the nodes holding a SWEEP-written stage column (issue #418):
+        # its D20 sidecar sits beside it exactly as an overview's does, so it
+        # anchors the same branch. A dispatched leaf's node is excluded — its
+        # column sidecar is that shard's write-path object, caught by the
+        # sibling rule below, and the two branches must stay disjoint.
+        overview_nodes |= {
+            n for n in map(_column_node, keys) if n is not None and n + "/" not in stats_of
+        }
         for key in keys:
             if _is_root_telemetry(key):
                 telemetry += 1
@@ -407,6 +519,23 @@ def store_object_counts(
                 # attribution above and trips #215 instead of vanishing.
                 if key.endswith(".rollup.json"):
                     rollups += 1
+                    continue
+                # Pyramid columns (issue #418), before the overview branch —
+                # they share the "stem is not a morton id" shape but not the
+                # audit posture. A column under a DISPATCHED leaf's node is
+                # that shard's write-path object (the leaf worker wrote it
+                # while the shard's cells were resident), so it counts into
+                # ``per_shard`` and rides the exact #215 guard; a column at
+                # any other node is a STAGE column the sweep wrote, which
+                # joins the overviews bucket outside the audited total (the
+                # leaf-only scope stated in the module docstring).
+                column_node = _column_node(key)
+                if column_node is not None:
+                    label = stats_of.get(column_node + "/")
+                    if label is None:
+                        overviews += 1
+                    else:
+                        per_shard[label] = per_shard.get(label, 0) + 1
                     continue
                 # Sweep overview zarrs (issue #201): `{window}.zarr/...` at a
                 # digit node. The window-token basename can never parse as a
@@ -482,8 +611,22 @@ def measure_objects(
     and the mismatch description (null when clean). ``n_shards`` is the number
     of shards expected to have written (the dispatch count for the per-merge
     harness, the completed-with-data count for the full-AOI fan-out).
+
+    On hive the pyramid DECLARATION is read from the store's own manifest and
+    threaded into the model (issue #418), so the column term needs no new
+    argument at the harness call sites: the block is the run's declaration,
+    written by ``hive.build_manifest`` before any leaf runs, never a product
+    of the write path being audited. A hive store with no readable manifest
+    raises here rather than quietly modelling the pre-#384 shape.
     """
-    expected = expected_object_counts(grid, n_shards=n_shards, store_layout=store_layout)
+    pyramid = None
+    if store_layout == "hive":
+        from zagg.hive import read_manifest
+
+        pyramid = (read_manifest(store_path, **store_kwargs) or {}).get("pyramid")
+    expected = expected_object_counts(
+        grid, n_shards=n_shards, store_layout=store_layout, pyramid=pyramid
+    )
     measured = store_object_counts(
         store_path,
         grid=grid,

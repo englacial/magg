@@ -425,6 +425,64 @@ def test_hive_overview_zarrs_count_into_their_own_bucket(monkeypatch):
     assert measured["other_keys"] == [f"{base}/-311.zarr/zarr.json"]
 
 
+def test_hive_columns_split_by_who_wrote_them(monkeypatch):
+    # Issue #418, the leaf-only scope: `{window}.pyramid.zarr` is one basename
+    # grammar with two writers. Under a DISPATCHED leaf's node it is the leaf
+    # worker's own write-path artifact (audited, per shard, so the #215 guard
+    # covers it); at an ancestor node it is a STAGE column the sweep wrote,
+    # which rides the overviews bucket outside the audited total — as does its
+    # D20 sidecar, while the leaf column's sidecar stays that shard's.
+    from zagg import hive
+
+    grid = from_config(_cfg())
+    word = int(morton_word(_KEY_A))
+    label = grid.shard_label(word)
+    leaf = hive.shard_leaf_path("", word).lstrip("/")
+    node = leaf.rsplit("/", 1)[0]
+    base = node.split("/", 1)[0]
+    keys = [
+        f"{leaf}/count/c/0",  # in-leaf data -> this shard
+        f"{node}/all.pyramid.zarr/zarr.json",  # the LEAF column -> this shard
+        f"{node}/all.pyramid.zarr/6/count/c/0",  # ... and its group object
+        f"{node}/all.pyramid.stats.json",  # ... and its D20 sidecar
+        f"{base}/all.pyramid.zarr/zarr.json",  # a STAGE column -> overviews
+        f"{base}/all.pyramid.stats.json",  # ... and its sidecar
+    ]
+    monkeypatch.setattr(bench_objects, "list_store_keys", lambda *a, **k: keys)
+    measured = bench_objects.store_object_counts(
+        "unused", grid=grid, shard_keys=[word], store_layout="hive"
+    )
+    assert measured["objects_per_shard"] == {label: 4}
+    assert measured["objects_overviews"] == 2
+    assert measured["objects_other"] == 0
+
+
+def test_column_term_is_zero_without_a_v2_declaration():
+    # The term keys off the store's own declaration: a `/1` block, a
+    # declared-off block and a `/2` block with no leaf-node entry all cost
+    # nothing, so a pre-#384 store keeps its pre-#384 count exactly.
+    from zagg.pyramid import PYRAMID_SPEC_V2
+
+    assert bench_objects._column_objects(None, 6) == 0
+    assert bench_objects._column_objects({"spec": "zagg-pyramid/1", "overview": {}}, 6) == 0
+    coarse = {
+        "spec": PYRAMID_SPEC_V2,
+        "overviews": [{"node": 5, "cells": [7]}],
+        "overview": {"fields": {"count": {"class": "exact"}}},
+    }
+    assert bench_objects._column_objects(coarse, 6) == 0
+    # One declared leaf resolution two orders down: groups 8, 7, 6 — one root
+    # zarr.json, per group a group zarr.json + (morton + one composable field)
+    # * (zarr.json + chunk), and the sidecar. A `none`-class field costs
+    # nothing: it exists at native resolution only and no column carries it.
+    block = {
+        "spec": PYRAMID_SPEC_V2,
+        "overviews": [{"node": 6, "cells": [8]}, {"node": 5, "cells": [7]}],
+        "overview": {"fields": {"count": {"class": "exact"}, "h": {"class": "none"}}},
+    }
+    assert bench_objects._column_objects(block, 6) == 1 + 3 * (1 + 2 * 2) + 1
+
+
 def test_hive_root_telemetry_accumulates_without_a_finding(monkeypatch):
     # Issue #362 (the red-main regression): a benchmark store reused across
     # runs accumulates one ``stats_{ts}_{run_id}.parquet`` (issue #297) and one
@@ -797,12 +855,19 @@ def test_expected_counts_sane_for_every_manifest_config():
         assert exp["total_max"] == exp["metadata"] + exp["per_shard_max"], rel
 
 
-def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
+@pytest.mark.parametrize("pyramid", [True, False], ids=["default", "pyramid-off"])
+def test_hive_sharded_store_matches_model(tmp_path, monkeypatch, pyramid):
     # Post issue #236: a sharded K>1 hive leaf writes ONE ShardingCodec object
     # per dense array (and one ragged object), so the hive model is EXACT.
     # End-to-end through the local runner (real process_and_write_hive +
     # write_leaf_to_zarr; only process_shard is faked, honoring the accumulate
     # contract), mirroring test_hive.test_local_hive_sharded_leaf_single_object.
+    #
+    # Both declaration shapes (issue #418): the DEFAULT, where the issue #384
+    # /2 flip makes every leaf worker write its own column artifact, and the
+    # `pyramid: false` opt-out that writes none. The audited posture is the
+    # default one — no escape hatch — and the opt-out is kept so the column
+    # term is pinned as a term (it must vanish, not merely be tolerated).
     import json
 
     import test_hive as th
@@ -815,11 +880,8 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     cfg = default_config("atl06")
     cfg.output["store_layout"] = "hive"
     cfg.output["grid"]["chunk_inner"] = 8  # K = 16; sharded defaults True (#236)
-    # The bench_objects model audits the BASE write path; since the issue #384
-    # /2 default flip a default declaration also writes the leaf column, which
-    # the model (a CI-owned script) has no term for yet — pin the audited
-    # posture explicitly. Flagged on the PR for the model's own column term.
-    cfg.output["pyramid"] = False
+    if not pyramid:
+        cfg.output["pyramid"] = False
     cfg.aggregation["variables"]["h"] = {
         "function": "np.sort",
         "source": "h_li",
@@ -851,7 +913,12 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     root = str(tmp_path / "out")
     agg(cfg, catalog=str(cat_path), store=root, backend="local")
 
-    expected = bench_objects.expected_object_counts(grid, n_shards=1, store_layout="hive")
+    from zagg.hive import read_manifest
+
+    block = read_manifest(root)["pyramid"]
+    expected = bench_objects.expected_object_counts(
+        grid, n_shards=1, store_layout="hive", pyramid=block
+    )
     measured = bench_objects.store_object_counts(
         root, grid=grid, shard_keys=[shard], store_layout="hive"
     )
@@ -861,9 +928,14 @@ def test_hive_sharded_store_matches_model(tmp_path, monkeypatch):
     # + MOC (the run parquet / sweep record are telemetry — issue #362).
     n_arrays = len(grid.shard_spec().members)
     assert expected["exact"] is True
+    # The leaf pyramid column (issue #418): one root zarr.json + per declared
+    # group a group zarr.json and a zarr.json + chunk object for `morton` and
+    # each composable field, + the D20 sidecar. Zero under the opt-out.
+    column = bench_objects._column_objects(block, grid.parent_order)
+    assert column == (1 + 3 * (1 + 2 * (1 + 3)) + 1 if pyramid else 0)
     # ... + the stats.json, granules.json and shardmap.json siblings
     # (issues #297/#388/#300).
-    assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 3
+    assert expected["per_shard_max"] == 2 + 2 * n_arrays + 1 + 3 + column
     assert expected["metadata"] == 3
     # Sweep rollups (issue #300), overview zarrs (issue #201 — with the D20
     # `{window}.stats.json` sidecar each overview leaf carries since issue
