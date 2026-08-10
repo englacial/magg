@@ -698,6 +698,93 @@ mirror, and no async redelivery — so the failure is fail-open by
 construction; the root object simply doesn't appear until the sweep or a
 refresh builds it.
 
+## Migration: the D19 hash epoch
+
+> **Every `semantic_hash` written before this release is invalidated, by
+> design.** Nothing in any store changed on disk; what changed is the
+> *derivation* of the digest that labels it. If you are upgrading a store
+> built by an earlier zagg, read this section before rerunning into it.
+
+[Issue #415](https://github.com/englacial/zagg/issues/415) closed two ruled
+defects in the semantic core ([PR #397](https://github.com/englacial/zagg/pull/397)
+questions (7) and (8)). Both change what `zagg.semantics.semantic_hash`
+digests, so both move every digest — which is why they were deliberately
+landed in one release rather than one at a time.
+
+### What changed
+
+1. **The granule fan-out width left the core.** `shard_workers` /
+   `granule_workers` are now in `zagg.semantics.DATA_SOURCE_PACKAGING_KEYS`.
+   D19's ratified exclusion list already called worker size packaging, but
+   the keys were never listed, so the digest moved with the pool width. That
+   was not merely untidy: both dispatchers hand each cell a `data_source`
+   clamped to `min(K, n_granules)`, so a *small shard's* worker computed a
+   different digest from the run's, and any rollup mixing clamped and
+   unclamped shards collapsed `semantic_hash` to `null`.
+2. **The leaf-shaping `output` knobs entered the core** —
+   `zagg.semantics.OUTPUT_LEAF_SHAPING_KEYS` (`aoi_mask`, `windowing`) and
+   `GRID_LEAF_SHAPING_KEYS` (`sharded`, `emit_cell_ids`). Before, the whole
+   `output` block was outside the core, so a config edit that changed what a
+   leaf *contains* moved neither half of the skip gate's identity pair and a
+   rerun read the stale leaf as `current`.
+
+Deliberately **not** changed: the orders (`parent_order` / `child_order` /
+`chunk_inner`) stay packaging — hashing them would make o8 and o9 runs
+different products and block mixed-order processing (D24) — and the whole
+`pyramid` block stays out, so
+[retrofitting a pyramid declaration](#retrofitting-the-pyramid-declaration)
+onto the config that built a store still hashes identically and still works.
+
+### Why re-hashing is correct, not a defect
+
+The pre-epoch digest answered "do these two configs produce the same leaves"
+**wrongly in both directions**: it separated configs that were identical in
+every effect (the clamp), and it equated configs that write different leaves
+(the `output` knobs). A digest that is wrong in both directions cannot be
+preserved for compatibility — preserving it would mean preserving a false
+answer to the only question it is asked. The stores themselves are
+untouched: no leaf byte moves, and the §5 `content_hashes` (which are over
+decoded values, not over identity) are unchanged. Only the *label* is
+restated, more accurately.
+
+### What an operator sees, and the three ways forward
+
+`semantic_hash` is a frozen manifest key, so a rerun into a pre-epoch store
+refuses **up front**, before any leaf is written:
+
+```
+morton_hive.json at s3://bucket/store does not match this run
+(existing {...} vs {...}); this store was templated for different
+orders/identity — clear the store root (or pick a new one) before
+writing with this configuration
+```
+
+`--overwrite` does not bypass it: when the digit tree already holds shard
+data, the overwrite path refuses too, because replacing only the manifest
+would leave the old leaves masquerading as legal data (D2). Pre-#299 stores
+that carry no hash at all are unaffected — the guard exempts a missing hash
+on either side, so they stay resumable exactly as before.
+
+1. **New product root (recommended).** Write under a new `output.product_name`
+   (or a new store root). Both products coexist under one root (D19), the old
+   one stays readable, and nothing is rewritten or lost.
+2. **Rebuild.** Clear the store root and rerun. Correct and simple; you pay
+   the full aggregation again.
+3. **Restamp in place.** The data really was produced by this config, so
+   rewriting the manifest's `semantic_hash` to the new digest
+   (`python -c "from zagg.config import load_config; from zagg.semantics import
+   semantic_hash; print(semantic_hash(load_config('cfg.yaml')))"`) is
+   *semantically* correct. Be aware of the cost: every leaf's D20 stats
+   sidecar records the **old** digest too, so a rerun then classifies each
+   unit `semantic-mismatch` and rewrites it wholesale — the store self-heals,
+   leaf by leaf, at the price of one full re-aggregation spread over reruns.
+   There is no zagg tool for this; it is a deliberate operator action.
+
+Whichever path you take, the first post-epoch run over a store is a **full
+rewrite** of everything it touches. The skip gate cannot certify a leaf as
+current against an identity that was computed by a different rule, and
+pretending otherwise is exactly the false skip the epoch exists to prevent.
+
 ## Re-runs: skip-if-current, the contraction guard, and the lifecycle touch
 
 Re-dispatching a shard used to mean an unconditional wholesale rewrite (D4)

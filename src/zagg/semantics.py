@@ -303,7 +303,7 @@ def _windowing_leaf_shape(config: PipelineConfig):
 
     Totality is split by fault class rather than caught around the whole call:
     a non-mapping block is refused on SHAPE here, and a mapping missing a
-    required key (or carrying an unparseable ``epoch``/window bound) raises
+    required key (or carrying an unparsable ``epoch``/window bound) raises
     ``KeyError``/``ValueError`` out of the normalizer, which is a GRAMMAR
     fault ``_validate_windowing`` also refuses by name. Anything else —
     ``TypeError``, ``AttributeError`` — would be a fault INSIDE the normalizer

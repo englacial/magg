@@ -731,7 +731,27 @@ neither gap and is safe now.
   worker size, streaming mode (merge-vs-spill lands `np.isclose` and
   shares one store, with the actual mode recorded per-run), and read
   knobs — hashing the whole template would have made o8 and o9 runs
-  different products and blocked mixed-order processing. The hash is a
+  different products and blocked mixed-order processing.
+  **Amended by the D19 hash epoch** (espg-ruled 2026-08-07 as PR #397
+  questions (7)(b)/(8)(c), recorded in
+  [#384 plan delta 2](https://github.com/englacial/zagg/issues/384#issuecomment-5223266761);
+  implemented in #415): two corrections to the lists above, landed together
+  because each one moves every existing digest. (a) *Worker size* was
+  already named as packaging but its keys were never excluded, so the
+  per-cell `min(K, n_granules)` clamp made a small shard's worker-side hash
+  differ from the run's — `shard_workers`/`granule_workers` now exclude
+  properly. (b) The **leaf-shaping `output` knobs** — `aoi_mask`,
+  `windowing`, `grid.sharded`, `grid.emit_cell_ids` — are now *included*:
+  they change what a leaf contains, so leaving them out made the D20 skip
+  gate (#388) read a config-changed rerun as `equal`. `sharded` therefore
+  moves from the exclusion list above into the core; the orders it sits
+  beside do **not** (D24 is untouched, and the object-layout hole is
+  narrowed rather than closed — `chunk_inner` still moves K without moving
+  the digest). The `pyramid` block stays excluded: D11 keeps it out of the
+  frozen manifest keys, and the leaf column it declares is verified by
+  reading the artifact (§4.6) rather than by the digest. Operator
+  consequences — every pre-epoch hash invalidated, and the three migration
+  paths — are in `docs/hive_layout.md`. The hash is a
   **frozen manifest key** (reusing a name with different aggregation
   semantics refuses up front, like any frozen-key mismatch) and is
   recorded in leaf attrs and D20 sidecars. The *literal* template is
@@ -1123,8 +1143,9 @@ registry — CI coverage should be auditable against this list:
 - **Semantic-hash canonicalization** (D19): syntactic edits (whitespace,
   key order, comments) never change the hash; packaging-knob edits
   (orders, chunking, worker size, streaming mode) never change the hash;
-  any semantic edit does. Name-grammar validation (base-component
-  exclusion, URL-safe charset).
+  any semantic edit does; and, post-epoch (#415), a leaf-shaping `output`
+  edit does while an explicit default hashes as absence. Name-grammar
+  validation (base-component exclusion, URL-safe charset).
 - **Manifest guard** (§3): frozen-key match ⇒ idempotent accept, no
   second PUT; mismatch ⇒ pre-dispatch refusal; `path_grouping` absent⇒1
   normalization; allowed-set membership for `cell_order`/`shard_order`.
