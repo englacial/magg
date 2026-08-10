@@ -402,8 +402,12 @@ derives the block through the same code path template time uses, then
   frozen one, so a config that did not build this store cannot install its
   fold laws. This is the layer that covers *reducers*: no leaf records which
   function produced a field, so nothing downstream could catch a config
-  declaring `max` over a store of minima. `output.*` is not in the semantic
-  core, so adding `output.pyramid` to the original config hashes identically.
+  declaring `max` over a store of minima. Adding `output.pyramid` to the
+  original config hashes identically, so the retrofit never false-refuses —
+  the whole `pyramid` block is deliberately outside the semantic core, and
+  keeping this workflow working is one of the reasons why (the D19 hash epoch
+  of issue #415 put the *leaf-shaping* `output` knobs into the core, listed in
+  `zagg.semantics.OUTPUT_LEAF_SHAPING_KEYS`; `pyramid` is not one of them).
   A pre-#299 manifest carries no hash; the comparison is then skipped, loudly.
 - **Typing** — every declared field must exist in a committed leaf with the
   declared dtype (dense fields), or the declared ragged element dtype and
