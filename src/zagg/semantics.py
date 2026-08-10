@@ -127,6 +127,18 @@ GRID_SPATIAL_KEYS = ("crs", "resolution", "bounds")
 #:   layout forever. The orders it interacts with (``chunk_inner``, and hence
 #:   K) stay excluded — D24's resolution axis is untouched, so this is
 #:   deliberately the one packing knob in the core.
+#:
+#:   Two consequences of hashing the DECLARATION rather than the effective
+#:   layout, both known and both deliberate (resolving the effective layout
+#:   needs K, and K needs the orders D24 keeps out):
+#:
+#:   * at ``K == 1`` the grid silently no-ops sharding (issue #215), so
+#:     ``sharded: true`` and ``sharded: false`` write identical leaves and
+#:     still hash apart — an over-discrimination, the safe direction (F1's
+#:     recorded posture: "over-discriminating is safe, a semantic collision
+#:     is not");
+#:   * ``chunk_inner`` changes K, hence the leaf's object set, and still
+#:     hashes equal — the object-layout hole is narrowed here, not closed.
 #: - ``emit_cell_ids`` (issue #304) — the D16 transition hatch writes an
 #:   ADDITIONAL ``cell_ids`` array into every leaf, which is a leaf-content
 #:   difference by the same test, not a display preference.
