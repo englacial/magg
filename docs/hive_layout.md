@@ -794,9 +794,30 @@ on either side, so they stay resumable exactly as before.
    and paths (1) and (2) have none of these failure modes.
 
 Whichever path you take, the first post-epoch run over a store is a **full
-rewrite** of everything it touches. The skip gate cannot certify a leaf as
-current against an identity that was computed by a different rule, and
-pretending otherwise is exactly the false skip the epoch exists to prevent.
+rewrite** of everything it touches — on a fleet-scale store that is a full
+re-aggregation, and it is the headline cost of the epoch, not a footnote. The
+skip gate cannot certify a leaf as current against an identity that was
+computed by a different rule, and pretending otherwise is exactly the false
+skip the epoch exists to prevent.
+
+On the Lambda path the manifest write is asynchronous (issue #252 hybrid,
+above), but the refusal is **not** deferred with it: the read-only frozen-key
+precheck (`zagg.hive.validate_manifest`) runs on the `mode: "ping"` preflight
+*before* fan-out, so an epoch mismatch costs one preflight, not a few thousand
+worker invocations.
+
+### What the epoch buys
+
+The break is the price of arming the fleet's leaf identity gate. Skip-if-current
+([below](#re-runs-skip-if-current-the-contraction-guard-and-the-lifecycle-touch))
+is armed by default only on the local backend today; fleet arming was
+explicitly gated on this epoch
+([issue #415](https://github.com/englacial/zagg/issues/415), sequencing), for
+the reason phase (7) records: pre-epoch the worker-side fallback hash was
+clamp-sensitive, so a small shard would have compared its leaf against a
+digest the run never wrote and rewritten forever without self-healing. After
+the epoch that comparison is sound, and the second post-epoch run over an
+unchanged store is the no-op the gate was built for.
 
 ## Re-runs: skip-if-current, the contraction guard, and the lifecycle touch
 
