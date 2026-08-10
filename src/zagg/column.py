@@ -80,6 +80,28 @@ def generation_key(block) -> tuple:
     )
 
 
+def stamped_generation_key(block, stamp) -> tuple:
+    """One child's contribution to its parent's skip key (issue #417).
+
+    :func:`generation_key` over the child's recorded ``generation`` block —
+    or, for a leaf column (which records none), the leaf identity: one leaf
+    at its stamp's timestamp — **unioned with the run id that stamped THIS
+    child**. That id is the term the issue turns on: the run that wrote the
+    child is what a same-second foreign rewrite changes, and reading the
+    relayed block alone would see only the ids of the child's own children
+    (empty all the way down a fleet-built store, so the gate would fall back
+    to the count/timestamp pair it is meant to strengthen). Fleet-written
+    stamps carry no ``run_id`` and contribute nothing.
+    """
+    stamp = stamp if isinstance(stamp, dict) else {}
+    if not isinstance(block, dict):
+        block = {"n_leaves": 1, "max_leaf_timestamp": stamp.get("written_at")}
+    runs = set(block.get("run_ids") or ())
+    if stamp.get("run_id"):
+        runs.add(stamp["run_id"])
+    return generation_key({**block, "run_ids": sorted(runs)})
+
+
 def column_resolutions(levels: list, node_order: int) -> list[int]:
     """The resolutions a leaf-node column carries, finest first (issue #383).
 

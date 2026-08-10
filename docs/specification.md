@@ -899,7 +899,8 @@ staged sweep's finisher.
   ```
 
   — the summed leaf count of the consumed children, the newest child stamp,
-  and the **sorted set of `run_id`s** those children's stamps carry
+  and the **sorted set of `run_id`s** those children's stamps carry, unioned
+  with the ids their own recorded blocks relay
   ([#417](https://github.com/englacial/zagg/issues/417)). A level is folded
   again exactly when this triple moves. The third term is load-bearing:
   stamps resolve to **one second**, so the first two alone read a child
