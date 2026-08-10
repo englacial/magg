@@ -241,6 +241,15 @@ examples:
     parser.add_argument(
         "--catalog-out", default=None, help="Optional: persist the fetched Catalog as geoparquet"
     )
+    parser.add_argument(
+        "--index-footprints",
+        type=int,
+        default=None,
+        metavar="ORDER",
+        help="Precompute the footprint_cells morton MOC column at ORDER before "
+        "building (issue #396), so this and every later build against the saved "
+        "catalog skip the geometry. Use the grid's parent_order.",
+    )
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -286,6 +295,9 @@ examples:
     query = Query(args.short_name, args.version, start, end, region=bbox, provider=args.provider)
     cat = CMRSource().fetch(query, preserve_thumbnails=args.preserve_thumbnails)
     print(f"Fetched {len(cat)} granules ({query.collection})")
+    if args.index_footprints is not None:
+        cat = cat.index_footprints(args.index_footprints)
+        print(f"Indexed footprint_cells at order {args.index_footprints}")
     if args.catalog_out:
         cat.to_geoparquet(args.catalog_out)
         print(f"Catalog -> {args.catalog_out}")
