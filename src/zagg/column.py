@@ -70,13 +70,18 @@ def generation_key(block) -> tuple:
     no run id) keys on the empty tuple, never on a wildcard: an upgraded
     store re-folds once rather than inheriting the blind spot. A non-block
     keys on ``()``, which matches no generation.
+
+    ``run_ids`` is compared as a SET: the recorded list is read back off an
+    artifact this process did not write, so its order is not a property to
+    assume (review finding — an unsorted or duplicated list would otherwise
+    re-fold a whole ladder for nothing).
     """
     if not isinstance(block, dict):
         return ()
     return (
         int(block.get("n_leaves") or 0),
         block.get("max_leaf_timestamp"),
-        tuple(block.get("run_ids") or ()),
+        tuple(sorted(set(block.get("run_ids") or ()))),
     )
 
 
