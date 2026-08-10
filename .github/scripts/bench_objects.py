@@ -84,6 +84,8 @@ from __future__ import annotations
 
 import re
 
+from zagg.column import COLUMN_SUFFIX
+
 # Per-shard attribution on the flat layout assumes the 1-D fullsphere HEALPix
 # layout the benchmark manifests use (block index arithmetic on the cells
 # axis); the hive layout attributes by leaf prefix and is layout-agnostic.
@@ -94,13 +96,6 @@ import re
 #: 0/5-9 digits or letters and ``all`` is the reserved token — which is what
 #: lets the hive walk tell an overview zarr from a stray source leaf.
 _MORTON_ID_RE = re.compile(r"-?[1-6][1-4]*")
-
-
-def _column_suffix() -> str:
-    """``zagg.column.COLUMN_SUFFIX`` — the ONE definition of the name seam."""
-    from zagg.column import COLUMN_SUFFIX
-
-    return COLUMN_SUFFIX
 
 
 def _column_node(key: str) -> str | None:
@@ -119,7 +114,7 @@ def _column_node(key: str) -> str | None:
     parts = key.split("/")
     for i, part in enumerate(parts):
         if part.endswith(".zarr"):
-            return "/".join(parts[:i]) if part.endswith(_column_suffix()) else None
+            return "/".join(parts[:i]) if part.endswith(COLUMN_SUFFIX) else None
     return None
 
 
@@ -143,7 +138,7 @@ def _overview_node(key: str) -> str | None:
     for i, part in enumerate(parts):
         if not part.endswith(".zarr"):
             continue
-        if part.endswith(_column_suffix()):
+        if part.endswith(COLUMN_SUFFIX):
             return None
         stem = part.removesuffix(".zarr").split("_", 1)[0]
         return None if _MORTON_ID_RE.fullmatch(stem) else "/".join(parts[:i])
