@@ -80,12 +80,18 @@ class TestCanonicalization:
     def test_packaging_knobs_never_change_hash(self):
         base = semantic_hash(_cfg())
         packaging = [
+            # The D24 resolution axis, untouched by the issue #415 epoch:
+            # hashing the orders would make o8 and o9 runs different products
+            # and block mixed-order processing.
             _cfg(output__grid__parent_order=9),
             _cfg(output__grid__child_order=19),
             _cfg(output__grid__chunk_inner=11),
-            _cfg(output__grid__sharded=False),
             _cfg(output__store_layout="hive"),
             _cfg(output__store="s3://elsewhere/prefix"),
+            _cfg(output__product_name="renamed"),
+            _cfg(output__consolidate_metadata=True),
+            _cfg(output__coverage_moc=False),
+            _cfg(output__sweep=False),
             _cfg(aggregation__handoff="pandas"),
             _cfg(data_source__reader="xarray"),
             _cfg(data_source__driver="https"),
@@ -95,11 +101,6 @@ class TestCanonicalization:
         # Worker sizing (issue #235) and read knobs are packaging too.
         cfg = _cfg()
         cfg.worker = {"memory": 8192, "extra_disk": True}
-        assert semantic_hash(cfg) == base
-        # emit_cell_ids is the issue #304 transition hatch, not identity (F4):
-        # the core reads only the grid type/scheme, so it drops out.
-        cfg = _cfg()
-        cfg.output["grid"]["emit_cell_ids"] = True
         assert semantic_hash(cfg) == base
 
     def test_worker_fan_out_width_is_packaging(self):
@@ -153,8 +154,14 @@ class TestCanonicalization:
 
     def test_grid_family_is_semantic(self):
         # Grid TYPE (+ indexing scheme) is identity; the orders are not (D24).
+        # The two leaf-shaping grid knobs ride resolved (issue #415 epoch).
         healpix = semantic_core(_cfg())
-        assert healpix["grid"] == {"type": "healpix", "indexing_scheme": "nested"}
+        assert healpix["grid"] == {
+            "type": "healpix",
+            "indexing_scheme": "nested",
+            "sharded": True,
+            "emit_cell_ids": False,
+        }
         rect = default_config("atl06_polar")
         rect = copy.deepcopy(rect)
         rect.output["grid"] = {
@@ -164,12 +171,16 @@ class TestCanonicalization:
             "bounds": [0, 0, 1000, 1000],
         }
         # F1: rect folds in the spatially-defining params (crs/resolution/
-        # bounds) — D24's resolution-axis exclusion is HEALPix-only.
+        # bounds) — D24's resolution-axis exclusion is HEALPix-only. The
+        # sharded default is grid-family-shaped, exactly as grids.from_config
+        # resolves it: HEALPix defaults on (issue #215), rect defaults off.
         assert semantic_core(rect)["grid"] == {
             "type": "rectilinear",
             "crs": "EPSG:3031",
             "resolution": 100,
             "bounds": [0, 0, 1000, 1000],
+            "sharded": False,
+            "emit_cell_ids": False,
         }
         assert semantic_hash(rect) != semantic_hash(_cfg())
 
@@ -214,9 +225,13 @@ class TestCanonicalization:
     def test_golden_hash_pin(self):
         # F4: a fully-inline config with fixed dicts, pinned to its exact
         # digest (re-pinned when pipeline.type joined the core, espg-ruled
-        # 2026-07-21). This catches accidental canonicalization drift — any change
-        # to key ordering, null pruning, the packaging-key sets, or the JSON
-        # separators would move this hash, so an unintended edit fails loudly.
+        # 2026-07-21; re-pinned again at the issue #415 hash epoch, when the
+        # leaf-shaping output knobs joined). This catches accidental
+        # canonicalization drift — any change to key ordering, null pruning,
+        # the packaging-key sets, or the JSON separators would move this hash,
+        # so an unintended edit fails loudly. Moving it deliberately is a
+        # compatibility event: every store's frozen manifest key changes with
+        # it (see the migration note in docs/hive_layout.md).
         cfg = PipelineConfig(
             data_source={
                 "reader": "h5coro",
@@ -238,7 +253,7 @@ class TestCanonicalization:
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         assert semantic_hash(cfg) == (
-            "98450eb2909a105f8989c55e317d27180bf92c559859ad1415bf77445f925f22"
+            "96e5b12005fcf09a9508e643abb7eecd7893220adef2ae75cf2b34f40c04d4c1"
         )
 
     def test_pipeline_type_is_semantic(self):
@@ -257,3 +272,91 @@ class TestCanonicalization:
     def test_fingerprint_rejects_short_input(self):
         with pytest.raises(ValueError, match="not a semantic hash"):
             semantic_fingerprint("abc")
+
+
+class TestLeafShapingOutputKnobs:
+    """The issue #415 hash epoch, half (8)(c): the ``output`` knobs that change
+    what a leaf CONTAINS (or which artifacts sit beside it) are identity now.
+
+    Before the epoch the whole ``output`` block was outside the core, so the
+    issue #388 skip gate's identity pair could not see a leaf-shape change and
+    a config-changed rerun read ``equal`` — PR #397 question (8).
+    """
+
+    WINDOWING = {"schedule": "annual", "time_field": "delta_time", "epoch": "2018-01-01"}
+
+    def test_sharded_flip_is_identity(self):
+        # The knob question (8) checked by hand: flipping it changes the
+        # leaf's object set while the granule set holds.
+        assert semantic_hash(_cfg(output__grid__sharded=False)) != semantic_hash(_cfg())
+
+    def test_an_explicit_default_hashes_as_absence(self):
+        # Resolved through the accessors, never as spelled: HEALPix output
+        # defaults to sharded (issue #215), so spelling the default must not
+        # mint a new product — the pipeline.type discipline (§8.3).
+        base = semantic_hash(_cfg())
+        assert semantic_hash(_cfg(output__grid__sharded=True)) == base
+        assert semantic_hash(_cfg(output__grid__emit_cell_ids=False)) == base
+        assert semantic_hash(_cfg(output__aoi_mask=False)) == base
+        assert semantic_hash(_cfg(output__windowing={"schedule": "none"})) == base
+
+    def test_emit_cell_ids_is_identity(self):
+        # The issue #304 hatch writes an ADDITIONAL cell_ids array into every
+        # leaf — a leaf-content difference, not a display preference.
+        assert semantic_hash(_cfg(output__grid__emit_cell_ids=True)) != semantic_hash(_cfg())
+
+    def test_aoi_mask_is_identity(self):
+        # Masks cells outside the AOI: the leaf's VALUES differ (issue #101).
+        assert semantic_hash(_cfg(output__aoi_mask=True)) != semantic_hash(_cfg())
+
+    def test_windowing_is_identity(self):
+        # A windowed and an unwindowed store over the same granules shared a
+        # hash before the epoch (issue #246, D13).
+        assert semantic_hash(_cfg(output__windowing=self.WINDOWING)) != semantic_hash(_cfg())
+
+    def test_windowing_is_folded_in_its_normalized_form(self):
+        # get_windowing canonicalizes the epoch, so two spellings of the same
+        # instant are one product (§8.3) — the same obligation the rest of the
+        # core meets by pruning nulls.
+        spelled = _cfg(output__windowing={**self.WINDOWING, "epoch": "2018-01-01T00:00:00Z"})
+        assert semantic_hash(spelled) == semantic_hash(_cfg(output__windowing=self.WINDOWING))
+        # ...and a real boundary change is a different product.
+        moved = _cfg(output__windowing={**self.WINDOWING, "epoch": "2019-01-01"})
+        assert semantic_hash(moved) != semantic_hash(_cfg(output__windowing=self.WINDOWING))
+
+    def test_the_pyramid_block_stays_out(self):
+        # Deliberately excluded even though the leaf column IS leaf-shaping:
+        # the column half is verified by reading the artifact
+        # (hive.leaf_column_expectation, the specification's §4.6 posture),
+        # D11 keeps the block out of the manifest's frozen keys, and
+        # sweep_overview.declare_pyramid exists to add a declaration to the
+        # config that built the store — hashing it would refuse the retrofit
+        # the tool is for.
+        base = semantic_hash(_cfg())
+        for knob in (
+            False,
+            {"overviews": [9]},
+            {"spacing": 2},
+            {"orders": [3]},
+            {"all_time": True},
+            {"summarize": {"h_li": {"as": "h_li_digest"}}},
+        ):
+            assert semantic_hash(_cfg(output__pyramid=knob)) == base
+
+    def test_the_documented_constants_match_the_core(self):
+        # The constants are the module's public statement of the epoch's
+        # scope; this pins them to what semantic_core actually builds, so the
+        # two cannot drift.
+        from zagg.semantics import GRID_LEAF_SHAPING_KEYS, OUTPUT_LEAF_SHAPING_KEYS
+
+        core = semantic_core(_cfg(output__windowing=self.WINDOWING))
+        assert set(core["output"]) == set(OUTPUT_LEAF_SHAPING_KEYS)
+        assert set(core["grid"]) - {"type", "indexing_scheme"} == set(GRID_LEAF_SHAPING_KEYS)
+
+    def test_the_core_stays_total_on_an_out_of_grammar_block(self):
+        # validate_config refuses these by name; the hash must not be the
+        # thing that raises — the Lambda worker builds its config without
+        # validate_config, and semantic_core must not start raising on a
+        # config that hashed before the epoch. It hashes as spelled.
+        assert len(semantic_hash(_cfg(output__windowing={"schedule": "annual"}))) == 64
+        assert len(semantic_hash(_cfg(output__windowing="yes"))) == 64

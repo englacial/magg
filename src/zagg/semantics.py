@@ -25,11 +25,26 @@ Included (the semantic core):
 - the **pipeline type** (``spatial`` | ``temporal`` | ``event``; absent
   normalizes to ``spatial`` — espg-ruled on the PR #316 review: a temporal
   engine over the same aggregation block is a different product; D19's
-  ratified list omitted it only because the temporal path wasn't in frame).
+  ratified list omitted it only because the temporal path wasn't in frame);
+- the **leaf-shaping ``output`` knobs** (the issue #415 hash epoch, espg-ruled
+  as PR #397 question (8)(c)): every knob that changes what a leaf *contains*
+  or which artifacts sit *beside* it — :data:`OUTPUT_LEAF_SHAPING_KEYS` and
+  :data:`GRID_LEAF_SHAPING_KEYS`. Before the epoch the whole ``output`` block
+  was outside the core, so the issue #388 skip gate's identity pair could not
+  see a leaf-shape change at all and read a config-changed rerun as ``equal``.
+  Every knob here is folded in **resolved through its accessor**, never as
+  spelled, so an explicit default hashes identically to an absent key (§8.3,
+  the ``pipeline.type`` discipline).
 
 Excluded as packaging: all orders (``parent_order``/``child_order``/
-``chunk_inner``), ``sharded``, store layout/path, ``emit_cell_ids`` (the
-issue #304 transition hatch), worker sizing, streaming mode, read knobs,
+``chunk_inner`` — the D24 resolution axis, which the epoch deliberately did
+NOT touch: hashing them would still make o8 and o9 runs different products and
+block mixed-order processing), store layout/path/name, ``coverage_moc`` and
+``sweep`` (run triggers over regenerable D9 caches), ``consolidate_metadata``
+(a derived finalize blob), the whole ``pyramid`` block (D11 keeps it out of
+the manifest's frozen keys because the §7 sweep populates it; the leaf column
+it declares is verified by READING the artifact instead — see
+:data:`OUTPUT_LEAF_SHAPING_KEYS`), worker sizing, streaming mode, read knobs,
 catalog/bounds (run inputs, recorded per-run — catalog identity lives in the
 D20 sidecar, never the product identity).
 
@@ -101,6 +116,44 @@ FINGERPRINT_HEX = 12
 #: argument that does not extend to rect — over-discriminating is safe, a
 #: semantic collision is not). HEALPix stays type + indexing scheme only.
 GRID_SPATIAL_KEYS = ("crs", "resolution", "bounds")
+
+#: ``output.grid`` keys that shape the LEAF, folded into the core's ``grid``
+#: at the issue #415 hash epoch (PR #397 question (8)(c)).
+#:
+#: - ``sharded`` (issue #108) — the knob question (8) checked: flipping it
+#:   over an existing store changes the leaf's object set (one ShardingCodec
+#:   object per array vs K regular chunk objects) while the granule set holds,
+#:   so pre-epoch the skip gate read ``equal`` and the store kept its old
+#:   layout forever. The orders it interacts with (``chunk_inner``, and hence
+#:   K) stay excluded — D24's resolution axis is untouched, so this is
+#:   deliberately the one packing knob in the core.
+#: - ``emit_cell_ids`` (issue #304) — the D16 transition hatch writes an
+#:   ADDITIONAL ``cell_ids`` array into every leaf, which is a leaf-content
+#:   difference by the same test, not a display preference.
+GRID_LEAF_SHAPING_KEYS = ("sharded", "emit_cell_ids")
+
+#: ``output`` keys outside ``grid`` that shape the LEAF (issue #415 epoch).
+#:
+#: - ``aoi_mask`` (issue #101) — masks cells outside the AOI, so the leaf's
+#:   VALUES differ. The plainest semantic knob that was outside the core.
+#: - ``windowing`` (issue #246, D13) — partitions observations by time into
+#:   per-window leaves; a windowed and an unwindowed store over the same
+#:   granules shared a hash before the epoch. Folded in its NORMALIZED form
+#:   (:func:`zagg.config.get_windowing`), so ``epoch`` spellings and the
+#:   issue #355 point-window sugar canonicalize.
+#:
+#: ``output.pyramid`` is deliberately NOT here, though it does shape the leaf
+#: (issue #383's column artifact), for three reasons that all point the same
+#: way: the artifact half is already covered by reading the artifact —
+#: :func:`zagg.hive.leaf_column_expectation`, the specification's §4.6 "read
+#: the columns, not the manifest" posture, which is what closed question (8)'s
+#: concrete regression; the block is excluded from the manifest's frozen keys
+#: by D11 because the §7 sweep populates it; and the retrofit path
+#: (:func:`zagg.sweep_overview.declare_pyramid`, ``--declare-pyramid``) exists
+#: precisely to add a pyramid declaration to the config that built a store,
+#: which its own semantic guard would then refuse. Hashing it would break a
+#: supported workflow to re-cover ground already covered.
+OUTPUT_LEAF_SHAPING_KEYS = ("aoi_mask", "windowing")
 
 
 #: D24 exact merge laws: aggregator name -> fold law. These are the reducers
@@ -216,6 +269,24 @@ def _prune_nulls(obj):
     return obj
 
 
+def _windowing_leaf_shape(config: PipelineConfig):
+    """The normalized ``output.windowing`` declaration, or ``None`` (D13).
+
+    Normalized rather than as-spelled so ``epoch`` spellings and the issue
+    #355 point-window sugar canonicalize (§8.3). Total by contract: an
+    out-of-grammar block is ``_validate_windowing``'s refusal to raise, not
+    the hash's — :func:`semantic_core` must not start raising on a config that
+    hashed before the epoch (the Lambda worker builds its config without
+    ``validate_config``), so such a block simply hashes as spelled.
+    """
+    from zagg.config import get_windowing
+
+    try:
+        return get_windowing(config)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return (config.output or {}).get("windowing")
+
+
 def semantic_core(config: PipelineConfig) -> dict:
     """The output-defining subset of ``config`` (D19), as a plain dict.
 
@@ -225,6 +296,8 @@ def semantic_core(config: PipelineConfig) -> dict:
     YAML explicit-null hashes identically to an absent key (§8.3). The returned
     structure is JSON-serializable plain data (the YAML loader guarantees it).
     """
+    from zagg.config import get_aoi_mask, get_emit_cell_ids, get_sharded
+
     grid_cfg = (config.output or {}).get("grid", {}) or {}
     grid_type = grid_cfg.get("type", "healpix")
     grid: dict = {"type": grid_type}
@@ -237,6 +310,12 @@ def semantic_core(config: PipelineConfig) -> dict:
         for key in GRID_SPATIAL_KEYS:
             if key in grid_cfg:
                 grid[key] = grid_cfg[key]
+    # GRID_LEAF_SHAPING_KEYS, resolved (issue #415): `sharded`'s default is
+    # grid-family-shaped exactly as `grids.from_config` resolves it — HEALPix
+    # output defaults to sharded (issue #215), rect does not — so an explicit
+    # `sharded: true` on a HEALPix config hashes identically to omitting it.
+    grid["sharded"] = get_sharded(config, default=grid_type == "healpix")
+    grid["emit_cell_ids"] = get_emit_cell_ids(config)
     core: dict = {
         "aggregation": _without(config.aggregation, AGGREGATION_PACKAGING_KEYS),
         "data_source": _without(config.data_source, DATA_SOURCE_PACKAGING_KEYS),
@@ -248,6 +327,14 @@ def semantic_core(config: PipelineConfig) -> dict:
         # the same discipline as the manifest's path_grouping absent=>1, so
         # every existing config hashes stably.
         "pipeline": {"type": get_pipeline_type(config)},
+        # OUTPUT_LEAF_SHAPING_KEYS (issue #415): the knobs that decide what a
+        # leaf CONTAINS or which artifacts sit beside it. Resolved, never as
+        # spelled — an unwindowed store prunes `windowing` away entirely, so
+        # only stores that actually declare a schedule pay for the key.
+        "output": {
+            "aoi_mask": get_aoi_mask(config),
+            "windowing": _windowing_leaf_shape(config),
+        },
     }
     return _prune_nulls(core)
 
@@ -286,7 +373,9 @@ __all__ = [
     "DATA_SOURCE_PACKAGING_KEYS",
     "EXACT_MERGE_LAWS",
     "FINGERPRINT_HEX",
+    "GRID_LEAF_SHAPING_KEYS",
     "GRID_SPATIAL_KEYS",
+    "OUTPUT_LEAF_SHAPING_KEYS",
     "canonical_semantic_json",
     "composability_classes",
     "field_composability",
