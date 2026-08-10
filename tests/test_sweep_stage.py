@@ -303,7 +303,6 @@ def _restamp(root, rel, **keys):
     stamp = dict(g.attrs["morton_hive_commit"])
     stamp.update(keys)
     g.attrs["morton_hive_commit"] = stamp
-    return stamp
 
 
 def _ladder_arrays(root):
@@ -431,8 +430,34 @@ class TestSameSecondSkipGate:
         assert dict(_artifact(root, leaf).attrs)["morton_hive_commit"]["written_at"] == was
         (row,) = _sweep(root, m, run_id="B")["stages"]
         assert row["written"] > 0
-        # The parent carries the REWRITE's partial (136 * 10), not the stale one.
+        # The parent carries the REWRITE's partial (136 * 10), not the stale one,
+        # and so does every level above it (the gate is per artifact node, so a
+        # partial re-fold would satisfy the count alone — review finding).
         assert list(_artifact(root, "1/1/1/all.zarr")["3"]["count"][:])[0] == 136 * 10
+        assert list(_artifact(root, "1/1/all.zarr")["2"]["count"][:])[0] == 136 * 10 + 272
+        assert list(_artifact(root, "1/all.zarr")["1"]["count"][:])[0] == 136 * 10 + 272 + 408
+
+    def test_same_second_foreign_rewrite_of_a_stage_column_is_refolded(self, tmp_path):
+        """The arm the merge tiers rest on. At ``width=1`` the coarser tuples'
+        children are STAGE columns, whose stamps carry a real ``run_id``
+        (:func:`zagg.sweep_stage.write_stage_column` writes it) — so this arm
+        needs no injected grammar for the id, only the same-second restamp."""
+        root = tmp_path / "s"
+        m = _stage_store(root)
+        _sweep(root, m, width=1)
+        col = "1/1/1/all.pyramid.zarr"
+        was = dict(_artifact(root, col).attrs)["morton_hive_commit"]["written_at"]
+        before = list(_artifact(root, "1/1/all.zarr")["2"]["count"][:])
+        # A foreign run rewrites the order-2 column's RELAY member (the tier
+        # every coarser merge consumes) inside its own recorded second.
+        g = zarr.open_group(open_store(str(root / col)), path="", mode="r+", zarr_format=3)
+        g["3"]["count"][0] = 1000
+        _restamp(root, col, written_at=was, run_id="C")
+        _sweep(root, m, width=1, run_id="B")
+        after = list(_artifact(root, "1/1/all.zarr")["2"]["count"][:])
+        # The '111' output cell re-merges the tampered relay (1000) with its
+        # sibling '1112' partial (272), where it held 136 + 272 before.
+        assert before[0] == 136 + 272 and after[0] == 1000 + 272
 
     def test_entry_without_run_ids_stays_current(self, tmp_path):
         """The upgrade path: a pre-#417 entry keys on the empty run-id set, and
