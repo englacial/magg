@@ -301,21 +301,16 @@ class _ColumnReader:
     def generation(self) -> tuple:
         """This column's generation basis: its own, or the leaf identity.
 
-        :func:`zagg.column.generation_key`'s triple. Stage columns record a
-        ``generation`` block in their attrs (the summed ratchet); a leaf
-        column is one leaf — ``n_leaves: 1`` at its stamp timestamp, under
-        the run id that stamp carries (fleet-written ones carry none). The
-        parent's skip gate keys on the SUM of these.
+        :func:`zagg.column.stamped_generation_key`'s triple: a stage column's
+        recorded ``generation`` block (the summed ratchet) or a leaf column's
+        identity — one leaf at its stamp's timestamp — plus the run id THIS
+        column's own stamp carries (fleet-written ones carry none, review
+        finding). The parent's skip gate keys on the SUM of these.
         """
-        from zagg.column import COLUMN_ATTR, generation_key
+        from zagg.column import COLUMN_ATTR, stamped_generation_key
 
         block = (self.attrs.get(COLUMN_ATTR) or {}).get("generation")
-        if not isinstance(block, dict):
-            stamp = self.stamp or {}
-            block = {"n_leaves": 1, "max_leaf_timestamp": stamp.get("written_at")}
-            if stamp.get("run_id"):
-                block["run_ids"] = [stamp["run_id"]]
-        return generation_key(block)
+        return stamped_generation_key(block, self.stamp)
 
     def read(self, res: int, name: str) -> np.ndarray | None:
         """One group array, stamp-validated; ``None`` for an absent member.
