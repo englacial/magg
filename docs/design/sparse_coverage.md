@@ -727,13 +727,14 @@ neither gap and is safe now.
   a different product; the original list omitted it only because the
   temporal path wasn't in frame, and pre-merge was the free moment to add
   it — no store carries a hash yet). Excluded as packaging: cell order (a
-  resolution axis — D24), parent/shard order, `chunk_inner`/`sharded`,
+  resolution axis — D24), parent/shard order, `chunk_inner`/`sharded`
+  (`sharded` amended below — the D19 hash epoch),
   worker size, streaming mode (merge-vs-spill lands `np.isclose` and
   shares one store, with the actual mode recorded per-run), and read
   knobs — hashing the whole template would have made o8 and o9 runs
   different products and blocked mixed-order processing.
-  **Amended by the D19 hash epoch** (espg-ruled 2026-08-07 as PR #397
-  questions (7)(b)/(8)(c), recorded in
+  **Amended by the D19 hash epoch** (espg-ruled on-thread 2026-08-07 as
+  PR #397 questions (7)(b)/(8)(c), recorded in
   [#384 plan delta 2](https://github.com/englacial/zagg/issues/384#issuecomment-5223266761);
   implemented in #415): two corrections to the lists above, landed together
   because each one moves every existing digest. (a) *Worker size* was
@@ -751,7 +752,8 @@ neither gap and is safe now.
   frozen manifest keys, and the leaf column it declares is verified by
   reading the artifact (§4.6) rather than by the digest. Operator
   consequences — every pre-epoch hash invalidated, and the three migration
-  paths — are in `docs/hive_layout.md`. The hash is a
+  paths — are in `docs/hive_layout.md`, "Migration: the D19 hash epoch".
+  The hash is a
   **frozen manifest key** (reusing a name with different aggregation
   semantics refuses up front, like any frozen-key mismatch) and is
   recorded in leaf attrs and D20 sidecars. The *literal* template is
