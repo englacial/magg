@@ -68,6 +68,13 @@ from zagg.config import PipelineConfig, get_pipeline_type
 #: hash — and ``semantic_hash`` being in :data:`zagg.telemetry._EQ_OR_NONE_KEYS`
 #: then collapsed the identity half to ``None`` in any rollup mixing clamped
 #: and unclamped shards.
+#:
+#: The clamp writes ``granule_workers`` whatever the config spelled, so that
+#: key alone closes the reported drift; ``shard_workers`` rides along because
+#: the two ARE one knob (``zagg.processing.worker._granule_workers`` resolves
+#: the canonical name first) and hashing the canonical spelling of an excluded
+#: knob would be incoherent. Issue #415 named only the legacy alias, so the
+#: canonical one is flagged for ruling on the epoch PR rather than assumed.
 DATA_SOURCE_PACKAGING_KEYS = (
     "reader",
     "driver",
