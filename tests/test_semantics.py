@@ -353,10 +353,23 @@ class TestLeafShapingOutputKnobs:
         assert set(core["output"]) == set(OUTPUT_LEAF_SHAPING_KEYS)
         assert set(core["grid"]) - {"type", "indexing_scheme"} == set(GRID_LEAF_SHAPING_KEYS)
 
-    def test_the_core_stays_total_on_an_out_of_grammar_block(self):
+    @pytest.mark.parametrize(
+        "block",
+        [
+            "yes",  # shape fault: not a mapping
+            5,
+            {"schedule": "annual"},  # grammar fault: no time_field/epoch
+            {"schedule": "explicit", "windows": [{"label": "x"}]},
+        ],
+    )
+    def test_the_core_stays_total_on_an_out_of_grammar_block(self, block):
         # validate_config refuses these by name; the hash must not be the
         # thing that raises — the Lambda worker builds its config without
         # validate_config, and semantic_core must not start raising on a
-        # config that hashed before the epoch. It hashes as spelled.
-        assert len(semantic_hash(_cfg(output__windowing={"schedule": "annual"}))) == 64
-        assert len(semantic_hash(_cfg(output__windowing="yes"))) == 64
+        # config that hashed before the epoch. Such a block hashes AS SPELLED,
+        # and stably: the same bad block twice is the same digest, and it does
+        # not collide with the unwindowed store.
+        digest = semantic_hash(_cfg(output__windowing=block))
+        assert len(digest) == 64
+        assert digest == semantic_hash(_cfg(output__windowing=block))
+        assert digest != semantic_hash(_cfg())

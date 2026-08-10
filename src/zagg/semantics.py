@@ -294,13 +294,24 @@ def _windowing_leaf_shape(config: PipelineConfig):
     the hash's — :func:`semantic_core` must not start raising on a config that
     hashed before the epoch (the Lambda worker builds its config without
     ``validate_config``), so such a block simply hashes as spelled.
+
+    Totality is split by fault class rather than caught around the whole call:
+    a non-mapping block is refused on SHAPE here, and a mapping missing a
+    required key (or carrying an unparseable ``epoch``/window bound) raises
+    ``KeyError``/``ValueError`` out of the normalizer, which is a GRAMMAR
+    fault ``_validate_windowing`` also refuses by name. Anything else —
+    ``TypeError``, ``AttributeError`` — would be a fault INSIDE the normalizer
+    and is deliberately left to propagate rather than launder into a digest.
     """
     from zagg.config import get_windowing
 
+    block = (config.output or {}).get("windowing")
+    if not isinstance(block, dict):
+        return block
     try:
         return get_windowing(config)
-    except (AttributeError, KeyError, TypeError, ValueError):
-        return (config.output or {}).get("windowing")
+    except (KeyError, ValueError):
+        return block
 
 
 def semantic_core(config: PipelineConfig) -> dict:
