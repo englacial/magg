@@ -858,3 +858,61 @@ class TestColumnArtifact:
         assert block["spec"] == "zagg-pyramid/2"
         assert block["overviews"][0] == {"node": exp["shard_order"], "cells": [5]}
         assert exp["declared"] == {"overviews": 5}
+
+
+class TestFixtureSemanticHash:
+    """The committed ``semantic_hash`` must be reproducible from the config
+    that built the fixture (issue #415).
+
+    Nothing else in the suite reads that manifest field — the §5 hashes cover
+    decoded values, not identity — so before this pin a semantic-core edit
+    could ship fixtures carrying a digest no zagg reproduces, and moczarr
+    would vendor them (espg/moczarr#19/#20) with every parity gate green. The
+    D19 hash epoch is exactly the change that would have done it.
+    """
+
+    @staticmethod
+    def _generator():
+        """The fixture generator as a module (the ``test_content_hash`` precedent)."""
+        import importlib.util
+
+        path = Path(__file__).parent.parent / "tools" / "generate_spec_fixtures.py"
+        spec = importlib.util.spec_from_file_location("zagg_spec_fixture_generator", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @staticmethod
+    def _recorded(name):
+        return json.loads((SPEC_DATA / name / "morton_hive.json").read_text())["semantic_hash"]
+
+    @pytest.mark.parametrize(
+        "name,kwargs",
+        [
+            ("minimal", {"kitchen_sink": False}),
+            ("kitchen_sink", {"kitchen_sink": True}),
+            ("column", {"kitchen_sink": False, "pyramid": {"overviews": 5}}),
+        ],
+    )
+    def test_leaf_fixture_hash_is_reproducible(self, name, kwargs):
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded(name) == semantic_hash(gen._config(**kwargs))
+
+    def test_the_pyramid_fixture_hash_is_reproducible(self):
+        # Its manifest is built from the /1 config and then retrofitted by
+        # declare_pyramid under the /2 one, so the recorded hash pins BOTH
+        # halves at once: the digest reproduces, and the two configs agree —
+        # which is the property that keeps the retrofit legal (the pyramid
+        # block is deliberately outside the semantic core, issue #415).
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        cfg_v1 = gen._config(False)
+        cfg_v2 = gen._config(False, pyramid=gen.PYRAMID_KNOB)
+        for cfg in (cfg_v1, cfg_v2):
+            cfg.aggregation["variables"].update(gen.PYRAMID_EXTRA_VARIABLES)
+            cfg.output["grid"] = dict(gen.PYRAMID_GRID)
+        assert semantic_hash(cfg_v1) == semantic_hash(cfg_v2)
+        assert self._recorded(PYRAMID) == semantic_hash(cfg_v1)
