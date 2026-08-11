@@ -239,6 +239,8 @@ def _digest_cfg(**meta_extra) -> PipelineConfig:
     """A minimal config carrying one ragged digest field ``d``."""
     return PipelineConfig(
         data_source={
+            "reader": "h5coro",
+            "groups": ["g"],
             "variables": {"h": "/p"},
             "coordinates": {"latitude": "/lat", "longitude": "/lon"},
         },
