@@ -856,6 +856,14 @@ class TestColumnArtifact:
         assert block["node"] == exp["shard"] and block["order"] == exp["shard_order"]
         assert block["source_cell_order"] == exp["cell_order"]
         assert block["window"] == "all"
+        # §4.6's decode-without-the-manifest keys on an approximate entry —
+        # including ``overview_delta``, the budget this column's fold actually
+        # compressed at (issue #424), which the committed bytes must carry for
+        # a spec-and-fixtures reader to see it.
+        entry = block["fields"]["h_tdigest"]
+        assert entry["class"] == "approximate" and entry["method"] == "tdigest_kway"
+        assert {"delta", "overview_delta", "dtype", "inner_shape"} <= set(entry)
+        assert entry["overview_delta"] == exp["delta"]
 
     def test_stamp_is_present_and_field_pinned(self):
         exp = _expected(COLUMN)
