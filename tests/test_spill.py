@@ -459,6 +459,14 @@ class TestSpillConfig:
         with pytest.raises(ValueError, match="unknown key"):
             get_streaming(_config(streaming={"mode": "spill", "state_layout": "arena"}))
 
+    def test_spill_fold_state_carries_the_declared_delta(self):
+        # Issue #424: the spill fold honors the field's declared δ (the 8,192
+        # leaf budget), never the module default.
+        cfg = _config(streaming={"mode": "spill"}, variables=_base_variables(delta=8192))
+        agg = SpillAggregator(cfg, _grid(cfg), "pandas", 25)
+        assert agg._digest_fields["h_tdigest"].delta == 8192
+        agg.close()
+
     def test_non_mergeable_config_is_accepted_by_spill(self):
         # The whole point of spill: reducers merge-mode validation rejects are
         # exact in the single-block regime.

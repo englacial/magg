@@ -191,6 +191,32 @@ def encode_digest(digest: np.ndarray, dtype) -> bytes:
     return np.ascontiguousarray(np.asarray(digest, dtype=dt)).tobytes()
 
 
+#: Default cap on the pyramid-fold compression budget (issue #424). Overview
+#: digests are governed by the ~1/δ quantile-accuracy bound (512 → ~0.2%),
+#: not the leaf's loss-free bound — and the cap also bounds the sweep's
+#: chunk-batched k-way fold buffers (4 children × δ × cells), which saturate
+#: toward ~1 GB per slab at a δ=8,192 leaf budget vs ~33 MB here.
+OVERVIEW_DELTA_CAP = 512
+
+
+def overview_fold_delta(meta: dict) -> int:
+    """The δ an overview/pyramid/column fold compresses at (issue #424).
+
+    A declared ``overview_delta`` (manifest field entry / config field key)
+    wins. Absent — every pre-#424 manifest — the leaf ``delta`` capped at
+    :data:`OVERVIEW_DELTA_CAP`: identical to the historical fold-at-leaf-δ
+    behavior for every manifest ever written (all carried δ ≤ 512), while a
+    raised leaf δ no longer saturates the fold buffers. Leaf-side builds and
+    streaming/spill folds are NOT overview folds and keep the leaf δ — only
+    the first fold level ever sees leaf-δ inputs, and those are bounded by
+    actual observations, not δ.
+    """
+    declared = meta.get("overview_delta")
+    if declared is not None:
+        return int(declared)
+    return min(int(meta.get("delta") or OVERVIEW_DELTA_CAP), OVERVIEW_DELTA_CAP)
+
+
 def check_weights_match(attrs, meta: dict, field: str) -> None:
     """Refuse a digest fold across mismatched §2.0 weights declarations (#424).
 
@@ -1377,7 +1403,7 @@ def _fold_node(
         for j, cell in enumerate(acc):
             if cell:
                 slab[j] = fold_digests(
-                    cell, delta=int(meta.get("delta") or 512), dtype=meta.get("dtype") or "float32"
+                    cell, delta=overview_fold_delta(meta), dtype=meta.get("dtype") or "float32"
                 )
         slabs[name] = slab
     stamps = [t for t in timestamps if t is not None]
@@ -1576,7 +1602,7 @@ def _fold_child(group, fields, factor, span, path) -> dict:
         values = arr[:]
         dtype = meta.get("dtype") or "float32"
         inner = tuple(meta.get("inner_shape") or (2,))
-        delta = int(meta.get("delta") or 512)
+        delta = overview_fold_delta(meta)
         folded = np.full(span, b"", dtype=object)
         for j in range(span):
             cell = [

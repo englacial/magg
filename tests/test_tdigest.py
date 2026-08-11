@@ -788,3 +788,50 @@ class TestBuildTDigestPairwise:
         d_s, l_s = build_tdigest(vals, delta=32, locations=locs)
         np.testing.assert_array_equal(d_p, d_s)
         np.testing.assert_array_equal(l_p, l_s)
+
+
+class TestSingletonPreservation:
+    """Issue #424: loss-free below δ, pinned at the exact boundary n = δ.
+
+    The δ = 8,192 raise's whole justification is "no original observation is
+    merged away while a cell's count stays ≤ δ" — these tests make that
+    load-bearing for the build AND both merge paths, so a future ``_compress``
+    change that eagerly re-compresses below saturation fails here.
+    """
+
+    def _assert_all_singletons(self, digest, source_values):
+        assert digest.shape == (len(source_values), 2)
+        np.testing.assert_array_equal(digest[:, 1], np.ones(len(source_values), dtype=np.float32))
+        np.testing.assert_array_equal(digest[:, 0], np.sort(source_values).astype(np.float32))
+
+    def test_build_is_loss_free_at_n_equals_delta(self):
+        rng = np.random.default_rng(424)
+        values = rng.normal(0.0, 100.0, 512)
+        self._assert_all_singletons(build_tdigest(values, delta=512), values)
+
+    def test_pairwise_merge_keeps_every_singleton_at_combined_delta(self):
+        # Two loss-free digests over overlapping ranges, combined n == δ: the
+        # merge re-runs the same greedy rule over 512 unit sub-centroids, so
+        # no eager re-compression below saturation may exist.
+        rng = np.random.default_rng(4242)
+        a_vals = rng.normal(0.0, 100.0, 300)
+        b_vals = rng.normal(0.0, 100.0, 212)
+        a = build_tdigest(a_vals, delta=512)
+        b = build_tdigest(b_vals, delta=512)
+        merged = merge_tdigests(a, b, delta=512)
+        self._assert_all_singletons(merged, np.concatenate([a_vals, b_vals]))
+
+    def test_kway_merge_keeps_every_singleton_at_combined_delta(self):
+        rng = np.random.default_rng(42424)
+        parts = [rng.normal(0.0, 100.0, 128) for _ in range(4)]
+        digests = [build_tdigest(p, delta=512) for p in parts]
+        merged = merge_tdigests_kway(digests, delta=512)
+        self._assert_all_singletons(merged, np.concatenate(parts))
+
+    def test_default_delta_unchanged(self):
+        # Raising the default would silently change output values under an
+        # unchanged semantic hash for any config omitting ``delta`` — the
+        # packaged configs are explicit instead (issue #424, plan Q2 ruling).
+        from zagg.stats.tdigest import _DEFAULT_DELTA
+
+        assert _DEFAULT_DELTA == 512
