@@ -731,12 +731,20 @@ def _read_group(
     arrow: bool = False,
     granule_url: str | None = None,
     io_stats: dict | None = None,
+    siblings: dict | None = None,
 ):
     """Read and spatially filter one HDF5 group.
 
     Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, an
     ``arro3.core.Table`` carrying the identical columns. Returns ``None`` when the
     group has no observations in this shard.
+
+    When ``data_source.coordinates.level`` names a record level (issue #425),
+    the group is a vlen-packed product (GEDI-style): coordinates expand from
+    the record level and the flat base datasets are gathered by the record
+    link — see :mod:`zagg.processing.read_vlen`. ``siblings`` (open h5coro
+    handles per sibling-asset name, from a paired-asset shard map) is consumed
+    only by that route's asset filters and ignored elsewhere.
 
     When ``data_source.read_plan.chunk_boundaries`` is set (issue #148 arm 2a),
     the read is planned a priori from the granule's chunk-boundary parquet —
@@ -773,6 +781,23 @@ def _read_group(
     by the dispatcher after the read completes — no lock (the point-path
     analogue of the raster ``io_stats`` sink). ``None`` counts nothing.
     """
+    # Vlen-packed sources (issue #425) dispatch on the coordinates.level key
+    # before the plan-shape branches below — the vlen route owns its own
+    # planned/full arms (read_plan.spatial_index must name the record level).
+    coords = data_source.get("coordinates")
+    if isinstance(coords, dict) and coords.get("level") is not None:
+        from zagg.processing.read_vlen import _vlen_read_group
+
+        return _vlen_read_group(
+            h5obj,
+            group,
+            data_source,
+            shard_key,
+            grid,
+            arrow=arrow,
+            io_stats=io_stats,
+            siblings=siblings,
+        )
     rp = data_source.get("read_plan")
     # Presence check, not truthiness: an empty/misconfigured ``chunk_boundaries``
     # block must fail loudly inside the a-priori path (missing ``prefix``), not

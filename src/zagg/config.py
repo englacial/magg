@@ -416,6 +416,10 @@ def validate_config(config: PipelineConfig) -> None:
     # Cross-check: each filter's level field must name a key in levels (issue #43)
     _validate_filter_levels(config.data_source)
 
+    # Vlen grammar surface (issue #425): coordinates.level, synthesize
+    # variables, sibling-asset declarations + asset filters.
+    _validate_vlen_source(config.data_source)
+
     # Virtual chunk-index backend block (issue #160)
     _validate_index(config.data_source)
 
@@ -1690,6 +1694,7 @@ def _normalize_filter(f: dict) -> dict:
     op = f["op"]
     out = {
         "level": f.get("level"),
+        "asset": f.get("asset"),
         "dataset": f["dataset"],
         "column": f.get("column"),
         "op": op,
@@ -1722,6 +1727,28 @@ def _validate_ds_variables(data_source: dict) -> None:
                 f"data_source.variables['{name}'] must be a path string or a "
                 f"{{path, column}} mapping (got {type(entry).__name__})"
             )
+        # Synthesized-column form (issue #425, vlen grammar): the column is
+        # computed per record — ``linspace(start, stop, count)`` over each
+        # record's samples — never read. Cross-checks against ``levels`` and
+        # ``coordinates.level`` live in ``_validate_vlen_source``.
+        if "synthesize" in entry:
+            if entry["synthesize"] != "linspace":
+                raise ValueError(
+                    f"data_source.variables['{name}'].synthesize must be 'linspace' "
+                    f"(got {entry['synthesize']!r})"
+                )
+            extra = set(entry) - {"synthesize", "level", "start", "stop"}
+            if extra:
+                raise ValueError(
+                    f"data_source.variables['{name}']: unknown keys {sorted(extra)} "
+                    "(the synthesize form takes 'synthesize', 'level', 'start', 'stop')"
+                )
+            for key in ("level", "start", "stop"):
+                if not isinstance(entry.get(key), str) or not entry[key]:
+                    raise ValueError(
+                        f"data_source.variables['{name}'].{key} must be a non-empty string"
+                    )
+            continue
         extra = set(entry) - {"path", "column"}
         if extra:
             raise ValueError(
@@ -1786,6 +1813,18 @@ def _validate_filters(data_source: dict) -> None:
             continue
         if "dataset" not in f:
             raise ValueError(f"filter[{i}]: structured filter requires 'dataset'")
+        asset = f.get("asset")
+        if asset is not None:
+            # Sibling-asset predicate (issue #425): evaluated on the paired
+            # asset's per-record rows after the declared key join, so it is
+            # record-level by construction — a 'level' would be ambiguous.
+            if not isinstance(asset, str) or not asset:
+                raise ValueError(f"filter[{i}]: 'asset' must be a non-empty string")
+            if f.get("level") is not None:
+                raise ValueError(
+                    f"filter[{i}]: 'asset' filters are record-level by construction "
+                    "(the join key aligns records); omit 'level'"
+                )
         op = f.get("op")
         if op not in FILTER_OPS:
             raise ValueError(f"filter[{i}]: unknown op {op!r} (allowed: {sorted(FILTER_OPS)})")
@@ -1803,6 +1842,89 @@ def _validate_filters(data_source: dict) -> None:
                 raise ValueError(f"filter[{i}]: op {op!r} requires a scalar 'value'")
             if not isinstance(f["value"], (int, float)) or isinstance(f["value"], bool):
                 raise ValueError(f"filter[{i}]: 'value' must be numeric (got {f['value']!r})")
+
+
+def _validate_vlen_source(data_source: dict) -> None:
+    """Cross-validate the vlen grammar surface (issue #425).
+
+    The vlen route is selected by ``coordinates.level`` (the base level has no
+    native coordinates; they expand from that record level). Checks:
+
+    - ``coordinates.level`` names a non-base level whose ``link`` points
+      directly at ``base_level`` (the ragged-gather link);
+    - ``synthesize:`` variables require the vlen route and their ``level``
+      must equal ``coordinates.level`` (the within-record index used by the
+      linspace comes from that level's link);
+    - ``data_source.assets`` entries carry a ``join`` block with string
+      ``left``/``right`` key paths; every filter's ``asset`` names a declared
+      entry, and asset filters require the vlen route.
+    """
+    ds = data_source or {}
+    coords = ds.get("coordinates")
+    coord_level = coords.get("level") if isinstance(coords, dict) else None
+    levels = ds.get("levels")
+    base_level = ds.get("base_level")
+    if coord_level is not None:
+        if not isinstance(levels, dict) or base_level is None:
+            raise ValueError("data_source.coordinates.level requires 'levels' and 'base_level'")
+        if coord_level not in levels:
+            raise ValueError(
+                f"data_source.coordinates.level {coord_level!r} is not a key in levels "
+                f"(available: {sorted(levels)})"
+            )
+        link = (levels[coord_level] or {}).get("link")
+        if not isinstance(link, dict) or link.get("to") != base_level:
+            raise ValueError(
+                f"data_source.coordinates.level {coord_level!r} must link directly to "
+                f"base level {base_level!r}"
+            )
+    for name, entry in (ds.get("variables") or {}).items():
+        if not isinstance(entry, dict) or "synthesize" not in entry:
+            continue
+        if coord_level is None:
+            raise ValueError(
+                f"data_source.variables['{name}']: synthesize requires the vlen route "
+                "(set data_source.coordinates.level)"
+            )
+        if entry["level"] != coord_level:
+            raise ValueError(
+                f"data_source.variables['{name}'].level {entry['level']!r} must equal "
+                f"coordinates.level {coord_level!r} (the within-record index comes "
+                "from that level's link)"
+            )
+    assets = ds.get("assets")
+    if assets is not None:
+        if not isinstance(assets, dict) or not assets:
+            raise ValueError("data_source.assets must be a non-empty mapping of name -> {join}")
+        for name, cfg in assets.items():
+            if not isinstance(cfg, dict) or not isinstance(cfg.get("join"), dict):
+                raise ValueError(f"data_source.assets['{name}'] requires a 'join' mapping")
+            join = cfg["join"]
+            unknown = set(join) - {"left", "right"}
+            if unknown:
+                raise ValueError(
+                    f"data_source.assets['{name}'].join: unknown keys {sorted(unknown)} "
+                    "(takes 'left' and 'right' record-key dataset paths)"
+                )
+            for side in ("left", "right"):
+                if not isinstance(join.get(side), str) or not join[side]:
+                    raise ValueError(
+                        f"data_source.assets['{name}'].join.{side} must be a non-empty string"
+                    )
+    for i, f in enumerate(ds.get("filters") or []):
+        asset = f.get("asset") if isinstance(f, dict) else None
+        if asset is None:
+            continue
+        if not isinstance(assets, dict) or asset not in assets:
+            raise ValueError(
+                f"filter[{i}]: asset {asset!r} is not declared in data_source.assets "
+                f"(available: {sorted(assets) if isinstance(assets, dict) else []})"
+            )
+        if coord_level is None:
+            raise ValueError(
+                f"filter[{i}]: 'asset' filters require the vlen route "
+                "(set data_source.coordinates.level)"
+            )
 
 
 def _segment_variable_names(data_source: dict) -> set[str]:
