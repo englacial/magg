@@ -565,12 +565,21 @@ def validate_config(config: PipelineConfig) -> None:
         if attrs is not None:
             if not isinstance(attrs, dict) or not all(isinstance(k, str) for k in attrs):
                 raise ValueError(f"Variable '{name}': attrs must be a mapping with string keys")
-            from zagg.grids.base import RAGGED_ELEMENT_ATTR
+            from zagg.grids.base import RAGGED_ELEMENT_ATTR, WEIGHTS_ATTR
 
             if RAGGED_ELEMENT_ATTR in attrs:
                 raise ValueError(
                     f"Variable '{name}': attrs key {RAGGED_ELEMENT_ATTR!r} is reserved "
                     f"for the ragged layout block (issue #209)"
+                )
+            # The §2.0 weights key is spec-owned on ragged payload arrays:
+            # the template stamps it from the field-level ``weights:``
+            # declaration, so an attrs transcription could silently disagree.
+            if meta.get("kind") == "ragged" and WEIGHTS_ATTR in attrs:
+                raise ValueError(
+                    f"Variable '{name}': attrs key {WEIGHTS_ATTR!r} is spec-owned on a "
+                    f"ragged payload array — declare the field-level 'weights:' key "
+                    f"instead (spec §2.0, issue #424)"
                 )
             import json
 
@@ -1473,7 +1482,11 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     ``ragged``). ``scalar`` fields need neither and stay the default path.
     ``vector`` and ``ragged`` fields may be driven by either ``function`` or
     ``expression``; ``len``/``count`` are rejected for both (they short-circuit
-    to a scalar count). See issue #29 (vector) and issue #48 (ragged).
+    to a scalar count). See issue #29 (vector) and issue #48 (ragged). A ragged
+    field may additionally declare ``weights`` (the spec §2.0 counts/flux
+    payload declaration; flux requires ``gain`` provenance attrs) and
+    ``overview_delta`` (the split pyramid-fold budget) — both issue #424,
+    both rejected on other kinds.
 
     A field may also declare ``resolution`` (``cell`` default, or ``chunk``).
     A ``resolution: chunk`` field (issue #30 item 2) is written ONCE per chunk
@@ -1513,6 +1526,16 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         raise ValueError(
             f"Variable '{name}': 'location' is only valid for kind 'ragged', not '{kind}'"
         )
+
+    # ``weights`` (spec §2.0, issue #424) declares a digest payload's
+    # weight-column semantics; ``overview_delta`` (issue #424) is the split
+    # pyramid-fold compression budget. Both describe a ragged digest payload —
+    # nothing else has a weight column or an overview digest fold.
+    for key in ("weights", "overview_delta"):
+        if key in meta and kind != "ragged":
+            raise ValueError(
+                f"Variable '{name}': '{key}' is only valid for kind 'ragged', not '{kind}'"
+            )
 
     # resolution (cell default, or chunk). A chunk-resolution field stores one
     # value per chunk in a companion array (issue #30 item 2). ``scalar`` and
@@ -1575,6 +1598,44 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     if "inner_shape" not in meta:
         raise ValueError(f"Variable '{name}': kind 'ragged' requires 'inner_shape'")
     _validate_trailing_shape(name, meta["inner_shape"], key_name="inner_shape")
+
+    # The §2.0 weights declaration (issue #424): "counts" (integer weights,
+    # sum exact — the absent-key default) or "flux" (positive reals, sum an
+    # estimate of detected photoelectrons). A flux field MUST carry its
+    # calibration provenance — the spec requires a ``gain`` attrs mapping
+    # naming at minimum the gain constant's name and version — so a store
+    # never holds calibrated weights whose calibration is unrecoverable.
+    weights = meta.get("weights")
+    if weights is not None:
+        from zagg.grids.base import WEIGHTS_KINDS
+
+        if weights not in WEIGHTS_KINDS:
+            raise ValueError(
+                f"Variable '{name}': weights {weights!r} is not one of {WEIGHTS_KINDS} (spec §2.0)"
+            )
+        if weights == "flux":
+            gain = (meta.get("attrs") or {}).get("gain")
+            if not isinstance(gain, dict) or not {"name", "version"} <= set(gain):
+                raise ValueError(
+                    f"Variable '{name}': weights 'flux' requires calibration provenance "
+                    f"in attrs — a 'gain' mapping with at least 'name' and 'version' "
+                    f"(spec §2.0, issue #424)"
+                )
+
+    # ``overview_delta`` (issue #424): the pyramid/overview fold budget, split
+    # from the leaf ``params.delta`` (leaf δ is the loss-free bound, overview δ
+    # the ~1/δ accuracy bound). A top-level key, NOT a params entry — params
+    # values are forwarded to the reducer as kwargs, which never take it.
+    overview_delta = meta.get("overview_delta")
+    if overview_delta is not None:
+        if not isinstance(overview_delta, int) or isinstance(overview_delta, bool):
+            raise ValueError(
+                f"Variable '{name}': overview_delta must be a positive int (got {overview_delta!r})"
+            )
+        if overview_delta < 1:
+            raise ValueError(
+                f"Variable '{name}': overview_delta must be a positive int (got {overview_delta!r})"
+            )
 
     # Same restriction as vector: ``len``/``count`` produce a scalar count.
     if meta.get("function") in ("len", "count"):
@@ -2166,6 +2227,10 @@ def get_output_signature(meta: dict) -> dict:
         # Ragged location channel (issue #87): the per-observation morton column
         # the reducer folds per centroid; ``None`` for unlocated fields.
         "location": meta.get("location"),
+        # Ragged weights declaration (spec §2.0, issue #424): "counts"/"flux",
+        # or ``None`` when undeclared (the spec reads absence as counts, so
+        # ``None`` keeps pre-#424 templates and signatures byte-identical).
+        "weights": meta.get("weights"),
     }
 
 
@@ -2204,6 +2269,10 @@ def output_field_signature(config: PipelineConfig) -> list[dict]:
         # so existing shard-map signatures are byte-identical.
         if sig["location"] is not None:
             entry["location"] = sig["location"]
+        # A weights declaration changes the payload semantics (spec §2.0,
+        # issue #424) — same keyed-only-when-set discipline as location.
+        if sig["weights"] is not None:
+            entry["weights"] = sig["weights"]
         fields.append(entry)
     return sorted(fields, key=lambda f: f["name"])
 
