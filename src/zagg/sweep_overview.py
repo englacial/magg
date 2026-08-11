@@ -191,6 +191,29 @@ def encode_digest(digest: np.ndarray, dtype) -> bytes:
     return np.ascontiguousarray(np.asarray(digest, dtype=dt)).tobytes()
 
 
+def check_weights_match(attrs, meta: dict, field: str) -> None:
+    """Refuse a digest fold across mismatched §2.0 weights declarations (#424).
+
+    Merges are legal only between payloads carrying the same declaration
+    (spec §2.0): folding a counts payload under a flux declaration (or vice
+    versa) would produce a weight column whose sum means neither thing. The
+    manifest's declared value (absent ⇒ counts, like the attrs key itself) is
+    the store-wide truth; a source array disagreeing with it raises here,
+    which the per-leaf/per-child fold guards turn into a loud skip rather
+    than a silent mixed merge.
+    """
+    from zagg.grids.base import weights_declaration
+
+    stored = weights_declaration(dict(attrs or {}))
+    declared = meta.get("weights") or "counts"
+    if stored != declared:
+        raise ValueError(
+            f"field {field!r}: stored weights declaration {stored!r} does not match "
+            f"the manifest's {declared!r} — merges are legal only between matching "
+            f"declarations (spec §2.0, issue #424)"
+        )
+
+
 def fold_digests(cell_digests: list, *, delta: int, dtype="float32") -> bytes:
     """Merge one overview cell's accumulated t-digests into its payload bytes.
 
@@ -1306,7 +1329,7 @@ def _fold_node(
                 cell_digests: dict = {}
                 for name, meta in fields.items():
                     try:
-                        values = group[name][:]
+                        arr = group[name]
                     except KeyError:
                         # Schema evolution: the field postdates this leaf — it
                         # contributes fill, exactly what re-running would write.
@@ -1314,9 +1337,13 @@ def _fold_node(
                         continue
                     if meta["class"] == "exact":
                         partials[name] = fold_dense(
-                            values, fold_factor, meta.get("method"), meta.get("fill_value", "NaN")
+                            arr[:], fold_factor, meta.get("method"), meta.get("fill_value", "NaN")
                         )
                     else:
+                        # Mismatched §2.0 weights declarations refuse to merge
+                        # (issue #424); the enclosing guard skips the leaf loudly.
+                        check_weights_match(dict(arr.attrs), meta, name)
+                        values = arr[:]
                         dtype = meta.get("dtype") or "float32"
                         inner = tuple(meta.get("inner_shape") or (2,))
                         cell_digests[name] = [
@@ -1534,15 +1561,19 @@ def _fold_child(group, fields, factor, span, path) -> dict:
     partials: dict = {}
     for name, meta in fields.items():
         try:
-            values = group[name][:]
+            arr = group[name]
         except KeyError:
             logger.debug(f"sweep[overview]: overview {path} lacks field {name!r}")
             continue
         if meta["class"] == "exact":
             partials[name] = fold_dense(
-                values, factor, meta.get("method"), meta.get("fill_value", "NaN")
+                arr[:], factor, meta.get("method"), meta.get("fill_value", "NaN")
             )
             continue
+        # Mismatched §2.0 weights declarations refuse to merge (issue #424);
+        # the enclosing per-child guard skips the child loudly.
+        check_weights_match(dict(arr.attrs), meta, name)
+        values = arr[:]
         dtype = meta.get("dtype") or "float32"
         inner = tuple(meta.get("inner_shape") or (2,))
         delta = int(meta.get("delta") or 512)

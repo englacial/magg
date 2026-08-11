@@ -182,6 +182,11 @@ def declared_fields(config) -> tuple[dict, list]:
                 "inner_shape": [int(inner)] if isinstance(inner, int) else [int(x) for x in inner],
                 "delta": int((meta.get("params") or {}).get("delta", 512)),
             }
+            # The §2.0 weights declaration, keyed only when non-default so
+            # existing manifests stay byte-identical; the sweep's fold gate
+            # compares it against the stored arrays (issue #424).
+            if meta.get("weights") not in (None, "counts"):
+                fields[name]["weights"] = meta["weights"]
         else:
             fields[name] = {"class": "none"}
             excluded.append(name)
