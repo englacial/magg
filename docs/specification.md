@@ -925,11 +925,15 @@ staged sweep's finisher.
   Both terms are **additive**: absent, `run_ids` MUST be read as the empty
   set and `granule_count` as `0` — never as a wildcard that matches any
   value — so an upgraded store (a pre-#417 or pre-#433 entry) folds once
-  more rather than inheriting the blind spot. A rewrite that changes neither
-  the leaf count, the second, the writing run nor the granule count is
-  invisible to the gate by construction; the fold it serves is the same
-  content in every case a writer produces, and the `/1` content hash remains
-  the divergence backstop.
+  more rather than inheriting the blind spot.
+
+  **Known boundary.** A rewrite that changes none of the four terms — same
+  leaf count, same recorded second, no `run_id`, same `granule_count` — is
+  invisible to the gate. A fleet leaf re-run over the *same* granule set
+  that nonetheless folds different bytes (a changed field declaration, a
+  repaired torn write) is the shape of it. The gate is a staleness ratchet,
+  not a content check: it deliberately decides without folding, and the `/1`
+  content hash is where content divergence is caught.
 
 ### 4.6 Leaf column artifacts (`zagg-column/1`)
 
