@@ -2132,6 +2132,42 @@ class TestDeclarePyramid:
         with pytest.raises(ValueError, match="h_tdigest.*inner_shape"):
             declare_pyramid(str(tmp_path), _leaf_cfg())
 
+    def test_flux_declaration_over_a_counts_store_refuses(self, tmp_path):
+        # The operator-facing case the gate exists for (review, issue #424):
+        # without it the retrofit PUTs the flux declaration clean, and the
+        # next sweep logs "skipping unreadable leaf" for every leaf.
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_tdigest"].update(
+            weights="flux", attrs={"gain": {"name": "g", "version": "1"}}
+        )
+        with pytest.raises(ValueError, match="h_tdigest.*weights declaration"):
+            declare_pyramid(str(tmp_path), cfg)
+        assert "pyramid" not in read_manifest(str(tmp_path))  # nothing written
+
+    def test_store_side_weights_drift_refuses(self, tmp_path):
+        # The other direction: a flux-stamped leaf under a counts config.
+        from zarr import open_array
+
+        self._pre_declaration_store(tmp_path)
+        leaf = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        arr = open_array(leaf, path=f"{CELL_ORDER}/h_tdigest", mode="r+", zarr_format=3)
+        arr.attrs["weights"] = "flux"
+        with pytest.raises(ValueError, match="h_tdigest.*weights declaration"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert "pyramid" not in read_manifest(str(tmp_path))
+
+    def test_undefined_stored_weights_raises(self, tmp_path):
+        # A value §2.0 does not define: unreadable, not merely mis-declared.
+        from zarr import open_array
+
+        self._pre_declaration_store(tmp_path)
+        leaf = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        arr = open_array(leaf, path=f"{CELL_ORDER}/h_tdigest", mode="r+", zarr_format=3)
+        arr.attrs["weights"] = "photons"
+        with pytest.raises(ValueError, match="unknown weights declaration"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+
     def test_unreadable_ragged_spec_revision_refuses(self, tmp_path):
         # espg-ruled (issue #358): a store whose ragged layout THIS zagg cannot
         # read must be refused at declaration, not discovered at fold time.
