@@ -109,8 +109,16 @@ def stamped_generation_key(block, stamp) -> tuple:
     would fall back to the count/timestamp pair it is meant to strengthen).
     Fleet-written stamps carry no ``run_id`` and contribute none; they do
     carry ``granule_count``, which is the leaf arm's whole point (issue
-    #433). A stage stamp's ``granule_count`` is already the sum over its own
-    children, so the term ratchets up the ladder like ``n_leaves``.
+    #433).
+
+    The two are composed differently ON PURPOSE (review finding): the run id
+    is UNIONED with the block's, the granule count REPLACES it. A stage
+    column's stamp count and its recorded block's are the same sum over the
+    same children (:func:`zagg.sweep_stage._summed_generation` and the relay
+    column's stamp both reduce that run's readers), so replacing loses
+    nothing and upgrades a pre-#433 block — which carries no count — off the
+    stamp. Unioning or ADDING them would double-count every granule at every
+    level of the ladder.
     """
     stamp = stamp if isinstance(stamp, dict) else {}
     if not isinstance(block, dict):
