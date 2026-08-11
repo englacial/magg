@@ -676,6 +676,15 @@ def write_path_total(measured: dict) -> int:
     ``objects_expected`` is comparable to; ``objects_total`` stays gross
     because storage/cost questions want every object. Single-sourced so the
     reported figure and the asserted figure cannot drift apart.
+
+    Only ``objects_total`` is subscripted; the three subtrahends are read
+    tolerantly ON PURPOSE (review finding) — :func:`object_count_mismatch`
+    accepts a PARTIAL ``measured`` carrying just the terms an assertion
+    needs, so a caller that never swept omits the sweep buckets rather than
+    writing zeros. The cost of that tolerance is that a bucket RENAME would
+    under-subtract silently instead of raising; the key set the measured side
+    emits is pinned directly against this docstring so a half-done rename
+    fails there first.
     """
     return (
         measured["objects_total"]
