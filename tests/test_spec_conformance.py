@@ -334,6 +334,25 @@ class TestFluxDeclaration:
         assert attrs["gain"] == exp["gain"]
         assert {"name", "version"} <= set(attrs["gain"])
 
+    def test_fold_arrays_re_declare_weights_and_gain(self):
+        """A fold's own payload arrays carry §2.0 through (review, issue #424).
+
+        The overview/column writer reconstructs its template from the manifest
+        field entry alone, so a declaration that stops at the leaf leaves every
+        folded array reading as ``counts`` — and the fold gate then refuses the
+        whole cascade above the finest level.
+        """
+        exp = _expected("flux")
+        column = _leaf_dir("flux", exp).parent / "all.pyramid.zarr"
+        groups = sorted(p.name for p in column.iterdir() if p.is_dir())
+        assert groups  # the fixture's §4.6 column, folded from the flux leaf
+        for group in groups:
+            meta = json.loads((column / group / "rx_flux" / "zarr.json").read_text())
+            attrs = meta["attributes"]
+            assert attrs["weights"] == "flux"
+            assert attrs["gain"] == exp["gain"]
+            assert "weights" not in attrs["ragged"]  # sibling key, never inside
+
     def test_absent_key_reads_as_counts_on_the_committed_minimal(self):
         from zagg.grids.base import weights_declaration
 

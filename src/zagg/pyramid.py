@@ -194,9 +194,17 @@ def declared_fields(config) -> tuple[dict, list]:
             }
             # The §2.0 weights declaration, keyed only when non-default so
             # existing manifests stay byte-identical; the sweep's fold gate
-            # compares it against the stored arrays (issue #424).
+            # compares it against the stored arrays (issue #424). Its
+            # calibration provenance rides along, because the manifest is the
+            # ONLY thing the overview writer reconstructs a field from
+            # (``sweep_overview._overview_config``) and §2.0 makes ``gain``
+            # REQUIRED on every flux-declared array — without it the overview
+            # would be stamped flux with its calibration unrecoverable.
             if meta.get("weights") not in (None, "counts"):
                 fields[name]["weights"] = meta["weights"]
+                gain = (meta.get("attrs") or {}).get("gain")
+                if gain is not None:
+                    fields[name]["gain"] = gain
         else:
             fields[name] = {"class": "none"}
             excluded.append(name)

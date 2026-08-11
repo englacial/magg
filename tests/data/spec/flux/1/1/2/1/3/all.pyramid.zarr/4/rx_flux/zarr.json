@@ -41,6 +41,11 @@
           2
         ]
       }
+    },
+    "weights": "flux",
+    "gain": {
+      "name": "spec-fixture-gain",
+      "version": "1"
     }
   },
   "dimension_names": [

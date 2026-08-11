@@ -866,8 +866,11 @@ staged sweep's finisher.
   overview folds run at when it is split from the leaf `delta`
   ([issue #424](https://github.com/englacial/zagg/issues/424); both budgets
   are fold algebra, informative per §2.3) — and, for a non-default §2.0
-  declaration, `weights`; a reader MUST tolerate entry keys it does not
-  bind. This map is the
+  declaration, `weights` together with the `gain` calibration provenance
+  §2.0 requires beside it (the overview writer reconstructs its arrays from
+  this entry alone, so a declaration recorded here without its provenance
+  would write an overview whose calibration is unrecoverable); a reader MUST
+  tolerate entry keys it does not bind. This map is the
   **all-fields** view; the per-overview `zagg_overview.fields` attrs map
   (§4.3) is the materialized subset.
 - **`all_time`** — whether the `all.zarr` all-time fold is materialized at

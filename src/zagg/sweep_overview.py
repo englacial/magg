@@ -1698,6 +1698,15 @@ def _overview_config(fields):
     The overview zarr reuses the leaf template machinery
     (``HealpixGrid.emit_shard_template``) so structure — dtypes, fills, the
     D18 ragged attrs, the D16 dggs attrs — cannot drift from source leaves.
+
+    The §2.0 ``weights`` declaration (and the ``gain`` provenance §2.0 makes
+    REQUIRED beside it) is carried through from the manifest field entry
+    (:func:`zagg.pyramid.declared_fields`), because the overview's payload IS
+    the fold of its sources' weights: a bare template would declare the fold
+    of a flux store as counts, and :func:`check_weights_match` would then
+    refuse every child of the cascade (review finding, issue #424). Both keys
+    are absent on a counts field, so a counts store's template bytes are
+    unchanged.
     """
     from zagg.config import PipelineConfig
 
@@ -1717,6 +1726,10 @@ def _overview_config(fields):
                 "dtype": meta.get("dtype", "float32"),
                 "fill_value": 0,
             }
+            if meta.get("weights") not in (None, "counts"):
+                variables[name]["weights"] = meta["weights"]
+                if meta.get("gain") is not None:
+                    variables[name]["attrs"] = {"gain": meta["gain"]}
     return PipelineConfig(
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
