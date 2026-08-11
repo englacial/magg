@@ -171,6 +171,13 @@ def _granule_entry(rec: dict) -> dict:
 #: between track and generation differ per product and are ignored.
 _SIBLING_ID_RE = re.compile(r"_(\d{13})_(O\d+)_(\d+)_(T\d+)_.*_(V\d+)(?:\.\w+)?$")
 
+#: Unpaired fraction of the PRIMARY catalog above which the pairless warning
+#: escalates (issue #425). An unpaired primary is excluded, so a sibling
+#: catalog queried over a different AOI / time window (or a dropped page)
+#: thins the product silently — per granule that is indistinguishable from a
+#: genuinely missing sibling, in aggregate it is not.
+_PAIRLESS_ALERT_FRACTION = 0.5
+
 
 def sibling_join_key(granule_id: str) -> tuple | None:
     """The cross-product join key of a granule id, or ``None`` if unkeyed.
@@ -1057,7 +1064,12 @@ class ShardMap:
             ``metadata["pairless"]`` lists ``{id, missing}`` for every primary
             without a sibling, sibling without a primary, and sibling shadowed
             by an earlier record on the same join key (``"duplicate-key"``),
-            and a build-time warning fires when the list is non-empty.
+            and a build-time warning fires when the list is non-empty. The
+            sibling catalog is taken as authoritative, so it **must be queried
+            over the same AOI and time window as the primary** — a narrower
+            one reports genuinely-paired acquisitions as missing and thins the
+            product; past ``_PAIRLESS_ALERT_FRACTION`` of the primary catalog
+            the warning escalates to name that cause.
         sibling_asset : str
             Asset key the sibling's hrefs are stored under (default ``"l2a"``);
             matches the ``data_source.assets`` name the reader joins on.
@@ -1103,6 +1115,19 @@ class ShardMap:
                     sibling_asset,
                     [p["id"] for p in pairless[:5]],
                 )
+                unpaired = sum(1 for p in pairless if p["missing"] == sibling_asset)
+                n_primary = len(records) + unpaired
+                if n_primary and unpaired > _PAIRLESS_ALERT_FRACTION * n_primary:
+                    logging.warning(
+                        "ShardMap.build: %d of %d primary granules (%.0f%%) have no %s "
+                        "sibling and are EXCLUDED — check that the sibling catalog was "
+                        "queried over the same AOI and time window as the primary "
+                        "(a mis-scoped sibling query thins the product silently)",
+                        unpaired,
+                        n_primary,
+                        100.0 * unpaired / n_primary,
+                        sibling_asset,
+                    )
         # Product short-name drives beam decomposition (collection like "ATL03_007").
         product = ((catalog.metadata or {}).get("collection") or "").split("_")[0].upper()
         if footprint == "beams":

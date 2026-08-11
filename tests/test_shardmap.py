@@ -1974,6 +1974,28 @@ class TestPairedAssetBuild:
         assert {dup_a, dup_b} <= assigned  # excluding a primary is destructive
         assert any("share a join key" in r.message for r in caplog.records)
 
+    def test_mostly_unpaired_primary_escalates_the_warning(self, grid, fake_spherely, caplog):
+        # A mis-scoped sibling query (different AOI, narrower window, dropped
+        # page) is per-granule indistinguishable from a genuinely missing
+        # sibling, and exclusion is destructive — so say so in aggregate
+        # (review finding, PR #432).
+        import logging as _logging
+
+        l1b, l2a = self._catalogs()
+        l2a = Catalog(l2a.table.slice(0, 1), l2a.metadata)  # 1 of 3 primaries pair
+        with caplog.at_level(_logging.WARNING):
+            ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assert any("AOI and time window" in r.message for r in caplog.records)
+
+    def test_mostly_paired_primary_does_not_escalate(self, grid, fake_spherely, caplog):
+        import logging as _logging
+
+        l1b, l2a = self._catalogs()  # 2 of 3 primaries pair
+        with caplog.at_level(_logging.WARNING):
+            ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assert any("pairless" in r.message for r in caplog.records)
+        assert not any("AOI and time window" in r.message for r in caplog.records)
+
     def test_fully_paired_reports_empty_list(self, grid, fake_spherely):
         l1b, l2a = self._catalogs()
         # Trim both catalogs to the two matching acquisitions.
