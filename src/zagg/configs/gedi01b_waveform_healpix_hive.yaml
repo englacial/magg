@@ -8,6 +8,15 @@
 # collections GEDI01_B_002 (primary) + GEDI02_A_002 (sibling), joined at
 # ShardMap.build(..., sibling_catalog=l2a_catalog) -- pairless granules are
 # excluded and reported (metadata["pairless"]).
+#
+# The HDF5 paths below follow the GEDI V002 product layout. The test suite
+# drives them over a synthetic mini-granule keyed off these same strings, so
+# it pins the GRAMMAR wiring, not the product dictionary: a wrong path fails
+# on the first real granule. Verification against real GEDI01_B / GEDI02_A
+# granules is part of the #426 fleet validation -- the L2A trio, and
+# rx_assess/rx_clipbin_count in particular (a per-algorithm or deeper dataset
+# would make `op: le, value: 0` admit or reject every shot), is what to check
+# there first.
 data_source:
   granule_workers: 4
   reader: h5coro
