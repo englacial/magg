@@ -1587,6 +1587,73 @@ class TestFieldAttrsTemplate:
         assert dict(m["count"].attributes) == {}
 
 
+class TestWeightsStamp:
+    """The §2.0 weights declaration is template-stamped (issue #424)."""
+
+    def _grid(self, meta_extra):
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "rx_flux": {
+                        "kind": "ragged",
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "source": "h_li",
+                        "inner_shape": [2],
+                        "dtype": "float32",
+                        "params": {"delta": 64},
+                        **meta_extra,
+                    },
+                }
+            }
+        )
+        return HealpixGrid(parent_order=4, child_order=8, chunk_inner=6, sharded=True, config=cfg)
+
+    def test_flux_stamped_as_sibling_of_the_ragged_block(self):
+        attrs = dict(
+            self._grid({"weights": "flux", "attrs": {"gain": {"name": "g", "version": "1"}}})
+            .spec()
+            .members["rx_flux"]
+            .attributes
+        )
+        assert attrs["weights"] == "flux"
+        # A sibling key, never inside the versioned block (the /2 migration
+        # retires the block wholesale — espg ruling, issue #422).
+        assert "weights" not in attrs["ragged"]
+        assert attrs["ragged"]["spec"] == "zagg-ragged/1"
+        # The declared provenance attrs ride alongside.
+        assert attrs["gain"] == {"name": "g", "version": "1"}
+
+    def test_counts_stamped_when_declared(self):
+        attrs = dict(self._grid({"weights": "counts"}).spec().members["rx_flux"].attributes)
+        assert attrs["weights"] == "counts"
+
+    def test_undeclared_emits_no_key(self):
+        # Absent config declaration -> absent attrs key: pre-#424 configs
+        # produce byte-identical templates (spec §2.0 reads absence as counts).
+        attrs = dict(self._grid({}).spec().members["rx_flux"].attributes)
+        assert "weights" not in attrs
+
+    def test_located_sibling_carries_no_weights_key(self):
+        attrs = (
+            self._grid({"weights": "counts", "location": "leaf_id"})
+            .spec()
+            .members["rx_flux_locations"]
+            .attributes
+        )
+        assert "weights" not in dict(attrs)
+
+    def test_weights_declaration_helper(self):
+        from zagg.grids.base import weights_declaration
+
+        assert weights_declaration({}) == "counts"
+        assert weights_declaration(None) == "counts"
+        assert weights_declaration({"weights": "flux"}) == "flux"
+        with pytest.raises(ValueError, match="unknown weights declaration"):
+            weights_declaration({"weights": "photons"})
+
+
 class TestCoverageBbox:
     """Shard-complete fetch regions (the AOI-bbox under-fetch gap)."""
 
