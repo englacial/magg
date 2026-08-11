@@ -2241,6 +2241,42 @@ class TestRaggedKind:
 
 
 # ---------------------------------------------------------------------------
+# Packaged δ = 8,192 raise (issues #414/#424)
+# ---------------------------------------------------------------------------
+
+
+class TestPackagedDeltaRaise:
+    """The four shipped ATL03 t-digest configs carry the split budgets.
+
+    Leaf δ = 8,192 is the measured loss-free bound (issue #422's statewide CA
+    scan); overview_delta = 512 is the pyramid-fold accuracy budget. The
+    packaged configs are EXPLICIT so ``_DEFAULT_DELTA`` never decides an
+    output value for them (the silent-change-under-stable-hash trap).
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "atl03_tdigest_healpix",
+            "atl03_tdigest_healpix_hive",
+            "atl03_tdigest_located_healpix",
+            "atl03_tdigest_strata_healpix",
+        ],
+    )
+    def test_digest_fields_declare_the_split_budgets(self, name):
+        cfg = default_config(name)
+        ragged = {
+            f: meta
+            for f, meta in cfg.aggregation["variables"].items()
+            if meta.get("kind") == "ragged"
+        }
+        assert ragged  # every one of these templates carries digest fields
+        for meta in ragged.values():
+            assert meta["params"]["delta"] == 8192
+            assert meta["overview_delta"] == 512
+
+
+# ---------------------------------------------------------------------------
 # Ragged weights declaration + overview_delta (spec §2.0, issue #424)
 # ---------------------------------------------------------------------------
 

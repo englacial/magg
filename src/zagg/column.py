@@ -219,7 +219,7 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
     a fractional fold factor, which no guard downstream can read as a divisor
     (both classes would surface it as an opaque numpy failure instead).
     """
-    from zagg.sweep_overview import decode_digest, fold_dense, fold_digests
+    from zagg.sweep_overview import decode_digest, fold_dense, fold_digests, overview_fold_delta
 
     cell_order = int(cell_order)
     fields = composable_fields(fields)
@@ -244,7 +244,7 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
             else:
                 dtype = meta.get("dtype") or "float32"
                 inner = tuple(meta.get("inner_shape") or (2,))
-                delta = int(meta.get("delta") or 512)
+                delta = overview_fold_delta(meta)
                 if slab.shape[0] % factor:
                     raise ValueError(
                         f"cannot fold {slab.shape[0]} cells {factor}-to-one for {name!r}"
@@ -275,11 +275,14 @@ def _column_provenance(meta: dict) -> dict:
     shared helper — the overview's identical gap is a spec call for the
     issue #383 phase 4 section, not a reason to leave this artifact short.
     """
-    from zagg.sweep_overview import _field_provenance
+    from zagg.sweep_overview import _field_provenance, overview_fold_delta
 
     entry = dict(_field_provenance(meta))
     if meta.get("class") == "approximate":
         entry["delta"] = int(meta.get("delta") or 512)
+        # The budget the column fold actually compressed at (issue #424):
+        # the split overview_delta, not the leaf δ.
+        entry["overview_delta"] = overview_fold_delta(meta)
         entry["dtype"] = meta.get("dtype") or "float32"
         entry["inner_shape"] = list(meta.get("inner_shape") or (2,))
     return entry

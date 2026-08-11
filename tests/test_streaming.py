@@ -404,6 +404,15 @@ class TestStreamingOccupied:
         np.testing.assert_array_equal(np.sort(occ["merge"]), np.sort(occ["pooled"]))
 
 
+class TestDeclaredDeltaPropagation:
+    """Issue #424: streaming folds honor the field's declared δ, not the default."""
+
+    def test_streaming_state_carries_the_declared_delta(self):
+        cfg = _config(streaming={"buffer_granules": 2}, delta=8192)
+        agg = StreamingAggregator(cfg, _grid(cfg), "pandas", 2)
+        assert agg._digest_fields["h_tdigest"] == ("h_ph", 8192)
+
+
 class TestStreamingReviewFolds:
     """Folds from the phase-4 adversarial review."""
 

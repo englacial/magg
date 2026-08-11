@@ -464,6 +464,7 @@ def _merge_slabs(
         decode_digest,
         fold_dense,
         fold_digests,
+        overview_fold_delta,
     )
 
     windows = next((len(row) for row in rows if row is not None), 1)
@@ -494,7 +495,7 @@ def _merge_slabs(
             continue
         dtype = meta.get("dtype") or "float32"
         inner = tuple(meta.get("inner_shape") or (2,))
-        delta = int(meta.get("delta") or 512)
+        delta = overview_fold_delta(meta)
         out = np.full(n_out, b"", dtype=object)
         pending: dict[int, list] = {}
         for i, row in enumerate(rows):

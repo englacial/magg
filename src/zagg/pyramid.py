@@ -158,7 +158,7 @@ def declared_fields(config) -> tuple[dict, list]:
     """
     from zagg.config import get_agg_fields
     from zagg.semantics import EXACT_MERGE_LAWS, _fold_function_name, composability_classes
-    from zagg.sweep_overview import EXACT_NAN_POLICY, TDIGEST_LAW
+    from zagg.sweep_overview import EXACT_NAN_POLICY, TDIGEST_LAW, overview_fold_delta
 
     agg = get_agg_fields(config)
     fields: dict = {}
@@ -175,12 +175,22 @@ def declared_fields(config) -> tuple[dict, list]:
             }
         elif cls == "approximate":
             inner = meta.get("inner_shape") or (2,)
+            delta = int((meta.get("params") or {}).get("delta", 512))
             fields[name] = {
                 "class": "approximate",
                 "method": TDIGEST_LAW,
                 "dtype": meta.get("dtype", "float32"),
                 "inner_shape": [int(inner)] if isinstance(inner, int) else [int(x) for x in inner],
-                "delta": int((meta.get("params") or {}).get("delta", 512)),
+                "delta": delta,
+                # The split pyramid-fold budget (issue #424), recorded RESOLVED
+                # so the manifest is self-describing: the sweep folds at this
+                # value. Pre-#424 manifests lack the key — the reader-side
+                # capped fallback in overview_fold_delta reproduces their
+                # historical fold-at-leaf-δ behavior exactly (all carried
+                # δ ≤ 512).
+                "overview_delta": overview_fold_delta(
+                    {"delta": delta, "overview_delta": meta.get("overview_delta")}
+                ),
             }
             # The §2.0 weights declaration, keyed only when non-default so
             # existing manifests stay byte-identical; the sweep's fold gate

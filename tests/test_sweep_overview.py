@@ -352,6 +352,64 @@ class TestFoldDigests:
         assert forward == backward  # the issue #279 order-independent law
 
 
+class TestOverviewFoldDelta:
+    """Issue #424: the split leaf-δ / overview-δ fold budget."""
+
+    def test_declared_budget_wins(self):
+        from zagg.sweep_overview import overview_fold_delta
+
+        assert overview_fold_delta({"delta": 8192, "overview_delta": 512}) == 512
+        assert overview_fold_delta({"delta": 64, "overview_delta": 1024}) == 1024
+
+    def test_absent_reproduces_every_historical_manifest(self):
+        # Every manifest ever written carried δ ≤ 512, so the capped fallback
+        # is byte-identical to the old fold-at-leaf-δ behavior for all of them.
+        from zagg.sweep_overview import overview_fold_delta
+
+        assert overview_fold_delta({"delta": 256}) == 256
+        assert overview_fold_delta({"delta": 16}) == 16
+        assert overview_fold_delta({}) == 512
+
+    def test_absent_caps_a_raised_leaf_delta(self):
+        # A δ=8,192 leaf must not saturate the sweep's k-way fold buffers
+        # through an old-style manifest: the cap bounds it.
+        from zagg.sweep_overview import OVERVIEW_DELTA_CAP, overview_fold_delta
+
+        assert overview_fold_delta({"delta": 8192}) == OVERVIEW_DELTA_CAP == 512
+
+    def test_declared_fields_records_the_resolved_budget(self):
+        from zagg.config import PipelineConfig
+        from zagg.pyramid import declared_fields
+
+        def cfg(**extra):
+            return PipelineConfig(
+                data_source={
+                    "variables": {"h": "/p"},
+                    "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+                },
+                aggregation={
+                    "variables": {
+                        "d": {
+                            "kind": "ragged",
+                            "function": "zagg.stats.tdigest.build_tdigest",
+                            "source": "h",
+                            "inner_shape": [2],
+                            "params": {"delta": 8192},
+                            **extra,
+                        }
+                    }
+                },
+                output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+            )
+
+        declared = declared_fields(cfg(overview_delta=256))[0]["d"]
+        assert declared["delta"] == 8192 and declared["overview_delta"] == 256
+        # Undeclared resolves to the capped fallback, recorded explicitly so
+        # the manifest is self-describing.
+        resolved = declared_fields(cfg())[0]["d"]
+        assert resolved["delta"] == 8192 and resolved["overview_delta"] == 512
+
+
 class TestWeightsGate:
     """Spec §2.0 (issue #424): merges refuse across mismatched declarations."""
 
@@ -458,7 +516,10 @@ class TestPyramidBlock:
         block = build_pyramid_block(cfg, shard_order=9)
         entry = block["overview"]["fields"]["h_tdigest"]
         assert entry["class"] == "approximate" and entry["method"] == "tdigest_kway"
-        assert entry["inner_shape"] == [2] and entry["delta"] == 256
+        # The packaged split budgets (issues #414/#424): leaf δ 8,192
+        # (loss-free bound), overview folds at 512 (accuracy bound).
+        assert entry["inner_shape"] == [2] and entry["delta"] == 8192
+        assert entry["overview_delta"] == 512
 
     def test_explicit_orders_and_all_time(self):
         from zagg.sweep_overview import build_pyramid_block
