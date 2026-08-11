@@ -1021,7 +1021,8 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   "window": "all",
   "fields": {"count": {"class": "exact", "method": "sum", "nan_policy": "skip"},
              "h_tdigest": {"class": "approximate", "method": "tdigest_kway",
-                            "delta": 16, "dtype": "float32", "inner_shape": [2]}},
+                            "delta": 16, "overview_delta": 16,
+                            "dtype": "float32", "inner_shape": [2]}},
   "groups": {"5": {"regime": "leaf-column", "merges_from_raw": 1, "n_cells": 4},
              "4": {"regime": "leaf-column", "merges_from_raw": 1, "n_cells": 1}},
   "cells_with_data_order": 5,
@@ -1036,7 +1037,12 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   commit stamp's `cells_with_data` records (the finest group).
   `fields` follows §4.3's materialized-fields contract (approximate entries
   additionally carry `dtype`/`inner_shape`/`delta` — enough to decode
-  without the manifest). `groups` carries the per-group provenance slots:
+  without the manifest — and `overview_delta`, the budget this column's fold
+  actually compressed at, which is the split pyramid-fold budget rather than
+  the leaf `delta` ([issue #424](https://github.com/englacial/zagg/issues/424);
+  both are fold algebra, informative per §2.3). A reader MUST tolerate entry
+  keys it does not bind, exactly as in §4.5). `groups` carries the per-group
+  provenance slots:
   the fold **regime** (`"leaf-column"` — folded from the leaf's own
   resident cells; `source_children` never rides this regime, its source is
   complete by construction), the `merges_from_raw` integer, and `n_cells`
