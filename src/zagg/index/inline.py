@@ -540,34 +540,61 @@ class InlineIndex(VirtualIndex):
         addresses), plus the spatial-index level's coordinate and link arrays
         (read in full by the planned route, and part of the bench extractor's
         manifest convention). Missing datasets raise ``KeyError`` — the same
-        group-read failure the data read would produce.
+        group-read failure the data read would produce, so nothing this
+        granule does NOT hold belongs in the set: a vlen source (issue #425)
+        contributes its record level's coordinates and link, the endpoint
+        datasets its synthesized columns interpolate between, and no
+        sibling-asset filter dataset (those live in the paired granule, which
+        this backend never opens).
         """
         from zagg.config import filters_from_data_source
         from zagg.processing.read import _level_coord_paths, _variable_specs
+        from zagg.processing.read_vlen import path_form_variables, synthesized_specs
 
-        paths = [tmpl.format(group=group) for tmpl in data_source["coordinates"].values()]
+        # ``coordinates.level`` names a record LEVEL, not a dataset (the vlen
+        # route: the base level has no native coordinates), so it is not a
+        # path to map — the record level's own lat/lon are the sibling keys.
+        paths = [
+            tmpl.format(group=group)
+            for key, tmpl in data_source["coordinates"].items()
+            if key != "level"
+        ]
         # Variables go through the read path's normalizer: an entry is either a
         # path-template string or the ``{path, column}`` mapping form (issue
         # #321). Chunk maps are per DATASET, so the column selector is
         # irrelevant here — several selectors on one path collapse in the
         # ``dict.fromkeys`` dedup below (one chunk map for all five
-        # ``signal_conf_ph`` surfaces).
+        # ``signal_conf_ph`` surfaces). ``synthesize:`` entries carry no
+        # ``path`` at all (the normalizer raises on one); what the read
+        # touches for them is the record-rate endpoint pair.
+        variables = data_source["variables"]
         paths += [
             tmpl.format(group=group)
-            for tmpl, _ in _variable_specs(data_source["variables"]).values()
+            for tmpl, _ in _variable_specs(path_form_variables(variables)).values()
         ]
+        for entry in synthesized_specs(variables).values():
+            paths += [entry[k].format(group=group) for k in ("start", "stop") if entry.get(k)]
         base_level = data_source.get("base_level")
         for f in filters_from_data_source(data_source):
-            if "expression" in f:
+            # A sibling-asset predicate reads the OTHER granule (issue #425).
+            if "expression" in f or f.get("asset") is not None:
                 continue
             if f.get("level") is None or f.get("level") == base_level:
                 paths.append(f["dataset"].format(group=group))
-        si_lvl = (data_source.get("levels") or {}).get(
-            (data_source.get("read_plan") or {}).get("spatial_index")
+        # Levels read in full by the group read: the planned route's spatial
+        # index, and — on a vlen source — the record level the coordinates and
+        # the gather map expand from (the same level, in every config that
+        # declares both).
+        level_keys = (
+            (data_source.get("read_plan") or {}).get("spatial_index"),
+            (data_source.get("coordinates") or {}).get("level"),
         )
-        if isinstance(si_lvl, dict):
-            paths.extend(_level_coord_paths(si_lvl, group))
-            link = si_lvl.get("link") or {}
+        for level_key in dict.fromkeys(k for k in level_keys if k):
+            lvl = (data_source.get("levels") or {}).get(level_key)
+            if not isinstance(lvl, dict):
+                continue
+            paths.extend(_level_coord_paths(lvl, group))
+            link = lvl.get("link") or {}
             for key in ("index_beg", "count"):
                 if key in link:
                     paths.append(link[key].format(group=group))

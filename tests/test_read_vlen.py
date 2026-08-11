@@ -616,6 +616,72 @@ class TestWorkerPairedEntries:
         assert _entry_url({"url": "s3://b/x.h5", "assets": {}}) == "s3://b/x.h5"
 
 
+class TestInlineWriteBackPrebuild:
+    """``index: inline`` with ``write_back`` prebuilds the group's chunk maps
+    before the read; both new grammar forms broke that helper, so the
+    combination the template advertises raised before a byte was read (review
+    finding, PR #432)."""
+
+    def _built_paths(self, monkeypatch, data_source, group="BEAM0000"):
+        import zagg.index.inline as inline_mod
+        from zagg.index.inline import InlineIndex
+
+        arrays = _l1b_arrays(group)
+        built = []
+
+        def _spy(h5obj, path):
+            # Missing datasets raise KeyError, as a real chunk-map walk does:
+            # anything this granule does not hold must not be in the set.
+            arrays[path]
+            built.append(path)
+            return object()
+
+        monkeypatch.setattr(inline_mod, "build_chunk_map", _spy)
+        h5obj = _FakeH5(arrays)
+        h5obj.resource = "s3://bucket/GEDI01_B_granule.h5"  # the write-back key
+        idx = InlineIndex(write_back=True, store="s3://bucket/manifests")
+        idx._prebuild_group_maps(h5obj, group, data_source)
+        return built
+
+    def test_template_prebuild_covers_the_read_set(self, monkeypatch):
+        from zagg.config import default_config
+
+        cfg = default_config("gedi01b_waveform_healpix_hive")
+        built = self._built_paths(monkeypatch, cfg.data_source)
+        assert "/BEAM0000/rxwaveform" in built  # the base-rate variable
+        assert "/BEAM0000/rx_sample_start_index" in built  # the record link
+        assert "/BEAM0000/rx_sample_count" in built
+        assert "/BEAM0000/geolocation/latitude_bin0" in built  # record coordinates
+        assert "/BEAM0000/geolocation/longitude_bin0" in built
+        # The synthesized column is computed, not read — its record-rate
+        # endpoints are what the read actually touches.
+        assert "/BEAM0000/geolocation/elevation_bin0" in built
+        assert "/BEAM0000/geolocation/elevation_lastbin" in built
+        assert len(built) == len(set(built))  # one map per dataset
+
+    def test_coordinates_level_is_not_a_dataset(self, monkeypatch):
+        from zagg.config import default_config
+
+        cfg = default_config("gedi01b_waveform_healpix_hive")
+        assert "shots" not in self._built_paths(monkeypatch, cfg.data_source)
+
+    def test_sibling_asset_filters_are_not_mapped(self, monkeypatch):
+        from zagg.config import default_config
+
+        cfg = default_config("gedi01b_waveform_healpix_hive")
+        built = self._built_paths(monkeypatch, cfg.data_source)
+        # The L2A predicates read the paired granule; this backend never opens
+        # it, so mapping them here would KeyError on the primary.
+        assert not [p for p in built if "quality_flag" in p or "rx_assess" in p]
+
+    def test_vlen_prebuild_runs_without_a_read_plan(self, monkeypatch):
+        # No read_plan: the record level still has to contribute its link, or
+        # the full-read arm's link datasets go unmapped.
+        built = self._built_paths(monkeypatch, _vlen_ds())
+        assert "/BEAM0000/rx_sample_start_index" in built
+        assert "/BEAM0000/rx_sample_count" in built
+
+
 # ── the packaged gedi01b template ────────────────────────────────────────────
 
 

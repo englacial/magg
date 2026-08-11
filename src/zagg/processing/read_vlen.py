@@ -74,6 +74,19 @@ def synthesized_specs(variables: dict) -> dict[str, dict]:
     }
 
 
+def path_form_variables(variables: dict) -> dict:
+    """``data_source.variables`` minus the ``synthesize:`` entries.
+
+    The subset the ordinary path machinery understands: a synthesized entry
+    carries no ``path``, so :func:`zagg.processing.read._variable_specs`
+    raises ``KeyError`` on one. Every consumer of that normalizer on a
+    possibly-vlen source (the read below, the inline backend's write-back
+    prebuild) filters through here first.
+    """
+    synth = synthesized_specs(variables)
+    return {name: entry for name, entry in variables.items() if name not in synth}
+
+
 def expand_link_indices(
     ibeg_arr: np.ndarray, cnt_arr: np.ndarray, index_base: int, n_base: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -372,12 +385,7 @@ def _vlen_read_group(
     asset_filters = [f for f in filters if "expression" not in f and f.get("asset") is not None]
     expressions = [f for f in filters if "expression" in f]
 
-    path_specs = {
-        name: spec
-        for name, spec in _variable_specs(
-            {n: e for n, e in variables.items() if not (isinstance(e, dict) and "synthesize" in e)}
-        ).items()
-    }
+    path_specs = _variable_specs(path_form_variables(variables))
     var_paths = {col: tmpl.format(group=group) for col, (tmpl, _) in path_specs.items()}
     filter_paths = {id(f): f["dataset"].format(group=group) for f in base_structured}
     base_paths = list(dict.fromkeys(list(var_paths.values()) + list(filter_paths.values())))
