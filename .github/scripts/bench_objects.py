@@ -433,7 +433,7 @@ def store_object_counts(
     other: list[str] = []
     metadata = 0
     rollups = 0
-    sweep_objects = 0
+    sweep = 0
     telemetry = 0
 
     if store_layout == "flat":
@@ -542,7 +542,7 @@ def store_object_counts(
                 if column_node is not None:
                     label = stats_of.get(column_node + "/")
                     if label is None:
-                        sweep_objects += 1
+                        sweep += 1
                     else:
                         per_shard[label] = per_shard.get(label, 0) + 1
                     continue
@@ -555,7 +555,7 @@ def store_object_counts(
                 # id-named `.zarr` outside the dispatched leaf set stays a
                 # loud ``other`` finding.
                 if _overview_node(key) is not None:
-                    sweep_objects += 1
+                    sweep += 1
                     continue
                 node, _, name = key.rpartition("/")
                 # Sidecar grammars, both naming generations
@@ -584,7 +584,7 @@ def store_object_counts(
                     # nor steal a real leaf sidecar's attribution; the
                     # ``overview_nodes`` anchor keeps every OTHER ``.stats.json``
                     # (store root, stray prefix, undispatched leaf) loud.
-                    sweep_objects += 1
+                    sweep += 1
                 else:
                     other.append(key)
     else:
@@ -595,7 +595,7 @@ def store_object_counts(
         "objects_metadata": metadata,
         "objects_per_shard": per_shard,
         "objects_rollups": rollups,
-        "objects_sweep": sweep_objects,
+        "objects_sweep": sweep,
         "objects_telemetry": telemetry,
         "objects_other": len(other),
         "other_keys": other[:20],
