@@ -99,6 +99,12 @@ def expand_link_indices(
     linspace synthesis interpolates over). Placement is by ``index_beg`` under
     the same origin (``index_base``) and empty-record discipline as
     :func:`zagg.processing.read._broadcast_segment_to_base`.
+
+    ``n_base`` is the caller's: :func:`_vlen_read_group` derives it as
+    ``Σcount`` under #43's contiguity assumption, so through the route the
+    ``-1`` rows are unreachable (a granule that leaves a hole raises here
+    instead) — the tolerance is for the offline/unit callers that pass a base
+    extent of their own.
     """
     parent_idx = np.full(n_base, -1, dtype=np.int64)
     within_idx = np.zeros(n_base, dtype=np.int64)
@@ -291,6 +297,15 @@ def _vlen_read_group(
     if len(coarse_lats) == 0:
         _record_obs_read(io_stats, 0)
         return None
+    # ``n_base`` under #43's contiguity assumption, exactly as the dense route
+    # derives it (:func:`zagg.processing.read._planned_read_group`): the record
+    # ranges neither overlap nor leave holes, so ``Σcount`` IS the flat array's
+    # length. The route therefore never reaches the ``parent_idx == -1`` rows
+    # the gather helpers below define — a granule that violates the assumption
+    # raises out of the gather map ("does not tile the declared base extent")
+    # instead of silently borrowing a neighbor's record, which is the property
+    # those rows exist to guarantee. The helpers stay gap-tolerant because they
+    # are also the offline/unit surface, where ``n_base`` is the caller's.
     n_base = int(cnt_arr.sum())
     if n_base <= 0:
         _record_obs_read(io_stats, 0)
