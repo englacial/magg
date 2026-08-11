@@ -980,7 +980,7 @@ class Run:
         cell_config = {**config_dict, "data_source": ds} if ds is not None else config_dict
         submap = {
             "grid_signature": self.catalog_data["grid_signature"],
-            "metadata": self.catalog_data.get("metadata"),
+            "metadata": runner._submap_metadata(self.catalog_data.get("metadata")),
             "granules": records,
         }
         result = runner._invoke_lambda_cell(

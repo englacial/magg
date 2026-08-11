@@ -2721,6 +2721,22 @@ def _resolve_granule_entries(records: list, driver: str | None) -> list:
     return out
 
 
+def _submap_metadata(metadata: dict | None) -> dict | None:
+    """Run-catalog metadata as it rides a per-cell leaf sub-map (issue #300).
+
+    Strips the run-wide fields whose size scales with the CATALOG rather than
+    the cell: ``pairless`` (issue #425) is one entry per unpaired granule, so
+    at mission scale it is O(MB) of JSON copied into every cell event — where
+    it counts against the 256 KB async cap that silently drops the whole
+    sub-map block (``_cell_payload``) — and then into every leaf object.
+    ``write_leaf_submap`` strips it on the way out for the same reason; the
+    full report stays on the run's own map, which is where it is read.
+    """
+    if not metadata or "pairless" not in metadata:
+        return metadata
+    return {k: v for k, v in metadata.items() if k != "pairless"}
+
+
 def _clamped_data_source(data_source: dict, n_granules: int) -> dict | None:
     """Per-cell ``granule_workers`` clamp: ``min(K, n_granules)`` (issue #184).
 
@@ -3645,7 +3661,7 @@ def _run_lambda(
         # (size-gated in _invoke_lambda_cell; dropped, never fatal).
         submap = {
             "grid_signature": catalog_data["grid_signature"],
-            "metadata": catalog_data.get("metadata"),
+            "metadata": _submap_metadata(catalog_data.get("metadata")),
             "granules": records,
         }
         # v2 Event transport (issue #327): the SAME event construction as the

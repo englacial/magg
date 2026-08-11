@@ -284,6 +284,24 @@ class TestDispatch:
             "granules": [_rec(3)],
         }
 
+    def test_pairless_report_stays_out_of_the_cell_submap(self, catalog):
+        # The sibling join's exclusion report (issue #425) holds one entry per
+        # unpaired granule — unbounded in the catalog size — so it must not
+        # ride every cell event: it counts against the 256 KB async cap, whose
+        # only remedy is silently dropping the whole submap block, and
+        # ``write_leaf_submap`` strips it again on the way out anyway (review
+        # finding, PR #432).
+        catalog["metadata"]["pairless"] = [{"id": f"g{i}", "missing": "l2a"} for i in range(500)]
+        catalog["metadata"]["sibling_asset"] = "l2a"
+        stub = StubLambdaClient()
+        _run(catalog, client=stub).dispatch(shard_keys=[_WORDS[1]]).results()
+        (_, _, event) = stub.cell_events()[0]
+        meta = event["submap"]["metadata"]
+        assert "pairless" not in meta
+        # The small identity fields still ride along.
+        assert meta["sibling_asset"] == "l2a"
+        assert meta["short_name"] == "ATL06"
+
     def test_hive_setup_handshake_precedes_cells(self, catalog):
         stub = StubLambdaClient()
         _run(catalog, client=stub).dispatch().wait(timeout=10)

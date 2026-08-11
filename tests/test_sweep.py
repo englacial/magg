@@ -503,6 +503,32 @@ class TestSubmapRollup:
         assert sm.metadata["granules_assigned"] == 2  # rewritten, not the stale 22116
         assert json.loads(path.read_text())["written_at"]  # staleness stamp rides the file
 
+    def test_leaf_submap_strips_the_run_wide_pairless_report(self, tmp_path):
+        # ``pairless`` (issue #425) is one entry per unpaired granule in the
+        # RUN's catalog — unbounded in its size, and meaningless per leaf — so
+        # it is stripped like the other run-wide fields; the small
+        # ``sibling_asset`` identity stays (review finding, PR #432).
+        from zagg.catalog.shardmap import ShardMap
+        from zagg.sweep import _node_rel, write_leaf_submap
+
+        _write_manifest(tmp_path)
+        write_leaf_submap(
+            str(tmp_path),
+            morton_word("-311"),
+            [_entry("gA")],
+            grid_signature=SUBMAP_SIG,
+            metadata={
+                "collection": "TEST_001",
+                "sibling_asset": "l2a",
+                "pairless": [{"id": f"g{i}", "missing": "l2a"} for i in range(500)],
+                "build_wall_s": 12.3,
+            },
+        )
+        sm = ShardMap.from_json(str(tmp_path / _node_rel("-311") / "shardmap.json"))
+        assert "pairless" not in sm.metadata
+        assert "build_wall_s" not in sm.metadata
+        assert sm.metadata["sibling_asset"] == "l2a"
+
     def test_reproject_shim_matches_real_grid_signature(self):
         # Pin the coarsen-target shim to the real grid it stands in for: at the
         # coarsened order N, _ReprojectTarget(SUBMAP_SIG, N).spatial_signature()

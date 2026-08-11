@@ -279,6 +279,7 @@ class TestEventDispatch:
         # sibling hrefs and every read raised (review finding, PR #432).
         sib = {"id": "s4", "s3": "s3://bucket/s4.h5", "https": "https://h/s4.h5"}
         catalog["granules"][0] = [{**_rec(4), "assets": {"l2a": sib}}]
+        catalog["metadata"]["pairless"] = [{"id": "gX", "missing": "l2a"}]
         stub = EventStubLambdaClient(status_store)
         _run(catalog, client=stub).dispatch(transport="event").results()
         events = {e["shard_key"]: e for _, _, e in stub.cell_events()}
@@ -286,6 +287,8 @@ class TestEventDispatch:
             {"url": _rec(4)["s3"], "assets": {"l2a": sib["s3"]}}
         ]
         assert events[_WORDS[1]]["granule_urls"] == [_rec(3)["s3"]]
+        # The unbounded pairless report never rides the per-cell submap block.
+        assert "pairless" not in events[_WORDS[0]]["submap"]["metadata"]
 
     def test_benign_no_data_counts_ok(self, catalog, status_store):
         stub = EventStubLambdaClient(status_store, benign={_WORDS[2]})

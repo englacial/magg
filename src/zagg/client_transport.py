@@ -425,7 +425,7 @@ def dispatch_event_shards(
         )
         submap = {
             "grid_signature": run.catalog_data["grid_signature"],
-            "metadata": run.catalog_data.get("metadata"),
+            "metadata": runner._submap_metadata(run.catalog_data.get("metadata")),
             "granules": records,
         }
         payload = runner._cell_payload(event, submap=submap, async_invoke=True, label=label)
