@@ -230,6 +230,20 @@ class TestBuildRecord:
         assert granules_sha256([]) is None
         assert granules_sha256(None) is None
 
+    def test_paired_entries_identify_by_primary_url(self):
+        # Paired-asset worker payloads (issue #425) may reach build_record
+        # verbatim (the Lambda handler passes event granule_urls); the record's
+        # id space and catalog hash must match the resolved-strings local path.
+        from zagg.telemetry import build_record
+
+        entries = [
+            "s3://b/g1.h5",
+            {"url": "s3://b/g2.h5", "assets": {"l2a": "s3://b/g2b.h5"}},
+        ]
+        rec = build_record(shard_key=1, metadata={"total_obs": 1}, granule_ids=entries)
+        assert rec["granules_sha256"] == granules_sha256(["s3://b/g1.h5", "s3://b/g2.h5"])
+        assert rec["n_granules"] == 2
+
 
 class TestMerge:
     def test_single_record_is_identity(self):

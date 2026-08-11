@@ -432,3 +432,136 @@ class TestVlenConfigValidation:
         ds = _vlen_ds(assets={"l2a": {"join": {"left": "/{group}/shot_number"}}})
         with pytest.raises(ValueError, match="join.right must be a non-empty string"):
             validate_config(_cfg(ds))
+
+
+# ── paired-asset plumbing: runner entry resolution + worker sibling handles ──
+
+
+class TestResolveGranuleEntries:
+    def _records(self):
+        return [
+            {"id": "a", "s3": "s3://b/a.h5", "https": "https://h/a.h5"},
+            {
+                "id": "b",
+                "s3": "s3://b/b.h5",
+                "https": "https://h/b.h5",
+                "assets": {"l2a": {"id": "sib", "s3": "s3://b/b2.h5", "https": "https://h/b2.h5"}},
+            },
+            {"id": "c", "s3": None, "https": "https://h/c.h5"},
+        ]
+
+    def test_single_asset_records_stay_plain_strings(self):
+        from zagg.runner import _resolve_granule_entries, _resolve_urls
+
+        entries = _resolve_granule_entries(self._records()[:1], "s3")
+        assert entries == ["s3://b/a.h5"]
+        assert entries == _resolve_urls(self._records()[:1], "s3")
+
+    def test_paired_record_resolves_to_entry_mapping(self):
+        from zagg.runner import _resolve_granule_entries
+
+        entries = _resolve_granule_entries(self._records(), "s3")
+        # href-less primary (c) dropped, same rule as _resolve_urls.
+        assert entries == [
+            "s3://b/a.h5",
+            {"url": "s3://b/b.h5", "assets": {"l2a": "s3://b/b2.h5"}},
+        ]
+
+    def test_driver_selects_sibling_endpoint(self):
+        from zagg.runner import _resolve_granule_entries
+
+        entries = _resolve_granule_entries(self._records(), "https")
+        assert entries[1] == {"url": "https://h/b.h5", "assets": {"l2a": "https://h/b2.h5"}}
+
+    def test_sibling_without_driver_endpoint_omitted(self):
+        from zagg.runner import _resolve_granule_entries
+
+        rec = {
+            "id": "b",
+            "s3": "s3://b/b.h5",
+            "https": None,
+            "assets": {"l2a": {"id": "sib", "s3": None, "https": "https://h/b2.h5"}},
+        }
+        # The sibling has no s3 href: the asset is omitted (the read then
+        # raises on the missing handle rather than reading unfiltered data).
+        assert _resolve_granule_entries([rec], "s3") == ["s3://b/b.h5"]
+
+    def test_raster_style_string_assets_stay_plain(self):
+        from zagg.runner import _resolve_granule_entries
+
+        rec = {
+            "id": "r",
+            "s3": "s3://b/r.h5",
+            "https": None,
+            "assets": {"red": "s3://b/red.tif"},
+        }
+        assert _resolve_granule_entries([rec], "s3") == ["s3://b/r.h5"]
+
+    def test_count_matches_resolve_urls(self):
+        from zagg.runner import _resolve_granule_entries, _resolve_urls
+
+        for driver in ("s3", "https"):
+            assert len(_resolve_granule_entries(self._records(), driver)) == len(
+                _resolve_urls(self._records(), driver)
+            )
+
+
+class TestWorkerPairedEntries:
+    """process_shard opens sibling handles for dict-form granule entries and
+    threads them to the read seam presence-gated (issue #425)."""
+
+    def _run(self, monkeypatch, entries):
+        from zagg.config import default_config
+        from zagg.grids import HealpixGrid
+        from zagg.index.hierarchical import HierarchicalIndex
+        from zagg.processing import process_shard
+
+        opened, closed, captured = [], [], []
+
+        class _RecH5:
+            def __init__(self, resource, driver, **kwargs):
+                self.resource = resource
+                opened.append(resource)
+
+            def close(self):
+                closed.append(self.resource)
+
+        def fake_read_group(h5obj, group, ds, shard_key, grid, **kwargs):
+            captured.append(dict(kwargs))
+            return None
+
+        monkeypatch.setattr("zagg.processing._read_group", fake_read_group)
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", _RecH5)
+        monkeypatch.setattr(
+            "zagg.processing.worker.index_from_config", lambda cfg: HierarchicalIndex()
+        )
+        from mortie import geo2mort
+
+        cfg = default_config()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        shard_key = int(geo2mort(-78.5, -132.0, order=6)[0])
+        process_shard(grid, shard_key, entries, s3_credentials={}, config=cfg)
+        return opened, closed, captured
+
+    def test_dict_entry_opens_and_closes_siblings(self, monkeypatch):
+        opened, closed, captured = self._run(
+            monkeypatch, [{"url": "s3://b/l1b.h5", "assets": {"l2a": "s3://b/l2a.h5"}}]
+        )
+        assert opened == ["b/l1b.h5", "b/l2a.h5"]  # s3:// scheme stripped for S3Driver
+        assert sorted(closed) == sorted(opened)
+        assert captured, "read seam should have been called"
+        for kwargs in captured:
+            assert set(kwargs["siblings"]) == {"l2a"}
+            assert kwargs["siblings"]["l2a"].resource == "b/l2a.h5"
+
+    def test_string_entries_pass_no_siblings(self, monkeypatch):
+        opened, closed, captured = self._run(monkeypatch, ["s3://b/plain.h5"])
+        assert opened == ["b/plain.h5"]
+        for kwargs in captured:
+            assert "siblings" not in kwargs
+
+    def test_entry_url_helper(self):
+        from zagg.processing.worker import _entry_url
+
+        assert _entry_url("s3://b/x.h5") == "s3://b/x.h5"
+        assert _entry_url({"url": "s3://b/x.h5", "assets": {}}) == "s3://b/x.h5"

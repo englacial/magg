@@ -88,6 +88,7 @@ class VirtualIndex:
         arrow: bool = False,
         granule_url: str | None = None,
         io_stats: dict | None = None,
+        siblings: dict | None = None,
     ):
         """Read + spatially filter one HDF5 group for one shard.
 
@@ -97,6 +98,9 @@ class VirtualIndex:
         by the worker only when the a-priori chunk-boundary arm (issue #148
         arm 2a, ``read_plan.chunk_boundaries``) is configured — it locates the
         granule's boundary parquet on that route and is omitted otherwise.
+        ``siblings`` (issue #425) is passed only for a paired-asset granule:
+        open h5coro handles per sibling-asset name, consumed by the vlen
+        route's asset filters.
 
         ``io_stats`` (issue #374) is the optional read-counter sink: a dict the
         backend's read routes accumulate ``obs_read`` (base-rate rows decoded,

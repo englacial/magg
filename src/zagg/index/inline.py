@@ -618,12 +618,34 @@ class InlineIndex(VirtualIndex):
         arrow=False,
         granule_url=None,
         io_stats=None,
+        siblings=None,
     ):
         from zagg.processing.read import (
             _planned_read_group,
             _read_group_full,
             _validate_planned_config,
         )
+
+        # Vlen-packed sources (issue #425) take their own route, which owns
+        # the record-expansion and planned/full arms; the compiled read_fn
+        # rides along so the flat base datasets still decode through it.
+        coords = data_source.get("coordinates")
+        if isinstance(coords, dict) and coords.get("level") is not None:
+            from zagg.processing.read_vlen import _vlen_read_group
+
+            if self.write_back:
+                self._prebuild_group_maps(h5obj, group, data_source)
+            return _vlen_read_group(
+                h5obj,
+                group,
+                data_source,
+                shard_key,
+                grid,
+                arrow=arrow,
+                read_fn=self._chunk_aligned_read_fn(h5obj, planned=True),
+                io_stats=io_stats,
+                siblings=siblings,
+            )
 
         rp = data_source.get("read_plan")
         # Two routes, one addressing seam (issue #170 phase 2): sources with a
