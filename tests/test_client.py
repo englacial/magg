@@ -646,6 +646,30 @@ class TestRunnerParity:
         assert client_events[_WORDS[1]]["granule_urls"] == [href]
         assert agg_events[_WORDS[1]]["granule_urls"] == [href]
 
+    def test_paired_asset_entries_reach_both_paths(self, tmp_path, monkeypatch):
+        """A paired-asset map's sibling hrefs (issue #425) ride the facade's
+        cell events too: the agg path resolved through
+        ``_resolve_granule_entries`` while the client still resolved bare urls,
+        so every paired run would have failed on the missing sibling handle
+        (review finding, PR #432)."""
+        paired = _catalog_dict()
+        sib = {"id": "s4", "s3": "s3://bucket/s4.h5", "https": "https://h/s4.h5"}
+        paired["granules"] = [[{**_rec(4), "assets": {"l2a": sib}}], [_rec(3)], [_rec(1)]]
+        path = tmp_path / "paired.json"
+        path.write_text(json.dumps(paired))
+
+        agg_events = self._agg_cell_events(str(path), monkeypatch)
+        stub = StubLambdaClient()
+        _run(paired, client=stub).dispatch().results()
+        client_events = {e["shard_key"]: e for _, _, e in stub.cell_events()}
+
+        entry = {"url": _rec(4)["s3"], "assets": {"l2a": sib["s3"]}}
+        assert client_events[_WORDS[0]]["granule_urls"] == [entry]
+        assert agg_events[_WORDS[0]]["granule_urls"] == [entry]
+        # Single-asset cells stay plain url strings on both paths.
+        assert client_events[_WORDS[1]]["granule_urls"] == [_rec(3)["s3"]]
+        assert agg_events[_WORDS[1]]["granule_urls"] == [_rec(3)["s3"]]
+
 
 # -- dispatch manifest (issue #327 phase 2) ------------------------------------
 

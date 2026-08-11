@@ -404,7 +404,7 @@ def dispatch_event_shards(
     for key, records in cells:
         key = int(key)
         label = runner._safe_label(run.grid, key)
-        granule_urls = runner._resolve_urls(records, run.driver)
+        granule_urls = runner._resolve_granule_entries(records, run.driver)
         ds = runner._clamped_data_source(dict(run.config.data_source), len(granule_urls))
         cell_config = {**config_dict, "data_source": ds} if ds is not None else config_dict
         event = runner._build_cell_event(

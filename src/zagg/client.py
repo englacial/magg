@@ -967,12 +967,15 @@ class Run:
         The url selection honors ``data_source.driver`` — as does ``_cell_work``
         since the espg ruling on PR #333 (it hardcoded ``"s3"`` before), so the
         two paths build identical events for an ``https`` config too;
-        ``TestRunnerParity`` asserts that field-by-field.
+        ``TestRunnerParity`` asserts that field-by-field. It also resolves
+        through ``_resolve_granule_entries`` (issue #425), so a paired-asset
+        map's sibling hrefs reach the worker here as they do on the agg path —
+        a plain URL string per granule for every single-asset map.
         """
         from zagg import runner
 
         label = runner._safe_label(self.grid, shard_key)
-        granule_urls = runner._resolve_urls(records, self.driver)
+        granule_urls = runner._resolve_granule_entries(records, self.driver)
         ds = runner._clamped_data_source(dict(self.config.data_source), len(granule_urls))
         cell_config = {**config_dict, "data_source": ds} if ds is not None else config_dict
         submap = {

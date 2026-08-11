@@ -273,6 +273,20 @@ class TestEventDispatch:
             assert mine.pop("run_id") and theirs.pop("run_id")  # fresh per dispatch
             assert mine == theirs  # byte-identical construction (issue #327)
 
+    def test_paired_asset_entries_ride_the_event_fanout(self, catalog, status_store):
+        # The async fan-out builds its own granule entries; it resolved bare
+        # urls, so a paired-asset map (issue #425) reached the worker with no
+        # sibling hrefs and every read raised (review finding, PR #432).
+        sib = {"id": "s4", "s3": "s3://bucket/s4.h5", "https": "https://h/s4.h5"}
+        catalog["granules"][0] = [{**_rec(4), "assets": {"l2a": sib}}]
+        stub = EventStubLambdaClient(status_store)
+        _run(catalog, client=stub).dispatch(transport="event").results()
+        events = {e["shard_key"]: e for _, _, e in stub.cell_events()}
+        assert events[_WORDS[0]]["granule_urls"] == [
+            {"url": _rec(4)["s3"], "assets": {"l2a": sib["s3"]}}
+        ]
+        assert events[_WORDS[1]]["granule_urls"] == [_rec(3)["s3"]]
+
     def test_benign_no_data_counts_ok(self, catalog, status_store):
         stub = EventStubLambdaClient(status_store, benign={_WORDS[2]})
         handle = _run(catalog, client=stub).dispatch(transport="event")
