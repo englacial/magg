@@ -1946,6 +1946,34 @@ class TestPairedAssetBuild:
             ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
         assert any("pairless" in r.message for r in caplog.records)
 
+    def test_duplicate_sibling_key_is_deterministic_and_reported(self, grid, fake_spherely):
+        # The join key ignores the release/production fields, so two sibling
+        # records can share one — last-writer-wins made the surviving record
+        # arbitrary and dropped the other in silence (review finding, PR #432).
+        core = "2019108002012_O01959_01_T03909"
+        l1b = _catalog([_item(_gedi_id("GEDI01_B", core=core), -76.62, -76.57)])
+        first = _gedi_id("GEDI02_A", core=core, release="003")
+        second = _gedi_id("GEDI02_A", core=core, release="004")
+        l2a = _catalog([_item(first, -76.62, -76.57), _item(second, -76.62, -76.57)])
+        sm = ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assets = {rec["assets"]["l2a"]["id"] for shard in sm.granules for rec in shard}
+        assert assets == {first}  # first in catalog order wins, not "whichever last"
+        assert {"id": second, "missing": "duplicate-key"} in sm.metadata["pairless"]
+
+    def test_duplicate_primary_keys_are_kept_but_warned(self, grid, fake_spherely, caplog):
+        import logging as _logging
+
+        core = "2019108002012_O01959_01_T03909"
+        dup_a = _gedi_id("GEDI01_B", core=core, release="005")
+        dup_b = _gedi_id("GEDI01_B", core=core, release="006")
+        l1b = _catalog([_item(dup_a, -76.62, -76.57), _item(dup_b, -76.62, -76.57)])
+        l2a = _catalog([_item(_gedi_id("GEDI02_A", core=core, release="003"), -76.62, -76.57)])
+        with caplog.at_level(_logging.WARNING):
+            sm = ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assigned = {rec["id"] for shard in sm.granules for rec in shard}
+        assert {dup_a, dup_b} <= assigned  # excluding a primary is destructive
+        assert any("share a join key" in r.message for r in caplog.records)
+
     def test_fully_paired_reports_empty_list(self, grid, fake_spherely):
         l1b, l2a = self._catalogs()
         # Trim both catalogs to the two matching acquisitions.

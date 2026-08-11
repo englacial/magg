@@ -194,23 +194,40 @@ def _pair_sibling_records(records, sibling_records, asset: str) -> tuple[list, l
     sibling cannot be quality-filtered (the L2A join is core to the flux
     currency), and a sibling without a primary has no data to contribute.
 
+    The join key deliberately ignores the release/production fields, so two
+    records of one product can share it (a reprocessed sibling, a paginated
+    query returning a granule twice). The join keeps the **first** record on a
+    key — deterministic in catalog order — and reports every record it shadows
+    as ``"duplicate-key"``: a shadowed sibling contributes nothing to the
+    build, and nothing may leave the build silently. Duplicate keys on the
+    PRIMARY side pair to one sibling and are kept (excluding a primary is
+    destructive), but warn.
+
     Returns ``(paired_records, pairless)`` where ``pairless`` entries are
-    ``{"id": <granule id>, "missing": <asset name | "primary">}``.
+    ``{"id": <granule id>, "missing": <asset name | "primary" |
+    "duplicate-key">}``.
     """
     sib_by_key: dict = {}
+    pairless: list = []
     for rec in sibling_records:
         key = sibling_join_key(rec["id"])
-        if key is not None:
-            sib_by_key[key] = rec
+        if key is None:
+            continue
+        if key in sib_by_key:
+            pairless.append({"id": rec["id"], "missing": "duplicate-key"})
+            continue
+        sib_by_key[key] = rec
     paired: list = []
-    pairless: list = []
     matched: set = set()
+    duplicate_primaries: list = []
     for rec in records:
         key = sibling_join_key(rec["id"])
         sib = sib_by_key.get(key) if key is not None else None
         if sib is None:
             pairless.append({"id": rec["id"], "missing": asset})
             continue
+        if key in matched:
+            duplicate_primaries.append(rec["id"])
         matched.add(key)
         rec = dict(rec)
         rec["assets"] = {
@@ -221,6 +238,15 @@ def _pair_sibling_records(records, sibling_records, asset: str) -> tuple[list, l
     for key, sib in sib_by_key.items():
         if key not in matched:
             pairless.append({"id": sib["id"], "missing": "primary"})
+    if duplicate_primaries:
+        logging.warning(
+            "ShardMap.build: %d primary granule(s) share a join key with another "
+            "primary and pair to the SAME %s sibling (kept, not excluded — check "
+            "the primary catalog for duplicates); e.g. %s",
+            len(duplicate_primaries),
+            asset,
+            duplicate_primaries[:5],
+        )
     return paired, pairless
 
 
@@ -1029,8 +1055,9 @@ class ShardMap:
             intersection runs once on the primary footprints (the products
             share them). **Pairless granules are excluded and reported**:
             ``metadata["pairless"]`` lists ``{id, missing}`` for every primary
-            without a sibling and sibling without a primary, and a build-time
-            warning fires when the list is non-empty.
+            without a sibling, sibling without a primary, and sibling shadowed
+            by an earlier record on the same join key (``"duplicate-key"``),
+            and a build-time warning fires when the list is non-empty.
         sibling_asset : str
             Asset key the sibling's hrefs are stored under (default ``"l2a"``);
             matches the ``data_source.assets`` name the reader joins on.
