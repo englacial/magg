@@ -111,6 +111,64 @@ def expand_link_indices(
     return parent_idx, within_idx
 
 
+def _planned_gather_map(
+    ibeg_arr: np.ndarray,
+    cnt_arr: np.ndarray,
+    index_base: int,
+    n_base: int,
+    base_slices: list[tuple[int, int]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """:func:`expand_link_indices` restricted to a plan's rows.
+
+    Same placement, validation and gap semantics, but the arrays are sized to
+    the planned rows (``sum(e - s)``) instead of the whole base extent — the
+    planned arm exists so a shard touching a handful of records never
+    materializes anything at sample rate (the issue #43 OOM posture), and at
+    GEDI's ~10^8 samples per beam group a full-rate ``int64`` pair is ~1.6 GB
+    against a 2 GB worker. Validation still runs over every record, so a
+    granule whose link does not tile the base extent raises here exactly as it
+    does on the full read.
+
+    Returns ``(global_idx, parent_idx, within_idx)``: the planned base rows and
+    their per-row record / within-record indices.
+    """
+    beg_all = np.asarray(ibeg_arr).astype(np.int64) - index_base
+    cnt_all = np.asarray(cnt_arr).astype(np.int64)
+    # Empty records cover no samples; their origin-1 sentinel start would read
+    # as beg=-1, so they are skipped rather than validated (the issue #116
+    # convention expand_link_indices follows).
+    nonempty = cnt_all > 0
+    bad = nonempty & (beg_all < 0)
+    if bad.any():
+        p = int(np.argmax(bad))
+        raise ValueError(f"index_beg_arr[{p}]={ibeg_arr[p]} is less than index_base={index_base}")
+    over = nonempty & (beg_all + cnt_all > n_base)
+    if over.any():
+        p = int(np.argmax(over))
+        raise ValueError(
+            f"record {p} range [{beg_all[p]}:{beg_all[p] + cnt_all[p]}] exceeds base size "
+            f"{n_base}; the record link does not tile the declared base extent"
+        )
+    if not base_slices:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty.copy(), empty.copy()
+    global_idx = np.concatenate([np.arange(s, e, dtype=np.int64) for s, e in base_slices])
+    parent_idx = np.full(len(global_idx), -1, dtype=np.int64)
+    within_idx = np.zeros(len(global_idx), dtype=np.int64)
+    off = 0
+    for s, e in base_slices:
+        # Records overlapping this slice, walked in index order so a later
+        # record shadows an earlier one exactly as the full-rate map does.
+        for p in np.nonzero(nonempty & (beg_all < e) & (beg_all + cnt_all > s))[0]:
+            beg = int(beg_all[p])
+            lo = max(beg, s)
+            hi = min(beg + int(cnt_all[p]), e)
+            parent_idx[off + lo - s : off + hi - s] = p
+            within_idx[off + lo - s : off + hi - s] = np.arange(lo - beg, hi - beg)
+        off += e - s
+    return global_idx, parent_idx, within_idx
+
+
 def synthesize_linspace(
     start_vals: np.ndarray,
     stop_vals: np.ndarray,
@@ -258,16 +316,22 @@ def _vlen_read_group(
         _record_obs_read(io_stats, 0)
         return None
 
-    # ---- The gather map: (record, within-record) index per base row.
-    parent_idx, within_idx = expand_link_indices(ibeg_arr, cnt_arr, index_base, n_base)
+    # ---- The gather map: (record, within-record) index per DECODED base row.
+    # The planned arm builds it at plan rate, never at sample rate — the map is
+    # the read's dominant allocation on a real granule. The full arm is
+    # O(n_base) by necessity and needs no row selection at all, so ``global_idx``
+    # stays ``None`` (the identity) rather than a full-rate ``arange``.
     if plan is not None:
-        global_idx = np.concatenate([np.arange(s, e, dtype=np.int64) for s, e in plan.base_slices])
-        parent_planned = parent_idx[global_idx]
-        within_planned = within_idx[global_idx]
+        global_idx, parent_planned, within_planned = _planned_gather_map(
+            ibeg_arr, cnt_arr, index_base, n_base, plan.base_slices
+        )
     else:
-        global_idx = np.arange(n_base, dtype=np.int64)
-        parent_planned = parent_idx
-        within_planned = within_idx
+        global_idx = None
+        parent_planned, within_planned = expand_link_indices(ibeg_arr, cnt_arr, index_base, n_base)
+
+    def _to_planned(arr: np.ndarray) -> np.ndarray:
+        """Select this read's rows out of a full-base-rate array."""
+        return arr if global_idx is None else arr[global_idx]
 
     # Rows DECODED by this group (issue #374): the planned slices (or the full
     # base extent), counted before the shard mask and filters below.
@@ -372,7 +436,7 @@ def _vlen_read_group(
         cross_full = expanded if cross_full is None else (cross_full & expanded)
 
     if cross_full is not None:
-        cross_planned = cross_full[global_idx][mask_spatial]
+        cross_planned = _to_planned(cross_full)[mask_spatial]
         keep_mask = cross_planned if keep_mask is None else (keep_mask & cross_planned)
     if keep_mask is not None and not keep_mask.any():
         return None
@@ -408,7 +472,7 @@ def _vlen_read_group(
             values = values[keep_mask]
         data_dict[col_name] = values
     for col_name, base_values in seg_broadcasts.items():
-        values = base_values[global_idx][mask_spatial]
+        values = _to_planned(base_values)[mask_spatial]
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values

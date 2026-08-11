@@ -213,6 +213,48 @@ class TestSynthesizeLinspace:
         np.testing.assert_allclose(vals[:5], [0, 1, 2, 3, 4])
 
 
+class TestPlannedGatherMap:
+    """The planned arm's gather map: plan-rate, and identical to the full-rate
+    map restricted to the planned rows (review finding, PR #432)."""
+
+    def test_matches_the_full_map_on_planned_rows(self):
+        from zagg.processing.read_vlen import _planned_gather_map
+
+        parent, within = expand_link_indices(STARTS, COUNTS, 1, 13)
+        gidx, p_plan, w_plan = _planned_gather_map(STARTS, COUNTS, 1, 13, [(0, 5), (9, 13)])
+        assert gidx.tolist() == [0, 1, 2, 3, 4, 9, 10, 11, 12]
+        assert p_plan.tolist() == parent[gidx].tolist()
+        assert w_plan.tolist() == within[gidx].tolist()
+        # Sized to the plan, not to the base extent.
+        assert len(p_plan) == 9 < 13
+
+    def test_gap_rows_stay_unassigned(self):
+        from zagg.processing.read_vlen import _planned_gather_map
+
+        # Record 1 starts at 8 (1-based), leaving base rows 5..6 untiled.
+        _, parent, _ = _planned_gather_map(np.array([1, 8]), np.array([5, 3]), 1, 10, [(3, 8)])
+        assert parent.tolist() == [0, 0, -1, -1, 1]
+
+    def test_validation_matches_the_full_map(self):
+        from zagg.processing.read_vlen import _planned_gather_map
+
+        with pytest.raises(ValueError, match="less than index_base"):
+            _planned_gather_map(np.array([0]), np.array([3]), 1, 3, [(0, 3)])
+        with pytest.raises(ValueError, match="exceeds base size"):
+            _planned_gather_map(np.array([1]), np.array([5]), 1, 3, [(0, 3)])
+
+    def test_planned_route_never_builds_the_full_rate_map(self, monkeypatch):
+        import zagg.processing.read_vlen as rv
+
+        def _boom(*a, **k):
+            raise AssertionError("the planned arm must not allocate at base rate")
+
+        monkeypatch.setattr(rv, "expand_link_indices", _boom)
+        ds = _vlen_ds(read_plan={"spatial_index": "shots", "pad": 0})
+        df = _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", ds, 1, _LatGrid())
+        assert df["shot_number"].tolist() == [103] + [104] * 4
+
+
 # ── the vlen read route (gather + expand + synthesis) ────────────────────────
 
 
