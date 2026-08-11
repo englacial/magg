@@ -90,6 +90,10 @@ class _OneShardGrid:
         return np.zeros(len(leaf_ids), dtype=int)
 
 
+NOISE_STDDEV = np.array([2.0, 1.0, 1.5, 1.0], dtype=np.float32)
+RX_ENERGY = np.array([50.0, 30.0, 5.0, 40.0], dtype=np.float32)
+
+
 def _l1b_arrays(group="BEAM0000"):
     return {
         f"/{group}/rxwaveform": WAVE,
@@ -97,6 +101,8 @@ def _l1b_arrays(group="BEAM0000"):
         f"/{group}/rx_sample_count": COUNTS,
         f"/{group}/shot_number": SHOTS,
         f"/{group}/noise_mean_corrected": NOISE_MEAN,
+        f"/{group}/noise_stddev_corrected": NOISE_STDDEV,
+        f"/{group}/rx_energy": RX_ENERGY,
         f"/{group}/geolocation/latitude_bin0": LATS,
         f"/{group}/geolocation/longitude_bin0": LONS,
         f"/{group}/geolocation/elevation_bin0": E0,
@@ -111,6 +117,7 @@ def _l2a_arrays(group="BEAM0000"):
         f"/{group}/shot_number": np.array([101, 102, 104], dtype=np.uint64),
         f"/{group}/quality_flag": np.array([1, 0, 1], dtype=np.uint8),
         f"/{group}/sensitivity": np.array([0.95, 0.99, 0.50], dtype=np.float32),
+        f"/{group}/rx_assess/rx_clipbin_count": np.array([0, 0, 0], dtype=np.uint16),
     }
 
 
@@ -565,3 +572,66 @@ class TestWorkerPairedEntries:
 
         assert _entry_url("s3://b/x.h5") == "s3://b/x.h5"
         assert _entry_url({"url": "s3://b/x.h5", "assets": {}}) == "s3://b/x.h5"
+
+
+# ── the packaged gedi01b template ────────────────────────────────────────────
+
+
+class TestGediTemplate:
+    """The shipped gedi01b_waveform_healpix_hive template: validated shape,
+    and the whole declared surface driven over the synthetic mini-granule —
+    read (gather/expand/synthesis + degrade + the L2A trio) into cell stats
+    (flux digest + companions)."""
+
+    @pytest.fixture
+    def cfg(self):
+        from zagg.config import default_config
+
+        return default_config("gedi01b_waveform_healpix_hive")
+
+    def test_ratified_shape(self, cfg):
+        grid = cfg.output["grid"]
+        assert (grid["parent_order"], grid["child_order"], grid["chunk_inner"]) == (9, 18, 12)
+        assert grid["sharded"] is True
+        assert cfg.output["store_layout"] == "hive"
+        assert cfg.output["pyramid"] is False
+        assert "streaming" not in cfg.aggregation  # pooled; composability none
+        flux = cfg.aggregation["variables"]["rx_flux"]
+        assert flux["params"]["delta"] == 8192
+        assert "operating_point" in flux["attrs"]  # clip provenance
+        assert flux["attrs"]["gain_name"]
+        assert len(cfg.data_source["groups"]) == 8
+
+    def test_template_reads_and_aggregates_the_fixture(self, cfg):
+        from zagg.processing import calculate_cell_statistics
+
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            cfg.data_source,
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        # Survivors: shot 101 only — 103 fails degrade, 102 fails quality_flag,
+        # 104 fails sensitivity (0.50 < 0.9), 103 also has no L2A row.
+        assert df["shot_number"].tolist() == [101] * 5
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), WAVE[:5])
+        np.testing.assert_allclose(df["elevation"].to_numpy(), _expected_elevation(0))
+
+        cell = {c: df[c].to_numpy() for c in df.columns if c != "leaf_id"}
+        stats = calculate_cell_statistics(cell, config=cfg)
+        assert stats["count"] == 5
+        assert stats["shot_count"] == 1
+        assert stats["shot_number"] == 101
+        assert stats["noise_mean"] == pytest.approx(NOISE_MEAN[0])
+        assert stats["rx_energy"] == pytest.approx(RX_ENERGY[0])
+        assert stats["elevation_bin0"] == pytest.approx(E0[0])
+        assert stats["elevation_lastbin"] == pytest.approx(E1[0])
+        # Flux digest: WAVE values 100-104 sit far above the noise floor, so
+        # all five samples survive the clip loss-free (weight = count - mean).
+        flux = stats["rx_flux"]
+        assert flux.shape == (5, 2)
+        np.testing.assert_allclose(
+            np.sort(flux[:, 1]), np.sort((WAVE[:5] - NOISE_MEAN[0]).astype(np.float32))
+        )

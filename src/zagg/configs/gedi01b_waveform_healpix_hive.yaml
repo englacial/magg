@@ -1,0 +1,185 @@
+# GEDI L1B waveform flux t-digest (HEALPix, hive store layout) -- issue #425.
+# The vlen-grammar template (issue #422 rulings): GEDI is pure config -- the
+# three generic primitives (origin-aware ragged gather, expand-by-count,
+# linspace coordinate synthesis) turn each waveform sample into an ordinary
+# flux-weighted point observation; nothing here is sensor code.
+#
+# Catalog build (off-config, the CMRSource path): provider LPCLOUD,
+# collections GEDI01_B_002 (primary) + GEDI02_A_002 (sibling), joined at
+# ShardMap.build(..., sibling_catalog=l2a_catalog) -- pairless granules are
+# excluded and reported (metadata["pairless"]).
+data_source:
+  granule_workers: 4
+  reader: h5coro
+  driver: s3
+  # No index block: the hierarchical route is the pinned baseline for the
+  # first GEDI builds; the vlen route also runs behind index: inline.
+  groups: [BEAM0000, BEAM0001, BEAM0010, BEAM0011, BEAM0101, BEAM0110, BEAM1000, BEAM1011]
+  coordinates:
+    # The base (sample) level carries no native coordinates: lat/lon expand
+    # from the shot level by rx_sample_count (the vlen expand primitive).
+    latitude: "/{group}/geolocation/latitude_bin0"
+    longitude: "/{group}/geolocation/longitude_bin0"
+    level: shots
+  variables:
+    rxwaveform: "/{group}/rxwaveform"
+    elevation:
+      # Per-sample elevation synthesized as linspace(elevation_bin0,
+      # elevation_lastbin, rx_sample_count) within each shot -- endpoints
+      # exact, never read at sample rate.
+      synthesize: linspace
+      level: shots
+      start: "/{group}/geolocation/elevation_bin0"
+      stop: "/{group}/geolocation/elevation_lastbin"
+  base_level: samples
+  levels:
+    samples:
+      path: "/{group}"
+      link: null
+    shots:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: latitude_bin0, longitude: longitude_bin0}
+      link:
+        to: samples
+        index_beg: "/{group}/rx_sample_start_index"
+        count: "/{group}/rx_sample_count"
+        index_base: 1            # rx_sample_start_index is ORIGIN-1 (GEDI product dictionary)
+      variables:
+        # Per-shot L1B pass-throughs, broadcast to sample rate (plain
+        # companion names per the issue #422 ruling).
+        shot_number: "/{group}/shot_number"
+        noise_mean: "/{group}/noise_mean_corrected"
+        noise_stddev: "/{group}/noise_stddev_corrected"
+        rx_energy: "/{group}/rx_energy"
+        elevation_bin0: "/{group}/geolocation/elevation_bin0"
+        elevation_lastbin: "/{group}/geolocation/elevation_lastbin"
+  assets:
+    # The paired L2A sibling (one shardmap, {l1b, l2a} per entry): per-shot
+    # quality datasets joined by shot_number -- L1B carries none of them, and
+    # clipped waveforms are radiometrically invalid, so the join is core to
+    # the flux currency (issue #422 ruling).
+    l2a:
+      join:
+        left: "/{group}/shot_number"
+        right: "/{group}/shot_number"
+  filters:
+    - level: shots
+      dataset: "/{group}/geolocation/degrade"
+      op: eq
+      value: 0
+    - asset: l2a
+      dataset: "/{group}/quality_flag"
+      op: eq
+      value: 1
+    - asset: l2a
+      dataset: "/{group}/sensitivity"
+      op: ge
+      value: 0.9
+    - asset: l2a
+      dataset: "/{group}/rx_assess/rx_clipbin_count"   # saturation counter: 0 = unclipped
+      op: le
+      value: 0
+  read_plan:
+    spatial_index: shots
+    pad: 1
+
+aggregation:
+  # Pooled (no streaming block): o9 shards are light at GEDI density, and the
+  # flux field's composability is `none` initially (issue #422 -- no pyramid,
+  # no spill whitelist growth). Promote alongside overviews when needed.
+  coordinates:
+    morton:
+      dtype: uint64
+      fill_value: 0
+  variables:
+    count:
+      function: len
+      source: rxwaveform
+      dtype: int32
+      fill_value: 0
+    rx_flux:
+      # Per-cell flux-weighted elevation digest: (k, 2) ragged payload of
+      # (elevation, photoelectron-weight) centroids over the shared t-digest
+      # compress path; sum(weights) estimates the cell's detected
+      # photoelectrons. Loss-free below delta, so single-shot cells
+      # reconstruct the clipped waveform exactly (stored rows + companions).
+      kind: ragged
+      function: "zagg.stats.waveform.build_waveform_digest"
+      source: elevation
+      inner_shape: [2]
+      dtype: float32
+      fill_value: 0
+      # weights: flux            # PR #431 rebase: the section-2.0 weights
+      #                          # declaration lands there; enable on rebase.
+      params:
+        delta: 8192              # ratified cross-sensor floor (issue #422, decision 7)
+        counts: rxwaveform       # params-as-column: per-sample ADC values
+        noise_mean: noise_mean
+        noise_stddev: noise_stddev
+        gain: 1.0
+        false_positive_rate: 1.0e-3
+        samples_per_record: 1420 # nominal GEDI rx window length
+        correlation_length: 5    # receiver noise correlation, samples
+      attrs:
+        # Provenance (issue #321 field attrs): the named/versioned gain and
+        # the declared operating point the clip threshold derives from.
+        gain_name: "unit"
+        gain_version: "gedi01b-v002-placeholder"
+        gain: 1.0
+        clip: "threshold-to-zero"
+        operating_point:
+          false_positive_rate: 1.0e-3
+          samples_per_record: 1420
+          correlation_length: 5
+    shot_count:
+      # Distinct shots contributing to the cell; the per-shot companions
+      # below are valid exactly when it is 1.
+      function: "zagg.stats.waveform.shot_count"
+      source: shot_number
+      dtype: int32
+      fill_value: 0
+    shot_number:
+      # The shot id when unique, sentinel 0 when pooled (issue #422 ruling).
+      function: "zagg.stats.waveform.shot_number"
+      source: shot_number
+      dtype: uint64
+      fill_value: 0
+    noise_mean:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: noise_mean
+      dtype: float32
+      fill_value: .nan
+    noise_stddev:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: noise_stddev
+      dtype: float32
+      fill_value: .nan
+    rx_energy:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: rx_energy
+      dtype: float32
+      fill_value: .nan
+    elevation_bin0:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: elevation_bin0
+      dtype: float64
+      fill_value: .nan
+    elevation_lastbin:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: elevation_lastbin
+      dtype: float64
+      fill_value: .nan
+
+output:
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 9              # shard / dispatch unit
+    chunk_inner: 12              # inner Zarr chunk: 4^(18-12) = 64x64 cells
+    sharded: true
+    child_order: 18              # leaf cell resolution (~20 m, ~GEDI footprint)
+  store_layout: hive
+  pyramid: false                 # composability none initially (issue #422)
+
+worker:
+  memory: 2048                   # pooled path, no spill: the light variant
