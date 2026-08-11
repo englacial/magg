@@ -466,6 +466,46 @@ class TestWeightsGate:
         assert "weights" not in declared_fields(cfg(weights="counts"))[0]["d"]
         flux = cfg(weights="flux", attrs={"gain": {"name": "g", "version": "1"}})
         assert declared_fields(flux)[0]["d"]["weights"] == "flux"
+        # §2.0 makes gain REQUIRED beside a flux declaration, and the manifest
+        # entry is all the overview writer reconstructs a field from.
+        assert declared_fields(flux)[0]["d"]["gain"] == {"name": "g", "version": "1"}
+
+    def test_overview_template_stamps_the_flux_declaration(self, tmp_path):
+        """The reconstructed overview template carries §2.0 through (#424).
+
+        Without it a flux store's overview declares counts, and the cascade's
+        per-child gate then refuses every child (review finding).
+        """
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.sweep_overview import _overview_config, check_weights_match
+
+        gain = {"name": "rx_gain", "version": "3"}
+        base = {
+            "class": "approximate",
+            "method": "tdigest_kway",
+            "dtype": "float32",
+            "inner_shape": [2],
+            "delta": 64,
+            "overview_delta": 64,
+        }
+        fields = {
+            "flux_d": {**base, "weights": "flux", "gain": gain},
+            "counts_d": dict(base),
+        }
+        grid = HealpixGrid(2, 4, config=_overview_config(fields), sharded=True)
+        grid.emit_shard_template(open_store(str(tmp_path / "ov.zarr")), overwrite=True)
+        group = zarr.open_group(
+            open_store(str(tmp_path / "ov.zarr")), path="4", mode="r", zarr_format=3
+        )
+        assert group["flux_d"].attrs["weights"] == "flux"
+        assert dict(group["flux_d"].attrs["gain"]) == gain
+        # A counts field declares nothing — a counts store's template bytes
+        # are unchanged by this path.
+        assert "weights" not in dict(group["counts_d"].attrs)
+        assert "gain" not in dict(group["counts_d"].attrs)
+        # And the fold gate now accepts the overview as a cascade source.
+        check_weights_match(dict(group["flux_d"].attrs), fields["flux_d"], "flux_d")
+        check_weights_match(dict(group["counts_d"].attrs), fields["counts_d"], "counts_d")
 
 
 class TestPyramidBlock:
