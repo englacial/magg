@@ -30,7 +30,11 @@ Excluded as packaging: all orders (``parent_order``/``child_order``/
 ``chunk_inner``), ``sharded``, store layout/path, ``emit_cell_ids`` (the
 issue #304 transition hatch), worker sizing, streaming mode, read knobs,
 catalog/bounds (run inputs, recorded per-run — catalog identity lives in the
-D20 sidecar, never the product identity).
+D20 sidecar, never the product identity), and the per-variable
+``overview_delta`` (issue #424 — the pyramid-fold budget shapes overview
+artifacts only, and the overview family is already packaging). A variable's
+``weights: "counts"`` normalizes away as the spec §2.0 absent-key default;
+``weights: "flux"`` is output-defining and hashes.
 
 Canonical form: the core dict serialized as sorted-key, compact,
 ASCII-escaped JSON — so YAML comments, whitespace, and key order can never
@@ -59,6 +63,12 @@ DATA_SOURCE_PACKAGING_KEYS = ("reader", "driver", "read_plan", "anonymous")
 #: ``aggregation`` keys that are packaging: the per-cell carrier choice
 #: (issue #132) transports identical values either way.
 AGGREGATION_PACKAGING_KEYS = ("handoff",)
+
+#: Per-variable aggregation keys that are packaging (issue #424):
+#: ``overview_delta`` shapes the pyramid/overview fold budget only — the
+#: overview family is packaging already (``output.pyramid`` never enters the
+#: core), so the split budget must not move a base product's identity either.
+VARIABLE_PACKAGING_KEYS = ("overview_delta",)
 
 #: Display length of :func:`semantic_fingerprint` (12 hex = 48 bits; the
 #: birthday bound puts same-store collision odds around 1e-8 at 1e4 products
@@ -171,6 +181,32 @@ def _without(mapping: dict, keys: tuple[str, ...]) -> dict:
     return {k: v for k, v in (mapping or {}).items() if k not in keys}
 
 
+def _normalize_variables(aggregation: dict) -> dict:
+    """Drop per-variable packaging keys and default-valued declarations (#424).
+
+    Two normalizations, both hash-stability obligations:
+
+    - :data:`VARIABLE_PACKAGING_KEYS` (``overview_delta``) drop outright —
+      overview artifacts are packaging, so declaring the split fold budget
+      hashes identically to omitting it;
+    - ``weights: "counts"`` drops because it is the spec §2.0 **absent-key
+      default** — the explicit and absent spellings mean the same bytes, so
+      they must be the same product. ``weights: "flux"`` stays: the stored
+      weight column means something else, which is exactly output-defining.
+    """
+    variables = (aggregation or {}).get("variables")
+    if not variables:
+        return aggregation
+    out = {}
+    for name, meta in variables.items():
+        if isinstance(meta, dict):
+            meta = {k: v for k, v in meta.items() if k not in VARIABLE_PACKAGING_KEYS}
+            if meta.get("weights") == "counts":
+                meta = {k: v for k, v in meta.items() if k != "weights"}
+        out[name] = meta
+    return {**aggregation, "variables": out}
+
+
 def _prune_nulls(obj):
     """Recursively drop ``None``-valued keys from every dict in ``obj``.
 
@@ -209,7 +245,9 @@ def semantic_core(config: PipelineConfig) -> dict:
             if key in grid_cfg:
                 grid[key] = grid_cfg[key]
     core: dict = {
-        "aggregation": _without(config.aggregation, AGGREGATION_PACKAGING_KEYS),
+        "aggregation": _normalize_variables(
+            _without(config.aggregation, AGGREGATION_PACKAGING_KEYS)
+        ),
         "data_source": _without(config.data_source, DATA_SOURCE_PACKAGING_KEYS),
         "grid": grid,
         # pipeline.type is output-defining (espg-ruled on the PR #316
@@ -255,6 +293,7 @@ __all__ = [
     "AGGREGATION_PACKAGING_KEYS",
     "COMPOSABILITY_CLASSES",
     "DATA_SOURCE_PACKAGING_KEYS",
+    "VARIABLE_PACKAGING_KEYS",
     "EXACT_MERGE_LAWS",
     "FINGERPRINT_HEX",
     "GRID_SPATIAL_KEYS",

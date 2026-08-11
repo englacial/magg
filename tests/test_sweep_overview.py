@@ -352,6 +352,64 @@ class TestFoldDigests:
         assert forward == backward  # the issue #279 order-independent law
 
 
+class TestWeightsGate:
+    """Spec §2.0 (issue #424): merges refuse across mismatched declarations."""
+
+    def test_matching_defaults_pass(self):
+        from zagg.sweep_overview import check_weights_match
+
+        # Absent on both sides reads as counts on both sides.
+        check_weights_match({}, {"class": "approximate"}, "d")
+        check_weights_match(None, {}, "d")
+        check_weights_match({"weights": "flux"}, {"weights": "flux"}, "d")
+
+    def test_mismatch_refuses_both_ways(self):
+        from zagg.sweep_overview import check_weights_match
+
+        with pytest.raises(ValueError, match="matching\\s+declarations"):
+            check_weights_match({"weights": "flux"}, {"class": "approximate"}, "d")
+        with pytest.raises(ValueError, match="matching\\s+declarations"):
+            check_weights_match({}, {"weights": "flux"}, "d")
+
+    def test_unknown_stored_declaration_refuses(self):
+        from zagg.sweep_overview import check_weights_match
+
+        with pytest.raises(ValueError, match="unknown weights declaration"):
+            check_weights_match({"weights": "photons"}, {}, "d")
+
+    def test_declared_fields_records_flux_only(self):
+        from zagg.config import PipelineConfig
+        from zagg.pyramid import declared_fields
+
+        def cfg(**extra):
+            return PipelineConfig(
+                data_source={
+                    "variables": {"h": "/p"},
+                    "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+                },
+                aggregation={
+                    "variables": {
+                        "d": {
+                            "kind": "ragged",
+                            "function": "zagg.stats.tdigest.build_tdigest",
+                            "source": "h",
+                            "inner_shape": [2],
+                            "params": {"delta": 64},
+                            **extra,
+                        }
+                    }
+                },
+                output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+            )
+
+        # counts (explicit or absent) records nothing — existing manifests
+        # stay byte-identical; flux is recorded for the sweep's fold gate.
+        assert "weights" not in declared_fields(cfg())[0]["d"]
+        assert "weights" not in declared_fields(cfg(weights="counts"))[0]["d"]
+        flux = cfg(weights="flux", attrs={"gain": {"name": "g", "version": "1"}})
+        assert declared_fields(flux)[0]["d"]["weights"] == "flux"
+
+
 class TestPyramidBlock:
     """The manifest declaration (Phase C): template time + config grammar."""
 
