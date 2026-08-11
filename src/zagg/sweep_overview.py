@@ -751,8 +751,15 @@ def _field_drift(group, name, meta) -> str | None:
     with a worse error. ``zagg-ragged/2`` is a live migration path (issue
     #210 moves the element declaration into the zarr data type), so this is
     not hypothetical (espg-ruled, issue #358).
+
+    The same branch gates the §2.0 ``weights`` declaration for the same
+    reason (issue #424): it is what :func:`check_weights_match` refuses a
+    fold over, so a disagreement caught here is the retrofit refusing, and
+    one missed here is every leaf warning at fold time. A stored value this
+    zagg does not define RAISES out of the probe rather than reporting drift
+    — that store is unreadable, not merely mis-declared.
     """
-    from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC
+    from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC, weights_declaration
 
     try:
         arr = group[name]
@@ -788,6 +795,20 @@ def _field_drift(group, name, meta) -> str | None:
         declared_inner = [int(s) for s in meta.get("inner_shape") or [2]]
         if stored_inner != declared_inner:
             return f"field {name!r}: ragged inner_shape {stored_inner} != declared {declared_inner}"
+        # The §2.0 weights declaration is one more thing a leaf can falsify,
+        # and it is stamped on the array this probe already opened: absent it
+        # here, ``declare_pyramid`` installs a flux declaration over a counts
+        # store cleanly, and every leaf then fails ``check_weights_match`` at
+        # FOLD time as a per-leaf warning (review finding, issue #424).
+        # Absent on either side is counts, exactly as the fold gate reads it.
+        stored_weights = weights_declaration(dict(arr.attrs))
+        declared_weights = meta.get("weights") or "counts"
+        if stored_weights != declared_weights:
+            return (
+                f"field {name!r}: stored weights declaration {stored_weights!r} != "
+                f"declared {declared_weights!r} — merges are legal only between "
+                f"matching declarations (spec §2.0)"
+            )
     elif meta["class"] == "exact":
         declared_dt = np.dtype(meta.get("dtype") or "float32")
         if arr.dtype != declared_dt:
