@@ -33,7 +33,9 @@ dependencies = [
     # SidecarIndex.read_group accepts the io_stats kwarg the worker forwards
     # unconditionally (issue #374); 0.3.1 raises TypeError on every sidecar
     # group read, which is what emptied the tdigest_healpix_o9_hive_sidecar
-    # benchmark target on merge CI (espg/h5coro-hidefix#7).
+    # benchmark target on merge CI (espg/h5coro-hidefix#7). A floor ahead of
+    # what PyPI has published (as 0.2.0 once was) fails resolution loudly — the
+    # state build_layer.sh's MORTIE_SPEC derivation cites this block for.
     "h5coro-hidefix>=0.3.2",
     # Floor 0.9.6 for the MOC batch twins on ShardMap.build's stored-index path
     # (issue #396 phase 4): mocs_and, the 1xN broadcast intersection of the AOI
