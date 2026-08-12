@@ -6,6 +6,7 @@ These tests verify that:
 3. The zagg package can be imported as Lambda would see it
 """
 
+import inspect
 import re
 import subprocess
 from pathlib import Path
@@ -66,11 +67,21 @@ class TestLambdaImports:
     def test_h5coro_hidefix_available(self):
         """h5coro-hidefix ships the compiled reader for the sidecar backend (issue #149).
 
-        importorskip, not a bare import: the pinned 0.2.0 is not on PyPI until
-        upstream cuts that release, so an env that could not install it yet
-        skips here instead of failing the whole suite.
+        importorskip, not a bare import: the floor can sit ahead of what PyPI
+        has published, so an env that could not install it yet skips here
+        instead of failing the whole suite.
+
+        The signature assertion pins the >=0.3.2 floor's reason: the worker
+        forwards io_stats to every backend ungated (``worker.py`` read_kwargs,
+        issue #374), and 0.3.1's read_group raised TypeError on every sidecar
+        group read — silently, as a caught per-group error reported as "No data
+        after filtering". Fails loudly wherever a below-floor hidefix installs.
         """
         pytest.importorskip("h5coro_hidefix")
+
+        from h5coro_hidefix.zagg_backend import SidecarIndex
+
+        assert "io_stats" in inspect.signature(SidecarIndex.read_group).parameters
 
 
 class TestFunctionBuild:
@@ -614,6 +625,44 @@ class TestLayerExtraParity:
             "reaches the layer. Either move the pin to [project.dependencies], or "
             "replace the derivation in build_layer.sh with a literal pin."
         )
+
+    @staticmethod
+    def _release(version):
+        """``"0.3.10"`` -> ``(0, 3, 10)``, so pins order numerically not lexically."""
+        return tuple(int(part) for part in version.split("."))
+
+    def test_every_lambda_extra_pin_satisfies_its_core_floor(self):
+        """A ``lambda`` exact pin must not contradict the core floor for the same dist.
+
+        The parity check above compares the pin to build_layer.sh; nothing
+        compared it to ``[project.dependencies]``. A floor bumped past its pin
+        (core ``>=0.3.2`` against extra ``==0.3.1``) makes ``zagg[lambda]``
+        outright unresolvable — an extra carries the base requirements too, so
+        the two specs intersect to nothing — which is why a floor bump and its
+        pin are one atomic change and cannot be landed half each.
+        """
+        import tomllib
+
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        floors = {}
+        for dep in pyproject["project"]["dependencies"]:
+            m = re.match(r"([A-Za-z0-9._-]+)>=([0-9][0-9.]*)$", dep)
+            if m:
+                floors[m.group(1)] = m.group(2)
+        checked = []
+        for pin in pyproject["project"]["optional-dependencies"]["lambda"]:
+            m = re.match(r"([A-Za-z0-9._-]+)==([0-9][0-9.]*)$", pin)
+            if not m or m.group(1) not in floors:
+                continue  # unpinned entries, or layer-only dists with no core floor
+            name, exact = m.group(1), m.group(2)
+            assert self._release(exact) >= self._release(floors[name]), (
+                f"lambda extra pins {name}=={exact}, below the [project.dependencies] "
+                f"floor >={floors[name]} — zagg[lambda] would be unresolvable"
+            )
+            checked.append(name)
+        # Guard the regexes above: a naming/spec drift that matched nothing
+        # would make this test vacuously green.
+        assert "h5coro-hidefix" in checked
 
     def test_derived_specs_still_come_from_project_dependencies(self):
         """The derivation the test above exempts must actually exist and resolve."""
