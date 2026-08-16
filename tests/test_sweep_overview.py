@@ -352,6 +352,162 @@ class TestFoldDigests:
         assert forward == backward  # the issue #279 order-independent law
 
 
+class TestOverviewFoldDelta:
+    """Issue #424: the split leaf-δ / overview-δ fold budget."""
+
+    def test_declared_budget_wins(self):
+        from zagg.sweep_overview import overview_fold_delta
+
+        assert overview_fold_delta({"delta": 8192, "overview_delta": 512}) == 512
+        assert overview_fold_delta({"delta": 64, "overview_delta": 1024}) == 1024
+
+    def test_absent_reproduces_every_historical_manifest(self):
+        # Every manifest ever written carried δ ≤ 512, so the capped fallback
+        # is byte-identical to the old fold-at-leaf-δ behavior for all of them.
+        from zagg.sweep_overview import overview_fold_delta
+
+        assert overview_fold_delta({"delta": 256}) == 256
+        assert overview_fold_delta({"delta": 16}) == 16
+        assert overview_fold_delta({}) == 512
+
+    def test_absent_caps_a_raised_leaf_delta(self):
+        # A δ=8,192 leaf must not saturate the sweep's k-way fold buffers
+        # through an old-style manifest: the cap bounds it.
+        from zagg.sweep_overview import OVERVIEW_DELTA_CAP, overview_fold_delta
+
+        assert overview_fold_delta({"delta": 8192}) == OVERVIEW_DELTA_CAP == 512
+
+    def test_declared_fields_records_the_resolved_budget(self):
+        from zagg.config import PipelineConfig
+        from zagg.pyramid import declared_fields
+
+        def cfg(**extra):
+            return PipelineConfig(
+                data_source={
+                    "variables": {"h": "/p"},
+                    "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+                },
+                aggregation={
+                    "variables": {
+                        "d": {
+                            "kind": "ragged",
+                            "function": "zagg.stats.tdigest.build_tdigest",
+                            "source": "h",
+                            "inner_shape": [2],
+                            "params": {"delta": 8192},
+                            **extra,
+                        }
+                    }
+                },
+                output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+            )
+
+        declared = declared_fields(cfg(overview_delta=256))[0]["d"]
+        assert declared["delta"] == 8192 and declared["overview_delta"] == 256
+        # Undeclared resolves to the capped fallback, recorded explicitly so
+        # the manifest is self-describing.
+        resolved = declared_fields(cfg())[0]["d"]
+        assert resolved["delta"] == 8192 and resolved["overview_delta"] == 512
+
+
+class TestWeightsGate:
+    """Spec §2.0 (issue #424): merges refuse across mismatched declarations."""
+
+    def test_matching_defaults_pass(self):
+        from zagg.sweep_overview import check_weights_match
+
+        # Absent on both sides reads as counts on both sides.
+        check_weights_match({}, {"class": "approximate"}, "d")
+        check_weights_match(None, {}, "d")
+        check_weights_match({"weights": "flux"}, {"weights": "flux"}, "d")
+
+    def test_mismatch_refuses_both_ways(self):
+        from zagg.sweep_overview import check_weights_match
+
+        with pytest.raises(ValueError, match="matching\\s+declarations"):
+            check_weights_match({"weights": "flux"}, {"class": "approximate"}, "d")
+        with pytest.raises(ValueError, match="matching\\s+declarations"):
+            check_weights_match({}, {"weights": "flux"}, "d")
+
+    def test_unknown_stored_declaration_refuses(self):
+        from zagg.sweep_overview import check_weights_match
+
+        with pytest.raises(ValueError, match="unknown weights declaration"):
+            check_weights_match({"weights": "photons"}, {}, "d")
+
+    def test_declared_fields_records_flux_only(self):
+        from zagg.config import PipelineConfig
+        from zagg.pyramid import declared_fields
+
+        def cfg(**extra):
+            return PipelineConfig(
+                data_source={
+                    "variables": {"h": "/p"},
+                    "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+                },
+                aggregation={
+                    "variables": {
+                        "d": {
+                            "kind": "ragged",
+                            "function": "zagg.stats.tdigest.build_tdigest",
+                            "source": "h",
+                            "inner_shape": [2],
+                            "params": {"delta": 64},
+                            **extra,
+                        }
+                    }
+                },
+                output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+            )
+
+        # counts (explicit or absent) records nothing — existing manifests
+        # stay byte-identical; flux is recorded for the sweep's fold gate.
+        assert "weights" not in declared_fields(cfg())[0]["d"]
+        assert "weights" not in declared_fields(cfg(weights="counts"))[0]["d"]
+        flux = cfg(weights="flux", attrs={"gain": {"name": "g", "version": "1"}})
+        assert declared_fields(flux)[0]["d"]["weights"] == "flux"
+        # §2.0 makes gain REQUIRED beside a flux declaration, and the manifest
+        # entry is all the overview writer reconstructs a field from.
+        assert declared_fields(flux)[0]["d"]["gain"] == {"name": "g", "version": "1"}
+
+    def test_overview_template_stamps_the_flux_declaration(self, tmp_path):
+        """The reconstructed overview template carries §2.0 through (#424).
+
+        Without it a flux store's overview declares counts, and the cascade's
+        per-child gate then refuses every child (review finding).
+        """
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.sweep_overview import _overview_config, check_weights_match
+
+        gain = {"name": "rx_gain", "version": "3"}
+        base = {
+            "class": "approximate",
+            "method": "tdigest_kway",
+            "dtype": "float32",
+            "inner_shape": [2],
+            "delta": 64,
+            "overview_delta": 64,
+        }
+        fields = {
+            "flux_d": {**base, "weights": "flux", "gain": gain},
+            "counts_d": dict(base),
+        }
+        grid = HealpixGrid(2, 4, config=_overview_config(fields), sharded=True)
+        grid.emit_shard_template(open_store(str(tmp_path / "ov.zarr")), overwrite=True)
+        group = zarr.open_group(
+            open_store(str(tmp_path / "ov.zarr")), path="4", mode="r", zarr_format=3
+        )
+        assert group["flux_d"].attrs["weights"] == "flux"
+        assert dict(group["flux_d"].attrs["gain"]) == gain
+        # A counts field declares nothing — a counts store's template bytes
+        # are unchanged by this path.
+        assert "weights" not in dict(group["counts_d"].attrs)
+        assert "gain" not in dict(group["counts_d"].attrs)
+        # And the fold gate now accepts the overview as a cascade source.
+        check_weights_match(dict(group["flux_d"].attrs), fields["flux_d"], "flux_d")
+        check_weights_match(dict(group["counts_d"].attrs), fields["counts_d"], "counts_d")
+
+
 class TestPyramidBlock:
     """The manifest declaration (Phase C): template time + config grammar."""
 
@@ -400,7 +556,10 @@ class TestPyramidBlock:
         block = build_pyramid_block(cfg, shard_order=9)
         entry = block["overview"]["fields"]["h_tdigest"]
         assert entry["class"] == "approximate" and entry["method"] == "tdigest_kway"
-        assert entry["inner_shape"] == [2] and entry["delta"] == 256
+        # The packaged split budgets (issues #414/#424): leaf δ 8,192
+        # (loss-free bound), overview folds at 512 (accuracy bound).
+        assert entry["inner_shape"] == [2] and entry["delta"] == 8192
+        assert entry["overview_delta"] == 512
 
     def test_explicit_orders_and_all_time(self):
         from zagg.sweep_overview import build_pyramid_block
@@ -1971,6 +2130,42 @@ class TestDeclarePyramid:
         rag["element"] = {"dtype": "float32", "shape": [-1, 3]}
         arr.attrs["ragged"] = rag
         with pytest.raises(ValueError, match="h_tdigest.*inner_shape"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+
+    def test_flux_declaration_over_a_counts_store_refuses(self, tmp_path):
+        # The operator-facing case the gate exists for (review, issue #424):
+        # without it the retrofit PUTs the flux declaration clean, and the
+        # next sweep logs "skipping unreadable leaf" for every leaf.
+        self._pre_declaration_store(tmp_path)
+        cfg = _leaf_cfg()
+        cfg.aggregation["variables"]["h_tdigest"].update(
+            weights="flux", attrs={"gain": {"name": "g", "version": "1"}}
+        )
+        with pytest.raises(ValueError, match="h_tdigest.*weights declaration"):
+            declare_pyramid(str(tmp_path), cfg)
+        assert "pyramid" not in read_manifest(str(tmp_path))  # nothing written
+
+    def test_store_side_weights_drift_refuses(self, tmp_path):
+        # The other direction: a flux-stamped leaf under a counts config.
+        from zarr import open_array
+
+        self._pre_declaration_store(tmp_path)
+        leaf = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        arr = open_array(leaf, path=f"{CELL_ORDER}/h_tdigest", mode="r+", zarr_format=3)
+        arr.attrs["weights"] = "flux"
+        with pytest.raises(ValueError, match="h_tdigest.*weights declaration"):
+            declare_pyramid(str(tmp_path), _leaf_cfg())
+        assert "pyramid" not in read_manifest(str(tmp_path))
+
+    def test_undefined_stored_weights_raises(self, tmp_path):
+        # A value §2.0 does not define: unreadable, not merely mis-declared.
+        from zarr import open_array
+
+        self._pre_declaration_store(tmp_path)
+        leaf = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        arr = open_array(leaf, path=f"{CELL_ORDER}/h_tdigest", mode="r+", zarr_format=3)
+        arr.attrs["weights"] = "photons"
+        with pytest.raises(ValueError, match="unknown weights declaration"):
             declare_pyramid(str(tmp_path), _leaf_cfg())
 
     def test_unreadable_ragged_spec_revision_refuses(self, tmp_path):

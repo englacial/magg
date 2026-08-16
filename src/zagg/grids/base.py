@@ -58,6 +58,39 @@ RAGGED_SPEC = "zagg-ragged/1"
 #: produce identical objects across workers.
 RAGGED_ZSTD_LEVEL = 3
 
+#: Array-attrs key declaring a digest payload's weight-column semantics
+#: (spec §2.0, issue #424): a SIBLING of :data:`RAGGED_ELEMENT_ATTR` on the
+#: payload array — never a key inside the versioned ``ragged`` block, which
+#: is retired wholesale under ``zagg-ragged/2`` (a sibling key survives that
+#: metadata-only migration untouched; espg ruling on issue #422). Spec-owned:
+#: stamped at template time from the field's ``weights:`` declaration,
+#: reserved against config-declared attrs.
+WEIGHTS_ATTR = "weights"
+
+#: The defined §2.0 declarations. ``counts`` — integer weights ≥ 1 summing to
+#: the exact observation count (the default: an ABSENT key reads as counts,
+#: keeping every pre-#424 store conformant verbatim). ``flux`` — positive
+#: reals whose sum estimates detected photoelectrons (calibration provenance
+#: required in attrs). Merges are legal only between matching declarations.
+WEIGHTS_KINDS = ("counts", "flux")
+
+
+def weights_declaration(attrs) -> str:
+    """The §2.0 weights declaration recorded in a payload array's attrs.
+
+    Absent key reads as ``"counts"`` (spec §2.0 — existing stores are
+    conformant verbatim); an unknown value is a future spec revision and
+    raises rather than half-parsing (the strict-check discipline every
+    versioned convention on the spec page gets).
+    """
+    value = dict(attrs or {}).get(WEIGHTS_ATTR, "counts")
+    if value not in WEIGHTS_KINDS:
+        raise ValueError(
+            f"unknown weights declaration {value!r} (spec §2.0 defines {WEIGHTS_KINDS}); "
+            f"refusing to guess weight semantics for a future spec revision"
+        )
+    return value
+
 
 def apply_field_attrs(spec, meta: dict):
     """Merge a variable's config-declared ``attrs`` onto its array spec.
@@ -135,6 +168,7 @@ def ragged_array_spec(
     element_dtype,
     inner_shape=(),
     locations=None,
+    weights=None,
 ):
     """Vlen-bytes ``ArraySpec`` for a ``kind: ragged`` field (issue #209).
 
@@ -180,6 +214,13 @@ def ragged_array_spec(
         declared in the payload array's attrs so a reader binds the channel
         by METADATA, not by reconstructing the naming convention (review,
         PR #211). ``None`` (unlocated) records nothing.
+    weights : str, optional
+        The field's §2.0 weights declaration (issue #424), stamped as the
+        :data:`WEIGHTS_ATTR` SIBLING key beside the ``ragged`` block (never
+        inside it — the block is retired under ``/2``). ``None`` (undeclared)
+        records nothing: the spec reads an absent key as ``"counts"``, so
+        pre-#424 configs emit byte-identical templates. Pass it for the
+        payload array only — a located sibling carries no user/spec attrs.
 
     Returns
     -------
@@ -215,8 +256,15 @@ def ragged_array_spec(
     ragged_meta: dict = {"spec": RAGGED_SPEC, "element": element}
     if locations is not None:
         ragged_meta["locations"] = str(locations)
+    attributes: dict = {RAGGED_ELEMENT_ATTR: ragged_meta}
+    if weights is not None:
+        if weights not in WEIGHTS_KINDS:
+            raise ValueError(
+                f"weights declaration {weights!r} is not one of {WEIGHTS_KINDS} (spec §2.0)"
+            )
+        attributes[WEIGHTS_ATTR] = str(weights)
     return ArraySpec(
-        attributes={RAGGED_ELEMENT_ATTR: ragged_meta},
+        attributes=attributes,
         shape=tuple(int(s) for s in shape),
         dimension_names=tuple(dims),
         data_type="variable_length_bytes",
@@ -584,6 +632,9 @@ __all__ = [
     "RAGGED_ELEMENT_ATTR",
     "RAGGED_SPEC",
     "RAGGED_ZSTD_LEVEL",
+    "WEIGHTS_ATTR",
+    "WEIGHTS_KINDS",
+    "weights_declaration",
     "ShardKey",
     "InconsistentShardError",
     "shard_label",

@@ -1852,6 +1852,7 @@ class TestGetOutputSignature:
             "dtype": "float32",
             "resolution": "cell",
             "location": None,
+            "weights": None,
         }
 
     def test_scalar_default_dtype_none(self):
@@ -1863,6 +1864,7 @@ class TestGetOutputSignature:
             "dtype": None,
             "resolution": "cell",
             "location": None,
+            "weights": None,
         }
 
     def test_vector_int_signature(self):
@@ -1874,6 +1876,7 @@ class TestGetOutputSignature:
             "dtype": "float32",
             "resolution": "cell",
             "location": None,
+            "weights": None,
         }
 
     def test_vector_list_signature(self):
@@ -2135,6 +2138,7 @@ class TestRaggedKind:
             "dtype": "float32",
             "resolution": "cell",
             "location": None,
+            "weights": None,
         }
 
     def test_ragged_inner_shape_int_normalized(self):
@@ -2234,6 +2238,106 @@ class TestRaggedKind:
         entries = output_field_signature(atl06_config)
         for e in entries:
             assert e["inner_shape"] == [], f"{e['name']!r} has non-empty inner_shape"
+
+
+# ---------------------------------------------------------------------------
+# Packaged δ = 8,192 raise (issues #414/#424)
+# ---------------------------------------------------------------------------
+
+
+class TestPackagedDeltaRaise:
+    """The four shipped ATL03 t-digest configs carry the split budgets.
+
+    Leaf δ = 8,192 is the measured loss-free bound (issue #422's statewide CA
+    scan); overview_delta = 512 is the pyramid-fold accuracy budget. The
+    packaged configs are EXPLICIT so ``_DEFAULT_DELTA`` never decides an
+    output value for them (the silent-change-under-stable-hash trap).
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "atl03_tdigest_healpix",
+            "atl03_tdigest_healpix_hive",
+            "atl03_tdigest_located_healpix",
+            "atl03_tdigest_strata_healpix",
+        ],
+    )
+    def test_digest_fields_declare_the_split_budgets(self, name):
+        cfg = default_config(name)
+        ragged = {
+            f: meta
+            for f, meta in cfg.aggregation["variables"].items()
+            if meta.get("kind") == "ragged"
+        }
+        assert ragged  # every one of these templates carries digest fields
+        for meta in ragged.values():
+            assert meta["params"]["delta"] == 8192
+            assert meta["overview_delta"] == 512
+
+
+# ---------------------------------------------------------------------------
+# Ragged weights declaration + overview_delta (spec §2.0, issue #424)
+# ---------------------------------------------------------------------------
+
+
+_FLUX_GAIN = {"gain": {"name": "test_gain", "version": "1"}}
+
+
+class TestWeightsDeclaration:
+    def test_counts_validates(self):
+        validate_config(_ragged_cfg(inner_shape=[2], weights="counts"))
+
+    def test_flux_with_gain_provenance_validates(self):
+        validate_config(_ragged_cfg(inner_shape=[2], weights="flux", attrs=dict(_FLUX_GAIN)))
+
+    def test_flux_requires_gain_provenance(self):
+        with pytest.raises(ValueError, match="requires calibration provenance"):
+            validate_config(_ragged_cfg(inner_shape=[2], weights="flux"))
+
+    def test_flux_gain_requires_name_and_version(self):
+        with pytest.raises(ValueError, match="requires calibration provenance"):
+            validate_config(
+                _ragged_cfg(inner_shape=[2], weights="flux", attrs={"gain": {"name": "g"}})
+            )
+
+    def test_unknown_value_rejected(self):
+        with pytest.raises(ValueError, match="is not one of"):
+            validate_config(_ragged_cfg(inner_shape=[2], weights="photons"))
+
+    def test_weights_rejected_on_non_ragged_kinds(self):
+        with pytest.raises(ValueError, match="'weights' is only valid for kind 'ragged'"):
+            _validate_output_kind("f", {"function": "min", "weights": "counts"})
+        with pytest.raises(ValueError, match="'weights' is only valid for kind 'ragged'"):
+            _validate_output_kind("f", {"kind": "vector", "trailing_shape": 4, "weights": "counts"})
+
+    def test_attrs_weights_key_is_spec_owned_on_ragged(self):
+        # The template stamps the §2.0 key from the field declaration; an
+        # attrs transcription could silently disagree, so it is reserved.
+        with pytest.raises(ValueError, match="spec-owned"):
+            validate_config(_ragged_cfg(inner_shape=[2], attrs={"weights": "flux"}))
+
+    def test_signature_carries_weights_only_when_set(self):
+        entries = output_field_signature(
+            _ragged_cfg(inner_shape=[2], weights="flux", attrs=dict(_FLUX_GAIN))
+        )
+        assert entries[0]["weights"] == "flux"
+        # Undeclared: keyed-only-when-set, so existing signatures are stable.
+        assert "weights" not in output_field_signature(_ragged_cfg(inner_shape=[2]))[0]
+
+
+class TestOverviewDelta:
+    def test_valid_overview_delta_validates(self):
+        validate_config(_ragged_cfg(inner_shape=[2], overview_delta=512))
+
+    @pytest.mark.parametrize("bad", [0, -1, 2.5, "512", True])
+    def test_invalid_overview_delta_rejected(self, bad):
+        with pytest.raises(ValueError, match="overview_delta must be a positive int"):
+            validate_config(_ragged_cfg(inner_shape=[2], overview_delta=bad))
+
+    def test_overview_delta_rejected_on_non_ragged_kinds(self):
+        with pytest.raises(ValueError, match="'overview_delta' is only valid for kind 'ragged'"):
+            _validate_output_kind("f", {"function": "min", "overview_delta": 512})
 
 
 # ---------------------------------------------------------------------------

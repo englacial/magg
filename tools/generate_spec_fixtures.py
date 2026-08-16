@@ -32,6 +32,14 @@ conformance tests assert decoded values, never object bytes.
   (the `atl03_tdigest_strata_healpix.yaml` field shapes), including a
   single-photon cell that packs the §3.1 golden word `0xFF000000FF0000FF`
   and a noise-only cell whose signal payload is the empty ``(0, 2)`` array.
+- ``flux/`` — the §2.0 weights-declaration surface (issue #424): one
+  flux-declared digest field (`rx_flux`, ``weights: flux`` stamped as the
+  SIBLING attrs key beside the ``ragged`` block, ``gain`` provenance attrs)
+  + `count`. Payload weights are fractional positive reals built through the
+  real merge algebra, so per-cell weight sums are NOT integers — the pin
+  that a flux reader must not round-trip weights through counts. The
+  committed ``minimal/`` (which predates §2.0 and is not regenerated) is the
+  absent-key ⇒ counts pin.
 - ``column/`` — the ``minimal`` inputs plus an explicit
   ``output.pyramid.overviews: 5`` knob, so the SAME worker invocation also
   writes the §4.6 leaf column (issue #383): ``all.pyramid.zarr`` beside the
@@ -133,6 +141,11 @@ PYRAMID_EXTRA_VARIABLES = {
 #: ``{order: fold_source}`` shape the production bookkeeping writer takes.
 PYRAMID_V1_ACTUALS = {1: "leaves", 0: "cascade"}
 
+#: The ``flux/`` fixture's §2.0 calibration provenance (issue #424): flux
+#: weights are meaningless without the gain constant that produced them, so
+#: the spec requires name + version in the payload array's attrs.
+FLUX_GAIN = {"name": "spec-fixture-gain", "version": "1"}
+
 
 def _cell_photons(rng, n, *, signal_frac=0.6):
     """Synthetic photons: heights + 5 confidence columns, ``n`` rows."""
@@ -161,13 +174,49 @@ def _point_words(grid, cell_word, n, rng):
     return morton_words(MortonIndexArray.from_latlon(lats, lons, points=True))
 
 
-def _config(kitchen_sink: bool, pyramid: dict | None = None):
+def _flux_digest(h, rng):
+    """A §2.0 flux payload built through the real merge algebra (issue #424).
+
+    Fractional positive weights (photoelectron-scale uniforms), sorted
+    sub-centroids, k-way merged at :data:`DELTA` — so the committed payload
+    exercises `_compress` over WEIGHTED sub-centroids and its per-cell weight
+    sums are not integers. A single sample passes through uncompressed (the
+    kway single-contributor law), pinning the singleton fractional weight.
+    """
+    from zagg.stats.tdigest import merge_tdigests_kway
+
+    h = np.asarray(h, dtype=np.float64)
+    weights = rng.uniform(0.5, 30.0, len(h))
+    order = np.argsort(h, kind="stable")
+    sub = np.column_stack([h[order], weights[order]]).astype(np.float32)
+    if len(sub) < 2:
+        return sub
+    # Two sorted halves through the k-way fold: a real weighted compression.
+    return merge_tdigests_kway([sub[0::2], sub[1::2]], delta=DELTA)
+
+
+def _config(kitchen_sink: bool, pyramid: dict | None = None, flux: bool = False):
     from zagg.config import PipelineConfig
 
     variables: dict = {
         "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0}
     }
-    if kitchen_sink:
+    if flux:
+        variables["rx_flux"] = {
+            "kind": "ragged",
+            # The generator feeds precomputed payloads through the write path
+            # (the fake process_shard below), so the declared reducer is never
+            # exercised here — the real flux transform lands with issue #425.
+            "function": "zagg.stats.tdigest.build_tdigest",
+            "source": "h",
+            "inner_shape": [2],
+            "dtype": "float32",
+            "fill_value": 0,
+            "params": {"delta": DELTA},
+            "weights": "flux",
+            "attrs": {"gain": dict(FLUX_GAIN)},
+        }
+    elif kitchen_sink:
         for stratum in ("signal", "noise"):
             variables[f"h_tdigest_{stratum}"] = {
                 "kind": "ragged",
@@ -236,7 +285,7 @@ def _config(kitchen_sink: bool, pyramid: dict | None = None):
     )
 
 
-def _build_cells(grid, shard, kitchen_sink: bool):
+def _build_cells(grid, shard, kitchen_sink: bool, flux: bool = False):
     """Per-cell synthetic inputs and their expected decoded values.
 
     Returns ``(by_chunk, expected_cells)`` where ``by_chunk`` maps a chunk
@@ -266,7 +315,14 @@ def _build_cells(grid, shard, kitchen_sink: bool):
             conf[:] = rng.integers(-2, 2, conf.shape)
         record: dict = {"index": cell_index, "morton": str(cell_word), "count": n}
         fields: dict = {"count": n}
-        if kitchen_sink:
+        if flux:
+            digest = _flux_digest(h, rng)
+            fields["rx_flux"] = digest
+            record["rx_flux"] = [[float(m), float(w)] for m, w in digest]
+            # The weight total (float64 sum over the float32 weights), recorded
+            # so the non-integer pin is a committed expectation, not derived.
+            record["flux_sum"] = float(digest[:, 1].astype(np.float64).sum())
+        elif kitchen_sink:
             words = _point_words(grid, cell_word, n, rng)
             signal = (conf >= 2).any(axis=1)
             for stratum, mask in (("signal", signal), ("noise", ~signal)):
@@ -295,7 +351,7 @@ def _build_cells(grid, shard, kitchen_sink: bool):
     return by_chunk, expected
 
 
-def _fake_process_shard(grid, by_chunk, kitchen_sink: bool):
+def _fake_process_shard(grid, by_chunk, kitchen_sink: bool, ragged_field: str = "h_tdigest"):
     """A ``process_shard`` stand-in feeding the REAL sharded leaf write path."""
 
     def fake(g, shard_key, urls, **kwargs):
@@ -325,7 +381,7 @@ def _fake_process_shard(grid, by_chunk, kitchen_sink: bool):
                     )
             else:
                 ids = sorted(cells)
-                ragged["h_tdigest"] = ([cells[i]["h_tdigest"] for i in ids], ids)
+                ragged[ragged_field] = ([cells[i][ragged_field] for i in ids], ids)
             kwargs["chunk_results"].append((block, df, ragged))
             occupied.extend(int(children[i]) for i in sorted(cells))
         kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
@@ -393,16 +449,16 @@ def _o11_hashes(leaf_path: str) -> dict:
     return {"arrays": dict(sorted(hashes.items())), "combined": combined}
 
 
-def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None) -> None:
+def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None, flux: bool = False) -> None:
     import zagg.processing as processing
     from zagg import hive
     from zagg.grids import HealpixGrid
     from zagg.grids.morton import morton_word
 
-    cfg = _config(kitchen_sink, pyramid=pyramid)
+    cfg = _config(kitchen_sink, pyramid=pyramid, flux=flux)
     grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
     shard = morton_word(SHARD_KEY)
-    by_chunk, expected_cells = _build_cells(grid, shard, kitchen_sink)
+    by_chunk, expected_cells = _build_cells(grid, shard, kitchen_sink, flux=flux)
     assert EMPTY_CHUNK not in by_chunk
 
     if out.exists():
@@ -414,7 +470,9 @@ def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None) -> None:
         hive.build_manifest(grid, dataset={"short_name": "SPEC_FIXTURE", "version": "1"}),
     )
     original = processing.process_shard
-    processing.process_shard = _fake_process_shard(grid, by_chunk, kitchen_sink)
+    processing.process_shard = _fake_process_shard(
+        grid, by_chunk, kitchen_sink, ragged_field="rx_flux" if flux else "h_tdigest"
+    )
     try:
         meta = hive.process_and_write_hive(
             shard,
@@ -444,6 +502,11 @@ def build(out: Path, kitchen_sink: bool, pyramid: dict | None = None) -> None:
         "cells": expected_cells,
         "content_hashes": _o11_hashes(str(out / leaf_rel)),
     }
+    if flux:
+        # The §2.0 declaration + provenance the conformance tests assert
+        # against the committed array attrs (issue #424).
+        expected["weights"] = "flux"
+        expected["gain"] = dict(FLUX_GAIN)
     if pyramid is not None:
         # The §4.6 column fixture (issue #383): the SAME worker invocation
         # wrote the leaf's column; record the raw knob, the decoded groups,
@@ -614,11 +677,27 @@ def main() -> None:
         type=Path,
         default=Path(__file__).resolve().parent.parent / "tests" / "data" / "spec",
     )
+    parser.add_argument(
+        "--only",
+        nargs="*",
+        default=None,
+        help="fixture names to (re)generate (default: all). The older-era "
+        "fixtures are stale by design (see module docstring) — regenerate "
+        "only what you mean to commit.",
+    )
     args = parser.parse_args()
-    build(args.out / "minimal", kitchen_sink=False)
-    build(args.out / "kitchen_sink", kitchen_sink=True)
-    build(args.out / "column", kitchen_sink=False, pyramid={"overviews": 5})
-    build_pyramid(args.out / "pyramid")
+    builders = {
+        "minimal": lambda: build(args.out / "minimal", kitchen_sink=False),
+        "kitchen_sink": lambda: build(args.out / "kitchen_sink", kitchen_sink=True),
+        "column": lambda: build(args.out / "column", kitchen_sink=False, pyramid={"overviews": 5}),
+        "pyramid": lambda: build_pyramid(args.out / "pyramid"),
+        "flux": lambda: build(args.out / "flux", kitchen_sink=False, flux=True),
+    }
+    unknown = set(args.only or ()) - set(builders)
+    if unknown:
+        parser.error(f"unknown fixture name(s) {sorted(unknown)} (known: {sorted(builders)})")
+    for name in args.only if args.only is not None else builders:
+        builders[name]()
 
 
 if __name__ == "__main__":

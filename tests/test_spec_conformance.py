@@ -50,6 +50,7 @@ RAGGED_ARRAYS = [
     ("kitchen_sink", "h_tdigest_noise", "float32", (2,)),
     ("kitchen_sink", "h_tdigest_signal_locations", "uint64", ()),
     ("kitchen_sink", "h_tdigest_noise_locations", "uint64", ()),
+    ("flux", "rx_flux", "float32", (2,)),
 ]
 SENTINEL = 2**64 - 1
 
@@ -66,6 +67,9 @@ FROZEN_COMBINED = {
     # column/'s LEAF is minimal's, byte for byte — the same literal is the
     # cross-fixture pin that writing a column perturbs nothing.
     "column": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
+    # The §2.0 flux fixture (issue #424) — asserted by TestFluxDeclaration
+    # (flux is not in FIXTURES: the leaf-shaped suite hardcodes h_tdigest).
+    "flux": "910a9b12d34b4d072f454b2dd1cc232a6a9a92b536a8d26f5395154a1c02bc32",
 }
 #: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
 #: its leaf, which is ``minimal``'s): the only committed store whose §5 key
@@ -84,6 +88,7 @@ FROZEN_ARRAYS = {
         "kitchen_sink",
         "6/composition",
     ): "04886a9dfb60c8a53de48202dc3d5ac694698864825426f084be961aa678acd5",
+    ("flux", "6/rx_flux"): "3ba141cb29b1771dee4c4c3f2aadec42b7de69e075d4334d6d7187301dc59eb8",
 }
 
 
@@ -304,6 +309,94 @@ class TestDigestPayload:
         got = sorted(np.concatenate([locs for _w, _rc, locs in rows]).tolist())
         want = sorted(int(w) for c in exp["cells"] for w in c["h_tdigest_signal_locations"])
         assert got == want
+
+
+class TestFluxDeclaration:
+    """§2.0 — the weights declaration, pinned on the committed `flux/` store.
+
+    The counts side of the contract needs no new fixture: `minimal/` predates
+    §2.0 and is deliberately not regenerated, so its absent `weights` key IS
+    the committed absent-key ⇒ counts pin (issue #424).
+    """
+
+    def test_weights_key_is_a_sibling_of_the_ragged_block(self):
+        exp = _expected("flux")
+        attrs = _array_meta("flux", exp, "rx_flux")["attributes"]
+        assert attrs["weights"] == "flux"
+        # A sibling key, never inside the versioned block: the block is
+        # retired wholesale under /2, a sibling survives the migration.
+        assert "weights" not in attrs["ragged"]
+        assert attrs["ragged"]["spec"] == "zagg-ragged/1"
+
+    def test_calibration_provenance_recorded(self):
+        exp = _expected("flux")
+        attrs = _array_meta("flux", exp, "rx_flux")["attributes"]
+        assert attrs["gain"] == exp["gain"]
+        assert {"name", "version"} <= set(attrs["gain"])
+
+    def test_fold_arrays_re_declare_weights_and_gain(self):
+        """A fold's own payload arrays carry §2.0 through (review, issue #424).
+
+        The overview/column writer reconstructs its template from the manifest
+        field entry alone, so a declaration that stops at the leaf leaves every
+        folded array reading as ``counts`` — and the fold gate then refuses the
+        whole cascade above the finest level.
+        """
+        exp = _expected("flux")
+        column = _leaf_dir("flux", exp).parent / "all.pyramid.zarr"
+        groups = sorted(p.name for p in column.iterdir() if p.is_dir())
+        assert groups  # the fixture's §4.6 column, folded from the flux leaf
+        for group in groups:
+            meta = json.loads((column / group / "rx_flux" / "zarr.json").read_text())
+            attrs = meta["attributes"]
+            assert attrs["weights"] == "flux"
+            assert attrs["gain"] == exp["gain"]
+            assert "weights" not in attrs["ragged"]  # sibling key, never inside
+
+    def test_absent_key_reads_as_counts_on_the_committed_minimal(self):
+        from zagg.grids.base import weights_declaration
+
+        exp = _expected("minimal")
+        attrs = _array_meta("minimal", exp, "h_tdigest")["attributes"]
+        assert "weights" not in attrs
+        assert weights_declaration(attrs) == "counts"
+
+    def test_flux_weights_are_positive_fractional_reals(self):
+        exp = _expected("flux")
+        store = _leaf_store("flux", exp)
+        non_integer = 0
+        for cell in exp["cells"]:
+            got = read_cell(store, f"{exp['group']}/rx_flux", cell["index"])
+            want = np.array(cell["rx_flux"], dtype=np.float32).reshape(-1, 2)
+            np.testing.assert_array_equal(got, want)
+            assert np.all(got[:, 1] > 0)  # §2.0: positive, no zero-weight rows
+            assert np.all(np.diff(got[:, 0]) >= 0)  # §2.1 ordering unchanged
+            total = float(got[:, 1].astype(np.float64).sum())
+            assert total == cell["flux_sum"]
+            non_integer += int(total != round(total))
+        assert non_integer  # flux sums are photoelectron estimates, not counts
+
+    def test_leaf_is_stamped_and_manifest_marked(self):
+        exp = _expected("flux")
+        attrs = json.loads((_leaf_dir("flux", exp) / "zarr.json").read_text())["attributes"]
+        assert attrs["morton_hive_commit"]["complete"] is True
+        manifest = json.loads((SPEC_DATA / "flux" / "morton_hive.json").read_text())
+        assert manifest["spec"] == "morton-hive/1"
+
+    def test_per_array_hashes_match_golden(self):
+        exp = _expected("flux")
+        got = TestContentHashes._hash_leaf(_leaf_dir("flux", exp))
+        assert got == exp["content_hashes"]["arrays"]
+
+    def test_frozen_digests_pin_the_recipe(self):
+        # flux is not in FIXTURES (the leaf-shaped suite hardcodes h_tdigest),
+        # so its frozen literals are asserted here.
+        exp = _expected("flux")
+        assert exp["content_hashes"]["combined"] == FROZEN_COMBINED["flux"]
+        arrays = exp["content_hashes"]["arrays"]
+        assert arrays["6/rx_flux"] == FROZEN_ARRAYS[("flux", "6/rx_flux")]
+        combined = hashlib.sha256("\n".join(sorted(arrays.values())).encode()).hexdigest()
+        assert combined == exp["content_hashes"]["combined"]
 
 
 class TestCoordinateAndDense:
@@ -763,6 +856,14 @@ class TestColumnArtifact:
         assert block["node"] == exp["shard"] and block["order"] == exp["shard_order"]
         assert block["source_cell_order"] == exp["cell_order"]
         assert block["window"] == "all"
+        # §4.6's decode-without-the-manifest keys on an approximate entry —
+        # including ``overview_delta``, the budget this column's fold actually
+        # compressed at (issue #424), which the committed bytes must carry for
+        # a spec-and-fixtures reader to see it.
+        entry = block["fields"]["h_tdigest"]
+        assert entry["class"] == "approximate" and entry["method"] == "tdigest_kway"
+        assert {"delta", "overview_delta", "dtype", "inner_shape"} <= set(entry)
+        assert entry["overview_delta"] == exp["delta"]
 
     def test_stamp_is_present_and_field_pinned(self):
         exp = _expected(COLUMN)

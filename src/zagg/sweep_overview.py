@@ -191,6 +191,55 @@ def encode_digest(digest: np.ndarray, dtype) -> bytes:
     return np.ascontiguousarray(np.asarray(digest, dtype=dt)).tobytes()
 
 
+#: Default cap on the pyramid-fold compression budget (issue #424). Overview
+#: digests are governed by the ~1/δ quantile-accuracy bound (512 → ~0.2%),
+#: not the leaf's loss-free bound — and the cap also bounds the sweep's
+#: chunk-batched k-way fold buffers (4 children × δ × cells), which saturate
+#: toward ~1 GB per slab at a δ=8,192 leaf budget vs ~33 MB here.
+OVERVIEW_DELTA_CAP = 512
+
+
+def overview_fold_delta(meta: dict) -> int:
+    """The δ an overview/pyramid/column fold compresses at (issue #424).
+
+    A declared ``overview_delta`` (manifest field entry / config field key)
+    wins. Absent — every pre-#424 manifest — the leaf ``delta`` capped at
+    :data:`OVERVIEW_DELTA_CAP`: identical to the historical fold-at-leaf-δ
+    behavior for every manifest ever written (all carried δ ≤ 512), while a
+    raised leaf δ no longer saturates the fold buffers. Leaf-side builds and
+    streaming/spill folds are NOT overview folds and keep the leaf δ — only
+    the first fold level ever sees leaf-δ inputs, and those are bounded by
+    actual observations, not δ.
+    """
+    declared = meta.get("overview_delta")
+    if declared is not None:
+        return int(declared)
+    return min(int(meta.get("delta") or OVERVIEW_DELTA_CAP), OVERVIEW_DELTA_CAP)
+
+
+def check_weights_match(attrs, meta: dict, field: str) -> None:
+    """Refuse a digest fold across mismatched §2.0 weights declarations (#424).
+
+    Merges are legal only between payloads carrying the same declaration
+    (spec §2.0): folding a counts payload under a flux declaration (or vice
+    versa) would produce a weight column whose sum means neither thing. The
+    manifest's declared value (absent ⇒ counts, like the attrs key itself) is
+    the store-wide truth; a source array disagreeing with it raises here,
+    which the per-leaf/per-child fold guards turn into a loud skip rather
+    than a silent mixed merge.
+    """
+    from zagg.grids.base import weights_declaration
+
+    stored = weights_declaration(dict(attrs or {}))
+    declared = meta.get("weights") or "counts"
+    if stored != declared:
+        raise ValueError(
+            f"field {field!r}: stored weights declaration {stored!r} does not match "
+            f"the manifest's {declared!r} — merges are legal only between matching "
+            f"declarations (spec §2.0, issue #424)"
+        )
+
+
 def fold_digests(cell_digests: list, *, delta: int, dtype="float32") -> bytes:
     """Merge one overview cell's accumulated t-digests into its payload bytes.
 
@@ -702,8 +751,15 @@ def _field_drift(group, name, meta) -> str | None:
     with a worse error. ``zagg-ragged/2`` is a live migration path (issue
     #210 moves the element declaration into the zarr data type), so this is
     not hypothetical (espg-ruled, issue #358).
+
+    The same branch gates the §2.0 ``weights`` declaration for the same
+    reason (issue #424): it is what :func:`check_weights_match` refuses a
+    fold over, so a disagreement caught here is the retrofit refusing, and
+    one missed here is every leaf warning at fold time. A stored value this
+    zagg does not define RAISES out of the probe rather than reporting drift
+    — that store is unreadable, not merely mis-declared.
     """
-    from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC
+    from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC, weights_declaration
 
     try:
         arr = group[name]
@@ -739,6 +795,20 @@ def _field_drift(group, name, meta) -> str | None:
         declared_inner = [int(s) for s in meta.get("inner_shape") or [2]]
         if stored_inner != declared_inner:
             return f"field {name!r}: ragged inner_shape {stored_inner} != declared {declared_inner}"
+        # The §2.0 weights declaration is one more thing a leaf can falsify,
+        # and it is stamped on the array this probe already opened: absent it
+        # here, ``declare_pyramid`` installs a flux declaration over a counts
+        # store cleanly, and every leaf then fails ``check_weights_match`` at
+        # FOLD time as a per-leaf warning (review finding, issue #424).
+        # Absent on either side is counts, exactly as the fold gate reads it.
+        stored_weights = weights_declaration(dict(arr.attrs))
+        declared_weights = meta.get("weights") or "counts"
+        if stored_weights != declared_weights:
+            return (
+                f"field {name!r}: stored weights declaration {stored_weights!r} != "
+                f"declared {declared_weights!r} — merges are legal only between "
+                f"matching declarations (spec §2.0)"
+            )
     elif meta["class"] == "exact":
         declared_dt = np.dtype(meta.get("dtype") or "float32")
         if arr.dtype != declared_dt:
@@ -1306,7 +1376,7 @@ def _fold_node(
                 cell_digests: dict = {}
                 for name, meta in fields.items():
                     try:
-                        values = group[name][:]
+                        arr = group[name]
                     except KeyError:
                         # Schema evolution: the field postdates this leaf — it
                         # contributes fill, exactly what re-running would write.
@@ -1314,9 +1384,13 @@ def _fold_node(
                         continue
                     if meta["class"] == "exact":
                         partials[name] = fold_dense(
-                            values, fold_factor, meta.get("method"), meta.get("fill_value", "NaN")
+                            arr[:], fold_factor, meta.get("method"), meta.get("fill_value", "NaN")
                         )
                     else:
+                        # Mismatched §2.0 weights declarations refuse to merge
+                        # (issue #424); the enclosing guard skips the leaf loudly.
+                        check_weights_match(dict(arr.attrs), meta, name)
+                        values = arr[:]
                         dtype = meta.get("dtype") or "float32"
                         inner = tuple(meta.get("inner_shape") or (2,))
                         cell_digests[name] = [
@@ -1350,7 +1424,7 @@ def _fold_node(
         for j, cell in enumerate(acc):
             if cell:
                 slab[j] = fold_digests(
-                    cell, delta=int(meta.get("delta") or 512), dtype=meta.get("dtype") or "float32"
+                    cell, delta=overview_fold_delta(meta), dtype=meta.get("dtype") or "float32"
                 )
         slabs[name] = slab
     stamps = [t for t in timestamps if t is not None]
@@ -1534,18 +1608,22 @@ def _fold_child(group, fields, factor, span, path) -> dict:
     partials: dict = {}
     for name, meta in fields.items():
         try:
-            values = group[name][:]
+            arr = group[name]
         except KeyError:
             logger.debug(f"sweep[overview]: overview {path} lacks field {name!r}")
             continue
         if meta["class"] == "exact":
             partials[name] = fold_dense(
-                values, factor, meta.get("method"), meta.get("fill_value", "NaN")
+                arr[:], factor, meta.get("method"), meta.get("fill_value", "NaN")
             )
             continue
+        # Mismatched §2.0 weights declarations refuse to merge (issue #424);
+        # the enclosing per-child guard skips the child loudly.
+        check_weights_match(dict(arr.attrs), meta, name)
+        values = arr[:]
         dtype = meta.get("dtype") or "float32"
         inner = tuple(meta.get("inner_shape") or (2,))
-        delta = int(meta.get("delta") or 512)
+        delta = overview_fold_delta(meta)
         folded = np.full(span, b"", dtype=object)
         for j in range(span):
             cell = [
@@ -1641,6 +1719,15 @@ def _overview_config(fields):
     The overview zarr reuses the leaf template machinery
     (``HealpixGrid.emit_shard_template``) so structure — dtypes, fills, the
     D18 ragged attrs, the D16 dggs attrs — cannot drift from source leaves.
+
+    The §2.0 ``weights`` declaration (and the ``gain`` provenance §2.0 makes
+    REQUIRED beside it) is carried through from the manifest field entry
+    (:func:`zagg.pyramid.declared_fields`), because the overview's payload IS
+    the fold of its sources' weights: a bare template would declare the fold
+    of a flux store as counts, and :func:`check_weights_match` would then
+    refuse every child of the cascade (review finding, issue #424). Both keys
+    are absent on a counts field, so a counts store's template bytes are
+    unchanged.
     """
     from zagg.config import PipelineConfig
 
@@ -1660,6 +1747,10 @@ def _overview_config(fields):
                 "dtype": meta.get("dtype", "float32"),
                 "fill_value": 0,
             }
+            if meta.get("weights") not in (None, "counts"):
+                variables[name]["weights"] = meta["weights"]
+                if meta.get("gain") is not None:
+                    variables[name]["attrs"] = {"gain": meta["gain"]}
     return PipelineConfig(
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},

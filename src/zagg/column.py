@@ -55,6 +55,58 @@ COLUMN_ROLE = "column"
 LEAF_REGIME = "leaf-column"
 
 
+def generation_key(block) -> tuple:
+    """The staged sweep's skip-gate key over a summed ``generation`` block.
+
+    ``(n_leaves, max_leaf_timestamp, run ids)`` — the block the stage worker
+    records in these attrs and in the ladder entries it writes (§4.4/§4.6).
+    The run ids are the issue #417 term: stamps resolve to **one second**, so
+    the count/timestamp pair alone reads a same-second rewrite of a child at
+    an unchanged leaf count as *current* and serves stale content. Every
+    stage stamp carries its ``run_id`` (PR #416 phase 2), so a foreign
+    rewrite moves the id set, and the single-writer law forbids a run
+    rewriting its own object mid-run. A block without ``run_ids`` (pre-#417,
+    or children that are all fleet-written leaf columns — those stamps carry
+    no run id) keys on the empty tuple, never on a wildcard: an upgraded
+    store re-folds once rather than inheriting the blind spot. A non-block
+    keys on ``()``, which matches no generation.
+
+    ``run_ids`` is compared as a SET: the recorded list is read back off an
+    artifact this process did not write, so its order is not a property to
+    assume (review finding — an unsorted or duplicated list would otherwise
+    re-fold a whole ladder for nothing).
+    """
+    if not isinstance(block, dict):
+        return ()
+    return (
+        int(block.get("n_leaves") or 0),
+        block.get("max_leaf_timestamp"),
+        tuple(sorted(set(block.get("run_ids") or ()))),
+    )
+
+
+def stamped_generation_key(block, stamp) -> tuple:
+    """One child's contribution to its parent's skip key (issue #417).
+
+    :func:`generation_key` over the child's recorded ``generation`` block —
+    or, for a leaf column (which records none), the leaf identity: one leaf
+    at its stamp's timestamp — **unioned with the run id that stamped THIS
+    child**. That id is the term the issue turns on: the run that wrote the
+    child is what a same-second foreign rewrite changes, and reading the
+    relayed block alone would see only the ids of the child's own children
+    (empty all the way down a fleet-built store, so the gate would fall back
+    to the count/timestamp pair it is meant to strengthen). Fleet-written
+    stamps carry no ``run_id`` and contribute nothing.
+    """
+    stamp = stamp if isinstance(stamp, dict) else {}
+    if not isinstance(block, dict):
+        block = {"n_leaves": 1, "max_leaf_timestamp": stamp.get("written_at")}
+    runs = set(block.get("run_ids") or ())
+    if stamp.get("run_id"):
+        runs.add(stamp["run_id"])
+    return generation_key({**block, "run_ids": sorted(runs)})
+
+
 def column_resolutions(levels: list, node_order: int) -> list[int]:
     """The resolutions a leaf-node column carries, finest first (issue #383).
 
@@ -167,7 +219,7 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
     a fractional fold factor, which no guard downstream can read as a divisor
     (both classes would surface it as an opaque numpy failure instead).
     """
-    from zagg.sweep_overview import decode_digest, fold_dense, fold_digests
+    from zagg.sweep_overview import decode_digest, fold_dense, fold_digests, overview_fold_delta
 
     cell_order = int(cell_order)
     fields = composable_fields(fields)
@@ -192,7 +244,7 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
             else:
                 dtype = meta.get("dtype") or "float32"
                 inner = tuple(meta.get("inner_shape") or (2,))
-                delta = int(meta.get("delta") or 512)
+                delta = overview_fold_delta(meta)
                 if slab.shape[0] % factor:
                     raise ValueError(
                         f"cannot fold {slab.shape[0]} cells {factor}-to-one for {name!r}"
@@ -223,11 +275,14 @@ def _column_provenance(meta: dict) -> dict:
     shared helper — the overview's identical gap is a spec call for the
     issue #383 phase 4 section, not a reason to leave this artifact short.
     """
-    from zagg.sweep_overview import _field_provenance
+    from zagg.sweep_overview import _field_provenance, overview_fold_delta
 
     entry = dict(_field_provenance(meta))
     if meta.get("class") == "approximate":
         entry["delta"] = int(meta.get("delta") or 512)
+        # The budget the column fold actually compressed at (issue #424):
+        # the split overview_delta, not the leaf δ.
+        entry["overview_delta"] = overview_fold_delta(meta)
         entry["dtype"] = meta.get("dtype") or "float32"
         entry["inner_shape"] = list(meta.get("inner_shape") or (2,))
     return entry

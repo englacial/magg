@@ -510,6 +510,30 @@ class TestReadTensors:
         with pytest.raises(ValueError, match="understands 'zagg-ragged/1' only"):
             list(read_tensors(store, "12/h_tdigest"))
 
+    def test_unknown_weights_declaration_raises(self):
+        # Spec §2.0 (issue #424): an undefined declaration is a future
+        # revision of that section and MUST be refused, never read as either
+        # defined value. The reader is the party that MUST is addressed to.
+        store, _g, _w = _build_store({_KEY_A: {0: np.array([1.0, 2.0])}})
+        arr = zarr.open_array(store, path="12/h_tdigest", mode="r+")
+        arr.attrs["weights"] = "photons"
+        with pytest.raises(ValueError, match="unknown weights declaration"):
+            list(read_tensors(store, "12/h_tdigest"))
+        with pytest.raises(ValueError, match="unknown weights declaration"):
+            read_cell(store, "12/h_tdigest", 0)
+
+    def test_defined_weights_declarations_open(self):
+        # Both DEFINED values read: what the readers BIND of flux semantics
+        # is issue #426's read-validation phase, so the gate refuses only the
+        # undefined ones (an absent key is "counts" — every other test here).
+        rng = np.random.default_rng(19)
+        for declared in ("counts", "flux"):
+            store, _g, _w = _build_store({_KEY_A: {0: rng.uniform(0.0, 30.0, 500)}})
+            arr = zarr.open_array(store, path="12/h_tdigest", mode="r+")
+            arr.attrs["weights"] = declared
+            blocks = list(read_tensors(store, "12/h_tdigest", dtype="float32"))
+            assert len(blocks) == 1
+
     def test_garbage_element_dtype_raises_pointed(self):
         # A corrupt dtype string surfaces as this layout's pointed error, not
         # a bare numpy TypeError with no mention of the field or contract.
