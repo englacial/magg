@@ -895,9 +895,10 @@ class TestFootprintCells:
             all_shards = {
                 int(s) for s in hp_grid.coverage(shardmap._region_parts(region, cat.metadata))
             }
-            values, offsets, order, rows = shardmap._footprint_cells_plan(
-                cat, records, hp_grid, "mortie", "swath", None
+            values, offsets, order, rows, considered = shardmap._footprint_cells_plan(
+                cat, hp_grid, "mortie", "swath", None
             )
+            assert considered == len(records), "the plan must count the records it aligns"
             assert order == index_order, "the plan must carry the column's own order"
             oracle = _intersect_cells_serial(rows, values, offsets, hp_grid, all_shards)
             assigned = {g for v in oracle.values() for g in v}
@@ -933,9 +934,8 @@ class TestFootprintCells:
         #   an earlier record and fail the equality.
         items = [_item(f"G{i}", -76.62 + 0.15 * i, -76.60 + 0.15 * i) for i in range(10)]
         cat = _catalog(items).index_footprints(11)
-        records = cat.granule_records()
-        values, offsets, _order, rows = shardmap._footprint_cells_plan(
-            cat, records, hp_grid, "mortie", "swath", None
+        values, offsets, _order, rows, _considered = shardmap._footprint_cells_plan(
+            cat, hp_grid, "mortie", "swath", None
         )
 
         def box(w, e, s=38.84, n=38.94):
@@ -954,7 +954,7 @@ class TestFootprintCells:
 
         for block in (1, 3, 4, 10):
             assert run(box(-76.63, -75.24, s=-40.0, n=-39.9), block) == set()
-            assert run(box(-76.63, -75.24), block) == set(range(len(records)))
+            assert run(box(-76.63, -75.24), block) == set(range(rows.size))
             # Records 4 and 5 exactly -- a middle run, so ``surv[0] != 0`` and
             # the trailing records are dropped too.
             assert run(box(-76.03, -75.84), block) == {4, 5}
@@ -974,9 +974,8 @@ class TestFootprintCells:
 
         items = [_item(f"G{i}", -76.62 + 0.05 * i, -76.60 + 0.05 * i) for i in range(6)]
         cat = _catalog(items).index_footprints(11)
-        records = cat.granule_records()
-        values, offsets, _order, rows = shardmap._footprint_cells_plan(
-            cat, records, hp_grid, "mortie", "swath", None
+        values, offsets, _order, rows, _considered = shardmap._footprint_cells_plan(
+            cat, hp_grid, "mortie", "swath", None
         )
         far = [
             (
@@ -1003,10 +1002,9 @@ class TestFootprintCells:
         import mortie
 
         cat = _overlapping_catalog().index_footprints(11)
-        records = cat.granule_records()
         all_shards = {int(s) for s in hp_grid.coverage(shardmap._region_parts(None, cat.metadata))}
-        values, offsets, _order, rows = shardmap._footprint_cells_plan(
-            cat, records, hp_grid, "mortie", "swath", None
+        values, offsets, _order, rows, _considered = shardmap._footprint_cells_plan(
+            cat, hp_grid, "mortie", "swath", None
         )
         real, calls = mortie.mocs_to_orders, []
 
@@ -1035,9 +1033,8 @@ class TestFootprintCells:
 
         items = [_item(f"G{i}", -76.62 + 0.15 * i, -76.60 + 0.15 * i) for i in range(8)]
         cat = _catalog(items).index_footprints(11)
-        records = cat.granule_records()
-        values, offsets, _order, rows = shardmap._footprint_cells_plan(
-            cat, records, hp_grid, "mortie", "swath", None
+        values, offsets, _order, rows, _considered = shardmap._footprint_cells_plan(
+            cat, hp_grid, "mortie", "swath", None
         )
 
         def box(w, e):

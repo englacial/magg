@@ -475,7 +475,7 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     return _regroup_hits(hit_shards, hit_owners)
 
 
-def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_order):
+def _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order):
     """Inputs for the :func:`_intersect_footprint_cells` fast path, or ``None``.
 
     Engages only on the shape the stored column can answer *exactly*, so a build
@@ -494,6 +494,19 @@ def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_orde
       a cover at *that* order, which the column cannot restate;
     - the grid is HEALPix and the catalog carries the column.
 
+    Takes no records and materializes none (issue #439): the plan is what lets
+    ``build`` intersect first and decode granules only for the rows that survive,
+    so it derives its own record alignment from the catalog's row screen.
+
+    Returns
+    -------
+    tuple or None
+        ``(values, offsets, order, rows, considered)``. ``rows`` maps record
+        index -> table row (``np.flatnonzero`` of the screen, which is exactly
+        the order :meth:`~zagg.catalog.Catalog.granule_records` emits) and
+        ``considered`` is the record count that alignment implies -- the
+        ``total_granules`` the eager path would have reported as ``len(records)``.
+
     Raises
     ------
     ValueError
@@ -509,6 +522,9 @@ def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_orde
         hands every earlier record with that id another granule's footprint --
         silently, since the shard count stays plausible. Refuse rather than
         misassign; the geometry path reads each record's own ring and is unaffected.
+        The check stays **table-wide**, not hits-only: it is a statement about the
+        catalog's integrity, so a duplicate among rows this build's AOI would have
+        discarded must refuse the build just as it did before the inversion.
     """
     if chosen != "mortie" or footprint != "swath" or mortie_order is not None:
         return None
@@ -526,18 +542,64 @@ def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_orde
             f"Catalog.index_footprints(order>={parent_order}), or build against a grid "
             f"with parent_order <= {order}."
         )
-    # ``granule_records`` skips rows with empty or non-polygonal geometry, so
-    # record index != table row; align on the granule id both sides carry.
-    row_of = {gid: i for i, gid in enumerate(catalog.table.column("id").to_pylist())}
-    if len(row_of) != catalog.table.num_rows:
+    import pyarrow.compute as pc
+
+    # ``mode="all"`` counts a null id as its own value, matching the id ->
+    # row dict this replaces (which the pre-#439 plan built from the whole
+    # column, unique-or-not, purely to align records back to rows).
+    distinct = pc.count_distinct(catalog.table.column("id"), mode="all").as_py()
+    if distinct != catalog.table.num_rows:
         raise ValueError(
-            f"catalog has duplicate granule ids ({catalog.table.num_rows - len(row_of)} "
+            f"catalog has duplicate granule ids ({catalog.table.num_rows - distinct} "
             f"repeats over {catalog.table.num_rows} rows); the footprint_cells column is "
             f"aligned to records by id, so a repeat would hand records another granule's "
             f"footprint. De-duplicate the catalog, or drop the column to build from geometry."
         )
-    rows = np.fromiter((row_of[r["id"]] for r in records), dtype=np.int64, count=len(records))
-    return values, offsets, order, rows
+    # ``granule_records`` skips rows with empty or non-polygonal geometry and
+    # keeps table order otherwise, so record ``i`` is the ``i``-th surviving
+    # row: the screen's ``flatnonzero`` *is* the record -> row map, and its
+    # popcount is the record count, neither needing a record. Ids no longer
+    # carry the alignment (they cannot -- there are no records yet), but a
+    # repeat still refuses above: it means the column cannot be trusted to
+    # belong to the rows it sits beside.
+    rows = np.flatnonzero(catalog.granule_row_mask()).astype(np.int64, copy=False)
+    return values, offsets, order, rows, int(rows.size)
+
+
+def _hit_records(catalog, rows, shard_to_idx):
+    """Decode granule records for the assigned rows only (issue #439).
+
+    The fast path intersects the stored column before any record exists, so the
+    indices in ``shard_to_idx`` are positions in the records the eager path
+    *would* have built. Take just the rows those indices name, decode that slice,
+    and renumber the assignment onto it -- at clone scale against a regional AOI
+    that is ~2.4k rows decoded instead of ~556k, which is the whole point.
+
+    Returns
+    -------
+    tuple
+        ``(records, shard_to_idx)`` -- records in ascending original-record
+        order, and the same dict with the same keys and per-shard ordering,
+        its values renumbered into ``records``.
+    """
+    if not shard_to_idx:
+        return [], shard_to_idx
+    from zagg.catalog.sources import Catalog
+
+    hits = np.unique(np.concatenate([np.asarray(v, dtype=np.int64) for v in shard_to_idx.values()]))
+    hit_rows = np.asarray(rows, dtype=np.int64)[hits]
+    records = Catalog(catalog.table.take(hit_rows), dict(catalog.metadata or {})).granule_records()
+    if len(records) != hits.size:
+        # Unreachable while the screen and ``granule_records`` share a
+        # predicate; if they ever diverge the renumbering below silently shifts
+        # every granule onto its neighbour's entry, so refuse instead.
+        raise ValueError(
+            f"footprint_cells row screen and granule_records disagree: {hits.size} rows taken "
+            f"yielded {len(records)} records. Drop the footprint_cells column to build from "
+            f"geometry, and report this (issue #439)."
+        )
+    renum = {int(h): i for i, h in enumerate(hits)}
+    return records, {k: [renum[i] for i in v] for k, v in shard_to_idx.items()}
 
 
 def _resolve_mortie_order(mortie_order, grid) -> int:
@@ -975,10 +1037,19 @@ class ShardMap:
         granule in shards the geometry path misses. A column **coarser** than the
         grid's ``parent_order`` raises rather than answering (see
         :func:`_footprint_cells_plan`).
+
+        That path also **materializes no granule records until after the
+        intersection** (issue #439). Decoding every row's WKB and asset map ran
+        ~25 s of a 29.5 s build over the 555,867-granule ATL03 clone against a
+        California AOI, to feed an intersection that assigned 2,357 of them; the
+        stored column is already table-row-ordered, so the build intersects on it
+        and then decodes only the rows it kept. The manifest is unchanged --
+        ``total_granules`` still counts the records *considered* (the whole
+        post-screen catalog), which :meth:`~zagg.catalog.Catalog.granule_row_mask`
+        supplies without decoding any.
         """
         if footprint not in ("swath", "beams"):
             raise ValueError(f"footprint must be 'swath' or 'beams' (got {footprint!r})")
-        records = catalog.granule_records()
         # Product short-name drives beam decomposition (collection like "ATL03_007").
         product = ((catalog.metadata or {}).get("collection") or "").split("_")[0].upper()
         if footprint == "beams":
@@ -1005,14 +1076,22 @@ class ShardMap:
         if chosen not in _BACKENDS:
             raise ValueError(f"unknown backend: {backend!r} (resolved to {chosen!r})")
 
-        t0 = time.perf_counter()
         # Fast path (issue #396): an indexed catalog already carries every
         # granule's MOC, so the build is set algebra against the AOI with no
         # geometry work. Resolved before the geometry backends because it is the
         # same mortie intersection they would run, minus the cover.
-        plan = _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_order)
+        plan = _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order)
+        # Records are the fast path's whole remaining cost -- shapely-parsing
+        # every row's WKB and ``to_pylist``-ing the nested assets column ran ~25 s
+        # of a 29.5 s clone-scale build, to feed an intersection that discards
+        # 99.6% of them (issue #439). So decode them AFTER the intersection
+        # there, for its hit rows only; every other path needs them all up front.
+        records = None if plan is not None else catalog.granule_records()
+        considered = plan[4] if plan is not None else len(records)
+
+        t0 = time.perf_counter()
         if plan is not None:
-            values, offsets, mortie_order, rows = plan
+            values, offsets, mortie_order, rows, _ = plan
             shard_to_idx = _intersect_footprint_cells(rows, values, offsets, grid, all_shards)
         elif chosen == "mortie":
             mortie_order = _resolve_mortie_order(mortie_order, grid)
@@ -1033,6 +1112,10 @@ class ShardMap:
                 product=product,
             )
         wall = time.perf_counter() - t0
+        if plan is not None:
+            # Outside the timer on purpose: ``build_wall_s`` has always meant the
+            # intersection's wall, with record decode outside it.
+            records, shard_to_idx = _hit_records(catalog, rows, shard_to_idx)
 
         from zagg.catalog.sources import FOOTPRINT_CELLS_ORDER
 
@@ -1042,7 +1125,7 @@ class ShardMap:
             **(catalog.metadata or {}),
             "backend": chosen,
             "footprint": footprint,
-            "total_granules": len(records),
+            "total_granules": considered,
             # Distinct granules the exact intersection ASSIGNED to some shard —
             # ``total_granules`` above is the catalog records CONSIDERED (the
             # input, often a conservative bbox-prefilter superset), and reading
