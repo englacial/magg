@@ -513,6 +513,39 @@ class Catalog:
             keep |= (lon0 <= b_lon1) & (lon1 >= b_lon0) & (lat0 <= b_lat1) & (lat1 >= b_lat0)
         return Catalog(self.table.take(np.flatnonzero(keep)), dict(self.metadata))
 
+    def granule_row_mask(self) -> np.ndarray:
+        """Boolean mask over table rows of the rows :meth:`granule_records` emits.
+
+        :meth:`granule_records` skips rows whose geometry is empty or not
+        polygonal, so record ``i`` is table row ``np.flatnonzero(mask)[i]`` and
+        ``mask.sum()`` is the record count -- both without decoding a single
+        record. Same predicate as the row-wise loop, applied with one batched
+        ``shapely.from_wkb`` instead of one call per row.
+
+        Two callers need the alignment without the records:
+        :meth:`index_footprints`, which gives screened rows an empty MOC so the
+        column stays one entry per table row, and ``ShardMap.build``'s
+        stored-index fast path, which intersects on the column *before*
+        materializing anything (issues #396, #439).
+
+        Returns
+        -------
+        numpy.ndarray
+            ``bool``, length ``table.num_rows``.
+
+        Notes
+        -----
+        Time is small (0.02 s over the 35,639-granule 88S catalog, ~0.3 s over
+        the 555,867-row ATL03 clone) but memory is not: the ``to_numpy`` WKB
+        copy plus the live shapely objects put the clone's RSS ~1 GB over the
+        parquet read. It is a peak, not a leak -- the objects die with the call.
+        """
+        import shapely
+
+        geoms = shapely.from_wkb(self.table.column("geometry").to_numpy(zero_copy_only=False))
+        # geom_type ids 3 and 6 are Polygon and MultiPolygon.
+        return ~shapely.is_empty(geoms) & np.isin(shapely.get_type_id(geoms), (3, 6))
+
     def index_footprints(self, order: int) -> "Catalog":
         """Precompute the ``footprint_cells`` morton MOC column (issue #396).
 
@@ -567,25 +600,25 @@ class Catalog:
         geometry -- are screened out with the **same** shapely predicate it uses
         and get an empty MOC, so the column stays one entry per table row and a
         catalog carrying a stray ``Point`` indexes rather than raising (mortie's
-        coverage refuses a point outright, naming the blob). The screen decodes
-        the WKB once with vectorised ``shapely.from_wkb``; on the 35,639-granule
-        88S catalog that is 0.02 s against 2.65 s for the order-9 cover, so it
-        costs under 1% of a pass that runs once per catalog.
+        coverage refuses a point outright, naming the blob). The screen is
+        :meth:`granule_row_mask` -- one vectorised ``shapely.from_wkb``, shared
+        with ``ShardMap.build``'s fast path; on the 35,639-granule 88S catalog
+        it is 0.02 s against 2.65 s for the order-9 cover, so it costs under 1%
+        of a pass that runs once per catalog.
 
         The screen is cheap in time but it is this pass's **peak in memory**, and
         it is the term ``from_wkbs``'s chunking does not bound: on the
         555,867-row ATL03 clone RSS goes 835 MB after the parquet read -> 1,169
         MB after ``to_numpy`` (a full WKB copy) -> 1,794 MB with the shapely
-        objects live. ``del geoms`` keeps that from stacking with the cover, so
-        it is a peak rather than a leak, but a whole-clone index wants headroom
-        for it. The ``keep.all()`` short-circuit below avoids a second ~334 MB
-        WKB copy in the case that actually occurs (nothing screened out --
+        objects live. They die with ``granule_row_mask``'s frame, so that stays
+        a peak rather than stacking with the cover, but a whole-clone index
+        wants headroom for it. The ``keep.all()`` short-circuit below avoids a
+        second ~334 MB WKB copy in the case that actually occurs (nothing screened out --
         every catalog in the tree). Reading the geometry-type word straight out
         of the WKB, or chunking the ``from_wkb`` call, would drop the screen's
         peak entirely; not done here because it trades the shared shapely
         predicate for a hand-rolled one.
         """
-        import shapely
         from mortie.arrow import from_morton_index, from_wkbs
 
         from zagg.catalog.shardmap import MORTIE_MOC_ORDER_CAP
@@ -598,10 +631,9 @@ class Catalog:
                 f"order <= {MORTIE_MOC_ORDER_CAP} (the grid's parent_order is the right choice)."
             )
         column = self.table.column("geometry")
-        geoms = shapely.from_wkb(column.to_numpy(zero_copy_only=False))
-        # geom_type ids 3 and 6 are Polygon and MultiPolygon.
-        keep = ~shapely.is_empty(geoms) & np.isin(shapely.get_type_id(geoms), (3, 6))
-        del geoms
+        # The shapely objects the screen decodes die with the call, so its peak
+        # does not stack with the cover below (see ``granule_row_mask``).
+        keep = self.granule_row_mask()
         if keep.all():
             values, kept_offsets = from_wkbs(column, order=int(order))
         elif keep.any():
