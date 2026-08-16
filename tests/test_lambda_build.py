@@ -592,7 +592,7 @@ class TestLayerExtraParity:
 
     # Distributions whose layer spec build_layer.sh *derives* from
     # ``[project.dependencies]`` instead of hard-coding (issue #322), keyed to the
-    # shell fragment that does the deriving. No literal ``"name==x.y.z"`` string
+    # shell fragment that does the deriving. No literal ``name==x.y.z`` string
     # exists for these, so the substring check below cannot apply — and the two
     # mechanisms are mutually exclusive: an exact pin added to the ``lambda`` extra
     # would not reach the layer, which the failure message has to say out loud.
@@ -623,8 +623,8 @@ class TestLayerExtraParity:
         Since PR #436 the script derives each exact pin from the extra at build
         time (extending issue #322's mortie pattern), so the contract inverts:
         every pinned name must be *fetched* via ``$(lambda_pin name)``, and no
-        literal ``"name==x.y.z"`` may exist in the script — a literal would be
-        a second declaration site, exactly the drift this closes.
+        literal ``name==x.y.z`` may exist in the script in any quoting — a
+        literal is a second declaration site, exactly the drift this closes.
 
         Deriving alone is not enough: the assignment block sits far from the
         installs, so a pin can be fetched and never passed to pip — the issue
@@ -662,7 +662,10 @@ class TestLayerExtraParity:
                 missing.append(name)
             elif f'"${var}"' not in installs:
                 uninstalled.append(f"{name} (${var})")
-            if re.search(rf'"{re.escape(name)}==', script):
+            # Unquoted and single-quoted args are as common as double-quoted
+            # ones here (`fastparquet cramjam`, `obspec`), so anchor on a name
+            # boundary + a version-ish tail instead of a leading quote.
+            if re.search(rf"(?<![\w.-]){re.escape(name)}==\d", script):
                 literal.append(name)
         assert not missing, (
             f"lambda-extra pins not derived in deployment/aws/build_layer.sh: {missing} "
