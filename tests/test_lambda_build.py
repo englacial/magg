@@ -599,32 +599,85 @@ class TestLayerExtraParity:
     _DERIVED = {"mortie": "MORTIE_SPEC=$("}
 
     def test_every_lambda_extra_pin_is_in_build_layer(self):
+        """Every exact ``lambda`` pin reaches the layer via ``lambda_pin`` derivation.
+
+        Since PR #436 the script derives each exact pin from the extra at build
+        time (extending issue #322's mortie pattern), so the contract inverts:
+        every pinned name must be *fetched* via ``$(lambda_pin name)``, and no
+        literal ``"name==x.y.z"`` may exist in the script — a literal would be
+        a second declaration site, exactly the drift this closes.
+        """
         import tomllib
 
         pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
         pins = pyproject["project"]["optional-dependencies"]["lambda"]
         script = (REPO_ROOT / "deployment" / "aws" / "build_layer.sh").read_text()
         missing = []
+        literal = []
         derived = []
         for pin in pins:
             m = re.match(r"([A-Za-z0-9._-]+)==([A-Za-z0-9.]+)$", pin)
             if not m:  # unpinned entries (cramjam, astropy) aren't layer-exact
                 continue
-            if m.group(1) in self._DERIVED:
+            name = m.group(1)
+            if name in self._DERIVED:
                 derived.append(pin)
                 continue
-            if f'"{pin}"' not in script:
-                missing.append(pin)
+            if f"$(lambda_pin {name})" not in script:
+                missing.append(name)
+            if re.search(rf'"{re.escape(name)}==', script):
+                literal.append(name)
         assert not missing, (
-            f"lambda-extra pins absent from deployment/aws/build_layer.sh: {missing} "
-            "(the layer would ship without them — see issue #218's async-tiff gap)"
+            f"lambda-extra pins not derived in deployment/aws/build_layer.sh: {missing} "
+            "(the layer would ship without them — see issue #218's async-tiff gap; "
+            "fetch each with NAME_PIN=$(lambda_pin <name>))"
+        )
+        assert not literal, (
+            f"build_layer.sh hard-codes {literal} — exact pins are single-sourced from "
+            "the lambda extra via lambda_pin (PR #436); a literal pin is a second "
+            "declaration site and will drift"
         )
         assert not derived, (
             f"{derived} is pinned in the lambda extra, but build_layer.sh derives that "
             "spec from [project.dependencies] (issue #322), so the exact pin never "
             "reaches the layer. Either move the pin to [project.dependencies], or "
-            "replace the derivation in build_layer.sh with a literal pin."
+            "derive it from the extra via lambda_pin instead."
         )
+
+    def test_lambda_pin_derivation_resolves_every_exact_pin(self):
+        """Execute the script's ``lambda_pin`` python: its output IS the extra's pin.
+
+        The parity test above matches text; this one runs the actual extraction
+        snippet out of build_layer.sh against the real pyproject.toml, so a
+        broken derivation (renamed table, quoting slip, a name it cannot find)
+        fails here instead of at layer-build time.
+        """
+        import subprocess
+        import sys
+        import tomllib
+
+        script = (REPO_ROOT / "deployment" / "aws" / "build_layer.sh").read_text()
+        m = re.search(r"lambda_pin\(\)\s*\{\s*\$PYTHON -c '(.*?)'", script, re.DOTALL)
+        assert m, "lambda_pin() helper missing from build_layer.sh"
+        code = m.group(1)
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        pins = [
+            p
+            for p in pyproject["project"]["optional-dependencies"]["lambda"]
+            if "==" in p and p.split("==")[0].strip() not in self._DERIVED
+        ]
+        assert pins  # the extra stopped pinning anything: the layer is unpinned
+        for pin in pins:
+            name = pin.split("==")[0].strip()
+            out = subprocess.run(
+                [sys.executable, "-c", code, str(REPO_ROOT / "pyproject.toml"), name],
+                capture_output=True,
+                text=True,
+            )
+            assert out.returncode == 0, f"lambda_pin({name}) failed: {out.stderr}"
+            assert out.stdout.strip() == pin, (
+                f"lambda_pin({name}) derived {out.stdout.strip()!r}, extra declares {pin!r}"
+            )
 
     @staticmethod
     def _release(version):

@@ -89,26 +89,26 @@ dependencies = [
 
 [project.optional-dependencies]
 lambda = [
+    # This extra is the single source for every exact layer pin:
+    # deployment/aws/build_layer.sh derives each one at build time via its
+    # lambda_pin helper (PR #436, extending issue #322's mortie pattern), and
+    # tests/test_lambda_build.py fails on any literal pin reintroduced there.
     "numpy==2.2.6",
     "pandas==2.2.3",
     # arro3-core replaces pyarrow as the deployed-worker Arrow carrier (issue #130).
-    # Keep this pin in sync with deployment/aws/build_layer.sh.
     "arro3-core==0.8.1",
     "h5coro==1.0.5",
-    # Keep this pin in sync with deployment/aws/build_layer.sh (abi3
-    # manylinux_2_28 wheels cover both layer arches, ~2.2 MB each).
+    # abi3 manylinux_2_28 wheels cover both layer arches, ~2.2 MB each.
     "h5coro-hidefix==0.3.2",
     "cramjam",
     "astropy",
-    # Keep this pin in sync with deployment/aws/build_layer.sh (abi3
-    # manylinux_2_28 wheels cover both layer arches, ~4 MB each) — issue #218.
+    # abi3 manylinux_2_28 wheels cover both layer arches, ~4 MB each — issue #218.
     "async-tiff==0.7.2",
     # The temporal worker (process_event, issue #220) reads xarray datasets and
     # opens NetCDF4/HDF5 bytes in-memory via the h5netcdf engine; h5coro is a
     # byte-range reader, not an xarray engine, so these must ship in the layer.
-    # Pins resolved against numpy==2.2.6/pandas==2.2.3 on the layer's python;
-    # keep in sync with deployment/aws/build_layer.sh (xarray must NOT be in
-    # its strip list).
+    # Pins resolved against numpy==2.2.6/pandas==2.2.3 on the layer's python
+    # (xarray must NOT be in build_layer.sh's strip list).
     "xarray==2026.7.0",
     "h5netcdf==1.8.1",
     "h5py==3.16.0",
