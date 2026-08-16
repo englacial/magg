@@ -598,6 +598,25 @@ class TestLayerExtraParity:
     # would not reach the layer, which the failure message has to say out loud.
     _DERIVED = {"mortie": "MORTIE_SPEC=$("}
 
+    @staticmethod
+    def _install_lines(script):
+        """The script's ``$PIP install`` invocations, backslash continuations joined.
+
+        Deriving a pin is only half the contract — it has to be handed to pip.
+        The installs span continuation lines (``build_layer.sh:93-96``), so a
+        raw per-line scan would miss most of them.
+        """
+        logical, buf = [], ""
+        for line in script.splitlines():
+            if line.endswith("\\"):
+                buf += line[:-1]
+                continue
+            logical.append(buf + line)
+            buf = ""
+        if buf:
+            logical.append(buf)
+        return [line for line in logical if "$PIP install" in line]
+
     def test_every_lambda_extra_pin_is_in_build_layer(self):
         """Every exact ``lambda`` pin reaches the layer via ``lambda_pin`` derivation.
 
@@ -606,13 +625,28 @@ class TestLayerExtraParity:
         every pinned name must be *fetched* via ``$(lambda_pin name)``, and no
         literal ``"name==x.y.z"`` may exist in the script — a literal would be
         a second declaration site, exactly the drift this closes.
+
+        Deriving alone is not enough: the assignment block sits far from the
+        installs, so a pin can be fetched and never passed to pip — the issue
+        #218 async-tiff gap in a new costume. The name -> shell-var mapping is
+        parsed out of the script (not hard-coded) so renaming a var cannot
+        quietly drop its install check, and each var must appear quoted on a
+        ``$PIP install`` line.
         """
         import tomllib
 
         pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
         pins = pyproject["project"]["optional-dependencies"]["lambda"]
         script = (REPO_ROOT / "deployment" / "aws" / "build_layer.sh").read_text()
+        pin_vars = {
+            name: var
+            for var, name in re.findall(
+                r"^([A-Z0-9_]+_PIN)=\$\(lambda_pin (.+)\)$", script, re.MULTILINE
+            )
+        }
+        installs = "\n".join(self._install_lines(script))
         missing = []
+        uninstalled = []
         literal = []
         derived = []
         for pin in pins:
@@ -623,14 +657,22 @@ class TestLayerExtraParity:
             if name in self._DERIVED:
                 derived.append(pin)
                 continue
-            if f"$(lambda_pin {name})" not in script:
+            var = pin_vars.get(name)
+            if var is None:
                 missing.append(name)
+            elif f'"${var}"' not in installs:
+                uninstalled.append(f"{name} (${var})")
             if re.search(rf'"{re.escape(name)}==', script):
                 literal.append(name)
         assert not missing, (
             f"lambda-extra pins not derived in deployment/aws/build_layer.sh: {missing} "
             "(the layer would ship without them — see issue #218's async-tiff gap; "
             "fetch each with NAME_PIN=$(lambda_pin <name>))"
+        )
+        assert not uninstalled, (
+            f"lambda-extra pins derived but never installed: {uninstalled} — the layer "
+            'ships without them (issue #218). Pass each as "$NAME_PIN" on a $PIP '
+            "install line."
         )
         assert not literal, (
             f"build_layer.sh hard-codes {literal} — exact pins are single-sourced from "
