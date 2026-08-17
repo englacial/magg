@@ -113,8 +113,10 @@ from zagg.time_axis import DEFAULT_TIME_ENCODING
 #:
 #: * the same granules fetched with ``lpdaac`` creds, ``gesdisc`` creds, or an
 #:   ``anonymous`` open produce byte-identical leaves — a hash that moves with
-#:   the provider is a false product split, and ``anonymous`` (the other
-#:   spelling of the same choice) was already excluded;
+#:   the provider is a false product split. It is the same class as the read
+#:   knobs and as ``anonymous``, already excluded (a *class*, not one knob
+#:   under two names: ``anonymous`` is read only by the raster source-store
+#:   kwargs, ``credentials_provider`` only by the point and temporal paths);
 #: * the failure asymmetry is loud in the excluded direction and silent in the
 #:   included one: the wrong credential fails the *fetch* — a 403 at read time,
 #:   never a quiet wrong value — so nothing depends on the hash to catch it,

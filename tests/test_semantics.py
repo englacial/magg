@@ -132,8 +132,10 @@ class TestCanonicalization:
         # #449): the provider selects HOW source bytes are fetched -- which
         # registry name mints the DAAC credentials the dispatcher attaches to
         # every event (issue #213 Phase 4) -- never WHAT is computed, the same
-        # D19 class as reader/driver/read_plan. `anonymous`, the other spelling
-        # of the same choice, was already excluded.
+        # D19 class as reader/driver/read_plan, and the same class as the read
+        # knobs and as `anonymous`, already excluded -- the same class, not one
+        # knob under two names (`anonymous` is read only by the raster
+        # source-store kwargs, this key only by the point/temporal paths).
         from zagg.semantics import DATA_SOURCE_PACKAGING_KEYS
 
         assert "credentials_provider" in DATA_SOURCE_PACKAGING_KEYS
@@ -153,7 +155,10 @@ class TestCanonicalization:
         assert semantic_hash(_cfg(data_source__credentials_provider="lpdaac")) == semantic_hash(
             _cfg(data_source__credentials_provider="gesdisc")
         )
-        # ...and it composes with the OTHER auth spelling, which never moved it.
+        # ...and a config carrying BOTH auth keys drops both. They are two
+        # knobs of one class on disjoint paths -- `anonymous` is read only by
+        # the raster source-store kwargs, the provider only by the point and
+        # temporal paths -- so this pins canonicalization, not a run shape.
         both = _cfg(data_source__credentials_provider="gesdisc")
         both.data_source["anonymous"] = True
         assert semantic_hash(both) == base

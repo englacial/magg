@@ -739,8 +739,11 @@ one release rather than one at a time.
    joined `DATA_SOURCE_PACKAGING_KEYS` (espg-ruled 2026-08-17): the provider
    name selects *how* source bytes are fetched, never *what* is computed from
    them, so the same granules read with `lpdaac` credentials, `gesdisc`
-   credentials, or an anonymous open are one product — `anonymous`, the other
-   spelling of the same choice, was already excluded. A wrong credential fails
+   credentials, or an anonymous open are one product. It is the same class as
+   the read knobs and as `anonymous`, already excluded — the same class, not
+   one knob under two names: `anonymous` is read only by the raster
+   source-store kwargs, `credentials_provider` only by the point and temporal
+   paths, so no single run consults both. A wrong credential fails
    the fetch loudly (a 403 at read time), so nothing depended on the digest to
    catch it. The operator consequence is the one that made it urgent: a
    **credential migration over unchanged data** — re-registering an existing
