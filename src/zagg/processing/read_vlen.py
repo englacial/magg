@@ -630,15 +630,24 @@ def _vlen_read_group(
     # handle via the record-key join, NaN'd where the record has no sibling
     # row, then broadcast through the same coordinates-level gather map the
     # companions above reuse — identical on both arms, since ``parent_safe`` /
-    # ``valid`` are already at this read's rate. A granule with no open
-    # sibling handle degrades to all-NaN columns with one warning per granule
-    # (asset FILTERS above keep their fail-closed semantics).
+    # ``valid`` are already at this read's rate.
+    #
+    # A granule with no open sibling handle degrades a VARIABLE-ONLY asset to
+    # all-NaN columns with one warning per granule; asset FILTERS keep their
+    # fail-closed semantics, and since the raise happens up in
+    # ``_sibling_joins`` it wins whenever the SAME asset carries both. That is
+    # the shipped gedi01b template's shape — ``l2a`` carries the
+    # ``rx_clipbin_count`` filter alongside the DEM variable — so a pairless
+    # granule there fails the group outright and the NaN arm below never fires
+    # (pinned: ``TestGediTemplate.test_pairless_granule_fails_the_group``). The
+    # NaN arm serves a config whose asset has variables only.
     asset_cols: dict[str, np.ndarray] = {}
     for asset, name_paths in asset_var_paths.items():
         join = asset_joins.get(asset)
         if join is None:
             # Absent from the joins means no open sibling handle for this
-            # granule; the one-per-granule warning was logged there.
+            # granule, and no filter rides this asset (one that did would have
+            # raised); the one-per-granule warning was logged there.
             record_vals = {
                 name: np.full(len(coarse_lats), np.nan, dtype=np.float64) for name in name_paths
             }
@@ -878,6 +887,11 @@ def _warn_missing_sibling_once(h5obj, asset: str, names: list[str]) -> None:
     comparison semantics). The read runs once per beam group; the guard rides
     the granule's open primary handle so eight groups warn once, not eight
     times.
+
+    Only a VARIABLE-ONLY asset reaches here: :func:`_sibling_joins` raises for
+    an asset carrying a filter before this is called, so a config declaring
+    both on one asset (the shipped gedi01b template's ``l2a``) never warns —
+    it fails the group.
     """
     warned = getattr(h5obj, "_zagg_asset_nan_warned", None)
     if warned is None:

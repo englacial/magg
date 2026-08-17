@@ -1249,6 +1249,17 @@ class TestGediTemplate:
         )
         assert df["shot_number"].tolist() == [101] * 5 + [104] * 4
 
+    def test_pairless_granule_fails_the_group(self, cfg):
+        # The template's DEM variable and its rx_clipbin_count filter ride the
+        # SAME asset (l2a), and the filter's fail-closed raise happens first —
+        # so a granule with no open sibling handle fails the group outright and
+        # the variable arm's NaN degradation never fires for this config (issue
+        # #464 review). The NaN arm serves a config whose asset carries
+        # variables only (test_variable_only_asset_without_sibling_nans_and_warns).
+        assert {f["asset"] for f in cfg.data_source["filters"] if "asset" in f} == {"l2a"}
+        with pytest.raises(ValueError, match="no open sibling handle"):
+            _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", cfg.data_source, 0, _OneShardGrid())
+
     def test_template_reads_and_aggregates_the_fixture(self, cfg):
         from zagg.processing import calculate_cell_statistics
 
