@@ -1821,10 +1821,12 @@ storage geometry (§1.5). It is an ordinary dense array — not a
     envelope is the half-open `[0, 0)` — it overlaps no window, including one
     containing the epoch — so a reader that meets it under the grammar's
     overlap predicate selects nothing, with or without this reservation.
-- Each observation enters under §8.1's discipline: an instant as a
-  **timestamp** word, exact to the nanosecond; a real interval (an
-  integration window — an observation need not be instantaneous) as a
-  **range** word conservatively containing it. A cell's stored word is the
+- Each observation enters under §8.1's discipline, restated here with its
+  force (§8.1's clauses bind a companion only where its section restates
+  them): a writer MUST encode an instant as a **timestamp** word, exact to
+  the nanosecond, and a real interval (an integration window — an
+  observation need not be instantaneous) as a **range** word conservatively
+  containing it. A cell's stored word is the
   join of its observations' words (below): a **timestamp** word exactly when
   that join is a single instant — a cell covering one instantaneous
   observation, or several sharing one instant — and a **range** word
@@ -1895,10 +1897,12 @@ row counts. The sibling carries the `temporal` block in its own attrs.
 - **A word's claim is keyed on its variant**, carried by the word itself,
   never by the payload's weights — under a `"flux"` payload (§2.0)
   `sum(weights)` is not a member count, so weight identifies nothing. Each
-  observation enters under §8.1's discipline (an instant as a **timestamp**
-  word, exact to the nanosecond; a real interval — an integration window —
-  as a **range** word conservatively containing it); a merged centroid
-  carries the grammar's `toc_merge` join over its members' words, with the
+  observation enters under §8.1's discipline, restated here with its force
+  (§8.1 binds a companion only where its section restates a clause): a writer
+  MUST encode an instant as a **timestamp** word, exact to the nanosecond,
+  and a real interval (an integration window) as a **range** word
+  conservatively containing it. A merged centroid carries the grammar's
+  `toc_merge` join over its members' words, with the
   same order-independence §8.2 states, and a centroid folded from a single
   observation carries that observation's word unchanged. (Zagg's own
   writers ingest per-observation instants today — range ingest is legal,
