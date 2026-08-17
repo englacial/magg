@@ -77,6 +77,8 @@ import logging
 
 import numpy as np
 
+from zagg.grids.base import ragged_locations_name
+
 logger = logging.getLogger(__name__)
 
 #: Per-artifact attrs revision for stage-written ladder overviews — the
@@ -419,6 +421,16 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
     from zagg.sweep_overview import _empty_slab
 
     slabs = {name: _empty_slab(meta, n_out) for name, meta in fields.items()}
+    # A located field's sibling is gathered under the same rule as its payload
+    # (ruling 4 on issue #410): a gather ASSIGNS gen-1 bytes, so the pair stays
+    # row-aligned by construction — no merge, no re-keying.
+    siblings = {
+        name: ragged_locations_name(name)
+        for name, meta in fields.items()
+        if meta.get("location") is not None
+    }
+    for sibling in siblings.values():
+        slabs[sibling] = np.full(n_out, b"", dtype=object)
     folded = missing = unreadable = 0
     for i, row in enumerate(rows):
         if row is None:
@@ -430,7 +442,7 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
             continue
         folded += 1
         seg = slice(i * span, (i + 1) * span)
-        for name in fields:
+        for name in list(fields) + list(siblings.values()):
             values = reader.read(res, name)
             if values is not None:
                 slabs[name][seg] = values
@@ -496,8 +508,25 @@ def _merge_slabs(
         dtype = meta.get("dtype") or "float32"
         inner = tuple(meta.get("inner_shape") or (2,))
         delta = overview_fold_delta(meta)
+        # A located field folds its sibling in the SAME k-way call as its
+        # payload (ruling 4 on issue #410): the merged words are keyed on the
+        # centroid partition that merge produces (spec §9.1), so the two are
+        # accumulated together per open cell and folded together.
+        sibling = ragged_locations_name(name) if meta.get("location") is not None else None
         out = np.full(n_out, b"", dtype=object)
+        sib_out = np.full(n_out, b"", dtype=object) if sibling else None
         pending: dict[int, list] = {}
+        words: dict[int, list] = {}
+
+        def _close(j, out=out, sib_out=sib_out, delta=delta, dtype=dtype, sibling=sibling):
+            cell = pending.pop(j)
+            if sibling is None:
+                out[j] = fold_digests(cell, delta=delta, dtype=dtype)
+            else:
+                out[j], sib_out[j] = fold_digests(
+                    cell, delta=delta, dtype=dtype, locations=words.pop(j)
+                )
+
         for i, row in enumerate(rows):
             base = i * src_per_child
             for reader in row or ():
@@ -506,18 +535,30 @@ def _merge_slabs(
                 slab = reader.read(res_src, name)
                 if slab is None:
                     continue
-                for p, payload in enumerate(slab):
-                    if payload is not None and len(payload):
-                        cell = pending.setdefault((base + p) // factor, [])
-                        cell.append(decode_digest(payload, dtype, inner))
+                sib_slab = reader.read(res_src, sibling) if sibling else None
+                if sibling is not None and sib_slab is None:
+                    raise ValueError(
+                        f"field {name!r} declares a location channel but source "
+                        f"{sibling!r} is absent at resolution {res_src}; folding the "
+                        f"payload alone would drop the channel (spec §9.1)"
+                    )
+                for pos, payload in enumerate(slab):
+                    if payload is None or not len(payload):
+                        continue
+                    key = (base + pos) // factor
+                    pending.setdefault(key, []).append(decode_digest(payload, dtype, inner))
+                    if sibling is not None:
+                        words.setdefault(key, []).append(decode_digest(sib_slab[pos], "uint64", ()))
             # Cells wholly covered by children 0..i are complete: fold and
             # free them, so resident state never exceeds the open boundary.
             done = ((i + 1) * src_per_child) // factor
             for j in [j for j in pending if j < done]:
-                out[j] = fold_digests(pending.pop(j), delta=delta, dtype=dtype)
-        for j, cell in pending.items():
-            out[j] = fold_digests(cell, delta=delta, dtype=dtype)
+                _close(j)
+        for j in list(pending):
+            _close(j)
         slabs[name] = out
+        if sib_out is not None:
+            slabs[sibling] = sib_out
     return slabs, folded, missing, unreadable
 
 

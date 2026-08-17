@@ -335,21 +335,30 @@ def field_composability(meta: dict) -> str:
     ``validate_streaming`` accepts, widened by the exact sum/min/max laws):
 
     - ``exact`` — scalar ``function`` in :data:`EXACT_MERGE_LAWS`;
-    - ``approximate`` — an unlocated ragged t-digest field with the standard
-      ``(2,)`` centroid inner shape (merge is order-dependent; ``np.isclose``
-      equality class, cf. D24);
+    - ``approximate`` — a ragged t-digest field with the standard ``(2,)``
+      centroid inner shape, **located or not** (merge is order-dependent;
+      ``np.isclose`` equality class, cf. D24);
     - ``none`` — everything else: expressions, vector fields, chunk-resolution
-      companions, located ragged (no streaming merge law for the location
-      channel yet), temporal companions (spec §8.2/§8.3 — see below), and any
+      companions, temporal companions (spec §8.2/§8.3 — see below), and any
       scalar reducer without an exact law (mean, std, median, quantiles, ...).
 
-    A field declaring a ``temporal`` companion (issue #410) is ``none``
-    whatever its reducer: the companion's fold law is the word grammar's
-    semilattice join (spec §8.2), and no zagg fold implements it yet. Folding
-    such a field through its reducer instead — ``max`` over toc words, say —
-    would emit a word whose conservative-envelope claim is simply false, so
-    the honest state until the #410 kernel PR is that the companion exists at
-    native resolution only.
+    **A located field folds through the pyramid** (ruling 4 on issue #410): the
+    ``location`` channel's fold law is the located k-way merge the kernel has
+    carried since #279 (``merge_tdigests_kway(..., locations=)``, the deepest
+    common ancestor of the contributors' words), and the overview fold sites
+    thread it. Its words then sit at heterogeneous orders within one overview
+    array, which spec §9.1 makes normative. Excluding located fields was the
+    bug, not the design — a `location:` declaration used to *remove* the digest
+    from every overview level.
+
+    A field declaring a ``temporal`` companion (issue #410) is still ``none``
+    whatever its reducer, and for a narrower reason than before: the words fold
+    exactly (the §8.2 join is a semilattice), but ruling 3 puts a **per-cell**
+    toc range at overview levels where the leaves are per-centroid, and that
+    shape-coarsening reduction (§8.4) is not wired through the fold sites yet.
+    Folding the field through its own reducer instead — ``max`` over toc words,
+    say — would emit a word whose conservative-envelope claim is false, so the
+    honest state remains native resolution only.
     """
     from zagg.config import get_output_signature
 
@@ -362,11 +371,7 @@ def field_composability(meta: dict) -> str:
     if sig["kind"] == "ragged":
         from zagg.processing.streaming import _TDIGEST_FUNCTIONS
 
-        if (
-            sig["location"] is None
-            and meta.get("function") in _TDIGEST_FUNCTIONS
-            and tuple(sig["inner_shape"]) == (2,)
-        ):
+        if meta.get("function") in _TDIGEST_FUNCTIONS and tuple(sig["inner_shape"]) == (2,):
             return "approximate"
         return "none"
     if sig["kind"] == "scalar" and function in EXACT_MERGE_LAWS:

@@ -40,6 +40,8 @@ import logging
 
 import numpy as np
 
+from zagg.grids.base import ragged_locations_name
+
 logger = logging.getLogger(__name__)
 
 #: Envelope version of the per-node overview attrs payload this module writes.
@@ -240,7 +242,7 @@ def check_weights_match(attrs, meta: dict, field: str) -> None:
         )
 
 
-def fold_digests(cell_digests: list, *, delta: int, dtype="float32") -> bytes:
+def fold_digests(cell_digests: list, *, delta: int, dtype="float32", locations=None):
     """Merge one overview cell's accumulated t-digests into its payload bytes.
 
     The approximate-class fold law (D24): the **order-independent k-way
@@ -248,15 +250,36 @@ def fold_digests(cell_digests: list, *, delta: int, dtype="float32") -> bytes:
     the overview digest is permutation-stable — a re-sweep over unchanged
     leaves reproduces identical bytes. An empty accumulation folds to the
     empty payload (the ragged fill).
+
+    ``locations`` is the §9 located channel (ruling 4 on issue #410): per-digest
+    ``uint64`` morton word vectors aligned with ``cell_digests``, threaded
+    through the same merge so a merged centroid's word is the deepest common
+    ancestor of its contributors'. Given, the return is a ``(payload_bytes,
+    location_bytes)`` pair; omitted, the bare payload bytes every unlocated
+    field still gets. **The two must come from one call** — the words are keyed
+    on the centroid partition the merge produces (spec §9.1), so folding them
+    separately would describe a different partition than the payload's. A
+    located empty accumulation folds to a pair of empty payloads, keeping the
+    sibling row-aligned with the digest at zero rows.
     """
     from zagg.stats.tdigest import merge_tdigests_kway
 
-    digests = [d for d in cell_digests if len(d)]
-    if not digests:
-        return b""
+    if locations is None:
+        digests = [d for d in cell_digests if len(d)]
+        if not digests:
+            return b""
+        if len(digests) == 1:
+            return encode_digest(digests[0], dtype)
+        return encode_digest(merge_tdigests_kway(digests, delta=int(delta)), dtype)
+    pairs = [(d, w) for d, w in zip(cell_digests, locations, strict=True) if len(d)]
+    if not pairs:
+        return b"", b""
+    digests = [d for d, _ in pairs]
+    words = [w for _, w in pairs]
     if len(digests) == 1:
-        return encode_digest(digests[0], dtype)
-    return encode_digest(merge_tdigests_kway(digests, delta=int(delta)), dtype)
+        return encode_digest(digests[0], dtype), encode_digest(words[0], "uint64")
+    merged, merged_words = merge_tdigests_kway(digests, delta=int(delta), locations=words)
+    return encode_digest(merged, dtype), encode_digest(merged_words, "uint64")
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +832,32 @@ def _field_drift(group, name, meta) -> str | None:
                 f"declared {declared_weights!r} — merges are legal only between "
                 f"matching declarations (spec §2.0)"
             )
+        # A declared location channel (ruling 4 on issue #410) is one more thing
+        # a leaf can falsify, and the same argument applies: without the check
+        # ``declare_pyramid`` installs a located declaration over a store with no
+        # sibling, and every fold then dies reading an array that is not there.
+        # The declaration is checked on the SIBLING, which is where §9 puts it.
+        if meta.get("location") is not None:
+            sibling = ragged_locations_name(name)
+            try:
+                sib = group[sibling]
+            except KeyError:
+                return (
+                    f"field {name!r}: declared a location channel but the sibling "
+                    f"{sibling!r} is absent from the leaf (spec §9/§1.1)"
+                )
+            if ragged.get("locations") != sibling:
+                return (
+                    f"field {name!r}: the payload binds locations "
+                    f"{ragged.get('locations')!r}, not the declared {sibling!r} — a "
+                    f"reader binds the channel by that declaration (spec §1.2)"
+                )
+            sib_element = (dict(sib.attrs.get(RAGGED_ELEMENT_ATTR) or {})).get("element") or {}
+            if sib_element.get("dtype") != "uint64":
+                return (
+                    f"field {name!r}: the location sibling declares element dtype "
+                    f"{sib_element.get('dtype')!r}, not 'uint64' (spec §6.1)"
+                )
     elif meta["class"] == "exact":
         declared_dt = np.dtype(meta.get("dtype") or "float32")
         if arr.dtype != declared_dt:
@@ -1337,11 +1386,17 @@ def _fold_node(
     leaf_cells = 4 ** (cell_order - shard_order)
     slabs: dict = {}
     digests: dict = {}
+    # Per located field, the accumulated sibling word vectors, index-aligned with
+    # ``digests[name]`` cell by cell so the fold merges the pair in one call
+    # (ruling 4 on issue #410, spec §9.1).
+    located: dict = {}
     for name, meta in fields.items():
         if meta["class"] == "exact":
             slabs[name] = _empty_slab(meta, n_cells)
         else:
             digests[name] = [[] for _ in range(n_cells)]
+            if meta.get("location") is not None:
+                located[name] = [[] for _ in range(n_cells)]
     if target_order >= shard_order:
         span = 4 ** (target_order - shard_order)
         fold_factor = 4 ** (shard_order - k)
@@ -1393,8 +1448,18 @@ def _fold_node(
                         values = arr[:]
                         dtype = meta.get("dtype") or "float32"
                         inner = tuple(meta.get("inner_shape") or (2,))
+                        # A located field's sibling is read in the SAME guarded
+                        # block as its payload, so a leaf missing or failing on
+                        # one contributes neither — never a digest folded with
+                        # its channel silently dropped (spec §9.1's words are
+                        # keyed on the partition the payload describes).
+                        words = group[ragged_locations_name(name)][:] if name in located else None
                         cell_digests[name] = [
-                            (start + i // fold_factor, decode_digest(payload, dtype, inner))
+                            (
+                                start + i // fold_factor,
+                                decode_digest(payload, dtype, inner),
+                                None if words is None else decode_digest(words[i], "uint64", ()),
+                            )
                             for i, payload in enumerate(values)
                             if payload is not None and len(payload)
                         ]
@@ -1409,8 +1474,10 @@ def _fold_node(
                     slabs[name][seg], partial, meta.get("method"), meta.get("fill_value", "NaN")
                 )
             for name, decoded in cell_digests.items():
-                for j, digest in decoded:
+                for j, digest, words in decoded:
                     digests[name][j].append(digest)
+                    if words is not None:
+                        located[name][j].append(words)
             n_leaves += 1
             timestamps.append(stamp.get("written_at"))
             granules += int(stamp.get("granule_count") or 0)
@@ -1420,13 +1487,23 @@ def _fold_node(
         return None
     for name, acc in digests.items():
         meta = fields[name]
+        dtype = meta.get("dtype") or "float32"
+        delta = overview_fold_delta(meta)
         slab = np.full(n_cells, b"", dtype=object)
+        words = located.get(name)
+        sibling = np.full(n_cells, b"", dtype=object) if words is not None else None
         for j, cell in enumerate(acc):
-            if cell:
-                slab[j] = fold_digests(
-                    cell, delta=overview_fold_delta(meta), dtype=meta.get("dtype") or "float32"
+            if not cell:
+                continue
+            if sibling is None:
+                slab[j] = fold_digests(cell, delta=delta, dtype=dtype)
+            else:
+                slab[j], sibling[j] = fold_digests(
+                    cell, delta=delta, dtype=dtype, locations=words[j]
                 )
         slabs[name] = slab
+        if sibling is not None:
+            slabs[ragged_locations_name(name)] = sibling
     stamps = [t for t in timestamps if t is not None]
     return {
         "slabs": slabs,
@@ -1506,6 +1583,12 @@ def _cascade_node(
     span = n_cells // factor
     source_cell_order = target_order + (source_order - k)
     slabs = {name: _empty_slab(meta, n_cells) for name, meta in fields.items()}
+    # A located field's sibling gets its own output slab (ruling 4 on issue
+    # #410): ``_fold_child`` returns it beside the payload, and children own
+    # disjoint spans, so it assigns exactly as every other slab does.
+    for name, meta in fields.items():
+        if meta["class"] != "exact" and meta.get("location") is not None:
+            slabs[ragged_locations_name(name)] = np.full(n_cells, b"", dtype=object)
     basename = _overview_basename(key)
     n_sources, n_leaves, timestamps, granules, ranges = 0, 0, [], 0, []
     missing, unreadable = 0, 0
@@ -1604,6 +1687,12 @@ def _fold_child(group, fields, factor, span, path) -> dict:
     digests are ever resident — the bound that makes the cascade fold's
     per-node memory independent of the subtree (issue #376). A field absent
     from the child contributes nothing (schema evolution, as at the leaves).
+
+    A located field's ``{field}_locations`` sibling folds in the SAME group as
+    its payload (ruling 4 on issue #410): the merged words are keyed on the
+    centroid partition that merge produced, so the pair cannot be folded in two
+    passes. The cascade therefore reads and writes both arrays here, and its
+    words sit at heterogeneous orders exactly as the leaf fold's do (spec §9.1).
     """
     partials: dict = {}
     for name, meta in fields.items():
@@ -1624,16 +1713,31 @@ def _fold_child(group, fields, factor, span, path) -> dict:
         dtype = meta.get("dtype") or "float32"
         inner = tuple(meta.get("inner_shape") or (2,))
         delta = overview_fold_delta(meta)
+        sibling_name = ragged_locations_name(name)
+        words = group[sibling_name][:] if meta.get("location") is not None else None
         folded = np.full(span, b"", dtype=object)
+        sibling = np.full(span, b"", dtype=object) if words is not None else None
         for j in range(span):
-            cell = [
-                decode_digest(payload, dtype, inner)
-                for payload in values[j * factor : (j + 1) * factor]
-                if payload is not None and len(payload)
+            rows = [
+                i
+                for i in range(j * factor, min((j + 1) * factor, len(values)))
+                if values[i] is not None and len(values[i])
             ]
-            if cell:
+            if not rows:
+                continue
+            cell = [decode_digest(values[i], dtype, inner) for i in rows]
+            if sibling is None:
                 folded[j] = fold_digests(cell, delta=delta, dtype=dtype)
+            else:
+                folded[j], sibling[j] = fold_digests(
+                    cell,
+                    delta=delta,
+                    dtype=dtype,
+                    locations=[decode_digest(words[i], "uint64", ()) for i in rows],
+                )
         partials[name] = folded
+        if sibling is not None:
+            partials[sibling_name] = sibling
     return partials
 
 
@@ -1747,6 +1851,17 @@ def _overview_config(fields):
                 "dtype": meta.get("dtype", "float32"),
                 "fill_value": 0,
             }
+            # A located field folds through the pyramid (ruling 4, issue #410),
+            # so its overview carries the same ``{field}_locations`` sibling its
+            # source leaves do — declared here because the manifest entry is the
+            # only description the overview writer has. The value is the source
+            # column's NAME, which the overview never reads (it folds stored
+            # words, not observations); what it buys is the sibling array and its
+            # §9 declaration, so an overview is self-describing exactly as a leaf
+            # is. Spec §9.1 makes the heterogeneous orders that fold produces
+            # normative.
+            if meta.get("location") is not None:
+                variables[name]["location"] = str(meta["location"])
             if meta.get("weights") not in (None, "counts"):
                 variables[name]["weights"] = meta["weights"]
                 if meta.get("gain") is not None:
