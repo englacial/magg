@@ -435,7 +435,7 @@ def merge_tdigests(
     *,
     locations1: np.ndarray,
     locations2: np.ndarray,
-) -> tuple[np.ndarray, ...]: ...
+) -> tuple[np.ndarray, np.ndarray]: ...
 @overload
 def merge_tdigests(
     d1: np.ndarray,
@@ -444,7 +444,18 @@ def merge_tdigests(
     *,
     temporal1: np.ndarray,
     temporal2: np.ndarray,
-) -> tuple[np.ndarray, ...]: ...
+) -> tuple[np.ndarray, np.ndarray]: ...
+@overload
+def merge_tdigests(
+    d1: np.ndarray,
+    d2: np.ndarray,
+    delta: int = ...,
+    *,
+    locations1: np.ndarray,
+    locations2: np.ndarray,
+    temporal1: np.ndarray,
+    temporal2: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
 def merge_tdigests(
     d1: np.ndarray,
     d2: np.ndarray,
@@ -524,9 +535,11 @@ def merge_tdigests(
     if d1.size == 0 or d2.size == 0:
         # One contributor is already a valid digest; the channels pass through
         # unreduced. Copy so the return never aliases the caller's array.
-        keep = 1 if d2.size == 0 else 2
-        kept = np.asarray(d1 if keep == 1 else d2, dtype=np.float32)
-        return (kept, *(c[keep].copy() for c in channels)) if channels else kept
+        left = d2.size == 0
+        kept = np.asarray(d1 if left else d2, dtype=np.float32)
+        if not channels:
+            return kept
+        return (kept, *((c1 if left else c2).copy() for _, c1, c2 in channels))
 
     combined = np.concatenate([d1, d2], axis=0)
     order = np.argsort(combined[:, 0], kind="stable")
@@ -556,11 +569,19 @@ def merge_tdigests_kway(
 @overload
 def merge_tdigests_kway(
     digests: list[np.ndarray], delta: int = ..., *, locations: list[np.ndarray]
-) -> tuple[np.ndarray, ...]: ...
+) -> tuple[np.ndarray, np.ndarray]: ...
 @overload
 def merge_tdigests_kway(
     digests: list[np.ndarray], delta: int = ..., *, temporal: list[np.ndarray]
-) -> tuple[np.ndarray, ...]: ...
+) -> tuple[np.ndarray, np.ndarray]: ...
+@overload
+def merge_tdigests_kway(
+    digests: list[np.ndarray],
+    delta: int = ...,
+    *,
+    locations: list[np.ndarray],
+    temporal: list[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
 def merge_tdigests_kway(
     digests: list[np.ndarray],
     delta: int = _DEFAULT_DELTA,
