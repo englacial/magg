@@ -1890,21 +1890,54 @@ levels to agree, and a reader MUST NOT infer one array's shape from another's.
 
 ### 8.4 Composition and merge legality
 
-**Contract.** Two payloads compose only when their temporal declarations
-**match on `{shape, grammar}`** — the §2.0 weights-gate discipline, for the
-same reason: words from two grammars, or from two shapes, describe different
-things, and a merged array carrying either would mean neither. A reader or
-writer joining declared payloads whose `shape` or `grammar` differ MUST
-refuse. (`spec` is strict-checked before this rule is reached: an unknown
-revision is already a refusal.)
+**Peer joins** (contract). Two payloads compose as *peers* — like joined with
+like, at one granularity — only when their temporal declarations **match on
+`{shape, grammar}`** — the §2.0 weights-gate discipline, for the same reason:
+words from two grammars, or from two shapes, describe different things, and a
+merged array carrying either would mean neither. A reader or writer joining
+declared payloads whose `shape` or `grammar` differ MUST refuse, and the
+composed result carries its contributors' shape unchanged. (`spec` is
+strict-checked before this rule is reached: an unknown revision is already a
+refusal.)
+
+**Shape-coarsening reductions are licensed, and are not peer joins**
+(contract). A reduction folds a finer companion into a coarser one, so by
+construction its output shape differs from its contributors' and it can never
+satisfy the peer gate above. This revision licenses exactly one — the
+`"per-centroid"` → `"per-cell"` fold that §8.3's closing *"Per-level shapes
+need not match"* clause describes and that
+[ruling 3 on #410](https://github.com/englacial/zagg/issues/410#issuecomment-5310502887)
+requires ("per-cell toc *range* at overview levels, even where leaves are
+per-centroid"). Its terms:
+
+- The contributors MUST be peers **of each other**: every one declares
+  `shape: "per-centroid"` under the same `grammar`. A reduction over
+  contributors that fail the peer gate is itself a refusal.
+- The output is a §8.2 array declaring `shape: "per-cell"` and the **same
+  `grammar`** — a reduction coarsens the shape, never the word grammar, and
+  never the `spec`.
+- The output word for cell `i` is `toc_merge` reduced over the per-centroid
+  words of cell `i`: the envelope §8.3's closing clause requires ("it is the
+  envelope of the per-centroid words beneath it"), exact and order-independent
+  by §8.2's join clause.
+- No other cross-shape combination is defined. A writer MUST NOT invent one,
+  and a reader MUST refuse any it meets under the peer rule above.
+
+So **"matching" is never ambiguous**: a peer join matches its contributors
+against *each other* and inherits their shape; a reduction matches its
+contributors against each other and **declares its own, coarser output
+shape**, which by construction does not match theirs. Which of the two is in
+play is a property of the operation being performed, never something a reader
+infers from the declarations it finds.
 
 **An absent `temporal` key is never a refusal.** A payload, cell array or
 digest that declares nothing composes freely with anything — this is the
 schema-evolution rule that keeps every store written before this revision
-conformant verbatim. Two consequences, both normative:
+conformant verbatim. Two consequences, both normative, and both binding on
+reductions as well as peer joins:
 
 - The composed result MUST NOT carry a temporal declaration unless **every**
-  contributor carried a matching one. Dropping the channel is the honest
+  contributor carried one matching the others'. Dropping the channel is the honest
   outcome: a word that omits an undeclared contributor's observations is not
   a conservative envelope, and silently narrowing one is the failure this
   clause exists to prevent.
