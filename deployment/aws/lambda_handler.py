@@ -838,10 +838,13 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
             import numpy as np
 
             from zagg.processing.raster import emit_raster_template
+            from zagg.time_axis import time_axis_dtype, time_encoding
 
             store = open_store(event["store_path"], **_output_store_kwargs(event))
             grid = from_config(config)
-            times_us = np.asarray(event["times_us"], dtype=np.int64)
+            # The wire carries plain ints; the cast is the config's declared
+            # time encoding (spec §8) — a toc word does not fit int64.
+            times_us = np.asarray(event["times_us"], dtype=time_axis_dtype(time_encoding(config)))
             if times_us.size == 0:
                 # A zero-timestep template is degenerate: the arrays get a
                 # 0-length time axis no worker can slab-write into.

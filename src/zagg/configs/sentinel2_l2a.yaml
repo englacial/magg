@@ -5,7 +5,7 @@
 # cell-ID joins are direct) takes the source pixel nearest its center --
 # dense by construction, exact uint16 DNs. Reflectance = DN * 1e-4 - 0.1,
 # recorded as CF scale_factor/add_offset attrs and never applied to the
-# stored data. Timesteps are datatakes (time_key), not item datetimes:
+# stored data. Timesteps are datatakes (time_key, toc-encoded), not item datetimes:
 # adjacent MGRS tiles of one datatake are a single (time, cells) slab, with
 # the 9,840 m tile overlap resolved by nearest-tile-center ownership.
 #
@@ -32,6 +32,12 @@ data_source:
   anonymous: true
 
 output:
+  # Time axis as mortie toc words (spec §8, issue #443): a datatake is a
+  # ~seconds-long acquisition whose adjacent MGRS tiles are sensed seconds
+  # apart, so the honest coordinate value is a conservative RANGE -- which
+  # int64 microseconds cannot state and a toc word can. Output-defining: a
+  # store born on toc is a different product from a legacy-axis one.
+  time_encoding: toc
   grid:
     type: healpix
     parent_order: 11
