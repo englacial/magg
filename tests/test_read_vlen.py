@@ -791,6 +791,18 @@ class _LastShotGrid:
         return np.asarray(leaf_ids).astype(int)
 
 
+class _FirstShotGrid:
+    """Grid stub: shard 1 for lat <= 10.5 (the first shot only), else 0."""
+
+    @staticmethod
+    def assign(lats, lons):
+        return (np.asarray(lats) <= 10.5).astype(np.uint64)
+
+    @staticmethod
+    def shards_of(leaf_ids):
+        return np.asarray(leaf_ids).astype(int)
+
+
 class TestStridedRecords:
     """A strided twin of the packed fixture: same rows out, none from the slack."""
 
@@ -921,3 +933,117 @@ class TestStridedRecords:
         arrays["/BEAM0000/rxwaveform"] = WAVE_STRIDED[:20]  # link reaches row 21
         with pytest.raises(ValueError, match="does not tile the declared base extent"):
             _read_group(_FakeH5(arrays), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+
+
+# ── memory posture: nothing at base rate on a planned vlen read (#452) ───────
+
+
+class _RampBase:
+    """Stand-in for a huge flat base dataset: value == row index, never
+    materialized. Only the plan's hyperslices are ever sliced out of it, which
+    is the property under test — a route that touched it whole would have to
+    allocate ``n_base`` and would trip the spy below."""
+
+    def __init__(self, n):
+        self._n = n
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, key):
+        start, stop, step = key.indices(self._n)
+        return np.arange(start, stop, step, dtype=np.float32) + 1.0
+
+
+class _AllocSpy:
+    """``numpy`` proxy recording the length of every array a module allocates.
+
+    Installed over the module-global ``np`` of ``read`` / ``read_vlen`` so only
+    those two modules' own allocations are seen (pandas, the grid stub and the
+    fixture keep the real numpy)."""
+
+    _TRACKED = ("zeros", "ones", "empty", "full", "arange", "repeat", "concatenate")
+
+    def __init__(self, sizes: list[int]):
+        self._sizes = sizes
+
+    def __getattr__(self, name):
+        attr = getattr(np, name)
+        if name not in self._TRACKED:
+            return attr
+
+        def _wrapped(*args, **kwargs):
+            out = attr(*args, **kwargs)
+            self._sizes.append(int(np.size(out)))
+            return out
+
+        return _wrapped
+
+
+class TestPlannedVlenMemoryPosture:
+    """A planned vlen read allocates at PLANNED rate, never at base rate.
+
+    The companion half of the fix: with a correct extent but base-rate
+    expansion, one GEDI beam group builds ~7 GB of per-shot broadcasts against
+    a 2 GB worker. The fixture strides the same four shots across 3,000,004
+    base rows while the shard touches five of them, so any surviving base-rate
+    allocation is six orders of magnitude larger than the plan and impossible
+    to miss."""
+
+    STRIDE = 1_000_000
+    N_BASE = 3 * STRIDE + 4
+
+    def _arrays(self, group="BEAM0000"):
+        arrays = _l1b_arrays(group)
+        arrays[f"/{group}/rx_sample_start_index"] = np.array(
+            [1, self.STRIDE + 1, 2 * self.STRIDE + 1, 3 * self.STRIDE + 1], dtype=np.uint64
+        )
+        arrays[f"/{group}/rxwaveform"] = _RampBase(self.N_BASE)
+        return arrays
+
+    def _data_source(self):
+        # All three expansion paths at once: a cross-level (record) filter, a
+        # sibling-asset join, and the segment-level variable broadcasts the
+        # shared fixture already declares (shot_number, noise_mean).
+        return _vlen_ds(
+            read_plan={"spatial_index": "shots", "pad": 0},
+            assets={
+                "l2a": {"join": {"left": "/{group}/shot_number", "right": "/{group}/shot_number"}}
+            },
+            filters=[
+                {
+                    "level": "shots",
+                    "dataset": "/{group}/geolocation/degrade",
+                    "op": "eq",
+                    "value": 0,
+                },
+                {"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1},
+            ],
+        )
+
+    def test_planned_read_allocates_nothing_at_base_rate(self, monkeypatch):
+        import zagg.processing.read as rd
+        import zagg.processing.read_vlen as rv
+
+        arrays = self._arrays()
+        assert link_base_extent(arrays["/BEAM0000/rx_sample_start_index"], COUNTS, 1) == self.N_BASE
+
+        sizes: list[int] = []
+        spy = _AllocSpy(sizes)
+        monkeypatch.setattr(rd, "np", spy)
+        monkeypatch.setattr(rv, "np", spy)
+        df = _read_group(
+            _FakeH5(arrays),
+            "BEAM0000",
+            self._data_source(),
+            1,
+            _FirstShotGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        monkeypatch.undo()
+
+        # The shard holds shot 101 only: 5 planned rows, all kept.
+        assert df["shot_number"].tolist() == [101] * 5
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), np.arange(1.0, 6.0))
+        assert sizes, "the allocation spy saw nothing — is it still wired to the read modules?"
+        assert max(sizes) <= 64, f"a base-rate allocation survived: {sorted(sizes)[-3:]}"
