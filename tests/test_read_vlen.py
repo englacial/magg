@@ -907,6 +907,17 @@ class TestOwnerMapReuse:
         from zagg.config import default_config
 
         ds = dict(default_config("gedi01b_waveform_healpix_hive").data_source)
+        # Pin the filter list explicitly (issue #457): this class tests owner-map
+        # DERIVATION counts, not filter policy, and its expected rows were sized
+        # to the quality gate. Inheriting the packaged config's filters let the
+        # #450 science-knob change (gates dropped, espg ruling) shift the row
+        # universe under the #454 pins -- a semantic conflict CI never saw
+        # because each PR was green alone. The six-companion count test below
+        # deliberately KEEPS the live-config coupling; this one must not.
+        ds["filters"] = [
+            {"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1},
+            {"asset": "l2a", "dataset": "/{group}/sensitivity", "op": "ge", "value": 0.9},
+        ]
         if read_plan:
             ds["read_plan"] = read_plan
         return ds
@@ -935,7 +946,11 @@ class TestOwnerMapReuse:
         assert calls == [], f"a coordinates-level consumer re-derived the owner map: {calls}"
 
     def test_the_template_hangs_six_companions_off_the_coordinates_level(self):
-        ds = self._template_ds()
+        from zagg.config import default_config
+
+        # LIVE config on purpose: this test tracks the real template's shape
+        # (companion count, filter levels), unlike the pinned harness above.
+        ds = dict(default_config("gedi01b_waveform_healpix_hive").data_source)
         shot_vars = ds["levels"][ds["coordinates"]["level"]]["variables"]
         # The count the finding is scaled by: six re-derivations, not one.
         assert len(shot_vars) == 6
