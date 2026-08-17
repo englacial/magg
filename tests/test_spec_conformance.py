@@ -1541,6 +1541,69 @@ class TestTemporalCompanions:
                     assert words.all()
             assert populated, f"column group {group} folded no populated cell"
 
+    def test_the_columns_words_reproduce_the_leafs_cell_by_cell(self):
+        """The fold identities, on the committed column bytes (§8.3, §9.1).
+
+        The row-alignment test above cannot tell a correct fold from one that
+        swapped the two siblings: the grammars accept each other's words, so a
+        swap survives ``shape == (rows,)`` and a nonzero check, and the
+        declarations it would contradict live in attrs, which do not move when
+        the bytes do. So pin the VALUES — per column cell, against the leaf cells
+        it folded:
+
+        * the toc **cell envelope** over a column cell's words equals the
+          envelope over every leaf instant under it. This is the identity
+          :func:`zagg.stats.tdigest._centroid_envelopes` names as what survives
+          an arbitrary fold tree (a per-centroid vector is indexed by the
+          centroid partition, so the words themselves do not).
+        * the located **hull** — ``mortie.common_ancestor`` over the column
+          cell's words equals the hull over the leaf's, §9.1's containment claim
+          read at cell granularity.
+
+        This is the fixture set's only golden for a *merge*-produced companion,
+        so these are the checks that make it load-bearing for moczarr.
+        """
+        from mortie import common_ancestor
+
+        from zagg.stats.toc import cell_envelope
+
+        exp = _expected("temporal")
+        leaf_order = int(exp["group"])
+        leaf_store = _leaf_store("temporal", exp)
+        leaf = {
+            name: zarr.open_array(
+                leaf_store, path=f"{exp['group']}/{name}", zarr_format=3, consolidated=False
+            )[:]
+            for name in ("h_tdigest_locations", "h_tdigest_times")
+        }
+        column = _leaf_dir("temporal", exp).parent / "all.pyramid.zarr"
+        store = LocalStore(str(column))
+        reducers = {
+            "h_tdigest_locations": lambda w: int(common_ancestor(w)),
+            "h_tdigest_times": lambda w: int(cell_envelope(w)),
+        }
+        checked = 0
+        for group in sorted(p.name for p in column.iterdir() if p.is_dir()):
+            factor = 4 ** (leaf_order - int(group))
+            for name, reduce in reducers.items():
+                words = zarr.open_array(
+                    store, path=f"{group}/{name}", zarr_format=3, consolidated=False
+                )[:]
+                for j, raw in enumerate(words):
+                    got = np.frombuffer(bytes(raw), "<u8")
+                    members = np.concatenate(
+                        [
+                            np.frombuffer(bytes(m), "<u8")
+                            for m in leaf[name][j * factor : (j + 1) * factor]
+                        ]
+                    )
+                    if not len(got):
+                        assert not len(members), f"{group}/{name} cell {j} dropped its members"
+                        continue
+                    assert reduce(got) == reduce(members), f"{group}/{name} cell {j}"
+                    checked += 1
+        assert checked, "no populated column cell — the assertions would be vacuous"
+
     def test_leaf_is_stamped_and_manifest_marked(self):
         exp = _expected("temporal")
         attrs = json.loads((_leaf_dir("temporal", exp) / "zarr.json").read_text())["attributes"]
