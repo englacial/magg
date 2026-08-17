@@ -244,8 +244,10 @@ def execute_read_plan(plan: ReadPlan, read_fn, dataset_path: str, dtype) -> np.n
         return np.asarray(read_fn(dataset_path, hyperslice=None), dtype=dtype)
     if not plan.parent_runs:
         return np.empty(0, dtype=dtype)
+    # h5coro's readDatasets returns a 0-d array for a single-element
+    # hyperslice; np.atleast_1d keeps concatenate from raising on it.
     parts = [
-        np.asarray(read_fn(dataset_path, hyperslice=chunk), dtype=dtype)
+        np.atleast_1d(np.asarray(read_fn(dataset_path, hyperslice=chunk), dtype=dtype))
         for chunk in plan.chunk_lists
     ]
     return np.concatenate(parts)

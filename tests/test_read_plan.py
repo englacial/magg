@@ -250,6 +250,41 @@ class TestExecuteReadPlan:
         expected = np.concatenate([data[5:10], data[20:25]])
         np.testing.assert_array_equal(out, expected)
 
+    def test_single_element_run_zero_dim_part(self):
+        # h5coro's readDatasets returns a 0-d array (numpy scalar) for a
+        # single-element hyperslice; np.concatenate raises on 0-d inputs
+        # ("zero-dimensional arrays cannot be concatenated"). Regression for
+        # the 2026-08-17 GEDI fleet run, which dropped 26 group reads this way.
+        data = np.arange(100.0, dtype=np.float32)
+        plan = self._make_plan([(42, 43)])
+
+        def read_fn(path, hyperslice=None):
+            lo, hi = hyperslice[0]
+            if hi - lo == 1:
+                return data[lo]  # 0-d numpy scalar, as h5coro returns
+            return data[lo:hi]
+
+        out = execute_read_plan(plan, read_fn, "/h", np.float32)
+        assert out.ndim == 1
+        np.testing.assert_array_equal(out, data[42:43])
+
+    def test_mixed_single_and_multi_element_runs(self):
+        # A single-element run alongside normal runs: order and values of the
+        # multi-element parts must be unchanged.
+        data = np.arange(100.0, dtype=np.float32)
+        plan = self._make_plan([(5, 10), (42, 43), (20, 25)])
+
+        def read_fn(path, hyperslice=None):
+            lo, hi = hyperslice[0]
+            if hi - lo == 1:
+                return data[lo]  # 0-d numpy scalar
+            return data[lo:hi]
+
+        out = execute_read_plan(plan, read_fn, "/h", np.float32)
+        expected = np.concatenate([data[5:10], data[42:43], data[20:25]])
+        assert out.dtype == np.float32
+        np.testing.assert_array_equal(out, expected)
+
     def test_full_read_plan_calls_without_hyperslice(self):
         data = np.arange(50.0, dtype=np.float32)
         plan = ReadPlan(
