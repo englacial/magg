@@ -444,6 +444,19 @@ def _vlen_read_group(
             lambda p, dt: execute_read_plan(plan, _base_read_fn, p, dt),
             workers,
         )
+        # The planned arm cannot see the dataset's declared length, but it can
+        # check the shape it does control: a hyperslice that runs off the end of
+        # a truncated dataset comes back short, and every base-rate array must
+        # be exactly the gather map's length. Without this the mismatch surfaces
+        # downstream as an opaque boolean-index ``IndexError`` in a worker log —
+        # the same corruption the full arm below refuses in domain words, and
+        # the class of failure issue #452 spent a day isolating.
+        for path, arr in arrays_by_path.items():
+            if len(arr) != len(global_idx):
+                raise ValueError(
+                    f"dataset {path!r} returned {len(arr)} of {len(global_idx)} planned "
+                    f"rows; the record link does not tile the declared base extent"
+                )
     else:
         # Full arm: the flat datasets may be LONGER than the link's extent — a
         # strided product pads the tail of its last record's window (GEDI:
