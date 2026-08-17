@@ -316,15 +316,32 @@ array of weighted centroids:
 word per centroid row** in its `{field}_locations` sibling (§1.1), row-aligned
 with the payload:
 
-- Per-observation locations enter as **order-29 point-kind morton words**
-  (mortie spec §4 — encoding-carried kind; an exact observation position).
-- A centroid of weight 1 carries its single member's word unchanged — an
-  exact observation position.
+- **A word's claim is keyed on its kind**, carried by the word's own
+  encoding (mortie spec §4), never by the payload's weights — under a
+  `"flux"` payload (§2.0) `sum(weights)` is not a member count, so weight
+  identifies nothing:
+  - a **point word** (order-29 by mortie's grammar) is an exact observation
+    position;
+  - an **area word** is the finest morton cell containing every observation
+    beneath it — whether it entered that way (an observation located only
+    to a cell: a footprint, a pre-aggregated input) or arose from a fold.
+- An observation whose position is exact enters as its point word; one
+  resolved only to a cell enters as that cell's area word — positions never
+  narrowed into points, the discipline §8.1 states for time, spatially.
+  (Zagg's own writers ingest point instruments as order-29 point words,
+  `HealpixGrid.assign`; area-word ingest is legal but no shipped config
+  emits it today — informative.)
 - A merged centroid carries the **deepest common ancestor** of its members'
   words (`mortie.common_ancestor`): the finest morton cell enclosing every
-  member. Point and area words share the same path prefix, so mixed inputs
-  (a fresh point word folded with an earlier merge's coarser area word)
-  compose under the same rule.
+  member; a centroid folded from a single member carries that member's word
+  unchanged. Point and area words share the same path prefix, so mixed
+  inputs (a fresh point word folded with an earlier merge's coarser area
+  word) compose under the one rule.
+
+A morton cell encodes **containment, not calibrated uncertainty**
+(informative): a small error disk straddling a cell boundary is honestly
+enclosed only by a much coarser cell, so an error-radius channel, if ever
+wanted, is a new companion declaration, not a reading of this one.
 
 A writer-side spill-block close (`aggregation.streaming.mode: spill` crossing
 its block threshold, issue #370) is an additional merge source under the same
@@ -1513,7 +1530,7 @@ product is never sharded, §8/#247):
   centroid's true member run, so the conformance suite asserts §8.2/§8.3's
   containment (and that a cell's per-cell envelope encloses every
   per-centroid envelope beneath it) on committed bytes. Its located sibling
-  carries **heterogeneous orders** — order-29 point words on weight-1
+  carries **heterogeneous orders** — order-29 point words on unmerged
   centroids, coarser ancestors on merged ones — which is §9.1's claim
   pinned. `kitchen_sink/`, committed before §9 and unregenerated, is the
   absent-`located` ⇒ §2.2 pin, exactly as `minimal/` is §2.0's.
@@ -1791,13 +1808,15 @@ storage geometry (§1.5). It is an ordinary dense array — not a
     envelope is the half-open `[0, 0)` — it overlaps no window, including one
     containing the epoch — so a reader that meets it under the grammar's
     overlap predicate selects nothing, with or without this reservation.
-- A cell whose word covers **exactly one** observation MUST be a
-  **timestamp** word, exact to the nanosecond. A cell pooling more than one
-  MUST be a **range** word whose envelope conservatively contains every
-  observation pooled into it. So the word is exact wherever the cell holds a
-  single observation and an honest conservative range wherever it does not —
-  the same instant-never-widened / interval-never-narrowed discipline
-  §8.1 states for the coordinate shape.
+- Each observation enters under §8.1's discipline: an instant as a
+  **timestamp** word, exact to the nanosecond; a real interval (an
+  integration window — an observation need not be instantaneous) as a
+  **range** word conservatively containing it. A cell covering exactly one
+  instantaneous observation therefore holds its exact timestamp word; a
+  cell pooling more than one observation — or covering any non-instant one
+  — holds a **range** word conservatively containing every observation
+  pooled into it. Instants never widened, intervals never narrowed, **per
+  observation, not per count**.
 - **The pooled word is the grammar's join.** A cell's word over a set of
   observations is `toc_merge` (the grammar's semilattice join) reduced over
   their individual words: the conservative envelope. The join is
@@ -1859,12 +1878,18 @@ row counts. The sibling carries the `temporal` block in its own attrs.
   companion. The key is spec-owned: a writer stamps it from the field's
   declaration, and config-declared attrs MUST NOT shadow it (§1.2's reserved-key
   discipline, enforced at config validation).
-- A centroid of **weight 1** carries its single observation's word: a
-  **timestamp**, exact to the nanosecond. A merged centroid carries a
-  **range** word conservatively containing every observation merged into it
-  — the grammar's `toc_merge` join over their words, with the same
-  order-independence §8.2 states. Both variants therefore coexist in one
-  array, and a reader that implements only one is not conforming.
+- **A word's claim is keyed on its variant**, carried by the word itself,
+  never by the payload's weights — under a `"flux"` payload (§2.0)
+  `sum(weights)` is not a member count, so weight identifies nothing. Each
+  observation enters under §8.1's discipline (an instant as a **timestamp**
+  word, exact to the nanosecond; a real interval — an integration window —
+  as a **range** word conservatively containing it); a merged centroid
+  carries the grammar's `toc_merge` join over its members' words, with the
+  same order-independence §8.2 states, and a centroid folded from a single
+  observation carries that observation's word unchanged. (Zagg's own
+  writers ingest per-observation instants today — range ingest is legal,
+  not emitted; informative.) Both variants therefore coexist in one array,
+  and a reader that implements only one is not conforming.
 - **Row order is the payload's, and it is not time order.** §2.1 sorts
   payload rows ascending by mean, and the sibling is row-aligned with them,
   so the stored words are in *value* order. A reader MUST NOT assume the
@@ -1990,9 +2015,10 @@ per centroid row of the payload it accompanies, bound from the payload
 array's `ragged` block `locations` key (§1.2). A reader MUST refuse a shape
 it does not implement.
 
-**An absent `located` key MUST be read as §2.2 verbatim** — order-29
-point-kind words at leaves, deepest-common-ancestor words after a merge —
-never as an unknown encoding, and never as grounds to refuse. Every located
+**An absent `located` key MUST be read as §2.2 verbatim** — kind-keyed
+words (a point word an exact position, an area word the finest cell
+containing everything beneath it), deepest-common-ancestor words after a
+merge — never as an unknown encoding, and never as grounds to refuse. Every located
 store written before this revision is conformant as it stands, no byte
 rewritten. What the declaration adds is self-description (a generic reader
 learns the word grammar from the array rather than from this page), the
@@ -2016,9 +2042,12 @@ a grammar that cannot move under a conforming reader.
 
 **Contract.**
 
-- The per-observation words a leaf ingests are **order-29 point-kind**
-  words; a centroid of weight 1 carries its single observation's word
-  unchanged, an exact position (§2.2).
+- A word's claim is keyed on its **kind** (§2.2): a **point word** is an
+  exact observation position; an **area word** is the finest morton cell
+  containing every observation beneath it — from cell-resolved ingest or
+  from a fold. A centroid folded from a single observation carries that
+  observation's word unchanged. (Zagg's writers ingest point instruments
+  as order-29 point words — informative.)
 - A merged centroid — at a leaf, at a spill-block close, or at any level of
   a pyramid — carries the **deepest common ancestor** of every observation
   merged into it: the finest morton cell containing all of them. That is the
@@ -2030,9 +2059,10 @@ a grammar that cannot move under a conforming reader.
   point word beside a merged centroid's coarse area word. A reader MUST
   decode each word's order from the word itself (mortie §1/§4) and MUST NOT
   assume a uniform order per array, per level, or per store, nor infer one
-  from the level's cell order. The **order-29 uniformity that §2.2's
-  per-observation clause implies is a leaf-ingest property only**, and does
-  not survive a fold.
+  from the level's cell order. **No order uniformity is promised anywhere —
+  leaf arrays included** (§2.2 admits cell-resolved area-word ingest): a
+  uniform order is an observation about particular bytes, never an
+  inference.
 - The ancestor reduction is exact and order-independent — point and area
   words share a path prefix, so mixed inputs compose under the one rule
   (§2.2) — but, as in §8.3, it does not lift the accompanying digest's
