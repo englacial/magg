@@ -2751,6 +2751,12 @@ def _clamped_data_source(data_source: dict, n_granules: int) -> dict | None:
     caller then passes the shared config through untouched, keeping unclamped
     cell payloads byte-identical. Just the simple ``min()`` policy; the
     worker still resolves the value through its ``_granule_workers`` guard.
+
+    The write-back uses whichever key the source dict carries — canonical
+    ``shard_workers`` if present, else the legacy ``granule_workers``. Writing
+    the legacy name unconditionally would leave both keys in the merged dict,
+    and ``_granule_workers`` prefers the canonical one, so the clamp would be
+    a silent no-op for any config using ``shard_workers``.
     """
     from zagg.processing.worker import _granule_workers
 
@@ -2758,7 +2764,8 @@ def _clamped_data_source(data_source: dict, n_granules: int) -> dict | None:
     clamped = min(k, max(int(n_granules), 1))
     if clamped == k:
         return None
-    return {**data_source, "granule_workers": clamped}
+    key = "shard_workers" if "shard_workers" in data_source else "granule_workers"
+    return {**data_source, key: clamped}
 
 
 def _check_signature(grid, catalog_data: dict) -> None:
