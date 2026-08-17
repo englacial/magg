@@ -305,14 +305,23 @@ def observation_words(values, *, epoch, scale: str, units: str) -> np.ndarray:
 
     The conversion is offset arithmetic on the grammar's own continuous scale —
     the epoch instant's internal ns plus the column's own continuous offset — so
-    no leap table enters the hot path. The scale-vs-UTC correction for a
-    pre-2017 epoch is taken from :func:`zagg.windows.utc_to_offset` rather than
-    recomputed here, so the toc words and the window routing cannot drift apart:
-    one fixed-offset model, one place.
+    no leap table enters the hot path, and no scale-vs-UTC correction belongs
+    here: ``mortie.from_datetime64`` is leap-aware, so ``base`` already places
+    the epoch on the grammar's continuous scale and ``values`` counts SI seconds
+    forward from it. Correcting on top of that would push a pre-2017-epoch word
+    18 s (``gps``) / 37 s (``tai``) off the true instant AND away from
+    :func:`zagg.windows.offset_to_utc`'s routing of the same observation, which
+    is exactly the drift this seam exists to avoid; with no correction, word and
+    router agree for every post-2017 epoch and for a GPS-native one, leaving
+    only windows.py's documented <= 1-leap-second tolerance. One residue stays:
+    :func:`zagg.windows.offset_to_utc` reads a *pre-2017* epoch on a non-UTC
+    scale as native to that scale, so for a ``tai`` column it routes 19 s from
+    the instant ``epoch + values`` SI seconds names. That is a windows.py epoch
+    convention, not something this encode can bridge.
     """
     import mortie
 
-    from zagg.windows import UNIT_SECONDS, parse_utc, utc_to_offset
+    from zagg.windows import UNIT_SECONDS, parse_utc
 
     if scale not in TOC_SOURCE_SCALES:
         raise ValueError(
@@ -322,12 +331,8 @@ def observation_words(values, *, epoch, scale: str, units: str) -> np.ndarray:
     if units not in UNIT_SECONDS:
         raise ValueError(f"toc ingest units {units!r} is not one of {sorted(UNIT_SECONDS)}")
     epoch_dt = parse_utc(epoch)
-    # ``utc_to_offset`` of the epoch against itself is 0 for a post-2017 epoch
-    # and the scale-UTC offset for a pre-2017 one — windows.py's branch, reused
-    # rather than restated.
-    shift_s = utc_to_offset(epoch_dt, epoch=epoch_dt, scale=scale, units="seconds")
     base = int(_internal_ns(np.array([epoch_dt.replace(tzinfo=None)], dtype="datetime64[us]"))[0])
-    offsets = np.asarray(values, dtype=np.float64) * UNIT_SECONDS[units] - shift_s
+    offsets = np.asarray(values, dtype=np.float64) * UNIT_SECONDS[units]
     if offsets.size and not np.isfinite(offsets).all():
         raise ValueError(
             "toc ingest met a non-finite observation time; a NaN or inf instant has no "
