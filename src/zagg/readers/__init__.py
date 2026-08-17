@@ -19,9 +19,16 @@ from zagg.readers.tdigest_tensor import (
     read_tensors,
 )
 
+# The raster ``(time, cells)`` family's time coordinate (spec §8, issue
+# #443). Re-exported rather than reimplemented: the encode and decode halves
+# of one wire contract belong in one module (``zagg.time_axis``), and the
+# writer imports the same constants.
+from zagg.time_axis import decode_time_axis, read_time_axis, time_axis_overlaps
+
 __all__ = [
     "cell_index",
     "chunk_z_range",
+    "decode_time_axis",
     "has_exact_occupancy",
     "rank_to_rowcol",
     "rasterize_cell",
@@ -29,5 +36,7 @@ __all__ = [
     "read_locations",
     "read_raw_values",
     "read_tensors",
+    "read_time_axis",
     "rowcol_to_rank",
+    "time_axis_overlaps",
 ]
