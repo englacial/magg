@@ -9,20 +9,21 @@ pins are being restated against it. Nothing here detects drift. The accident
 detector is and stays ``tests/test_benchmark_shardmap.py::
 test_pinned_shardmap_no_drift``, which rebuilds the same maps and fails loudly
 when a pin moves on its own; this script is that guard's deliberate
-counterpart, and it IMPORTS the guard's recipe helpers (manifest
-AOI/temporal/CMR resolution, the config lookup, the ``nested_in`` containment
-rule) so the two cannot drift apart.
+counterpart, and it CALLS the guard's own rebuild and pin functions —
+``drift.rebuild_shardmap`` and ``drift.select_pin`` — rather than restating
+them, so the two cannot build or pin differently. A second copy of the recipe
+is precisely what let the uncommitted scratch driver drift off the guard.
 
 One run, per shard-map entry named on the command line:
 
-1. rebuilds the map through the guard's recipe — the entry's config for the
-   grid, its resolved AOI/temporal/CMR (per-entry override over the top-level
-   manifest default), the committed map's ``metadata.backend``, and either the
-   committed ``catalog_parquet`` snapshot when the entry carries one (offline)
-   or a live CMR fetch when it does not;
-2. selects the pin with ``bench_metrics.select_densest_shard`` — for a
-   ``nested_in`` entry over the finer shards inside the pinned parent shard
-   only, never the global densest;
+1. rebuilds the map with ``drift.rebuild_shardmap`` — the entry's config for
+   the grid, its resolved AOI/temporal/CMR (per-entry override over the
+   top-level manifest default), the committed map's ``metadata.backend``, and
+   either the committed ``catalog_parquet`` snapshot when the entry carries one
+   (offline) or a live CMR fetch when it does not;
+2. selects the pin with ``drift.select_pin`` — for a ``nested_in`` entry over
+   the finer shards inside the pinned parent shard only, never the global
+   densest, and against the parent's pin as it stands on disk NOW;
 3. prunes the written map to the pinned shard when the committed map is pruned
    (``metadata.pruned`` — the 88S ring maps, whose full form is hundreds of MB
    of JSON), carrying that note over verbatim: it is editorial prose, not a
@@ -63,20 +64,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 BENCH = REPO / "tests" / "data" / "benchmark"
 TARGETS = BENCH / "targets.json"
-# The drift guard owns the rebuild recipe; importing it (rather than restating
-# it) is what keeps this driver on the guard's rails. ``bench_metrics``, beside
-# it under ``.github/scripts``, owns the densest-shard pin rule.
+# The drift guard owns the rebuild recipe and the pin rule; CALLING them
+# (rather than restating them) is what keeps this driver on the guard's rails.
 sys.path.insert(0, str(REPO / "tests"))
-sys.path.insert(0, str(REPO / ".github" / "scripts"))
 
-import bench_metrics  # noqa: E402
 import test_benchmark_shardmap as drift  # noqa: E402
 
-from zagg.catalog import load_polygon, polygon_to_bbox  # noqa: E402
 from zagg.catalog.shardmap import ShardMap  # noqa: E402
-from zagg.catalog.sources import Catalog, CMRSource, Query  # noqa: E402
-from zagg.config import load_config  # noqa: E402
-from zagg.grids import from_config  # noqa: E402
 
 #: Metadata keys a faithful rebuild may still move, reported by ``--check`` as
 #: such rather than as a changed pin: the build's own wall clock, and the MOC
@@ -102,65 +96,46 @@ def committed(sm_key: str) -> dict:
     return json.loads((BENCH / entry(sm_key)["path"]).read_text())
 
 
-def rebuild(sm_key: str) -> ShardMap:
-    """The full rebuilt map for one ``targets.json`` shard-map entry."""
-    sm_meta = entry(sm_key)
-    backend = committed(sm_key)["metadata"]["backend"]
-    grid = from_config(load_config(str(drift._config_for_shardmap(sm_key))))
-    aoi, temporal, cmr = drift.resolve_aoi_temporal_cmr(sm_meta)
-    parts = load_polygon(str(BENCH / aoi["file"]))
-    if sm_meta.get("catalog_parquet"):
-        catalog = Catalog.from_geoparquet(str(BENCH / sm_meta["catalog_parquet"]))
-    else:
-        catalog = CMRSource().fetch(
-            Query(
-                cmr["short_name"],
-                cmr["version"],
-                temporal["start"],
-                temporal["end"],
-                region=polygon_to_bbox(parts),
-                provider=cmr["provider"],
-            )
-        )
-    return ShardMap.build(catalog, grid, region=parts, backend=backend, footprint=cmr["footprint"])
+def prune_to_pin(rebuilt: ShardMap, key: int, note: str) -> ShardMap:
+    """The rebuild reduced to its pinned shard, carrying ``metadata.pruned``.
+
+    The 88S ring maps are committed pruned — their full form is hundreds of MB
+    of JSON. ``metadata`` stays the FULL build's (``total_shards`` /
+    ``total_pairs`` count the ring, not the surviving shard), matching the
+    committed maps, and ``note`` is carried over verbatim: it is editorial
+    prose, not a derived quantity.
+    """
+    i = [j for j, k in enumerate(rebuilt.shard_keys) if int(k) == key][0]
+    return ShardMap(
+        rebuilt.grid_signature,
+        [rebuilt.shard_keys[i]],
+        [rebuilt.granules[i]],
+        {**rebuilt.metadata, "pruned": note},
+    )
 
 
 def repin(sm_key: str) -> tuple[ShardMap, int, int]:
     """``(map to write, shard_key, n_granules)`` for one entry.
 
+    The rebuild and the pin rule are the guard's — ``drift.rebuild_shardmap``
+    and ``drift.select_pin`` — called, not restated, so this driver cannot
+    build or pin differently from the accident detector. Only the parent-pin
+    source differs: a ``nested_in`` child extracts against the parent's pin as
+    it stands on disk NOW, which is the parent's FRESH pin when both are
+    re-pinned in one run.
+
     The written map is the rebuild pruned to the pinned shard when the
-    committed map is pruned, and the whole rebuild otherwise. Either way
-    ``metadata`` is the FULL build's (``total_shards`` / ``total_pairs`` count
-    the ring, not the surviving shard), matching the committed maps.
+    committed map is pruned, and the whole rebuild otherwise.
     """
     sm_meta = entry(sm_key)
-    rebuilt = rebuild(sm_key)
-    shard_keys, granules = rebuilt.shard_keys, rebuilt.granules
+    rebuilt = drift.rebuild_shardmap(sm_key, sm_meta)
     nested_in = sm_meta.get("nested_in")
-    if nested_in:
-        # The nested pin (issue #148) is the densest finer shard INSIDE the
-        # pinned parent, so one parent extraction pass covers both orders.
-        parent_key = int(entry(nested_in)["shard_key"])
-        parent_grid = from_config(load_config(str(drift._config_for_shardmap(nested_in))))
-        keep = [
-            i
-            for i, k in enumerate(shard_keys)
-            if drift._containing_shard(parent_grid, int(k)) == parent_key
-        ]
-        shard_keys = [shard_keys[i] for i in keep]
-        granules = [granules[i] for i in keep]
-    key, n = bench_metrics.select_densest_shard({"shard_keys": shard_keys, "granules": granules})
+    parent_key = int(entry(nested_in)["shard_key"]) if nested_in else None
+    key, n = drift.select_pin(rebuilt, sm_meta, parent_key)
     note = committed(sm_key)["metadata"].get("pruned")
     if note is None:
         return rebuilt, key, n
-    i = [j for j, k in enumerate(shard_keys) if int(k) == key][0]
-    pruned = ShardMap(
-        rebuilt.grid_signature,
-        [shard_keys[i]],
-        [granules[i]],
-        {**rebuilt.metadata, "pruned": note},
-    )
-    return pruned, key, n
+    return prune_to_pin(rebuilt, key, note), key, n
 
 
 def differences(sm_key: str, mapped: ShardMap) -> list[str]:
