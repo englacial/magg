@@ -324,16 +324,20 @@ with the payload:
     reported position, carrying **no area claim** — not an assertion that
     the observation is dimensionless;
   - an **area word** is a cell known to contain every observation beneath
-    it — the finest such cell its producer could establish, whether it
-    entered that way (an observation whose *only* known location is a cell:
-    a pre-gridded or pre-aggregated input) or arose from a fold (the
-    deepest common ancestor of that fold's input words).
-- An observation located to a position enters as its point word; one
-  resolved only to a cell enters as that cell's area word — positions never
-  narrowed into points, the discipline §8.1 states for time, spatially.
-  (Zagg's own writers ingest point instruments as order-29 point words,
-  `HealpixGrid.assign`; area-word ingest is legal but no shipped config
-  emits it today — informative.)
+    it — the finest such cell its producer could establish. Under this
+    section an area word arises only from a fold (the deepest common
+    ancestor of the fold's input words); ingesting one directly is the
+    [§9](#9-zagg-located1) declaration's grant, not this section's.
+- **Per-observation ingest under this section is order-29 point words**
+  (`HealpixGrid.assign`): an observation enters as its reported position's
+  point word, and area words appear only as fold products. A writer whose
+  observations are resolved only to a cell (a pre-gridded or pre-aggregated
+  input) MUST NOT narrow them into points — §8.1's discipline, spatially —
+  and therefore MUST write them under the §9 declaration, which grants
+  area-word ingest; this section deliberately does not. The restriction is
+  the freeze rule at work: these semantics predate the declaration, and a
+  store read "as §2.2 verbatim" keeps exactly the meaning this section was
+  published with.
 - A merged centroid carries the **deepest common ancestor of its members'
   words** (`mortie.common_ancestor`): a cell containing every observation
   merged into it, and the finest one those words establish — a fold sees
@@ -2039,14 +2043,15 @@ it does not implement.
 
 **An absent `located` key MUST be read as §2.2 verbatim** — kind-keyed
 words (a point word a reported position carrying no area claim, an area word
-a cell containing everything beneath it), and after a merge the deepest
-common ancestor of the members' **words** — never as an unknown encoding,
-and never as grounds to refuse. Every located
-store written before this revision is conformant as it stands, no byte
-rewritten. What the declaration adds is self-description (a generic reader
-learns the word grammar from the array rather than from this page), the
-§8 shape vocabulary, and the overview clause below, which §2.2 does not
-cover.
+a cell containing everything beneath it), **order-29 point-word ingest**,
+area words only as fold products (the deepest common ancestor of the
+members' **words**) — never as an unknown encoding, and never as grounds to
+refuse. Every located store written before this revision is conformant as it
+stands, no byte rewritten. What the declaration adds is self-description (a
+generic reader learns the word grammar from the array rather than from this
+page), the §8 shape vocabulary, **the coarse-ingest grant** (§9.1 — a
+latitude §2.2 deliberately withholds, so its published semantics never
+move), and the overview clause below, which §2.2 does not cover.
 
 ### The word grammar is mortie's
 
@@ -2070,8 +2075,16 @@ a grammar that cannot move under a conforming reader.
   is a cell known to contain every observation beneath it — the finest such
   cell its producer could establish, from cell-resolved ingest or from a
   fold. A centroid folded from a single observation carries that
-  observation's word unchanged. (Zagg's writers ingest point instruments
-  as order-29 point words — informative.)
+  observation's word unchanged.
+- **Coarse ingest is this declaration's grant.** An observation located to
+  a position enters as its point word; one resolved only to a cell enters
+  as that cell's area word — positions never narrowed into points, §8.1's
+  discipline spatially. A store whose ingest words include area words MUST
+  carry this declaration: undeclared ingest is §2.2's (order-29 point words
+  only), so the absent-key route never widens under a reader's feet. (Zagg's
+  writers ingest point instruments as order-29 point words,
+  `HealpixGrid.assign`; no shipped config emits area-word ingest today —
+  informative.)
 - A merged centroid — at a leaf, at a spill-block close, or at any level of
   a pyramid — carries the **deepest common ancestor of its contributors'
   words**: a cell containing every observation merged into it, and the
@@ -2087,9 +2100,10 @@ a grammar that cannot move under a conforming reader.
   decode each word's order from the word itself (mortie §1/§4) and MUST NOT
   assume a uniform order per array, per level, or per store, nor infer one
   from the level's cell order. **No order uniformity is promised anywhere —
-  leaf arrays included** (§2.2 admits cell-resolved area-word ingest): a
-  uniform order is an observation about particular bytes, never an
-  inference.
+  leaf arrays included** (this declaration admits cell-resolved area-word
+  ingest, and even §2.2's strict ingest leaves spill-folded leaf centroids
+  coarse): a uniform order is an observation about particular bytes, never
+  an inference.
 - The ancestor reduction is exact and order-independent — point and area
   words share a path prefix, so mixed inputs compose under the one rule
   (§2.2) — but, as in §8.3, it does not lift the accompanying digest's
