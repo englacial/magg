@@ -23,6 +23,7 @@ from zagg.processing.read import (
     link_base_extent,
 )
 from zagg.processing.read_vlen import (
+    _sibling_joined_values,
     expand_link_indices,
     synthesize_linspace,
 )
@@ -502,6 +503,45 @@ class TestSiblingAssetJoin:
         # 104 fails sensitivity (0.50), 102 fails quality, 103 unmatched.
         assert sorted(set(df["shot_number"].tolist())) == [101]
 
+    def test_two_predicates_on_one_dataset_anded(self):
+        # Both predicates name the SAME sibling dataset: the join reads and
+        # gathers it once per unique path (issue #464 phase 1) and the verdicts
+        # still AND, so the result matches the single-predicate form.
+        ds = _l2a_ds(
+            filters=[
+                {"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "ge", "value": 1},
+                {"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "le", "value": 1},
+            ]
+        )
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            ds,
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        assert sorted(set(df["shot_number"].tolist())) == [101, 104]
+        assert len(df) == 9
+
+    def test_asset_variable_nans_the_unmatched_record(self):
+        # The variable arm's missing-row policy (issue #464 phase 2): shot 103
+        # has no L2A row, so its samples carry NaN rather than a neighbor's
+        # sensitivity — and the record is NOT dropped (only filters fail closed).
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            _l2a_var_ds(),
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        shots = df["shot_number"].to_numpy()
+        sens = df["sensitivity"].to_numpy()
+        assert np.isnan(sens[shots == 103]).all()
+        assert np.allclose(sens[shots == 101], 0.95)
+        assert np.allclose(sens[shots == 104], 0.50)
+
     def test_unmatched_record_never_borrows(self):
         # With no predicates beyond the join itself there are no asset filters,
         # so declare a tautology: every matched shot passes, unmatched drop.
@@ -576,6 +616,66 @@ class TestSiblingAssetJoin:
         )
         assert len(df) == 13
         assert np.isnan(df["sensitivity"].to_numpy()).all()
+
+
+class TestSiblingJoinedValues:
+    """The record-key join itself, direct (the contract both consumers share)."""
+
+    JOIN_CFG = {"join": {"left": "/{group}/shot_number", "right": "/{group}/shot_number"}}
+
+    @staticmethod
+    def _read_full(paths):
+        return _FakeH5(_l1b_arrays()).readDatasets(list(paths))
+
+    def _join(self, dataset_paths, n_records=4, sibling_arrays=None):
+        return _sibling_joined_values(
+            _FakeH5(_l2a_arrays() if sibling_arrays is None else sibling_arrays),
+            "BEAM0000",
+            "l2a",
+            self.JOIN_CFG,
+            n_records,
+            dataset_paths,
+            self._read_full,
+        )
+
+    def test_matched_vector_and_gather_order(self):
+        vals, matched = self._join(
+            ["/BEAM0000/quality_flag", "/BEAM0000/sensitivity"],
+        )
+        # Shots 101/102/104 have L2A rows; 103 does not.
+        assert matched.tolist() == [True, True, False, True]
+        # Row i is the sibling's value for primary record i — L2A file order is
+        # (101, 102, 104), so the gather is a reorder, not a slice.
+        assert vals["/BEAM0000/quality_flag"][[0, 1, 3]].tolist() == [1, 0, 1]
+        assert np.allclose(vals["/BEAM0000/sensitivity"][[0, 1, 3]], [0.95, 0.99, 0.50])
+
+    def test_unmatched_row_is_a_placeholder_only(self):
+        # The unmatched row carries the clamped gather's neighbor (shot 104's
+        # values), which is exactly why a consumer must test ``matched``.
+        vals, matched = self._join(["/BEAM0000/sensitivity"])
+        assert not matched[2]
+        assert np.isclose(vals["/BEAM0000/sensitivity"][2], 0.50)
+
+    def test_duplicate_paths_collapse_to_one_key(self):
+        vals, _ = self._join(["/BEAM0000/quality_flag", "/BEAM0000/quality_flag"])
+        assert list(vals) == ["/BEAM0000/quality_flag"]
+
+    def test_record_count_mismatch_raises(self):
+        with pytest.raises(ValueError, match=r"join\.left has 4 records"):
+            self._join(["/BEAM0000/quality_flag"], n_records=5)
+
+    def test_empty_sibling_returns_placeholder_arrays(self):
+        vals, matched = self._join(["/BEAM0000/quality_flag"], sibling_arrays=_l2a_arrays_empty())
+        assert not matched.any()
+        assert vals["/BEAM0000/quality_flag"].shape == (4,)
+        assert vals["/BEAM0000/quality_flag"].dtype == np.uint8
+
+    def test_duplicate_right_keys_raise(self):
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/shot_number"] = np.array([101, 102, 102, 104], dtype=np.uint64)
+        arrays["/BEAM0000/quality_flag"] = np.array([1, 1, 0, 1], dtype=np.uint8)
+        with pytest.raises(ValueError, match="duplicate key 102"):
+            self._join(["/BEAM0000/quality_flag"], sibling_arrays=arrays)
 
 
 # ── config validation of the vlen grammar ────────────────────────────────────
