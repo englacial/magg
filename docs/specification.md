@@ -1890,6 +1890,23 @@ levels to agree, and a reader MUST NOT infer one array's shape from another's.
 
 ### 8.4 Composition and merge legality
 
+**Scope.** §8.4 governs the composition of the **companion** shapes —
+`"per-cell"` (§8.2) and `"per-centroid"` (§8.3). It does **not** govern the
+`"coordinate"` shape: two time axes join under §8.1's Composition paragraph,
+which is the stricter rule, and **§8.1 takes precedence wherever both could
+be read to apply**. The two differ exactly on absence, and deliberately: an
+undeclared *companion* carries no information, so §8.4 composes with it and
+drops the channel; an undeclared *coordinate* array carries the legacy
+encoding (§8), which is information — a rival encoding of the same axis — so
+§8.1 MUST-refuses a legacy ↔ `zagg-toc/1` join. Nothing in §8.4's absent-key
+clause below licenses that join. This is the same boundary §8.1 draws from
+its own side under "What §8.1 does not cover".
+
+§9.2 imports this section verbatim with `located` in place of `temporal`, and
+inherits this scope with it: it governs the located companions — whose only
+shape this revision defines is `"per-centroid"` (§9) — and never a coordinate
+array.
+
 **Peer joins** (contract). Two payloads compose as *peers* — like joined with
 like, at one granularity — only when their temporal declarations **match on
 `{shape, grammar}`** — the §2.0 weights-gate discipline, for the same reason:
