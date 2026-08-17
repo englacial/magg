@@ -29,6 +29,8 @@ Split out of ``read.py`` per the §4 module cap (the route would push it past
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
@@ -36,6 +38,7 @@ from zagg.config import evaluate_filter_expression, filters_from_data_source
 from zagg.processing.read import (
     _expand_mask_at_rows,
     _expand_mask_to_base,
+    _gather_segment_at_parents,
     _predicate_mask,
     _read_paths_pooled,
     _read_segment_broadcasts,
@@ -48,6 +51,8 @@ from zagg.processing.read import (
     link_base_extent,
 )
 from zagg.read_plan import execute_read_plan, plan_read
+
+logger = logging.getLogger(__name__)
 
 
 def vlen_coordinates_level(data_source: dict) -> str | None:
@@ -89,6 +94,26 @@ def path_form_variables(variables: dict) -> dict:
     """
     synth = synthesized_specs(variables)
     return {name: entry for name, entry in variables.items() if name not in synth}
+
+
+def asset_variable_specs(data_source: dict) -> dict[str, dict]:
+    """Asset-sourced record-level variables: ``{name: {asset, path}}`` (issue #464).
+
+    A ``levels.<coordinates.level>.variables`` entry may be an ``{asset, path}``
+    mapping: the dataset is read from the named sibling asset's handle, joined
+    per record on the declared ``assets.<name>.join`` key, and broadcast to
+    base rate exactly like a plain record-level companion — so it is an
+    ordinary column downstream (expression filters included). Validation
+    (:func:`zagg.config._validate_vlen_source`) pins these to the coordinates
+    level: the join is keyed to that level's records.
+    """
+    coord_level = vlen_coordinates_level(data_source)
+    if coord_level is None:
+        return {}
+    lvl_vars = ((data_source.get("levels") or {}).get(coord_level) or {}).get("variables")
+    if not isinstance(lvl_vars, dict):
+        return {}
+    return {name: entry for name, entry in lvl_vars.items() if isinstance(entry, dict)}
 
 
 def expand_link_indices(
@@ -579,6 +604,47 @@ def _vlen_read_group(
         else {}
     )
 
+    # Asset-sourced record-level variables (issue #464): read from the sibling
+    # handle via the record-key join, NaN'd where the record has no sibling
+    # row, then broadcast through the same coordinates-level gather map the
+    # companions above reuse — identical on both arms, since ``parent_safe`` /
+    # ``valid`` are already at this read's rate. A granule with no open
+    # sibling handle degrades to all-NaN columns with one warning per granule
+    # (asset FILTERS above keep their fail-closed semantics).
+    asset_cols: dict[str, np.ndarray] = {}
+    asset_vars = asset_variable_specs(data_source)
+    if asset_vars:
+        by_asset_vars: dict[str, dict[str, str]] = {}
+        for name, entry in asset_vars.items():
+            by_asset_vars.setdefault(entry["asset"], {})[name] = entry["path"].format(group=group)
+        for asset, name_paths in by_asset_vars.items():
+            sibling = (siblings or {}).get(asset)
+            if sibling is None:
+                _warn_missing_sibling_once(h5obj, asset, sorted(name_paths))
+                record_vals = {
+                    name: np.full(len(coarse_lats), np.nan, dtype=np.float64) for name in name_paths
+                }
+            else:
+                values_by_path, matched = _sibling_joined_values(
+                    sibling,
+                    group,
+                    asset,
+                    data_source["assets"][asset],
+                    len(coarse_lats),
+                    list(name_paths.values()),
+                    _read_full,
+                )
+                record_vals = {}
+                for name, path in name_paths.items():
+                    # Always float64: the unmatched-row NaN (and the missing-
+                    # sibling arm above) need a float column either way.
+                    vals = _select_column(np.asarray(values_by_path[path]), None, name)
+                    vals = vals.astype(np.float64)
+                    vals[~matched] = np.nan
+                    record_vals[name] = vals
+            for name, vals in record_vals.items():
+                asset_cols[name] = _gather_segment_at_parents(vals, parent_safe, valid)
+
     # ---- Assemble columns: gathered variables, synthesized, broadcasts, leaf.
     data_dict: dict[str, np.ndarray] = {}
     for col_name, path in var_paths.items():
@@ -597,12 +663,17 @@ def _vlen_read_group(
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values
+    for col_name, planned_values in asset_cols.items():
+        values = planned_values[mask_spatial]
+        if keep_mask is not None:
+            values = values[keep_mask]
+        data_dict[col_name] = values
     leaf_after = leaf_ids[mask_spatial]
     data_dict["leaf_id"] = leaf_after[keep_mask] if keep_mask is not None else leaf_after
 
     # Base-level expression filters over the assembled columns, as in the
     # dense routes (aggregation-time escape hatch, no pushdown).
-    expr_names = list(variables) + list(seg_broadcasts)
+    expr_names = list(variables) + list(seg_broadcasts) + list(asset_cols)
     for f in expressions:
         cols = {c: data_dict[c] for c in expr_names if c in data_dict}
         try:
@@ -722,3 +793,30 @@ def _sibling_joined_values(
     sib_idx = order[pos_clip] if len(sorted_keys) else np.zeros(n_records, dtype=np.int64)
     values_by_path = {p: np.asarray(sib_data[p])[sib_idx] for p in dict.fromkeys(dataset_paths)}
     return values_by_path, matched
+
+
+def _warn_missing_sibling_once(h5obj, asset: str, names: list[str]) -> None:
+    """One warning per granule when an asset VARIABLE's sibling is absent (#464).
+
+    Asset variables degrade to NaN columns — unlike asset filters, which fail
+    closed (:func:`_sibling_record_mask`): a quality gate must never pass
+    unverified records silently, but a missing companion column is recoverable
+    downstream (and an expression filter over it drops the NaN rows by plain
+    comparison semantics). The read runs once per beam group; the guard rides
+    the granule's open primary handle so eight groups warn once, not eight
+    times.
+    """
+    warned = getattr(h5obj, "_zagg_asset_nan_warned", None)
+    if warned is None:
+        warned = set()
+        try:
+            h5obj._zagg_asset_nan_warned = warned
+        except AttributeError:
+            pass  # a handle with __slots__: degrade to one warning per group
+    if asset in warned:
+        return
+    warned.add(asset)
+    logger.warning(
+        f"granule carries no open sibling handle for asset {asset!r}; asset "
+        f"variables {names} filled with NaN"
+    )
