@@ -567,6 +567,74 @@ class Catalog:
             )
         return ~shapely.is_empty(geoms) & np.isin(type_ids, (3, 6))
 
+    def cover_footprints(self, order: int) -> tuple:
+        """Cover every footprint at ``order`` and return the MOCs -- persisting nothing.
+
+        The shared core of :meth:`index_footprints` and of ``ShardMap.build``'s
+        **unindexed** mortie path (issue #445): one ``mortie.arrow.from_wkbs``
+        call over the geometry column, screened by :meth:`granule_row_mask`, in
+        the same row-aligned ragged layout :meth:`footprint_cells` returns. The
+        only difference between the two callers is what they do with it --
+        ``index_footprints`` writes it into a column, ``build`` intersects it and
+        drops it -- so they cannot drift on the cover itself. "Indexed" is
+        therefore a statement about persistence, not about how a build assigns.
+
+        Parameters
+        ----------
+        order : int
+            HEALPix order to cover at. Unvalidated here: callers own the bound
+            (``index_footprints`` refuses above ``MORTIE_MOC_ORDER_CAP``,
+            ``build`` covers at the grid's ``parent_order``).
+
+        Returns
+        -------
+        tuple
+            ``(values, offsets, rows)``. ``values`` is every covered row's
+            morton words concatenated (``uint64``); ``offsets`` are arrow list
+            offsets **over the whole table** (``int64``, length
+            ``table.num_rows + 1``), so row ``i``'s MOC is
+            ``values[offsets[i]:offsets[i + 1]]`` and a screened-out row carries
+            a zero-length run; ``rows`` is the covered table rows (``int64``,
+            ascending) -- ``np.flatnonzero`` of the screen, which is exactly the
+            order :meth:`granule_records` emits.
+
+        Notes
+        -----
+        Row-aligned rather than compact so both callers index it by table row:
+        the column ``index_footprints`` writes is one entry per row by contract,
+        and ``build``'s intersection is positional against the same table. The
+        empty runs cost 8 bytes each.
+
+        Memory is :meth:`index_footprints`' documented posture, because it is
+        this method: ``from_wkbs`` bounds its own peak at roughly the result
+        size, and the screen's WKB copy plus live shapely objects is the term it
+        does not bound (~1 GB over the parquet read on the 555,867-row ATL03
+        clone -- a peak, not a leak, issue #429).
+        """
+        from mortie.arrow import from_wkbs
+
+        column = self.table.column("geometry")
+        # The shapely objects the screen decodes die with the call, so its peak
+        # does not stack with the cover below (see ``granule_row_mask``).
+        keep = self.granule_row_mask()
+        if keep.all():
+            # The case that actually occurs (every catalog in the tree); taking
+            # the column whole avoids a second WKB copy.
+            values, kept_offsets = from_wkbs(column, order=int(order))
+        elif keep.any():
+            values, kept_offsets = from_wkbs(column.filter(pa.array(keep)), order=int(order))
+        else:
+            values, kept_offsets = np.empty(0, dtype=np.uint64), np.zeros(1, dtype=np.int64)
+        # Scatter the kept rows' MOC lengths back over every row: screened rows
+        # get a zero-length run, so ``values[offsets[i]:offsets[i + 1]]`` stays
+        # keyed by table row.
+        counts = np.zeros(len(keep), dtype=np.int64)
+        counts[keep] = np.diff(kept_offsets)
+        offsets = np.zeros(len(keep) + 1, dtype=np.int64)
+        np.cumsum(counts, out=offsets[1:])
+        rows = np.flatnonzero(keep).astype(np.int64, copy=False)
+        return np.asarray(values, dtype=np.uint64), offsets, rows
+
     def index_footprints(self, order: int) -> "Catalog":
         """Precompute the ``footprint_cells`` morton MOC column (issue #396).
 
@@ -635,14 +703,14 @@ class Catalog:
         MB after ``to_numpy`` (a full WKB copy) -> 1,794 MB with the shapely
         objects live. They die with ``granule_row_mask``'s frame, so that stays
         a peak rather than stacking with the cover, but a whole-clone index
-        wants headroom for it. The ``keep.all()`` short-circuit below avoids a
-        second ~334 MB WKB copy in the case that actually occurs (nothing screened out --
-        every catalog in the tree). Reading the geometry-type word straight out
+        wants headroom for it. :meth:`cover_footprints`' ``keep.all()``
+        short-circuit avoids a second ~334 MB WKB copy in the case that actually
+        occurs (nothing screened out -- every catalog in the tree). Reading the geometry-type word straight out
         of the WKB, or chunking the ``from_wkb`` call, would drop the screen's
         peak entirely; not done here because it trades the shared shapely
         predicate for a hand-rolled one.
         """
-        from mortie.arrow import from_morton_index, from_wkbs
+        from mortie.arrow import from_morton_index
 
         from zagg.catalog.shardmap import MORTIE_MOC_ORDER_CAP
 
@@ -653,23 +721,11 @@ class Catalog:
                 f"finer column could not be the cover any build asks for. Index at "
                 f"order <= {MORTIE_MOC_ORDER_CAP} (the grid's parent_order is the right choice)."
             )
-        column = self.table.column("geometry")
-        # The shapely objects the screen decodes die with the call, so its peak
-        # does not stack with the cover below (see ``granule_row_mask``).
-        keep = self.granule_row_mask()
-        if keep.all():
-            values, kept_offsets = from_wkbs(column, order=int(order))
-        elif keep.any():
-            values, kept_offsets = from_wkbs(column.filter(pa.array(keep)), order=int(order))
-        else:
-            values, kept_offsets = np.empty(0, dtype=np.uint64), np.zeros(1, dtype=np.int64)
-        # Scatter the kept rows' MOC lengths back over every row: screened rows
-        # get a zero-length run, so ``values[offsets[i]:offsets[i + 1]]`` stays
-        # keyed by table row.
-        counts = np.zeros(len(keep), dtype=np.int64)
-        counts[keep] = np.diff(kept_offsets)
-        offsets = np.zeros(len(keep) + 1, dtype=np.int64)
-        np.cumsum(counts, out=offsets[1:])
+        # The cover, the screen and the row-aligned scatter all live in
+        # :meth:`cover_footprints` -- shared with ``ShardMap.build``'s unindexed
+        # path (issue #445), which runs the identical cover and simply keeps it
+        # in memory. This method is that cover plus the column write.
+        values, offsets, _ = self.cover_footprints(int(order))
         cells = pa.LargeListArray.from_arrays(
             pa.array(offsets, pa.int64()), from_morton_index(values)
         )
