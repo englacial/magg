@@ -1343,9 +1343,10 @@ class TestLiveCover:
     cover the geometry column, intersect, then decode records for the hits. The
     oracle is the path it replaces -- ``pre_445_path`` restores the record-first
     ``_intersect_mortie`` build -- and the pin is the serialized manifest, so
-    "faster" cannot quietly become "different". The two intended divergences
-    (the MultiPolygon superset, inherited with the cover; the cover order, now
-    ``parent_order``) are pinned as divergences, each on its own.
+    "faster" cannot quietly become "different". The intended divergences (the
+    MultiPolygon superset, inherited with the cover; the cover order, now
+    ``parent_order``, and the superset it admits at coarse shard orders) are
+    pinned as divergences, each on its own.
     """
 
     @pytest.fixture
@@ -1417,6 +1418,38 @@ class TestLiveCover:
         assert orders == [11]
         assert sm.metadata["mortie_order"] == 11
         assert "footprint_cells" not in sm.metadata, "nothing was persisted"
+
+    def test_coarse_shard_order_covers_a_superset(self, monkeypatch):
+        # The order default is flat by MEASUREMENT, not identical by
+        # construction: mortie's coverage is conservative per order, so a cover
+        # at ``parent_order`` can keep a boundary cell that the chunk-order
+        # cover refined down does not -- never the reverse. Every production
+        # pair measured flat (9/13, 11/13, 8/12, 9/11: 0/200 rows differing over
+        # random polygons), so it takes a coarse grid to see the gap at all:
+        # parent 6 against chunk 10, one rectangle straddling an order-6 seam.
+        # The assertion is the DIRECTION -- a future change that made the
+        # default a subset (dropping a real granule/shard pair) fails here.
+        coarse = HealpixGrid(6, 12, layout="fullsphere", chunk_inner=10)
+        cat = _catalog([_item("G00", 86.389228, 88.222362, lat0=-61.180344, lat1=-60.706814)])
+        region = [
+            (
+                np.array([-62.0, -62.0, -60.0, -60.0, -62.0]),
+                np.array([85.0, 89.0, 89.0, 85.0, 85.0]),
+            )
+        ]
+        live = ShardMap.build(cat, coarse, region=region, backend="mortie")
+        monkeypatch.setattr(shardmap, "_live_cells_plan", lambda *a, **k: None)
+        oracle = ShardMap.build(cat, coarse, region=region, backend="mortie")
+        assert live.metadata["mortie_order"] == 6
+        assert oracle.metadata["mortie_order"] == 10
+        assert set(oracle.shard_keys) < set(live.shard_keys), (
+            "the coarse cover must be a STRICT superset on this fixture, or it has stopped "
+            "reproducing the divergence and no longer pins the direction"
+        )
+        assert len(live.shard_keys) == 4 and len(oracle.shard_keys) == 3
+        by_shard = dict(zip(live.shard_keys, live.granules, strict=True))
+        extra = set(live.shard_keys) - set(oracle.shard_keys)
+        assert all([g["id"] for g in by_shard[k]] == ["G00"] for k in extra)
 
     def test_pinned_order_is_honored_and_matches_the_oracle(self, hp_grid, tmp_path, monkeypatch):
         # An explicit order is a request for a cover at that order -- nothing is
