@@ -2347,11 +2347,51 @@ class TestTemporalShapeDeclaration:
         cfg.aggregation["variables"] = {"observed": meta}
         return cfg
 
-    def test_per_centroid_on_a_ragged_field_validates(self):
+    @staticmethod
+    def _allow(monkeypatch, *functions):
+        """Lift the #410 producer gate for the named reducers.
+
+        Stands in for the kernel PR, which lifts it by naming its reducer in
+        ``TOC_PRODUCING_FUNCTIONS``. Every shape check below is live the
+        moment it does, so they are exercised through this seam rather than
+        left untested behind the gate.
+        """
+        from zagg import time_axis
+
+        monkeypatch.setattr(time_axis, "TOC_PRODUCING_FUNCTIONS", frozenset(functions))
+
+    def test_per_centroid_on_a_ragged_field_validates(self, monkeypatch):
+        self._allow(monkeypatch, "mean")
         validate_config(_ragged_cfg(inner_shape=[2], temporal="per-centroid"))
 
-    def test_per_cell_on_a_dense_uint64_field_validates(self):
+    def test_per_cell_on_a_dense_uint64_field_validates(self, monkeypatch):
+        self._allow(monkeypatch, "nanmax")
         validate_config(self._cell_cfg())
+
+    def test_temporal_is_refused_until_a_reducer_produces_words(self):
+        # The declaration surface landed ahead of the kernel: no reducer
+        # produces toc words today, so a runnable config declaring one would
+        # write a store violating §8.2/§8.3. Refuse at submission, the way
+        # validate_streaming refuses a located field under mode: merge.
+        for cfg in (_ragged_cfg(inner_shape=[2], temporal="per-centroid"), self._cell_cfg()):
+            with pytest.raises(ValueError, match="no reducer in this release produces"):
+                validate_config(cfg)
+
+    def test_the_refusal_names_the_kernel_that_lifts_it(self):
+        with pytest.raises(ValueError, match=r"issue #410"):
+            validate_config(self._cell_cfg())
+
+    def test_an_allowlisted_reducer_is_the_only_way_through(self, monkeypatch):
+        # The gate keys on the FIELD's reducer, not on the shape: allowlisting
+        # one reducer does not open the declaration to another's.
+        self._allow(monkeypatch, "nanmax")
+        validate_config(self._cell_cfg())
+        with pytest.raises(ValueError, match="no reducer in this release produces"):
+            validate_config(self._cell_cfg(function="nanmin"))
+
+    def test_undeclared_fields_are_untouched_by_the_gate(self):
+        # The gate is scoped to `temporal:` — every other config still loads.
+        validate_config(_ragged_cfg(inner_shape=[2]))
 
     def test_unknown_shape_rejected(self):
         with pytest.raises(ValueError, match="is not one of"):
@@ -2395,7 +2435,9 @@ class TestTemporalShapeDeclaration:
                 _ragged_cfg(inner_shape=[2], temporal="per-centroid", resolution="chunk")
             )
 
-    def test_sibling_name_collision_rejected(self):
+    def test_sibling_name_collision_rejected(self, monkeypatch):
+        # Behind the producer gate, like every other shape check here.
+        self._allow(monkeypatch, "mean")
         cfg = _ragged_cfg(inner_shape=[2], temporal="per-centroid")
         cfg.aggregation["variables"]["h_ph_tdigest_times"] = {
             "function": "mean",

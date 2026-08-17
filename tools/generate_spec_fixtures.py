@@ -950,7 +950,21 @@ def _centroid_runs(digest, n_obs: int):
 
 
 def _temporal_config():
-    """The ``temporal/`` fixture's config: both companion shapes at once."""
+    """The ``temporal/`` fixture's config: both companion shapes at once.
+
+    **This config is deliberately un-submittable, and constructed rather than
+    validated.** ``validate_config`` refuses every field-level ``temporal:``
+    in this release (``config._validate_temporal_producer``): no reducer
+    produces toc words until the #410 kernel PR, so a runnable config
+    declaring a companion would write a store violating the section it
+    declares. The generator is the documented test-only bypass — it builds
+    ``PipelineConfig`` directly, computes the words itself, and hands them to
+    the production write path through the fake ``process_shard`` below, which
+    is exactly why the §7 fixture can commit words the pipeline cannot yet
+    produce. Nothing here should grow a ``validate_config`` call; when the
+    kernel lands, the config's reducers get named in
+    ``time_axis.TOC_PRODUCING_FUNCTIONS`` and this note goes away.
+    """
     from zagg.config import PipelineConfig
 
     return PipelineConfig(
