@@ -55,6 +55,13 @@ TOC_FIELD_SHAPES = (TOC_SHAPE_PER_CELL, TOC_SHAPE_PER_CENTROID)
 #: The §8.2 reserved word: a per-cell companion's ``fill_value``, marking a
 #: cell the writer never observed. Never an acquisition.
 TOC_UNOBSERVED = 0
+#: The reducers that PRODUCE toc words, and may therefore declare a field-level
+#: ``temporal:`` companion (issue #410). **Empty in this release**: the §8.2/§8.3
+#: declaration surface landed ahead of the aggregation kernel, so
+#: ``zagg.config`` refuses ``temporal:`` outright rather than let a run stamp a
+#: declaration over words nothing produced. The kernel PR lifts the gate by
+#: naming its reducer here — that is the whole of lifting it.
+TOC_PRODUCING_FUNCTIONS: frozenset[str] = frozenset()
 #: The §8 word-grammar citation — a grammar REVISION token in the ecosystem's
 #: {name}/{major} style (``zagg-ragged/1``, ``morton-hive/2``), never a
 #: documentation URL or a stamp of the writer's installed mortie: store bytes
@@ -85,6 +92,7 @@ __all__ = [
     "TOC_EPOCH",
     "TOC_FIELD_SHAPES",
     "TOC_GRAMMAR",
+    "TOC_PRODUCING_FUNCTIONS",
     "TOC_SHAPE_COORDINATE",
     "TOC_SHAPE_PER_CELL",
     "TOC_SHAPE_PER_CENTROID",

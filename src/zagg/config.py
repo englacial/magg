@@ -1552,6 +1552,12 @@ def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
 
     ``coordinate`` is deliberately not accepted here: a time axis is declared
     by ``output.time_encoding`` (§8.1), not by an aggregation variable.
+
+    A well-formed declaration is then gated on a PRODUCER — see
+    :func:`_validate_temporal_producer`, which refuses every ``temporal:`` in
+    this release. The shape checks run first, and deliberately: they are the
+    live checks the moment the kernel lifts the gate, so they are worth
+    reporting to an author ahead of it.
     """
     from zagg.time_axis import (
         TOC_FIELD_SHAPES,
@@ -1610,12 +1616,54 @@ def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
                 f"fill_value {TOC_UNOBSERVED} (got {fill!r}) — §8.2 reserves it as the "
                 f"unobserved-cell marker"
             )
+        _validate_temporal_producer(name, meta)
         return
     if kind != "ragged":
         raise ValueError(
             f"Variable '{name}': temporal {TOC_SHAPE_PER_CENTROID!r} is a sibling of a "
             f"ragged payload, so kind must be 'ragged', not {kind!r} (spec §8.3)"
         )
+    _validate_temporal_producer(name, meta)
+
+
+def _validate_temporal_producer(name: str, meta: dict) -> None:
+    """Refuse a ``temporal:`` companion no reducer in this release produces.
+
+    The §8.2/§8.3 declaration surface landed ahead of the kernel that folds the
+    words (issue #410), so a config declaring a companion today would validate,
+    run, stamp the declaration, and write a store that violates the section it
+    declares — an all-empty ``{field}_times`` sibling beside a populated
+    payload (§8.3's row-alignment MUST), or a dense array holding the field's
+    own reducer output cast to ``uint64`` under a ``zagg-toc/1`` stamp (§8.2's
+    envelope claim). Refusing at submission is the same gate
+    :func:`zagg.processing.streaming.validate_streaming` applies to a located
+    field under ``mode: merge`` — name the channel the chosen path cannot
+    honor, and name the path that will.
+
+    The gate is an allowlist of producing reducers,
+    :data:`zagg.time_axis.TOC_PRODUCING_FUNCTIONS`, **empty in this release**,
+    so the refusal is total for users; the kernel PR lifts it per reducer.
+
+    The one documented bypass is the §7 conformance-fixture generator
+    (``tools/generate_spec_fixtures.py``), which constructs its
+    ``PipelineConfig`` directly and never calls :func:`validate_config` — it
+    feeds hand-computed words through the production write path precisely
+    because no reducer produces them yet. That is a test-only seam: every user
+    entry point (``load_config``, ``zagg.client``, ``client_transport``)
+    validates, so no runnable submission reaches the writer.
+    """
+    from zagg.time_axis import TOC_PRODUCING_FUNCTIONS
+
+    func = meta.get("function")
+    if func is not None and func in TOC_PRODUCING_FUNCTIONS:
+        return
+    raise ValueError(
+        f"Variable '{name}': 'temporal' declares a companion that no reducer in this "
+        f"release produces (function {func!r}) — the spec §8.2/§8.3 declaration "
+        f"surface landed ahead of the toc aggregation kernel, so enabling it would "
+        f"write a store violating the section it declares. The gate lifts with the "
+        f"kernel (issue #410)."
+    )
 
 
 def _validate_output_kind(name: str, meta: dict) -> None:
