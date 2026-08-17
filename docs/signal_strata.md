@@ -31,8 +31,11 @@ is **committed at ingest** and carried through the store in three pieces:
 
 The shipped template is `zagg/configs/atl03_tdigest_strata_healpix.yaml` —
 **located strata is the default**: both digest fields carry `location:
-leaf_id`, so each centroid stores its order-29 morton word (an exact photon
-position at weight 1) in the `{field}_locations` sibling arrays. The
+leaf_id`, so each centroid stores a morton word in the `{field}_locations`
+sibling arrays — an order-29 **point** word (the photon's reported position,
+no area claim) for an unmerged centroid, the deepest common ancestor of its
+members' words once centroids merge; a reader decodes kind and order from
+each word, never from the centroid's weight (spec §2.2/§9.1). The
 five confidence columns are read from the single 2-D `signal_conf_ph` dataset
 via the per-variable `column` selector (`{path: ..., column: k}` — the
 variable analogue of the structured-filter `column`); the shared path is

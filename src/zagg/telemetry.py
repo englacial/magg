@@ -16,10 +16,13 @@ summation order. Identity-like fields (``shard_key``, ``granules_sha256``,
 
 The sidecar has one SIBLING of its own (issue #388): ``granules.json``, the
 recorded granule-id list behind the record's ``granules_sha256``, on the same
-spec-keyed naming grammar (:func:`granule_ids_key`). It is deliberately not a
-record key — identity equality is the hash compare every fan-out reader
-already makes, and the list is fetched only to name what a contraction
-dropped.
+spec-keyed naming grammar (:func:`granule_ids_key`). Both are recorded in the
+CANONICAL granule-id space — the driver-stripped bare id
+(:func:`canonical_granule_id`, espg-ruled at the D19 hash epoch) — so the
+identity a leaf carries names the granules it read and not the driver that
+fetched them. It is deliberately not a record key — identity equality is the
+hash compare every fan-out reader already makes, and the list is fetched only
+to name what a contraction dropped.
 
 ``build_record``/``merge`` are pure (no I/O); the sidecar/parquet helpers below
 them do object-store I/O and import their backends lazily.
@@ -120,14 +123,102 @@ _EQ_OR_NONE_KEYS = (
 )
 
 
-def granules_sha256(granule_ids: Iterable[str] | None) -> str | None:
+def canonical_granule_id(entry) -> str:
+    """The canonical identity of one granule: its **driver-stripped bare id**.
+
+    espg-ruled at the D19 hash epoch, 2026-08-17 (PR #420 question (1)(b)):
+    *"we want the granule to trigger the hash, not how that granule is
+    fetched."* One physical granule is named three ways across the code paths
+    that record it — a resolved ``s3://bucket/key/FILE`` href, an
+    ``https://host/path/FILE`` href (``zagg.runner._resolve_urls`` picks one by
+    ``data_source.driver``), or the bare catalog id (``rec["id"]``, which for
+    every CMR/STAC catalog zagg reads IS the href's basename). Pre-epoch each
+    spelling hashed to a different :func:`granules_sha256`, so switching driver
+    — pure fetch mechanism, already packaging in the D19 core
+    (:data:`zagg.semantics.DATA_SOURCE_PACKAGING_KEYS`) — made every leaf's
+    recorded catalog identity un-reproducible and sent the skip gate down the
+    ``expansion`` arm for a rerun over exactly the same inputs.
+
+    The canonical form is therefore the basename: the scheme, host, bucket and
+    key prefix are all *where the bytes live*, not *which granule it is*, and
+    the s3 and https hrefs for one granule agree on nothing else. Ids that are
+    already bare pass through unchanged and idempotently, which covers the
+    raster id space (:func:`raster_granule_ids` — STAC item ids or ISO
+    datetimes, neither of which carries a path separator).
+
+    Paired-asset worker payloads (issue #425) arrive as ``{"url", "assets"}``
+    mappings; the record's granule identity is the **primary alone** — issue
+    #425's invariant, unchanged by this epoch — which is what keeps a caller
+    passing resolved strings (the local backend) and one passing the worker
+    payload verbatim (the Lambda handler) on one hash. The ``assets`` are
+    dropped, so a sibling href never reaches a digest at all: swap the sibling
+    for a genuinely different granule and :func:`granules_sha256` does not move.
+    Whether the recorded catalog identity *should* cover the sibling a paired
+    read consumes is a separate ruling, not implied here.
+
+    Accepted cost of the ruling: two granules whose hrefs differ only in
+    prefix collapse to one identity. Every catalog zagg reads names granules
+    globally uniquely (that is *why* ``rec["id"]`` equals the basename), and
+    the alternative — keeping any part of the fetch path — is exactly what the
+    ruling excludes. The cost is not only an identity collision: it also
+    degrades the **contraction guard's** per-granule resolution inside a
+    collapsed group, and in the unsafe direction — dropping one member of a
+    collided pair leaves ``zagg.dedup.classify_leaf_identity``'s set diff
+    unchanged, so the leaf reads ``id-multiset-drift`` and rewrites where the
+    pre-epoch href-space diff refused and named the dropped href. Such a leaf
+    is logged loudly (``zagg.dedup._warn_on_collapsed_recorded_ids``); making
+    it refuse instead is a ruling on the contraction predicate, standing for
+    espg (PR #420 review finding (2)).
+
+    A malformed entry RAISES rather than minting an identity: a mapping with no
+    ``url`` primary, or an empty/``None`` id, has no canonical form, and
+    stringifying it would give every such entry the SAME id — collapsing N of
+    them onto one recorded id, silently shrinking the recorded set the same way
+    the collision above degrades the contraction guard. Nothing in the
+    dispatchers produces one (``zagg.runner._resolve_granule_entries`` always
+    sets a non-empty ``url``), and the pre-epoch ``build_record`` raised
+    ``KeyError`` here; the whole point of the D19/D20 identity pair is that an
+    identity is never silently wrong.
+    """
+    if isinstance(entry, dict):
+        if not entry.get("url"):
+            raise ValueError(
+                f"granule entry has no 'url' primary, so it has no canonical "
+                f"identity (issue #425's paired-asset shape): {entry!r}"
+            )
+        entry = entry["url"]
+    if entry is None or entry == "":
+        raise ValueError("granule entry is empty, so it has no canonical identity")
+    text = str(entry).rstrip("/")
+    return text.rpartition("/")[2] or text
+
+
+def canonical_granule_ids(granule_ids: Iterable[Any] | None) -> list[str] | None:
+    """:func:`canonical_granule_id` over an id list, preserving order/length.
+
+    ``None`` in, ``None`` out — the callers distinguish "no planned set" from
+    "the empty set" (:func:`zagg.dedup.classify_leaf_identity`), so this must
+    not collapse the two.
+    """
+    if granule_ids is None:
+        return None
+    return [canonical_granule_id(g) for g in granule_ids]
+
+
+def granules_sha256(granule_ids: Iterable[Any] | None) -> str | None:
     """Catalog identity of a shard: sha256 over its sorted granule ids.
 
     Ids are whatever uniquely names the shard's inputs (granule URLs for the
-    aggregation path, item ids/datetimes for raster). Sorted so the hash is
-    order-independent; ``None``/empty -> ``None`` (no catalog identity).
+    aggregation path, item ids/datetimes for raster), reduced to their
+    canonical form first (:func:`canonical_granule_id`) so the digest names
+    the GRANULES and not the driver that fetched them. Any href form is
+    accepted, and so are the paired-asset mappings (issue #425) — hence
+    ``Iterable[Any]``, matching :func:`canonical_granule_ids` and the callers,
+    not the ``Iterable[str]`` this annotation carried pre-epoch. Sorted so the
+    hash is order-independent; ``None``/empty -> ``None`` (no catalog
+    identity).
     """
-    ids = sorted(str(g) for g in granule_ids) if granule_ids else []
+    ids = sorted(canonical_granule_ids(granule_ids) or [])
     if not ids:
         return None
     return hashlib.sha256("\n".join(ids).encode()).hexdigest()
@@ -164,7 +255,7 @@ def build_record(
     *,
     shard_key,
     metadata: dict,
-    granule_ids: Iterable[str] | None = None,
+    granule_ids: Iterable[Any] | None = None,
     invoked_by: dict | None = None,
     run_id: str | None = None,
     window: str | None = None,
@@ -234,16 +325,15 @@ def build_record(
         for k, v in phase_entries.items()
         if not k.endswith("_bytes") and k != "spill_blocks_closed"
     }
-    # Paired-asset worker payloads (issue #425) carry ``{"url", "assets"}``
-    # entries; the record's granule identity is the primary URL, so the
-    # catalog hash stays byte-identical between a caller passing resolved
-    # strings (the local backend) and one passing the worker payload verbatim
-    # (the Lambda handler).
-    granule_ids = (
-        [g["url"] if isinstance(g, dict) else g for g in granule_ids]
-        if granule_ids is not None
-        else None
-    )
+    # Canonical granule identity (espg-ruled 2026-08-17, the D19 hash epoch):
+    # the driver-stripped bare id, so an s3 href, an https href and a bare
+    # catalog id of one granule record identically. Paired-asset worker
+    # payloads (issue #425) carry ``{"url", "assets"}`` entries and identify by
+    # their primary, so the catalog hash stays byte-identical between a caller
+    # passing resolved strings (the local backend) and one passing the worker
+    # payload verbatim (the Lambda handler) -- see
+    # :func:`canonical_granule_id`.
+    granule_ids = canonical_granule_ids(granule_ids)
     n_granules = metadata.get("granule_count")
     if n_granules is None:
         n_granules = len(granule_ids or [])
@@ -913,7 +1003,10 @@ def write_granule_ids(leaf_path: str, granule_ids, spec: str | None = None, **st
         from zagg.store import open_object_store
 
         prefix, _, name = leaf_path.rstrip("/").rpartition("/")
-        ids = sorted(str(g) for g in granule_ids) if granule_ids else []
+        # Recorded in the CANONICAL id space (espg-ruled 2026-08-17): the same
+        # driver-stripped bare ids the hash beside them is taken over, and the
+        # same space ``dedup.classify_leaf_identity`` diffs the planned set in.
+        ids = sorted(canonical_granule_ids(granule_ids) or [])
         obstore.put(
             open_object_store(prefix, **store_kwargs),
             granule_ids_key(name, spec),

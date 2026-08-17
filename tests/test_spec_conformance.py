@@ -51,6 +51,9 @@ RAGGED_ARRAYS = [
     ("kitchen_sink", "h_tdigest_signal_locations", "uint64", ()),
     ("kitchen_sink", "h_tdigest_noise_locations", "uint64", ()),
     ("flux", "rx_flux", "float32", (2,)),
+    ("temporal", "h_tdigest", "float32", (2,)),
+    ("temporal", "h_tdigest_locations", "uint64", ()),
+    ("temporal", "h_tdigest_times", "uint64", ()),
 ]
 SENTINEL = 2**64 - 1
 
@@ -77,6 +80,10 @@ FROZEN_COMBINED = {
     # TestTemporalDeclaration (raster_toc is not in FIXTURES: it carries no
     # ragged array at all, so nothing the leaf-shaped suite asserts applies).
     "raster_toc": "42263e046ecf4d71de8460063b38e6f15522e245cdc2182ce3a0acaf35db7e4e",
+    # The §8.2/§8.3/§9 companion fixture (issue #410) — asserted by
+    # TestTemporalCompanions (temporal/ is not in FIXTURES: the leaf-shaped
+    # suite's digest assertions assume an UNLOCATED h_tdigest).
+    "temporal": "fcfc8c33810f7a9a6409c2c5d5d69297631d7aabfd79a4ee9dca3614ed853d81",
 }
 #: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
 #: its leaf, which is ``minimal``'s): the only committed store whose §5 key
@@ -101,6 +108,16 @@ FROZEN_ARRAYS = {
         "raster_toc",
         "6/time",
     ): "551f7be5718086c2ca1d379e1d1581368d21e4ca1433ce3ae4ae397e11b08f7f",
+    # The §8.2 dense per-cell companion and the §8.3 ragged per-centroid
+    # sibling (issue #410) — one frozen literal per companion element kind.
+    (
+        "temporal",
+        "6/observed",
+    ): "bf3b7e75967323db2a2db71d0b58f895f7178e99dd08eab385b5a917ff383d04",
+    (
+        "temporal",
+        "6/h_tdigest_times",
+    ): "84b51ac52e36710701238d3599dd6947818f20f9ca66a54ae1597b4b53471488",
 }
 
 
@@ -152,7 +169,7 @@ def _digest_expectations(exp):
     """Yield ``(field, cell_index, expected (k, 2) float32 digest)``."""
     for cell in exp["cells"]:
         for field in cell:
-            if field.startswith("h_tdigest") and not field.endswith("_locations"):
+            if field.startswith("h_tdigest") and not field.endswith(("_locations", "_times")):
                 want = np.array(cell[field], dtype=np.float32).reshape(-1, 2)
                 yield field, cell["index"], want
 
@@ -973,6 +990,151 @@ class TestColumnArtifact:
         assert exp["declared"] == {"overviews": 5}
 
 
+class TestFixtureSemanticHash:
+    """The committed ``semantic_hash`` must be reproducible from the config
+    that built the fixture (issue #415).
+
+    Nothing else in the suite reads that manifest field — the §5 hashes cover
+    decoded values, not identity — so before this pin a semantic-core edit
+    could ship fixtures carrying a digest no zagg reproduces, and moczarr
+    would vendor them (espg/moczarr#19/#20) with every parity gate green. The
+    D19 hash epoch is exactly the change that would have done it.
+    """
+
+    @staticmethod
+    def _generator():
+        """The fixture generator as a module (the ``test_content_hash`` precedent)."""
+        import importlib.util
+
+        path = Path(__file__).parent.parent / "tools" / "generate_spec_fixtures.py"
+        spec = importlib.util.spec_from_file_location("zagg_spec_fixture_generator", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @staticmethod
+    def _recorded(name):
+        return json.loads((SPEC_DATA / name / "morton_hive.json").read_text())["semantic_hash"]
+
+    #: Every fixture this class recomputes, and how its config is rebuilt.
+    #: ``test_every_fixture_is_covered`` refuses a fixture that is not here.
+    COVERED = ("minimal", "kitchen_sink", "column", "flux", PYRAMID, "raster_toc", "temporal")
+
+    @pytest.mark.parametrize(
+        "name,kwargs",
+        [
+            ("minimal", {"kitchen_sink": False}),
+            ("kitchen_sink", {"kitchen_sink": True}),
+            ("column", {"kitchen_sink": False, "pyramid": {"overviews": 5}}),
+            # The §2.0 flux fixture (issue #424) landed after the epoch's
+            # phase 3, so its committed digest was pre-epoch until now.
+            ("flux", {"kitchen_sink": False, "flux": True}),
+        ],
+    )
+    def test_leaf_fixture_hash_is_reproducible(self, name, kwargs):
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded(name) == semantic_hash(gen._config(**kwargs))
+
+    def test_the_raster_toc_fixture_hash_is_reproducible(self):
+        # The §8 fixture (issue #443) is built from its own config literal
+        # rather than `_config`, so the builder hands it over through
+        # `_raster_toc_config`. It also pins the one INCLUDED output key that
+        # is not leaf-shaping: `time_encoding: toc` is in the core, so this
+        # digest is not the same product as the default-encoding raster.
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded("raster_toc") == semantic_hash(gen._raster_toc_config())
+
+    def test_the_temporal_fixture_hash_is_reproducible(self):
+        # The §8.2/§8.3 fixture (issue #410) merged in carrying a pre-epoch
+        # digest — the third fixture this gate has caught (after `flux/` and
+        # `raster_toc/`) — and was regenerated at the sync. Its config is its
+        # own literal too, handed over through `_temporal_config`.
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded("temporal") == semantic_hash(gen._temporal_config())
+
+    def test_every_fixture_is_covered(self):
+        # The gate on the gate: a fixture added without a hash pin ships a
+        # digest nothing reproduces, which is exactly how `flux/` and
+        # `raster_toc/` came to carry pre-epoch values while the suite stayed
+        # green. Adding a fixture now fails here until it is pinned above.
+        recorded = {
+            p.parent.relative_to(SPEC_DATA).as_posix()
+            for p in SPEC_DATA.glob("**/morton_hive.json")
+            if json.loads(p.read_text()).get("semantic_hash")
+        }
+        assert recorded == set(self.COVERED)
+
+    def test_the_pyramid_fixture_hash_is_reproducible(self):
+        # Its manifest is built from the /1 config and then retrofitted by
+        # declare_pyramid under the /2 one, so the recorded hash pins BOTH
+        # halves at once: the digest reproduces, and the two configs agree —
+        # which is the property that keeps the retrofit legal (the pyramid
+        # block is deliberately outside the semantic core, issue #415).
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        cfg_v1 = gen._config(False)
+        cfg_v2 = gen._config(False, pyramid=gen.PYRAMID_KNOB)
+        for cfg in (cfg_v1, cfg_v2):
+            cfg.aggregation["variables"].update(gen.PYRAMID_EXTRA_VARIABLES)
+            cfg.output["grid"] = dict(gen.PYRAMID_GRID)
+        assert semantic_hash(cfg_v1) == semantic_hash(cfg_v2)
+        assert self._recorded(PYRAMID) == semantic_hash(cfg_v1)
+
+
+class TestFixtureGranuleIdentity:
+    """The OTHER half of the identity pair: each leaf's ``granules.json``
+    sibling (issue #388) must self-pair and be recorded in the CANONICAL
+    granule-id space (issue #415's granule ruling).
+
+    Nothing else in the suite reads that object —
+    :class:`TestFixtureSemanticHash` recomputes ``semantic_hash`` only — so the
+    epoch's edits to the committed siblings were covered by no assertion at
+    all. Both properties matter to a reader: a sibling whose digest does not
+    pair with its own id list is rejected as ``unrecorded-ids``
+    (``zagg.dedup._sibling_ids``), which silently disarms the contraction guard
+    on that leaf; and an id list still in the pre-epoch href space would pair
+    with nothing a post-epoch run plans.
+    """
+
+    #: Every committed sibling, enumerated over the tree the way
+    #: ``test_every_fixture_is_covered`` is, so a new fixture cannot ship one
+    #: unguarded.
+    SIBLINGS = sorted(
+        p.relative_to(SPEC_DATA).as_posix() for p in SPEC_DATA.glob("**/granules.json")
+    )
+
+    def test_every_leaf_fixture_carries_the_sibling(self):
+        # The gate on the gate, on ``test_every_fixture_is_covered``'s pattern:
+        # a fixture with a leaf but no recorded id list ships a leaf the
+        # contraction guard cannot protect. ``pyramid/`` is manifest-only (no
+        # leaf, hence no sibling), which is why this keys on the leaf.
+        want = {
+            f"{name}/{Path(_expected(name)['leaf']).parent.as_posix()}/granules.json"
+            for name in TestFixtureSemanticHash.COVERED
+            if _expected(name).get("leaf")
+        }
+        assert set(self.SIBLINGS) == want
+
+    @pytest.mark.parametrize("rel", SIBLINGS)
+    def test_the_sibling_self_pairs_on_canonical_ids(self, rel):
+        from zagg.telemetry import GRANULE_IDS_SPEC, canonical_granule_ids, granules_sha256
+
+        sibling = json.loads((SPEC_DATA / rel).read_text())
+        ids = sibling["granule_ids"]
+        assert sibling["spec"] == GRANULE_IDS_SPEC
+        assert granules_sha256(ids) == sibling["granules_sha256"]
+        # Already canonical, and sorted as the writer records them: the epoch is
+        # a fixed point on these ids, so re-canonicalizing moves nothing.
+        assert canonical_granule_ids(ids) == ids == sorted(ids)
+
+
 class TestTemporalDeclaration:
     """§8 — the temporal declaration, pinned on the committed `raster_toc/`.
 
@@ -1101,3 +1263,256 @@ class TestTemporalDeclaration:
         assert got["6/time"] == FROZEN_ARRAYS[("raster_toc", "6/time")]
         combined = hashlib.sha256("\n".join(sorted(got.values())).encode()).hexdigest()
         assert combined == exp["content_hashes"]["combined"]
+
+
+class TestTemporalCompanions:
+    """§8.2/§8.3 — the temporal companions, pinned on the committed
+    `temporal/` store.
+
+    The absent-declaration side needs no new fixture: `minimal/`,
+    `kitchen_sink/`, `column/` and `flux/` carry no `temporal` key on any
+    array, which is the §8.4 schema-evolution pin.
+    """
+
+    def _attrs(self, field):
+        exp = _expected("temporal")
+        return exp, _array_meta("temporal", exp, field)["attributes"]
+
+    def test_per_cell_declaration_and_dtype(self):
+        exp, attrs = self._attrs("observed")
+        assert attrs["temporal"] == exp["declarations"]["observed"]
+        assert attrs["temporal"] == {
+            "spec": "zagg-toc/1",
+            "shape": "per-cell",
+            "grammar": "mortie-toc/1",
+        }
+        meta = _array_meta("temporal", exp, "observed")
+        # §8.2: dense uint64 on the cells axis, reserved fill 0, aligned with
+        # `morton` — same shape, no sibling geometry of its own.
+        assert meta["data_type"] == "uint64"
+        assert meta["fill_value"] == 0
+        assert meta["shape"] == _array_meta("temporal", exp, "morton")["shape"]
+
+    def test_per_centroid_declaration_rides_the_sibling(self):
+        exp, payload = self._attrs("h_tdigest")
+        # The payload carries the BINDING and no declaration (§8.3) — and the
+        # binding is a sibling key, never inside the versioned ragged block.
+        assert payload["times"] == exp["times_binding"] == "h_tdigest_times"
+        assert "times" not in payload["ragged"]
+        assert "temporal" not in payload
+        sibling = _array_meta("temporal", exp, payload["times"])["attributes"]
+        assert sibling["temporal"] == exp["declarations"]["h_tdigest_times"]
+        assert sibling["temporal"]["shape"] == "per-centroid"
+        # A sibling carries the spec-owned declaration and nothing else.
+        assert set(sibling) == {"ragged", "temporal"}
+
+    def test_sibling_rows_align_with_the_payload(self):
+        exp = _expected("temporal")
+        store = _leaf_store("temporal", exp)
+        for cell in exp["cells"]:
+            digest = read_cell(store, f"{exp['group']}/h_tdigest", cell["index"])
+            words = read_cell(store, f"{exp['group']}/h_tdigest_times", cell["index"])
+            assert words.dtype == np.uint64
+            assert words.shape == (digest.shape[0],)
+            np.testing.assert_array_equal(words, np.array(cell["h_tdigest_times"], dtype=np.uint64))
+
+    def test_stored_per_cell_words_match_the_golden(self):
+        exp = _expected("temporal")
+        store = _leaf_store("temporal", exp)
+        observed = zarr.open_array(
+            store, path=f"{exp['group']}/observed", zarr_format=3, consolidated=False
+        )[:]
+        assert observed.dtype == np.uint64
+        populated = {cell["index"]: int(cell["observed"]) for cell in exp["cells"]}
+        for index, word in enumerate(observed):
+            # §8.2: 0 is reserved for a cell the writer never observed, and a
+            # populated cell never stores it.
+            assert int(word) == populated.get(index, 0)
+            if index in populated:
+                assert int(word) != 0
+
+    def test_both_word_variants_are_committed_in_both_shapes(self):
+        from mortie import toc_is_range
+
+        exp = _expected("temporal")
+        per_cell = np.array([c["observed"] for c in exp["cells"]], dtype=np.uint64)
+        per_centroid = np.concatenate(
+            [np.array(c["h_tdigest_times"], dtype=np.uint64) for c in exp["cells"]]
+        )
+        for words in (per_cell, per_centroid):
+            kinds = np.asarray(toc_is_range(words), dtype=bool)
+            assert kinds.any() and not kinds.all()
+
+    def test_words_conservatively_contain_their_members(self):
+        """§8.2/§8.3's whole claim, on committed bytes.
+
+        A merged word's envelope contains every member instant; a
+        single-member word is that instant exactly, never widened.
+        """
+        from mortie import to_datetime64, toc2time
+
+        def bounds(words):
+            lo, hi = toc2time(np.asarray(words, dtype=np.uint64))
+            return (
+                np.asarray(to_datetime64(lo)).astype("int64"),
+                np.asarray(to_datetime64(hi)).astype("int64"),
+            )
+
+        exp = _expected("temporal")
+        for cell in exp["cells"]:
+            lo, hi = bounds(cell["h_tdigest_times"])
+            spans = np.array(cell["centroid_spans_ns"], dtype="int64")
+            assert (lo <= spans[:, 0]).all()
+            single = spans[:, 0] == spans[:, 1]
+            assert (hi[single] == spans[single, 1]).all()  # exact instants
+            assert (hi[~single] > spans[~single, 1]).all()  # exclusive ends
+            # The per-cell word is an envelope of the whole cell, and so of
+            # every per-centroid envelope beneath it.
+            cell_lo, cell_hi = bounds([cell["observed"]])
+            obs = np.array(cell["obs_span_ns"], dtype="int64")
+            assert cell_lo[0] <= obs[0]
+            assert cell_hi[0] == obs[1] if obs[0] == obs[1] else cell_hi[0] > obs[1]
+            assert cell_lo[0] <= lo.min() and cell_hi[0] >= hi.max()
+
+    def test_window_predicate_runs_on_the_stored_words(self):
+        # §8.2/§8.3: selection is the grammar's overlap predicate on the
+        # stored words -- no decode, no sort, no bisection.
+        from mortie import from_datetime64, toc_overlaps
+
+        exp = _expected("temporal")
+        cell = exp["cells"][0]
+        obs = np.array(cell["obs_span_ns"], dtype="int64").astype("datetime64[ns]")
+        lo, hi = (int(w) for w in from_datetime64(obs))
+        words = np.array(cell["h_tdigest_times"], dtype=np.uint64)
+        assert np.asarray(toc_overlaps(words, lo, hi + 1), dtype=bool).all()
+        far = int(from_datetime64(np.array(["2099-01-01"], dtype="datetime64[ns]"))[0])
+        assert not np.asarray(toc_overlaps(words, far, far + 10**9), dtype=bool).any()
+
+    def test_absent_declaration_on_every_pre_companion_fixture(self):
+        from zagg.time_axis import temporal_declaration
+
+        for name in (*FIXTURES, "flux"):
+            exp = _expected(name)
+            for field in ("morton", "count"):
+                assert temporal_declaration(_array_meta(name, exp, field)["attributes"]) is None
+        # ...and no payload array binds a temporal sibling.
+        assert (
+            "times" not in _array_meta("minimal", _expected("minimal"), "h_tdigest")["attributes"]
+        )
+
+    def test_companions_are_absent_from_the_leaf_column(self):
+        """A companion exists at native resolution only, for now.
+
+        Its fold law is the grammar's join (§8.2), which no zagg fold
+        implements yet, so the D24 class is ``none`` and the §4.6 column this
+        same worker invocation wrote carries neither companion — rather than
+        carrying words folded through the field's own reducer, whose envelope
+        claim would be false. The #410 kernel PR is what flips this.
+        """
+        exp = _expected("temporal")
+        column = _leaf_dir("temporal", exp).parent / "all.pyramid.zarr"
+        groups = sorted(p.name for p in column.iterdir() if p.is_dir())
+        assert groups
+        for group in groups:
+            arrays = sorted(p.name for p in (column / group).iterdir() if p.is_dir())
+            assert arrays == ["count", "morton"]
+
+    def test_leaf_is_stamped_and_manifest_marked(self):
+        exp = _expected("temporal")
+        attrs = json.loads((_leaf_dir("temporal", exp) / "zarr.json").read_text())["attributes"]
+        assert attrs["morton_hive_commit"]["complete"] is True
+        manifest = json.loads((SPEC_DATA / "temporal" / "morton_hive.json").read_text())
+        assert manifest["spec"] == "morton-hive/1"
+
+    def test_frozen_digests_pin_the_recipe(self):
+        exp = _expected("temporal")
+        got = TestContentHashes._hash_leaf(_leaf_dir("temporal", exp))
+        assert got == exp["content_hashes"]["arrays"]
+        assert exp["content_hashes"]["combined"] == FROZEN_COMBINED["temporal"]
+        for field in ("6/observed", "6/h_tdigest_times"):
+            assert got[field] == FROZEN_ARRAYS[("temporal", field)]
+        combined = hashlib.sha256("\n".join(sorted(got.values())).encode()).hexdigest()
+        assert combined == exp["content_hashes"]["combined"]
+
+
+class TestLocatedDeclaration:
+    """§9 — the located declaration, pinned on the committed `temporal/`.
+
+    The absent-key ⇒ §2.2 side is pinned by `kitchen_sink/`, which predates
+    this revision and is deliberately not regenerated: its located siblings
+    carry no `located` key, and a reader must read them as §2.2 verbatim
+    rather than refuse them.
+    """
+
+    def test_declaration_rides_the_sibling_that_holds_the_words(self):
+        exp = _expected("temporal")
+        payload = _array_meta("temporal", exp, "h_tdigest")["attributes"]
+        assert payload["ragged"]["locations"] == "h_tdigest_locations"
+        assert "located" not in payload
+        sibling = _array_meta("temporal", exp, "h_tdigest_locations")["attributes"]
+        assert sibling["located"] == exp["declarations"]["h_tdigest_locations"]
+        assert sibling["located"] == {
+            "spec": "zagg-located/1",
+            "shape": "per-centroid",
+            "grammar": "mortie-morton/1",
+        }
+        assert set(sibling) == {"ragged", "located"}
+
+    def test_declared_words_are_the_2_2_words(self):
+        # §9 self-describes what §2.2 already pinned: the declaration changes
+        # no byte of the channel it declares.
+        from mortie import is_point, orders_of
+
+        exp = _expected("temporal")
+        store = _leaf_store("temporal", exp)
+        # The shipping reader binds the sibling through the payload's attrs
+        # (§1.2), so what §9 declares is what a reader actually returns.
+        rows = list(read_locations(store, f"{exp['group']}/h_tdigest"))
+        got = sorted(np.concatenate([locs for _w, _rc, locs in rows]).tolist())
+        want = sorted(int(w) for c in exp["cells"] for w in c["h_tdigest_locations"])
+        assert got == want
+        merged_orders: list[int] = []
+        for cell in exp["cells"]:
+            digest = read_cell(store, f"{exp['group']}/h_tdigest", cell["index"])
+            words = read_cell(store, f"{exp['group']}/h_tdigest_locations", cell["index"])
+            assert words.dtype == np.uint64
+            assert words.shape == (digest.shape[0],)
+            np.testing.assert_array_equal(
+                words, np.array(cell["h_tdigest_locations"], dtype=np.uint64)
+            )
+            # The split is the fixture's RECORDED member runs, never the
+            # payload weight: §2.2/§9.1 key a word's claim on the word, and
+            # under a "flux" payload (§2.0) a weight is not a member count.
+            # These bytes give every observation its own instant, so a
+            # single-instant span is a single-member run.
+            spans = np.array(cell["centroid_spans_ns"], dtype="int64")
+            unmerged = spans[:, 0] == spans[:, 1]
+            points = np.asarray(is_point(words), dtype=bool)
+            orders = np.asarray(orders_of(words))
+            # An unmerged centroid keeps its observation's order-29 POINT
+            # word; the merged rows are where coarser ancestors appear.
+            assert unmerged.any()
+            assert points[unmerged].all()
+            assert (orders[unmerged] == 29).all()
+            merged_orders.extend(int(o) for o in orders[~unmerged])
+        # Heterogeneous orders in one committed array is the §9.1 claim a
+        # reader must not assume away — decoded per word, never per array.
+        assert merged_orders and min(merged_orders) < 29
+
+    def test_absent_declaration_on_the_pre_section_9_fixture(self):
+        from zagg.grids.base import located_declaration
+
+        exp = _expected("kitchen_sink")
+        for stratum in ("signal", "noise"):
+            attrs = _array_meta("kitchen_sink", exp, f"h_tdigest_{stratum}_locations")["attributes"]
+            assert "located" not in attrs
+            assert located_declaration(attrs) is None
+
+    def test_unknown_declaration_is_refused(self):
+        from zagg.grids.base import located_declaration
+
+        exp = _expected("temporal")
+        block = dict(_array_meta("temporal", exp, "h_tdigest_locations")["attributes"]["located"])
+        for bad in ({"spec": "zagg-located/2"}, {"shape": "per-cell"}, {"grammar": "geohash/1"}):
+            with pytest.raises(ValueError):
+                located_declaration({"located": {**block, **bad}})

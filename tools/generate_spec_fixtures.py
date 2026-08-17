@@ -72,6 +72,18 @@ conformance tests assert decoded values, never object bytes.
   no network and no GDAL. The other four fixtures, which carry no
   ``temporal`` key anywhere, are the absent-key ⇒ legacy pin.
 
+- ``temporal/`` — the §8.2/§8.3/§9 COMPANION surface (issue #410):
+  ``minimal/``'s geometry and cell plan with a located AND temporal digest
+  field (payload + ``h_tdigest_locations`` + ``h_tdigest_times``, each
+  sibling stamped with the declaration of the words IT holds) plus the dense
+  per-cell ``observed`` toc array and ``count``. Both toc variants ride both
+  shapes: the 1-observation cell is an exact TIMESTAMP, every
+  multi-observation cell and merged centroid a conservative RANGE. The words
+  are computed here from the generator's inputs and handed to the write path
+  — the aggregation kernel that will produce them is #410's next PR — so the
+  expectations stay input-derived. ``kitchen_sink/``, committed before §9
+  and not regenerated, is the absent-``located`` ⇒ §2.2 pin.
+
 STALE BY DESIGN: ``minimal/`` and ``kitchen_sink/`` were committed before
 issue #382 and their ``morton_hive.json`` still carries the pre-#382
 ``pyramid`` block (``{"orders": [], "aggregation": {}}``). Running this
@@ -760,27 +772,12 @@ def _raster_slab(t_idx: int, n_cells: int):
     return {"red": red, "scl": scl}, valid
 
 
-def build_raster_toc(out: Path) -> None:
-    """The §8 ``raster_toc/`` fixture: a toc-declared ``(time, cells)`` leaf.
-
-    Written through the production raster hive seam
-    (``processing.raster.process_and_write_raster_hive`` — leaf template,
-    per-timestep slab streaming, coverage sidecar, commit stamp, O11
-    hashing), with only the COG **sampling** faked: the fixture pins the
-    stored bytes and the time-axis declaration, not the pull-NN arithmetic
-    (``tests/test_raster.py`` owns that), and a committed fixture must never
-    need network or GDAL to regenerate.
-    """
-    import zarr
-
-    from zagg import hive
+def _raster_toc_config():
+    """The ``raster_toc/`` fixture's config, factored out of the builder so a
+    test can recompute the fixture's ``semantic_hash`` from it (issue #415)."""
     from zagg.config import load_config_from_dict
-    from zagg.grids import from_config
-    from zagg.grids.morton import morton_word
-    from zagg.processing import raster as raster_mod
-    from zagg.time_axis import decode_time_axis, time_axis_attrs
 
-    cfg = load_config_from_dict(
+    return load_config_from_dict(
         {
             "data_source": {"reader": "raster", "bands": RASTER_BANDS, "nodata": 0},
             "output": {
@@ -798,6 +795,28 @@ def build_raster_toc(out: Path) -> None:
             },
         }
     )
+
+
+def build_raster_toc(out: Path) -> None:
+    """The §8 ``raster_toc/`` fixture: a toc-declared ``(time, cells)`` leaf.
+
+    Written through the production raster hive seam
+    (``processing.raster.process_and_write_raster_hive`` — leaf template,
+    per-timestep slab streaming, coverage sidecar, commit stamp, O11
+    hashing), with only the COG **sampling** faked: the fixture pins the
+    stored bytes and the time-axis declaration, not the pull-NN arithmetic
+    (``tests/test_raster.py`` owns that), and a committed fixture must never
+    need network or GDAL to regenerate.
+    """
+    import zarr
+
+    from zagg import hive
+    from zagg.grids import from_config
+    from zagg.grids.morton import morton_word
+    from zagg.processing import raster as raster_mod
+    from zagg.time_axis import decode_time_axis, time_axis_attrs
+
+    cfg = _raster_toc_config()
     grid = from_config(cfg)
     shard = morton_word(SHARD_KEY)
     n_cells = grid.cells_per_shard
@@ -882,6 +901,297 @@ def build_raster_toc(out: Path) -> None:
     print(f"{out.name}: leaf {leaf_rel}, {len(words)} timesteps, {n_cells} cells")
 
 
+#: The ``temporal/`` fixture's per-observation clock (§8.2/§8.3, issue #410).
+#: A base instant per populated cell, plus one step per observation, so every
+#: multi-observation cell spans a real interval and a 1-observation cell is a
+#: real instant. Well inside the toc grammar's range and far from its epoch.
+TEMPORAL_BASE = "2019-05-14T02:11:07.250000000"
+#: Seconds between consecutive observations of one cell. Wide enough that a
+#: merged centroid's envelope is a genuine range rather than a rounding
+#: artifact, narrow enough that a cell's whole span stays sub-hour.
+TEMPORAL_STEP_S = 3
+
+
+def _obs_times_ns(n: int, cell_ordinal: int) -> np.ndarray:
+    """Per-observation instants for one cell, in ns since the Unix epoch.
+
+    Ordered with the cell's value-sorted rank (see :func:`_temporal_words`),
+    and offset per cell so no two cells share a clock.
+    """
+    base = np.datetime64(TEMPORAL_BASE, "ns").astype("int64")
+    step = int(TEMPORAL_STEP_S * 1_000_000_000)
+    return base + cell_ordinal * 97 * step + np.arange(n, dtype="int64") * step
+
+
+def _toc_words(lo_ns: np.ndarray, hi_ns: np.ndarray) -> np.ndarray:
+    """Envelope words for ``[lo, hi]`` pairs: exact timestamp when degenerate.
+
+    The §8 honesty rule in one place — an instant is never widened into a
+    range, a real interval never narrowed into an instant.
+    """
+    import mortie
+
+    lo = np.asarray(mortie.from_datetime64(lo_ns.astype("datetime64[ns]")), dtype="uint64")
+    hi = np.asarray(mortie.from_datetime64(hi_ns.astype("datetime64[ns]")), dtype="uint64")
+    out = np.asarray(mortie.span2toc(lo, hi), dtype="uint64")
+    instant = lo == hi
+    if instant.any():
+        out[instant] = np.asarray(mortie.time2toc(lo[instant]), dtype="uint64")
+    return out
+
+
+def _centroid_runs(digest, n_obs: int):
+    """``(start, stop)`` observation runs per centroid row.
+
+    The generator assigns each observation a time monotone in its VALUE and
+    §2.1 sorts payload rows ascending by mean, so centroid ``i`` covers a
+    contiguous run of the value-ordered observations, delimited by the
+    cumulative weights before it. That contiguity is what lets the fixture
+    state each centroid's true member set — and therefore assert §8.3's
+    conservative-containment claim rather than assume it.
+    """
+    weights = np.asarray(digest[:, 1], dtype=np.float64).round().astype("int64")
+    assert int(weights.sum()) == n_obs, (int(weights.sum()), n_obs)
+    bounds = np.concatenate([[0], np.cumsum(weights)])
+    return list(zip(bounds[:-1], bounds[1:], strict=True))
+
+
+def _temporal_config():
+    """The ``temporal/`` fixture's config: both companion shapes at once.
+
+    **This config is deliberately un-submittable, and constructed rather than
+    validated.** ``validate_config`` refuses every field-level ``temporal:``
+    in this release (``config._validate_temporal_producer``): no reducer
+    produces toc words until the #410 kernel PR, so a runnable config
+    declaring a companion would write a store violating the section it
+    declares. The generator is the documented test-only bypass — it builds
+    ``PipelineConfig`` directly, computes the words itself, and hands them to
+    the production write path through the fake ``process_shard`` below, which
+    is exactly why the §7 fixture can commit words the pipeline cannot yet
+    produce. Nothing here should grow a ``validate_config`` call; when the
+    kernel lands, the config's reducers get named in
+    ``time_axis.TOC_PRODUCING_FUNCTIONS`` and this note goes away.
+    """
+    from zagg.config import PipelineConfig
+
+    return PipelineConfig(
+        data_source={"groups": ["g"]},
+        aggregation={
+            "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+            "variables": {
+                "count": {"function": "len", "source": "h", "dtype": "int32", "fill_value": 0},
+                "h_tdigest": {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest",
+                    "source": "h",
+                    "location": "leaf_id",
+                    # §8.3: a uint64 sibling sharing the digest's offsets.
+                    "temporal": "per-centroid",
+                    "inner_shape": [2],
+                    "dtype": "float32",
+                    "fill_value": 0,
+                    "params": {"delta": DELTA},
+                },
+                # §8.2: the dense per-cell companion. The generator feeds its
+                # words through the write path (the fake process_shard below),
+                # so the declared reducer is never exercised here — the toc
+                # reducer itself lands with the #410 kernel PR.
+                "observed": {
+                    "function": "nanmax",
+                    "source": "h",
+                    "dtype": "uint64",
+                    "fill_value": 0,
+                    "temporal": "per-cell",
+                },
+            },
+        },
+        output={
+            "store_layout": "hive",
+            "grid": {
+                "type": "healpix",
+                "parent_order": 4,
+                "child_order": 6,
+                "chunk_inner": 5,
+                "sharded": True,
+            },
+        },
+    )
+
+
+def _fake_temporal_shard(grid, by_chunk):
+    """``process_shard`` stand-in for ``temporal/``: dense + both channels."""
+
+    def fake(g, shard_key, urls, **kwargs):
+        occupied = []
+        for ordinal, (block, children) in enumerate(grid.iter_chunks(int(shard_key))):
+            cells = by_chunk.get(ordinal, {})
+            if not cells:
+                kwargs["chunk_results"].append((block, pd.DataFrame(), {}))
+                continue
+            n = grid.cells_per_chunk
+            df = pd.DataFrame({"morton": np.asarray(children, dtype=np.uint64)})
+            df["count"] = np.array(
+                [cells.get(i, {}).get("count", 0) for i in range(n)], dtype=np.int32
+            )
+            # §8.2: an unobserved cell keeps the reserved 0 fill.
+            df["observed"] = np.array(
+                [cells.get(i, {}).get("observed", 0) for i in range(n)], dtype=np.uint64
+            )
+            ids = sorted(cells)
+            # The §8.3 4-tuple: payloads, cells, location words, toc words.
+            ragged = {
+                "h_tdigest": (
+                    [cells[i]["h_tdigest"][0] for i in ids],
+                    ids,
+                    [cells[i]["h_tdigest"][1] for i in ids],
+                    [cells[i]["h_tdigest"][2] for i in ids],
+                )
+            }
+            kwargs["chunk_results"].append((block, df, ragged))
+            occupied.extend(int(children[i]) for i in sorted(cells))
+        kwargs["occupied_out"].append(np.asarray(occupied, dtype=np.uint64))
+        return pd.DataFrame(), {
+            "shard_key": int(shard_key),
+            "cells_with_data": len(occupied),
+            "total_obs": sum(c["count"] for cells in by_chunk.values() for c in cells.values()),
+            "granule_count": 1,
+            "files_processed": 1,
+            "duration_s": 0.0,
+            "error": None,
+        }
+
+    return fake
+
+
+def build_temporal(out: Path) -> None:
+    """The §8.2/§8.3/§9 ``temporal/`` fixture: both companion shapes, declared.
+
+    One leaf on the same 4/5/6 geometry as ``minimal/``, carrying a located
+    AND temporal digest field — payload plus its two uint64 siblings — and a
+    dense per-cell toc companion, each word array stamped with the
+    declaration of the words IT holds. Both toc variants are committed (the
+    1-observation cell is an exact timestamp, every multi-observation cell
+    and every merged centroid a conservative range), so a reader implementing
+    only one variant fails a §7 fixture.
+
+    Declaration-scoped, like the PR it lands in: the words are computed here
+    from the generator's inputs and handed to the production write path. The
+    aggregation kernel that will produce them is issue #410's next PR — which
+    is exactly why the expectations are derived from inputs, never read back.
+    """
+    import zagg.processing as processing
+    from zagg import hive
+    from zagg.grids import HealpixGrid
+    from zagg.grids.morton import morton_word
+    from zagg.stats.tdigest import build_tdigest
+
+    cfg = _temporal_config()
+    grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+    shard = morton_word(SHARD_KEY)
+    children = grid.children(shard)
+    rng = np.random.default_rng(410)
+
+    by_chunk: dict = {}
+    expected_cells = []
+    # The minimal/kitchen_sink cell plan: chunk ordinal 2 stays EMPTY, and the
+    # 1-observation cell is what commits the exact-timestamp variant.
+    for ordinal, (chunk, local, n) in enumerate([(0, 0, 40), (0, 2, 1), (1, 1, 5), (3, 3, 300)]):
+        cell_index = chunk * grid.cells_per_chunk + local
+        cell_word = int(children[cell_index])
+        h = np.round(rng.normal(30.0, 5.0, n), 3).astype(np.float64)
+        words = np.asarray(_point_words(grid, cell_word, n, rng))
+        # Times rise with VALUE, so a centroid's members are contiguous in the
+        # payload's own §2.1 ordering (see _centroid_runs).
+        order = np.argsort(h, kind="stable")
+        h, words = h[order], words[order]
+        times_ns = _obs_times_ns(n, ordinal)
+        digest, locs = build_tdigest(h, DELTA, locations=words)
+        runs = _centroid_runs(digest, n)
+        per_centroid = _toc_words(
+            times_ns[[lo for lo, _ in runs]], times_ns[[hi - 1 for _, hi in runs]]
+        )
+        per_cell = int(_toc_words(times_ns[:1], times_ns[-1:])[0])
+        by_chunk.setdefault(chunk, {})[local] = {
+            "count": n,
+            "observed": per_cell,
+            "h_tdigest": (digest, locs, per_centroid),
+        }
+        expected_cells.append(
+            {
+                "index": cell_index,
+                "morton": str(cell_word),
+                "count": n,
+                "h_tdigest": [[float(m), float(w)] for m, w in digest],
+                "h_tdigest_locations": [str(int(w)) for w in locs],
+                "h_tdigest_times": [str(int(w)) for w in per_centroid],
+                "observed": str(per_cell),
+                # The REAL member instants the stored words must contain
+                # (§8.2/§8.3's conservative-containment claim), derived from
+                # the same inputs the words were built from — never
+                # transcribed, so an input edit that moves the words fails
+                # the conformance assertion instead of sliding past it.
+                "centroid_spans_ns": [
+                    [str(int(times_ns[lo])), str(int(times_ns[hi - 1]))] for lo, hi in runs
+                ],
+                "obs_span_ns": [str(int(times_ns[0])), str(int(times_ns[-1]))],
+            }
+        )
+    assert EMPTY_CHUNK not in by_chunk
+
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    root = str(out)
+    hive.ensure_manifest(
+        root,
+        hive.build_manifest(grid, dataset={"short_name": "SPEC_FIXTURE", "version": "1"}),
+    )
+    original = processing.process_shard
+    processing.process_shard = _fake_temporal_shard(grid, by_chunk)
+    try:
+        meta = hive.process_and_write_hive(
+            shard, ["s3://fixture/a.h5"], grid, {}, root, cfg, store_kwargs={}
+        )
+    finally:
+        processing.process_shard = original
+    assert meta.get("error") is None, meta
+
+    leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
+    expected = {
+        "shard": SHARD_KEY,
+        "leaf": leaf_rel,
+        "group": grid.group_path,
+        "shard_order": 4,
+        "chunk_order": 5,
+        "cell_order": 6,
+        "cells_per_chunk": grid.cells_per_chunk,
+        "chunks_per_shard": grid.chunks_per_shard,
+        "empty_chunk": EMPTY_CHUNK,
+        "delta": DELTA,
+        # The declarations the conformance tests assert against the committed
+        # attrs — each on the array that HOLDS the words (§8/§9), and the
+        # payload's binding, which is a sibling key of the ragged block.
+        "declarations": {
+            "observed": {"spec": "zagg-toc/1", "shape": "per-cell", "grammar": "mortie-toc/1"},
+            "h_tdigest_times": {
+                "spec": "zagg-toc/1",
+                "shape": "per-centroid",
+                "grammar": "mortie-toc/1",
+            },
+            "h_tdigest_locations": {
+                "spec": "zagg-located/1",
+                "shape": "per-centroid",
+                "grammar": "mortie-morton/1",
+            },
+        },
+        "times_binding": "h_tdigest_times",
+        "cells": expected_cells,
+        "content_hashes": _o11_hashes(str(out / leaf_rel)),
+    }
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells, both toc variants")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -905,6 +1215,7 @@ def main() -> None:
         "pyramid": lambda: build_pyramid(args.out / "pyramid"),
         "flux": lambda: build(args.out / "flux", kitchen_sink=False, flux=True),
         "raster_toc": lambda: build_raster_toc(args.out / "raster_toc"),
+        "temporal": lambda: build_temporal(args.out / "temporal"),
     }
     unknown = set(args.only or ()) - set(builders)
     if unknown:

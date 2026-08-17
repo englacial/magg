@@ -34,14 +34,18 @@ import pandas as pd
 
 from zagg.config import evaluate_filter_expression, filters_from_data_source
 from zagg.processing.read import (
+    _expand_mask_at_rows,
     _expand_mask_to_base,
     _predicate_mask,
     _read_paths_pooled,
     _read_segment_broadcasts,
     _read_workers,
     _record_obs_read,
+    _segment_level_variables,
     _select_column,
+    _validate_link_disjoint,
     _variable_specs,
+    link_base_extent,
 )
 from zagg.read_plan import execute_read_plan, plan_read
 
@@ -100,11 +104,18 @@ def expand_link_indices(
     the same origin (``index_base``) and empty-record discipline as
     :func:`zagg.processing.read._broadcast_segment_to_base`.
 
-    ``n_base`` is the caller's: :func:`_vlen_read_group` derives it as
-    ``Σcount`` under #43's contiguity assumption, so through the route the
-    ``-1`` rows are unreachable (a granule that leaves a hole raises here
-    instead) — the tolerance is for the offline/unit callers that pass a base
-    extent of their own.
+    ``n_base`` is the caller's: :func:`_vlen_read_group` derives it from the
+    link itself (:func:`zagg.processing.read.link_base_extent`, issue #452). On
+    a strided product the ``-1`` rows are ROUTINE — the slack between a
+    record's valid samples and the next record's window start (GEDI L1B: ~50%
+    of the rows a plan decodes) — and are dropped downstream by the
+    ``valid & mask_spatial`` test, never assigned a neighbor's record. That
+    handling is load-bearing, not defensive: GEDI's slack is **zero-filled in
+    the product** (``rx_sample_start_index`` steps by exactly 1,420 with
+    ``rx_sample_count`` ~701, and ``rxwaveform[701:1420]`` of each window reads
+    as literal zeros), so a gap row that leaked through would aggregate as a
+    real zero-amplitude sample. On a contiguous product these rows do not
+    occur. A record reaching past ``n_base`` still raises rather than wrapping.
     """
     parent_idx = np.full(n_base, -1, dtype=np.int64)
     within_idx = np.zeros(n_base, dtype=np.int64)
@@ -297,16 +308,27 @@ def _vlen_read_group(
     if len(coarse_lats) == 0:
         _record_obs_read(io_stats, 0)
         return None
-    # ``n_base`` under #43's contiguity assumption, exactly as the dense route
-    # derives it (:func:`zagg.processing.read._planned_read_group`): the record
-    # ranges neither overlap nor leave holes, so ``Σcount`` IS the flat array's
-    # length. The route therefore never reaches the ``parent_idx == -1`` rows
-    # the gather helpers below define — a granule that violates the assumption
-    # raises out of the gather map ("does not tile the declared base extent")
-    # instead of silently borrowing a neighbor's record, which is the property
-    # those rows exist to guarantee. The helpers stay gap-tolerant because they
-    # are also the offline/unit surface, where ``n_base`` is the caller's.
-    n_base = int(cnt_arr.sum())
+    # The base extent the record link tiles (issue #452): the last base row any
+    # non-empty record reaches. Contiguous products make that ``Σcount`` (#43's
+    # assumption, ATL03's shape); STRIDED ones do not — GEDI L1B gives every
+    # shot a fixed 1,420-sample window in ``rxwaveform`` and counts only the
+    # valid samples, so ``Σcount`` understates the array by ~50%, ``plan_read``
+    # clamps every run to ``base_end <= base_start``, and the group returns
+    # zero rows with no error raised. Under striding the slack rows between
+    # records are ROUTINE (143k of 310k planned rows on the reference shard):
+    # they belong to no record, so the gather map marks them ``parent_idx ==
+    # -1``, ``synthesize_linspace`` NaNs them, and ``valid & mask_spatial``
+    # drops them before a single column is assembled. That drop is the
+    # correctness guarantee, not a nicety: GEDI zero-fills the slack in the
+    # product (the tail of each 1,420-sample window past ``rx_sample_count``
+    # reads as literal zeros), so any row that leaked through would land in a
+    # cell as a real zero-amplitude sample — ~46% of the fetched span.
+    # First assembly of the coordinates link: the whole route hangs off it, and
+    # both owner derivations (the paint maps below, the searchsorted twins in
+    # read.py) are only equivalent on disjoint records — so refuse an
+    # overlapping link here, once, rather than emit silently mismatched columns.
+    _validate_link_disjoint(ibeg_arr, cnt_arr, index_base, level=coord_key)
+    n_base = link_base_extent(ibeg_arr, cnt_arr, index_base)
     if n_base <= 0:
         _record_obs_read(io_stats, 0)
         return None
@@ -357,9 +379,13 @@ def _vlen_read_group(
         global_idx = None
         parent_planned, within_planned = expand_link_indices(ibeg_arr, cnt_arr, index_base, n_base)
 
-    def _to_planned(arr: np.ndarray) -> np.ndarray:
-        """Select this read's rows out of a full-base-rate array."""
-        return arr if global_idx is None else arr[global_idx]
+    # ``global_idx`` is the arm switch for every expansion below: the plan's base
+    # rows on the planned arm, ``None`` on the full arm. On the full arm the rows
+    # ARE ``arange(n_base)``, but materializing that identity would be a
+    # regression, not a convenience — it costs 8 B/row (1.57 GB on a GEDI beam
+    # group) and turns each base-rate paint into a 33 B/row searchsorted gather.
+    # So the full arm keeps the base-rate forms it always used and never builds
+    # a row vector at all.
 
     # Rows DECODED by this group (issue #374): the planned slices (or the full
     # base extent), counted before the shard mask and filters below.
@@ -418,8 +444,37 @@ def _vlen_read_group(
             lambda p, dt: execute_read_plan(plan, _base_read_fn, p, dt),
             workers,
         )
+        # The planned arm cannot see the dataset's declared length, but it can
+        # check the shape it does control: a hyperslice that runs off the end of
+        # a truncated dataset comes back short, and every base-rate array must
+        # be exactly the gather map's length. Without this the mismatch surfaces
+        # downstream as an opaque boolean-index ``IndexError`` in a worker log —
+        # the same corruption the full arm below refuses in domain words, and
+        # the class of failure issue #452 spent a day isolating.
+        for path, arr in arrays_by_path.items():
+            if len(arr) != len(global_idx):
+                raise ValueError(
+                    f"dataset {path!r} returned {len(arr)} of {len(global_idx)} planned "
+                    f"rows; the record link does not tile the declared base extent"
+                )
     else:
-        arrays_by_path = _read_full(base_paths)
+        # Full arm: the flat datasets may be LONGER than the link's extent — a
+        # strided product pads the tail of its last record's window (GEDI:
+        # 1,420 samples allocated, ``count`` valid). Those rows belong to no
+        # record, so trim them here and keep every base-rate array the same
+        # length as the gather map (issue #452). A dataset SHORTER than the
+        # extent is a real inconsistency (the link over-runs the array) and is
+        # reported with the gather map's wording.
+        arrays_by_path = {}
+        for path, arr in _read_full(base_paths).items():
+            arr = np.asarray(arr)
+            if len(arr) < n_base:
+                raise ValueError(
+                    f"dataset {path!r} has {len(arr)} rows, fewer than the record "
+                    f"link's base extent {n_base}; the record link does not tile "
+                    f"the declared base extent"
+                )
+            arrays_by_path[path] = arr[:n_base]
 
     # ---- Filters. Base-level structured predicates over the gathered rows;
     # record-level predicates expand to base rate via each level's link (the
@@ -431,36 +486,59 @@ def _vlen_read_group(
         fmask = _predicate_mask(flag, f)
         keep_mask = fmask if keep_mask is None else (keep_mask & fmask)
 
-    cross_full: np.ndarray | None = None
+    # The PLANNED arm expands at planned rate (issue #452): each record-rate
+    # verdict is gathered onto the rows this read decoded, never painted across
+    # the whole base extent and sliced afterwards (196 MB per filter on a GEDI
+    # beam group). The FULL arm decodes every base row anyway, so it keeps the
+    # base-rate paint — cheaper there by 33x, since the at-rows form's
+    # searchsorted temporaries are 33 B/row against the paint's 1 B/row. Either
+    # way a row owned by no record is False.
+    cross_planned: np.ndarray | None = None
     for f in coarse_structured:
-        cf_lvl = levels[f["level"]]
-        cf_link = cf_lvl["link"]
-        cf_paths = [
-            f["dataset"].format(group=group),
-            cf_link["index_beg"].format(group=group),
-            cf_link["count"].format(group=group),
-        ]
-        cf_data = _read_full(cf_paths)
-        coarse_fmask = _predicate_mask(np.asarray(cf_data[cf_paths[0]]), f)
-        expanded = _expand_mask_to_base(
-            coarse_fmask,
-            np.asarray(cf_data[cf_paths[1]]),
-            np.asarray(cf_data[cf_paths[2]]),
-            int(cf_link.get("index_base", 0)),
-            n_base,
-        )
-        cross_full = expanded if cross_full is None else (cross_full & expanded)
+        cf_flag_path = f["dataset"].format(group=group)
+        if f["level"] == coord_key:
+            # The predicate rides the coordinates level's own link, whose per-row
+            # owner the gather map above already carries — so reuse it, exactly
+            # as the sibling-asset arm below does. Deriving it a second time (by
+            # last-start-wins, where the map was painted) would put two owner
+            # maps on the route that have to agree, for no gain.
+            coarse_fmask = _predicate_mask(np.asarray(_read_full([cf_flag_path])[cf_flag_path]), f)
+            expanded = coarse_fmask[parent_safe] & valid
+        else:
+            cf_link = levels[f["level"]]["link"]
+            cf_paths = [
+                cf_flag_path,
+                cf_link["index_beg"].format(group=group),
+                cf_link["count"].format(group=group),
+            ]
+            cf_data = _read_full(cf_paths)
+            cf_ibeg = np.asarray(cf_data[cf_paths[1]])
+            cf_cnt = np.asarray(cf_data[cf_paths[2]])
+            cf_index_base = int(cf_link.get("index_base", 0))
+            _validate_link_disjoint(cf_ibeg, cf_cnt, cf_index_base, level=f["level"])
+            coarse_fmask = _predicate_mask(np.asarray(cf_data[cf_flag_path]), f)
+            # A genuinely different link owns its own placement, so its per-row
+            # owner does have to be derived — by searchsorted over that link's
+            # starts on the planned arm, by the base-rate paint on the full one.
+            expanded = (
+                _expand_mask_at_rows(coarse_fmask, cf_ibeg, cf_cnt, cf_index_base, global_idx)
+                if global_idx is not None
+                else _expand_mask_to_base(coarse_fmask, cf_ibeg, cf_cnt, cf_index_base, n_base)
+            )
+        cross_planned = expanded if cross_planned is None else (cross_planned & expanded)
 
     if asset_filters:
         record_mask = _sibling_record_mask(
             h5obj, group, data_source, asset_filters, len(coarse_lats), siblings, _read_full
         )
-        expanded = _expand_mask_to_base(record_mask, ibeg_arr, cnt_arr, index_base, n_base)
-        cross_full = expanded if cross_full is None else (cross_full & expanded)
+        # The sibling join is keyed to the coordinates level, whose per-row owner
+        # the gather map already carries.
+        expanded = record_mask[parent_safe] & valid
+        cross_planned = expanded if cross_planned is None else (cross_planned & expanded)
 
-    if cross_full is not None:
-        cross_planned = _to_planned(cross_full)[mask_spatial]
-        keep_mask = cross_planned if keep_mask is None else (keep_mask & cross_planned)
+    if cross_planned is not None:
+        cross_masked = cross_planned[mask_spatial]
+        keep_mask = cross_masked if keep_mask is None else (keep_mask & cross_masked)
     if keep_mask is not None and not keep_mask.any():
         return None
 
@@ -477,8 +555,28 @@ def _vlen_read_group(
             within_planned,
         )
 
-    seg_broadcasts = _read_segment_broadcasts(
-        h5obj, group, data_source, levels, n_base, read_fn=read_fn
+    # Record-level variable broadcasts. On the PLANNED arm they gather straight
+    # onto this read's rows (issue #452): the base-rate form is one sample-rate
+    # array per companion variable — ~7 GB for GEDI's six against a 2 GB worker.
+    # On the FULL arm ``base_rows`` stays ``None`` and the original base-rate
+    # broadcast runs: every base row is decoded there anyway, and the at-rows
+    # gather would cost 8x the paint (33 B/row vs 4) for the same answer.
+    # Companions declared on the COORDINATES level — the common case, and all six
+    # of the shipped GEDI template's — reuse the gather map instead of each
+    # re-deriving it (issue #452 review).
+    seg_broadcasts = (
+        _read_segment_broadcasts(
+            h5obj,
+            group,
+            data_source,
+            levels,
+            n_base,
+            read_fn=read_fn,
+            base_rows=global_idx,
+            parents_by_level={coord_key: (parent_safe, valid)},
+        )
+        if _segment_level_variables(data_source)
+        else {}
     )
 
     # ---- Assemble columns: gathered variables, synthesized, broadcasts, leaf.
@@ -494,8 +592,8 @@ def _vlen_read_group(
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values
-    for col_name, base_values in seg_broadcasts.items():
-        values = _to_planned(base_values)[mask_spatial]
+    for col_name, planned_values in seg_broadcasts.items():
+        values = planned_values[mask_spatial]
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values
