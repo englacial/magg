@@ -13,6 +13,9 @@ A ragged field is ONE ``variable_length_bytes`` array on the cell grid::
                                   bytes of its (n, *inner_shape) payload
     {group}/{field}_locations  <- located fields only (issue #87): the uint64
                                   per-row location words, row-aligned
+    {group}/{field}_times      <- temporal fields only (spec §8.3, issue #410):
+                                  the uint64 per-row toc words, row-aligned the
+                                  same way. Both shipped templates write it.
     {group}/morton             <- per-cell uint64 morton coordinate (zagg's
                                   standard HEALPix coordinate array)
 
@@ -21,11 +24,20 @@ The element interpretation is self-describing via the array attrs
 
     attrs["ragged"] = {"element": {"dtype": "float32", "shape": [-1, 2]},
                        "locations": "<sibling name>"}   # located fields only
+    attrs["times"] = "<sibling name>"                   # temporal fields only
 
 so the readers decode what the writer declared rather than hardcoding a dtype,
 and bind the location channel by metadata, not naming convention. A store
 without these attrs is not a zagg ragged vlen array (pre-issue-209 CSR stores
 are a hard break) and raises a pointed error.
+
+**No helper here binds the temporal channel yet.** :func:`read_locations` is the
+§9 counterpart and refuses a field by name when it declares no locations
+channel; :func:`read_raw_values` decodes a ``(n, 2)`` digest and cannot be
+pointed at a flat word vector. Until a ``times`` helper lands, a client decodes
+``{field}_times`` directly off its own ``ragged`` attrs and interprets the words
+with mortie (``toc_is_range``, ``toc2time``). Recorded here so this layout
+description matches what the shipped templates write.
 
 The read plan honors the layout the writer chose: a whole-store sweep LISTs the
 array's stored chunk objects (one object per shard under the ShardingCodec, or
