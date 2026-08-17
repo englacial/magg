@@ -1270,6 +1270,21 @@ class TestBatchedCompanionFolds:
             with batched_companion_folds():
                 _centroid_ancestors(locs, starts, 6)
 
+    def test_the_placeholder_survives_the_aggregate_normalization(self):
+        # ``calculate_cell_statistics`` normalizes every channel with
+        # ``np.ascontiguousarray`` before collecting it, and the flush fills the
+        # placeholder in place afterwards — so that call must be identity here.
+        # Unfilled, the placeholder reads as the reserved 0 word (refusable),
+        # never as uninitialized bytes.
+        from zagg.stats.tdigest import batched_companion_folds
+
+        v, lo, t, d = self._cells()[1]
+        with batched_companion_folds():
+            _, locs, times = build_tdigest(v, delta=d, locations=lo, temporal=t)
+            for channel in (locs, times):
+                assert np.ascontiguousarray(np.asarray(channel)) is channel
+                assert not channel.any(), "a deferred placeholder must read as reserved 0"
+
     def test_batch_deactivates_after_exit(self):
         # The context always resets, so a later unbatched call folds for real.
         from zagg.stats.tdigest import batched_companion_folds

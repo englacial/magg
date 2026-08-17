@@ -197,10 +197,15 @@ class _CompanionBatch:
     starts, n)`` fold input and the batched result is byte-for-byte the
     per-call results, sliced back apart.
 
-    Correctness requires deferred outputs to be **write-only until the
-    flush**, which holds for the one activation site
+    Correctness requires deferred outputs to be **write-only and un-copied
+    until the flush**, which holds for the one activation site
     (``_aggregate_chunk_cells``' per-cell loop): the channel vectors are only
-    collected for the ragged writer, which runs after that function returns.
+    collected for the ragged writer, which runs after that function returns, and
+    the one normalization on the way there (``np.ascontiguousarray`` in
+    ``calculate_cell_statistics``) is identity-preserving for the contiguous
+    ``uint64`` placeholder handed out here.  A reducer that returned a *copy*
+    would strand the flush on an orphan, which is why the placeholder is
+    ``zeros`` (a refusable reserved word) rather than ``empty``.
     """
 
     def __init__(self) -> None:
@@ -221,7 +226,14 @@ class _CompanionBatch:
                 f"deferred companion fold got starts[0]={int(starts[0])}; the cross-cell "
                 "batch requires each centroid partition to start at 0 (see _compress)"
             )
-        out = np.empty(len(starts), dtype=np.uint64)
+        # ``zeros``, not ``empty``: if a placeholder ever escapes the flush (a
+        # reducer that copies its channel instead of handing the vector straight
+        # back — see the ``ascontiguousarray`` note in ``calculate_cell_statistics``)
+        # the unfilled vector reads as spec 8.2's reserved unobserved word, which
+        # ``_check_words``/``zagg.stats.toc`` refuse outright, rather than as
+        # plausible-looking uninitialized bytes. A calloc of <= delta words is free
+        # against the fold it replaces.
+        out = np.zeros(len(starts), dtype=np.uint64)
         rows = self._rows.get(fold, 0)
         # The declared ``n`` rides along rather than being re-derived from
         # ``len(words)`` at the flush: the two agree for every current caller, but a
