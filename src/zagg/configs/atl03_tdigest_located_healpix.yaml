@@ -75,7 +75,12 @@ aggregation:
       # the nanosecond while a centroid is one photon. Per-centroid at EVERY
       # pyramid level, symmetric with the located channel (espg-ruled
       # 2026-08-17). Stored as the {field}_times sibling, bound from the
-      # payload's `times` attr; read it back with zagg.readers.
+      # payload's `times` attr. NOTE zagg.readers has no helper for this channel
+      # yet: read_locations binds the section 9 `ragged.locations` key only, and
+      # read_raw_values decodes a (n, 2) digest, not a flat word vector. Until
+      # one exists, decode the sibling directly -- it is an ordinary ragged
+      # uint64 vlen array whose element dtype/shape its own `ragged` attrs
+      # declare -- and interpret the words with mortie (toc_is_range, toc2time).
       temporal: per-centroid
       inner_shape: [2]
       params:
