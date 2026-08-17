@@ -943,6 +943,16 @@ class TestTemporalChannel:
         assert len(digest) == 5
         np.testing.assert_array_equal(out, words[keep])
 
+    def test_where_reducer_refuses_a_mismatched_channel(self):
+        # ``build_tdigest_where`` carries its own copy of the shape check,
+        # because it masks the channel before delegating.
+        from zagg.stats.tdigest import build_tdigest_where
+
+        values = np.arange(10.0)
+        keep = np.array([True, False] * 5)
+        with pytest.raises(ValueError, match="temporal shape .* does not match values shape"):
+            build_tdigest_where(values, 512, where=keep, temporal=_toc_words(9))
+
     def test_pairwise_build_output_identical(self):
         values = np.linspace(0.0, 1.0, 200)
         words = _toc_words(200)
@@ -979,6 +989,69 @@ class TestTemporalMergeLaws:
         empty = np.empty((0, 2), dtype=np.float32)
         merged, out = merge_tdigests(
             d, empty, 512, temporal1=t, temporal2=np.empty(0, dtype=np.uint64)
+        )
+        np.testing.assert_array_equal(merged, d)
+        np.testing.assert_array_equal(out, t)
+        assert out is not t, "the channel must not alias the caller's array"
+
+    def test_pairwise_merge_of_two_sides_envelopes_contain_their_members(self):
+        # The pairwise law is a distinct code path from the k-way one (plain
+        # argsort on means, no channel tie key) and it is what the two shipped
+        # spill/streaming call sites use, so its temporal fold needs its own
+        # containment assertion, not just the k-way order laws.
+        import mortie
+
+        def covers(envelope, member):
+            e_start, e_end = (int(b[0]) for b in mortie.toc2time(np.array([envelope], "uint64")))
+            m_start, m_end = (int(b[0]) for b in mortie.toc2time(np.array([member], "uint64")))
+            return e_start <= m_start and m_end <= e_end
+
+        (d1, d2), (t1, t2) = self._parts(k=2, n=150)
+        merged, out = merge_tdigests(d1, d2, 8, temporal1=t1, temporal2=t2)
+        assert out.dtype == np.uint64 and len(out) == len(merged) < len(t1) + len(t2)
+        assert mortie.toc_is_range(out).any(), "a re-compressed merge must produce ranges"
+        for member in np.concatenate([t1, t2]):
+            assert any(covers(envelope, member) for envelope in out)
+
+    def test_pairwise_merge_both_channels_independent_of_each_other(self):
+        # Pins the (reducer, left, right) / joined-words pairing on the pairwise
+        # arm: a channel swap would leave each vector reduced by the other
+        # channel's law, so neither would match its declared-alone output.
+        rng = np.random.default_rng(4103)
+        digests, locs, times = [], [], []
+        for i in range(2):
+            d, lo, t = build_tdigest(
+                rng.normal(float(i), 2.0, 80),
+                delta=16,
+                locations=_point_words(80, seed=100 + i),
+                temporal=_toc_words(80, base="2021-03-0%d" % (i + 1)),
+            )
+            digests.append(d)
+            locs.append(lo)
+            times.append(t)
+        d_both, l_both, t_both = merge_tdigests(
+            *digests,
+            16,
+            locations1=locs[0],
+            locations2=locs[1],
+            temporal1=times[0],
+            temporal2=times[1],
+        )
+        _, l_only = merge_tdigests(*digests, 16, locations1=locs[0], locations2=locs[1])
+        _, t_only = merge_tdigests(*digests, 16, temporal1=times[0], temporal2=times[1])
+        np.testing.assert_array_equal(d_both, merge_tdigests(*digests, 16))
+        np.testing.assert_array_equal(l_both, l_only)
+        np.testing.assert_array_equal(t_both, t_only)
+
+    def test_pairwise_merge_passes_the_right_side_through(self):
+        # The other emptiness arm: ``d1`` empty keeps ``temporal2``, and the
+        # selector must not hand back the left channel instead.
+        vals = np.arange(10.0)
+        words = _toc_words(10)
+        d, t = build_tdigest(vals, delta=512, temporal=words)
+        empty = np.empty((0, 2), dtype=np.float32)
+        merged, out = merge_tdigests(
+            empty, d, 512, temporal1=np.empty(0, dtype=np.uint64), temporal2=t
         )
         np.testing.assert_array_equal(merged, d)
         np.testing.assert_array_equal(out, t)
