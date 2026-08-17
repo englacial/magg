@@ -1028,11 +1028,25 @@ class TestStridedRecords:
             r for r in SLACK_ROWS if r < STRIDED_EXTENT
         ]
 
-    def test_dataset_shorter_than_the_link_extent_raises(self):
+    @pytest.mark.parametrize(
+        "read_plan, grid",
+        [
+            (None, _OneShardGrid()),
+            ({"spatial_index": "shots", "pad": 0}, _LastShotGrid()),
+        ],
+        ids=["full", "planned"],
+    )
+    def test_dataset_shorter_than_the_link_extent_raises(self, read_plan, grid):
+        # BOTH arms refuse a truncated dataset in the same domain words. The
+        # planned arm is the production GEDI route; before the fold it surfaced
+        # the same corruption as an opaque ``IndexError: boolean index did not
+        # match indexed array`` from deep in the column assembly.
         arrays = _l1b_arrays_strided()
         arrays["/BEAM0000/rxwaveform"] = WAVE_STRIDED[:20]  # link reaches row 21
+        ds = _vlen_ds() if read_plan is None else _vlen_ds(read_plan=read_plan)
+        shard = 0 if read_plan is None else 1
         with pytest.raises(ValueError, match="does not tile the declared base extent"):
-            _read_group(_FakeH5(arrays), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+            _read_group(_FakeH5(arrays), "BEAM0000", ds, shard, grid)
 
 
 # ── memory posture: nothing at base rate on a planned vlen read (#452) ───────
