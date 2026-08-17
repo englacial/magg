@@ -66,27 +66,50 @@ class TestStreamingConfig:
         assert get_streaming(_config()) is None
 
     def test_block_defaults_buffer(self):
-        assert get_streaming(_config(streaming={})) == {"buffer_granules": 50, "mode": "merge"}
+        assert get_streaming(_config(streaming={})) == {
+            "buffer_granules": 50,
+            "mode": "merge",
+            "block_bytes": None,
+        }
 
     def test_explicit_buffer(self):
         assert get_streaming(_config(streaming={"buffer_granules": 7})) == {
             "buffer_granules": 7,
             "mode": "merge",
+            "block_bytes": None,
         }
 
-    @pytest.mark.parametrize(
-        "key", ["state_layout", "arena_backing", "block_bytes", "buffer_granuels"]
-    )
+    def test_explicit_block_bytes(self):
+        # issue #474: the fold-regime threshold is reachable from config.
+        assert get_streaming(_config(streaming={"mode": "spill", "block_bytes": 1 << 30})) == {
+            "buffer_granules": 50,
+            "mode": "spill",
+            "block_bytes": 1 << 30,
+        }
+
+    @pytest.mark.parametrize("key", ["state_layout", "arena_backing", "buffer_granuels"])
     def test_unknown_keys_rejected(self, key):
         # The removed #260 arena knobs (and any typo) must fail loudly, not
-        # silently run the dict path (#239 discipline).
-        with pytest.raises(ValueError, match="unknown key"):
+        # silently run the dict path (#239 discipline). The refusal names the
+        # full grammar, block_bytes included (issue #474).
+        with pytest.raises(ValueError, match="buffer_granules, mode and block_bytes"):
             get_streaming(_config(streaming={key: "arena"}))
 
     @pytest.mark.parametrize("bad", [0, -1, "50", 2.5])
     def test_bad_buffer_raises(self, bad):
         with pytest.raises(ValueError, match="buffer_granules"):
             get_streaming(_config(streaming={"buffer_granules": bad}))
+
+    @pytest.mark.parametrize("bad", [0, -1, "1048576", 2.5])
+    def test_bad_block_bytes_raises(self, bad):
+        with pytest.raises(ValueError, match="block_bytes"):
+            get_streaming(_config(streaming={"mode": "spill", "block_bytes": bad}))
+
+    def test_block_bytes_requires_spill_mode(self):
+        # Merge mode has no spill blocks; a silently-ignored knob is the #239
+        # failure mode.
+        with pytest.raises(ValueError, match="only applies to mode: spill"):
+            get_streaming(_config(streaming={"block_bytes": 1 << 20}))
 
     def test_non_mapping_block_raises(self):
         with pytest.raises(ValueError, match="mapping"):

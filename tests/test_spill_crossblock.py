@@ -908,3 +908,41 @@ class TestFoldRegimeVisibility:
             _, _, meta = _run(monkeypatch, cfg, grid, key, dfs)
         assert not any(self._MSG in r.message for r in caplog.records)
         assert meta["phase_timings"]["spill_blocks_closed"] == 0
+
+
+class TestConfigBlockBytes:
+    """``aggregation.streaming.block_bytes`` (issue #474): the fold-regime
+    threshold reachable from config — no monkeypatched ``_default_block_bytes``
+    — with the folded results matching pooled per the issue #370 laws."""
+
+    def test_small_block_bytes_engages_fold_and_folds_correctly(self, monkeypatch):
+        key = _shard_key()
+        spill = {"buffer_granules": 1, "mode": "spill", "block_bytes": 1}
+        pooled_cfg = _config(_variables())
+        spill_cfg = _config(_variables(), streaming=spill)
+        grid = _grid(pooled_cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=40, seed=13)
+        df_p, ragged_p, _ = _run(monkeypatch, pooled_cfg, grid, key, list(dfs))
+        df_s, ragged_s, meta = _run(monkeypatch, spill_cfg, _grid(spill_cfg), key, list(dfs))
+        # buffer_granules=1 + a 1-byte config threshold: every flush closes.
+        assert meta["phase_timings"]["spill_blocks_closed"] == len(_CELL_LISTS)
+        # Counts fold exactly; digests carry the exact total weight and stay
+        # within t-digest accuracy of pooled (issue #370 kway law).
+        pd.testing.assert_series_equal(df_p["count"], df_s["count"])
+        vals_p, idx_p = ragged_p["h_tdigest"]
+        vals_s, idx_s = ragged_s["h_tdigest"]
+        assert idx_p == idx_s
+        for dp, ds in zip(vals_p, vals_s, strict=True):
+            assert float(dp[:, 1].sum()) == float(ds[:, 1].sum())
+            for q in (0.1, 0.5, 0.9):
+                assert abs(quantile_from_tdigest(ds, q) - quantile_from_tdigest(dp, q)) < 1.0
+
+    def test_large_block_bytes_stays_single_block(self, monkeypatch):
+        # A generous config threshold keeps the exact single-block regime.
+        key = _shard_key()
+        spill = {"buffer_granules": 1, "mode": "spill", "block_bytes": 1 << 30}
+        cfg = _config(_variables(), streaming=spill)
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=20, seed=5)
+        _, _, meta = _run(monkeypatch, cfg, grid, key, dfs)
+        assert meta["phase_timings"]["spill_blocks_closed"] == 0

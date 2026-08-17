@@ -479,12 +479,18 @@ def process_shard(
 
     streaming_cfg = get_streaming(config)
     spill_mode = streaming_cfg is not None and streaming_cfg["mode"] == "spill"
-    if spill_mode:
-        buffered = SpillAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
-    elif streaming_cfg is not None:
-        buffered = StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
-    else:
+    if streaming_cfg is None:
         buffered = None
+    elif spill_mode:
+        buffered = SpillAggregator(
+            config,
+            grid,
+            handoff,
+            streaming_cfg["buffer_granules"],
+            block_bytes=streaming_cfg["block_bytes"],
+        )
+    else:
+        buffered = StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
 
     # Per-phase timing (issue #100; always-on collection since issue #297 —
     # the stats sidecar needs complete timings by default, and the cost is a
