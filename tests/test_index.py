@@ -763,6 +763,54 @@ class TestChunkMapCacheEviction:
         assert not errors
         assert deferred_seen  # the walks really did strand lines to evict
 
+    def test_read_group_drains_deferred_lines_on_the_planned_route(self, monkeypatch):
+        # Review finding on PR #462: nothing exercised ``read_group``'s
+        # ``finally`` drains, so removing them kept the suite green while
+        # restoring the full issue #460 leak (worse than pre-PR: the lazy builds
+        # now only RECORD their lines). Reference arm = the identical read with
+        # the drain neutralized; the discriminator is the scale-free strict
+        # subset, not a count.
+        import zagg.index.inline as inline_mod
+
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        h5obj = _open_fixture_small_lines()
+        df = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
+
+        ref = _open_fixture_small_lines()
+        monkeypatch.setattr(inline_mod, "_evict_deferred_lines", lambda h5obj, deferred: 0)
+        df_ref = InlineIndex().read_group(ref, "gt1l", ds, 1, grid)
+
+        assert df is not None and len(df) > 0
+        pd.testing.assert_frame_equal(df, df_ref)  # the drain changes no output...
+        assert set(h5obj.cache) < set(ref.cache)  # ...and really does drop lines
+
+    def test_read_group_drains_deferred_lines_on_the_vlen_route(self, monkeypatch):
+        # The vlen dispatch (``coordinates.level`` set) is read_group's FIRST
+        # arm and the route issue #460 was filed against (GEDI L1B), yet no test
+        # reached its drain (review finding on PR #462). Stub the route itself so
+        # this stays a ~ms unit test of the dispatch: the stub does one read that
+        # forces a lazy map build (hence deferred lines), and by the time
+        # read_group returns the drain must have dropped them.
+        import zagg.processing.read_vlen as read_vlen_mod
+
+        seen: dict = {}
+
+        def stub(h5obj, group, data_source, shard_key, grid, *, read_fn=None, **kw):
+            read_fn(self.PATH, hyperslice=[(0, 10)])
+            seen["deferred"] = set(read_fn.deferred_lines)
+            return None
+
+        monkeypatch.setattr(read_vlen_mod, "_vlen_read_group", stub)
+        ds = _fixture_data_source()
+        ds["coordinates"] = dict(ds["coordinates"], level="segments")
+        h5obj = _open_fixture_small_lines()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        assert InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid) is None
+        _, walk_lines, _ = self._unevicted_reference()
+        assert walk_lines and seen["deferred"] >= walk_lines  # deferred, not evicted...
+        assert not walk_lines & set(h5obj.cache)  # ...then drained by the finally
+
     def test_lines_touched_logged_at_debug(self, caplog):
         # Issue #460 phase 3: each map build reports the walk's cache-line
         # footprint at DEBUG, so a pathological granule is visible in logs.
