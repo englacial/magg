@@ -625,7 +625,10 @@ def _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order):
     - ``footprint="swath"`` -- the column covers the CMR footprint, not the
       per-beam corridors ``footprint="beams"`` decomposes it into (issue #65);
     - ``mortie_order`` was not pinned by the caller -- an explicit order asks for
-      a cover at *that* order, which the column cannot restate;
+      a cover at *that* order, which the column cannot restate. Since issue #445
+      declining here does **not** mean falling back to geometry: an indexed
+      catalog with a pinned order lands on :func:`_live_cells_plan`'s ephemeral
+      cover and inherits its deltas (see :meth:`ShardMap.build`'s Notes);
     - the grid is HEALPix and the catalog carries the column.
 
     Takes no records and materializes none (issue #439): the plan is what lets
@@ -750,7 +753,13 @@ def _live_cells_plan(catalog, grid, chosen, footprint, mortie_order):
     for a cover at that order, so the cover runs there whatever it costs, and is
     validated against ``parent_order`` exactly as the geometry path validates it.
     (The stored plan cannot honor a pin at all -- a persisted column cannot
-    restate its order -- which is why it refuses instead.)
+    restate its order -- which is why it declines instead.) Note what that
+    means for an *indexed* catalog: a pinned build there declines the stored
+    plan and lands **here**, not on the geometry path it took pre-#445, so it
+    covers from WKB and inherits this path's deltas. Pinned by
+    ``TestLiveCover::test_a_pinned_indexed_build_covers_live_too``, and raised
+    for espg's ruling on PR #447 (the alternative is gating indexed catalogs out
+    of this plan to keep the records-path assignment for pinned builds).
 
     Engages on the same shape :func:`_footprint_cells_plan` does, minus the
     column: the backend resolves to ``mortie`` (a spherely build stays exact-S2),
@@ -1334,6 +1343,18 @@ class ShardMap:
         raised ``AttributeError`` on the same row: both refuse, one legibly.
         Memory is the index's documented posture, screen peak included (~1 GB
         over the parquet read at clone scale, issue #429).
+
+        **A pinned ``mortie_order`` covers live whether or not the catalog is
+        indexed.** A persisted column cannot restate an arbitrary order, so the
+        stored plan declines a pin (:func:`_footprint_cells_plan`) -- and since
+        issue #445 what catches it is the ephemeral cover, not the geometry
+        path. So an *indexed* catalog built with an explicit ``mortie_order``
+        is a third population whose assignment can move: it inherits the same
+        two deltas above (measured on a two-part MultiPolygon: 8 shards on the
+        records path, 13 on the cover). The pin is honored either way, and
+        ``metadata["footprint_cells"]`` still records ``False`` there -- it
+        means "the stored column did not answer this build", which stays the
+        thing the operator can act on. Flagged for review on PR #447.
         """
         if footprint not in ("swath", "beams"):
             raise ValueError(f"footprint must be 'swath' or 'beams' (got {footprint!r})")
