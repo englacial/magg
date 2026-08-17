@@ -402,8 +402,12 @@ derives the block through the same code path template time uses, then
   frozen one, so a config that did not build this store cannot install its
   fold laws. This is the layer that covers *reducers*: no leaf records which
   function produced a field, so nothing downstream could catch a config
-  declaring `max` over a store of minima. `output.*` is not in the semantic
-  core, so adding `output.pyramid` to the original config hashes identically.
+  declaring `max` over a store of minima. Adding `output.pyramid` to the
+  original config hashes identically, so the retrofit never false-refuses —
+  the whole `pyramid` block is deliberately outside the semantic core, and
+  keeping this workflow working is one of the reasons why (the D19 hash epoch
+  of issue #415 put the *leaf-shaping* `output` knobs into the core, listed in
+  `zagg.semantics.OUTPUT_LEAF_SHAPING_KEYS`; `pyramid` is not one of them).
   A pre-#299 manifest carries no hash; the comparison is then skipped, loudly.
 - **Typing** — every declared field must exist in a committed leaf with the
   declared dtype (dense fields), or the declared ragged element dtype and
@@ -700,6 +704,205 @@ mirror, and no async redelivery — so the failure is fail-open by
 construction; the root object simply doesn't appear until the sweep or a
 refresh builds it.
 
+## Migration: the D19 hash epoch
+
+> **Every `semantic_hash` written before this release is invalidated, by
+> design** — and so is every `granules_sha256` taken over resolved hrefs
+> (item 5). Nothing in any store changed on disk; what changed is the
+> *derivation* of the digests that label it. If you are upgrading a store
+> built by an earlier zagg, read this section before rerunning into it.
+
+[Issue #415](https://github.com/englacial/zagg/issues/415) closed two ruled
+defects in the semantic core ([PR #397](https://github.com/englacial/zagg/pull/397)
+questions (7) and (8)), and carried two further ruled exclusions that had to
+ride the same epoch: the credential mechanism
+([issue #449](https://github.com/englacial/zagg/issues/449)) and the
+byte-movement knobs (espg-ruled 2026-08-17 on the epoch PR). Those four change
+what `zagg.semantics.semantic_hash` digests, so each moves every digest —
+which is why they were deliberately landed in one release rather than one at a
+time. A fifth ruling (item 5 below) canonicalizes **granule** identity, moving
+the sidecars' `granules_sha256` rather than `semantic_hash`; it rides the same
+release for the same reason, since both halves of the identity PAIR are what
+the skip gate compares.
+
+### What changed
+
+1. **The granule fan-out width left the core.** `shard_workers` /
+   `granule_workers` are now in `zagg.semantics.DATA_SOURCE_PACKAGING_KEYS`.
+   D19's ratified exclusion list already called worker size packaging, but
+   the keys were never listed, so the digest moved with the pool width. That
+   was not merely untidy: both dispatchers hand each cell a `data_source`
+   clamped to `min(K, n_granules)`, so a *small shard's* worker computed a
+   different digest from the run's, and any rollup mixing clamped and
+   unclamped shards collapsed `semantic_hash` to `null`.
+2. **The leaf-shaping `output` knobs entered the core** —
+   `zagg.semantics.OUTPUT_LEAF_SHAPING_KEYS` (`aoi_mask`, `windowing`) and
+   `GRID_LEAF_SHAPING_KEYS` (`sharded`). Before, the whole
+   `output` block was outside the core, so a config edit that changed what a
+   leaf *contains* moved neither half of the skip gate's identity pair and a
+   rerun read the stale leaf as `current`. `output.grid.emit_cell_ids` meets
+   that criterion too and is still **excluded** (espg-ruled 2026-08-17): the
+   D16 hatch is scheduled for removal
+   ([issue #304](https://github.com/englacial/zagg/issues/304)), and hashing it
+   would leave every store built with it ON carrying a digest that no legal
+   config can reproduce once the knob is gone. A leaf's *array inventory* is
+   verified by reading the leaf — the same argument that keeps `output.pyramid`
+   out.
+3. **The credential mechanism left the core.** `data_source.credentials_provider`
+   joined `DATA_SOURCE_PACKAGING_KEYS` (espg-ruled 2026-08-17): the provider
+   name selects *how* source bytes are fetched, never *what* is computed from
+   them, so the same granules read with `lpdaac` credentials, `gesdisc`
+   credentials, or an anonymous open are one product. It is the same class as
+   the read knobs and as `anonymous`, already excluded — the same class, not
+   one knob under two names: `anonymous` is read only by the raster
+   source-store kwargs, `credentials_provider` only by the point and temporal
+   paths, so no single run consults both. A wrong credential fails
+   the fetch loudly (a 403 at read time), so nothing depended on the digest to
+   catch it. The operator consequence is the one that made it urgent: a
+   **credential migration over unchanged data** — re-registering an existing
+   store's source under a different provider, or adding the key to a config
+   that ran without it — no longer refuses the store and rewrites it to produce
+   the same bytes.
+
+4. **Three more byte-movement knobs left the core.** `read_workers`,
+   `write_buffer` and `source_region` joined `DATA_SOURCE_PACKAGING_KEYS`
+   (espg-ruled 2026-08-17): `read_workers` is the third fan-out width beside
+   the two spellings item 1 excluded, `write_buffer` bounds how many slabs are
+   alive under the streamed raster sink, and `source_region` is the raster
+   source store's AWS region kwarg — which sat in the *same dict literal* as
+   the already-excluded `anonymous`, so hashing one and not the other split a
+   single "how do we open the source" decision across both sides of the line.
+   Each fails loudly in its own direction (a small pool is slower, a wrong
+   region is a connection error, an over-large buffer is an OOM), so nothing
+   depended on the digest to catch them. The operator consequence matches item
+   3: **retuning machinery over unchanged data no longer rehashes.** The live
+   demonstration is dated, and it covers the **fan-out widths only** — two GEDI
+   flux builds of the same shard on 2026-08-17 produced identical `total_obs`
+   and `cells_with_data` in the exact single-block spill regime and still hashed
+   apart on `read_workers` and the two `*_workers` spellings of item 1. It
+   cannot cover the other two: `write_buffer` and `source_region` are read only
+   on the raster path, and a GEDI flux build is the point path, so their
+   exclusion rests on the arguments above rather than on this measurement.
+5. **Granule identity is now the driver-stripped bare granule id.** This one
+   moves the *other* digest — `granules_sha256`, the **catalog** identity half
+   recorded in every D20 sidecar, and the id list in its `granules.json`
+   sibling. espg-ruled 2026-08-17: *"we want the granule to trigger the hash,
+   not how that granule is fetched."* A single granule is named three ways
+   across the paths that record it — a resolved `s3://bucket/key/FILE` href, an
+   `https://host/path/FILE` href (`data_source.driver` picks one), or the bare
+   catalog id, which for every catalog zagg reads *is* the basename of both
+   hrefs. Pre-epoch each spelling hashed differently, so a driver switch —
+   packaging in the semantic core since forever — made every leaf's recorded
+   catalog identity un-reproducible and sent the skip gate down the
+   `expansion` arm for a rerun over exactly the same granules. Both halves
+   canonicalize: the digest **and** the recorded id list, so the `missing` ids
+   a contraction names are driver-independent too. Recorded lists written
+   before this release keep working — the classifier canonicalizes the
+   *recorded* side as well, so a pre-epoch leaf diffs cleanly instead of
+   reading as a full contraction. Accepted cost of the ruling: two granules
+   whose hrefs differ only in prefix collapse to one identity; every catalog
+   zagg reads names granules globally uniquely, which is why the catalog's own
+   id equals the basename. That cost lands in two places, not one — besides the
+   identity collision it **degrades the contraction guard** inside a collapsed
+   group, and the safe way is not the way it falls: dropping one member of a
+   collided pair leaves the set diff unchanged, so the leaf reads
+   `id-multiset-drift` and rewrites where the pre-epoch diff refused and named
+   the dropped href. Any leaf whose recorded ids collapse is logged loudly for
+   exactly that reason; making it refuse instead is a standing question on the
+   contraction predicate (PR #420 review finding (2)).
+
+Deliberately **not** changed: the orders (`parent_order` / `child_order` /
+`chunk_inner`) stay packaging — hashing them would make o8 and o9 runs
+different products and block mixed-order processing (D24) — and the whole
+`pyramid` block stays out, so
+[retrofitting a pyramid declaration](#retrofitting-the-pyramid-declaration)
+onto the config that built a store still hashes identically and still works.
+`emit_cell_ids` stays out for the reason recorded under item 2.
+
+### Why re-hashing is correct, not a defect
+
+The pre-epoch digest answered "do these two configs produce the same leaves"
+**wrongly in both directions**: it separated configs that were identical in
+every effect (the clamp), and it equated configs that write different leaves
+(the `output` knobs). A digest that is wrong in both directions cannot be
+preserved for compatibility — preserving it would mean preserving a false
+answer to the only question it is asked. The stores themselves are
+untouched: no leaf byte moves, and the §5 `content_hashes` (which are over
+decoded values, not over identity) are unchanged. Only the *label* is
+restated, more accurately.
+
+### What an operator sees, and the three ways forward
+
+`semantic_hash` is a frozen manifest key, so a rerun into a pre-epoch store
+refuses **up front**, before any leaf is written:
+
+```
+morton_hive.json at s3://bucket/store does not match this run
+(existing {...} vs {...}); this store was templated for different
+orders/identity — clear the store root (or pick a new one) before
+writing with this configuration
+```
+
+`--overwrite` does not bypass it: when the digit tree already holds shard
+data, the overwrite path refuses too, because replacing only the manifest
+would leave the old leaves masquerading as legal data (D2). Pre-#299 stores
+that carry no hash at all are unaffected — the guard exempts a missing hash
+on either side, so they stay resumable exactly as before.
+
+1. **New product root (recommended).** Write under a new `output.product_name`
+   (or a new store root). Both products coexist under one root (D19), the old
+   one stays readable, and nothing is rewritten or lost.
+2. **Rebuild.** Clear the store root and rerun. Correct and simple; you pay
+   the full aggregation again.
+3. **Restamp the manifest in place — expert path, read the whole entry.**
+   The data really was produced by this config, so writing the new digest
+   into `morton_hive.json` is *semantically* correct. It is also the only
+   path that can make things worse, in three ways:
+   - **It is not one field.** `semantic_hash` is recorded in leaf attrs and
+     in every D20 stats sidecar as well as the manifest, and `dedup`'s
+     identity checks read the *sidecar's* copy, not the manifest's. A
+     manifest-only restamp therefore leaves a **mixed-identity store** — root
+     says one thing, leaves say another — until every leaf has been
+     rewritten. Nothing else in zagg expects that state to persist.
+   - **The rewrite is not a heal, it is the same re-aggregation as (2)**,
+     paid unpredictably across future runs instead of once deliberately:
+     each unit classifies `semantic-mismatch` and rewrites wholesale.
+   - **It manually defeats the guard that catches a wrong config.** Nothing
+     verifies that the config you hash is the one that built the store, and
+     once a foreign digest is installed the frozen-key check will never fire
+     for that store again. Before restamping, confirm the config is the
+     store's own by recomputing its **pre-epoch** digest under the previous
+     zagg and matching it against the recorded one.
+
+   There is no zagg tool for any of this; it is a deliberate operator action,
+   and paths (1) and (2) have none of these failure modes.
+
+Whichever path you take, the first post-epoch run over a store is a **full
+rewrite** of everything it touches — on a fleet-scale store that is a full
+re-aggregation, and it is the headline cost of the epoch, not a footnote. The
+skip gate cannot certify a leaf as current against an identity that was
+computed by a different rule, and pretending otherwise is exactly the false
+skip the epoch exists to prevent.
+
+On the Lambda path the manifest write is asynchronous (issue #252 hybrid,
+above), but the refusal is **not** deferred with it: the read-only frozen-key
+precheck (`zagg.hive.validate_manifest`) runs on the `mode: "ping"` preflight
+*before* fan-out, so an epoch mismatch costs one preflight, not a few thousand
+worker invocations.
+
+### What the epoch buys
+
+The break is the price of arming the fleet's leaf identity gate. Skip-if-current
+([below](#re-runs-skip-if-current-the-contraction-guard-and-the-lifecycle-touch))
+is armed by default only on the local backend today; fleet arming was
+explicitly gated on this epoch
+([issue #415](https://github.com/englacial/zagg/issues/415), sequencing), for
+the reason phase (7) records: pre-epoch the worker-side fallback hash was
+clamp-sensitive, so a small shard would have compared its leaf against a
+digest the run never wrote and rewritten forever without self-healing. After
+the epoch that comparison is sound, and the second post-epoch run over an
+unchanged store is the no-op the gate was built for.
+
 ## Re-runs: skip-if-current, the contraction guard, and the lifecycle touch
 
 Re-dispatching a shard used to mean an unconditional wholesale rewrite (D4)
@@ -786,14 +989,32 @@ summary; the CLI prints them as "rewritten with the guard inert") so an
 operator can see how much of a store is still unguarded; making them refuse
 instead is a standing design fork (PR #397 question (4)).
 
-Two identity caveats operators hit in practice. The recorded id space is
-**driver-dependent** on the aggregation path (resolved `s3://` vs `https://`
-hrefs): flipping the driver between runs reads as a full mixed contraction
-and refuses per leaf — `--allow-contraction` is the escape hatch. And the
-identity pair deliberately does **not** cover leaf-*shaping* `output` knobs
-beyond the column artifact (e.g. flipping `sharded` changes the leaf's
-object layout while both identity halves hold): changing those still needs
-`--overwrite` (PR #397 question (8)).
+One identity caveat operators still hit: the identity pair does **not** cover
+`output.grid.chunk_inner`, which changes the leaf's object set through K while
+both halves hold, so changing it still needs `--overwrite`
+(espg-ruled 2026-08-17 as the bounded state — closing it costs part of D24;
+`sharded` itself *is* covered since the epoch, see
+[the migration note](#migration-the-d19-hash-epoch) item 2).
+
+The **driver-dependence** caveat is gone, in two different strengths either
+side of the epoch. The recorded id space used to be the resolved href, so
+flipping `data_source.driver` between runs read as a full mixed contraction and
+refused per leaf. Since the epoch both sides are reduced to the canonical
+driver-stripped bare granule id (item 5 of the migration note), so:
+
+* against a leaf written **at or after** the epoch, a driver switch over
+  unchanged granules reads `equal` and skips — its recorded
+  `granules_sha256` is already in the canonical space, so the hash fast path
+  matches and no sibling is read;
+* against a **pre-epoch** leaf it does not skip, and cannot: the fast path
+  compares the *stored* digest, which was taken over resolved hrefs, so it
+  mismatches by construction and the leaf is rewritten once (expected at an
+  epoch — the note's "every pre-epoch `granules_sha256` invalidated" headline
+  is this). What canonicalizing the *recorded* side buys is the direction of
+  that rewrite: the sibling's hrefs reduce to the same bare ids as the plan, so
+  the leaf reads `id-multiset-drift`/`expansion` and rewrites, instead of
+  **refusing as a spurious contraction**. A driver switch over a pre-epoch
+  store therefore no longer needs `--allow-contraction` to get past the guard.
 
 ### The refusal manifest
 
