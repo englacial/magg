@@ -34,12 +34,13 @@ import pandas as pd
 
 from zagg.config import evaluate_filter_expression, filters_from_data_source
 from zagg.processing.read import (
-    _expand_mask_to_base,
+    _expand_mask_at_rows,
     _predicate_mask,
     _read_paths_pooled,
     _read_segment_broadcasts,
     _read_workers,
     _record_obs_read,
+    _segment_level_variables,
     _select_column,
     _variable_specs,
     link_base_extent,
@@ -371,9 +372,20 @@ def _vlen_read_group(
         global_idx = None
         parent_planned, within_planned = expand_link_indices(ibeg_arr, cnt_arr, index_base, n_base)
 
-    def _to_planned(arr: np.ndarray) -> np.ndarray:
-        """Select this read's rows out of a full-base-rate array."""
-        return arr if global_idx is None else arr[global_idx]
+    rows_cache: np.ndarray | None = None
+
+    def _base_rows() -> np.ndarray:
+        """Global base index of each row this read decoded.
+
+        The plan's rows, or the identity map on the full arm (which is O(n_base)
+        by necessity anyway). Built lazily and once: a read with no cross-level
+        filter and no segment-level variable never needs it, and on the full arm
+        it is a sample-rate array.
+        """
+        nonlocal rows_cache
+        if rows_cache is None:
+            rows_cache = global_idx if global_idx is not None else np.arange(n_base, dtype=np.int64)
+        return rows_cache
 
     # Rows DECODED by this group (issue #374): the planned slices (or the full
     # base extent), counted before the shard mask and filters below.
@@ -461,7 +473,12 @@ def _vlen_read_group(
         fmask = _predicate_mask(flag, f)
         keep_mask = fmask if keep_mask is None else (keep_mask & fmask)
 
-    cross_full: np.ndarray | None = None
+    # Both cross-level arms expand at PLANNED rate (issue #452): each record-rate
+    # verdict is gathered onto the rows this read decoded, never painted across
+    # the whole base extent and sliced afterwards (196 MB per filter on a GEDI
+    # beam group). A row owned by no record is False, exactly as the base-rate
+    # form leaves it.
+    cross_planned: np.ndarray | None = None
     for f in coarse_structured:
         cf_lvl = levels[f["level"]]
         cf_link = cf_lvl["link"]
@@ -472,25 +489,30 @@ def _vlen_read_group(
         ]
         cf_data = _read_full(cf_paths)
         coarse_fmask = _predicate_mask(np.asarray(cf_data[cf_paths[0]]), f)
-        expanded = _expand_mask_to_base(
+        # A non-coordinate level owns its own link, so its per-row owner comes
+        # from a searchsorted over that link's starts rather than from the
+        # coordinates level's gather map.
+        expanded = _expand_mask_at_rows(
             coarse_fmask,
             np.asarray(cf_data[cf_paths[1]]),
             np.asarray(cf_data[cf_paths[2]]),
             int(cf_link.get("index_base", 0)),
-            n_base,
+            _base_rows(),
         )
-        cross_full = expanded if cross_full is None else (cross_full & expanded)
+        cross_planned = expanded if cross_planned is None else (cross_planned & expanded)
 
     if asset_filters:
         record_mask = _sibling_record_mask(
             h5obj, group, data_source, asset_filters, len(coarse_lats), siblings, _read_full
         )
-        expanded = _expand_mask_to_base(record_mask, ibeg_arr, cnt_arr, index_base, n_base)
-        cross_full = expanded if cross_full is None else (cross_full & expanded)
+        # The sibling join is keyed to the coordinates level, whose per-row owner
+        # the gather map already carries.
+        expanded = record_mask[parent_safe] & valid
+        cross_planned = expanded if cross_planned is None else (cross_planned & expanded)
 
-    if cross_full is not None:
-        cross_planned = _to_planned(cross_full)[mask_spatial]
-        keep_mask = cross_planned if keep_mask is None else (keep_mask & cross_planned)
+    if cross_planned is not None:
+        cross_masked = cross_planned[mask_spatial]
+        keep_mask = cross_masked if keep_mask is None else (keep_mask & cross_masked)
     if keep_mask is not None and not keep_mask.any():
         return None
 
@@ -507,8 +529,16 @@ def _vlen_read_group(
             within_planned,
         )
 
-    seg_broadcasts = _read_segment_broadcasts(
-        h5obj, group, data_source, levels, n_base, read_fn=read_fn
+    # Record-level variable broadcasts, gathered straight onto this read's rows
+    # (issue #452): the base-rate form is one sample-rate array per companion
+    # variable — ~7 GB for GEDI's six against a 2 GB worker. ``_base_rows`` is
+    # only built when there is something to broadcast.
+    seg_broadcasts = (
+        _read_segment_broadcasts(
+            h5obj, group, data_source, levels, n_base, read_fn=read_fn, base_rows=_base_rows()
+        )
+        if _segment_level_variables(data_source)
+        else {}
     )
 
     # ---- Assemble columns: gathered variables, synthesized, broadcasts, leaf.
@@ -524,8 +554,8 @@ def _vlen_read_group(
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values
-    for col_name, base_values in seg_broadcasts.items():
-        values = _to_planned(base_values)[mask_spatial]
+    for col_name, planned_values in seg_broadcasts.items():
+        values = planned_values[mask_spatial]
         if keep_mask is not None:
             values = values[keep_mask]
         data_dict[col_name] = values
