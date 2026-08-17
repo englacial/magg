@@ -15,8 +15,9 @@ Included (the semantic core):
 - the ``data_source`` **semantics** — which groups/variables/coordinates are
   read and how observations are filtered (``filters``/``quality_filter``,
   photon ``base_level``/``levels``, raster ``bands``/``nodata``/
-  ``collections``/``static_data``) — minus the read machinery and fan-out
-  sizing (``reader``, ``driver``, ``read_plan``, ``anonymous``,
+  ``collections``/``static_data``) — minus the read machinery, the credential
+  mechanism and fan-out sizing (``reader``, ``driver``, ``read_plan``,
+  ``anonymous``, ``credentials_provider``,
   ``shard_workers``/``granule_workers``);
 - the grid **type + indexing scheme** (D19: cell order is a resolution axis
   (D24), parent/shard order and chunking are packaging — hashing the whole
@@ -45,6 +46,8 @@ block mixed-order processing), store layout/path/name, ``coverage_moc`` and
 the manifest's frozen keys because the §7 sweep populates it; the leaf column
 it declares is verified by READING the artifact instead — see
 :data:`OUTPUT_LEAF_SHAPING_KEYS`), worker sizing, streaming mode, read knobs,
+the credential mechanism (``credentials_provider``/``anonymous`` select how
+source bytes are fetched, never what is computed — espg-ruled 2026-08-17),
 catalog/bounds (run inputs, recorded per-run — catalog identity lives in the
 D20 sidecar, never the product identity), and the per-variable
 ``overview_delta`` (issue #424 — the pyramid-fold budget shapes overview
@@ -95,11 +98,38 @@ from zagg.config import PipelineConfig, get_pipeline_type
 #: the canonical name first) and hashing the canonical spelling of an excluded
 #: knob would be incoherent. Issue #415 named only the legacy alias, so the
 #: canonical one is flagged for ruling on the epoch PR rather than assumed.
+#:
+#: ``credentials_provider`` (issue #213 Phase 4/6) joined at the same epoch,
+#: **espg-ruled 2026-08-17**: it selects HOW source bytes are fetched — which
+#: registry name mints the DAAC credentials the dispatcher attaches to every
+#: event — and never WHAT is computed from them, the same D19 class as
+#: ``reader``/``driver``/``read_plan``. Three reasons it is ruled *here*
+#: rather than left pinned as-is (issue #449):
+#:
+#: * the same granules fetched with ``lpdaac`` creds, ``gesdisc`` creds, or an
+#:   ``anonymous`` open produce byte-identical leaves — a hash that moves with
+#:   the provider is a false product split, and ``anonymous`` (the other
+#:   spelling of the same choice) was already excluded;
+#: * the failure asymmetry is loud in the excluded direction and silent in the
+#:   included one: the wrong credential fails the *fetch* — a 403 at read time,
+#:   never a quiet wrong value — so nothing depends on the hash to catch it,
+#:   while hashing it silently splits one product in two;
+#: * a credential migration must never rehash unchanged data. The MERRA-2 /
+#:   gesdisc path is the live case: moving an existing store from one provider
+#:   registration to another (or adding the key to a config that ran without
+#:   it) would otherwise refuse every leaf as ``semantic-mismatch`` and rewrite
+#:   the store to produce the same bytes.
+#:
+#: Ruled at the epoch deliberately so the first GEDI store's identity is born
+#: without an auth knob in it: no store carries a provider-bearing hash yet
+#: (the ``lpdaac`` line lands with the GEDI template, PR #450), so this costs
+#: nothing now and cannot be taken back cheaply later.
 DATA_SOURCE_PACKAGING_KEYS = (
     "reader",
     "driver",
     "read_plan",
     "anonymous",
+    "credentials_provider",
     "shard_workers",
     "granule_workers",
 )

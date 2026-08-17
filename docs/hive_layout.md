@@ -713,9 +713,11 @@ refresh builds it.
 
 [Issue #415](https://github.com/englacial/zagg/issues/415) closed two ruled
 defects in the semantic core ([PR #397](https://github.com/englacial/zagg/pull/397)
-questions (7) and (8)). Both change what `zagg.semantics.semantic_hash`
-digests, so both move every digest — which is why they were deliberately
-landed in one release rather than one at a time.
+questions (7) and (8)), and carried one further ruled exclusion
+([issue #449](https://github.com/englacial/zagg/issues/449)) that had to ride
+the same epoch. All three change what `zagg.semantics.semantic_hash` digests,
+so all three move every digest — which is why they were deliberately landed in
+one release rather than one at a time.
 
 ### What changed
 
@@ -733,6 +735,18 @@ landed in one release rather than one at a time.
    `output` block was outside the core, so a config edit that changed what a
    leaf *contains* moved neither half of the skip gate's identity pair and a
    rerun read the stale leaf as `current`.
+3. **The credential mechanism left the core.** `data_source.credentials_provider`
+   joined `DATA_SOURCE_PACKAGING_KEYS` (espg-ruled 2026-08-17): the provider
+   name selects *how* source bytes are fetched, never *what* is computed from
+   them, so the same granules read with `lpdaac` credentials, `gesdisc`
+   credentials, or an anonymous open are one product — `anonymous`, the other
+   spelling of the same choice, was already excluded. A wrong credential fails
+   the fetch loudly (a 403 at read time), so nothing depended on the digest to
+   catch it. The operator consequence is the one that made it urgent: a
+   **credential migration over unchanged data** — re-registering an existing
+   store's source under a different provider, or adding the key to a config
+   that ran without it — no longer refuses the store and rewrites it to produce
+   the same bytes.
 
 Deliberately **not** changed: the orders (`parent_order` / `child_order` /
 `chunk_inner`) stay packaging — hashing them would make o8 and o9 runs

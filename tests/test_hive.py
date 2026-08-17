@@ -1296,6 +1296,30 @@ class TestLeafSkipIfCurrent:
         )
         assert meta["current"] is True and meta["identity"] == "equal"
 
+    def test_a_credential_migration_still_reads_current(self, monkeypatch, cfg, tmp_path):
+        # The credentials_provider half of the epoch (espg-ruled 2026-08-17,
+        # issue #449), pinned where the cost would land: a store written
+        # WITHOUT a provider, then rerun under a config that names one — the
+        # MERRA-2/gesdisc migration over unchanged data. The bytes a leaf holds
+        # do not depend on which registry minted the credentials that fetched
+        # them, so the gate must still read `equal` and the fold must not run.
+        from dataclasses import replace
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        migrated = {**cfg.data_source, "credentials_provider": "gesdisc"}
+        self._arm_boom(monkeypatch)
+        meta = hive.process_and_write_hive(
+            shard,
+            list(self.URLS),
+            grid,
+            {},
+            root,
+            replace(cfg, data_source=migrated),
+            store_kwargs={},
+            skip_if_current=True,
+        )
+        assert meta["current"] is True and meta["identity"] == "equal"
+
     def test_a_sharded_flip_defeats_the_skip(self, monkeypatch, cfg, tmp_path):
         # The issue #415 epoch's (8)(c) half, at the gate: flipping
         # output.grid.sharded over an existing store changes the leaf's

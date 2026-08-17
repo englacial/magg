@@ -127,6 +127,37 @@ class TestCanonicalization:
         assert clamped is not None and clamped["granule_workers"] == 2
         assert semantic_hash(replace(cfg, data_source=clamped)) == semantic_hash(cfg)
 
+    def test_credentials_provider_is_packaging(self):
+        # The issue #415 epoch's third passenger, espg-ruled 2026-08-17 (issue
+        # #449): the provider selects HOW source bytes are fetched -- which
+        # registry name mints the DAAC credentials the dispatcher attaches to
+        # every event (issue #213 Phase 4) -- never WHAT is computed, the same
+        # D19 class as reader/driver/read_plan. `anonymous`, the other spelling
+        # of the same choice, was already excluded.
+        from zagg.semantics import DATA_SOURCE_PACKAGING_KEYS
+
+        assert "credentials_provider" in DATA_SOURCE_PACKAGING_KEYS
+        cfg = _cfg(data_source__credentials_provider="lpdaac")
+        assert "credentials_provider" not in semantic_core(cfg)["data_source"]
+        assert semantic_hash(cfg) == semantic_hash(_cfg())
+
+    def test_a_credential_migration_never_rehashes(self):
+        # The trap the ruling exists to close, and the reason it is ruled at
+        # the epoch rather than later: the MERRA-2/gesdisc path moves an
+        # existing store from one provider registration to another over
+        # UNCHANGED data. Adding, dropping, or swapping the key must all be
+        # one product -- otherwise every leaf reads `semantic-mismatch` and the
+        # store rewrites itself to produce the same bytes.
+        base = semantic_hash(_cfg())
+        assert semantic_hash(_cfg(data_source__credentials_provider="gesdisc")) == base
+        assert semantic_hash(_cfg(data_source__credentials_provider="lpdaac")) == semantic_hash(
+            _cfg(data_source__credentials_provider="gesdisc")
+        )
+        # ...and it composes with the OTHER auth spelling, which never moved it.
+        both = _cfg(data_source__credentials_provider="gesdisc")
+        both.data_source["anonymous"] = True
+        assert semantic_hash(both) == base
+
     def test_semantic_edits_always_change_hash(self):
         base = semantic_hash(_cfg())
         cfg = _cfg()

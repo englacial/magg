@@ -750,7 +750,14 @@ neither gap and is safe now.
   narrowed rather than closed — `chunk_inner` still moves K without moving
   the digest). The `pyramid` block stays excluded: D11 keeps it out of the
   frozen manifest keys, and the leaf column it declares is verified by
-  reading the artifact (§4.6) rather than by the digest. Operator
+  reading the artifact (§4.6) rather than by the digest. (c) A third
+  exclusion rode the same epoch (espg-ruled 2026-08-17, issue #449):
+  `credentials_provider` is packaging — it selects how source bytes are
+  fetched (the same class as the read knobs and as `anonymous`, already
+  excluded), never what is computed, and a wrong credential fails the fetch
+  loudly rather than silently. Ruled at the epoch so the first GEDI store's
+  identity is born without an auth knob, and so a credential migration over
+  unchanged data (the MERRA-2/gesdisc path) never rehashes. Operator
   consequences — every pre-epoch hash invalidated, and the three migration
   paths — are in `docs/hive_layout.md`, "Migration: the D19 hash epoch".
   The hash is a
