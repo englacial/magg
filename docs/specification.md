@@ -927,6 +927,25 @@ staged sweep's finisher.
   tolerate entry keys it does not bind. This map is the
   **all-fields** view; the per-overview `zagg_overview.fields` attrs map
   (§4.3) is the materialized subset.
+- **A located ragged field is `approximate`, and its entry carries
+  `location`.** A `location:` declaration (§9) does not exclude a field from
+  the pyramid: the located k-way merge reduces the `{field}_locations` words
+  over the same centroid partition the digest merge produces, so a located
+  digest field folds through every level and the class is `approximate` like
+  any other digest field ([ruling 4 on
+  issue #410](https://github.com/englacial/zagg/issues/410#issuecomment-5310502887)).
+  Its entry carries `location` — the source column the leaves' words were
+  ingested from — keyed **only when set**, so an unlocated field's entry is
+  unchanged. The key is load-bearing for the same reason `weights`/`gain` are:
+  the overview writer reconstructs a level's arrays from this entry alone, so
+  without it the overview template emits no sibling array and the fold has
+  nowhere to write its words. An overview level of a located field therefore
+  carries the `{field}_locations` sibling, its §9 `located` declaration, and
+  the payload's §1.2 `locations` binding, exactly as a leaf does — with the
+  words at the **heterogeneous orders** §9.1 makes normative. A **temporal**
+  companion (§8.3) is a different case and stays `class: "none"`: §8.4's
+  shape-coarsening reduction is not wired through the fold sites, so those
+  fields exist at native resolution only.
 - **`all_time`** — whether the `all.zarr` all-time fold is materialized at
   the declared orders (windowed stores only; a `schedule: none` store's
   single fold is already all-time).
@@ -1068,7 +1087,13 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   for every coarser cell (there is no `partial/` grammar; a coarse level
   declared later never rewrites a leaf). Each group holds the `morton`
   coordinate (the node's order-`r` descendant words, ascending) and one
-  array per **composable** field (§4.5 classes; `none` fields are absent).
+  array per **composable** field (§4.5 classes; `none` fields are absent),
+  plus — for a field whose §4.5 entry carries `location` — that field's
+  `{field}_locations` sibling, row-aligned with its payload and carrying the
+  §9 declaration, exactly as an overview level does. The pair is written
+  together or not at all: the words are exact only *given* the centroid
+  partition the payload describes (§9.1), so a group holding a populated
+  payload against an empty sibling is non-conformant, not merely short.
   A group's arrays are **single-chunk and unsharded** — `chunk_shape` equals
   `shape` (`4^(r - node)` cells), no `sharding_indexed` codec — whatever the
   leaf's own `chunk_inner`/sharding: a column group is small by construction,
