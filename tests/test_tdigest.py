@@ -1246,6 +1246,19 @@ class TestBatchedCompanionFolds:
                 raise RuntimeError("boom")
         assert calls == [], "a failed loop must not fold its abandoned placeholders"
 
+    def test_single_entry_flush_folds_with_the_declared_n(self):
+        # A lone deferral must fold with the ``n`` it declared, not with
+        # ``len(words)``: a partition overrunning its words has to fail exactly
+        # where the unbatched call does, not silently fold a truncated one.
+        from zagg.stats.tdigest import _centroid_envelopes, batched_companion_folds
+
+        words, starts = _toc_words(6), np.array([0, 3], dtype=np.int64)
+        with pytest.raises(ValueError, match="exceeds word array length"):
+            _centroid_envelopes(words, starts, 9)
+        with pytest.raises(ValueError, match="exceeds word array length"):
+            with batched_companion_folds():
+                _centroid_envelopes(words, starts, 9)
+
     def test_batch_deactivates_after_exit(self):
         # The context always resets, so a later unbatched call folds for real.
         from zagg.stats.tdigest import batched_companion_folds
