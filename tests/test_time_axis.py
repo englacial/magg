@@ -74,9 +74,19 @@ class TestDeclaration:
             temporal_declaration({"temporal": block})
 
     def test_unimplemented_shape_refused(self):
-        block = {**TOC_ATTRS["temporal"], "shape": "per-centroid"}
-        with pytest.raises(ValueError, match="shape 'per-centroid' is not implemented"):
+        # A shape outside the vocabulary is a future revision's: refuse it
+        # rather than decode words under a layout this reader cannot know.
+        block = {**TOC_ATTRS["temporal"], "shape": "per-granule"}
+        with pytest.raises(ValueError, match="shape 'per-granule' is not implemented"):
             temporal_declaration({"temporal": block})
+
+    def test_companion_shape_refused_where_a_coordinate_is_expected(self):
+        # §8.2/§8.3 shapes are defined, but a caller that can only consume a
+        # time AXIS must not read a companion's block as one.
+        block = {**TOC_ATTRS["temporal"], "shape": "per-centroid"}
+        assert temporal_declaration({"temporal": block}) == block
+        with pytest.raises(ValueError, match="shape 'per-centroid' is not implemented"):
+            temporal_declaration({"temporal": block}, shape="coordinate")
 
     def test_uncited_grammar_refused(self):
         block = {**TOC_ATTRS["temporal"], "grammar": "mortie-toc/2"}

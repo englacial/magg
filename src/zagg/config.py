@@ -700,6 +700,19 @@ def validate_config(config: PipelineConfig) -> None:
                     f"field/coordinate of that name — rename one of them (issue #209)"
                 )
 
+        # The §8.3 per-centroid temporal channel takes the same sibling-name
+        # reservation, for the same corruption reason (issue #410).
+        if meta.get("temporal") == "per-centroid":
+            from zagg.grids.base import ragged_times_name
+
+            sibling = ragged_times_name(name)
+            if sibling in agg_vars or sibling in config.aggregation.get("coordinates", {}):
+                raise ValueError(
+                    f"Variable '{name}': its temporal channel is stored in a sibling "
+                    f"array named '{sibling}', which collides with the declared "
+                    f"field/coordinate of that name — rename one of them (spec §8.3)"
+                )
+
         # Field-level store attrs (issue #321): free-form provenance the grid
         # template merges onto the field's array spec (e.g. the composition
         # field's lane order and signal threshold), so readers bind to
@@ -708,7 +721,13 @@ def validate_config(config: PipelineConfig) -> None:
         if attrs is not None:
             if not isinstance(attrs, dict) or not all(isinstance(k, str) for k in attrs):
                 raise ValueError(f"Variable '{name}': attrs must be a mapping with string keys")
-            from zagg.grids.base import RAGGED_ELEMENT_ATTR, WEIGHTS_ATTR
+            from zagg.grids.base import (
+                LOCATED_ATTR,
+                RAGGED_ELEMENT_ATTR,
+                TIMES_ATTR,
+                WEIGHTS_ATTR,
+            )
+            from zagg.time_axis import TEMPORAL_ATTR
 
             if RAGGED_ELEMENT_ATTR in attrs:
                 raise ValueError(
@@ -724,6 +743,18 @@ def validate_config(config: PipelineConfig) -> None:
                     f"ragged payload array — declare the field-level 'weights:' key "
                     f"instead (spec §2.0, issue #424)"
                 )
+            # Same discipline for the §8/§9 declaration blocks and the §8.3
+            # sibling binding (issue #410): the template stamps all three
+            # from the field-level ``temporal:``/``location:`` declarations,
+            # so an author transcription could disagree with the words the
+            # writer actually stored.
+            for key in (TEMPORAL_ATTR, LOCATED_ATTR, TIMES_ATTR):
+                if key in attrs:
+                    raise ValueError(
+                        f"Variable '{name}': attrs key {key!r} is spec-owned (spec §8/§9) — "
+                        f"declare the field-level 'temporal:'/'location:' key instead "
+                        f"(issue #410)"
+                    )
             import json
 
             try:
@@ -1635,6 +1666,75 @@ OUTPUT_KINDS = ("scalar", "vector", "ragged")
 OUTPUT_RESOLUTIONS = ("cell", "chunk")
 
 
+def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
+    """Validate a field's ``temporal:`` declaration (spec §8.2/§8.3, #410).
+
+    The declared value is a §8 **shape**, and each shape pins the array that
+    will hold the words:
+
+    - ``per-cell`` — the field's own DENSE array is the companion, so it must
+      be a ``uint64`` scalar field at cell resolution, with the §8.2 reserved
+      ``fill_value: 0`` marking an unobserved cell;
+    - ``per-centroid`` — a uint64 ragged SIBLING row-aligned with the field's
+      digest, so the field must be ``kind: ragged`` at cell resolution; the
+      sibling shares the payload's per-cell row counts by construction, which
+      a chunk-uniform collapse would destroy.
+
+    ``coordinate`` is deliberately not accepted here: a time axis is declared
+    by ``output.time_encoding`` (§8.1), not by an aggregation variable.
+    """
+    from zagg.time_axis import (
+        TOC_FIELD_SHAPES,
+        TOC_SHAPE_COORDINATE,
+        TOC_SHAPE_PER_CELL,
+        TOC_SHAPE_PER_CENTROID,
+        TOC_UNOBSERVED,
+    )
+
+    shape = meta.get("temporal")
+    if shape is None:
+        return
+    if shape == TOC_SHAPE_COORDINATE:
+        raise ValueError(
+            f"Variable '{name}': temporal shape {TOC_SHAPE_COORDINATE!r} is the time "
+            f"axis' own declaration — set 'output.time_encoding: toc' instead (spec §8.1)"
+        )
+    if shape not in TOC_FIELD_SHAPES:
+        raise ValueError(
+            f"Variable '{name}': temporal {shape!r} is not one of {TOC_FIELD_SHAPES} (spec §8)"
+        )
+    if meta.get("resolution", "cell") != "cell":
+        raise ValueError(
+            f"Variable '{name}': 'temporal' is not supported with 'resolution: chunk' "
+            f"— a temporal companion is per cell or per centroid (spec §8.2/§8.3)"
+        )
+    if shape == TOC_SHAPE_PER_CELL:
+        if kind != "scalar":
+            raise ValueError(
+                f"Variable '{name}': temporal {TOC_SHAPE_PER_CELL!r} is a dense per-cell "
+                f"companion, so kind must be 'scalar', not {kind!r} (spec §8.2)"
+            )
+        if str(meta.get("dtype")) != "uint64":
+            raise ValueError(
+                f"Variable '{name}': temporal {TOC_SHAPE_PER_CELL!r} requires "
+                f"dtype 'uint64' (got {meta.get('dtype')!r}) — the words are packed "
+                f"uint64 (spec §8.2)"
+            )
+        fill = meta.get("fill_value", TOC_UNOBSERVED)
+        if isinstance(fill, bool) or fill != TOC_UNOBSERVED:
+            raise ValueError(
+                f"Variable '{name}': temporal {TOC_SHAPE_PER_CELL!r} requires "
+                f"fill_value {TOC_UNOBSERVED} (got {fill!r}) — §8.2 reserves it as the "
+                f"unobserved-cell marker"
+            )
+        return
+    if kind != "ragged":
+        raise ValueError(
+            f"Variable '{name}': temporal {TOC_SHAPE_PER_CENTROID!r} is a sibling of a "
+            f"ragged payload, so kind must be 'ragged', not {kind!r} (spec §8.3)"
+        )
+
+
 def _validate_output_kind(name: str, meta: dict) -> None:
     """Validate a variable's non-scalar output declaration.
 
@@ -1697,6 +1797,8 @@ def _validate_output_kind(name: str, meta: dict) -> None:
             raise ValueError(
                 f"Variable '{name}': '{key}' is only valid for kind 'ragged', not '{kind}'"
             )
+
+    _validate_temporal_shape(name, meta, kind)
 
     # resolution (cell default, or chunk). A chunk-resolution field stores one
     # value per chunk in a companion array (issue #30 item 2). ``scalar`` and
@@ -2510,6 +2612,11 @@ def get_output_signature(meta: dict) -> dict:
         # or ``None`` when undeclared (the spec reads absence as counts, so
         # ``None`` keeps pre-#424 templates and signatures byte-identical).
         "weights": meta.get("weights"),
+        # Temporal companion shape (spec §8.2/§8.3, issue #410):
+        # "per-cell"/"per-centroid", or ``None`` when the field carries no
+        # temporal companion — absence declares nothing, so pre-#410
+        # templates and signatures stay byte-identical.
+        "temporal": meta.get("temporal"),
     }
 
 
@@ -2552,6 +2659,11 @@ def output_field_signature(config: PipelineConfig) -> list[dict]:
         # issue #424) — same keyed-only-when-set discipline as location.
         if sig["weights"] is not None:
             entry["weights"] = sig["weights"]
+        # A temporal declaration changes the store schema too (a dense uint64
+        # companion, or a uint64 sibling vlen array — spec §8.2/§8.3, issue
+        # #410), under the same keyed-only-when-set discipline.
+        if sig["temporal"] is not None:
+            entry["temporal"] = sig["temporal"]
         fields.append(entry)
     return sorted(fields, key=lambda f: f["name"])
 

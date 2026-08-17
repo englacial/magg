@@ -1854,6 +1854,7 @@ class TestGetOutputSignature:
             "resolution": "cell",
             "location": None,
             "weights": None,
+            "temporal": None,
         }
 
     def test_scalar_default_dtype_none(self):
@@ -1866,6 +1867,7 @@ class TestGetOutputSignature:
             "resolution": "cell",
             "location": None,
             "weights": None,
+            "temporal": None,
         }
 
     def test_vector_int_signature(self):
@@ -1878,6 +1880,7 @@ class TestGetOutputSignature:
             "resolution": "cell",
             "location": None,
             "weights": None,
+            "temporal": None,
         }
 
     def test_vector_list_signature(self):
@@ -2140,6 +2143,7 @@ class TestRaggedKind:
             "resolution": "cell",
             "location": None,
             "weights": None,
+            "temporal": None,
         }
 
     def test_ragged_inner_shape_int_normalized(self):
@@ -2325,6 +2329,81 @@ class TestWeightsDeclaration:
         assert entries[0]["weights"] == "flux"
         # Undeclared: keyed-only-when-set, so existing signatures are stable.
         assert "weights" not in output_field_signature(_ragged_cfg(inner_shape=[2]))[0]
+
+
+class TestTemporalShapeDeclaration:
+    """The field-level ``temporal:`` shape (spec §8.2/§8.3, issue #410)."""
+
+    def _cell_cfg(self, **overrides):
+        meta = {
+            "function": "nanmax",
+            "source": "h_ph",
+            "dtype": "uint64",
+            "fill_value": 0,
+            "temporal": "per-cell",
+            **overrides,
+        }
+        cfg = _ragged_cfg(inner_shape=[2])
+        cfg.aggregation["variables"] = {"observed": meta}
+        return cfg
+
+    def test_per_centroid_on_a_ragged_field_validates(self):
+        validate_config(_ragged_cfg(inner_shape=[2], temporal="per-centroid"))
+
+    def test_per_cell_on_a_dense_uint64_field_validates(self):
+        validate_config(self._cell_cfg())
+
+    def test_unknown_shape_rejected(self):
+        with pytest.raises(ValueError, match="is not one of"):
+            validate_config(_ragged_cfg(inner_shape=[2], temporal="per-photon"))
+
+    def test_coordinate_shape_points_at_the_axis_knob(self):
+        # §8.1 is declared by output.time_encoding, never by a variable.
+        with pytest.raises(ValueError, match="output.time_encoding"):
+            validate_config(_ragged_cfg(inner_shape=[2], temporal="coordinate"))
+
+    def test_per_centroid_requires_a_ragged_field(self):
+        with pytest.raises(ValueError, match="kind must be 'ragged'"):
+            validate_config(self._cell_cfg(temporal="per-centroid"))
+
+    def test_per_cell_requires_a_scalar_field(self):
+        with pytest.raises(ValueError, match="kind must be 'scalar'"):
+            validate_config(_ragged_cfg(inner_shape=[2], temporal="per-cell"))
+
+    def test_per_cell_requires_uint64(self):
+        with pytest.raises(ValueError, match="requires dtype 'uint64'"):
+            validate_config(self._cell_cfg(dtype="int64"))
+
+    def test_per_cell_requires_the_reserved_fill(self):
+        # §8.2 reserves 0 as the unobserved-cell marker.
+        with pytest.raises(ValueError, match="reserves it as the"):
+            validate_config(self._cell_cfg(fill_value=1))
+
+    def test_chunk_resolution_rejected(self):
+        with pytest.raises(ValueError, match="not supported with 'resolution: chunk'"):
+            validate_config(
+                _ragged_cfg(inner_shape=[2], temporal="per-centroid", resolution="chunk")
+            )
+
+    def test_sibling_name_collision_rejected(self):
+        cfg = _ragged_cfg(inner_shape=[2], temporal="per-centroid")
+        cfg.aggregation["variables"]["h_ph_tdigest_times"] = {
+            "function": "mean",
+            "source": "h_ph",
+        }
+        with pytest.raises(ValueError, match="temporal channel is stored in a sibling"):
+            validate_config(cfg)
+
+    @pytest.mark.parametrize("key", ["temporal", "located", "times"])
+    def test_spec_owned_attrs_keys_rejected(self, key):
+        with pytest.raises(ValueError, match="spec-owned"):
+            validate_config(_ragged_cfg(inner_shape=[2], attrs={key: "anything"}))
+
+    def test_signature_carries_temporal_only_when_set(self):
+        entries = output_field_signature(_ragged_cfg(inner_shape=[2], temporal="per-centroid"))
+        assert entries[0]["temporal"] == "per-centroid"
+        # Undeclared: keyed-only-when-set, so existing signatures are stable.
+        assert "temporal" not in output_field_signature(_ragged_cfg(inner_shape=[2]))[0]
 
 
 class TestOverviewDelta:
