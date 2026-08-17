@@ -331,8 +331,14 @@ def fold_digests(
 
     ``channels`` carries the companion channels (issue #410) as
     ``{kernel kwarg: [per-digest word vector]}`` — ``locations`` for the §9
-    morton words, ``temporal`` for the §8.3 toc words, in
-    :data:`COMPANION_CHANNELS` order. Each vector list is aligned with
+    morton words, ``temporal`` for the §8.3 toc words. The returned slots are
+    always in :data:`COMPANION_CHANNELS` order, whatever order the mapping was
+    built in: every arm below normalizes through that table, because the k-way
+    merge fixes its own return order by the same table and an arm that instead
+    followed the caller's insertion order would hand back a toc word in the
+    locations slot. The two word grammars are mutually accepting, so such a swap
+    raises nowhere — it just writes false containment claims. An unrecognized
+    kwarg is rejected rather than dropped. Each vector list is aligned with
     ``cell_digests``, and every declared channel is threaded through the SAME
     merge, so a merged centroid's location is the deepest common ancestor of its
     contributors' words and its toc word is their envelope. Given, the return is
@@ -364,7 +370,15 @@ def fold_digests(
             return encode_digest(digests[0], dtype)
         return encode_digest(merge_tdigests_kway(digests, delta=int(delta)), dtype)
     keep = [i for i, d in enumerate(cell_digests) if len(d)]
-    for kwarg, vectors in channels.items():
+    declared = [kwarg for _key, kwarg, _namer in COMPANION_CHANNELS if kwarg in channels]
+    unknown = sorted(set(channels) - set(declared))
+    if unknown:
+        raise ValueError(
+            f"unknown companion channel(s) {unknown} — the channels map is keyed by the "
+            f"kernel kwarg of a COMPANION_CHANNELS entry"
+        )
+    for kwarg in declared:
+        vectors = channels[kwarg]
         if len(vectors) != len(cell_digests):
             raise ValueError(
                 f"{kwarg} channel has {len(vectors)} vectors for "
@@ -378,13 +392,13 @@ def fold_digests(
                     f"row-aligned with its payload (spec §1.1)"
                 )
     if not keep:
-        return (b"", *(b"" for _ in channels))
+        return (b"", *(b"" for _ in declared))
     digests = [cell_digests[i] for i in keep]
-    kept = {kwarg: [vectors[i] for i in keep] for kwarg, vectors in channels.items()}
+    kept = {kwarg: [channels[kwarg][i] for i in keep] for kwarg in declared}
     if len(digests) == 1:
         return (
             encode_digest(digests[0], dtype),
-            *(encode_digest(v[0], "uint64") for v in kept.values()),
+            *(encode_digest(kept[kwarg][0], "uint64") for kwarg in declared),
         )
     payload, *words = merge_tdigests_kway(digests, delta=int(delta), **kept)
     return (encode_digest(payload, dtype), *(encode_digest(w, "uint64") for w in words))
