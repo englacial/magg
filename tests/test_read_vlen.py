@@ -1049,6 +1049,120 @@ class TestStridedRecords:
             _read_group(_FakeH5(arrays), "BEAM0000", ds, shard, grid)
 
 
+# ── a third level, with a link of its own (#452 review) ─────────────────────
+#
+# Every level in the fixtures above is either ``samples`` (base) or ``shots``
+# (coordinates), so the cross-level expansion has only ever run against the
+# very link the gather map was built from — the searchsorted derivation
+# compared against itself. ``blocks`` is a genuinely different link over the
+# same 24-row strided base: ORIGIN-0 (``shots`` is origin-1), two records with
+# their own starts and counts, boundaries that cut *inside* a shot's samples.
+#
+#   row     0 .......................... 18 | 19 | 20 21 | 22 23
+#   block   0 ...........................  | -- | 1 .... | -----
+#   shot    101 .. | 102 .. | 103 |    | 104 ......... |
+#
+# Keeping block 1 keeps base rows 20-21 only: the last two samples of shot 104
+# and nothing else — an answer no ``shots``-level filter can produce, and one
+# that shifts by a row if the level's ``index_base`` is taken from the
+# coordinates link instead of its own.
+
+BLOCK_STARTS = np.array([0, 20], dtype=np.uint64)  # ORIGIN-0, unlike shots
+BLOCK_COUNTS = np.array([19, 2], dtype=np.uint16)
+BLOCK_FLAG = np.array([0, 1], dtype=np.uint8)
+
+
+def _l1b_arrays_blocks(group="BEAM0000"):
+    arrays = _l1b_arrays_strided(group)
+    arrays[f"/{group}/block_start"] = BLOCK_STARTS
+    arrays[f"/{group}/block_count"] = BLOCK_COUNTS
+    arrays[f"/{group}/block_flag"] = BLOCK_FLAG
+    return arrays
+
+
+def _vlen_ds_blocks(**extra):
+    ds = _vlen_ds()
+    ds["levels"] = dict(ds["levels"])
+    ds["levels"]["blocks"] = {
+        "path": "/{group}",
+        "link": {
+            "to": "samples",
+            "index_beg": "/{group}/block_start",
+            "count": "/{group}/block_count",
+            "index_base": 0,
+        },
+    }
+    ds["filters"] = [{"level": "blocks", "dataset": "/{group}/block_flag", "op": "eq", "value": 1}]
+    ds.update(extra)
+    return ds
+
+
+class TestThirdLevelLink:
+    """A cross-level filter on a link that is NOT the coordinates link."""
+
+    # Shard 1 (shots 103 + 104, pad 0) plans base rows 12..21; of those, rows
+    # 12 and 18-21 carry samples and 13-17 are slack. Block 1 covers 20-21.
+    PLANNED_ROWS = np.arange(12, 22)
+
+    def test_searchsorted_expansion_matches_the_hand_computed_owner_map(self):
+        expanded = _expand_mask_at_rows(
+            BLOCK_FLAG.astype(bool), BLOCK_STARTS, BLOCK_COUNTS, 0, self.PLANNED_ROWS
+        )
+        # rows 12-18 -> block 0 (flag 0), row 19 -> no block, rows 20-21 -> block 1.
+        assert expanded.tolist() == [False] * 8 + [True, True]
+        np.testing.assert_array_equal(
+            expanded,
+            _expand_mask_to_base(
+                BLOCK_FLAG.astype(bool), BLOCK_STARTS, BLOCK_COUNTS, 0, STRIDED_EXTENT
+            )[self.PLANNED_ROWS],
+        )
+
+    def test_a_wrong_index_base_on_the_second_link_changes_the_answer(self):
+        # The property the two-level fixtures could not see: read the level's
+        # own origin wrong and the window slides by a row.
+        shifted = _expand_mask_at_rows(
+            BLOCK_FLAG.astype(bool), BLOCK_STARTS, BLOCK_COUNTS, 1, self.PLANNED_ROWS
+        )
+        assert shifted.tolist() == [False] * 7 + [True, True, False]
+
+    def test_planned_read_filters_on_the_third_level(self):
+        ds = _vlen_ds_blocks(read_plan={"spatial_index": "shots", "pad": 0})
+        df = _read_group(_FakeH5(_l1b_arrays_blocks()), "BEAM0000", ds, 1, _LatGrid())
+        assert df["shot_number"].tolist() == [104, 104]
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), WAVE[11:13])
+
+    def test_planned_matches_full_on_the_third_level(self):
+        plan_df = _read_group(
+            _FakeH5(_l1b_arrays_blocks()),
+            "BEAM0000",
+            _vlen_ds_blocks(read_plan={"spatial_index": "shots", "pad": 0}),
+            1,
+            _LatGrid(),
+        )
+        full_df = _read_group(
+            _FakeH5(_l1b_arrays_blocks()), "BEAM0000", _vlen_ds_blocks(), 1, _LatGrid()
+        )
+        for col in ("rxwaveform", "shot_number", "noise_mean", "elevation"):
+            np.testing.assert_allclose(plan_df[col].to_numpy(), full_df[col].to_numpy())
+
+    def test_a_shots_level_filter_cannot_produce_the_same_rows(self):
+        # Guards against the fixture degenerating back into a no-op: the block
+        # boundary cuts inside shot 104, so no per-shot verdict yields these rows.
+        ds = _vlen_ds(
+            read_plan={"spatial_index": "shots", "pad": 0},
+            filters=[
+                {
+                    "level": "shots",
+                    "dataset": "/{group}/geolocation/degrade",
+                    "op": "eq",
+                    "value": 0,
+                }
+            ],
+        )
+        df = _read_group(_FakeH5(_l1b_arrays_blocks()), "BEAM0000", ds, 1, _LatGrid())
+        assert df["shot_number"].tolist() == [104] * 4
+
+
 # ── memory posture: nothing at base rate on a planned vlen read (#452) ───────
 
 
