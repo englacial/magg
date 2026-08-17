@@ -2166,6 +2166,95 @@ class TestTemporalCompanionProduction:
         assert slots == (None, [1])
         assert _ragged_entry((["v"], [0], *slots)) == (["v"], [0], None, [1])
 
+    # -- the per-chunk toc encode hoist (issue #476) -------------------------
+
+    def _grouped(self, n=60):
+        from zagg.processing.aggregate import _group_columns
+
+        cfg = self._cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        cell = self._cell(n)
+        cells = grid.cells_of(cell["leaf_id"])
+        children = np.unique(cells)
+        cols, cell_to_slice = _group_columns(dict(cell), cells)
+        return cfg, children, cols, cell_to_slice
+
+    def test_chunk_encode_matches_the_per_cell_encode(self):
+        # The hoisted one-pass encode is element-wise, so each cell's slice must
+        # be byte-identical to encoding that cell's rows alone (issue #476).
+        from zagg.processing.aggregate import _chunk_toc_words, _toc_word_column
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        by_cell = _chunk_toc_words(cols, cell_to_slice, children, cfg)
+        assert set(by_cell) == set(cell_to_slice)
+        for key, (start, end) in cell_to_slice.items():
+            per_cell = _toc_word_column({col: arr[start:end] for col, arr in cols.items()}, cfg)
+            np.testing.assert_array_equal(by_cell[key], per_cell)
+
+    def test_chunk_path_never_encodes_per_cell(self, monkeypatch):
+        # The chunk path injects the pre-encoded column, so the per-cell encode
+        # (and its dict copy) must not run — while the emitted words stay
+        # byte-identical to the per-cell route (issue #476).
+        import zagg.processing.aggregate as agg_mod
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        agg_fields = get_agg_fields(cfg)
+        calls = []
+        orig = agg_mod._toc_word_column
+        monkeypatch.setattr(
+            agg_mod, "_toc_word_column", lambda *a, **k: calls.append(1) or orig(*a, **k)
+        )
+        stats, payloads, idx, channels, _ = _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], agg_fields
+        )
+        assert calls == [], "the chunk path must not fall back to the per-cell encode"
+        for j, i in enumerate(idx["h_tdigest"]):
+            start, end = cell_to_slice[int(children[i])]
+            cell = {col: arr[start:end] for col, arr in cols.items()}
+            digest, locs, times = calculate_cell_statistics(cell, config=cfg)["h_tdigest"]
+            np.testing.assert_array_equal(payloads["h_tdigest"][j], digest)
+            np.testing.assert_array_equal(channels["h_tdigest"]["locations"][j], locs)
+            np.testing.assert_array_equal(channels["h_tdigest"]["times"][j], times)
+            assert stats["observed"][i] == calculate_cell_statistics(cell, config=cfg)["observed"]
+
+    def test_no_clock_refused_on_the_chunk_path(self):
+        # §8.3's refusal stays reachable after the hoist: a populated chunk with
+        # a declared companion but no clock fails exactly as the per-cell route.
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        del cfg.output["time_source"]
+        with pytest.raises(ValueError, match="no per-observation clock"):
+            _aggregate_chunk_cells(
+                children,
+                cols,
+                cell_to_slice,
+                {},
+                cfg,
+                ["h_tdigest", "observed"],
+                get_agg_fields(cfg),
+            )
+
+    def test_all_empty_chunk_needs_no_clock(self):
+        # Parity with the per-cell route, where an empty cell never reaches the
+        # encode: a chunk with no populated cells must not demand a clock.
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        del cfg.output["time_source"]
+        empty_cols = {col: arr[:0] for col, arr in cols.items()}
+        stats, payloads, idx, channels, cwd = _aggregate_chunk_cells(
+            children,
+            empty_cols,
+            {},
+            {},
+            cfg,
+            ["h_tdigest", "observed"],
+            get_agg_fields(cfg),
+        )
+        assert cwd == 0 and payloads["h_tdigest"] == []
+
 
 class TestRaggedChunkCompanion:
     """Issue #82 phase 4c: a ``kind: ragged`` + ``resolution: chunk`` field stores

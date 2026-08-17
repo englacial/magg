@@ -40,16 +40,18 @@ def _temporal_fields(agg_fields: dict) -> dict[str, str]:
     }
 
 
-def _toc_word_column(cell_data: dict, config) -> np.ndarray:
-    """Encode this cell's observation times as toc words (spec §8.3, #410).
+def _checked_toc_source(columns, config) -> dict:
+    """The validated clock declaration for a temporal companion (spec §8.3, #410).
 
-    The single conversion point: the declared ``output.time_source`` column
-    through :func:`zagg.time_axis.observation_words`. Both companion shapes read
-    the result — a ``per-centroid`` field as the reducer's ``temporal=`` channel,
-    a ``per-cell`` field as its ``source`` column — so one store can never carry
-    two clocks.
+    The refusal seam both encode routes share: a declared companion with no
+    ``output.time_source`` block is the §8.3 no-clock error (config validation is
+    the front door, but a config built without it must still fail loudly rather
+    than write an empty companion), and a declared clock whose column was not
+    read names itself. ``columns`` only needs membership + iteration, so either
+    a per-cell namespace or the pooled column dict can be checked without
+    gathering anything.
     """
-    from zagg.time_axis import observation_words, toc_source
+    from zagg.time_axis import toc_source
 
     source = toc_source(config)
     if source is None:
@@ -58,18 +60,87 @@ def _toc_word_column(cell_data: dict, config) -> np.ndarray:
             "clock — declare output.time_source {field, epoch, scale, units} (spec §8.3, "
             "issue #410)"
         )
-    if source["field"] not in cell_data:
+    if source["field"] not in columns:
         raise ValueError(
             f"output.time_source.field {source['field']!r} is not in the cell data "
-            f"(available: {sorted(cell_data)}); a temporal companion needs the declared "
+            f"(available: {sorted(columns)}); a temporal companion needs the declared "
             f"time column read at base rate"
         )
+    return source
+
+
+def _toc_word_column(cell_data: dict, config) -> np.ndarray:
+    """Encode this cell's observation times as toc words (spec §8.3, #410).
+
+    The single conversion point: the declared ``output.time_source`` column
+    through :func:`zagg.time_axis.observation_words`. Both companion shapes read
+    the result — a ``per-centroid`` field as the reducer's ``temporal=`` channel,
+    a ``per-cell`` field as its ``source`` column — so one store can never carry
+    two clocks. The chunk path encodes through :func:`_chunk_toc_words` instead
+    (one pass per chunk, issue #476); this per-cell route remains for direct
+    :func:`calculate_cell_statistics` callers.
+    """
+    from zagg.time_axis import observation_words
+
+    source = _checked_toc_source(cell_data, config)
     return observation_words(
         cell_data[source["field"]],
         epoch=source["epoch"],
         scale=source["scale"],
         units=source["units"],
     )
+
+
+def _chunk_toc_words(
+    col_arrays: dict[str, np.ndarray],
+    cell_to_slice: dict[int, tuple[int, int]],
+    children: np.ndarray,
+    config,
+) -> dict[int, np.ndarray]:
+    """Encode one chunk's toc words in ONE pass and split them per cell (#476).
+
+    Per-chunk hoist of :func:`_toc_word_column`: gather the declared
+    ``output.time_source`` column over the chunk's populated cells, encode it
+    through one :func:`zagg.time_axis.observation_words` call, and slice the
+    result back per cell. The encode is element-wise, so each cell's words are
+    byte-identical to the per-cell encode this replaces — only the call count
+    collapses (issue #476 measured 28,515 per-cell encodes at 0.21 ms against
+    one pooled pass over the same rows).
+
+    Returns ``{cell_key: words}`` for exactly the chunk's populated cells. A
+    chunk with no populated cells returns ``{}`` before touching the clock
+    declaration — matching the per-cell path, where an empty cell never reaches
+    the encode — while any populated cell runs the §8.3 refusal checks
+    (:func:`_checked_toc_source`) exactly as the per-cell route did.
+    """
+    present: list[tuple[int, int, int]] = []
+    for child in children:
+        key = int(child)
+        sl = cell_to_slice.get(key)
+        if sl is not None:
+            present.append((key, *sl))
+    if not present:
+        return {}
+    from zagg.time_axis import observation_words
+
+    source = _checked_toc_source(col_arrays, config)
+    col = col_arrays[source["field"]]
+    if len(present) == 1:
+        _, start, end = present[0]
+        gathered = col[start:end]
+    else:
+        idx = np.concatenate([np.arange(start, end) for _, start, end in present])
+        gathered = col[idx]
+    words = observation_words(
+        gathered, epoch=source["epoch"], scale=source["scale"], units=source["units"]
+    )
+    out: dict[int, np.ndarray] = {}
+    pos = 0
+    for key, start, end in present:
+        n = end - start
+        out[key] = words[pos : pos + n]
+        pos += n
+    return out
 
 
 def _rss_mb() -> float:
@@ -478,12 +549,14 @@ def calculate_cell_statistics(
         0,
     )
     # The derived toc word column (spec §8.2/§8.3, issue #410): one word per
-    # observation, encoded here rather than in the read path so every route into
-    # the aggregation (pooled, spill read-back, per-chunk precompute) gets it
-    # from ONE conversion, and so the total encode work is exactly one pass over
-    # the shard's rows. Materialized only when a field declares a companion, so
+    # observation, from ONE conversion point whichever route reaches the
+    # aggregation. The chunk path (``_aggregate_chunk_cells`` — pooled and spill
+    # read-back alike) pre-encodes it once per chunk (``_chunk_toc_words``,
+    # issue #476) and injects it at ``cell_data`` construction, so this per-cell
+    # encode — and its dict copy — only runs for direct callers whose namespace
+    # lacks the column. Materialized only when a field declares a companion, so
     # a config written before #410 takes the code path it always did.
-    if n_obs and _temporal_fields(agg_fields):
+    if n_obs and TOC_WORD_COLUMN not in cell_data and _temporal_fields(agg_fields):
         cell_data = {**cell_data, TOC_WORD_COLUMN: _toc_word_column(cell_data, config)}
     if n_obs == 0:
         # Empty cell: every agg field gets its sentinel EXCEPT a field whose
@@ -873,6 +946,19 @@ def _aggregate_chunk_cells(
 
     _empty: dict[str, np.ndarray] = {col: arr[:0] for col, arr in col_arrays.items()}
 
+    # Per-chunk toc encode (issue #476): when a field declares a temporal
+    # companion, encode the whole chunk's words in one pass and hand each
+    # populated cell its slice at namespace construction — the per-cell encode
+    # (and its dict copy) in ``calculate_cell_statistics`` then never runs on
+    # this path. Both callers (the worker's pooled loop and the spill
+    # read-back, which is per chunk by construction) get the hoist here, so
+    # chunk boundaries are respected at any chunks_per_shard.
+    cell_toc = (
+        _chunk_toc_words(col_arrays, cell_to_slice, children, config)
+        if _temporal_fields(agg_fields)
+        else None
+    )
+
     cells_with_data = 0
     for i, child_morton in enumerate(children):
         child_key = int(child_morton)
@@ -881,6 +967,8 @@ def _aggregate_chunk_cells(
             cell_data: dict[str, np.ndarray] = {
                 col: arr[start:end] for col, arr in col_arrays.items()
             }
+            if cell_toc is not None:
+                cell_data[TOC_WORD_COLUMN] = cell_toc[child_key]
             cells_with_data += 1
         else:
             cell_data = _empty
