@@ -2652,6 +2652,18 @@ class TestTimeSource:
         with pytest.raises(ValueError, match="reserved name of the derived toc word column"):
             validate_config(bare)
 
+    def test_declared_coordinate_may_not_shadow_the_derived_name(self):
+        # Coordinates are read into the same cell_data mapping the derived words
+        # are merged into, so an unreserved name there would be overwritten
+        # silently, and only for the cells with observations (issue #410 review).
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.data_source["coordinates"] = {
+            **(cfg.data_source.get("coordinates") or {}),
+            "toc_word": "{group}/toc_word",
+        }
+        with pytest.raises(ValueError, match=r"data_source.coordinates declares 'toc_word'"):
+            validate_config(cfg)
+
     def test_both_clock_declarations_must_agree(self):
         # The fallback single-sources the clock only when time_source is ABSENT.
         # Unchecked, a store declaring both routes windows on one clock and

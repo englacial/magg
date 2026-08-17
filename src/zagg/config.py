@@ -587,9 +587,15 @@ def validate_config(config: PipelineConfig) -> None:
     # not to whether the column happens to exist.
     from zagg.time_axis import TOC_WORD_COLUMN, toc_source
 
-    if TOC_WORD_COLUMN in ds_vars:
+    # ``coordinates`` is in the reservation too (issue #410 review): coordinate
+    # columns are read into the same ``cell_data`` mapping, where the derived
+    # words would overwrite the read column — silently, and only for cells with
+    # observations.
+    coord_names = set((config.data_source or {}).get("coordinates") or {})
+    if TOC_WORD_COLUMN in ds_vars | coord_names:
+        surface = "variables" if TOC_WORD_COLUMN in ds_vars else "coordinates"
         raise ValueError(
-            f"data_source.variables declares {TOC_WORD_COLUMN!r}, which is the "
+            f"data_source.{surface} declares {TOC_WORD_COLUMN!r}, which is the "
             f"reserved name of the derived toc word column output.time_source "
             f"materializes (spec §8.2/§8.3) — rename the column"
         )
