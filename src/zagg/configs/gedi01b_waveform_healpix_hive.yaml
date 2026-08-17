@@ -68,10 +68,12 @@ data_source:
         elevation_bin0: "/{group}/geolocation/elevation_bin0"
         elevation_lastbin: "/{group}/geolocation/elevation_lastbin"
   assets:
-    # The paired L2A sibling (one shardmap, {l1b, l2a} per entry): per-shot
-    # quality datasets joined by shot_number -- L1B carries none of them, and
-    # clipped waveforms are radiometrically invalid, so the join is core to
-    # the flux currency (issue #422 ruling).
+    # The paired L2A sibling (one shardmap, {l1b, l2a} per entry), joined by
+    # shot_number. After the retrieval-fitness filters were dropped (espg
+    # ruling 2026-08-17, refs #425) the one consumed L2A dataset is the
+    # saturation counter ``rx_assess/rx_clipbin_count`` -- L1B carries no such
+    # per-shot assessment, and clipped waveforms are radiometrically invalid,
+    # so the join stays core to the flux currency (issue #422 ruling).
     l2a:
       join:
         left: "/{group}/shot_number"
