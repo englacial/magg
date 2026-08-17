@@ -668,6 +668,12 @@ def calculate_cell_statistics(
             payload = _coerce_ragged_value(payload, sig)
             out = []
             for label, channel in zip(channels, words, strict=True):
+                # Must not copy: under ``batched_companion_folds`` (issue #476) the
+                # reducer hands back a contiguous uint64 placeholder the batch fills
+                # in place at the flush, so this normalization has to be identity —
+                # which it is for the contiguous uint64 vectors the build_tdigest
+                # family returns. A copy here would strand the flush on an orphan
+                # (see ``_CompanionBatch``).
                 channel = np.ascontiguousarray(np.asarray(channel))
                 if channel.dtype != np.uint64:
                     # A silent uint64 cast would wrap negative/float garbage into
