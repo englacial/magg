@@ -471,6 +471,16 @@ def _l2a_var_ds(**extra):
     return ds
 
 
+def _dem_var_ds(**extra):
+    """``_l2a_ds`` plus the DEM as an asset variable (the issue #464 gate shape)."""
+    ds = _l2a_ds(**extra)
+    ds["levels"]["shots"]["variables"]["dem"] = {
+        "asset": "l2a",
+        "path": "/{group}/digital_elevation_model",
+    }
+    return ds
+
+
 class TestSiblingAssetJoin:
     def test_join_filters_by_shot_number(self):
         # quality_flag == 1 keeps shots 101 + 104; shot 102 fails the flag and
@@ -725,6 +735,166 @@ class TestSiblingJoinedValues:
         arrays["/BEAM0000/quality_flag"] = np.array([1, 1, 0, 1], dtype=np.uint8)
         with pytest.raises(ValueError, match="duplicate key 102"):
             self._join(["/BEAM0000/quality_flag"], sibling_arrays=arrays)
+
+
+# ── asset-sourced shot-level variables through the read route (issue #464) ───
+
+
+class TestAssetVariables:
+    """Design (B) end to end: the record-key join feeding the existing
+    coordinates-level broadcast, on both arms, with the stock expression
+    machinery consuming the result unchanged."""
+
+    def test_full_read_joins_and_broadcasts(self):
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            _dem_var_ds(),
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        # Per-shot DEM repeated by count; shot 103 has no L2A row -> NaN.
+        np.testing.assert_array_equal(
+            df["dem"].to_numpy(), np.array([60.0] * 5 + [30.0] * 3 + [np.nan] + [40.0] * 4)
+        )
+
+    def test_planned_matches_full(self):
+        ds_plan = _dem_var_ds(read_plan={"spatial_index": "shots", "pad": 1})
+        ds_full = _dem_var_ds()
+        for shard in (0, 1):
+            a = _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                ds_plan,
+                shard,
+                _LatGrid(),
+                siblings={"l2a": _FakeH5(_l2a_arrays())},
+            )
+            b = _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                ds_full,
+                shard,
+                _LatGrid(),
+                siblings={"l2a": _FakeH5(_l2a_arrays())},
+            )
+            np.testing.assert_array_equal(a["dem"].to_numpy(), b["dem"].to_numpy())
+
+    def test_strided_planned_read(self):
+        # The production GEDI shape: strided records under a plan. Shard 1
+        # holds shots 103 (unmatched -> NaN) + 104.
+        ds = _dem_var_ds(read_plan={"spatial_index": "shots", "pad": 0})
+        df = _read_group(
+            _FakeH5(_l1b_arrays_strided()),
+            "BEAM0000",
+            ds,
+            1,
+            _LatGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        np.testing.assert_array_equal(df["dem"].to_numpy(), np.array([np.nan] + [40.0] * 4))
+
+    def test_expression_filter_mixes_primary_and_asset_columns(self):
+        # The issue #464 gate shape: a primary shot-level column against an
+        # asset-sourced one through the STOCK expression machinery — no filter
+        # changes. Shot 102's DEM is poisoned by ~5.8 km (the 2023-031 epoch
+        # analogue) and drops; shot 103's NaN (no sibling row) drops by plain
+        # comparison semantics.
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/digital_elevation_model"] = np.array([10.5, 5800.0, 9.0])
+        ds = _dem_var_ds(filters=[{"expression": "abs(noise_mean - dem) <= 200"}])
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            ds,
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(arrays)},
+        )
+        assert sorted(set(df["shot_number"].tolist())) == [101, 104]
+        assert len(df) == 9
+
+    def test_missing_sibling_warns_once_per_granule_not_per_group(self, caplog):
+        # The read runs once per beam group; the NaN warning is deduped on the
+        # granule's open primary handle, so a granule's eight groups warn once.
+        arrays = {**_l1b_arrays("BEAM0000"), **_l1b_arrays("BEAM0001")}
+        h5 = _FakeH5(arrays)
+        with caplog.at_level("WARNING", logger="zagg.processing.read_vlen"):
+            for group in ("BEAM0000", "BEAM0001"):
+                df = _read_group(h5, group, _dem_var_ds(), 0, _OneShardGrid())
+                assert np.isnan(df["dem"].to_numpy()).all()
+        assert sum("no open sibling handle" in r.getMessage() for r in caplog.records) == 1
+
+    def test_asset_filter_still_fails_closed_beside_a_variable(self):
+        # Declaring an asset VARIABLE must not soften the FILTER policy: with
+        # no sibling handle, the filter on the same asset raises as before.
+        ds = _dem_var_ds(
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1}]
+        )
+        with pytest.raises(ValueError, match="no open sibling handle"):
+            _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", ds, 0, _OneShardGrid())
+
+
+class TestAssetVariableValidation:
+    """Config-side validation of the ``{asset, path}`` level-variable form."""
+
+    def test_valid_config_passes(self):
+        validate_config(_cfg(_dem_var_ds()))
+
+    def test_undeclared_asset_rejected(self):
+        ds = _dem_var_ds()
+        ds["levels"]["shots"]["variables"]["dem"] = {"asset": "nope", "path": "/{group}/x"}
+        with pytest.raises(ValueError, match="asset 'nope' is not declared in data_source.assets"):
+            validate_config(_cfg(ds))
+
+    def test_non_coordinates_level_rejected(self):
+        # The join is keyed to the coordinates level's records; any other
+        # level's rows have no defined key alignment.
+        ds = _l2a_ds()
+        ds["levels"]["blocks"] = {
+            "path": "/{group}",
+            "link": {
+                "to": "samples",
+                "index_beg": "/{group}/block_start",
+                "count": "/{group}/block_count",
+            },
+            "variables": {"dem": {"asset": "l2a", "path": "/{group}/digital_elevation_model"}},
+        }
+        with pytest.raises(ValueError, match="declare them on coordinates.level 'shots'"):
+            validate_config(_cfg(ds))
+
+    def test_requires_vlen_route(self):
+        ds = _dem_var_ds()
+        del ds["coordinates"]["level"]
+        del ds["variables"]["elevation"]  # synthesize needs the vlen route too
+        with pytest.raises(ValueError, match="asset variables require the vlen route"):
+            validate_config(_cfg(ds))
+
+    def test_unknown_keys_rejected(self):
+        ds = _dem_var_ds()
+        ds["levels"]["shots"]["variables"]["dem"] = {
+            "asset": "l2a",
+            "path": "/{group}/x",
+            "column": 0,
+        }
+        with pytest.raises(ValueError, match="the asset form takes 'asset' and 'path'"):
+            validate_config(_cfg(ds))
+
+    def test_non_string_path_rejected(self):
+        ds = _dem_var_ds()
+        ds["levels"]["shots"]["variables"]["dem"] = {"asset": "l2a", "path": ""}
+        with pytest.raises(ValueError, match="variables.dem.path must be a non-empty string"):
+            validate_config(_cfg(ds))
+
+    def test_collision_with_base_variable_rejected(self):
+        ds = _dem_var_ds()
+        ds["levels"]["shots"]["variables"]["rxwaveform"] = {
+            "asset": "l2a",
+            "path": "/{group}/digital_elevation_model",
+        }
+        with pytest.raises(ValueError, match="collides with a data_source.variables column"):
+            validate_config(_cfg(ds))
 
 
 # ── config validation of the vlen grammar ────────────────────────────────────
@@ -994,6 +1164,15 @@ class TestInlineWriteBackPrebuild:
         # it, so mapping them here would KeyError on the primary.
         assert not [p for p in built if "rx_assess" in p]
 
+    def test_asset_variables_are_not_mapped(self, monkeypatch):
+        from zagg.config import default_config
+
+        cfg = default_config("gedi01b_waveform_healpix_hive")
+        built = self._built_paths(monkeypatch, cfg.data_source)
+        # Asset-sourced variables (issue #464) read the paired granule too:
+        # mapping the DEM here would KeyError on the primary the same way.
+        assert not [p for p in built if "digital_elevation_model" in p]
+
     def test_vlen_prebuild_runs_without_a_read_plan(self, monkeypatch):
         # No read_plan: the record level still has to contribute its link, or
         # the full-read arm's link datasets go unmapped.
@@ -1051,6 +1230,24 @@ class TestGediTemplate:
         assert expressions == [
             "abs((elevation_bin0 + elevation_lastbin)/2 - digital_elevation_model) <= 200"
         ]
+
+    def test_template_gate_drops_an_epoch_poisoned_shot(self, cfg):
+        # The issue #464 failure mode through the SHIPPED template: shot 102's
+        # DEM sits ~5.75 km from its window midpoint (the 2023-031 constant
+        # offset, scaled to the fixture), while 101 and 104 stay within 200 m.
+        # Only the geolocation gate separates them — degrade and the saturation
+        # counter pass all three.
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/digital_elevation_model"] = np.array([60.0, 5800.0, 40.0])
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            cfg.data_source,
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(arrays)},
+        )
+        assert df["shot_number"].tolist() == [101] * 5 + [104] * 4
 
     def test_template_reads_and_aggregates_the_fixture(self, cfg):
         from zagg.processing import calculate_cell_statistics
