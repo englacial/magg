@@ -25,7 +25,7 @@ migration is metadata-only.
 
 ## Why the attrs are the contract
 
-The element interpretation (dtype, inner shape, the located sibling's name)
+The element interpretation (dtype, inner shape, the companion siblings' names)
 is self-describing in the array's attrs — the
 [spec §1.2 block](specification.md#12-the-ragged-attrs-block) — so a reader
 decodes exactly what the writer declared rather than hardcoding a dtype or
@@ -36,6 +36,38 @@ never half-parses — the coverage-envelope discipline applied to the ragged
 layout. A vlen array without a well-formed `element` declaration is **not** a
 zagg ragged array — pre-issue-209 CSR stores are a hard break, and the readers
 raise a pointed error rather than decode under a guessed layout.
+
+## Why the companion words are declared, not implied
+
+A companion sibling holds **packed words**, not self-describing scalars — a
+morton cell in `{field}_locations`, a toc time in `{field}_times` — so
+nothing in a uint64 array says which grammar produced it. The spec's
+word-typed declaration
+([§8](specification.md#8-zagg-toc1), instantiated for space in
+[§9](specification.md#9-zagg-located1)) closes that: a `{spec, shape,
+grammar}` block, stamped by the writer on the array that *holds* the words,
+with the payload array carrying only the *binding* to it. One rule follows
+from that split and is worth stating plainly here: **read the declaration off
+the sibling you bound, never off the payload.**
+
+Two properties the family is designed around:
+
+- **Absence is never a refusal.** Every located store written before §9
+  carries no `located` key, and reads exactly as
+  [§2.2](specification.md#22-the-location-channel) always said it did. The
+  declaration adds self-description and the shape vocabulary; it never
+  reinterprets a byte.
+- **Composition gates on `{shape, grammar}`** — the same discipline the
+  [§2.0 `weights`](specification.md#20-the-weights-declaration) declaration
+  established, and for the same reason: merging two arrays whose words mean
+  different things yields an array that means neither.
+
+The binding for the temporal sibling is a **sibling attrs key** (`times`),
+not a key inside the versioned `ragged` block, matching `weights` and for the
+same reason — the block is retired wholesale under
+[`zagg-ragged/2`](specification.md#6-zagg-ragged2), and a key outside it
+survives that metadata-only migration untouched. `locations` predates that
+ruling and stays where it is; the asymmetry is history, not design.
 
 ## Why the wire framing is golden-pinned
 
@@ -85,7 +117,9 @@ store). The sharded 2-GET count is pinned by
 A [hive](hive_layout.md) leaf zarr is exactly this layout scoped to one shard.
 Under the leaf's `{group}` path a reader finds the ragged vlen array with its
 versioned `ragged` attrs, the sibling `morton` coordinate array (chunk
-identity), and, for a located field, the `{field}_locations` sibling — all
+identity), and the field's companion siblings — `{field}_locations` for a
+located field, `{field}_times` for one carrying the per-centroid temporal
+companion ([spec §8.3](specification.md#83-shape-per-centroid)) — all
 sharded as one whole-leaf `ShardingCodec` object (one stored span). So a hive
 product is **read one leaf at a time**: open the leaf store
 (`hive.shard_leaf_path`) and pass the same `field` path to the readers. The
@@ -114,7 +148,8 @@ and hive-leaf writers are pinned to store byte-identical per-cell payloads
   then the one inner chunk holding the cell), never the whole shard object. An
   out-of-range index raises `IndexError` naming the valid range (no negative-index
   wrap); an absent cell returns the zero-length `(0, *inner_shape)` array. Works
-  on the `{field}_locations` sibling too.
+  on the `{field}_locations` and `{field}_times` siblings too — both are
+  themselves `zagg-ragged/1` uint64 arrays.
 - **Sub-leaf subtree read** (`subtree=` on the sweep readers —
   [issue #351](https://github.com/englacial/zagg/issues/351)) — the nested
   cells axis makes the subtree below any ancestor one **contiguous cell span**
