@@ -237,6 +237,28 @@ class TestComposabilityClasses:
         }
         assert field_composability(meta) == "none"
 
+    def test_a_temporal_waveform_field_is_still_none(self):
+        # The per-centroid SHAPE does not put a field in the pyramid: the class
+        # is decided by the reducer, and ``build_waveform_digest`` is outside
+        # ``_TDIGEST_FUNCTIONS`` by the issue #422 ruling (GEDI declares
+        # ``pyramid: false``). So a waveform field carrying the channel stays
+        # class ``none`` and never appears above native resolution — there is no
+        # ``rx_flux_times`` on any overview (review finding).
+        meta = {
+            "kind": "ragged",
+            "function": "zagg.stats.waveform.build_waveform_digest",
+            "inner_shape": [2],
+            "temporal": "per-centroid",
+            "dtype": "float32",
+        }
+        assert field_composability(meta) == "none"
+        # ... and the SAME declaration under the standard reducer does fold, so
+        # the class turns on the function, not on the channel.
+        assert (
+            field_composability({**meta, "function": "zagg.stats.tdigest.build_tdigest"})
+            == "approximate"
+        )
+
     def test_located_declaration_rides_the_manifest_entry(self):
         # The manifest is the only description the overview WRITER has of a
         # field (``_overview_config``), so the channel has to be recorded there

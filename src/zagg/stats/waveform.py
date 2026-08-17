@@ -202,12 +202,20 @@ def build_waveform_digest(
     the value co-sort carry along so each output centroid gets the envelope of
     the samples that survived into it
     (:func:`zagg.stats.tdigest._centroid_envelopes`). Given, the return is a
-    ``(digest, words)`` pair. Per-centroid at every level, symmetric with the
-    located channel (espg-ruled 2026-08-17): a waveform record's samples share
-    one instant, so a single-shot cell's centroids all carry that exact
-    timestamp and only genuinely pooled cells produce ranges — which is
-    ruling 2's "exact when ``shot_count == 1``, a range when pooled", now
-    expressed per centroid rather than per cell.
+    ``(digest, words)`` pair. The per-centroid **shape** is the one the espg
+    ruling of 2026-08-17 makes universal, identical to the located channel's;
+    the ruling's *at every level* half does not describe this reducer's stores,
+    because ``build_waveform_digest`` is absent from
+    ``zagg.processing.streaming._TDIGEST_FUNCTIONS`` — so a waveform field is
+    D24 class ``none`` (issue #422, and the GEDI template's ``pyramid: false``)
+    and exists at native resolution only. There is no waveform overview to carry
+    a companion, and a reader must not expect one.
+
+    What the words say is ruling 2's honesty property: a waveform record's
+    samples share one instant, so a single-shot cell's centroids all carry that
+    exact timestamp and only genuinely pooled cells produce ranges — "exact when
+    ``shot_count == 1``, a range when pooled", now expressed per centroid rather
+    than per cell.
 
     Returns the ``(k, 2)`` float32 centroid array (``(0, 2)`` when nothing
     survives the clip).
