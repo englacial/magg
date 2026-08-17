@@ -52,7 +52,8 @@ def test_s2_neon_o9_tracks_the_shipped_sentinel2_config():
     from zagg.config import get_store_layout, load_config
     from zagg.semantics import semantic_hash
 
-    bench = load_config(str(BENCH / "configs" / "s2_neon_o9.yaml"))
+    manifest, base = rrb.load_targets(str(BENCH / "targets_raster_neon.json"))
+    bench = load_config(str(base / manifest["targets"]["raster_s2_neon_2025"]["config"]))
     shipped = load_config(str(REPO / "src" / "zagg" / "configs" / "sentinel2_l2a.yaml"))
 
     assert bench.data_source == shipped.data_source
