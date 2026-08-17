@@ -960,17 +960,22 @@ def _temporal_config():
     """The ``temporal/`` fixture's config: both companion shapes at once.
 
     **This config is deliberately un-submittable, and constructed rather than
-    validated.** ``validate_config`` refuses every field-level ``temporal:``
-    in this release (``config._validate_temporal_producer``): no reducer
-    produces toc words until the #410 kernel PR, so a runnable config
-    declaring a companion would write a store violating the section it
-    declares. The generator is the documented test-only bypass — it builds
-    ``PipelineConfig`` directly, computes the words itself, and hands them to
-    the production write path through the fake ``process_shard`` below, which
-    is exactly why the §7 fixture can commit words the pipeline cannot yet
-    produce. Nothing here should grow a ``validate_config`` call; when the
-    kernel lands, the config's reducers get named in
-    ``time_axis.TOC_PRODUCING_FUNCTIONS`` and this note goes away.
+    validated.** It has no reader — the fake ``process_shard`` below stands in
+    for one — so it declares no ``output.time_source``, which
+    ``validate_config`` requires of every ``temporal:`` field
+    (``config._validate_temporal_producer``), and its ``observed`` reducer is a
+    stand-in rather than :func:`zagg.stats.toc.cell_envelope`. The generator
+    computes both companions' words itself and hands them to the production
+    write path, which is what lets the §7 fixture pin store BYTES independently
+    of the kernel that produces them.
+
+    That independence is the point, and it is checked from the other side:
+    ``tests/test_spec_conformance.py::TestTemporalCompanions::``
+    ``test_the_production_kernel_reproduces_the_committed_words`` drives these
+    same inputs through the real reducers (``build_tdigest(..., temporal=)`` and
+    ``cell_envelope``) and asserts every committed word. So the generator stays
+    a hand-computed oracle on purpose — nothing here should grow a
+    ``validate_config`` call — while the production path is pinned to it.
     """
     from zagg.config import PipelineConfig
 

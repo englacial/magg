@@ -1984,6 +1984,189 @@ class TestTemporalCompanionSeams:
             write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(), chunk_idx=(0,))
 
 
+class TestTemporalCompanionProduction:
+    """The §8.2/§8.3 companions as the AGGREGATION produces them (issue #410).
+
+    The seam tests above pin the template and the writer over handed-in words;
+    these pin the words themselves — one conversion (``output.time_source`` ->
+    the derived ``toc_word`` column) feeding both companion shapes.
+    """
+
+    EPOCH = "2018-01-01T00:00:00"
+
+    @staticmethod
+    def _cfg(**overrides):
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={
+                "groups": ["g"],
+                "variables": {"h_li": "{group}/h_li", "delta_time": "{group}/delta_time"},
+            },
+            aggregation={
+                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+                "variables": {
+                    "h_tdigest": {
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [2],
+                        "location": "leaf_id",
+                        "temporal": "per-centroid",
+                        "dtype": "float32",
+                        "params": {"delta": 16},
+                    },
+                    "observed": {
+                        "function": "zagg.stats.toc.cell_envelope",
+                        "source": "toc_word",
+                        "dtype": "uint64",
+                        "fill_value": 0,
+                        "temporal": "per-cell",
+                    },
+                    **overrides,
+                },
+            },
+            output={
+                "time_source": {
+                    "field": "delta_time",
+                    "epoch": "2018-01-01T00:00:00",
+                    "scale": "gps",
+                    "units": "seconds",
+                }
+            },
+        )
+
+    def _cell(self, n=200):
+        from conftest import point_words
+
+        rng = np.random.default_rng(410)
+        h = rng.normal(30.0, 5.0, n)
+        return {
+            "h_li": h,
+            "delta_time": 3.0 * np.arange(n, dtype=np.float64),
+            "leaf_id": point_words(n, seed=7),
+        }
+
+    def test_the_config_validates(self):
+        from zagg.config import validate_config
+
+        cfg = self._cfg()
+        cfg.output["grid"] = {"type": "healpix", "parent_order": 6, "child_order": 12}
+        validate_config(cfg)
+
+    def test_both_shapes_come_out_of_one_conversion(self):
+        import mortie
+
+        from zagg.stats.toc import cell_envelope
+        from zagg.time_axis import observation_words
+
+        cell = self._cell()
+        stats = calculate_cell_statistics(cell, config=self._cfg())
+        digest, locs, times = stats["h_tdigest"]
+        expected_obs = observation_words(
+            cell["delta_time"], epoch=self.EPOCH, scale="gps", units="seconds"
+        )
+        # §8.4's licensed reduction: the per-cell word IS the envelope of the
+        # per-centroid words, and equally of the raw observations.
+        assert int(stats["observed"]) == int(cell_envelope(expected_obs))
+        assert int(cell_envelope(times)) == int(cell_envelope(expected_obs))
+        assert len(times) == len(digest) == len(locs)
+        assert times.dtype == np.uint64
+        assert mortie.toc_is_range(times).any(), "a compressed digest must produce ranges"
+
+    def test_per_centroid_words_contain_their_members(self):
+        # The words are value-ordered (§8.3), and the fixture's times rise with
+        # the observation index, so verify containment through the digest's own
+        # weights rather than assuming a run order: every stored word's envelope
+        # must lie inside the cell's whole envelope, and the join over them must
+        # equal it exactly.
+        import mortie
+
+        from zagg.stats.toc import cell_envelope
+        from zagg.time_axis import observation_words
+
+        cell = self._cell()
+        _, _, times = calculate_cell_statistics(cell, config=self._cfg())["h_tdigest"]
+        whole = np.array([int(cell_envelope(times))], dtype=np.uint64)
+        lo, hi = (int(b[0]) for b in mortie.toc2time(whole))
+        obs = mortie.toc2time(
+            observation_words(cell["delta_time"], epoch=self.EPOCH, scale="gps", units="seconds")
+        )[0]
+        assert lo <= int(obs.min()) and int(obs.max()) < hi
+        starts, ends = mortie.toc2time(times)
+        assert int(starts.min()) >= lo and int(ends.max()) <= hi
+
+    def test_empty_cell_keeps_the_channel_arity(self):
+        # A companion-carrying field's contract is ``(payload, *channels)`` even
+        # for an empty cell, so a direct caller always unpacks one shape.
+        stats = calculate_cell_statistics({"h_li": np.array([])}, config=self._cfg())
+        digest, locs, times = stats["h_tdigest"]
+        assert digest.shape == (0, 2)
+        assert locs.shape == times.shape == (0,)
+        assert locs.dtype == times.dtype == np.uint64
+
+    def test_temporal_only_field_needs_no_location(self):
+        cfg = self._cfg()
+        del cfg.aggregation["variables"]["h_tdigest"]["location"]
+        payload, times = calculate_cell_statistics(self._cell(), config=cfg)["h_tdigest"]
+        assert len(times) == len(payload) and times.dtype == np.uint64
+
+    def test_the_words_track_the_declared_clock_not_the_field_source(self):
+        # Shifting the declared epoch moves every word; touching the digest's
+        # own source column does not. One clock, declared in one place.
+        cell = self._cell(50)
+        base = calculate_cell_statistics(cell, config=self._cfg())["h_tdigest"][2]
+        cfg = self._cfg()
+        cfg.output["time_source"]["epoch"] = "2019-01-01T00:00:00"
+        moved = calculate_cell_statistics(cell, config=cfg)["h_tdigest"][2]
+        assert not np.array_equal(base, moved)
+
+    def test_missing_clock_column_names_itself(self):
+        cell = self._cell(10)
+        del cell["delta_time"]
+        with pytest.raises(ValueError, match="output.time_source.field 'delta_time' is not"):
+            calculate_cell_statistics(cell, config=self._cfg())
+
+    def test_undeclared_clock_refused_at_the_reducer_too(self):
+        # Config validation is the front door, but a config built without it
+        # must still fail loudly rather than write an empty companion.
+        cfg = self._cfg()
+        del cfg.output["time_source"]
+        with pytest.raises(ValueError, match="no per-observation clock"):
+            calculate_cell_statistics(self._cell(10), config=cfg)
+
+    def test_chunk_cells_collects_both_channels(self):
+        from zagg.processing.aggregate import _aggregate_chunk_cells, _group_columns
+        from zagg.processing.write import _channel_entry
+
+        cfg = self._cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        cell = self._cell(60)
+        cells = grid.cells_of(cell["leaf_id"])
+        children = np.unique(cells)
+        cols, cell_to_slice = _group_columns(dict(cell), cells)
+        _, payloads, idx, channels, _ = _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], get_agg_fields(cfg)
+        )
+        assert list(channels["h_tdigest"]) == ["locations", "times"]
+        for words in channels["h_tdigest"].values():
+            assert len(words) == len(payloads["h_tdigest"]) == len(idx)
+        # The sink entry the worker builds from it: (payloads, cells, locs, times).
+        entry = (payloads["h_tdigest"], idx, *_channel_entry(channels["h_tdigest"]))
+        assert len(entry) == 4
+
+    def test_channel_entry_arities(self):
+        from zagg.processing.write import _channel_entry, _ragged_entry
+
+        assert _channel_entry({}) == ()
+        assert len(_channel_entry({"locations": [1]})) == 1
+        # A temporal-only field gets an explicit None location slot, which
+        # ``_ragged_entry`` already reads as "no location channel".
+        slots = _channel_entry({"times": [1]})
+        assert slots == (None, [1])
+        assert _ragged_entry((["v"], [0], *slots)) == (["v"], [0], None, [1])
+
+
 class TestRaggedChunkCompanion:
     """Issue #82 phase 4c: a ``kind: ragged`` + ``resolution: chunk`` field stores
     ONE variable-length payload per chunk (collapsed from the populated cells under

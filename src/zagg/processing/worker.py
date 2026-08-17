@@ -45,7 +45,7 @@ from zagg.processing.aggregate import (
     _has_vector_fields,
     _pool_chunk_columns,
 )
-from zagg.processing.write import _build_output
+from zagg.processing.write import _build_output, _channel_entry
 from zagg.schema import ProcessingMetadata
 
 logger = logging.getLogger(__name__)
@@ -886,26 +886,37 @@ def process_shard(
             # driven through the pooled aggregation machinery (single-block) or
             # emitted from the cross-block merged state (multi-block); either
             # way the return is the full _aggregate_chunk_cells 5-tuple, so
-            # located ragged fields and chunk_precompute are served.
-            stats_arrays, ragged_payloads, ragged_idx, ragged_locs, cwd = buffered.chunk_outputs(
-                chunk_children, agg_fields
-            )
+            # companion-carrying ragged fields and chunk_precompute are served.
+            (
+                stats_arrays,
+                ragged_payloads,
+                ragged_idx,
+                ragged_channels,
+                cwd,
+            ) = buffered.chunk_outputs(chunk_children, agg_fields)
         elif buffered is not None:
             # Buffered path (issue #148 phase 4): emit this chunk's outputs from
             # the running merged state; chunk_precompute is rejected at validation
-            # so there are no chunk scalars to evaluate. Located ragged fields
-            # (issue #87) are likewise rejected by validate_streaming, so the
-            # location sink is empty here by construction.
+            # so there are no chunk scalars to evaluate. Companion-carrying
+            # ragged fields (issue #87's located channel, spec §8.3's temporal
+            # one) are likewise rejected by validate_streaming, so the channel
+            # sink is empty here by construction.
             stats_arrays, ragged_payloads, ragged_idx, cwd = buffered.chunk_outputs(
                 chunk_children, agg_fields
             )
-            ragged_locs = {}
+            ragged_channels = {}
         else:
             # Per-chunk precompute (issue #82 phase 6): pool only this chunk's rows
             # from the shard's sorted column arrays, then reduce the anchor over them.
             chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, chunk_children)
             chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
-            stats_arrays, ragged_payloads, ragged_idx, ragged_locs, cwd = _aggregate_chunk_cells(
+            (
+                stats_arrays,
+                ragged_payloads,
+                ragged_idx,
+                ragged_channels,
+                cwd,
+            ) = _aggregate_chunk_cells(
                 chunk_children,
                 col_arrays,
                 cell_to_slice,
@@ -938,14 +949,17 @@ def process_shard(
             children=(chunk_children if chunks_per_shard > 1 else None),
             aoi_mask=chunk_aoi_mask,
         )
-        # A located field (issue #87) carries its per-cell uint64 location vectors
-        # as a third element; unlocated fields keep the 2-tuple contract unchanged.
+        # A companion-carrying field appends one element per declared channel, in
+        # the ``write._ragged_entry`` order (``locations`` then ``times`` — issue
+        # #87 and spec §8.3): the located 3-tuple, the temporal-only 4-tuple with
+        # a ``None`` location slot, and the both-channels 4-tuple. A field with
+        # neither channel keeps the 2-tuple contract unchanged.
         ragged = (
             {
                 name: (
-                    (ragged_payloads[name], ragged_idx[name], ragged_locs[name])
-                    if name in ragged_locs
-                    else (ragged_payloads[name], ragged_idx[name])
+                    ragged_payloads[name],
+                    ragged_idx[name],
+                    *_channel_entry(ragged_channels.get(name, {})),
                 )
                 for name in ragged_payloads
             }

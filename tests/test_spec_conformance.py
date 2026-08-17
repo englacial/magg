@@ -1388,6 +1388,73 @@ class TestTemporalCompanions:
         far = int(from_datetime64(np.array(["2099-01-01"], dtype="datetime64[ns]"))[0])
         assert not np.asarray(toc_overlaps(words, far, far + 10**9), dtype=bool).any()
 
+    def test_the_production_kernel_reproduces_the_committed_words(self):
+        """§7 parity: the aggregation kernel emits the committed bytes.
+
+        The `temporal/` fixture was generated one PR ahead of the kernel, with
+        its words computed in the generator and handed to the production write
+        path. This drives the generator's OWN inputs through the production
+        reducer instead (``build_tdigest(..., temporal=)`` and
+        ``zagg.stats.toc.cell_envelope``) and asserts the result equals the
+        committed expectations word for word — so a kernel change that moved a
+        single word fails here rather than silently diverging from the spec
+        bytes external readers decode against (issue #410, CLAUDE.md §4).
+
+        The generator is imported rather than re-implemented: its clock, its
+        RNG, and its cell plan are the inputs, so nothing here can drift from
+        the fixture it checks.
+        """
+        import importlib.util
+
+        from zagg.grids import HealpixGrid
+        from zagg.grids.morton import morton_word
+        from zagg.stats.tdigest import build_tdigest
+        from zagg.stats.toc import cell_envelope
+        from zagg.time_axis import observation_words
+
+        root = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "_spec_fixture_gen", root / "tools" / "generate_spec_fixtures.py"
+        )
+        gen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gen)
+
+        exp = _expected("temporal")
+        cfg = gen._temporal_config()
+        grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+        children = grid.children(morton_word(gen.SHARD_KEY))
+        rng = np.random.default_rng(410)
+        # The fixture's clock is ns since the Unix epoch; express it as offsets
+        # from a declared epoch so the words come from the PRODUCTION encoder.
+        epoch = "2018-01-01T00:00:00"
+        epoch_ns = np.datetime64(epoch, "ns").astype("int64")
+
+        plan = [(0, 0, 40), (0, 2, 1), (1, 1, 5), (3, 3, 300)]
+        assert len(plan) == len(exp["cells"])
+        for ordinal, ((chunk, local, n), expected) in enumerate(zip(plan, exp["cells"])):
+            cell_index = chunk * grid.cells_per_chunk + local
+            assert cell_index == expected["index"]
+            cell_word = int(children[cell_index])
+            h = np.round(rng.normal(30.0, 5.0, n), 3).astype(np.float64)
+            words = np.asarray(gen._point_words(grid, cell_word, n, rng))
+            order = np.argsort(h, kind="stable")
+            h, words = h[order], words[order]
+            times_ns = gen._obs_times_ns(n, ordinal)
+            toc = observation_words(
+                (times_ns - epoch_ns) / 1e9, epoch=epoch, scale="gps", units="seconds"
+            )
+            digest, locs, per_centroid = build_tdigest(h, gen.DELTA, locations=words, temporal=toc)
+            np.testing.assert_array_equal(
+                locs, np.array(expected["h_tdigest_locations"], dtype=np.uint64)
+            )
+            np.testing.assert_array_equal(
+                per_centroid, np.array(expected["h_tdigest_times"], dtype=np.uint64)
+            )
+            assert int(cell_envelope(toc)) == int(expected["observed"])
+            np.testing.assert_allclose(
+                digest, np.array(expected["h_tdigest"], dtype=np.float32), rtol=0, atol=0
+            )
+
     def test_absent_declaration_on_every_pre_companion_fixture(self):
         from zagg.time_axis import temporal_declaration
 

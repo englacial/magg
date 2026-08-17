@@ -499,9 +499,11 @@ class SpillAggregator:
       silently approximating.
 
     ``chunk_outputs`` returns the 5-tuple ``_aggregate_chunk_cells`` contract
-    (``stats_arrays, ragged_payloads, ragged_cell_indices, ragged_locations,
+    (``stats_arrays, ragged_payloads, ragged_cell_indices, ragged_channels,
     cells_with_data``) — one element more than StreamingAggregator, since
-    spill serves located fields.
+    spill serves located fields. The §8.3 temporal channel is NOT among them:
+    ``validate_spill_fold`` refuses a ``temporal:`` field, so the channel
+    mapping this path emits carries ``locations`` only (issue #410).
     """
 
     def __init__(
@@ -1088,7 +1090,11 @@ class SpillAggregator:
         ragged_cell_indices: dict[str, list[int]] = {n: [] for n in self._digest_fields}
         # Located fields only (issue #87): keyed presence tells the worker to
         # deliver the 3-tuple ragged contract, mirroring _aggregate_chunk_cells.
-        ragged_locs: dict[str, list] = {n: [] for n, f in self._digest_fields.items() if f.location}
+        # ``temporal:`` never reaches here (refused by validate_spill_fold), so
+        # ``locations`` is the only channel this mapping ever carries.
+        ragged_channels: dict[str, dict[str, list]] = {
+            n: {"locations": []} for n, f in self._digest_fields.items() if f.location
+        }
         cells_with_data = 0
         for i, child in enumerate(children):
             cell = int(child)
@@ -1109,9 +1115,9 @@ class SpillAggregator:
                 if digest is not None and digest.size > 0:
                     ragged_payloads[name].append(digest)
                     ragged_cell_indices[name].append(i)
-                    if name in ragged_locs:
-                        ragged_locs[name].append(self._digest_locs[name][cell])
-        return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_locs, cells_with_data
+                    if name in ragged_channels:
+                        ragged_channels[name]["locations"].append(self._digest_locs[name][cell])
+        return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_channels, cells_with_data
 
     def close(self) -> None:
         """Release every spill fd and the cached partition (idempotent).

@@ -123,7 +123,18 @@ def validate_streaming(config: PipelineConfig) -> None:
         problems.append("chunk_precompute is chunk-scoped and cannot stream")
     for name, meta in get_agg_fields(config).items():
         sig = get_output_signature(meta)
-        if "expression" in meta:
+        if sig["temporal"] is not None:
+            # Merge mode carries no companion channel at all (the located one is
+            # refused below for the same shape of reason), so a temporal field
+            # would stamp a §8 declaration over an empty sibling. Route to the
+            # pooled path (issue #410).
+            problems.append(
+                f"field '{name}': temporal companions (temporal: {sig['temporal']!r}) cannot "
+                f"stream under mode: merge — the running merged state carries no companion "
+                f"channel, so the §8.3 sibling would be stamped and left empty; run the "
+                f"pooled path (no aggregation.streaming block)"
+            )
+        elif "expression" in meta:
             problems.append(f"field '{name}': expression fields cannot stream")
         elif sig["resolution"] != "cell":
             problems.append(f"field '{name}': resolution '{sig['resolution']}' cannot stream")
@@ -223,7 +234,20 @@ def validate_spill_fold(config: PipelineConfig) -> None:
         problems.append("chunk_precompute is chunk-scoped and has no cross-block fold")
     for name, meta in get_agg_fields(config).items():
         sig = get_output_signature(meta)
-        if "expression" in meta:
+        if sig["temporal"] is not None:
+            # The words THEMSELVES fold exactly (the §8.2 join is associative,
+            # commutative and idempotent), but the block close's per-field channel
+            # state is located-only today, so a temporal field would emit a
+            # companion missing every block past the first — a §8.3 row-alignment
+            # break, not an approximation. Refuse until the channel is threaded
+            # through the close (issue #410).
+            problems.append(
+                f"field '{name}': temporal companions (temporal: {sig['temporal']!r}) have "
+                f"no cross-block fold state yet — the spill block close carries the located "
+                f"channel only; run the pooled path (no aggregation.streaming block) for a "
+                f"temporal store (spec §8.2/§8.3, issue #410)"
+            )
+        elif "expression" in meta:
             problems.append(f"field '{name}': expression fields have no cross-block fold")
         elif sig["resolution"] != "cell":
             problems.append(

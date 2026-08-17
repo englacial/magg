@@ -290,6 +290,28 @@ class TestSpillFoldProbe:
         with pytest.raises(ValueError, match="chunk_precompute.*no cross-block fold"):
             validate_spill_fold(cfg)
 
+    def test_temporal_companion_has_no_cross_block_fold_yet(self):
+        # The toc join itself is exact and fold-tree independent (spec §8.2), but
+        # the block close's per-field channel state is located-only, so a
+        # temporal field would emit a companion missing every block past the
+        # first — a §8.3 row-alignment break. Named, not silently approximated.
+        variables = _variables(located=True)
+        variables["h_tdigest"]["temporal"] = "per-centroid"
+        with pytest.raises(ValueError, match="temporal companions.*no cross-block fold state"):
+            validate_spill_fold(_config(variables, streaming=_SPILL))
+
+    def test_temporal_refusal_names_the_pooled_path(self):
+        variables = _variables()
+        variables["h_tdigest"]["temporal"] = "per-centroid"
+        with pytest.raises(ValueError, match="run the pooled path"):
+            validate_spill_fold(_config(variables, streaming=_SPILL))
+
+    def test_temporal_cannot_stream_under_merge_mode_either(self):
+        variables = _variables()
+        variables["h_tdigest"]["temporal"] = "per-centroid"
+        with pytest.raises(ValueError, match="temporal companions.*cannot stream"):
+            validate_streaming(_config(variables))
+
     def test_mis_declared_inner_shape_still_has_no_fold(self):
         # The fold stores merged (k, 2) digests directly, so a mis-declared
         # inner_shape must fail here rather than disagree with the store schema
