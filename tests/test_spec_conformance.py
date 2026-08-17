@@ -73,6 +73,10 @@ FROZEN_COMBINED = {
     # The §2.0 flux fixture (issue #424) — asserted by TestFluxDeclaration
     # (flux is not in FIXTURES: the leaf-shaped suite hardcodes h_tdigest).
     "flux": "910a9b12d34b4d072f454b2dd1cc232a6a9a92b536a8d26f5395154a1c02bc32",
+    # The §8 temporal fixture (issue #443) — asserted by
+    # TestTemporalDeclaration (raster_toc is not in FIXTURES: it carries no
+    # ragged array at all, so nothing the leaf-shaped suite asserts applies).
+    "raster_toc": "42263e046ecf4d71de8460063b38e6f15522e245cdc2182ce3a0acaf35db7e4e",
 }
 #: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
 #: its leaf, which is ``minimal``'s): the only committed store whose §5 key
@@ -92,6 +96,11 @@ FROZEN_ARRAYS = {
         "6/composition",
     ): "04886a9dfb60c8a53de48202dc3d5ac694698864825426f084be961aa678acd5",
     ("flux", "6/rx_flux"): "3ba141cb29b1771dee4c4c3f2aadec42b7de69e075d4334d6d7187301dc59eb8",
+    # The §8 uint64 toc-word time coordinate (issue #443).
+    (
+        "raster_toc",
+        "6/time",
+    ): "551f7be5718086c2ca1d379e1d1581368d21e4ca1433ce3ae4ae397e11b08f7f",
 }
 
 
@@ -1020,3 +1029,133 @@ class TestFixtureSemanticHash:
             cfg.output["grid"] = dict(gen.PYRAMID_GRID)
         assert semantic_hash(cfg_v1) == semantic_hash(cfg_v2)
         assert self._recorded(PYRAMID) == semantic_hash(cfg_v1)
+
+
+class TestTemporalDeclaration:
+    """§8 — the temporal declaration, pinned on the committed `raster_toc/`.
+
+    The absent-declaration ⇒ legacy side needs no new fixture: the four
+    digest fixtures carry no ``temporal`` key anywhere, which is the pin.
+    """
+
+    def _time_meta(self):
+        exp = _expected("raster_toc")
+        meta = json.loads(
+            (_leaf_dir("raster_toc", exp) / exp["group"] / "time" / "zarr.json").read_text()
+        )
+        return exp, meta
+
+    def test_declaration_grammar_and_dtype(self):
+        exp, meta = self._time_meta()
+        attrs = meta["attributes"]
+        assert attrs == exp["time_attrs"]
+        # §8: exactly the #410-ruled {spec, shape, grammar revision} -- the
+        # committed bytes carry NO per-store epoch, timescale, or quantum
+        # keys, and the grammar is a {name}/{major} revision token, never a
+        # documentation URL or a release stamp.
+        assert attrs["temporal"] == {
+            "spec": "zagg-toc/1",
+            "shape": "coordinate",
+            "grammar": "mortie-toc/1",
+        }
+        # §8.1: uint64 words, one per timestep, no CF pair to mislead a
+        # units/calendar-decoding client.
+        assert meta["data_type"] == "uint64"
+        assert set(attrs) == {"temporal"}
+        assert meta["shape"] == [len(exp["time_words"])]
+
+    def test_stored_words_match_the_golden(self):
+        exp = _expected("raster_toc")
+        store = _leaf_store("raster_toc", exp)
+        words = zarr.open_array(
+            store, path=f"{exp['group']}/time", zarr_format=3, consolidated=False
+        )[:]
+        assert words.dtype == np.uint64
+        np.testing.assert_array_equal(words, np.array(exp["time_words"], dtype=np.uint64))
+        # These particular words ascend, but that is INCIDENTAL to this
+        # fixture: its three groups are days apart, so no envelope start can
+        # lead the row before it. §8.1 does NOT promise ascending stored
+        # words -- the span-lead counterexample is pinned by
+        # test_raster_pipeline.py::TestTocTimeIndex::
+        # test_a_leading_span_puts_the_stored_words_out_of_row_order.
+        np.testing.assert_array_equal(np.sort(words), words)
+
+    def test_decode_matches_the_golden_bounds(self):
+        from zagg.readers import read_time_axis
+
+        exp = _expected("raster_toc")
+        lo, hi = read_time_axis(_leaf_store("raster_toc", exp), exp["group"])
+        want = np.array(exp["time_bounds_ns"], dtype="int64")
+        np.testing.assert_array_equal(lo.astype("int64"), want[:, 0])
+        np.testing.assert_array_equal(hi.astype("int64"), want[:, 1])
+
+    def test_bounds_conservatively_contain_the_real_acquisitions(self):
+        # The §8.1 honesty claim, on committed bytes: a range never narrows
+        # its acquisition, and a single-instant acquisition never widens.
+        exp = _expected("raster_toc")
+        bounds = np.array(exp["time_bounds_ns"], dtype="int64")
+        for (start_ns, end_ns), acq in zip(bounds, exp["acquisitions"], strict=True):
+            real_lo = np.datetime64(acq["start"], "ns").astype("int64")
+            real_hi = np.datetime64(acq["end"], "ns").astype("int64")
+            assert start_ns <= real_lo
+            if real_lo == real_hi:
+                assert start_ns == end_ns == real_lo  # exact timestamp word
+            else:
+                assert end_ns > real_hi  # exclusive envelope end
+
+    def test_both_word_variants_are_committed(self):
+        from mortie import toc_is_range
+
+        exp = _expected("raster_toc")
+        words = np.array(exp["time_words"], dtype=np.uint64)
+        kinds = np.asarray(toc_is_range(words), dtype=bool)
+        assert kinds.any() and not kinds.all()
+
+    def test_window_predicate_runs_on_the_stored_words(self):
+        from zagg.readers import time_axis_overlaps
+
+        exp = _expected("raster_toc")
+        store = _leaf_store("raster_toc", exp)
+        arr = zarr.open_array(store, path=f"{exp['group']}/time", zarr_format=3, consolidated=False)
+        mask = time_axis_overlaps(
+            arr[:], dict(arr.attrs), "2025-06-18T00:00:00", "2025-06-19T00:00:00"
+        )
+        np.testing.assert_array_equal(mask, [False, True, False])
+
+    def test_bands_and_morton_decode(self):
+        exp = _expected("raster_toc")
+        store = _leaf_store("raster_toc", exp)
+        for name, want in exp["bands"].items():
+            got = zarr.open_array(
+                store, path=f"{exp['group']}/{name}", zarr_format=3, consolidated=False
+            )[:]
+            assert got.shape == (len(exp["time_words"]), exp["cells_per_shard"])
+            np.testing.assert_array_equal(got, np.array(want, dtype=got.dtype))
+        morton = zarr.open_array(
+            store, path=f"{exp['group']}/morton", zarr_format=3, consolidated=False
+        )[:]
+        np.testing.assert_array_equal(morton, np.array(exp["morton"], dtype=np.uint64))
+
+    def test_absent_declaration_on_every_pre_section_8_fixture(self):
+        from zagg.time_axis import temporal_declaration
+
+        for name in (*FIXTURES, "flux"):
+            exp = _expected(name)
+            attrs = _array_meta(name, exp, "morton")["attributes"]
+            assert temporal_declaration(attrs) is None
+
+    def test_leaf_is_stamped_and_manifest_marked(self):
+        exp = _expected("raster_toc")
+        attrs = json.loads((_leaf_dir("raster_toc", exp) / "zarr.json").read_text())["attributes"]
+        assert attrs["morton_hive_commit"]["complete"] is True
+        manifest = json.loads((SPEC_DATA / "raster_toc" / "morton_hive.json").read_text())
+        assert manifest["spec"] == "morton-hive/1"
+
+    def test_frozen_digests_pin_the_recipe(self):
+        exp = _expected("raster_toc")
+        got = TestContentHashes._hash_leaf(_leaf_dir("raster_toc", exp))
+        assert got == exp["content_hashes"]["arrays"]
+        assert exp["content_hashes"]["combined"] == FROZEN_COMBINED["raster_toc"]
+        assert got["6/time"] == FROZEN_ARRAYS[("raster_toc", "6/time")]
+        combined = hashlib.sha256("\n".join(sorted(got.values())).encode()).hexdigest()
+        assert combined == exp["content_hashes"]["combined"]

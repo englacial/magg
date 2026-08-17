@@ -453,3 +453,32 @@ class TestWeightsAndOverviewDeltaHashing:
         assert semantic_hash(_digest_cfg(overview_delta=512)) == semantic_hash(_digest_cfg())
         core = semantic_core(_digest_cfg(overview_delta=512))
         assert "overview_delta" not in core["aggregation"]["variables"]["d"]
+
+
+class TestTimeEncodingHashing:
+    """Issue #443: the §8 time-coordinate encoding is output-defining."""
+
+    def _raster_cfg(self, encoding=None) -> PipelineConfig:
+        output = {"grid": {"type": "healpix", "parent_order": 10, "child_order": 16}}
+        if encoding:
+            output["time_encoding"] = encoding
+        return PipelineConfig(
+            data_source={"reader": "raster", "bands": {"red": {"asset": "red", "dtype": "uint16"}}},
+            output=output,
+        )
+
+    def test_default_encoding_hashes_as_absent(self):
+        # The §8 absent-key default: an explicit `microseconds` is the same
+        # stored axis, so it must be the same product identity — which is
+        # also what keeps every pre-#443 config's hash byte-identical.
+        assert semantic_hash(self._raster_cfg("microseconds")) == semantic_hash(self._raster_cfg())
+        assert "time_encoding" not in semantic_core(self._raster_cfg("microseconds"))
+
+    def test_toc_is_semantic(self):
+        toc = self._raster_cfg("toc")
+        assert semantic_hash(toc) != semantic_hash(self._raster_cfg())
+        assert semantic_core(toc)["time_encoding"] == "toc"
+
+    def test_packaged_s2_config_declares_toc(self):
+        cfg = default_config("sentinel2_l2a")
+        assert semantic_core(cfg)["time_encoding"] == "toc"

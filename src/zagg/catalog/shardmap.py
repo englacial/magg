@@ -424,12 +424,17 @@ def _regroup_hits(hit_shards, hit_owners) -> Dict[int, List[int]]:
     return out
 
 
-def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[int, List[int]]:
-    """Shard assignment from the catalog's stored MOCs -- no geometry (issue #396).
+def _intersect_footprint_cells(
+    rows, values, offsets, grid, all_shards, *, stored: bool = True
+) -> Dict[int, List[int]]:
+    """Shard assignment from row-aligned footprint MOCs -- no geometry (issue #396).
 
-    The phase-3 fast path. Where ``_intersect_mortie`` covers every footprint
-    from its vertices on every build, this reads the cover the catalog already
-    carries (``Catalog.index_footprints``) and does set algebra only: the AOI's
+    The phase-3 fast path, and since issue #445 the *only* mortie ``swath``
+    intersection: the cover it consumes is either the one the catalog carries
+    (``Catalog.index_footprints``) or the one this build just made
+    (``_live_cells_plan``), which is the whole remaining difference between an
+    indexed build and an unindexed one. Where ``_intersect_mortie`` covers every
+    footprint from its vertices, this does set algebra only: the AOI's
     shard keys are themselves a MOC at ``parent_order``, so a granule's shards
     are ``moc_to_order(moc_and(granule_moc, aoi_moc), parent_order)`` -- no
     ``searchsorted`` filter either, since intersecting with the AOI first is
@@ -438,7 +443,15 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     ``rows`` maps record index -> catalog table row (``rows[i]`` is the row
     record ``i`` came from); it is not the identity, because
     ``granule_records`` drops rows whose geometry is empty or not polygonal
-    while the column has one entry per row.
+    while the cover has one entry per row.
+
+    ``stored`` says which of those two covers arrived, and is used for one
+    thing: the cell-budget refusal's remediation clause. Re-indexing or dropping
+    the ``footprint_cells`` column is only actionable when there *is* one
+    (``plan is not None`` in :meth:`ShardMap.build`); an ephemeral cover has
+    neither, so it gets the remedies that do apply to it. Nothing else branches
+    on it -- the assignment is identical either way, which is the point of the
+    shared intersection.
 
     mortie 0.9.6's batch twins (espg/mortie#173) remove the per-granule Python
     loop: one ``mocs_and(aoi_moc, ...)`` per block of records (empty results
@@ -482,8 +495,14 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     # of quietly losing one granule. This is a real divergence from the
     # geometry path, which still swallows the same refusal per ring
     # (``_intersect_mortie``, below): the same catalog + grid can now raise
-    # where it built, depending on whether the column is present. Deliberate,
-    # and narrow -- refusal is not unreachable, but it is remote. ``aoi_moc``
+    # where it built. Since issue #445 the presence of the column is no longer
+    # what decides which side you are on -- every mortie HEALPix ``swath`` build
+    # reaches this raise, stored column or ephemeral cover alike, and only
+    # ``footprint="beams"``, spherely, rectilinear and paired builds still
+    # swallow it on the geometry path. (That is why the raise below takes
+    # ``stored``: the remedy differs even though the refusal does not.)
+    # Deliberate, and narrow -- refusal is not unreachable, but it is remote.
+    # ``aoi_moc``
     # is compressed, so the intersection can keep cells *coarser* than
     # ``parent_order`` and ``mocs_to_orders`` can genuinely expand; the bound
     # is the AOI-clipped footprint densified at ``parent_order``, so tripping
@@ -542,13 +561,31 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
             # un-rebased "MOC 400" out of a 512-record block is a plausible
             # record index, so it would send the operator to the wrong granule
             # rather than obviously failing. Re-raise, never swallow.
+            # The remedy depends on where the cover came from (issue #445).
+            # Telling the operator of an *unindexed* build to re-index or drop a
+            # column names two things that do not exist, and re-indexing would
+            # not move this anyway: the flattening target is ``parent_order``
+            # whatever ``mortie_order`` was. So name what is actually actionable
+            # on each path.
+            remedy = (
+                "Re-index the catalog at a coarser order, or drop the "
+                "footprint_cells column to build from geometry."
+                if stored
+                else (
+                    f"This build covered the catalog itself -- there is no "
+                    f"footprint_cells column to re-cut or drop, and the cover is "
+                    f"flattened to the grid's parent_order {parent_order} whatever "
+                    f"order it ran at. The bound is one granule's AOI-clipped "
+                    f"footprint densified at parent_order {parent_order}: build "
+                    f"against a grid with a coarser parent_order, or narrow or "
+                    f"split the region so that footprint clips smaller."
+                )
+            )
             raise ValueError(
-                f"footprint_cells batch failed within records "
-                f"{own[0]}-{own[-1]} (the MOC index in the message counts this "
-                f"block's {own.size} prefilter survivors inside that range, "
-                f"which are generally not contiguous records): {exc}. "
-                f"Re-index the catalog at a coarser order, or drop the "
-                f"footprint_cells column to build from geometry."
+                f"{'footprint_cells' if stored else 'footprint cover'} batch failed "
+                f"within records {own[0]}-{own[-1]} (the MOC index in the message "
+                f"counts this block's {own.size} prefilter survivors inside that "
+                f"range, which are generally not contiguous records): {exc}. {remedy}"
             ) from exc
         # Every slot in this block is non-empty by the predicate's contract,
         # so ``flat`` is never empty here and each owner repeats >= 1 time.
@@ -588,7 +625,10 @@ def _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order):
     - ``footprint="swath"`` -- the column covers the CMR footprint, not the
       per-beam corridors ``footprint="beams"`` decomposes it into (issue #65);
     - ``mortie_order`` was not pinned by the caller -- an explicit order asks for
-      a cover at *that* order, which the column cannot restate;
+      a cover at *that* order, which the column cannot restate. Since issue #445
+      declining here does **not** mean falling back to geometry: an indexed
+      catalog with a pinned order lands on :func:`_live_cells_plan`'s ephemeral
+      cover and inherits its deltas (see :meth:`ShardMap.build`'s Notes);
     - the grid is HEALPix and the catalog carries the column.
 
     Takes no records and materializes none (issue #439): the plan is what lets
@@ -668,6 +708,88 @@ def _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order):
     return values, offsets, order, rows, int(rows.size)
 
 
+def _live_cells_plan(catalog, grid, chosen, footprint, mortie_order):
+    """The same inputs as :func:`_footprint_cells_plan`, covered now (issue #445).
+
+    An *unindexed* catalog is one whose cover was never persisted -- not one that
+    needs a different intersection. So the live mortie build becomes
+    build-an-ephemeral-index-and-query-it: cover the WKB column with
+    :meth:`~zagg.catalog.Catalog.cover_footprints` (no records, no column), then
+    hand :func:`_intersect_footprint_cells` exactly what the stored path hands
+    it. Records follow for the hit rows only, via the shared :func:`_hit_records`.
+    On the 555,867-granule ATL03 clone against California that is 86.9 s -> ~33 s,
+    and the record decode that dominated it stops running over rows the AOI
+    discards (99.6% of them).
+
+    **The cover runs at the grid's ``parent_order``**, not at
+    :func:`_resolve_mortie_order`'s chunk-order default. A shard map records one
+    thing -- which ``parent_order`` cells a footprint touches -- and that is
+    exactly what an order-``parent_order`` cover answers; the real-catalog order
+    sweep quoted in :func:`_resolve_mortie_order` (``bench/neon_order_sweep.py``)
+    measures granules/shard flat for every order >= ``parent_order``, so a finer
+    MOC buys precision the shard cells cannot see while coverage words per
+    granule roughly double per order (``index_footprints`` prices the clone at
+    ~270-420 MB at order 9 against ~9-13 GB at order 13 -- the whole-catalog o13
+    cover this path would otherwise need is not materializable). espg's ruling,
+    2026-08-16.
+
+    That default is **flat by measurement and superset-safe by construction**,
+    not an identity. mortie's coverage is conservative per order, so
+    ``cover(parent_order)`` is a superset of
+    ``moc_to_order(cover(chunk_order), parent_order)``: refining a fine cover
+    down does not reproduce a coarse one, and a boundary cell the fine cover
+    misses can survive at the coarse one. The direction never inverts -- a true
+    granule/shard pair is never dropped, only extra ones admitted -- and at the
+    orders production runs there is no difference at all: a 200-polygon
+    randomized sweep measured 0/200 rows differing at parent/chunk 9/13, 11/13,
+    8/12 and 9/11, against 1-2 rows and up to 0.71% extra cells at the coarse
+    pairs 6/10, 5/9 and 3/7. So the clone-scale digest match at
+    ``parent_order=9`` is real, and a coarse-grid build inherits the same
+    conservative posture the stored index already ships (the MultiPolygon
+    superset below, the AOI overhang of #101). Pinned by
+    ``TestLiveCover::test_coarse_shard_order_covers_a_superset``.
+
+    An explicit ``mortie_order`` is still **honored literally**: it is a request
+    for a cover at that order, so the cover runs there whatever it costs, and is
+    validated against ``parent_order`` exactly as the geometry path validates it.
+    (The stored plan cannot honor a pin at all -- a persisted column cannot
+    restate its order -- which is why it declines instead.) Note what that
+    means for an *indexed* catalog: a pinned build there declines the stored
+    plan and lands **here**, not on the geometry path it took pre-#445, so it
+    covers from WKB and inherits this path's deltas. Pinned by
+    ``TestLiveCover::test_a_pinned_indexed_build_covers_live_too``, and raised
+    for espg's ruling on PR #447 (the alternative is gating indexed catalogs out
+    of this plan to keep the records-path assignment for pinned builds).
+
+    Engages on the same shape :func:`_footprint_cells_plan` does, minus the
+    column: the backend resolves to ``mortie`` (a spherely build stays exact-S2),
+    ``footprint="swath"`` (the cover is the CMR footprint, not the per-beam
+    corridors of #65 -- those keep :func:`_intersect_mortie`), and the grid is
+    HEALPix. Paired builds (issue #425) never reach here -- ``build`` gates them
+    out, as it does for the stored plan.
+
+    Returns
+    -------
+    tuple or None
+        ``(values, offsets, order, rows, considered)`` -- the same contract
+        :func:`_footprint_cells_plan` returns, so both feed the same
+        intersection: ``offsets`` are table-row-aligned, ``rows`` maps record
+        index -> table row, and ``considered`` is the screen popcount, the
+        ``total_granules`` the eager path reported as ``len(records)``.
+    """
+    if chosen != "mortie" or footprint != "swath":
+        return None
+    parent_order = getattr(grid, "parent_order", None)
+    cover = getattr(catalog, "cover_footprints", None)
+    if parent_order is None or not callable(cover):
+        return None
+    # An explicit pin is resolved (and validated -- coarser than the shards still
+    # raises) before the cover, so a refusal costs nothing, as on the stored path.
+    order = parent_order if mortie_order is None else _resolve_mortie_order(mortie_order, grid)
+    values, offsets, rows = cover(order)
+    return values, offsets, order, rows, int(rows.size)
+
+
 def _hit_records(catalog, rows, shard_to_idx):
     """Decode granule records for the assigned rows only (issue #439).
 
@@ -735,6 +857,17 @@ def _resolve_mortie_order(mortie_order, grid) -> int:
     explicit ``mortie_order`` is honored but still validated against
     ``parent_order``. Non-HEALPix grids (no ``parent_order`` / ``child_order``)
     keep the legacy default of 8.
+
+    This resolves the order for the paths that cover from decoded rings --
+    ``footprint="beams"``, non-HEALPix grids, :meth:`ShardMap.reproject`. The
+    HEALPix ``swath`` path covers from WKB instead and defaults to
+    ``parent_order`` on the same sweep evidence quoted above, calling this only
+    to honor (and validate) an explicit pin -- see :func:`_live_cells_plan`.
+    The sweep makes those two defaults *measurably* equal at production orders,
+    not equal by construction: a cover at ``parent_order`` is a superset of the
+    same footprint covered here and refined down, never a subset, and the gap is
+    reachable at coarse shard orders. :func:`_live_cells_plan` carries the
+    numbers.
     """
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
     if mortie_order is not None:
@@ -1175,6 +1308,53 @@ class ShardMap:
         ``total_granules`` still counts the records *considered* (the whole
         post-screen catalog), which :meth:`~zagg.catalog.Catalog.granule_row_mask`
         supplies without decoding any.
+
+        **An unindexed mortie build covers first too** (issue #445). "Indexed"
+        now means only that the cover was persisted: a mortie ``swath`` build on
+        a HEALPix grid with no usable column covers the WKB column itself
+        (:meth:`~zagg.catalog.Catalog.cover_footprints`) and runs the *same*
+        intersection, instead of decoding every record to cover from its rings.
+        On the clone/California case that is 86.9 s -> ~33 s. Records still
+        follow the intersection, and ``total_granules`` is still the screen
+        popcount. The cover runs at the grid's ``parent_order`` -- the order the
+        map's shard membership is stated in, and the order beyond which the
+        real-catalog sweep in :func:`_resolve_mortie_order` measures granules per
+        shard flat -- so an unpinned unindexed build records
+        ``mortie_order = parent_order`` where it used to record the chunk order.
+        Same assignment at the orders production runs (byte-identical over the
+        555,867-granule clone, and 0/200 rows differing in a randomized sweep at
+        parent/chunk 9/13, 11/13, 8/12 and 9/11), and **superset-safe** in
+        general: mortie's coverage is conservative per order, so the coarser
+        cover can admit a boundary shard that the finer cover refined down
+        misses -- up to 0.71% extra cells at 3/7 -- and never drops one. See
+        :func:`_live_cells_plan`. A caller-pinned ``mortie_order`` is still
+        honored literally. Unchanged paths: ``footprint="beams"`` (the cover is
+        the swath, not the corridors), the spherely backend, rectilinear grids,
+        and paired builds (issue #425).
+
+        Two deltas ride on it, both inherited from the cover this path now shares
+        with the index. **MultiPolygon** footprints get the same superset as
+        above -- the cover takes every part where
+        :meth:`~zagg.catalog.Catalog.granule_records` reads only the largest
+        part's exterior ring -- so a multi-part granule may assign to more shards
+        than it did pre-#445; every CMR ATL03/06 granule is single-part, so no
+        production build moves. And a **null** geometry is refused by name
+        (:meth:`~zagg.catalog.Catalog.granule_row_mask`) where the record loop
+        raised ``AttributeError`` on the same row: both refuse, one legibly.
+        Memory is the index's documented posture, screen peak included (~1 GB
+        over the parquet read at clone scale, issue #429).
+
+        **A pinned ``mortie_order`` covers live whether or not the catalog is
+        indexed.** A persisted column cannot restate an arbitrary order, so the
+        stored plan declines a pin (:func:`_footprint_cells_plan`) -- and since
+        issue #445 what catches it is the ephemeral cover, not the geometry
+        path. So an *indexed* catalog built with an explicit ``mortie_order``
+        is a third population whose assignment can move: it inherits the same
+        two deltas above (measured on a two-part MultiPolygon: 8 shards on the
+        records path, 13 on the cover). The pin is honored either way, and
+        ``metadata["footprint_cells"]`` still records ``False`` there -- it
+        means "the stored column did not answer this build", which stays the
+        thing the operator can act on. Flagged for review on PR #447.
         """
         if footprint not in ("swath", "beams"):
             raise ValueError(f"footprint must be 'swath' or 'beams' (got {footprint!r})")
@@ -1249,7 +1429,10 @@ class ShardMap:
         # the intersection would make this branch's number incomparable with the
         # ``build_wall_s`` already recorded in existing manifests. Two segments
         # rather than one span because the geometry path's ``granule_records``
-        # sits between them and has always been outside (issue #439).
+        # sits between them and has always been outside (issue #439). The
+        # ephemeral cover (issue #445) sits in the first segment for the same
+        # reason the geometry path's cover sits in the second: covering is
+        # intersection work, and ``build_wall_s`` has always counted it.
         t0 = time.perf_counter()
         # A paired build never plans: pairing filtered the records, and the
         # plan's positional table alignment cannot represent that (issue #425).
@@ -1258,6 +1441,16 @@ class ShardMap:
             if paired_records is not None
             else _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order)
         )
+        # No stored column: cover one now and query it, rather than decoding
+        # every record to cover from its rings (issue #445). Same intersection,
+        # same records step -- the only difference from ``plan`` is that nothing
+        # was persisted, which is why the metadata below keys off ``plan`` alone.
+        live = (
+            _live_cells_plan(catalog, grid, chosen, footprint, mortie_order)
+            if plan is None and paired_records is None
+            else None
+        )
+        cells = plan if plan is not None else live
         plan_wall = time.perf_counter() - t0
         # Records are the fast path's whole remaining cost -- shapely-parsing
         # every row's WKB and ``to_pylist``-ing the nested assets column ran ~25 s
@@ -1266,16 +1459,21 @@ class ShardMap:
         # there, for its hit rows only; every other path needs them all up front.
         if paired_records is not None:
             records = paired_records
-        elif plan is not None:
+        elif cells is not None:
             records = None
         else:
             records = catalog.granule_records()
-        considered = plan[4] if plan is not None else len(records)
+        considered = cells[4] if cells is not None else len(records)
 
         t0 = time.perf_counter()
-        if plan is not None:
-            values, offsets, mortie_order, rows, _ = plan
-            shard_to_idx = _intersect_footprint_cells(rows, values, offsets, grid, all_shards)
+        if cells is not None:
+            values, offsets, mortie_order, rows, _ = cells
+            # ``stored`` only steers the cell-budget refusal's remedy: the
+            # stored column can be re-cut or dropped, an ephemeral cover cannot
+            # (issue #445).
+            shard_to_idx = _intersect_footprint_cells(
+                rows, values, offsets, grid, all_shards, stored=plan is not None
+            )
         elif chosen == "mortie":
             mortie_order = _resolve_mortie_order(mortie_order, grid)
             shard_to_idx = _intersect_mortie(
@@ -1295,9 +1493,10 @@ class ShardMap:
                 product=product,
             )
         wall = plan_wall + (time.perf_counter() - t0)
-        if plan is not None:
-            # Outside the timer on purpose: ``build_wall_s`` covers the plan and
-            # the intersection, and record decode has never been part of it.
+        if cells is not None:
+            # Outside the timer on purpose: ``build_wall_s`` covers the plan (the
+            # ephemeral cover included) and the intersection, and record decode
+            # has never been part of it.
             records, shard_to_idx = _hit_records(catalog, rows, shard_to_idx)
 
         from zagg.catalog.sources import FOOTPRINT_CELLS_ORDER

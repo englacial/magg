@@ -31,6 +31,14 @@ from urllib.parse import urlparse
 
 import numpy as np
 
+from zagg.time_axis import (
+    DEFAULT_TIME_ENCODING,
+    encode_time_axis,
+    time_axis_attrs,
+    time_axis_dtype,
+    time_encoding,
+)
+
 logger = logging.getLogger(__name__)
 
 # TIFF SampleFormat x BitsPerSample -> numpy dtype, for sizing the fill return
@@ -504,26 +512,50 @@ def _us_iso(us: int) -> str:
     )
 
 
-def raster_time_index(granules) -> tuple[dict, np.ndarray]:
+def raster_time_index(
+    granules, *, encoding: str = DEFAULT_TIME_ENCODING
+) -> tuple[dict, np.ndarray]:
     """Global timestep index from ShardMap granule lists.
 
     A timestep is an *acquisition group* — entries sharing a ``time_key``
     (e.g. the Sentinel-2 datatake id; adjacent MGRS tiles of one datatake are
     items seconds apart) — falling back to the entry datetime when no key was
-    configured. The group's coordinate value is its earliest datetime.
+    configured.
+
+    Under the default ``microseconds`` encoding the group's coordinate value
+    is its earliest datetime, as it always has been. Under ``toc`` (spec §8,
+    issue #443) it is the group's acquisition ENVELOPE — the earliest
+    ``time_start`` (or item datetime) to the latest ``time_end`` (or item
+    datetime) across its members — encoded as one toc word: an exact
+    timestamp where the envelope is a single instant, a conservative range
+    where it is not. A datatake's tiles are sensed seconds apart, which is
+    the range this encoding exists to state honestly.
+
+    Row ORDER is the group's earliest item datetime either way, so a leaf's
+    row assignment cannot drift with the encoding. That is *not* the same as
+    ascending stored words under ``toc``: the word encodes the ENVELOPE
+    start, which a declared ``time_start`` can push before an earlier row's
+    key, so the returned words may descend (§8.1 — a reader must use the
+    overlap predicate, never a bisect).
 
     Parameters
     ----------
     granules : list of list of dict
-        ``ShardMap.granules`` (raster entries carry ``assets`` + ``datetime``).
+        ``ShardMap.granules`` (raster entries carry ``assets`` + ``datetime``,
+        optionally ``time_start``/``time_end`` from the STAC item's
+        ``start_datetime``/``end_datetime``).
+    encoding : str
+        ``output.time_encoding`` (:func:`zagg.time_axis.time_encoding`).
 
     Returns
     -------
-    (time_index, times_us)
-        ``{group_key: t_idx}`` and the int64 microseconds-since-epoch time
-        coordinate, both in ascending time order.
+    (time_index, times)
+        ``{group_key: t_idx}`` and the encoded time coordinate (int64
+        microseconds, or uint64 toc words under ``toc``), both in row order
+        — ascending group earliest-item datetime.
     """
     earliest: dict = {}
+    span: dict = {}
     for shard_entries in granules:
         for e in shard_entries:
             if not e.get("assets"):
@@ -532,12 +564,22 @@ def raster_time_index(granules) -> tuple[dict, np.ndarray]:
                 raise ValueError(f"raster granule entry {e.get('id')!r} carries no datetime")
             key = e.get("time_key") or e["datetime"]
             us = _iso_us(e["datetime"])
-            if key not in earliest or us < earliest[key]:
-                earliest[key] = us
+            lo = _iso_us(e["time_start"]) if e.get("time_start") else us
+            hi = _iso_us(e["time_end"]) if e.get("time_end") else us
+            if key not in earliest:
+                earliest[key], span[key] = us, (lo, hi)
+            else:
+                earliest[key] = min(earliest[key], us)
+                span[key] = (min(span[key][0], lo), max(span[key][1], hi))
     ordered = sorted(earliest, key=lambda k: (earliest[k], k))
     time_index = {k: i for i, k in enumerate(ordered)}
-    times_us = np.array([earliest[k] for k in ordered], dtype=np.int64)
-    return time_index, times_us
+    if encoding == DEFAULT_TIME_ENCODING:
+        times = np.array([earliest[k] for k in ordered], dtype=np.int64)
+    else:
+        times = encode_time_axis(
+            [span[k][0] for k in ordered], [span[k][1] for k in ordered], encoding=encoding
+        )
+    return time_index, times
 
 
 def _chord2(lons, lats, lon0: float, lat0: float) -> np.ndarray:
@@ -832,8 +874,6 @@ def _combine_by_ownership(sampled, lonlat, bands):
 # resize-then-write-slab pattern and are single-writer (the runner owns the
 # resize, as it owns template emission).
 
-_TIME_ATTRS = {"units": "microseconds since 1970-01-01T00:00:00", "calendar": "proleptic_gregorian"}
-
 
 def _raster_array_spec(shape, chunks, dims, dtype, fill, attrs=None):
     """ArraySpec shared by the flat template and the hive leaf spec."""
@@ -880,12 +920,23 @@ def _raster_members(grid, config, n_time: int, n_cells: int) -> dict:
     review: one default cell coordinate everywhere). The legacy NESTED
     ``cell_ids`` array rides only the same ``emit_cell_ids`` transition
     hatch as the spatial path — never a separate schedule.
+
+    ``time``'s element type and attrs come from the config's declared
+    encoding (spec §8): int64 microseconds with CF ``units``/``calendar``
+    by default, uint64 toc words with the ``temporal`` declaration and no CF
+    pair under ``time_encoding: toc``.
     """
     from zagg.config import get_raster_bands
 
+    encoding = time_encoding(config)
     members = {
         "time": _raster_array_spec(
-            (n_time,), (max(n_time, 1),), ("time",), "int64", 0, dict(_TIME_ATTRS)
+            (n_time,),
+            (max(n_time, 1),),
+            ("time",),
+            time_axis_dtype(encoding),
+            0,
+            time_axis_attrs(encoding),
         ),
         "morton": _raster_array_spec((n_cells,), (grid.cells_per_chunk,), ("cells",), "uint64", 0),
     }
@@ -931,7 +982,7 @@ def emit_raster_template(store, grid, config, times_us: np.ndarray, *, overwrite
     from zarr import open_array
     from zarr.errors import ArrayNotFoundError, ContainsGroupError
 
-    times_us = np.asarray(times_us, dtype=np.int64)
+    times_us = np.asarray(times_us, dtype=time_axis_dtype(time_encoding(config)))
     spec = raster_group_spec(grid, config, int(len(times_us)))
     time_path = f"{grid.group_path}/time"
     with zarr_config.set({"async.concurrency": 128}):
@@ -1014,7 +1065,7 @@ def emit_raster_leaf_template(
     with zarr_config.set({"async.concurrency": 128}):
         spec.to_zarr(store, "", overwrite=overwrite)
         arr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
-        times = np.asarray(times_us, dtype=np.int64)
+        times = np.asarray(times_us, dtype=time_axis_dtype(time_encoding(config)))
         arr[:] = times
         arr = open_array(store, path=f"{grid.group_path}/morton", zarr_format=3, consolidated=False)
         arr[:] = children
@@ -1313,7 +1364,7 @@ def process_and_write_raster_hive(
     # The leaf's own time axis, from the dispatched subset. Every group key in
     # the subset is in this index by construction, so the worker never trips
     # the foreign-manifest guard.
-    time_index, times_us = raster_time_index([granules])
+    time_index, times_us = raster_time_index([granules], encoding=time_encoding(config))
     box: dict = {}
     write_s = 0.0
     # O11 incremental hashing (issue #342 phase 5). The raster leaf never

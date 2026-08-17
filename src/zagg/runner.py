@@ -799,6 +799,7 @@ class RasterStrategy:
             write_raster_slab,
         )
         from zagg.telemetry import build_record, raster_granule_ids, write_sidecar
+        from zagg.time_axis import time_encoding
 
         catalog_path = catalog or config.catalog
         if not catalog_path:
@@ -823,7 +824,9 @@ class RasterStrategy:
 
         grid = from_config(config)
         _check_signature(grid, catalog_data)
-        time_index, times_us = raster_time_index(catalog_data["granules"])
+        time_index, times_us = raster_time_index(
+            catalog_data["granules"], encoding=time_encoding(config)
+        )
         if not time_index:
             raise ValueError("catalog carries no raster granule entries (no assets/datetime)")
 
@@ -5099,8 +5102,11 @@ def _invoke_lambda_raster_setup(
     deliberately invoke-only and must never PUT to the store. Synchronous
     because the template is load-bearing before fan-out (workers write slabs
     into its arrays) — the flat point-path lifecycle, not the #252 async
-    hybrid. ``times_us`` is the catalog-derived global time coordinate
-    (int64 μs since the epoch), JSON-safe as a plain int list.
+    hybrid. ``times_us`` is the catalog-derived global time coordinate in the
+    config's declared encoding — int64 μs since the Unix epoch by default, or
+    uint64 mortie toc words under ``output.time_encoding: toc`` (spec §8) —
+    JSON-safe as a plain int list either way; the worker re-derives the dtype
+    from ``config``, so the parameter name is historical, not a width claim.
 
     A deployed function that predates the raster setup branch would fall
     through to the point-path ``grid.emit_template`` — wrong template, right
@@ -5115,8 +5121,9 @@ def _invoke_lambda_raster_setup(
         "overwrite": overwrite,
         "config": config_dict,
         # times_us rides inline in this sync RequestResponse payload (6 MB
-        # cap, not the 256 KB async/Event cap); int64 μs stamps serialize at
-        # ~17 B each → ~350K-timestep headroom, orders above any real catalog
+        # cap, not the 256 KB async/Event cap); the widest stamp is a 20-digit
+        # uint64 toc word at ~21 B → ~285K-timestep headroom (int64 μs stamps
+        # are ~17 B / ~350K), both orders above any real catalog
         # (the pinned NEON benchmark catalog is 85 items). No chunking
         # fallback — a pathological series would surface as a boto ClientError.
         "times_us": [int(t) for t in times_us],

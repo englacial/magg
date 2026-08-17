@@ -35,7 +35,11 @@ Included (the semantic core):
   see a leaf-shape change at all and read a config-changed rerun as ``equal``.
   Every knob here is folded in **resolved through its accessor**, never as
   spelled, so an explicit default hashes identically to an absent key (§8.3,
-  the ``pipeline.type`` discipline).
+  the ``pipeline.type`` discipline);
+- the raster **time-coordinate encoding** (``output.time_encoding``, spec §8 /
+  issue #443), keyed only when non-default: toc words and legacy microseconds
+  are different stored values meaning different things, exactly as
+  ``weights: "flux"`` is.
 
 Excluded as packaging: all orders (``parent_order``/``child_order``/
 ``chunk_inner`` — the D24 resolution axis, which the epoch deliberately did
@@ -74,6 +78,7 @@ import hashlib
 import json
 
 from zagg.config import PipelineConfig, get_pipeline_type
+from zagg.time_axis import DEFAULT_TIME_ENCODING
 
 #: ``data_source`` keys that are read machinery or worker sizing, not output
 #: semantics (D19 names the two as separate packaging categories).
@@ -437,6 +442,14 @@ def semantic_core(config: PipelineConfig) -> dict:
             "windowing": _windowing_leaf_shape(config),
         },
     }
+    # The time coordinate's encoding (spec §8, issue #443) is output-defining
+    # for the same reason `weights: "flux"` is: the stored axis MEANS
+    # something else. Keyed only when non-default, so every config written
+    # before §8 — and the explicit `microseconds` spelling of the absent-key
+    # default — hashes byte-identically to today.
+    encoding = (config.output or {}).get("time_encoding")
+    if encoding not in (None, DEFAULT_TIME_ENCODING):
+        core["time_encoding"] = encoding
     return _prune_nulls(core)
 
 
