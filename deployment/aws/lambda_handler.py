@@ -81,7 +81,11 @@ writes the raster (time, cells) template instead, from a synchronous invoke):
         block for the manifest, sourced from the ShardMap metadata by the
         orchestrator (matching the local dispatcher). Absent on flat runs.
     "times_us": [int, ...] (raster only, issue #264) -- the catalog-derived
-        time coordinate, int64 microseconds since the epoch; the orchestrator
+        time coordinate, in whatever encoding "config" declares: int64
+        microseconds since the Unix epoch by default, or uint64 mortie toc
+        words under output.time_encoding: toc (spec §8, issue #443). Plain
+        ints either way; the worker re-derives the dtype from the config, so
+        the key name is historical and NOT a width claim. The orchestrator
         owns the global timestep index and threads it here so the template
         write needs no S3 access from the dispatcher.
     "run_manifest": dict (optional, issue #327) -- {"run_id", "shards"
