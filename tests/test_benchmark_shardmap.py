@@ -203,10 +203,11 @@ def test_pinned_shardmap_no_drift(sm_key):
 #
 # ``tools/repin_benchmark_shardmaps.py`` is the counterpart of the drift check
 # above: the guard detects an accidental move, the driver makes a deliberate
-# one. It imports the guard's recipe helpers, so these tests pin the parts the
-# guard does not exercise -- the pruning, the pin write-back, and the claim the
-# driver exists to support: that it reproduces the PR #441 artifacts from the
-# committed catalogs.
+# one. It CALLS ``rebuild_shardmap`` and ``select_pin`` above, so the rebuild
+# and the pin rule are already covered by the drift check; these tests pin the
+# parts they do not reach -- the pruning, the pin write-back, the re-pin
+# ordering, and the claim the driver exists to support: that it reproduces the
+# PR #441 artifacts from the committed catalogs.
 
 OFFLINE_PINS = [k for k, v in MANIFEST["shardmaps"].items() if v.get("catalog_parquet")]
 
