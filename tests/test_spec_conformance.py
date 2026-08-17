@@ -1335,15 +1335,23 @@ class TestLocatedDeclaration:
             np.testing.assert_array_equal(
                 words, np.array(cell["h_tdigest_locations"], dtype=np.uint64)
             )
-            kinds = np.asarray(is_point(words), dtype=bool)
-            singles = np.asarray(digest[:, 1]) == 1
-            # §9.1: a weight-1 centroid keeps its observation's order-29
-            # POINT word; a merged one carries a coarser area ancestor.
-            assert (kinds == singles).all()
-            assert (np.asarray(orders_of(words[kinds])) == 29).all()
-            merged_orders.extend(int(o) for o in np.asarray(orders_of(words[~kinds])))
+            # The split is the fixture's RECORDED member runs, never the
+            # payload weight: §2.2/§9.1 key a word's claim on the word, and
+            # under a "flux" payload (§2.0) a weight is not a member count.
+            # These bytes give every observation its own instant, so a
+            # single-instant span is a single-member run.
+            spans = np.array(cell["centroid_spans_ns"], dtype="int64")
+            unmerged = spans[:, 0] == spans[:, 1]
+            points = np.asarray(is_point(words), dtype=bool)
+            orders = np.asarray(orders_of(words))
+            # An unmerged centroid keeps its observation's order-29 POINT
+            # word; the merged rows are where coarser ancestors appear.
+            assert unmerged.any()
+            assert points[unmerged].all()
+            assert (orders[unmerged] == 29).all()
+            merged_orders.extend(int(o) for o in orders[~unmerged])
         # Heterogeneous orders in one committed array is the §9.1 claim a
-        # reader must not assume away.
+        # reader must not assume away — decoded per word, never per array.
         assert merged_orders and min(merged_orders) < 29
 
     def test_absent_declaration_on_the_pre_section_9_fixture(self):
