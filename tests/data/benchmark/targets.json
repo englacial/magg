@@ -18,43 +18,43 @@
   "shardmaps": {
     "healpix_o11": {
       "path": "shardmaps/sm_healpix_o11.json",
-      "shard_key": 5347398660508352523,
+      "shard_key": 5347392338316492811,
       "n_granules": 50,
-      "note": "Re-pinned over the full-mission window 2018-10-13..2026-03-15 (issue #202): the densest o11 shard is now 5347398660508352523 at 50 granules, with a close cluster of three shards at 49 (incl. the old pin 5347394812217655307). The benchmark always dispatches this static shard_key, so the series is stable regardless of CMR drift. The drift test is tie-tolerant (compares granule count within +/-1, not exact shard_key) so an equally-dense reselection over the window doesn't read as drift."
+      "note": "Re-pinned under the AUTHALIC latitude convention (mortie >=0.9.8, issue #438): the densest o11 shard is now 5347392338316492811 at 50 granules, with a close cluster of three shards at 49 (incl. the pre-authalic pin 5347394812217655307). Granule membership is unchanged (same 66-granule CMR set over the full-mission window 2018-10-13..2026-03-15, issue #202) -- only cell/shard attribution moved. The benchmark always dispatches this static shard_key, so the series is stable regardless of CMR drift. The drift test is tie-tolerant (compares granule count within +/-1, not exact shard_key) so an equally-dense reselection over the window doesn't read as drift."
     },
     "healpix_o10": {
       "path": "shardmaps/sm_healpix_o10.json",
-      "shard_key": 5347405532456026122,
-      "n_granules": 56,
-      "note": "Re-pinned over 2018-10-13..2026-03-15 (issue #202). Retired from the live matrix (o9-only reset); retained as a frozen provisional target so its shard-map pin stays drift-guarded."
+      "shard_key": 5347392338316492810,
+      "n_granules": 55,
+      "note": "Re-pinned under the AUTHALIC latitude convention (mortie >=0.9.8, issue #438): densest o10 shard 5347405532456026122/56 -> 5347392338316492810/55 over the same 2018-10-13..2026-03-15 window and the same 66-granule CMR set (issue #202) -- only cell/shard attribution moved. Retired from the live matrix (o9-only reset); retained as a frozen provisional target so its shard-map pin stays drift-guarded."
     },
     "healpix_o9": {
       "path": "shardmaps/sm_healpix_o9.json",
-      "shard_key": 5347395636851376137,
+      "shard_key": 5347294481781620745,
       "n_granules": 66,
-      "note": "Re-pinned over 2018-10-13..2026-03-15 (issue #202): densest o9 shard unchanged (5347395636851376137), granule count 59 -> 66. BOTH live-matrix arms dispatch this plain map: the nomask arm as-is; the mask arm builds the strict-AOI per-cell mask on the fly at dispatch (run_benchmark._shardmap_with_mask, mortie) -- the ~190 KB mask is derived (grid + AOI, doesn't move granules), so it is not committed (issue #202)."
+      "note": "Re-pinned under the AUTHALIC latitude convention (mortie >=0.9.8, issue #438): two o9 shards now tie at 66 granules -- the pre-authalic pin 5347395636851376137 and 5347294481781620745 -- so select_densest_shard's lowest-key tiebreak lands on the latter. Granule membership is unchanged (same 66-granule CMR set over 2018-10-13..2026-03-15, issue #202; the count went 59 -> 66 at that re-pin). BOTH live-matrix arms dispatch this plain map: the nomask arm as-is; the mask arm builds the strict-AOI per-cell mask on the fly at dispatch (run_benchmark._shardmap_with_mask, mortie) -- the ~190 KB mask is derived (grid + AOI, doesn't move granules), so it is not committed (issue #202)."
     },
     "healpix_o9_88s": {
       "path": "shardmaps/sm_healpix_o9_88s.json",
-      "shard_key": 11530494877603201033,
-      "n_granules": 5620,
+      "shard_key": 11530143033882312713,
+      "n_granules": 5536,
       "aoi": {
         "file": "antarctic_88s.geojson",
         "name": "Antarctic 88S ring"
       },
-      "note": "88S stress pin (issue #148): the worst shard by granule count over the full turning-latitude ring (576 o9 shards, 2.04M pairs, 35,639 catalog granules). The committed map is PRUNED to this one shard (metadata.pruned); the full map is ~0.7 GB. Expected to OOM/timeout at 2 GB -- that is the point (see README).",
+      "note": "88S stress pin (issue #148), re-pinned under the AUTHALIC latitude convention (mortie >=0.9.8, issue #438: 11530494877603201033/5620 -> 11530143033882312713/5536, rebuilt offline from the SAME catalogs/cat_88s.parquet snapshot, so only cell/shard attribution moved): the worst shard by granule count over the full turning-latitude ring (564 o9 shards, 2.07M pairs, 35,639 catalog granules; 576 shards / 2.04M pairs pre-authalic). The committed map is PRUNED to this one shard (metadata.pruned); the full map is ~0.7 GB. Expected to OOM/timeout at 2 GB -- that is the point (see README).",
       "catalog_parquet": "catalogs/cat_88s.parquet"
     },
     "healpix_o10_88s": {
       "path": "shardmaps/sm_healpix_o10_88s.json",
-      "shard_key": 11530494877603201034,
-      "n_granules": 4605,
+      "shard_key": 11530145232905568266,
+      "n_granules": 4991,
       "nested_in": "healpix_o9_88s",
       "aoi": {
         "file": "antarctic_88s.geojson",
         "name": "Antarctic 88S ring"
       },
-      "note": "88S stress pin (issue #148), NESTED: the densest o10 shard inside the pinned o9 stress shard (nested_in), not the global o10 densest (4,642 at another ring longitude), so one o9 extraction pass covers both orders per the issue #148 decisions. The drift test derives the nested densest when nested_in is set. Committed map PRUNED to this shard (full map ~1.7 GB).",
+      "note": "88S stress pin (issue #148), NESTED, re-pinned under the AUTHALIC latitude convention (mortie >=0.9.8, issue #438: 11530494877603201034/4605 -> 11530145232905568266/4991, rebuilt offline from the SAME catalogs/cat_88s.parquet snapshot -- the new pin is a different physical cell inside the new o9 parent, and the ring now fans to 1692 o10 shards instead of 1756, so the average granules-per-shard rises ~8% with it): the densest o10 shard inside the pinned o9 stress shard (nested_in), not the global o10 densest (4,992 at another ring longitude), so one o9 extraction pass covers both orders per the issue #148 decisions. The drift test derives the nested densest when nested_in is set. Committed map PRUNED to this shard (full map ~1.7 GB).",
       "catalog_parquet": "catalogs/cat_88s.parquet"
     }
   },

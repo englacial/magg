@@ -416,6 +416,10 @@ def validate_config(config: PipelineConfig) -> None:
     # Cross-check: each filter's level field must name a key in levels (issue #43)
     _validate_filter_levels(config.data_source)
 
+    # Vlen grammar surface (issue #425): coordinates.level, synthesize
+    # variables, sibling-asset declarations + asset filters.
+    _validate_vlen_source(config.data_source)
+
     # Virtual chunk-index backend block (issue #160)
     _validate_index(config.data_source)
 
@@ -565,12 +569,21 @@ def validate_config(config: PipelineConfig) -> None:
         if attrs is not None:
             if not isinstance(attrs, dict) or not all(isinstance(k, str) for k in attrs):
                 raise ValueError(f"Variable '{name}': attrs must be a mapping with string keys")
-            from zagg.grids.base import RAGGED_ELEMENT_ATTR
+            from zagg.grids.base import RAGGED_ELEMENT_ATTR, WEIGHTS_ATTR
 
             if RAGGED_ELEMENT_ATTR in attrs:
                 raise ValueError(
                     f"Variable '{name}': attrs key {RAGGED_ELEMENT_ATTR!r} is reserved "
                     f"for the ragged layout block (issue #209)"
+                )
+            # The §2.0 weights key is spec-owned on ragged payload arrays:
+            # the template stamps it from the field-level ``weights:``
+            # declaration, so an attrs transcription could silently disagree.
+            if meta.get("kind") == "ragged" and WEIGHTS_ATTR in attrs:
+                raise ValueError(
+                    f"Variable '{name}': attrs key {WEIGHTS_ATTR!r} is spec-owned on a "
+                    f"ragged payload array — declare the field-level 'weights:' key "
+                    f"instead (spec §2.0, issue #424)"
                 )
             import json
 
@@ -1473,7 +1486,11 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     ``ragged``). ``scalar`` fields need neither and stay the default path.
     ``vector`` and ``ragged`` fields may be driven by either ``function`` or
     ``expression``; ``len``/``count`` are rejected for both (they short-circuit
-    to a scalar count). See issue #29 (vector) and issue #48 (ragged).
+    to a scalar count). See issue #29 (vector) and issue #48 (ragged). A ragged
+    field may additionally declare ``weights`` (the spec §2.0 counts/flux
+    payload declaration; flux requires ``gain`` provenance attrs) and
+    ``overview_delta`` (the split pyramid-fold budget) — both issue #424,
+    both rejected on other kinds.
 
     A field may also declare ``resolution`` (``cell`` default, or ``chunk``).
     A ``resolution: chunk`` field (issue #30 item 2) is written ONCE per chunk
@@ -1513,6 +1530,16 @@ def _validate_output_kind(name: str, meta: dict) -> None:
         raise ValueError(
             f"Variable '{name}': 'location' is only valid for kind 'ragged', not '{kind}'"
         )
+
+    # ``weights`` (spec §2.0, issue #424) declares a digest payload's
+    # weight-column semantics; ``overview_delta`` (issue #424) is the split
+    # pyramid-fold compression budget. Both describe a ragged digest payload —
+    # nothing else has a weight column or an overview digest fold.
+    for key in ("weights", "overview_delta"):
+        if key in meta and kind != "ragged":
+            raise ValueError(
+                f"Variable '{name}': '{key}' is only valid for kind 'ragged', not '{kind}'"
+            )
 
     # resolution (cell default, or chunk). A chunk-resolution field stores one
     # value per chunk in a companion array (issue #30 item 2). ``scalar`` and
@@ -1575,6 +1602,44 @@ def _validate_output_kind(name: str, meta: dict) -> None:
     if "inner_shape" not in meta:
         raise ValueError(f"Variable '{name}': kind 'ragged' requires 'inner_shape'")
     _validate_trailing_shape(name, meta["inner_shape"], key_name="inner_shape")
+
+    # The §2.0 weights declaration (issue #424): "counts" (integer weights,
+    # sum exact — the absent-key default) or "flux" (positive reals, sum an
+    # estimate of detected photoelectrons). A flux field MUST carry its
+    # calibration provenance — the spec requires a ``gain`` attrs mapping
+    # naming at minimum the gain constant's name and version — so a store
+    # never holds calibrated weights whose calibration is unrecoverable.
+    weights = meta.get("weights")
+    if weights is not None:
+        from zagg.grids.base import WEIGHTS_KINDS
+
+        if weights not in WEIGHTS_KINDS:
+            raise ValueError(
+                f"Variable '{name}': weights {weights!r} is not one of {WEIGHTS_KINDS} (spec §2.0)"
+            )
+        if weights == "flux":
+            gain = (meta.get("attrs") or {}).get("gain")
+            if not isinstance(gain, dict) or not {"name", "version"} <= set(gain):
+                raise ValueError(
+                    f"Variable '{name}': weights 'flux' requires calibration provenance "
+                    f"in attrs — a 'gain' mapping with at least 'name' and 'version' "
+                    f"(spec §2.0, issue #424)"
+                )
+
+    # ``overview_delta`` (issue #424): the pyramid/overview fold budget, split
+    # from the leaf ``params.delta`` (leaf δ is the loss-free bound, overview δ
+    # the ~1/δ accuracy bound). A top-level key, NOT a params entry — params
+    # values are forwarded to the reducer as kwargs, which never take it.
+    overview_delta = meta.get("overview_delta")
+    if overview_delta is not None:
+        if not isinstance(overview_delta, int) or isinstance(overview_delta, bool):
+            raise ValueError(
+                f"Variable '{name}': overview_delta must be a positive int (got {overview_delta!r})"
+            )
+        if overview_delta < 1:
+            raise ValueError(
+                f"Variable '{name}': overview_delta must be a positive int (got {overview_delta!r})"
+            )
 
     # Same restriction as vector: ``len``/``count`` produce a scalar count.
     if meta.get("function") in ("len", "count"):
@@ -1690,6 +1755,7 @@ def _normalize_filter(f: dict) -> dict:
     op = f["op"]
     out = {
         "level": f.get("level"),
+        "asset": f.get("asset"),
         "dataset": f["dataset"],
         "column": f.get("column"),
         "op": op,
@@ -1722,6 +1788,28 @@ def _validate_ds_variables(data_source: dict) -> None:
                 f"data_source.variables['{name}'] must be a path string or a "
                 f"{{path, column}} mapping (got {type(entry).__name__})"
             )
+        # Synthesized-column form (issue #425, vlen grammar): the column is
+        # computed per record — ``linspace(start, stop, count)`` over each
+        # record's samples — never read. Cross-checks against ``levels`` and
+        # ``coordinates.level`` live in ``_validate_vlen_source``.
+        if "synthesize" in entry:
+            if entry["synthesize"] != "linspace":
+                raise ValueError(
+                    f"data_source.variables['{name}'].synthesize must be 'linspace' "
+                    f"(got {entry['synthesize']!r})"
+                )
+            extra = set(entry) - {"synthesize", "level", "start", "stop"}
+            if extra:
+                raise ValueError(
+                    f"data_source.variables['{name}']: unknown keys {sorted(extra)} "
+                    "(the synthesize form takes 'synthesize', 'level', 'start', 'stop')"
+                )
+            for key in ("level", "start", "stop"):
+                if not isinstance(entry.get(key), str) or not entry[key]:
+                    raise ValueError(
+                        f"data_source.variables['{name}'].{key} must be a non-empty string"
+                    )
+            continue
         extra = set(entry) - {"path", "column"}
         if extra:
             raise ValueError(
@@ -1786,6 +1874,18 @@ def _validate_filters(data_source: dict) -> None:
             continue
         if "dataset" not in f:
             raise ValueError(f"filter[{i}]: structured filter requires 'dataset'")
+        asset = f.get("asset")
+        if asset is not None:
+            # Sibling-asset predicate (issue #425): evaluated on the paired
+            # asset's per-record rows after the declared key join, so it is
+            # record-level by construction — a 'level' would be ambiguous.
+            if not isinstance(asset, str) or not asset:
+                raise ValueError(f"filter[{i}]: 'asset' must be a non-empty string")
+            if f.get("level") is not None:
+                raise ValueError(
+                    f"filter[{i}]: 'asset' filters are record-level by construction "
+                    "(the join key aligns records); omit 'level'"
+                )
         op = f.get("op")
         if op not in FILTER_OPS:
             raise ValueError(f"filter[{i}]: unknown op {op!r} (allowed: {sorted(FILTER_OPS)})")
@@ -1803,6 +1903,89 @@ def _validate_filters(data_source: dict) -> None:
                 raise ValueError(f"filter[{i}]: op {op!r} requires a scalar 'value'")
             if not isinstance(f["value"], (int, float)) or isinstance(f["value"], bool):
                 raise ValueError(f"filter[{i}]: 'value' must be numeric (got {f['value']!r})")
+
+
+def _validate_vlen_source(data_source: dict) -> None:
+    """Cross-validate the vlen grammar surface (issue #425).
+
+    The vlen route is selected by ``coordinates.level`` (the base level has no
+    native coordinates; they expand from that record level). Checks:
+
+    - ``coordinates.level`` names a non-base level whose ``link`` points
+      directly at ``base_level`` (the ragged-gather link);
+    - ``synthesize:`` variables require the vlen route and their ``level``
+      must equal ``coordinates.level`` (the within-record index used by the
+      linspace comes from that level's link);
+    - ``data_source.assets`` entries carry a ``join`` block with string
+      ``left``/``right`` key paths; every filter's ``asset`` names a declared
+      entry, and asset filters require the vlen route.
+    """
+    ds = data_source or {}
+    coords = ds.get("coordinates")
+    coord_level = coords.get("level") if isinstance(coords, dict) else None
+    levels = ds.get("levels")
+    base_level = ds.get("base_level")
+    if coord_level is not None:
+        if not isinstance(levels, dict) or base_level is None:
+            raise ValueError("data_source.coordinates.level requires 'levels' and 'base_level'")
+        if coord_level not in levels:
+            raise ValueError(
+                f"data_source.coordinates.level {coord_level!r} is not a key in levels "
+                f"(available: {sorted(levels)})"
+            )
+        link = (levels[coord_level] or {}).get("link")
+        if not isinstance(link, dict) or link.get("to") != base_level:
+            raise ValueError(
+                f"data_source.coordinates.level {coord_level!r} must link directly to "
+                f"base level {base_level!r}"
+            )
+    for name, entry in (ds.get("variables") or {}).items():
+        if not isinstance(entry, dict) or "synthesize" not in entry:
+            continue
+        if coord_level is None:
+            raise ValueError(
+                f"data_source.variables['{name}']: synthesize requires the vlen route "
+                "(set data_source.coordinates.level)"
+            )
+        if entry["level"] != coord_level:
+            raise ValueError(
+                f"data_source.variables['{name}'].level {entry['level']!r} must equal "
+                f"coordinates.level {coord_level!r} (the within-record index comes "
+                "from that level's link)"
+            )
+    assets = ds.get("assets")
+    if assets is not None:
+        if not isinstance(assets, dict) or not assets:
+            raise ValueError("data_source.assets must be a non-empty mapping of name -> {join}")
+        for name, cfg in assets.items():
+            if not isinstance(cfg, dict) or not isinstance(cfg.get("join"), dict):
+                raise ValueError(f"data_source.assets['{name}'] requires a 'join' mapping")
+            join = cfg["join"]
+            unknown = set(join) - {"left", "right"}
+            if unknown:
+                raise ValueError(
+                    f"data_source.assets['{name}'].join: unknown keys {sorted(unknown)} "
+                    "(takes 'left' and 'right' record-key dataset paths)"
+                )
+            for side in ("left", "right"):
+                if not isinstance(join.get(side), str) or not join[side]:
+                    raise ValueError(
+                        f"data_source.assets['{name}'].join.{side} must be a non-empty string"
+                    )
+    for i, f in enumerate(ds.get("filters") or []):
+        asset = f.get("asset") if isinstance(f, dict) else None
+        if asset is None:
+            continue
+        if not isinstance(assets, dict) or asset not in assets:
+            raise ValueError(
+                f"filter[{i}]: asset {asset!r} is not declared in data_source.assets "
+                f"(available: {sorted(assets) if isinstance(assets, dict) else []})"
+            )
+        if coord_level is None:
+            raise ValueError(
+                f"filter[{i}]: 'asset' filters require the vlen route "
+                "(set data_source.coordinates.level)"
+            )
 
 
 def _segment_variable_names(data_source: dict) -> set[str]:
@@ -2166,6 +2349,10 @@ def get_output_signature(meta: dict) -> dict:
         # Ragged location channel (issue #87): the per-observation morton column
         # the reducer folds per centroid; ``None`` for unlocated fields.
         "location": meta.get("location"),
+        # Ragged weights declaration (spec §2.0, issue #424): "counts"/"flux",
+        # or ``None`` when undeclared (the spec reads absence as counts, so
+        # ``None`` keeps pre-#424 templates and signatures byte-identical).
+        "weights": meta.get("weights"),
     }
 
 
@@ -2204,6 +2391,10 @@ def output_field_signature(config: PipelineConfig) -> list[dict]:
         # so existing shard-map signatures are byte-identical.
         if sig["location"] is not None:
             entry["location"] = sig["location"]
+        # A weights declaration changes the payload semantics (spec §2.0,
+        # issue #424) — same keyed-only-when-set discipline as location.
+        if sig["weights"] is not None:
+            entry["weights"] = sig["weights"]
         fields.append(entry)
     return sorted(fields, key=lambda f: f["name"])
 

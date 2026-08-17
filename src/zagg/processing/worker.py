@@ -65,6 +65,16 @@ _EXEMPLAR_CHARS = 300
 _TRACEBACK_LIMIT = 5
 
 
+def _entry_url(entry) -> str:
+    """Primary URL of a granule entry (issue #425).
+
+    An entry is a plain URL string (single-asset granule — every pre-#425
+    payload) or a ``{"url": ..., "assets": {name: url}}`` mapping from a
+    paired-asset shard map; labels/logs always use the primary URL.
+    """
+    return entry["url"] if isinstance(entry, dict) else entry
+
+
 def _granule_workers(data_source: dict) -> int:
     """Granules in flight per shard (issue #180).
 
@@ -399,10 +409,17 @@ def process_shard(
     # — its lazy-init race was fixed upstream — enforced by the pyproject pin.)
     granule_workers = _granule_workers(data_source)
 
-    def _read_granule(s3_url: str) -> tuple:
+    def _read_granule(entry) -> tuple:
         """One granule end-to-end: H5Coro open → group loop → ``finish_granule``
         → close, all in the calling thread (issue #180 — under the pool each
         granule gets its own ``H5Coro``, never shared across threads).
+
+        ``entry`` is a plain URL string (single-asset granule, unchanged), or a
+        ``{"url": ..., "assets": {name: url}}`` mapping from a paired-asset
+        shard map (issue #425): each sibling asset gets its own ``H5Coro``
+        opened beside the primary and handed to the read as ``siblings`` so
+        the vlen route's asset filters can join per record; all handles are
+        released together in the ``finally``.
 
         Returns ``(reads, group_errors, io_stats)``: ``reads`` is the carriers
         of the groups that returned data (group order, ``None`` — legitimately
@@ -416,7 +433,12 @@ def process_shard(
         Raises when the granule itself fails (e.g. the open) — the caller warns
         and skips it, shard continues (issue #116 semantics).
         """
+        if isinstance(entry, dict):
+            s3_url, asset_urls = entry["url"], dict(entry.get("assets") or {})
+        else:
+            s3_url, asset_urls = entry, {}
         h5obj = None
+        siblings: dict = {}
         reads: list = []
         group_errors = 0
         io_stats: dict = {}
@@ -430,10 +452,20 @@ def process_shard(
                 errorChecking=True,
                 verbose=False,
             )
+            for name, url in asset_urls.items():
+                siblings[name] = _processing.h5coro.H5Coro(
+                    _rewrite_url(url),
+                    h5coro_driver,
+                    credentials=credentials,
+                    errorChecking=True,
+                    verbose=False,
+                )
 
             for g in data_source["groups"]:
                 try:
                     read_kwargs = {"arrow": use_arrow, "io_stats": io_stats}
+                    if siblings:
+                        read_kwargs["siblings"] = siblings
                     if apriori:
                         read_kwargs["granule_url"] = s3_url
                     chunk = index_backend.read_group(
@@ -467,12 +499,15 @@ def process_shard(
             # loop → Lambda OOM. ``close()`` is the live path; ``cache.clear()`` is a
             # fallback for builds lacking it. Retained ``reads`` data is already
             # copied off the cache lines (see PR #94), so releasing here is safe.
-            if h5obj is not None:
+            # Sibling-asset handles (issue #425) release under the same rule.
+            for handle in [h5obj, *siblings.values()]:
+                if handle is None:
+                    continue
                 try:
-                    if hasattr(h5obj, "close"):
-                        h5obj.close()
-                    elif getattr(h5obj, "cache", None) is not None:
-                        h5obj.cache.clear()
+                    if hasattr(handle, "close"):
+                        handle.close()
+                    elif getattr(handle, "cache", None) is not None:
+                        handle.cache.clear()
                 except Exception:
                     logger.debug("h5coro cache release failed", exc_info=True)
 
@@ -491,9 +526,10 @@ def process_shard(
         """
         nonlocal granule_errors
         if granule_workers == 1:
-            for s3_url in granule_urls:
+            for entry in granule_urls:
+                s3_url = _entry_url(entry)
                 try:
-                    yield s3_url, *_read_granule(s3_url)
+                    yield s3_url, *_read_granule(entry)
                 except Exception as e:
                     granule_errors += 1
                     _record_read_error(f"processing file {s3_url}", e)
@@ -503,7 +539,8 @@ def process_shard(
             ) as pool:
                 urls = iter(granule_urls)
                 in_flight = deque(
-                    (u, pool.submit(_read_granule, u)) for u in islice(urls, granule_workers)
+                    (_entry_url(u), pool.submit(_read_granule, u))
+                    for u in islice(urls, granule_workers)
                 )
                 while in_flight:
                     s3_url, future = in_flight.popleft()
@@ -519,7 +556,7 @@ def process_shard(
                     # (including streaming granule_done flushes) — the ≤ K
                     # bound and the fold order are unchanged.
                     for u in islice(urls, 1):
-                        in_flight.append((u, pool.submit(_read_granule, u)))
+                        in_flight.append((_entry_url(u), pool.submit(_read_granule, u)))
                     if reads is not None:
                         yield s3_url, reads, group_errors, granule_io
 

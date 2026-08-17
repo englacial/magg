@@ -97,11 +97,12 @@ aggregation:
       location: leaf_id
       inner_shape: [2]
       params:
-        delta: 256
+        delta: 8192              # leaf centroid budget: loss-free bound (issues #414/#424)
         where: >-
           (signal_conf_land >= 2) | (signal_conf_ocean >= 2) |
           (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) |
           (signal_conf_inland_water >= 2)
+      overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
       dtype: float32
       fill_value: 0
       attrs:
@@ -114,11 +115,12 @@ aggregation:
       location: leaf_id
       inner_shape: [2]
       params:
-        delta: 256
+        delta: 8192              # leaf centroid budget: loss-free bound (issues #414/#424)
         where: >-
           ~((signal_conf_land >= 2) | (signal_conf_ocean >= 2) |
           (signal_conf_sea_ice >= 2) | (signal_conf_land_ice >= 2) |
           (signal_conf_inland_water >= 2))
+      overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
       dtype: float32
       fill_value: 0
       attrs:

@@ -323,7 +323,11 @@ def write_leaf_submap(
 
     entries = [dict(g) for g in granules]
     meta = dict(metadata or {})
-    for stale in ("aoi_mask", "build_wall_s", "reproject"):
+    # Run-wide fields that must not be republished per leaf: build provenance
+    # (rewritten below or meaningless here) and ``pairless`` — the sibling
+    # join's per-granule exclusion report (issue #425), which is unbounded in
+    # the catalog size and belongs to the RUN's map, not to one leaf's.
+    for stale in ("aoi_mask", "build_wall_s", "reproject", "pairless"):
         meta.pop(stale, None)
     meta.update(
         total_shards=1,

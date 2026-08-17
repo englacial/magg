@@ -234,7 +234,16 @@ def build_record(
         for k, v in phase_entries.items()
         if not k.endswith("_bytes") and k != "spill_blocks_closed"
     }
-    granule_ids = list(granule_ids) if granule_ids is not None else None
+    # Paired-asset worker payloads (issue #425) carry ``{"url", "assets"}``
+    # entries; the record's granule identity is the primary URL, so the
+    # catalog hash stays byte-identical between a caller passing resolved
+    # strings (the local backend) and one passing the worker payload verbatim
+    # (the Lambda handler).
+    granule_ids = (
+        [g["url"] if isinstance(g, dict) else g for g in granule_ids]
+        if granule_ids is not None
+        else None
+    )
     n_granules = metadata.get("granule_count")
     if n_granules is None:
         n_granules = len(granule_ids or [])

@@ -1458,7 +1458,9 @@ def process_and_write_hive(
         )
         identity, unit_meta = leaf_identity_gate(
             leaf_path,
-            [str(u) for u in granule_urls],
+            # Paired-asset entries (issue #425) identify by their primary URL,
+            # so the planned-id space matches the strings-only local path.
+            [u["url"] if isinstance(u, dict) else str(u) for u in granule_urls],
             semantic_hash=semantic_hash,
             allow_contraction=allow_contraction,
             sidecar_spec=sidecar_spec,
@@ -1684,7 +1686,14 @@ def process_and_write_hive(
         # must account for it.
         from zagg.telemetry import write_granule_ids
 
-        write_granule_ids(leaf_path, granule_urls, spec=sidecar_spec, **store_kwargs)
+        write_granule_ids(
+            leaf_path,
+            # Same primary-URL identity as the gate above (issue #425): the
+            # recorded and planned id spaces must share one shape.
+            [u["url"] if isinstance(u, dict) else str(u) for u in granule_urls],
+            spec=sidecar_spec,
+            **store_kwargs,
+        )
         _write_elapsed += time.time() - _t0
     # Write-phase split (issue #249): read/index/aggregate come from
     # ``process_shard``; ``write`` is the leaf write-out above (template +

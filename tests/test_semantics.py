@@ -373,3 +373,52 @@ class TestLeafShapingOutputKnobs:
         assert len(digest) == 64
         assert digest == semantic_hash(_cfg(output__windowing=block))
         assert digest != semantic_hash(_cfg())
+
+
+def _digest_cfg(**meta_extra) -> PipelineConfig:
+    """A minimal config carrying one ragged digest field ``d``."""
+    return PipelineConfig(
+        data_source={
+            "reader": "h5coro",
+            "groups": ["g"],
+            "variables": {"h": "/p"},
+            "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+        },
+        aggregation={
+            "variables": {
+                "d": {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest",
+                    "source": "h",
+                    "inner_shape": [2],
+                    "dtype": "float32",
+                    "params": {"delta": 8192},
+                    **meta_extra,
+                }
+            }
+        },
+        output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
+    )
+
+
+class TestWeightsAndOverviewDeltaHashing:
+    """Issue #424: default weights and overview_delta never move a hash."""
+
+    def test_weights_counts_hashes_as_absent(self):
+        # The §2.0 absent-key default: explicit and absent spellings are the
+        # same bytes, so they must be the same product identity.
+        assert semantic_hash(_digest_cfg(weights="counts")) == semantic_hash(_digest_cfg())
+
+    def test_weights_flux_is_semantic(self):
+        gain = {"gain": {"name": "g", "version": "1"}}
+        base = _digest_cfg(attrs=dict(gain))
+        flux = _digest_cfg(weights="flux", attrs=dict(gain))
+        assert semantic_hash(flux) != semantic_hash(base)
+        assert semantic_core(flux)["aggregation"]["variables"]["d"]["weights"] == "flux"
+
+    def test_overview_delta_is_packaging(self):
+        # The pyramid-fold budget shapes overview artifacts only; the base
+        # product identity must not move when it is declared (issue #424).
+        assert semantic_hash(_digest_cfg(overview_delta=512)) == semantic_hash(_digest_cfg())
+        core = semantic_core(_digest_cfg(overview_delta=512))
+        assert "overview_delta" not in core["aggregation"]["variables"]["d"]

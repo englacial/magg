@@ -48,9 +48,10 @@ Fleets run concurrently with a live sweep: the worker validates each column's
 stamp before and after reading its groups and re-reads on movement, so a
 mid-read leaf rewrite never feeds a torn column into a merge; a mid-sweep
 append is ordinary under-coverage, recorded and healed by the next sweep.
-Stage-written stamps carry the run id; a skip-if-current read that sees a
-FOREIGN fresh stamp aborts loudly (:class:`ForeignSweepError`) — the backstop
-for residual races the lease cannot see (TTL clock skew, zombie workers).
+Stage-written stamps carry the run id: a skip-if-current read that sees a
+FOREIGN fresh stamp aborts loudly (:class:`ForeignSweepError` — the backstop
+for residual races the lease cannot see), and the run id is also a TERM of
+the skip key (issue #417), so a same-second rewrite cannot read as current.
 
 **Soft barriers.** Inter-stage barriers are scheduling preferences, not
 correctness (#381 point (6)): a stage run before its finer tuple landed
@@ -297,22 +298,19 @@ class _ColumnReader:
     def committed(self) -> bool:
         return self.stamp is not None
 
-    def generation(self) -> dict:
+    def generation(self) -> tuple:
         """This column's generation basis: its own, or the leaf identity.
 
-        Stage columns record a ``generation`` block in their attrs (the
-        summed ratchet); a leaf column is one leaf — ``n_leaves: 1`` at its
-        stamp timestamp. The parent's skip gate keys on the SUM of these.
+        :func:`zagg.column.stamped_generation_key`'s triple: a stage column's
+        recorded ``generation`` block (the summed ratchet) or a leaf column's
+        identity — one leaf at its stamp's timestamp — plus the run id THIS
+        column's own stamp carries (fleet-written ones carry none, review
+        finding). The parent's skip gate keys on the SUM of these.
         """
-        from zagg.column import COLUMN_ATTR
+        from zagg.column import COLUMN_ATTR, stamped_generation_key
 
         block = (self.attrs.get(COLUMN_ATTR) or {}).get("generation")
-        if isinstance(block, dict):
-            return {
-                "n_leaves": int(block.get("n_leaves") or 0),
-                "max_leaf_timestamp": block.get("max_leaf_timestamp"),
-            }
-        return {"n_leaves": 1, "max_leaf_timestamp": (self.stamp or {}).get("written_at")}
+        return stamped_generation_key(block, self.stamp)
 
     def read(self, res: int, name: str) -> np.ndarray | None:
         """One group array, stamp-validated; ``None`` for an absent member.
@@ -386,16 +384,25 @@ def _readers_for(
 
 
 def _summed_generation(rows: list) -> dict:
-    """The ratchet key: child generations summed (skip-if-current basis)."""
-    n, stamps = 0, []
+    """The ratchet key: child generations summed (skip-if-current basis).
+
+    ``run_ids`` is the union over the contributing children — issue #417's
+    term; see :func:`zagg.column.generation_key`.
+    """
+    n, stamps, runs = 0, [], set()
     for row in rows:
         for reader in row:
             if _is_reader(reader):
-                gen = reader.generation()
-                n += gen["n_leaves"]
-                stamps.append(gen["max_leaf_timestamp"])
+                count, timestamp, run_ids = reader.generation()
+                n += count
+                stamps.append(timestamp)
+                runs.update(run_ids)
     stamps = [t for t in stamps if t is not None]
-    return {"n_leaves": int(n), "max_leaf_timestamp": max(stamps) if stamps else None}
+    return {
+        "n_leaves": int(n),
+        "max_leaf_timestamp": max(stamps) if stamps else None,
+        "run_ids": sorted(runs),
+    }
 
 
 def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) -> tuple:
@@ -457,6 +464,7 @@ def _merge_slabs(
         decode_digest,
         fold_dense,
         fold_digests,
+        overview_fold_delta,
     )
 
     windows = next((len(row) for row in rows if row is not None), 1)
@@ -487,7 +495,7 @@ def _merge_slabs(
             continue
         dtype = meta.get("dtype") or "float32"
         inner = tuple(meta.get("inner_shape") or (2,))
-        delta = int(meta.get("delta") or 512)
+        delta = overview_fold_delta(meta)
         out = np.full(n_out, b"", dtype=object)
         pending: dict[int, list] = {}
         for i, row in enumerate(rows):
@@ -901,12 +909,13 @@ def stage_node(
     tuple order materializes every dirty artifact node beneath the dispatch
     node — skip-if-current keyed on SUMMED CHILD GENERATIONS (the ratchet:
     a healed or appended child moves the sum and forces the rewrite; a
-    content hash cannot be had without folding, so the generation pair is
-    the gate) — and finally its own stage column (relay + gatherables),
-    unless this is the root tuple (no parent consumes it) or the all-time
-    item (the per-window columns carry the gen-1 tier; an all-time column
-    would relay merged content, breaching the merge-source law).
+    content hash cannot be had without folding, so #417's count/timestamp/
+    run-id key is the gate) — and finally its own stage column (relay +
+    gatherables), unless this is the root tuple (no parent consumes it) or
+    the all-time item (per-window columns carry the gen-1 tier; an all-time
+    column would relay merged content, breaching the merge-source law).
     """
+    from zagg.column import generation_key
     from zagg.sweep_overview import ENVELOPE_NAME, _read_envelope
     from zagg.windows import union_time_range
 
@@ -939,7 +948,7 @@ def stage_node(
             entry = entries.get(key)
             if (
                 isinstance(entry, dict)
-                and entry.get("generation") == fresh_gen
+                and generation_key(entry.get("generation")) == generation_key(fresh_gen)
                 and entry.get("regime") == regime_plan
                 and _artifact_stamp(
                     store_root, target, entry.get("object"), run_id, run_started, store_kwargs
@@ -1100,7 +1109,7 @@ def _stage_column_current(
     """Whether the dispatch node's column is committed at the fresh generation."""
     import zarr
 
-    from zagg.column import COLUMN_ATTR, column_name
+    from zagg.column import COLUMN_ATTR, column_name, generation_key
     from zagg.hive import COMMIT_ATTR
     from zagg.store import open_store
 
@@ -1121,7 +1130,8 @@ def _stage_column_current(
             f"stage column {path} carries a fresh stamp from foreign sweep run "
             f"{stamp.get('run_id')!r}; two sweeps are live on this store — aborting"
         )
-    return (attrs.get(COLUMN_ATTR) or {}).get("generation") == fresh_gen
+    stored = (attrs.get(COLUMN_ATTR) or {}).get("generation")
+    return generation_key(stored) == generation_key(fresh_gen)
 
 
 def _sweep_spec() -> str:
