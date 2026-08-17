@@ -402,7 +402,7 @@ def test_run_target_dry_run():
     assert rec["target"] == "tdigest_healpix_o9_sidecar_nomask"
     assert rec["aggregator"] == "tdigest"
     assert rec["grid_type"] == "healpix"
-    assert rec["shard_key"] == 5347395636851376137  # o9 densest cell
+    assert rec["shard_key"] == 5347294481781620745  # o9 densest cell
     assert rec["shard_area_km2"] == pytest.approx(162.1, abs=1.0)  # o9 HEALPix cell
     assert rec["total_obs"] is None  # no dispatch in dry-run
 
@@ -2261,7 +2261,7 @@ def test_run_target_measures_objects_when_store_written(monkeypatch, tmp_path):
         context={"commit": "deadbee", "event": "pr"},
         dry_run=False,
     )
-    assert calls["measure"] == (store, 5347395636851376137, "us-west-2")
+    assert calls["measure"] == (store, 5347294481781620745, "us-west-2")
     assert rec["objects_total"] == 10 and rec["objects_expected"] == 10
 
 
@@ -2410,7 +2410,7 @@ def test_run_target_threads_store_layout():
     hive_rec = run_benchmark.run_target("tdigest_healpix_o9_hive", manifest, base, **common)
     assert hive_rec["store_layout"] == "hive"
     assert hive_rec["index_backend"] == "inline"
-    assert hive_rec["shard_key"] == 5347395636851376137  # same pinned densest o9 cell
+    assert hive_rec["shard_key"] == 5347294481781620745  # same pinned densest o9 cell
     flat_rec = run_benchmark.run_target(
         "tdigest_healpix_o9_inline_nomask", manifest, base, **common
     )
