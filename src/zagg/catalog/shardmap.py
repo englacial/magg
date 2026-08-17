@@ -696,6 +696,22 @@ def _live_cells_plan(catalog, grid, chosen, footprint, mortie_order):
     cover this path would otherwise need is not materializable). espg's ruling,
     2026-08-16.
 
+    That default is **flat by measurement and superset-safe by construction**,
+    not an identity. mortie's coverage is conservative per order, so
+    ``cover(parent_order)`` is a superset of
+    ``moc_to_order(cover(chunk_order), parent_order)``: refining a fine cover
+    down does not reproduce a coarse one, and a boundary cell the fine cover
+    misses can survive at the coarse one. The direction never inverts -- a true
+    granule/shard pair is never dropped, only extra ones admitted -- and at the
+    orders production runs there is no difference at all: a 200-polygon
+    randomized sweep measured 0/200 rows differing at parent/chunk 9/13, 11/13,
+    8/12 and 9/11, against 1-2 rows and up to 0.71% extra cells at the coarse
+    pairs 6/10, 5/9 and 3/7. So the clone-scale digest match at
+    ``parent_order=9`` is real, and a coarse-grid build inherits the same
+    conservative posture the stored index already ships (the MultiPolygon
+    superset below, the AOI overhang of #101). Pinned by
+    ``TestLiveCover::test_coarse_shard_order_covers_a_superset``.
+
     An explicit ``mortie_order`` is still **honored literally**: it is a request
     for a cover at that order, so the cover runs there whatever it costs, and is
     validated against ``parent_order`` exactly as the geometry path validates it.
@@ -804,6 +820,11 @@ def _resolve_mortie_order(mortie_order, grid) -> int:
     HEALPix ``swath`` path covers from WKB instead and defaults to
     ``parent_order`` on the same sweep evidence quoted above, calling this only
     to honor (and validate) an explicit pin -- see :func:`_live_cells_plan`.
+    The sweep makes those two defaults *measurably* equal at production orders,
+    not equal by construction: a cover at ``parent_order`` is a superset of the
+    same footprint covered here and refined down, never a subset, and the gap is
+    reachable at coarse shard orders. :func:`_live_cells_plan` carries the
+    numbers.
     """
     is_healpix = hasattr(grid, "parent_order") and hasattr(grid, "child_order")
     if mortie_order is not None:
@@ -1257,7 +1278,13 @@ class ShardMap:
         real-catalog sweep in :func:`_resolve_mortie_order` measures granules per
         shard flat -- so an unpinned unindexed build records
         ``mortie_order = parent_order`` where it used to record the chunk order.
-        Same assignment, less cover. A caller-pinned ``mortie_order`` is still
+        Same assignment at the orders production runs (byte-identical over the
+        555,867-granule clone, and 0/200 rows differing in a randomized sweep at
+        parent/chunk 9/13, 11/13, 8/12 and 9/11), and **superset-safe** in
+        general: mortie's coverage is conservative per order, so the coarser
+        cover can admit a boundary shard that the finer cover refined down
+        misses -- up to 0.71% extra cells at 3/7 -- and never drops one. See
+        :func:`_live_cells_plan`. A caller-pinned ``mortie_order`` is still
         honored literally. Unchanged paths: ``footprint="beams"`` (the cover is
         the swath, not the corridors), the spherely backend, rectilinear grids,
         and paired builds (issue #425).
