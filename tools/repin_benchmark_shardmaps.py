@@ -106,6 +106,12 @@ def prune_to_pin(rebuilt: ShardMap, key: int, note: str) -> ShardMap:
     ``total_pairs`` count the ring, not the surviving shard), matching the
     committed maps, and ``note`` is carried over verbatim: it is editorial
     prose, not a derived quantity.
+
+    ``aoi_mask`` is sliced with ``shard_keys`` rather than dropped: it is
+    documented as parallel to them (``ShardMap``), so positional construction
+    would silently write a maskless map, and slicing it wrong would be worse
+    still. No committed benchmark map carries one today (the strict-AOI arm
+    builds its mask at dispatch), so this is the latent case, not a live one.
     """
     i = [j for j, k in enumerate(rebuilt.shard_keys) if int(k) == key][0]
     return ShardMap(
@@ -113,6 +119,7 @@ def prune_to_pin(rebuilt: ShardMap, key: int, note: str) -> ShardMap:
         [rebuilt.shard_keys[i]],
         [rebuilt.granules[i]],
         {**rebuilt.metadata, "pruned": note},
+        aoi_mask=None if rebuilt.aoi_mask is None else [rebuilt.aoi_mask[i]],
     )
 
 
