@@ -42,6 +42,7 @@ from zagg.processing.read import (
     _record_obs_read,
     _select_column,
     _variable_specs,
+    link_base_extent,
 )
 from zagg.read_plan import execute_read_plan, plan_read
 
@@ -100,11 +101,18 @@ def expand_link_indices(
     the same origin (``index_base``) and empty-record discipline as
     :func:`zagg.processing.read._broadcast_segment_to_base`.
 
-    ``n_base`` is the caller's: :func:`_vlen_read_group` derives it as
-    ``Σcount`` under #43's contiguity assumption, so through the route the
-    ``-1`` rows are unreachable (a granule that leaves a hole raises here
-    instead) — the tolerance is for the offline/unit callers that pass a base
-    extent of their own.
+    ``n_base`` is the caller's: :func:`_vlen_read_group` derives it from the
+    link itself (:func:`zagg.processing.read.link_base_extent`, issue #452). On
+    a strided product the ``-1`` rows are ROUTINE — the slack between a
+    record's valid samples and the next record's window start (GEDI L1B: ~50%
+    of the rows a plan decodes) — and are dropped downstream by the
+    ``valid & mask_spatial`` test, never assigned a neighbor's record. That
+    handling is load-bearing, not defensive: GEDI's slack is **zero-filled in
+    the product** (``rx_sample_start_index`` steps by exactly 1,420 with
+    ``rx_sample_count`` ~701, and ``rxwaveform[701:1420]`` of each window reads
+    as literal zeros), so a gap row that leaked through would aggregate as a
+    real zero-amplitude sample. On a contiguous product these rows do not
+    occur. A record reaching past ``n_base`` still raises rather than wrapping.
     """
     parent_idx = np.full(n_base, -1, dtype=np.int64)
     within_idx = np.zeros(n_base, dtype=np.int64)
@@ -297,16 +305,22 @@ def _vlen_read_group(
     if len(coarse_lats) == 0:
         _record_obs_read(io_stats, 0)
         return None
-    # ``n_base`` under #43's contiguity assumption, exactly as the dense route
-    # derives it (:func:`zagg.processing.read._planned_read_group`): the record
-    # ranges neither overlap nor leave holes, so ``Σcount`` IS the flat array's
-    # length. The route therefore never reaches the ``parent_idx == -1`` rows
-    # the gather helpers below define — a granule that violates the assumption
-    # raises out of the gather map ("does not tile the declared base extent")
-    # instead of silently borrowing a neighbor's record, which is the property
-    # those rows exist to guarantee. The helpers stay gap-tolerant because they
-    # are also the offline/unit surface, where ``n_base`` is the caller's.
-    n_base = int(cnt_arr.sum())
+    # The base extent the record link tiles (issue #452): the last base row any
+    # non-empty record reaches. Contiguous products make that ``Σcount`` (#43's
+    # assumption, ATL03's shape); STRIDED ones do not — GEDI L1B gives every
+    # shot a fixed 1,420-sample window in ``rxwaveform`` and counts only the
+    # valid samples, so ``Σcount`` understates the array by ~50%, ``plan_read``
+    # clamps every run to ``base_end <= base_start``, and the group returns
+    # zero rows with no error raised. Under striding the slack rows between
+    # records are ROUTINE (143k of 310k planned rows on the reference shard):
+    # they belong to no record, so the gather map marks them ``parent_idx ==
+    # -1``, ``synthesize_linspace`` NaNs them, and ``valid & mask_spatial``
+    # drops them before a single column is assembled. That drop is the
+    # correctness guarantee, not a nicety: GEDI zero-fills the slack in the
+    # product (the tail of each 1,420-sample window past ``rx_sample_count``
+    # reads as literal zeros), so any row that leaked through would land in a
+    # cell as a real zero-amplitude sample — ~46% of the fetched span.
+    n_base = link_base_extent(ibeg_arr, cnt_arr, index_base)
     if n_base <= 0:
         _record_obs_read(io_stats, 0)
         return None
@@ -419,7 +433,23 @@ def _vlen_read_group(
             workers,
         )
     else:
-        arrays_by_path = _read_full(base_paths)
+        # Full arm: the flat datasets may be LONGER than the link's extent — a
+        # strided product pads the tail of its last record's window (GEDI:
+        # 1,420 samples allocated, ``count`` valid). Those rows belong to no
+        # record, so trim them here and keep every base-rate array the same
+        # length as the gather map (issue #452). A dataset SHORTER than the
+        # extent is a real inconsistency (the link over-runs the array) and is
+        # reported with the gather map's wording.
+        arrays_by_path = {}
+        for path, arr in _read_full(base_paths).items():
+            arr = np.asarray(arr)
+            if len(arr) < n_base:
+                raise ValueError(
+                    f"dataset {path!r} has {len(arr)} rows, fewer than the record "
+                    f"link's base extent {n_base}; the record link does not tile "
+                    f"the declared base extent"
+                )
+            arrays_by_path[path] = arr[:n_base]
 
     # ---- Filters. Base-level structured predicates over the gathered rows;
     # record-level predicates expand to base rate via each level's link (the

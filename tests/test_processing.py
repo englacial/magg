@@ -28,6 +28,7 @@ from zagg.processing import (
     _read_segment_broadcasts,
     _segment_level_variables,
     calculate_cell_statistics,
+    link_base_extent,
     process_shard,
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
@@ -4459,6 +4460,69 @@ class TestExpandMaskToBase:
         cnt = np.array([2, 0, 2])
         out = _expand_mask_to_base(coarse, ibeg, cnt, index_base=1, total_base_size=4)
         np.testing.assert_array_equal(out, [True, True, True, True])
+
+
+class TestLinkBaseExtent:
+    """``link_base_extent``: the base extent a record link tiles (issue #452).
+
+    A no-op on the contiguous links this route reads — it reduces to ``Σcount``,
+    pinned below down to the byte-identical planned hyperslices. The correction
+    is for strided products, where ``Σcount`` understates the flat array and
+    ``plan_read`` clamps every run to an empty slice."""
+
+    def test_contiguous_equals_sum_of_counts(self):
+        ibeg = np.arange(0, 12, 2, dtype=np.int64)
+        cnt = np.full(6, 2, dtype=np.int64)
+        assert link_base_extent(ibeg, cnt, 0) == int(cnt.sum()) == 12
+
+    def test_atl03_shaped_link_equals_sum_of_counts(self):
+        # Origin-1 starts with issue #116 empties (``ph_index_beg == 0``): the
+        # empties are skipped, so the extent is still ``Σcount``.
+        ibeg = np.array([1, 0, 3, 0, 5], dtype=np.int64)
+        cnt = np.array([2, 0, 2, 0, 2], dtype=np.int64)
+        assert link_base_extent(ibeg, cnt, 1) == int(cnt.sum()) == 6
+
+    def test_strided_link_exceeds_sum_of_counts(self):
+        # The GEDI L1B shape: a fixed window per record, count == valid samples.
+        ibeg = np.array([1, 1421, 2841], dtype=np.int64)
+        cnt = np.array([700, 800, 650], dtype=np.int64)
+        assert int(cnt.sum()) == 2150
+        assert link_base_extent(ibeg, cnt, 1) == 2840 + 650
+
+    def test_single_record_and_index_base(self):
+        assert link_base_extent(np.array([0]), np.array([5]), 0) == 5
+        assert link_base_extent(np.array([1]), np.array([5]), 1) == 5
+
+    def test_all_empty_link_is_zero(self):
+        assert link_base_extent(np.array([0, 0]), np.array([0, 0]), 1) == 0
+        assert link_base_extent(np.array([], dtype=np.int64), np.array([], dtype=np.int64), 0) == 0
+
+    def test_planned_read_hyperslices_unchanged(self):
+        """The contiguous (ATL03-shaped) planned read stays byte-identical."""
+
+        class _RecordingH5(_FakeH5):
+            def __init__(self, arrays):
+                super().__init__(arrays)
+                self.requests = []
+
+            def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+                for d in datasets:
+                    if isinstance(d, dict) and d["hyperslice"]:
+                        self.requests.append((d["dataset"], tuple(map(tuple, d["hyperslice"]))))
+                return super().readDatasets(datasets)
+
+        ds = _planned_read_data_source()
+        h5 = _RecordingH5(_planned_read_h5()._arrays)
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
+        # Exactly the three base-rate reads over photons 2..5 (the plan's one
+        # run), unchanged by deriving the extent from the link.
+        assert sorted(h5.requests) == [
+            ("/heights/h", ((2, 6),)),
+            ("/heights/lat_ph", ((2, 6),)),
+            ("/heights/lon_ph", ((2, 6),)),
+        ]
 
 
 class TestReadGroupCrossLevel:

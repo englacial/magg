@@ -50,6 +50,7 @@ from zagg.processing.read import (
     _read_segment_broadcasts,
     _segment_level_variables,
     _validate_planned_config,
+    link_base_extent,
 )
 
 # ``worker`` imports this package (``import zagg.processing as _processing``) but
@@ -114,6 +115,7 @@ __all__ = [
     "_read_segment_broadcasts",
     "_segment_level_variables",
     "_validate_planned_config",
+    "link_base_extent",
     # write-stage helpers
     "_arrow_column",
     "_build_output",
