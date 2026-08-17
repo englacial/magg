@@ -162,27 +162,27 @@ aggregation:
       function: "zagg.stats.waveform.single_shot_value"
       source: noise_mean
       dtype: float32
-      fill_value: .nan
+      fill_value: "NaN"
     noise_stddev:
       function: "zagg.stats.waveform.single_shot_value"
       source: noise_stddev
       dtype: float32
-      fill_value: .nan
+      fill_value: "NaN"
     rx_energy:
       function: "zagg.stats.waveform.single_shot_value"
       source: rx_energy
       dtype: float32
-      fill_value: .nan
+      fill_value: "NaN"
     elevation_bin0:
       function: "zagg.stats.waveform.single_shot_value"
       source: elevation_bin0
       dtype: float64
-      fill_value: .nan
+      fill_value: "NaN"
     elevation_lastbin:
       function: "zagg.stats.waveform.single_shot_value"
       source: elevation_lastbin
       dtype: float64
-      fill_value: .nan
+      fill_value: "NaN"
 
 output:
   grid:

@@ -175,8 +175,56 @@ def load_config(path: str) -> PipelineConfig:
     return cfg
 
 
+def _is_float_nan(value) -> bool:
+    """Whether ``value`` is a float NaN (YAML ``.nan`` / ``float("nan")``)."""
+    return isinstance(value, float) and np.isnan(value)
+
+
+def _has_nan_fill(node) -> bool:
+    """Whether any ``fill_value`` anywhere under ``node`` is a float NaN."""
+    if isinstance(node, dict):
+        return any(
+            _is_float_nan(v) if k == "fill_value" else _has_nan_fill(v) for k, v in node.items()
+        )
+    if isinstance(node, list):
+        return any(_has_nan_fill(v) for v in node)
+    return False
+
+
+def _normalize_nan_fills(node):
+    """Rewrite float-NaN ``fill_value`` declarations to the string ``"NaN"``.
+
+    YAML's ``.nan`` parses to a float NaN, which ``json.dumps`` emits as the
+    non-standard token ``NaN`` -- Lambda's strict JSON parser rejects the whole
+    dispatch payload (``InvalidRequestContentException``, issue #448). The
+    string is the grammar's native form everywhere else: it is the healpix /
+    rect template default (``meta.get("fill_value", "NaN")``), what
+    :func:`_is_nan_fill` and the aggregate/spill/streaming fill checks compare
+    against, and zarr v3's JSON fill encoding. Canonicalizing at load keeps
+    ``.nan`` legal in authored YAML while guaranteeing one wire form -- and one
+    form for the semantic hash.
+
+    Returns the node unchanged (same object) when there is nothing to rewrite,
+    so the common case allocates nothing and callers keep their dict identity.
+    """
+    if not _has_nan_fill(node):
+        return node
+    if isinstance(node, dict):
+        return {
+            k: "NaN" if (k == "fill_value" and _is_float_nan(v)) else _normalize_nan_fills(v)
+            for k, v in node.items()
+        }
+    return [_normalize_nan_fills(v) for v in node]
+
+
 def load_config_from_dict(d: dict) -> PipelineConfig:
     """Build a PipelineConfig from a plain dict (e.g. Lambda JSON payload).
+
+    Float-NaN ``fill_value`` declarations are canonicalized to the string
+    ``"NaN"`` here (issue #448) -- this is the single funnel every config
+    passes through (``load_config``, ``default_config``, the client, and the
+    Lambda worker's ``event["config"]``), so no config reaches a dispatch
+    payload carrying a value ``json.dumps(..., allow_nan=False)`` refuses.
 
     Parameters
     ----------
@@ -187,6 +235,7 @@ def load_config_from_dict(d: dict) -> PipelineConfig:
     -------
     PipelineConfig
     """
+    d = _normalize_nan_fills(d)
     return PipelineConfig(
         data_source=d.get("data_source", {}),
         aggregation=d.get("aggregation", {}),

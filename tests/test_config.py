@@ -1,5 +1,6 @@
 """Tests for the YAML pipeline configuration system."""
 
+import json
 from dataclasses import asdict
 
 import numpy as np
@@ -2710,3 +2711,132 @@ class TestNanAmbiguousReductionWarning:
         cfg = default_config("atl06")  # h_min/h_max: min/max, float32, NaN default
         validate_config(cfg)  # must NOT raise
         assert "h_min" in caplog.text and "h_max" in caplog.text
+
+
+class TestNanFillCanonicalization:
+    """Float-NaN ``fill_value`` normalizes to the string ``"NaN"`` at load
+    (issue #448).
+
+    YAML ``.nan`` parses to a float NaN; ``json.dumps`` emits the non-standard
+    token ``NaN``, and Lambda's strict parser refuses the whole dispatch
+    payload (``InvalidRequestContentException``). The string form is the
+    grammar's native one, so the fix is a canonicalization at the single load
+    funnel rather than a new spelling rule for config authors.
+    """
+
+    def _cfg_dict(self, fill):
+        return {
+            "data_source": {
+                "reader": "h5coro",
+                "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+                "variables": {"h": "/h"},
+            },
+            "aggregation": {
+                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+                "variables": {
+                    "h_mean": {
+                        "function": "mean",
+                        "source": "h",
+                        "dtype": "float32",
+                        "fill_value": fill,
+                    }
+                },
+            },
+            "output": {
+                "store": ".",
+                "grid": {"type": "healpix", "parent_order": 6, "child_order": 12},
+            },
+        }
+
+    def test_yaml_nan_loads_as_the_string(self, tmp_path):
+        import yaml
+
+        path = tmp_path / "c.yaml"
+        path.write_text(yaml.safe_dump(self._cfg_dict(float("nan"))))
+        assert "fill_value: .nan" in path.read_text()  # the YAML spelling under test
+        cfg = load_config(str(path))
+        assert cfg.aggregation["variables"]["h_mean"]["fill_value"] == "NaN"
+
+    def test_dict_nan_normalizes(self):
+        cfg = load_config_from_dict(self._cfg_dict(float("nan")))
+        assert cfg.aggregation["variables"]["h_mean"]["fill_value"] == "NaN"
+
+    def test_nan_free_config_is_not_copied(self):
+        # No NaN anywhere -> the input sub-dicts are passed through untouched,
+        # so callers that hold a reference (and the identity assumptions in
+        # the runner's per-cell config splicing) are unaffected.
+        d = self._cfg_dict(0.0)
+        cfg = load_config_from_dict(d)
+        assert cfg.aggregation is d["aggregation"]
+        assert cfg.data_source is d["data_source"]
+
+    def test_normalized_config_serializes_strictly(self):
+        cfg = load_config_from_dict(self._cfg_dict(float("nan")))
+        json.dumps(asdict(cfg), allow_nan=False)  # must not raise
+
+    def test_both_spellings_hash_identically(self):
+        from zagg.semantics import semantic_hash
+
+        from_nan = load_config_from_dict(self._cfg_dict(float("nan")))
+        from_str = load_config_from_dict(self._cfg_dict("NaN"))
+        assert semantic_hash(from_nan) == semantic_hash(from_str)
+
+    def test_string_form_is_a_nan_fill_and_reaches_the_template(self, tmp_path):
+        # The two consumers the normalization hands the string to: the
+        # #201 warning's NaN test, and the healpix template's fill_value.
+        import zarr
+        from zarr.storage import MemoryStore
+
+        from zagg.config import _is_nan_fill
+        from zagg.grids import from_config
+
+        cfg = load_config_from_dict(self._cfg_dict(float("nan")))
+        assert _is_nan_fill(cfg.aggregation["variables"]["h_mean"])
+        grid = from_config(cfg)
+        store = grid.emit_template(MemoryStore())
+        group = zarr.open_group(store, path=grid.group_path, mode="r")
+        assert np.isnan(group["h_mean"].fill_value)
+
+
+class TestPackagedConfigsAreDispatchable:
+    """Every packaged config must survive the strict JSON the Lambda dispatch
+    payload is built with (issue #448).
+
+    The dispatch event's ``config`` block is ``dataclasses.asdict(config)``
+    (``runner._dispatch_lambda`` -> ``_invoke_lambda_ping`` /
+    ``_invoke_lambda``), serialized by ``json.dumps``. ``allow_nan=False`` is
+    exactly what Lambda's parser enforces, so a config that fails here is a
+    config that cannot be dispatched.
+    """
+
+    def _packaged_names(self):
+        from importlib import resources
+
+        import zagg.configs
+
+        return sorted(
+            p.name[: -len(".yaml")]
+            for p in resources.files(zagg.configs).iterdir()
+            if p.name.endswith(".yaml")
+        )
+
+    def test_names_found(self):
+        names = self._packaged_names()
+        assert "atl06" in names and "gedi01b_waveform_healpix_hive" in names
+
+    def test_every_packaged_config_serializes_strictly(self):
+        for name in self._packaged_names():
+            cfg = default_config(name)
+            json.dumps(asdict(cfg), allow_nan=False)  # must not raise
+
+    def test_gedi_companions_declare_the_string_form(self):
+        cfg = default_config("gedi01b_waveform_healpix_hive")
+        companions = [
+            "noise_mean",
+            "noise_stddev",
+            "rx_energy",
+            "elevation_bin0",
+            "elevation_lastbin",
+        ]
+        for name in companions:
+            assert cfg.aggregation["variables"][name]["fill_value"] == "NaN"
