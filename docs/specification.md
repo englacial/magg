@@ -1824,12 +1824,13 @@ storage geometry (§1.5). It is an ordinary dense array — not a
 - Each observation enters under §8.1's discipline: an instant as a
   **timestamp** word, exact to the nanosecond; a real interval (an
   integration window — an observation need not be instantaneous) as a
-  **range** word conservatively containing it. A cell covering exactly one
-  instantaneous observation therefore holds its exact timestamp word; a
-  cell pooling more than one observation — or covering any non-instant one
-  — holds a **range** word conservatively containing every observation
-  pooled into it. Instants never widened, intervals never narrowed, **per
-  observation, not per count**.
+  **range** word conservatively containing it. A cell's stored word is the
+  join of its observations' words (below): a **timestamp** word exactly when
+  that join is a single instant — a cell covering one instantaneous
+  observation, or several sharing one instant — and a **range** word
+  conservatively containing every observation pooled into it otherwise.
+  Instants never widened, intervals never narrowed, **per observation, not
+  per count**.
 - **The pooled word is the grammar's join.** A cell's word over a set of
   observations is `toc_merge` (the grammar's semilattice join) reduced over
   their individual words: the conservative envelope. The join is
