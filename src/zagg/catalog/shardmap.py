@@ -1080,7 +1080,18 @@ class ShardMap:
         # granule's MOC, so the build is set algebra against the AOI with no
         # geometry work. Resolved before the geometry backends because it is the
         # same mortie intersection they would run, minus the cover.
+        #
+        # Inside the timer, as it was before the inversion: ``build_wall_s`` has
+        # always spanned the plan as well as the intersection, and the plan is
+        # where the record -> row alignment lives (an id -> row dict then, the
+        # ``granule_row_mask`` screen now -- 0.47 s at clone scale). Timing only
+        # the intersection would make this branch's number incomparable with the
+        # ``build_wall_s`` already recorded in existing manifests. Two segments
+        # rather than one span because the geometry path's ``granule_records``
+        # sits between them and has always been outside (issue #439).
+        t0 = time.perf_counter()
         plan = _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order)
+        plan_wall = time.perf_counter() - t0
         # Records are the fast path's whole remaining cost -- shapely-parsing
         # every row's WKB and ``to_pylist``-ing the nested assets column ran ~25 s
         # of a 29.5 s clone-scale build, to feed an intersection that discards
@@ -1111,10 +1122,10 @@ class ShardMap:
                 footprint=footprint,
                 product=product,
             )
-        wall = time.perf_counter() - t0
+        wall = plan_wall + (time.perf_counter() - t0)
         if plan is not None:
-            # Outside the timer on purpose: ``build_wall_s`` has always meant the
-            # intersection's wall, with record decode outside it.
+            # Outside the timer on purpose: ``build_wall_s`` covers the plan and
+            # the intersection, and record decode has never been part of it.
             records, shard_to_idx = _hit_records(catalog, rows, shard_to_idx)
 
         from zagg.catalog.sources import FOOTPRINT_CELLS_ORDER
