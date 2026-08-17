@@ -101,60 +101,73 @@ def _config_for_shardmap(sm_key: str) -> Path:
     raise AssertionError(f"no target references shardmap '{sm_key}'")
 
 
-@pytest.mark.slow
-@needs_cmr
-@pytest.mark.parametrize("sm_key", list(MANIFEST["shardmaps"]))
-def test_pinned_shardmap_no_drift(sm_key):
+def rebuild_shardmap(sm_key: str, sm_meta: dict):
+    """Rebuild one shard map from its ``targets.json`` entry — THE recipe.
+
+    Entry config → grid; the entry's resolved AOI/temporal/CMR (a per-entry
+    override, issue #121, over the top-level manifest default — NEON entries
+    carry none); the committed map's ``metadata.backend``; and either the
+    committed ``catalog_parquet`` snapshot when the entry carries one or a live
+    CMR fetch when it does not.
+
+    Build-once catalog (issue #148): an entry carrying ``catalog_parquet``
+    rebuilds from the committed stac-geoparquet snapshot instead of re-fetching
+    CMR — the rebuild is then deterministic and offline, per the catalog design
+    (fetch once, save the parquet, reuse). Regenerate the snapshot only to
+    deliberately re-pin.
+
+    Shared with the issue #444 re-pin driver rather than restated there: the
+    drift guard and its deliberate counterpart must build the same way, and a
+    second copy of this recipe is exactly what would let them drift apart.
+    """
     from zagg.catalog import load_polygon, polygon_to_bbox
     from zagg.catalog.shardmap import ShardMap
     from zagg.catalog.sources import Catalog, CMRSource, Query
     from zagg.config import load_config
     from zagg.grids import from_config
 
-    sm_meta = MANIFEST["shardmaps"][sm_key]
-    committed = json.loads((BENCH / sm_meta["path"]).read_text())
-    backend = committed["metadata"]["backend"]
-    if backend == "spherely":
-        pytest.importorskip("spherely")
-
-    cfg = load_config(str(_config_for_shardmap(sm_key)))
-    grid = from_config(cfg)
-    # Resolve this shard map's AOI/temporal/CMR: a per-entry override (issue #121)
-    # falls back to the top-level manifest default. NEON entries have no override.
+    backend = json.loads((BENCH / sm_meta["path"]).read_text())["metadata"]["backend"]
+    grid = from_config(load_config(str(_config_for_shardmap(sm_key))))
     aoi, temporal, cmr = resolve_aoi_temporal_cmr(sm_meta)
     # aoi.file is relative to the manifest dir, like the config/shardmap paths.
     parts = load_polygon(str(BENCH / aoi["file"]))
-
     if sm_meta.get("catalog_parquet"):
-        # Build-once catalog (issue #148): an entry carrying ``catalog_parquet``
-        # rebuilds from the committed stac-geoparquet snapshot instead of
-        # re-fetching CMR -- the drift check then guards the shardmap build +
-        # pin deterministically and offline, per the catalog design (fetch
-        # once, save the parquet, reuse). Regenerate the snapshot only to
-        # deliberately re-pin.
         catalog = Catalog.from_geoparquet(str(BENCH / sm_meta["catalog_parquet"]))
     else:
-        query = Query(
-            cmr["short_name"],
-            cmr["version"],
-            temporal["start"],
-            temporal["end"],
-            region=polygon_to_bbox(parts),
-            provider=cmr["provider"],
+        catalog = CMRSource().fetch(
+            Query(
+                cmr["short_name"],
+                cmr["version"],
+                temporal["start"],
+                temporal["end"],
+                region=polygon_to_bbox(parts),
+                provider=cmr["provider"],
+            )
         )
-        catalog = CMRSource().fetch(query)
-    rebuilt = ShardMap.build(
-        catalog, grid, region=parts, backend=backend, footprint=cmr["footprint"]
-    )
+    return ShardMap.build(catalog, grid, region=parts, backend=backend, footprint=cmr["footprint"])
 
-    # A nested pin (issue #148: the 88S o10 stress shard is the densest o10
-    # shard INSIDE the pinned o9 stress shard, so one o9 extraction pass covers
-    # both orders) is compared against the same nested quantity, not the global
-    # densest — otherwise a correct rebuild would read as drift.
+
+def select_pin(rebuilt, sm_meta: dict, parent_key: int | None = None) -> tuple[int, int]:
+    """The ``(shard_key, n_granules)`` pin for a rebuilt map — THE pin rule.
+
+    A nested pin (issue #148: the 88S o10 stress shard is the densest o10 shard
+    INSIDE the pinned o9 stress shard, so one o9 extraction pass covers both
+    orders) is selected over the shards nested in the parent's pin, never the
+    global densest — otherwise a correct rebuild would read as drift.
+
+    ``parent_key`` lets the issue #444 driver extract against a parent pin it
+    has just rewritten on disk; the guard passes none and reads the manifest as
+    loaded at import. Shared with that driver for the same reason as
+    :func:`rebuild_shardmap`.
+    """
+    from zagg.config import load_config
+    from zagg.grids import from_config
+
     shard_keys, granules = rebuilt.shard_keys, rebuilt.granules
     nested_in = sm_meta.get("nested_in")
     if nested_in:
-        parent_key = int(MANIFEST["shardmaps"][nested_in]["shard_key"])
+        if parent_key is None:
+            parent_key = int(MANIFEST["shardmaps"][nested_in]["shard_key"])
         parent_grid = from_config(load_config(str(_config_for_shardmap(nested_in))))
         keep = [
             i
@@ -163,8 +176,19 @@ def test_pinned_shardmap_no_drift(sm_key):
         ]
         shard_keys = [shard_keys[i] for i in keep]
         granules = [granules[i] for i in keep]
+    return bench_metrics.select_densest_shard({"shard_keys": shard_keys, "granules": granules})
 
-    key, n = bench_metrics.select_densest_shard({"shard_keys": shard_keys, "granules": granules})
+
+@pytest.mark.slow
+@needs_cmr
+@pytest.mark.parametrize("sm_key", list(MANIFEST["shardmaps"]))
+def test_pinned_shardmap_no_drift(sm_key):
+    sm_meta = MANIFEST["shardmaps"][sm_key]
+    committed = json.loads((BENCH / sm_meta["path"]).read_text())
+    if committed["metadata"]["backend"] == "spherely":
+        pytest.importorskip("spherely")
+
+    key, n = select_pin(rebuild_shardmap(sm_key, sm_meta), sm_meta)
     pinned_n = sm_meta["n_granules"]
     # Tie-tolerant: the densest *count* is the stable quantity; an equally-dense
     # reselection (different key, same count) is fine -- a count drift is not.
