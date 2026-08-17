@@ -14,7 +14,7 @@ from zagg.config import (
     PipelineConfig,
     validate_config,
 )
-from zagg.processing.read import _read_group
+from zagg.processing.read import _read_group, link_base_extent
 from zagg.processing.read_vlen import (
     expand_link_indices,
     synthesize_linspace,
@@ -743,3 +743,181 @@ class TestGediTemplate:
         np.testing.assert_allclose(
             np.sort(flux[:, 1]), np.sort((WAVE[:5] - NOISE_MEAN[0]).astype(np.float32))
         )
+
+
+# ── strided records (the GEDI L1B shape — issue #452) ────────────────────────
+#
+# The packed fixture above is the pathological case that hid the bug: its
+# records tile ``rxwaveform`` end to end, so ``Σcount`` happens to equal the
+# array length. Real GEDI L1B is STRIDED — ``rx_sample_start_index`` steps by a
+# fixed 1,420-sample window per shot while ``rx_sample_count`` is the valid
+# sample count — and the slack between a record's valid samples and the next
+# window is ZERO-FILLED in the product. Same four shots, same counts, starts
+# strided by 6, and 2 samples of tail padding past the last record:
+#
+#   row   0 1 2 3 4 | 5 | 6 7 8 | 9 10 11 | 12 | 13..17 | 18 19 20 21 | 22 23
+#   shot  101 ..... | . | 102 . | ....... | 103| ...... | 104 ....... | .....
+#
+# ``Σcount`` is 13 but the link's extent is 22: under the old derivation
+# ``plan_read`` clamped every run to ``base_end <= base_start`` and the group
+# returned zero rows with no error (the 0.45.0 fleet smoke).
+
+STARTS_STRIDED = np.array([1, 7, 13, 19], dtype=np.uint64)  # origin-1, stride 6
+WAVE_STRIDED = np.zeros(24, dtype=np.float32)  # slack is zero-filled, as in GEDI
+WAVE_STRIDED[0:5] = WAVE[0:5]
+WAVE_STRIDED[6:9] = WAVE[5:8]
+WAVE_STRIDED[12] = WAVE[8]
+WAVE_STRIDED[18:22] = WAVE[9:13]
+STRIDED_EXTENT = 22
+SLACK_ROWS = [5, 9, 10, 11, 13, 14, 15, 16, 17, 22, 23]
+
+
+def _l1b_arrays_strided(group="BEAM0000"):
+    arrays = _l1b_arrays(group)
+    arrays[f"/{group}/rxwaveform"] = WAVE_STRIDED
+    arrays[f"/{group}/rx_sample_start_index"] = STARTS_STRIDED
+    return arrays
+
+
+class _LastShotGrid:
+    """Grid stub: shard 1 for lat >= 12.5 (the last shot only), else 0."""
+
+    @staticmethod
+    def assign(lats, lons):
+        return (np.asarray(lats) >= 12.5).astype(np.uint64)
+
+    @staticmethod
+    def shards_of(leaf_ids):
+        return np.asarray(leaf_ids).astype(int)
+
+
+class TestStridedRecords:
+    """A strided twin of the packed fixture: same rows out, none from the slack."""
+
+    def test_extent_exceeds_sum_of_counts(self):
+        assert link_base_extent(STARTS_STRIDED, COUNTS, 1) == STRIDED_EXTENT
+        assert int(COUNTS.sum()) == 13 < STRIDED_EXTENT
+
+    def test_full_read_row_parity_with_the_packed_fixture(self):
+        strided = _read_group(
+            _FakeH5(_l1b_arrays_strided()), "BEAM0000", _vlen_ds(), 0, _OneShardGrid()
+        )
+        packed = _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+        assert len(strided) == len(packed) == 13
+        for col in ("rxwaveform", "shot_number", "noise_mean", "elevation"):
+            np.testing.assert_allclose(strided[col].to_numpy(), packed[col].to_numpy())
+
+    def test_no_slack_row_leaks_into_the_output(self):
+        df = _read_group(_FakeH5(_l1b_arrays_strided()), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+        # Every returned sample comes from a record's valid range; the slack is
+        # zero-filled in the product, so a leaked row would show up as a real
+        # zero-amplitude sample (and inflate the row count).
+        assert (df["rxwaveform"].to_numpy() != 0.0).all()
+        np.testing.assert_array_equal(
+            df["rxwaveform"].to_numpy(), WAVE_STRIDED[[r for r in range(24) if r not in SLACK_ROWS]]
+        )
+
+    def test_planned_read_selects_shard_records(self):
+        # Shard 1 holds shots 103 + 104 (lat >= 11.5) -> one run -> base rows
+        # 12..21: 5 real samples and 5 slack, the ~1.9x read amplification
+        # striding costs. Only the real ones come back.
+        ds = _vlen_ds(read_plan={"spatial_index": "shots", "pad": 0})
+        io_stats: dict = {}
+        df = _read_group(
+            _FakeH5(_l1b_arrays_strided()), "BEAM0000", ds, 1, _LatGrid(), io_stats=io_stats
+        )
+        assert io_stats["obs_read"] == 10  # rows DECODED, slack included
+        assert len(df) == 5
+        assert df["shot_number"].tolist() == [103] + [104] * 4
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), WAVE[8:13])
+
+    def test_planned_matches_full(self):
+        ds_plan = _vlen_ds(read_plan={"spatial_index": "shots", "pad": 1})
+        for shard in (0, 1):
+            a = _read_group(_FakeH5(_l1b_arrays_strided()), "BEAM0000", ds_plan, shard, _LatGrid())
+            b = _read_group(
+                _FakeH5(_l1b_arrays_strided()), "BEAM0000", _vlen_ds(), shard, _LatGrid()
+            )
+            for col in ("rxwaveform", "shot_number", "noise_mean", "elevation"):
+                np.testing.assert_allclose(a[col].to_numpy(), b[col].to_numpy())
+
+    def test_sum_of_counts_extent_returns_the_silent_zero(self, monkeypatch):
+        # The bug, pinned: with the extent derived as Σcount (13), the last
+        # shot's run starts past the phantom end (row 18), ``plan_read`` clamps
+        # it to ``base_end <= base_start``, and the group returns no rows and no
+        # error -- the 0.45.0 fleet smoke, one shard at a time.
+        import zagg.processing.read_vlen as rv
+
+        ds = _vlen_ds(read_plan={"spatial_index": "shots", "pad": 0})
+        h5, grid = _FakeH5(_l1b_arrays_strided()), _LastShotGrid()
+        io_stats: dict = {}
+        monkeypatch.setattr(rv, "link_base_extent", lambda ibeg, cnt, base: int(np.sum(cnt)))
+        assert _read_group(h5, "BEAM0000", ds, 1, grid, io_stats=io_stats) is None
+        assert io_stats["obs_read"] == 0
+        monkeypatch.undo()
+        df = _read_group(_FakeH5(_l1b_arrays_strided()), "BEAM0000", ds, 1, grid)
+        assert df["shot_number"].tolist() == [104] * 4
+
+    def test_record_level_filter_expands_at_planned_rate(self):
+        # degrade == 0 at the shots level drops shot 103's single sample; the
+        # cross-level expansion now gathers per planned row (searchsorted over
+        # the level's link) instead of painting the base extent.
+        ds = _vlen_ds(
+            read_plan={"spatial_index": "shots", "pad": 0},
+            filters=[
+                {
+                    "level": "shots",
+                    "dataset": "/{group}/geolocation/degrade",
+                    "op": "eq",
+                    "value": 0,
+                }
+            ],
+        )
+        df = _read_group(_FakeH5(_l1b_arrays_strided()), "BEAM0000", ds, 1, _LatGrid())
+        assert df["shot_number"].tolist() == [104] * 4
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), WAVE[9:13])
+
+    def test_sibling_join_expands_at_planned_rate(self):
+        ds = _vlen_ds(
+            read_plan={"spatial_index": "shots", "pad": 0},
+            assets={
+                "l2a": {"join": {"left": "/{group}/shot_number", "right": "/{group}/shot_number"}}
+            },
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1}],
+        )
+        df = _read_group(
+            _FakeH5(_l1b_arrays_strided()),
+            "BEAM0000",
+            ds,
+            1,
+            _LatGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        # Shot 103 has no L2A row (dropped); 104 passes the flag.
+        assert df["shot_number"].tolist() == [104] * 4
+
+    def test_slack_rows_nan_under_linspace_synthesis(self):
+        from zagg.processing.read_vlen import _planned_gather_map
+
+        gidx, parent, within = _planned_gather_map(
+            STARTS_STRIDED, COUNTS, 1, STRIDED_EXTENT, [(0, STRIDED_EXTENT)]
+        )
+        vals = synthesize_linspace(E0, E1, COUNTS, parent, within)
+        slack = [r for r in SLACK_ROWS if r < STRIDED_EXTENT]
+        assert np.isnan(vals[slack]).all()
+        assert not np.isnan(vals[[0, 4, 6, 8, 12, 18, 21]]).any()
+        np.testing.assert_allclose(vals[0:5], _expected_elevation(0))
+        np.testing.assert_allclose(vals[18:22], _expected_elevation(3))
+        assert gidx.tolist() == list(range(STRIDED_EXTENT))
+
+    def test_gather_map_marks_every_slack_row_unassigned(self):
+        parent, _ = expand_link_indices(STARTS_STRIDED, COUNTS, 1, STRIDED_EXTENT)
+        assert [int(r) for r in np.flatnonzero(parent < 0)] == [
+            r for r in SLACK_ROWS if r < STRIDED_EXTENT
+        ]
+
+    def test_dataset_shorter_than_the_link_extent_raises(self):
+        arrays = _l1b_arrays_strided()
+        arrays["/BEAM0000/rxwaveform"] = WAVE_STRIDED[:20]  # link reaches row 21
+        with pytest.raises(ValueError, match="does not tile the declared base extent"):
+            _read_group(_FakeH5(arrays), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
