@@ -77,8 +77,6 @@ import logging
 
 import numpy as np
 
-from zagg.grids.base import ragged_locations_name
-
 logger = logging.getLogger(__name__)
 
 #: Per-artifact attrs revision for stage-written ladder overviews — the
@@ -435,35 +433,36 @@ def _source_counts(rows: list, broken=()) -> tuple:
     return folded, missing, unreadable
 
 
-def _located_pair(reader, res: int, name: str, sibling: str) -> tuple | None:
-    """One contributor's ``(payload, words)`` at ``res``, or ``None`` if refused.
+def _companion_group(reader, res: int, name: str, declared: list) -> dict | None:
+    """One contributor's ``{array: values}`` at ``res``, or ``None`` if refused.
 
-    The §9 pair is read TOGETHER and validated before either half is used
-    (ruling 4 on issue #410). ``_StageReader.read`` returns ``None`` per
-    ARRAY, not per member — its documented schema-evolution contract — so a
-    column written before ``location:`` was added to the declaration reads its
-    payload fine and its sibling as ``None``. That is not under-coverage: the
-    words are exact only *given* the centroid partition the payload describes
-    (spec §9.1/§2.3), so a payload gathered or folded without its words is
-    **corruption**, not a missing member. Both absent is the honest
-    schema-evolution case and reads as fill.
+    A field and EVERY companion it declares are read together and validated
+    before any of them is used (issue #410). ``_StageReader.read`` returns
+    ``None`` per ARRAY, not per member — its documented schema-evolution
+    contract — so a column written before ``location:``/``temporal:`` joined the
+    declaration reads its payload fine and its siblings as ``None``. That is not
+    under-coverage: the words are exact only *given* the centroid partition the
+    payload describes (spec §9.1/§8.3/§2.3), so a payload gathered or folded
+    without its words is **corruption**, not a missing member. All absent
+    together is the honest schema-evolution case and reads as fill.
 
-    Returns ``(None, None)`` for the refused pair; the caller counts the
-    contributor unreadable and skips it, which is the posture
-    ``sweep_overview._fold_node`` takes at a leaf missing the sibling (skip
+    Returns ``None`` for a partial group; the caller counts the contributor
+    unreadable and skips it, which is the posture
+    ``sweep_overview._fold_node`` takes at a leaf missing a sibling (skip
     loudly, ``failed += 1``) rather than aborting the level — a single stale
     child column must not take a whole stage down.
     """
-    payload, words = reader.read(res, name), reader.read(res, sibling)
-    if (payload is None) == (words is None):
-        # Both present is the fold; both absent is the honest schema-evolution
-        # case (the field postdates this column) and reads as fill.
-        return payload, words
+    arrays = {name: reader.read(res, name)}
+    for _kwarg, sibling in declared:
+        arrays[sibling] = reader.read(res, sibling)
+    present = [k for k, v in arrays.items() if v is not None]
+    if not present or len(present) == len(arrays):
+        return arrays
     logger.warning(
-        f"stage sweep: column {reader.path} carries {name!r} "
-        f"{'without' if words is None else 'only as'} its {sibling!r} channel at "
-        f"resolution {res}; counting the contributor unreadable rather than writing a "
-        f"payload and a channel that describe different partitions (spec §9.1/§1.1)"
+        f"stage sweep: column {reader.path} carries {sorted(present)} at resolution {res} "
+        f"but not {sorted(set(arrays) - set(present))}; counting the contributor "
+        f"unreadable rather than writing a payload and channels that describe different "
+        f"partitions (spec §9.1/§8.3, §1.1)"
     )
     return None
 
@@ -487,16 +486,17 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
     child carrying one half contributes neither and is counted unreadable
     rather than half-applied into the span.
     """
-    from zagg.sweep_overview import _empty_slab
+    from zagg.sweep_overview import _empty_slab, field_companions
 
     slabs = {name: _empty_slab(meta, n_out) for name, meta in fields.items()}
-    siblings = {
-        name: ragged_locations_name(name)
+    companions = {
+        name: field_companions(name, meta)
         for name, meta in fields.items()
-        if meta.get("location") is not None
+        if field_companions(name, meta)
     }
-    for sibling in siblings.values():
-        slabs[sibling] = np.full(n_out, b"", dtype=object)
+    for declared in companions.values():
+        for _kwarg, sibling in declared:
+            slabs[sibling] = np.full(n_out, b"", dtype=object)
     broken: set = set()
     for i, row in enumerate(rows):
         if row is None:
@@ -504,22 +504,22 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
         reader = row[0]
         if not _is_reader(reader):
             continue
-        pairs: dict = {}
+        grouped: dict = {}
         skip: set = set()
-        for name, sibling in siblings.items():
-            pair = _located_pair(reader, res, name, sibling)
-            if pair is None:
-                # BOTH halves stay fill: the child's span for this field reads
+        for name, declared in companions.items():
+            group = _companion_group(reader, res, name, declared)
+            if group is None:
+                # EVERY half stays fill: the child's span for this field reads
                 # as under-covered, never as a payload with an absent channel.
                 broken.add((i, 0))
-                skip |= {name, sibling}
+                skip |= {name, *(sib for _kw, sib in declared)}
                 continue
-            pairs[name], pairs[sibling] = pair
+            grouped.update(group)
         seg = slice(i * span, (i + 1) * span)
-        for name in list(fields) + list(siblings.values()):
+        for name in list(slabs):
             if name in skip:
                 continue
-            values = pairs[name] if name in pairs else reader.read(res, name)
+            values = grouped[name] if name in grouped else reader.read(res, name)
             if values is not None:
                 slabs[name][seg] = values
     return (slabs, *_source_counts(rows, broken))
@@ -561,6 +561,7 @@ def _merge_slabs(
         _empty_slab,
         combine_dense,
         decode_digest,
+        field_companions,
         fold_dense,
         fold_digests,
         overview_fold_delta,
@@ -605,34 +606,39 @@ def _merge_slabs(
         # unreadable — the gather's posture, and ``_fold_node``'s at a leaf
         # missing the sibling — never folded payload-only, and never a raise
         # that takes the whole level down over one stale child column.
-        sibling = ragged_locations_name(name) if meta.get("location") is not None else None
+        declared = field_companions(name, meta)
         out = np.full(n_out, b"", dtype=object)
-        sib_out = np.full(n_out, b"", dtype=object) if sibling else None
+        sibling_slabs = {kwarg: np.full(n_out, b"", dtype=object) for kwarg, _ in declared}
         pending: dict[int, list] = {}
-        words: dict[int, list] = {}
+        # {kernel kwarg: {open cell: [word vectors]}} — accumulated in lockstep
+        # with ``pending`` so a cell closes with its payload and every channel.
+        words: dict[str, dict[int, list]] = {kwarg: {} for kwarg, _ in declared}
 
-        def _close(j, out=out, sib_out=sib_out, delta=delta, dtype=dtype, sibling=sibling):
+        def _close(j, out=out, delta=delta, dtype=dtype, declared=declared):
             cell = pending.pop(j)
-            if sibling is None:
+            if not declared:
                 out[j] = fold_digests(cell, delta=delta, dtype=dtype)
-            else:
-                out[j], sib_out[j] = fold_digests(
-                    cell, delta=delta, dtype=dtype, locations=words.pop(j)
-                )
+                return
+            payload, *encoded = fold_digests(
+                cell,
+                delta=delta,
+                dtype=dtype,
+                channels={kwarg: words[kwarg].pop(j) for kwarg, _ in declared},
+            )
+            out[j] = payload
+            for (kwarg, _), value in zip(declared, encoded, strict=True):
+                sibling_slabs[kwarg][j] = value
 
         for i, row in enumerate(rows):
             base = i * src_per_child
             for w, reader in enumerate(row or ()):
                 if not _is_reader(reader):
                     continue
-                if sibling is None:
-                    slab, sib_slab = reader.read(res_src, name), None
-                else:
-                    pair = _located_pair(reader, res_src, name, sibling)
-                    if pair is None:
-                        broken.add((i, w))
-                        continue
-                    slab, sib_slab = pair
+                group = _companion_group(reader, res_src, name, declared)
+                if group is None:
+                    broken.add((i, w))
+                    continue
+                slab = group[name]
                 if slab is None:
                     continue
                 for pos, payload in enumerate(slab):
@@ -640,8 +646,10 @@ def _merge_slabs(
                         continue
                     key = (base + pos) // factor
                     pending.setdefault(key, []).append(decode_digest(payload, dtype, inner))
-                    if sibling is not None:
-                        words.setdefault(key, []).append(decode_digest(sib_slab[pos], "uint64", ()))
+                    for kwarg, sibling in declared:
+                        words[kwarg].setdefault(key, []).append(
+                            decode_digest(group[sibling][pos], "uint64", ())
+                        )
             # Cells wholly covered by children 0..i are complete: fold and
             # free them, so resident state never exceeds the open boundary.
             done = ((i + 1) * src_per_child) // factor
@@ -650,8 +658,8 @@ def _merge_slabs(
         for j in list(pending):
             _close(j)
         slabs[name] = out
-        if sib_out is not None:
-            slabs[sibling] = sib_out
+        for kwarg, sibling in declared:
+            slabs[sibling] = sibling_slabs[kwarg]
     return (slabs, *_source_counts(rows, broken))
 
 

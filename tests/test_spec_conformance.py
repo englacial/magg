@@ -1467,14 +1467,20 @@ class TestTemporalCompanions:
             "times" not in _array_meta("minimal", _expected("minimal"), "h_tdigest")["attributes"]
         )
 
-    def test_companions_are_absent_from_the_leaf_column(self):
-        """A companion exists at native resolution only, for now.
+    def test_both_companions_fold_into_the_leaf_column(self):
+        """Both companions ride every §4.6 column group, per-centroid.
 
-        Its fold law is the grammar's join (§8.2), which no zagg fold
-        implements yet, so the D24 class is ``none`` and the §4.6 column this
-        same worker invocation wrote carries neither companion — rather than
-        carrying words folded through the field's own reducer, whose envelope
-        claim would be false. The #410 kernel PR is what flips this.
+        espg-ruled 2026-08-17 (amending ruling 3 on issue #410): the temporal
+        channel is **per-centroid at every level**, symmetric with located — so
+        each column group carries the digest and BOTH siblings, and there is no
+        per-cell overview companion anywhere in the tree. §8.4's shape-coarsening
+        reduction stays licensed for producers that want it; zagg's digest
+        pyramids do not use it.
+
+        The dense per-cell field (``observed``, the §8.2 shape) is absent from
+        every group on purpose: its fold law is the grammar's join over a cell
+        group rather than its own reducer, so it is D24 class ``none`` and exists
+        at native resolution only.
         """
         exp = _expected("temporal")
         column = _leaf_dir("temporal", exp).parent / "all.pyramid.zarr"
@@ -1482,7 +1488,58 @@ class TestTemporalCompanions:
         assert groups
         for group in groups:
             arrays = sorted(p.name for p in (column / group).iterdir() if p.is_dir())
-            assert arrays == ["count", "morton"]
+            assert arrays == [
+                "count",
+                "h_tdigest",
+                "h_tdigest_locations",
+                "h_tdigest_times",
+                "morton",
+            ], f"column group {group}"
+
+    def test_the_columns_companions_are_row_aligned_and_declared(self):
+        """§1.1 row alignment and the §8.3/§9 declarations, on committed bytes.
+
+        The column is a *fold*, so its words are the merge's own output rather
+        than the leaf's — this is the one place in the fixture set where a folded
+        companion is pinned. Every populated payload row has exactly one word in
+        each sibling, and each sibling declares the words IT holds.
+        """
+        from zagg.grids.base import located_declaration
+        from zagg.time_axis import temporal_declaration
+
+        exp = _expected("temporal")
+        column = _leaf_dir("temporal", exp).parent / "all.pyramid.zarr"
+        store = LocalStore(str(column))
+        for group in sorted(p.name for p in column.iterdir() if p.is_dir()):
+            payload = zarr.open_array(
+                store, path=f"{group}/h_tdigest", zarr_format=3, consolidated=False
+            )[:]
+            sibs = {
+                name: zarr.open_array(
+                    store, path=f"{group}/{name}", zarr_format=3, consolidated=False
+                )
+                for name in ("h_tdigest_locations", "h_tdigest_times")
+            }
+            assert located_declaration(dict(sibs["h_tdigest_locations"].attrs))["shape"] == (
+                "per-centroid"
+            )
+            assert temporal_declaration(dict(sibs["h_tdigest_times"].attrs)) == {
+                "spec": "zagg-toc/1",
+                "shape": "per-centroid",
+                "grammar": "mortie-toc/1",
+            }
+            populated = 0
+            for i, raw in enumerate(payload):
+                rows = len(np.frombuffer(bytes(raw), "<f4")) // 2
+                if not rows:
+                    continue
+                populated += 1
+                for name, arr in sibs.items():
+                    words = np.frombuffer(bytes(arr[:][i]), "<u8")
+                    assert words.shape == (rows,), f"{group}/{name} row {i}"
+                    # §8.2's reserved 0 never appears in a real word.
+                    assert words.all()
+            assert populated, f"column group {group} folded no populated cell"
 
     def test_leaf_is_stamped_and_manifest_marked(self):
         exp = _expected("temporal")

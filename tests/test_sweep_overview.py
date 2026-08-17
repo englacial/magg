@@ -28,7 +28,7 @@ from zagg.sweep_overview import (
     OVERVIEW_ATTR,
     PYRAMID_SPEC,
     ROLE_ATTR,
-    check_located_match,
+    check_companion_match,
     combine_dense,
     declare_pyramid,
     decode_digest,
@@ -209,11 +209,10 @@ class TestComposabilityClasses:
         }
         assert field_composability(meta) == "approximate"
 
-    def test_temporal_companion_is_still_none(self):
-        # Ruling 3's per-centroid -> per-cell coarsening at overview levels
-        # (spec §8.4) is not wired through the fold sites, so a temporal field
-        # stays at native resolution: folding it through its own reducer would
-        # emit a word whose envelope claim is false.
+    def test_temporal_per_centroid_is_approximate(self):
+        # espg-ruled 2026-08-17, amending ruling 3: the temporal channel is
+        # per-centroid at EVERY level, symmetric with located, so a temporal
+        # digest field folds through the pyramid like any other.
         meta = {
             "kind": "ragged",
             "function": "zagg.stats.tdigest.build_tdigest",
@@ -221,6 +220,20 @@ class TestComposabilityClasses:
             "location": "leaf_id",
             "temporal": "per-centroid",
             "dtype": "float32",
+        }
+        assert field_composability(meta) == "approximate"
+
+    def test_temporal_per_cell_stays_none(self):
+        # The §8.2 DENSE shape (GEDI's leaf companion, ruling 2) is a different
+        # object: its fold law is the grammar's join over a cell group, not its
+        # own reducer, so classifying it by `function` would fold nanmax over toc
+        # words and emit a word whose envelope claim is false.
+        meta = {
+            "function": "nanmax",
+            "source": "delta_time",
+            "dtype": "uint64",
+            "fill_value": 0,
+            "temporal": "per-cell",
         }
         assert field_composability(meta) == "none"
 
@@ -418,7 +431,7 @@ class TestFoldDigests:
         # empty channel (spec §1.1's row-alignment MUST).
         d = self._digest(np.arange(10.0))
         with pytest.raises(ValueError, match="row-aligned with its payload"):
-            fold_digests([d], delta=64, locations=[np.array([], dtype=np.uint64)])
+            fold_digests([d], delta=64, channels={"locations": [np.array([], dtype=np.uint64)]})
 
     def test_a_short_located_sibling_is_refused_on_the_merge_arm(self):
         from conftest import point_words
@@ -426,13 +439,15 @@ class TestFoldDigests:
         d = self._digest(np.arange(10.0))
         words = point_words(10, seed=7)
         with pytest.raises(ValueError, match="row-aligned with its payload"):
-            fold_digests([d, d], delta=64, locations=[words[:3], words])
+            fold_digests([d, d], delta=64, channels={"locations": [words[:3], words]})
 
     def test_the_aligned_pair_folds(self):
         from conftest import point_words
 
         d = self._digest(np.arange(10.0))
-        payload, sib = fold_digests([d], delta=64, locations=[point_words(len(d), seed=7)])
+        payload, sib = fold_digests(
+            [d], delta=64, channels={"locations": [point_words(len(d), seed=7)]}
+        )
         n_rows = decode_digest(payload, "float32").shape[0]
         assert decode_digest(sib, "uint64", ()).shape == (n_rows,)
 
@@ -1289,7 +1304,7 @@ class TestLocatedDeclarationGate:
         sib = self._leaf_group(tmp_path)["h_tdigest_locations"]
         del sib.attrs["located"]
         assert self._drift(tmp_path) is None
-        assert check_located_match(dict(sib.attrs), "h_tdigest") is None
+        assert check_companion_match(dict(sib.attrs), "h_tdigest") is None
 
     def test_the_leaf_fold_refuses_an_unimplemented_shape(self, tmp_path):
         # The fold-time counterpart: the leaf is skipped LOUDLY, exactly as a

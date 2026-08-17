@@ -374,7 +374,7 @@ class TestLocatedColumn:
     def test_a_missing_sibling_slab_refuses_by_name(self):
         slabs, _truth = _located_cell_slabs(self.CELLS)
         del slabs["h_tdigest_locations"]
-        with pytest.raises(ValueError, match="declares a location channel"):
+        with pytest.raises(ValueError, match="declares a locations channel"):
             fold_column(slabs, LOCATED_FIELDS, cell_order=CELL_ORDER, resolutions=[3])
 
     def test_a_short_sibling_row_refuses_rather_than_writing_it(self):

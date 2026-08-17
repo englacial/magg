@@ -1585,6 +1585,17 @@ product is never sharded, §8/#247):
   pinned. `kitchen_sink/`, committed before §9 and unregenerated, is the
   absent-`located` ⇒ §2.2 pin, exactly as `minimal/` is §2.0's.
 
+  Its §4.6 leaf column carries the **folded** companions: every resolution
+  group holds `h_tdigest` with both siblings, each declaring `per-centroid`,
+  row-aligned with the folded payload. That makes it the fixture set's only
+  golden for a companion produced by a *merge* rather than by ingest — both
+  channels reduced over the centroid partition that merge produced, at every
+  level (espg-ruled 2026-08-17, amending
+  [ruling 3](https://github.com/englacial/zagg/issues/410#issuecomment-5310502887)).
+  The dense `observed` array is deliberately absent from those groups: the
+  `"per-cell"` shape's fold law is the grammar's join over a cell group rather
+  than the field's own reducer, so it exists at native resolution only.
+
 `minimal/` and `kitchen_sink/` pin the layout edge cases a reader must
 handle (`column/`'s leaf is `minimal/`'s, so it pins them again): inner chunk
 ordinal 2 is **empty** (absent from the shard index — the §1.5 sentinel, and
@@ -2004,8 +2015,12 @@ satisfy the peer gate above. This revision licenses exactly one — the
 `"per-centroid"` → `"per-cell"` fold that §8.3's closing *"Per-level shapes
 need not match"* clause describes and that
 [ruling 3 on #410](https://github.com/englacial/zagg/issues/410#issuecomment-5310502887)
-requires ("per-cell toc *range* at overview levels, even where leaves are
-per-centroid"). Its terms:
+first called for ("per-cell toc *range* at overview levels, even where leaves
+are per-centroid"). That ruling was **amended on 2026-08-17**: zagg's own digest
+pyramids keep companions `"per-centroid"` at every level, symmetric with the
+located channel, so the reduction below is **licensed but unused by this
+writer** — the terms stand unchanged for any producer that wants it, and a
+reader must still implement the mixed-level case §8.3 permits. Its terms:
 
 - The contributors MUST be peers **of each other**: every one declares
   `shape: "per-centroid"` under the same `grammar`. A reduction over
