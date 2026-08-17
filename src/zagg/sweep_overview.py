@@ -243,6 +243,35 @@ def check_weights_match(attrs, meta: dict, field: str) -> None:
         )
 
 
+def check_located_match(attrs, field: str) -> None:
+    """Refuse a digest fold over a §9 located declaration this zagg cannot join.
+
+    The located analogue of :func:`check_weights_match`, called on the
+    SIBLING's attrs — where §9 puts the block. §9.2 imports §8.4 verbatim:
+    declared companions compose only when they match on ``{shape, grammar}``,
+    and a writer joining ones that differ MUST refuse. ``zagg-located/1``
+    defines exactly one of each, so strict-checking every contributor's
+    declaration IS the match check: any two blocks that pass agree by
+    construction, and one that does not pass is a shape or grammar this fold
+    has no words for. An absent block is §2.2 verbatim (§9's absent-key rule —
+    every located store written before the declaration stays conformant) and
+    joins cleanly, so it is not drift.
+
+    Reading the words under the wrong shape would not fail loudly — a
+    ``per-cell`` sibling's rows decode as per-centroid vectors and fold into
+    words whose containment claim is false — which is why the refusal is here
+    and not left to the arithmetic. The per-leaf and per-child fold guards turn
+    it into a loud skip; :func:`_field_drift` refuses the same store at
+    retrofit time, so a disagreement is caught before the declaration lands.
+    """
+    from zagg.grids.base import located_declaration
+
+    try:
+        located_declaration(dict(attrs or {}))
+    except ValueError as e:
+        raise ValueError(f"field {field!r}: {e}") from e
+
+
 @overload
 def fold_digests(
     cell_digests: list, *, delta: int, dtype: str = ..., locations: None = ...
@@ -808,7 +837,12 @@ def _field_drift(group, name, meta) -> str | None:
     zagg does not define RAISES out of the probe rather than reporting drift
     — that store is unreadable, not merely mis-declared.
     """
-    from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC, weights_declaration
+    from zagg.grids.base import (
+        RAGGED_ELEMENT_ATTR,
+        RAGGED_SPEC,
+        located_declaration,
+        weights_declaration,
+    )
 
     try:
         arr = group[name]
@@ -878,11 +912,32 @@ def _field_drift(group, name, meta) -> str | None:
                     f"{ragged.get('locations')!r}, not the declared {sibling!r} — a "
                     f"reader binds the channel by that declaration (spec §1.2)"
                 )
+            # The §9 declaration itself, strict-checked: §9.2 imports §8.4, so
+            # companions compose only on matching ``{shape, grammar}`` and a
+            # writer joining ones that differ MUST refuse. This revision defines
+            # one of each, so the strict check IS the match check — and it RAISES
+            # rather than reporting drift (docstring posture: a sibling declaring
+            # an unimplemented shape is unreadable, not merely mis-declared).
+            located_declaration(dict(sib.attrs))
             sib_element = (dict(sib.attrs.get(RAGGED_ELEMENT_ATTR) or {})).get("element") or {}
-            if sib_element.get("dtype") != "uint64":
+            sib_dtype = sib_element.get("dtype")
+            # Normalized like the payload's compare five lines up: an equivalent
+            # spelling (``"<u8"``) is the same dtype and must not read as drift.
+            if sib_dtype is None or np.dtype(sib_dtype) != np.dtype("uint64"):
                 return (
                     f"field {name!r}: the location sibling declares element dtype "
-                    f"{sib_element.get('dtype')!r}, not 'uint64' (spec §6.1)"
+                    f"{sib_dtype!r}, not 'uint64' (spec §6.1)"
+                )
+            # The words are decoded as a flat vector (``decode_digest(...,
+            # ())``), so an inner shape would be silently reinterpreted by the
+            # fold — exactly the store-contradicts-the-recipe class this gate
+            # exists for.
+            sib_inner = [int(s) for s in (sib_element.get("shape") or [-1])[1:]]
+            if sib_inner:
+                return (
+                    f"field {name!r}: the location sibling declares element shape "
+                    f"{sib_element.get('shape')!r}; the §9 channel is one flat uint64 "
+                    f"word per centroid row (spec §9/§1.1)"
                 )
     elif meta["class"] == "exact":
         declared_dt = np.dtype(meta.get("dtype") or "float32")
@@ -1478,8 +1533,13 @@ def _fold_node(
                         # block as its payload, so a leaf missing or failing on
                         # one contributes neither — never a digest folded with
                         # its channel silently dropped (spec §9.1's words are
-                        # keyed on the partition the payload describes).
-                        words = group[ragged_locations_name(name)][:] if name in located else None
+                        # keyed on the partition the payload describes). A §9
+                        # declaration this fold cannot join refuses here, exactly
+                        # as a mismatched §2.0 one does above.
+                        sib = group[ragged_locations_name(name)] if name in located else None
+                        if sib is not None:
+                            check_located_match(dict(sib.attrs), name)
+                        words = None if sib is None else sib[:]
                         cell_digests[name] = [
                             (
                                 start + i // fold_factor,
@@ -1740,7 +1800,11 @@ def _fold_child(group, fields, factor, span, path) -> dict:
         inner = tuple(meta.get("inner_shape") or (2,))
         delta = overview_fold_delta(meta)
         sibling_name = ragged_locations_name(name)
-        words = group[sibling_name][:] if meta.get("location") is not None else None
+        # A §9 declaration this fold cannot join refuses beside the §2.0 one.
+        sib = group[sibling_name] if meta.get("location") is not None else None
+        if sib is not None:
+            check_located_match(dict(sib.attrs), name)
+        words = None if sib is None else sib[:]
         folded = np.full(span, b"", dtype=object)
         sibling = np.full(span, b"", dtype=object) if words is not None else None
         for j in range(span):
