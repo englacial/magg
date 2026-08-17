@@ -647,6 +647,29 @@ def _ragged_entry(entry) -> tuple:
     return values_list, cell_ids, None, None
 
 
+#: The sink entry's companion slots, in order — the positional contract
+#: :func:`_ragged_entry` reads back.
+RAGGED_CHANNELS = ("locations", "times")
+
+
+def _channel_entry(channels: dict) -> tuple:
+    """A field's declared companion channels as the sink entry's trailing slots.
+
+    ``channels`` is the aggregation stage's ``{channel: [per-cell words]}`` for
+    one field (:func:`zagg.processing.aggregate._aggregate_chunk_cells`). Returns
+    the slots :data:`RAGGED_CHANNELS` names, truncated after the last declared
+    one, so a field with no companion still yields the historical 2-tuple and a
+    located-only field the historical 3-tuple — byte-identical sink entries for
+    every config written before spec §8.3. A field declaring ``times`` without
+    ``locations`` gets an explicit ``None`` in the location slot, which
+    :func:`_ragged_entry` already reads as "no location channel".
+    """
+    slots = [channels.get(label) for label in RAGGED_CHANNELS]
+    while slots and slots[-1] is None:
+        slots.pop()
+    return tuple(slots)
+
+
 def _ragged_sig(name: str, grid) -> dict:
     """Output signature of a ragged field, tolerant of config-less stub grids."""
     agg_fields = get_agg_fields(grid.config) if getattr(grid, "config", None) else {}

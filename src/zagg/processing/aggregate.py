@@ -22,8 +22,54 @@ from zagg.config import (
     get_chunk_precompute,
     get_output_signature,
 )
+from zagg.time_axis import TOC_SHAPE_PER_CENTROID, TOC_WORD_COLUMN
 
 logger = logging.getLogger(__name__)
+
+
+def _temporal_fields(agg_fields: dict) -> dict[str, str]:
+    """``{field: temporal shape}`` for every field declaring one (spec §8, #410).
+
+    Empty for every config written before #410, which is what keeps the derived
+    toc word column off those runs' code path entirely.
+    """
+    return {
+        name: str(meta["temporal"])
+        for name, meta in agg_fields.items()
+        if meta.get("temporal") is not None
+    }
+
+
+def _toc_word_column(cell_data: dict, config) -> np.ndarray:
+    """Encode this cell's observation times as toc words (spec §8.3, #410).
+
+    The single conversion point: the declared ``output.time_source`` column
+    through :func:`zagg.time_axis.observation_words`. Both companion shapes read
+    the result — a ``per-centroid`` field as the reducer's ``temporal=`` channel,
+    a ``per-cell`` field as its ``source`` column — so one store can never carry
+    two clocks.
+    """
+    from zagg.time_axis import observation_words, toc_source
+
+    source = toc_source(config)
+    if source is None:
+        raise ValueError(
+            "a field declares a temporal companion but the store has no per-observation "
+            "clock — declare output.time_source {field, epoch, scale, units} (spec §8.3, "
+            "issue #410)"
+        )
+    if source["field"] not in cell_data:
+        raise ValueError(
+            f"output.time_source.field {source['field']!r} is not in the cell data "
+            f"(available: {sorted(cell_data)}); a temporal companion needs the declared "
+            f"time column read at base rate"
+        )
+    return observation_words(
+        cell_data[source["field"]],
+        epoch=source["epoch"],
+        scale=source["scale"],
+        units=source["units"],
+    )
 
 
 def _rss_mb() -> float:
@@ -431,6 +477,14 @@ def calculate_cell_statistics(
         (len(v) for v in cell_data.values() if np.ndim(v) != 0),
         0,
     )
+    # The derived toc word column (spec §8.2/§8.3, issue #410): one word per
+    # observation, encoded here rather than in the read path so every route into
+    # the aggregation (pooled, spill read-back, per-chunk precompute) gets it
+    # from ONE conversion, and so the total encode work is exactly one pass over
+    # the shard's rows. Materialized only when a field declares a companion, so
+    # a config written before #410 takes the code path it always did.
+    if n_obs and _temporal_fields(agg_fields):
+        cell_data = {**cell_data, TOC_WORD_COLUMN: _toc_word_column(cell_data, config)}
     if n_obs == 0:
         # Empty cell: every agg field gets its sentinel EXCEPT a field whose
         # ``expression`` is a bare chunk-precompute name. Those resolve to the
@@ -515,37 +569,48 @@ def calculate_cell_statistics(
 
         func = resolve_function(func_name)
 
-        # Located ragged field (issue #87): hand the reducer the named
-        # per-observation morton column and accept a ``(payload, locations)``
-        # pair — the uint64 locations ride beside the payload into the
-        # ``{field}_locations`` sibling vlen array. Only the HEALPix read path
+        # Companion-carrying ragged field: hand the reducer the named
+        # per-observation morton column (``location:``, issue #87) and/or the
+        # derived toc word column (``temporal: per-centroid``, spec §8.3, issue
+        # #410), and accept one extra tuple element per declared channel — the
+        # uint64 words ride beside the payload into the ``{field}_locations`` /
+        # ``{field}_times`` sibling vlen arrays. Only the HEALPix read path
         # supplies ``leaf_id``, so a missing column is a grid/config mismatch,
         # reported clearly.
-        if sig["kind"] == "ragged" and sig["location"] is not None:
-            loc_col = sig["location"]
-            if loc_col not in cell_data:
-                raise ValueError(
-                    f"ragged field {name!r} declares location: {loc_col!r} but that "
-                    f"column is not in the cell data (available: {sorted(cell_data)}); "
-                    f"per-observation mortons require a HEALPix grid"
-                )
-            payload, locations = func(values, locations=cell_data[loc_col], **resolved_params)
+        per_centroid = sig["temporal"] == TOC_SHAPE_PER_CENTROID
+        if sig["kind"] == "ragged" and (sig["location"] is not None or per_centroid):
+            channels = {}
+            if sig["location"] is not None:
+                loc_col = sig["location"]
+                if loc_col not in cell_data:
+                    raise ValueError(
+                        f"ragged field {name!r} declares location: {loc_col!r} but that "
+                        f"column is not in the cell data (available: {sorted(cell_data)}); "
+                        f"per-observation mortons require a HEALPix grid"
+                    )
+                channels["locations"] = cell_data[loc_col]
+            if per_centroid:
+                channels["temporal"] = cell_data[TOC_WORD_COLUMN]
+            payload, *words = func(values, **channels, **resolved_params)
             payload = _coerce_ragged_value(payload, sig)
-            locations = np.ascontiguousarray(np.asarray(locations))
-            if locations.dtype != np.uint64:
-                # A silent uint64 cast would wrap negative/float garbage into
-                # plausible-looking morton words; require the reducer to return
-                # uint64 outright (as build_tdigest does).
-                raise ValueError(
-                    f"ragged field {name!r}: locations dtype {locations.dtype} is not "
-                    f"uint64; the reducer must return packed morton words"
-                )
-            if locations.shape != (payload.shape[0],):
-                raise ValueError(
-                    f"ragged field {name!r}: locations shape {locations.shape} does not "
-                    f"match the payload's {payload.shape[0]} elements"
-                )
-            result[name] = (payload, locations)
+            out = []
+            for label, channel in zip(channels, words, strict=True):
+                channel = np.ascontiguousarray(np.asarray(channel))
+                if channel.dtype != np.uint64:
+                    # A silent uint64 cast would wrap negative/float garbage into
+                    # plausible-looking morton or toc words; require the reducer to
+                    # return uint64 outright (as build_tdigest does).
+                    raise ValueError(
+                        f"ragged field {name!r}: {label} dtype {channel.dtype} is not "
+                        f"uint64; the reducer must return packed words"
+                    )
+                if channel.shape != (payload.shape[0],):
+                    raise ValueError(
+                        f"ragged field {name!r}: {label} shape {channel.shape} does not "
+                        f"match the payload's {payload.shape[0]} elements"
+                    )
+                out.append(channel)
+            result[name] = (payload, *out)
             continue
 
         out = func(values, **resolved_params)
@@ -603,19 +668,19 @@ def _empty_cell_value(meta: dict):
     ``trailing_shape`` array filled with its schema-declared sentinel
     (:func:`_field_sentinel`), so empty and populated cells emit the same shape.
     A ``ragged`` field (issue #48) returns an empty list ``[]`` — the ragged writer
-    handles absent cells by leaving them out of ``cell_ids``. A *located* ragged
-    field (issue #87) returns an empty ``(payload, locations)`` pair instead,
-    keeping the pair contract uniform for direct callers.
+    handles absent cells by leaving them out of ``cell_ids``. A companion-carrying
+    ragged field returns an empty tuple of the same arity its reducer would —
+    ``(payload, *channels)`` — so direct callers can always unpack the same shape
+    (issue #87's located pair, extended by spec §8.3's temporal channel).
     """
     sig = get_output_signature(meta)
     if sig["kind"] == "ragged":
-        if sig["location"] is not None:
-            # A located field's contract is a (payload, locations) pair even for
-            # empty cells (issue #87), so direct callers can always unpack.
+        channels = (sig["location"] is not None) + (sig["temporal"] == TOC_SHAPE_PER_CENTROID)
+        if channels:
             dtype = np.dtype(sig["dtype"]) if sig["dtype"] is not None else np.dtype("float32")
             return (
                 np.empty((0, *sig["inner_shape"]), dtype=dtype),
-                np.empty(0, dtype=np.uint64),
+                *(np.empty(0, dtype=np.uint64) for _ in range(channels)),
             )
         return []
     if sig["kind"] == "vector":
@@ -763,28 +828,38 @@ def _aggregate_chunk_cells(
     the whole shard's, so this is byte-for-byte the old single-chunk loop.
 
     Returns ``(stats_arrays, ragged_payloads, ragged_cell_indices,
-    ragged_locations, cells_with_data)``: dense fields preallocated to
+    ragged_channels, cells_with_data)``: dense fields preallocated to
     ``(n_cells, *trailing_shape)`` and filled per cell; ragged fields collected
     as ``(payloads, cell_indices)`` keyed by the cell's position in ``children``
-    (the chunk-local index the ragged writer expects). ``ragged_locations`` holds
-    the per-cell uint64 location vectors for located fields only (issue #87) —
-    keyed like ``ragged_payloads`` and index-aligned with them; unlocated fields
-    have no entry.
+    (the chunk-local index the ragged writer expects). ``ragged_channels`` holds
+    the per-cell uint64 companion vectors for the fields declaring one —
+    ``{field: {channel: [per-cell words]}}``, the channels being ``locations``
+    (issue #87) and ``times`` (spec §8.3, issue #410), each index-aligned with
+    that field's payloads. A field declaring no companion has no entry, so a
+    config written before either channel produces the same empty mapping.
     """
     children = np.asarray(children)
     n_cells = len(children)
     stats_arrays: dict = {}
     ragged_payloads: dict[str, list] = {}
     ragged_cell_indices: dict[str, list[int]] = {}
-    ragged_locations: dict[str, list] = {}
+    ragged_channels: dict[str, dict[str, list]] = {}
     for name in data_vars:
         meta = agg_fields[name]
         sig = get_output_signature(meta)
         if sig["kind"] == "ragged":
             ragged_payloads[name] = []
             ragged_cell_indices[name] = []
+            # Channel order is the kernel's fixed return order (locations, then
+            # temporal), which is what lets the reducer's extra tuple elements be
+            # zipped onto these keys positionally below.
+            declared = {}
             if sig["location"] is not None:
-                ragged_locations[name] = []
+                declared["locations"] = []
+            if sig["temporal"] == TOC_SHAPE_PER_CENTROID:
+                declared["times"] = []
+            if declared:
+                ragged_channels[name] = declared
             continue
         # Vector fields (issue #29) get a per-cell (n_cells, *trailing_shape) block;
         # scalars keep the 1-D (n_cells,) layout, unchanged.
@@ -821,28 +896,31 @@ def _aggregate_chunk_cells(
             if key in ragged_payloads:
                 # Ragged field: collect non-empty payloads with their chunk-local
                 # cell index. Empty cells (``_empty_cell_value`` -> []) are skipped.
-                # A located field (issue #87) delivers a (payload, locations) pair;
-                # its locations are collected index-aligned with the payloads.
+                # A companion-carrying field delivers ``(payload, *channel words)``
+                # in the kernel's fixed order; the words are collected
+                # index-aligned with the payloads.
                 if isinstance(value, tuple):
-                    payload, locations = value
+                    payload, *words = value
                 else:
-                    payload, locations = np.asarray(value), None
+                    payload, words = np.asarray(value), []
                 if payload.size == 0:
                     continue
-                # Fail fast if the value's shape disagrees with the declared
-                # signature (a located field must deliver its pair; empty cells
-                # are exempt as they were skipped above) — a silent mismatch
-                # would surface much later as a length error in the ragged writer.
-                if (key in ragged_locations) != (locations is not None):
+                # Fail fast if the value's arity disagrees with the declared
+                # signature (empty cells are exempt, having been skipped above) —
+                # a silent mismatch would surface much later as a length error in
+                # the ragged writer, or as a companion silently dropped.
+                channels = ragged_channels.get(key, {})
+                if len(channels) != len(words):
                     raise ValueError(
-                        f"ragged field {key!r}: located/unlocated mismatch between the "
-                        f"declared signature and the reducer's return"
+                        f"ragged field {key!r}: the reducer returned {len(words)} companion "
+                        f"channel(s) but the declared signature has {len(channels)} "
+                        f"({sorted(channels) or 'none'})"
                     )
                 ragged_payloads[key].append(payload)
                 ragged_cell_indices[key].append(i)
-                if locations is not None:
-                    ragged_locations[key].append(locations)
+                for channel, word_vector in zip(channels.values(), words, strict=True):
+                    channel.append(word_vector)
             else:
                 stats_arrays[key][i] = value
 
-    return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_locations, cells_with_data
+    return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_channels, cells_with_data

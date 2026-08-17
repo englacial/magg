@@ -208,3 +208,89 @@ class TestWindowSelection:
     def test_inverted_window_refused(self):
         with pytest.raises(ValueError, match="window is inverted"):
             time_axis_overlaps(np.array([0], dtype="int64"), {}, "2025-01-02", "2025-01-01")
+
+
+class TestObservationWords:
+    """``observation_words`` — the per-observation toc encode (§8.3, #410)."""
+
+    EPOCH = "2018-01-01T00:00:00"
+
+    def _words(self, values, **kw):
+        from zagg.time_axis import observation_words
+
+        kw.setdefault("epoch", self.EPOCH)
+        kw.setdefault("scale", "gps")
+        kw.setdefault("units", "seconds")
+        return observation_words(np.asarray(values, dtype=np.float64), **kw)
+
+    def test_every_word_is_a_timestamp_never_a_range(self):
+        # §8.3's MUST: an instant is never widened into a range, and zagg's
+        # readers deliver per-observation instants.
+        import mortie
+
+        words = self._words([0.0, 1.5, 86400.25, 3.2e7])
+        assert words.dtype == np.uint64
+        assert not mortie.toc_is_range(words).any()
+
+    def test_round_trips_to_the_declared_instants(self):
+        import mortie
+
+        offsets = [0.0, 1.5, 86400.25]
+        start, end = mortie.toc2time(self._words(offsets))
+        assert np.array_equal(start, end)  # a timestamp's two bounds coincide
+        expected = np.datetime64(self.EPOCH, "ns").astype("int64") + np.rint(
+            np.asarray(offsets) * 1e9
+        ).astype("int64")
+        assert np.array_equal(
+            mortie.to_datetime64(start).astype("int64"),
+            expected,
+        )
+
+    def test_days_units_scale(self):
+        assert int(self._words([1.0], units="days")[0]) == int(self._words([86400.0])[0])
+
+    def test_utc_scale_refused(self):
+        with pytest.raises(ValueError, match="continuous timescale"):
+            self._words([0.0], scale="utc")
+
+    def test_unknown_units_refused(self):
+        with pytest.raises(ValueError, match="units 'ticks' is not one of"):
+            self._words([0.0], units="ticks")
+
+    def test_pre_epoch_time_refused(self):
+        # The grammar's 1850 origin is a hard floor; refusing names the gap
+        # rather than wrapping into a plausible-looking word.
+        with pytest.raises(ValueError, match="precedes the toc epoch"):
+            self._words([-1e18], units="seconds")
+
+    def test_non_finite_refused(self):
+        # Dropping a NaN instant would misalign the companion from its payload,
+        # which is a §8.3 row-alignment break rather than a lost observation.
+        with pytest.raises(ValueError, match="non-finite observation time"):
+            self._words([0.0, np.nan])
+
+    def test_empty_input_returns_empty(self):
+        out = self._words([])
+        assert out.shape == (0,) and out.dtype == np.uint64
+
+    def test_agrees_with_the_window_router_at_a_boundary(self):
+        # The hazard this single-sourcing exists to prevent: an observation
+        # routed into window W whose stored word reads as outside it. Both sides
+        # derive from the same fixed-offset model, so a boundary instant's word
+        # decodes back to the very instant the router converted.
+        import mortie
+
+        from zagg.windows import utc_to_offset
+
+        boundary = np.datetime64("2019-01-01T00:00:00", "ns")
+        offset = utc_to_offset(
+            boundary.astype("datetime64[us]").astype(object), epoch=self.EPOCH, scale="gps"
+        )
+        decoded = mortie.to_datetime64(mortie.toc2time(self._words([offset]))[0])[0]
+        assert decoded == boundary
+
+    def test_post_ceiling_time_refused(self):
+        # ~2142 is the grammar's ceiling (1850 + 2^63 ns); past it the cast
+        # would wrap into a plausible-looking word.
+        with pytest.raises(ValueError, match="exceeds the toc grammar's range"):
+            self._words([1e18])

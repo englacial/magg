@@ -401,6 +401,11 @@ def validate_config(config: PipelineConfig) -> None:
     # worth catching at submission rather than a knob that silently does
     # nothing.
     _validate_time_encoding(config)
+    # The per-observation clock the §8.2/§8.3 companions encode from (issue
+    # #410) — checked here for the same reason as the block above: the value is
+    # only meaningful where a companion is declared, so declaring it on a
+    # pipeline kind that has none is a typo worth catching at submission.
+    _validate_time_source(config)
 
     ptype = get_pipeline_type(config)
     if ptype != "spatial":
@@ -569,6 +574,21 @@ def validate_config(config: PipelineConfig) -> None:
     ds_vars = set(config.data_source.get("variables", {}).keys()) | _segment_variable_names(
         config.data_source
     )
+    # The derived toc word column (spec §8.2/§8.3, issue #410): materialized
+    # per observation from ``output.time_source``, so it is a real base-rate
+    # column everywhere one is valid — a ``per-cell`` companion names it as its
+    # ``source``. Only present when the clock is declared, so no config written
+    # before #410 gains a name.
+    from zagg.time_axis import TOC_WORD_COLUMN, toc_source
+
+    if toc_source(config) is not None:
+        if TOC_WORD_COLUMN in ds_vars:
+            raise ValueError(
+                f"data_source.variables declares {TOC_WORD_COLUMN!r}, which is the "
+                f"reserved name of the derived toc word column output.time_source "
+                f"materializes (spec §8.2/§8.3) — rename the column"
+            )
+        ds_vars = ds_vars | {TOC_WORD_COLUMN}
     agg_vars = config.aggregation.get("variables", {})
 
     # Validate the per-chunk precompute hook (issue #30, item 1). Each entry is
@@ -635,7 +655,7 @@ def validate_config(config: PipelineConfig) -> None:
             _validate_expression_columns(name, meta["expression"], expr_vars)
 
         # Validate the output-kind declaration (kind + trailing_shape + dtype)
-        _validate_output_kind(name, meta)
+        _validate_output_kind(name, meta, config)
 
         # Located ragged fields (issue #87): the location column is the
         # per-observation morton the HEALPix read path supplies as ``leaf_id``
@@ -701,10 +721,35 @@ def validate_config(config: PipelineConfig) -> None:
                 )
 
         # The §8.3 per-centroid temporal channel takes the same sibling-name
-        # reservation, for the same corruption reason (issue #410).
+        # reservation, for the same corruption reason (issue #410) — plus the
+        # same two reducer-surface checks the location channel gets, because it
+        # rides in the same way: as a reserved ``temporal=`` kwarg injected by
+        # aggregate.py.
         if meta.get("temporal") == "per-centroid":
             from zagg.grids.base import ragged_times_name
 
+            if "temporal" in meta.get("params", {}):
+                raise ValueError(
+                    f"Variable '{name}': params may not name 'temporal' — it is "
+                    f"reserved for the temporal channel (spec §8.3, issue #410)"
+                )
+            if has_func:
+                func = resolve_function(meta["function"])
+                try:
+                    func_params = inspect.signature(func).parameters
+                except (TypeError, ValueError):
+                    func_params = None  # ufuncs/builtins: not introspectable
+                if func_params is not None and "temporal" not in func_params:
+                    has_var_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in func_params.values()
+                    )
+                    if not has_var_kw:
+                        raise ValueError(
+                            f"Variable '{name}': function {meta['function']!r} does not "
+                            f"accept a 'temporal' keyword, which 'temporal: per-centroid' "
+                            f"requires (use a reducer carrying the channel, e.g. "
+                            f"zagg.stats.tdigest.build_tdigest)"
+                        )
             sibling = ragged_times_name(name)
             if sibling in agg_vars or sibling in config.aggregation.get("coordinates", {}):
                 raise ValueError(
@@ -946,6 +991,82 @@ def _validate_time_encoding(config: PipelineConfig) -> None:
         raise ValueError(
             f"output.time_encoding: {encoding!r} applies to raster (time, cells) "
             f"products only — this pipeline writes no time coordinate (spec §8)"
+        )
+
+
+def _validate_time_source(config: PipelineConfig) -> None:
+    """Validate ``output.time_source`` — the per-observation clock (issue #410).
+
+    The block a temporal companion's words are encoded from:
+    ``{field, epoch, scale, units}`` (see :func:`zagg.time_axis.toc_source`).
+    Three rules beyond shape:
+
+    - ``field`` must be a BASE-RATE ``data_source.variables`` column, the same
+      constraint ``output.windowing.time_field`` carries — a companion is one
+      word per observation, so a coordinate or a segment-level column would
+      encode at the wrong rate;
+    - ``scale`` must be continuous (:data:`zagg.time_axis.TOC_SOURCE_SCALES`).
+      ``utc`` is refused by name rather than silently tolerated: §8.3 requires
+      an instant exact to the nanosecond and a nominal-UTC column is only good
+      to the leap seconds since its epoch;
+    - the declared column must not be :data:`zagg.time_axis.TOC_WORD_COLUMN`
+      itself, which is the DERIVED word column, not a source.
+
+    Declaring the block without any temporal companion is legal (it materializes
+    the derived column, which an expression may read); the converse is not — see
+    :func:`_validate_temporal_producer`.
+    """
+    from zagg.time_axis import TOC_SOURCE_SCALES, TOC_WORD_COLUMN
+    from zagg.windows import UNIT_SECONDS, parse_utc
+
+    block = (config.output or {}).get("time_source")
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"output.time_source must be a mapping {{field, epoch, scale, units}} "
+            f"(got {block!r}) — spec §8.3, issue #410"
+        )
+    unknown = set(block) - {"field", "epoch", "scale", "units"}
+    if unknown:
+        raise ValueError(
+            f"output.time_source has unknown key(s) {sorted(unknown)} "
+            f"(known: epoch, field, scale, units)"
+        )
+    field = block.get("field")
+    if not isinstance(field, str) or not field:
+        raise ValueError(
+            "output.time_source.field is required: the per-observation time column "
+            "the temporal companion's words are encoded from (issue #410)"
+        )
+    if field == TOC_WORD_COLUMN:
+        raise ValueError(
+            f"output.time_source.field {field!r} is the DERIVED toc word column, not a "
+            f"source — name the dataset-time column it is encoded from (issue #410)"
+        )
+    declared = set((config.data_source or {}).get("variables") or {})
+    if field not in declared:
+        raise ValueError(
+            f"output.time_source.field {field!r} is not a declared "
+            f"data_source.variables column (available: {sorted(declared)}) — a temporal "
+            f"companion is one word per observation, so the column must be base-rate"
+        )
+    if "epoch" not in block:
+        raise ValueError(
+            "output.time_source.epoch is required: the UTC instant the column counts from"
+        )
+    parse_utc(block["epoch"])  # raises with the offending value named
+    scale = block.get("scale") or TOC_SOURCE_SCALES[0]
+    if scale not in TOC_SOURCE_SCALES:
+        raise ValueError(
+            f"output.time_source.scale must be a continuous timescale {TOC_SOURCE_SCALES} "
+            f"(got {scale!r}); a nominal-UTC column cannot carry the nanosecond-exact "
+            f"instant spec §8.3 requires of a timestamp word"
+        )
+    units = block.get("units") or "seconds"
+    if units not in UNIT_SECONDS:
+        raise ValueError(
+            f"output.time_source.units must be one of {sorted(UNIT_SECONDS)} (got {units!r})"
         )
 
 
@@ -1599,16 +1720,19 @@ def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:
         return
     if not isinstance(precompute, dict):
         raise ValueError("aggregation.chunk_precompute must be a mapping of name -> entry")
-    reserved = ds_vars | {"leaf_id"}
+    from zagg.time_axis import TOC_WORD_COLUMN
+
+    reserved = ds_vars | {"leaf_id", TOC_WORD_COLUMN}
     for name, meta in precompute.items():
         if not isinstance(name, str) or not name.strip():
             raise ValueError("chunk_precompute entry names must be non-empty strings")
         if name in reserved:
             raise ValueError(
                 f"chunk_precompute '{name}': name collides with a "
-                f"data_source.variables column or the reserved 'leaf_id'; the "
-                f"per-cell namespace merge would shadow the real column with a "
-                f"chunk scalar. Rename the precompute entry."
+                f"data_source.variables column or a reserved derived column "
+                f"('leaf_id', {TOC_WORD_COLUMN!r}); the per-cell namespace merge "
+                f"would shadow the real column with a chunk scalar. Rename the "
+                f"precompute entry."
             )
         if not isinstance(meta, dict):
             raise ValueError(f"chunk_precompute '{name}': entry must be a mapping")
@@ -1666,7 +1790,7 @@ OUTPUT_KINDS = ("scalar", "vector", "ragged")
 OUTPUT_RESOLUTIONS = ("cell", "chunk")
 
 
-def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
+def _validate_temporal_shape(name: str, meta: dict, kind: str, config=None) -> None:
     """Validate a field's ``temporal:`` declaration (spec §8.2/§8.3, #410).
 
     The declared value is a §8 **shape**, and each shape pins the array that
@@ -1685,11 +1809,10 @@ def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
     ``coordinate`` is deliberately not accepted here: a time axis is declared
     by ``output.time_encoding`` (§8.1), not by an aggregation variable.
 
-    A well-formed declaration is then gated on a PRODUCER — see
-    :func:`_validate_temporal_producer`, which refuses every ``temporal:`` in
-    this release. The shape checks run first, and deliberately: they are the
-    live checks the moment the kernel lifts the gate, so they are worth
-    reporting to an author ahead of it.
+    A well-formed declaration is then gated on a PRODUCER and on the store's
+    per-observation clock — see :func:`_validate_temporal_producer`. The shape
+    checks run first, and deliberately: they describe the field itself, so they
+    are the more useful message when both are wrong.
     """
     from zagg.time_axis import (
         TOC_FIELD_SHAPES,
@@ -1748,57 +1871,70 @@ def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
                 f"fill_value {TOC_UNOBSERVED} (got {fill!r}) — §8.2 reserves it as the "
                 f"unobserved-cell marker"
             )
-        _validate_temporal_producer(name, meta)
+        _validate_temporal_producer(name, meta, config)
         return
     if kind != "ragged":
         raise ValueError(
             f"Variable '{name}': temporal {TOC_SHAPE_PER_CENTROID!r} is a sibling of a "
             f"ragged payload, so kind must be 'ragged', not {kind!r} (spec §8.3)"
         )
-    _validate_temporal_producer(name, meta)
+    _validate_temporal_producer(name, meta, config)
 
 
-def _validate_temporal_producer(name: str, meta: dict) -> None:
-    """Refuse a ``temporal:`` companion no reducer in this release produces.
+def _validate_temporal_producer(name: str, meta: dict, config=None) -> None:
+    """Refuse a ``temporal:`` companion nothing in this release would produce.
 
-    The §8.2/§8.3 declaration surface landed ahead of the kernel that folds the
-    words (issue #410), so a config declaring a companion today would validate,
-    run, stamp the declaration, and write a store that violates the section it
-    declares — an all-empty ``{field}_times`` sibling beside a populated
-    payload (§8.3's row-alignment MUST), or a dense array holding the field's
-    own reducer output cast to ``uint64`` under a ``zagg-toc/1`` stamp (§8.2's
-    envelope claim). Refusing at submission is the same gate
-    :func:`zagg.processing.streaming.validate_streaming` applies to a located
-    field under ``mode: merge`` — name the channel the chosen path cannot
-    honor, and name the path that will.
+    A declaration whose reducer emits no toc words would validate, run, stamp
+    the §8 declaration, and write a store violating the section it declares —
+    an all-empty ``{field}_times`` sibling beside a populated payload (§8.3's
+    row-alignment MUST), or a dense array holding the field's own reducer output
+    cast to ``uint64`` under a ``zagg-toc/1`` stamp (§8.2's envelope claim). The
+    gate is therefore an allowlist,
+    :data:`zagg.time_axis.TOC_PRODUCING_FUNCTIONS`, split by the shape each
+    reducer can serve: :data:`~zagg.time_axis.TOC_PER_CELL_FUNCTIONS` produce a
+    whole-cell word, the rest carry the channel beside a ragged payload.
 
-    The gate is an allowlist of producing reducers,
-    :data:`zagg.time_axis.TOC_PRODUCING_FUNCTIONS`, **empty in this release**,
-    so the refusal is total for users; the kernel PR lifts it per reducer.
-
-    The one documented bypass is the §7 conformance-fixture generator
-    (``tools/generate_spec_fixtures.py``), which constructs its
-    ``PipelineConfig`` directly and never calls :func:`validate_config` — it
-    feeds hand-computed words through the production write path precisely
-    because no reducer produces them yet. That is a test-only seam: every user
-    entry point (``load_config``, ``zagg.client``, ``client_transport``)
-    validates, so no runnable submission reaches the writer.
+    A producing reducer is necessary but not sufficient: the words have to come
+    from somewhere, so a companion also requires the store's per-observation
+    clock (``output.time_source``, :func:`zagg.time_axis.toc_source` — which
+    falls back to a continuous-scale ``output.windowing``). ``config`` is
+    optional only so the per-field checks stay callable in isolation; every
+    ``validate_config`` path passes it.
     """
-    from zagg.time_axis import TOC_PRODUCING_FUNCTIONS
-
-    func = meta.get("function")
-    if func is not None and func in TOC_PRODUCING_FUNCTIONS:
-        return
-    raise ValueError(
-        f"Variable '{name}': 'temporal' declares a companion that no reducer in this "
-        f"release produces (function {func!r}) — the spec §8.2/§8.3 declaration "
-        f"surface landed ahead of the toc aggregation kernel, so enabling it would "
-        f"write a store violating the section it declares. The gate lifts with the "
-        f"kernel (issue #410)."
+    from zagg.time_axis import (
+        TOC_PER_CELL_FUNCTIONS,
+        TOC_PRODUCING_FUNCTIONS,
+        TOC_SHAPE_PER_CELL,
+        toc_source,
     )
 
+    shape = meta.get("temporal")
+    func = meta.get("function")
+    if func not in TOC_PRODUCING_FUNCTIONS:
+        raise ValueError(
+            f"Variable '{name}': 'temporal' declares a companion that function {func!r} "
+            f"does not produce — only {sorted(TOC_PRODUCING_FUNCTIONS)} emit toc words "
+            f"(spec §8.2/§8.3, issue #410)"
+        )
+    per_cell_reducer = func in TOC_PER_CELL_FUNCTIONS
+    if per_cell_reducer != (shape == TOC_SHAPE_PER_CELL):
+        wants = TOC_SHAPE_PER_CELL if per_cell_reducer else "per-centroid"
+        raise ValueError(
+            f"Variable '{name}': function {func!r} produces the {wants!r} temporal "
+            f"shape, not {shape!r} — a whole-cell reducer cannot fill a per-centroid "
+            f"sibling, and a digest kernel's channel is not a dense per-cell array "
+            f"(spec §8.2/§8.3)"
+        )
+    if config is not None and toc_source(config) is None:
+        raise ValueError(
+            f"Variable '{name}': 'temporal' requires the store's per-observation clock — "
+            f"declare output.time_source {{field, epoch, scale, units}} (or an "
+            f"output.windowing block on a continuous scale, which it falls back to). "
+            f"Without it there is no column to encode toc words from (issue #410)"
+        )
 
-def _validate_output_kind(name: str, meta: dict) -> None:
+
+def _validate_output_kind(name: str, meta: dict, config=None) -> None:
     """Validate a variable's non-scalar output declaration.
 
     A field may declare ``kind`` (``scalar`` default, ``vector``, or ``ragged``)
@@ -1861,7 +1997,7 @@ def _validate_output_kind(name: str, meta: dict) -> None:
                 f"Variable '{name}': '{key}' is only valid for kind 'ragged', not '{kind}'"
             )
 
-    _validate_temporal_shape(name, meta, kind)
+    _validate_temporal_shape(name, meta, kind, config)
 
     # resolution (cell default, or chunk). A chunk-resolution field stores one
     # value per chunk in a companion array (issue #30 item 2). ``scalar`` and

@@ -56,12 +56,40 @@ TOC_FIELD_SHAPES = (TOC_SHAPE_PER_CELL, TOC_SHAPE_PER_CENTROID)
 #: cell the writer never observed. Never an acquisition.
 TOC_UNOBSERVED = 0
 #: The reducers that PRODUCE toc words, and may therefore declare a field-level
-#: ``temporal:`` companion (issue #410). **Empty in this release**: the §8.2/§8.3
-#: declaration surface landed ahead of the aggregation kernel, so
-#: ``zagg.config`` refuses ``temporal:`` outright rather than let a run stamp a
-#: declaration over words nothing produced. The kernel PR lifts the gate by
-#: naming its reducer here — that is the whole of lifting it.
-TOC_PRODUCING_FUNCTIONS: frozenset[str] = frozenset()
+#: ``temporal:`` companion (issue #410). A ``per-centroid`` companion comes from
+#: the t-digest kernels' ``temporal=`` channel (§8.3); a ``per-cell`` one from
+#: :func:`zagg.stats.toc.cell_envelope`, whose whole output IS the word (§8.2).
+#: The gate exists because the declaration surface landed one PR ahead of the
+#: kernel: a reducer absent from this set would stamp a `zagg-toc/1`
+#: declaration over words nothing produced, which is a store violating the
+#: section it declares.
+TOC_PRODUCING_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "zagg.stats.tdigest.build_tdigest",
+        "zagg.stats.tdigest.build_tdigest_pairwise",
+        "zagg.stats.tdigest.build_tdigest_where",
+        "zagg.stats.toc.cell_envelope",
+    }
+)
+#: The subset of :data:`TOC_PRODUCING_FUNCTIONS` producing a whole-cell word —
+#: the ``per-cell`` shape's reducers (§8.2). The rest carry the channel beside a
+#: ragged payload, so they produce ``per-centroid`` (§8.3), and the two sets
+#: partition the allowlist: a shape-vs-reducer mismatch is a config error.
+TOC_PER_CELL_FUNCTIONS: frozenset[str] = frozenset({"zagg.stats.toc.cell_envelope"})
+#: The derived per-observation column the read/aggregation path materializes
+#: from :func:`toc_source` — the toc analogue of the HEALPix ``leaf_id`` morton
+#: column, and the one place a per-observation instant becomes a toc word.
+#: Reserved: a config may READ it (a ``per-cell`` companion declares
+#: ``source: toc_word``) but never declare a column of that name.
+TOC_WORD_COLUMN = "toc_word"
+#: The continuous timescales a temporal companion may ingest from. ``utc`` is
+#: excluded deliberately: §8.1/§8.3 require an instant to be encoded exact to
+#: the nanosecond, and a nominal-UTC offset column is only good to the leap
+#: seconds elapsed since its epoch (``zagg.windows``' documented <= 1 s
+#: tolerance) — a full quantum wider than the range variant's ~2.15 s start
+#: grid is meant to imply. Window ROUTING tolerates that; a word claiming
+#: nanosecond exactness cannot.
+TOC_SOURCE_SCALES = ("gps", "tai")
 #: The §8 word-grammar citation — a grammar REVISION token in the ecosystem's
 #: {name}/{major} style (``zagg-ragged/1``, ``morton-hive/2``), never a
 #: documentation URL or a stamp of the writer's installed mortie: store bytes
@@ -92,16 +120,21 @@ __all__ = [
     "TOC_EPOCH",
     "TOC_FIELD_SHAPES",
     "TOC_GRAMMAR",
+    "TOC_PER_CELL_FUNCTIONS",
     "TOC_PRODUCING_FUNCTIONS",
     "TOC_SHAPE_COORDINATE",
     "TOC_SHAPE_PER_CELL",
     "TOC_SHAPE_PER_CENTROID",
     "TOC_SHAPES",
+    "TOC_SOURCE_SCALES",
     "TOC_SPEC",
     "TOC_UNOBSERVED",
+    "TOC_WORD_COLUMN",
     "decode_time_axis",
     "encode_time_axis",
+    "observation_words",
     "read_time_axis",
+    "toc_source",
     "temporal_attrs",
     "temporal_declaration",
     "temporal_declaration_block",
@@ -211,6 +244,114 @@ def temporal_declaration(attrs, *, shape: str | None = None) -> dict | None:
             f"implement"
         )
     return block
+
+
+def toc_source(config) -> dict | None:
+    """The store's per-observation clock declaration, normalized (issue #410).
+
+    ``output.time_source`` names the column a temporal companion's words are
+    encoded from, and the conversion that reaches the grammar's continuous
+    scale::
+
+        output:
+          time_source:
+            field: delta_time                 # a base-rate variables column
+            epoch: "2018-01-01T00:00:00"      # the column's zero, as UTC
+            scale: gps                        # continuous only (TOC_SOURCE_SCALES)
+            units: seconds
+
+    Returns ``{"field", "epoch", "scale", "units"}`` with defaults resolved, or
+    ``None`` when nothing is declared. **An absent block falls back to
+    ``output.windowing``** when that block already carries a continuous-scale
+    clock: window routing and toc ingest then derive from ONE declaration, which
+    is what keeps them from disagreeing at a window boundary (an observation
+    routed into window *W* whose stored word reads as outside it). A windowed
+    store on ``scale: utc`` gets no fallback — see :data:`TOC_SOURCE_SCALES` —
+    and must declare a continuous column explicitly.
+
+    Shape and vocabulary are validated in :mod:`zagg.config`
+    (``_validate_time_source``); this is the read point every consumer uses.
+    """
+    block = (getattr(config, "output", None) or {}).get("time_source")
+    if block is None:
+        from zagg.config import get_windowing
+
+        windowing = get_windowing(config)
+        if windowing is None or windowing["scale"] not in TOC_SOURCE_SCALES:
+            return None
+        block = {
+            "field": windowing["time_field"],
+            "epoch": windowing["epoch"],
+            "scale": windowing["scale"],
+            "units": windowing["units"],
+        }
+    return {
+        "field": str(block["field"]),
+        "epoch": str(block["epoch"]),
+        "scale": str(block.get("scale") or TOC_SOURCE_SCALES[0]),
+        "units": str(block.get("units") or "seconds"),
+    }
+
+
+def observation_words(values, *, epoch, scale: str, units: str) -> np.ndarray:
+    """Per-observation offsets -> exact toc **timestamp** words (§8.3).
+
+    ``values`` is a dataset-time column (e.g. ICESat-2 ``delta_time``): offsets
+    in ``units`` on ``scale`` since ``epoch``, the same triple
+    :func:`zagg.windows.utc_to_offset` takes. Every output word is a
+    **timestamp**, never a range: zagg's readers deliver per-observation
+    instants, and §8.3 forbids widening an instant into a range. Range ingest is
+    legal under the spec, just not something any shipped reader produces.
+
+    The conversion is offset arithmetic on the grammar's own continuous scale —
+    the epoch instant's internal ns plus the column's own continuous offset — so
+    no leap table enters the hot path. The scale-vs-UTC correction for a
+    pre-2017 epoch is taken from :func:`zagg.windows.utc_to_offset` rather than
+    recomputed here, so the toc words and the window routing cannot drift apart:
+    one fixed-offset model, one place.
+    """
+    import mortie
+
+    from zagg.windows import UNIT_SECONDS, parse_utc, utc_to_offset
+
+    if scale not in TOC_SOURCE_SCALES:
+        raise ValueError(
+            f"toc ingest requires a continuous timescale {TOC_SOURCE_SCALES} (got {scale!r}); "
+            f"a nominal-UTC column cannot carry the nanosecond-exact instant §8.3 requires"
+        )
+    if units not in UNIT_SECONDS:
+        raise ValueError(f"toc ingest units {units!r} is not one of {sorted(UNIT_SECONDS)}")
+    epoch_dt = parse_utc(epoch)
+    # ``utc_to_offset`` of the epoch against itself is 0 for a post-2017 epoch
+    # and the scale-UTC offset for a pre-2017 one — windows.py's branch, reused
+    # rather than restated.
+    shift_s = utc_to_offset(epoch_dt, epoch=epoch_dt, scale=scale, units="seconds")
+    base = int(_internal_ns(np.array([epoch_dt.replace(tzinfo=None)], dtype="datetime64[us]"))[0])
+    offsets = np.asarray(values, dtype=np.float64) * UNIT_SECONDS[units] - shift_s
+    if offsets.size and not np.isfinite(offsets).all():
+        raise ValueError(
+            "toc ingest met a non-finite observation time; a NaN or inf instant has no "
+            "word, and silently dropping it would misalign the companion from its payload"
+        )
+    # Bound-check in float, BEFORE the int64 cast: an out-of-domain offset
+    # overflows the cast (numpy warns and yields garbage) where the grammar's
+    # own limits are what the caller needs named. The window is the timestamp
+    # variant's own domain — ns since the epoch, below the 63rd bit.
+    ns = np.rint(offsets * 1_000_000_000.0)
+    ceiling = float(2**63 - 1 - base)
+    if ns.size and float(ns.min()) < -float(base):
+        raise ValueError(
+            f"observation time precedes the toc epoch {TOC_EPOCH} by "
+            f"{-(float(ns.min()) + base):.0f} ns — the word grammar cannot represent it "
+            f"(spec §8)"
+        )
+    if ns.size and float(ns.max()) > ceiling:
+        raise ValueError(
+            f"observation time exceeds the toc grammar's range ({TOC_EPOCH} + 2^63 ns, "
+            f"~2142) by {float(ns.max()) - ceiling:.0f} ns (spec §8)"
+        )
+    internal = base + ns.astype(np.int64)
+    return np.asarray(mortie.time2toc(internal.astype(np.uint64)), dtype=np.uint64)
 
 
 def _internal_ns(when: np.ndarray) -> np.ndarray:
