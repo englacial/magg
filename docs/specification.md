@@ -3,7 +3,8 @@
 This page is the **normative record** of zagg's byte-level store conventions:
 the ragged vlen-bytes layout, the t-digest payload bytes, the packed
 composition word, the pyramid/overview declarations, the O11 content-hash
-recipe, and the temporal declaration on a time coordinate. It exists so an independent reader
+recipe, and the temporal and located declarations on the word-typed
+coordinate and companion arrays. It exists so an independent reader
 ([moczarr](https://github.com/espg/moczarr)) can decode a zagg store from this
 page and the committed conformance fixtures alone — no zagg import, no
 reverse-engineering of `grids/base.py`
@@ -55,7 +56,7 @@ text marked *informative* explains or motivates and binds nothing.
   explicit succession clause; readers add revisions, they never drop them.
 - The committed conformance fixtures (§7) are part of the contract: a reader
   implementation that reproduces the fixtures' expected decoded values and
-  content hashes conforms to §1–§3, §5 and §8. zagg's own test suite asserts the
+  content hashes conforms to §1–§3, §5, §8 and §9. zagg's own test suite asserts the
   same expectations (`tests/test_spec_conformance.py`), so the spec, the
   fixtures, and the shipping reader cannot drift apart silently.
 
@@ -69,6 +70,7 @@ Contents:
 6. [`zagg-ragged/2` — the typed `vlen-ndarray` revision](#6-zagg-ragged2)
 7. [Conformance fixtures](#7-conformance-fixtures)
 8. [`zagg-toc/1` — the temporal declaration](#8-zagg-toc1)
+9. [`zagg-located/1` — the located declaration](#9-zagg-located1)
 
 ---
 
@@ -89,13 +91,15 @@ axis. Source of truth in code: `zagg.grids.base.ragged_array_spec` /
 
 ### 1.1 Layout
 
-A ragged field `{field}` under a product group is up to three sibling arrays:
+A ragged field `{field}` under a product group is up to four sibling arrays:
 
 ```text
 {group}/{field}             <- vlen payload array; populated cell i holds the raw
                                little-endian bytes of its (n, *inner_shape) payload
 {group}/{field}_locations   <- LOCATED fields only (issue #87): per-row uint64
                                location words, row-aligned with {field}
+{group}/{field}_times       <- TEMPORAL fields only (§8.3, issue #410): per-row
+                               uint64 toc words, row-aligned with {field}
 {group}/morton              <- per-cell uint64 morton coordinate (zagg's standard
                                HEALPix coordinate array; the chunk-identity source)
 ```
@@ -117,6 +121,10 @@ A ragged field `{field}` under a product group is up to three sibling arrays:
   payload row of cell `i`. Readers MUST bind the sibling by the payload
   array's `locations` attrs declaration (§1.2), never by reconstructing the
   `{field}_locations` naming convention.
+- A **temporal** field's sibling `{field}_times` array (§8.3) is the same
+  shape of thing under the same row-alignment rule, bound by the payload
+  array's `times` attrs key. A field may carry either sibling, both, or
+  neither.
 
 ### 1.2 The `ragged` attrs block
 
@@ -145,11 +153,14 @@ A vlen array without a well-formed `element` declaration is **not** a
 `zagg-ragged/1` array; a reader MUST refuse it with a pointed error rather
 than decode under a guessed layout (pre-issue-209 CSR stores are a hard
 break). The `ragged` attrs key is reserved: config-declared field attrs MUST
-NOT shadow it (enforced at config validation). The §2.0 `weights` key is
-likewise spec-owned on a ragged payload array — writer-stamped from the
-field's declaration, never author-transcribed. A located field's provenance
-attrs (e.g. `stratum`, `signal_threshold` — §3.3) land on the **payload array
-only**; the `{field}_locations` sibling carries no user attrs.
+NOT shadow it (enforced at config validation). The §2.0 `weights` key and
+§8.3's `times` binding are likewise spec-owned on a ragged payload array —
+writer-stamped from the field's declaration, never author-transcribed — as
+are the §8/§9 `temporal` and `located` declaration blocks on the companion
+arrays that carry them. A located field's provenance attrs (e.g. `stratum`,
+`signal_threshold` — §3.3) land on the **payload array only**; a sibling
+array carries no **user** attrs, only the spec-owned declaration its own
+section defines.
 
 ### 1.3 Codec chain
 
@@ -321,7 +332,10 @@ rule: an overflow shard's centroids may carry coarser common-ancestor words,
 with the stored layout and byte-level contract above unchanged.
 
 Word semantics (bit layout, kind marking, coarsening) are mortie's
-specification §1/§4, not restated here.
+specification §1/§4, not restated here. A located sibling MAY additionally
+carry the [§9](#9-zagg-located1) `located` declaration, which self-describes
+that grammar in the store; its absence is this section verbatim, never a
+refusal (§9).
 
 ### 2.3 What is deliberately not specified (informative)
 
@@ -1365,7 +1379,10 @@ point of the revision):
 - An array whose zarr data type is `vlen-ndarray` **is** `zagg-ragged/2`;
   the `ragged` attrs marker is retired on such arrays (not written). The
   element declaration lives in the dtype configuration alone — a reader
-  MUST NOT require the attrs block on a `/2` array.
+  MUST NOT require the attrs block on a `/2` array. (§8.3's `times` binding
+  and §2.0's `weights` are already top-level keys beside the block, so they
+  ride the migration unchanged — this clause is about the bindings that
+  live *inside* it.)
 - A located `/2` payload array still declares its sibling binding in
   **metadata, never by naming convention** (the §1.2 rule survives the
   revision), and it does so under a **new top-level attrs key** — not a
@@ -1588,11 +1605,17 @@ the declaration is `{shape, grammar revision}` under the `spec` marker, with
 - **`spec`** — the convention revision. Readers MUST strict-check it: an
   unknown or future revision raises, never half-parses under a guessed
   layout.
-- **`shape`** — the vocabulary value above. **`"coordinate"`** is the only
-  one this revision defines for `temporal`: the declaring array **is** the
-  time coordinate of a `(time, cells)` product — one word per timestep,
-  row-aligned with the leading axis of every `(time, cells)` array in the
-  same group. A reader MUST refuse a `shape` it does not implement.
+- **`shape`** — the vocabulary value above. This revision defines all three
+  for `temporal`, each with its own contract section: **`"coordinate"`**
+  (§8.1 — the declaring array **is** the time coordinate of a
+  `(time, cells)` product), **`"per-cell"`** (§8.2 — one word per cell of
+  the cell grid), and **`"per-centroid"`** (§8.3 — one word per centroid of
+  the digest it accompanies). A reader MUST refuse a `shape` it does not
+  implement — including one a later revision adds, which is why refusing is
+  the required behavior and guessing never is. Adding a shape is therefore
+  additive within the revision: `spec` does not move, stores already written
+  stay valid verbatim, and a reader that implements only some shapes fails
+  loudly on the rest rather than mis-decoding them.
 - **`grammar`** — the word grammar the values follow, named as a **grammar
   revision** in the `{name}/{major}` style this document uses throughout
   (`zagg-ragged/1`, `morton-hive/2`). It is a fixed token of this revision —
@@ -1603,13 +1626,21 @@ the declaration is `{shape, grammar revision}` under the `spec` marker, with
   reader MUST refuse a `grammar` it does not implement, and SHOULD record it
   as what it decoded against.
 
-**Forward instantiations** (informative, both
-[#410](https://github.com/englacial/zagg/issues/410)). The temporal
-companions — one word per cell, one word per centroid — arrive as the
-`"per-cell"` and `"per-centroid"` shapes under *this* `spec` and *this*
-grammar. The **located** (spatial) companion family declares under the same
-pattern with `grammar: "mortie-morton/1"`, landing with the #410 kernel PR.
-Neither re-declares the store's **primary** morton axis: that surface stays
+**The declaring array is the array that holds the words.** A block declares
+the values of the array it sits on, never a neighbour's: the time coordinate
+declares its own axis (§8.1), a per-cell companion its own dense array
+(§8.2), a per-centroid companion its own ragged sibling (§8.3). Where a
+companion is reached through another array, that array carries a *binding*
+(a sibling array name) and the companion carries the *declaration* — the
+same split §1.2 already makes for the located sibling.
+
+**Instantiations** ([#410](https://github.com/englacial/zagg/issues/410)).
+The temporal companions — one word per cell, one word per centroid — are the
+`"per-cell"` (§8.2) and `"per-centroid"` (§8.3) shapes under *this* `spec`
+and *this* grammar. The **located** (spatial) companion family declares
+under the same pattern with `grammar: "mortie-morton/1"` and its own domain
+key, in [§9](#9-zagg-located1). None of them re-declares the store's
+**primary** morton axis: that surface stays
 declared by the `morton-hive/{1,2}` manifest grammar (`morton_hive.json`,
 `docs/hive_layout.md`) and the store's [DGGS-convention](https://github.com/zarr-conventions/dggs)
 `dggs` attrs (`docs/morton_arrow.md`). This pattern is for word-typed
@@ -1704,8 +1735,235 @@ whose values mean two different things, so a reader or writer joining two
 stores' time axes MUST refuse a mismatch. This is a *join* rule only:
 reading either store on its own is always legal.
 
-**What this revision does not cover** (informative). Only
-`shape: "coordinate"` has a contract here; the `"per-cell"` and
-`"per-centroid"` temporal companions are the forward instantiations noted
-above and carry none of §8.1's clauses yet. Nothing in §8 constrains the
-`(time, cells)` band arrays themselves, which are unchanged.
+**What §8.1 does not cover** (informative). Its clauses are the
+`"coordinate"` shape's alone: the companion shapes carry their own in §8.2
+and §8.3, and a clause here binds a companion only where that section
+restates it. Nothing in §8 constrains the `(time, cells)` band arrays
+themselves, which are unchanged.
+
+### 8.2 `shape: "per-cell"`
+
+**Contract** ([#410](https://github.com/englacial/zagg/issues/410)). One
+word per cell of the store's cell grid: a **dense `uint64` array on the
+cells axis**, index-aligned with the `morton` coordinate (row `i` is the
+cell `morton[i]` addresses), sharing that array's shape, chunk grid and
+storage geometry (§1.5). It is an ordinary dense array — not a
+`zagg-ragged/1` array — and carries the `temporal` block in its own attrs.
+
+- The array's `fill_value` MUST be `0`, and **`0` is reserved**: it marks a
+  cell the writer left unobserved and MUST NOT be read as an acquisition. A
+  writer MUST NOT store `0` for an observed cell. (The one word the grammar
+  encodes as `0` is a degenerate range whose conservative envelope is the
+  epoch instant itself; every mission this store form serves postdates the
+  epoch by more than a century, so the collision is a documented exclusion,
+  not a live case.)
+- A cell whose word covers **exactly one** observation MUST be a
+  **timestamp** word, exact to the nanosecond. A cell pooling more than one
+  MUST be a **range** word whose envelope conservatively contains every
+  observation pooled into it. So the word is exact wherever the cell holds a
+  single observation and an honest conservative range wherever it does not —
+  the same instant-never-widened / interval-never-narrowed discipline
+  §8.1 states for the coordinate shape.
+- **The pooled word is the grammar's join.** A cell's word over a set of
+  observations is `toc_merge` (the grammar's semilattice join) reduced over
+  their individual words: the conservative envelope. The join is
+  associative, commutative and idempotent, so the stored word is
+  **independent of the order and tree** any producer reduced in — bit
+  identity, not approximate agreement. Whether that reduction happens in one
+  pass, in spill blocks, or up a pyramid is a producer's business and is not
+  specified here.
+- The claim a reader may make from the word is exactly the envelope:
+  every observation the cell summarizes fell inside `[start, end)` (both
+  bounds equal for a timestamp). It is **not** a claim that the cell was
+  observed throughout that interval, and the envelope's midpoint is not an
+  observation.
+- Stored word order is not the cells' order and carries no meaning: the axis
+  is ordered by `morton` (§1.5), so a reader MUST NOT sort or bisect this
+  array to resolve a time window. Selection is the grammar's overlap
+  predicate applied to the stored words directly — a conservative superset
+  of the cells whose real observations intersect the window, over-reporting
+  by at most one quantum at an edge and never under-reporting.
+
+### 8.3 `shape: "per-centroid"`
+
+**Contract** ([#410](https://github.com/englacial/zagg/issues/410)). One
+word per centroid of a digest field: a **`zagg-ragged/1` vlen sibling array**
+(element dtype `uint64`, empty `inner_shape`) with the same shape and chunk
+geometry as the payload array, **row-aligned** with it exactly as the
+located sibling is (§1.1) — cell `i` of the sibling holds one `uint64` word
+per payload row of cell `i`, so the two arrays share the payload's per-cell
+row counts. The sibling carries the `temporal` block in its own attrs.
+
+- **Binding.** The payload array declares the sibling by name under a
+  spec-owned **`times`** attrs key — a *sibling* of the §1.2 `ragged` block
+  on the payload array, exactly as §2.0's `weights` is, and for the same
+  reason: the `ragged` block is retired wholesale under `/2` (§1.6/§6.3), so
+  a key outside it survives that metadata-only migration untouched. The
+  `zagg-ragged/1` block grammar is therefore **unchanged by this revision** —
+  no key is added to it, and a `/1` reader that ignores unknown top-level
+  attrs decodes such a store exactly as before, minus the companion.
+
+  ```json
+  {
+    "ragged": {
+      "spec": "zagg-ragged/1",
+      "element": {"dtype": "float32", "shape": [-1, 2]},
+      "locations": "h_tdigest_locations"
+    },
+    "times": "h_tdigest_times"
+  }
+  ```
+
+  (The asymmetry with `locations` — inside the block — is deliberate and
+  historical: `locations` predates the sibling-key ruling and cannot move
+  without a `/1` revision, while a new key has no such constraint.)
+
+  A reader MUST bind the sibling by that declaration, never by
+  reconstructing a naming convention, and MUST read the `temporal` block off
+  the **sibling** it binds — a payload array carries the binding, never the
+  declaration. An absent `times` key means the field has no temporal
+  companion. The key is spec-owned: a writer stamps it from the field's
+  declaration, and config-declared attrs MUST NOT shadow it (§1.2's reserved-key
+  discipline, enforced at config validation).
+- A centroid of **weight 1** carries its single observation's word: a
+  **timestamp**, exact to the nanosecond. A merged centroid carries a
+  **range** word conservatively containing every observation merged into it
+  — the grammar's `toc_merge` join over their words, with the same
+  order-independence §8.2 states. Both variants therefore coexist in one
+  array, and a reader that implements only one is not conforming.
+- **Row order is the payload's, and it is not time order.** §2.1 sorts
+  payload rows ascending by mean, and the sibling is row-aligned with them,
+  so the stored words are in *value* order. A reader MUST NOT assume the
+  words ascend and MUST NOT bisect them; window selection is the grammar's
+  overlap predicate on the words directly, exactly as in §8.2, and its
+  result is a conservative superset of the centroids whose observations
+  intersect the window.
+- The digest payload it accompanies is **approximate** across fold orders
+  (§2.3) while this companion's join is exact. The companion's exactness
+  does not lift the field's composability class: a merged payload's
+  centroids may differ, and the words are exact **given** the centroid
+  partition they describe, not independently of it.
+- Provenance attrs still ride the payload array only (§1.2); the temporal
+  sibling carries the spec-owned `temporal` block and no user attrs.
+
+**Per-level shapes need not match** (contract). The two companion shapes
+describe the same information at different granularities, so one product may
+carry `"per-centroid"` on its leaves and `"per-cell"` on the summaries folded
+above them — a per-cell range is the honest temporal statement for a lossy
+summary, and it is the envelope of the per-centroid words beneath it. Each
+array is read through **its own** declaration; nothing requires a store's
+levels to agree, and a reader MUST NOT infer one array's shape from another's.
+
+### 8.4 Composition and merge legality
+
+**Contract.** Two payloads compose only when their temporal declarations
+**match on `{shape, grammar}`** — the §2.0 weights-gate discipline, for the
+same reason: words from two grammars, or from two shapes, describe different
+things, and a merged array carrying either would mean neither. A reader or
+writer joining declared payloads whose `shape` or `grammar` differ MUST
+refuse. (`spec` is strict-checked before this rule is reached: an unknown
+revision is already a refusal.)
+
+**An absent `temporal` key is never a refusal.** A payload, cell array or
+digest that declares nothing composes freely with anything — this is the
+schema-evolution rule that keeps every store written before this revision
+conformant verbatim. Two consequences, both normative:
+
+- The composed result MUST NOT carry a temporal declaration unless **every**
+  contributor carried a matching one. Dropping the channel is the honest
+  outcome: a word that omits an undeclared contributor's observations is not
+  a conservative envelope, and silently narrowing one is the failure this
+  clause exists to prevent.
+- An undeclared store supports **no temporal subsetting**. A reader MUST NOT
+  infer an encoding, an epoch, or a window from anything else in the store,
+  and MUST report that the query is unanswerable rather than approximate it.
+
+---
+
+## 9. `zagg-located/1`
+
+**Status: contract** ([issue #410](https://github.com/englacial/zagg/issues/410)).
+The **spatial** instantiation of §8's word-typed coordinate declaration:
+attrs key `located`, `spec: "zagg-located/1"`, `grammar:
+"mortie-morton/1"`. Everything §8 says about the pattern — the three keys
+and no more, strict-checking, the declaring array being the array that holds
+the words, informative extra keys ignored rather than refused — applies here
+unchanged and is not restated. The marker is named for the domain, not for
+the word type, precisely so it cannot read as a second declaration of the
+store's primary morton axis: it is not one, per §8's carve-out.
+
+```json
+"located": {
+  "spec": "zagg-located/1",
+  "shape": "per-centroid",
+  "grammar": "mortie-morton/1"
+}
+```
+
+**`shape`** — `"per-centroid"` is the only value this revision defines: the
+declaring array is the `{field}_locations` sibling of §1.1/§2.2, one word
+per centroid row of the payload it accompanies, bound from the payload
+array's `ragged` block `locations` key (§1.2). A reader MUST refuse a shape
+it does not implement.
+
+**An absent `located` key MUST be read as §2.2 verbatim** — order-29
+point-kind words at leaves, deepest-common-ancestor words after a merge —
+never as an unknown encoding, and never as grounds to refuse. Every located
+store written before this revision is conformant as it stands, no byte
+rewritten. What the declaration adds is self-description (a generic reader
+learns the word grammar from the array rather than from this page), the
+§8 shape vocabulary, and the overview clause below, which §2.2 does not
+cover.
+
+### The word grammar is mortie's
+
+A `zagg-located/1` value is a mortie **morton word**: one `uint64` packing
+the HEALPix nested cell and its order, with the order-29 point/area kind
+carried by the encoding. The bit layout, the order range, the kind
+convention and the raw-sort Z-order property are normative in mortie's
+[`docs/specification.md`](https://github.com/espg/mortie/blob/main/docs/specification.md)
+§1 and §4, and are **not restated here**. Unlike §8's toc citation, this is
+the same class of citation §2.2 already makes: mortie's §10 *"Frozen for
+1.x"* enumerates §1's bit layout and §4's encoding-carried kind convention
+as immutable within that major version, so the `mortie-morton/1` token names
+a grammar that cannot move under a conforming reader.
+
+### 9.1 Leaf and overview words
+
+**Contract.**
+
+- The per-observation words a leaf ingests are **order-29 point-kind**
+  words; a centroid of weight 1 carries its single observation's word
+  unchanged, an exact position (§2.2).
+- A merged centroid — at a leaf, at a spill-block close, or at any level of
+  a pyramid — carries the **deepest common ancestor** of every observation
+  merged into it: the finest morton cell containing all of them. That is the
+  whole claim a reader may make from the word. It is not a centroid
+  position, not a mean, and not a cell the data fills.
+- **Overview words sit at heterogeneous orders, within one array.** A fold
+  coarsens only as far as its contributors force, so one overview array's
+  words routinely carry different orders — an unmerged centroid's order-29
+  point word beside a merged centroid's coarse area word. A reader MUST
+  decode each word's order from the word itself (mortie §1/§4) and MUST NOT
+  assume a uniform order per array, per level, or per store, nor infer one
+  from the level's cell order. The **order-29 uniformity that §2.2's
+  per-observation clause implies is a leaf-ingest property only**, and does
+  not survive a fold.
+- The ancestor reduction is exact and order-independent — point and area
+  words share a path prefix, so mixed inputs compose under the one rule
+  (§2.2) — but, as in §8.3, it does not lift the accompanying digest's
+  composability class (§2.3): the words are exact **given** the centroid
+  partition they describe.
+
+### 9.2 Composition and merge legality
+
+**Contract.** §8.4 applies verbatim with `located` in place of `temporal`:
+declared companions compose only on matching `{shape, grammar}` and MUST be
+refused otherwise; an absent declaration is never a refusal. The one
+difference follows from the absent-key rule above — an undeclared located
+sibling is not information-free the way an undeclared temporal one is, since
+§2.2 already pins its word semantics, so composing a declared companion with
+an undeclared one is legal **and** the result MAY carry the declaration: the
+words mean the same thing on both sides. A reader that cannot establish that
+— because §2.2 does not apply to the array in hand — MUST drop the
+declaration rather than assert it.
