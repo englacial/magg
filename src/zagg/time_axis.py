@@ -91,6 +91,17 @@ TOC_WORD_COLUMN = "toc_word"
 #: grid is meant to imply. Window ROUTING tolerates that; a word claiming
 #: nanosecond exactness cannot.
 TOC_SOURCE_SCALES = ("gps", "tai")
+#: The refusal for a ``temporal:`` companion whose clock does not resolve —
+#: :func:`toc_source` returns ``None``. Single-sourced (issue #472) so the
+#: submission seam (``config._validate_temporal_producer``) and the worker
+#: seam (``processing.aggregate._toc_word_column``, defense in depth) read
+#: identically: the first fleet failure burned one invoke per shard on an
+#: error fully determinable from the config dict alone.
+TOC_NO_CLOCK_ERROR = (
+    "a field declares a temporal companion but the store has no per-observation "
+    "clock — declare output.time_source {field, epoch, scale, units} (spec §8.3, "
+    "issue #410)"
+)
 #: The §8 word-grammar citation — a grammar REVISION token in the ecosystem's
 #: {name}/{major} style (``zagg-ragged/1``, ``morton-hive/2``), never a
 #: documentation URL or a stamp of the writer's installed mortie: store bytes

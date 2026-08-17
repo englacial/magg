@@ -1960,6 +1960,7 @@ def _validate_temporal_producer(name: str, meta: dict, config=None) -> None:
     ``validate_config`` path passes it.
     """
     from zagg.time_axis import (
+        TOC_NO_CLOCK_ERROR,
         TOC_PER_CELL_FUNCTIONS,
         TOC_PRODUCING_FUNCTIONS,
         TOC_SHAPE_PER_CELL,
@@ -1983,13 +1984,13 @@ def _validate_temporal_producer(name: str, meta: dict, config=None) -> None:
             f"sibling, and a digest kernel's channel is not a dense per-cell array "
             f"(spec §8.2/§8.3)"
         )
+    # The clock cross-check runs through the SAME resolver the worker encodes
+    # with (``toc_source``: ``output.time_source``, falling back to a
+    # continuous-scale ``output.windowing`` block), and raises the worker's
+    # exact message so the two seams read identically (issue #472) — the
+    # worker's copy stays as defense in depth.
     if config is not None and toc_source(config) is None:
-        raise ValueError(
-            f"Variable '{name}': 'temporal' requires the store's per-observation clock — "
-            f"declare output.time_source {{field, epoch, scale, units}} (or an "
-            f"output.windowing block on a continuous scale, which it falls back to). "
-            f"Without it there is no column to encode toc words from (issue #410)"
-        )
+        raise ValueError(f"Variable '{name}': {TOC_NO_CLOCK_ERROR}")
 
 
 def _validate_output_kind(name: str, meta: dict, config=None) -> None:

@@ -1,6 +1,7 @@
 """Tests for the YAML pipeline configuration system."""
 
 import json
+import re
 from dataclasses import asdict
 
 import numpy as np
@@ -32,6 +33,7 @@ from zagg.config import (
     validate_config,
 )
 from zagg.processing import calculate_cell_statistics
+from zagg.time_axis import TOC_NO_CLOCK_ERROR
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -2404,10 +2406,11 @@ class TestTemporalShapeDeclaration:
 
     def test_temporal_requires_the_stores_clock(self):
         # Without output.time_source (or a continuous-scale windowing block to
-        # fall back to) there is no column to encode words from.
+        # fall back to) there is no column to encode words from. The refusal is
+        # the worker's own text (issue #472) prefixed with the variable name.
         cfg = self._centroid_cfg()
         del cfg.output["time_source"]
-        with pytest.raises(ValueError, match="requires the store's per-observation clock"):
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
             validate_config(cfg)
 
     def test_windowing_satisfies_the_clock(self):
@@ -2720,6 +2723,104 @@ class TestTimeSource:
         cfg.aggregation["chunk_precompute"] = {"toc_word": {"function": "mean", "source": "h_ph"}}
         with pytest.raises(ValueError, match="reserved derived column"):
             validate_config(cfg)
+
+
+class TestTemporalClockAtSubmission:
+    """A ``temporal:`` companion without a resolvable clock is refused at
+    submission, not first by the worker on the fleet (issue #472).
+
+    The regression shape is the observed one: the ``02_write`` demo grafted
+    ``aggregation["variables"]`` from ``atl03_tdigest_located_healpix`` (whose
+    variables declare ``temporal: per-centroid``, PR #463) onto the hive base
+    template without also grafting ``output.time_source`` and the
+    ``delta_time`` source column — every shard then burned an invoke on the
+    worker's refusal, for an error fully determinable from the config dict.
+    """
+
+    def _graft(self):
+        import copy
+
+        base = default_config("atl03_tdigest_healpix_hive", validate=False)
+        located = default_config("atl03_tdigest_located_healpix", validate=False)
+        base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
+        return base, located
+
+    def test_graft_without_clock_refused_at_submission(self):
+        # The exact observed shape, pinned to the worker's message text so the
+        # two seams read identically.
+        cfg, _ = self._graft()
+        assert (cfg.output or {}).get("time_source") is None
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            validate_config(cfg)
+
+    def test_graft_clock_without_column_refused_at_submission(self):
+        # The graft's second missing piece: time_source present but its field
+        # not a declared data_source variable — refused here, not as a worker
+        # KeyError one seam later.
+        cfg, located = self._graft()
+        cfg.output["time_source"] = dict(located.output["time_source"])
+        assert cfg.output["time_source"]["field"] not in cfg.data_source["variables"]
+        with pytest.raises(ValueError, match="not a declared data_source variable"):
+            validate_config(cfg)
+
+    def test_graft_with_full_clock_validates(self):
+        # Grafting BOTH missing pieces (the clock block and its column) is the
+        # correct form of the demo's config, and it validates.
+        cfg, located = self._graft()
+        cfg.output["time_source"] = dict(located.output["time_source"])
+        field = cfg.output["time_source"]["field"]
+        cfg.data_source["variables"][field] = located.data_source["variables"][field]
+        validate_config(cfg)
+
+    def test_windowing_fallback_satisfies_the_graft(self):
+        # The continuous-scale windowing fallback (PR #463) resolves the clock
+        # through the same resolver the worker uses (toc_source), so the graft
+        # with a windowing block and its column — but no time_source — is valid.
+        cfg, _ = self._graft()
+        cfg.data_source["variables"]["delta_time"] = "{group}/heights/delta_time"
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+        }
+        validate_config(cfg)
+
+    def test_both_seams_raise_the_same_text(self):
+        # Parity pin: the worker's defense-in-depth refusal is the exact string
+        # the validator embeds (single-sourced in zagg.time_axis, issue #472).
+        from zagg.processing.aggregate import _toc_word_column
+
+        cfg, _ = self._graft()
+        with pytest.raises(ValueError) as worker_exc:
+            _toc_word_column({}, cfg)
+        with pytest.raises(ValueError) as submit_exc:
+            validate_config(cfg)
+        assert str(worker_exc.value) == TOC_NO_CLOCK_ERROR
+        assert TOC_NO_CLOCK_ERROR in str(submit_exc.value)
+
+    def test_every_shipped_temporal_template_validates(self):
+        # Sweep the packaged configs for aggregation variables carrying the
+        # ``temporal:`` key; each such template must pass validate_config, and
+        # the sweep must actually find the known carriers (a guard against the
+        # discovery matching nothing).
+        from importlib import resources
+
+        import zagg.configs
+
+        names = sorted(
+            p.name[: -len(".yaml")]
+            for p in resources.files(zagg.configs).iterdir()
+            if p.name.endswith(".yaml")
+        )
+        carriers = set()
+        for name in names:
+            cfg = default_config(name, validate=False)
+            agg_vars = (cfg.aggregation or {}).get("variables") or {}
+            if any(isinstance(m, dict) and m.get("temporal") for m in agg_vars.values()):
+                carriers.add(name)
+                validate_config(cfg)
+        assert carriers >= {"atl03_tdigest_located_healpix", "gedi01b_waveform_healpix_hive"}
 
 
 class TestOverviewDelta:
