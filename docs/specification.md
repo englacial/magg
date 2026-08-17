@@ -339,9 +339,17 @@ with the payload:
   merged into it, and the finest one those words establish — a fold sees
   words, never the observations beneath them, so a coarse input word bounds
   how fine the result can be. A centroid folded from a single member carries
-  that member's word unchanged. Point and area words share the same path prefix, so mixed
-  inputs (a fresh point word folded with an earlier merge's coarser area
-  word) compose under the one rule.
+  that member's word unchanged. Point and area words share the same path
+  prefix, so mixed inputs (a fresh point word folded with an earlier merge's
+  coarser area word) compose under the one rule.
+- **Orders are heterogeneous, leaf arrays included.** A reader MUST decode
+  each word's order and kind from the word itself (mortie §1/§4) and MUST
+  NOT assume a uniform order per array, per cell, or per store. A store whose
+  leaf words happen to be uniformly order-29 point words (every shipped
+  config's output today) is an observation about particular bytes, never an
+  inference this section licenses — the same duty §9.1 spells out for a
+  declared companion, stated here so the undeclared read path (§9's
+  absent-key clause) carries it too.
 
 A morton cell encodes **containment, not calibrated uncertainty**
 (informative): a small error disk straddling a cell boundary is honestly
