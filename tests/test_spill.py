@@ -20,6 +20,7 @@ which frame is scheduling-dependent and buffer/pool composition varies run to
 run (a trap first hit in the issue #217 arena A/B tests).
 """
 
+import inspect
 import tempfile
 
 import numpy as np
@@ -34,6 +35,7 @@ from zagg.processing.spill import (
     SpillBlock,
     SpillOverflowError,
     SpillReduceError,
+    _default_block_bytes,
     check_tmp_headroom,
     partition_ids,
 )
@@ -466,11 +468,16 @@ class TestSpillConfig:
         # (absent) keeps the disk-derived _default_block_bytes behavior.
         seen = {}
         real_init = SpillAggregator.__init__
+        # Bind through the real signature, not kwargs.get: a positional pass
+        # would otherwise record None and the absent-knob arm would still pass,
+        # a silent hole in exactly the seam this test guards.
+        sig = inspect.signature(real_init)
 
         def spy(agg, *args, **kwargs):
-            seen["block_bytes"] = kwargs.get("block_bytes")
+            seen["block_bytes"] = sig.bind(agg, *args, **kwargs).arguments.get("block_bytes")
             real_init(agg, *args, **kwargs)
             seen["resolved"] = agg.block_bytes
+            seen["agg"] = agg
 
         monkeypatch.setattr(SpillAggregator, "__init__", spy)
         streaming = {"mode": "spill"}
@@ -485,7 +492,10 @@ class TestSpillConfig:
         if block_bytes is not None:
             assert seen["resolved"] == block_bytes
         else:
-            assert seen["resolved"] > 0  # disk-derived default, unchanged
+            # The disk-derived default, exactly — `> 0` cannot fail, since
+            # _default_block_bytes is a max(1, ...).
+            agg = seen["agg"]
+            assert seen["resolved"] == _default_block_bytes(agg._n_partitions, agg.tmp_dir)
 
     def test_explicit_block_bytes_reserves_the_overlap_pair(self, monkeypatch, tmp_path):
         # issue #474: an explicit threshold skips _default_block_bytes' 45%
