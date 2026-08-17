@@ -294,6 +294,24 @@ class TestObservationWords:
         decoded = mortie.to_datetime64(mortie.toc2time(self._words([offset]))[0])[0]
         assert decoded == boundary
 
+    def test_is_exact_to_the_nanosecond_at_icesat2_magnitudes(self):
+        # §8.3 MUSTs a timestamp word exact to the nanosecond. By 2026
+        # ``delta_time`` is ~2.5e8 s, so ``offsets * 1e9`` lands near 2.5e17 where
+        # a float64 ulp is 32 ns: one multiply quantizes before it rounds and
+        # misses the nearest ns by up to 16 ns (issue #410 review). Compared
+        # against exact rational arithmetic on the delivered float64 values.
+        from fractions import Fraction
+
+        import mortie
+
+        from zagg.time_axis import _internal_ns
+
+        values = np.random.default_rng(410).uniform(2.4e8, 2.5e8, 2000)
+        base = int(_internal_ns(np.array([np.datetime64(self.EPOCH, "us")]))[0])
+        start, _ = mortie.toc2time(self._words(values))
+        exact = np.array([base + round(Fraction(float(v)) * 10**9) for v in values], dtype="uint64")
+        assert np.array_equal(np.asarray(start, dtype="uint64"), exact)
+
     def test_pre_2017_epoch_is_not_leap_shifted(self):
         # Every other case here sits on the post-2017 ATLAS epoch, where a
         # scale-vs-UTC correction is 0 and therefore invisible: deleting or
