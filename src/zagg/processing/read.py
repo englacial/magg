@@ -196,6 +196,105 @@ def link_base_extent(index_beg_arr, count_arr, index_base: int) -> int:
     return int((beg[nonempty] + cnt[nonempty]).max())
 
 
+def _link_parent_at_rows(
+    index_beg_arr, count_arr, index_base: int, base_rows: np.ndarray
+) -> np.ndarray:
+    """Owning record index per given base row, ``-1`` where none (issue #452).
+
+    The planned-rate twin of the paint-and-slice loops above: instead of
+    building a length-``n_base`` array and selecting the read's rows out of it,
+    each requested row's record is located directly, with one ``searchsorted``
+    over the link's starts. On the vlen route ``n_base`` is sample rate (~2·10^8
+    per GEDI beam group) while ``base_rows`` is the plan's rows (~3·10^5), so
+    the difference is a 2 GB worker surviving or not (the issue #43 OOM
+    posture, applied to the expansion side).
+
+    Records are assumed not to overlap — the link grammar's contract, which the
+    gather maps validate — and ties on an identical start resolve to the later
+    record, matching the paint order of :func:`_broadcast_segment_to_base`.
+    Empty records (``count == 0``) own nothing (issue #116).
+    """
+    beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
+    cnt = np.asarray(count_arr).astype(np.int64)
+    rows = np.asarray(base_rows, dtype=np.int64)
+    nonempty = np.flatnonzero(cnt > 0)
+    if nonempty.size == 0 or rows.size == 0:
+        return np.full(rows.shape, -1, dtype=np.int64)
+    order = nonempty[np.argsort(beg[nonempty], kind="stable")]
+    pos = np.searchsorted(beg[order], rows, side="right") - 1
+    inside = pos >= 0
+    owner = order[np.where(inside, pos, 0)]
+    inside &= rows < beg[owner] + cnt[owner]
+    return np.where(inside, owner, -1)
+
+
+def _expand_mask_at_rows(
+    coarse_mask: np.ndarray,
+    index_beg_arr,
+    count_arr,
+    index_base: int,
+    base_rows: np.ndarray,
+) -> np.ndarray:
+    """:func:`_expand_mask_to_base` restricted to ``base_rows`` (issue #452).
+
+    Identical to ``_expand_mask_to_base(...)[base_rows]`` — a row owned by no
+    record is ``False`` there and here — without the length-``n_base``
+    intermediate (196 MB per cross-level filter on a GEDI beam group).
+    """
+    beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
+    cnt = np.asarray(count_arr).astype(np.int64)
+    bad = (cnt > 0) & (beg < 0)
+    if bad.any():
+        p = int(np.argmax(bad))
+        raise ValueError(
+            f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
+        )
+    parent = _link_parent_at_rows(index_beg_arr, count_arr, index_base, base_rows)
+    valid = parent >= 0
+    return np.asarray(coarse_mask, dtype=bool)[np.where(valid, parent, 0)] & valid
+
+
+def _gather_segment_at_rows(
+    seg_values: np.ndarray,
+    index_beg_arr,
+    count_arr,
+    index_base: int,
+    total_base_size: int,
+    base_rows: np.ndarray,
+) -> np.ndarray:
+    """:func:`_broadcast_segment_to_base` restricted to ``base_rows`` (issue #452).
+
+    Identical to ``_broadcast_segment_to_base(...)[base_rows]``, fill semantics
+    included (``NaN`` for float dtypes on a row no record owns, zero otherwise),
+    without the length-``n_base`` intermediate — one per segment-level variable,
+    which on GEDI's six per-shot companions is ~7 GB against a 2 GB worker.
+    """
+    beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
+    cnt = np.asarray(count_arr).astype(np.int64)
+    nonempty = cnt > 0
+    bad = nonempty & (beg < 0)
+    if bad.any():
+        p = int(np.argmax(bad))
+        raise ValueError(
+            f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
+        )
+    over = nonempty & (beg + cnt > total_base_size)
+    if over.any():
+        p = int(np.argmax(over))
+        raise ValueError(
+            f"segment {p} range [{beg[p]}:{beg[p] + cnt[p]}] exceeds base size "
+            f"{total_base_size}; the segment-level variable's link does not tile "
+            f"the read's base extent"
+        )
+    seg_values = np.asarray(seg_values)
+    parent = _link_parent_at_rows(index_beg_arr, count_arr, index_base, base_rows)
+    valid = parent >= 0
+    out = seg_values[np.where(valid, parent, 0)]
+    if not valid.all():
+        out[~valid] = np.nan if np.issubdtype(seg_values.dtype, np.floating) else 0
+    return out
+
+
 def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
     """Collect declared segment-level (non-base) readable variables (issue #30).
 
@@ -223,7 +322,13 @@ def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
 
 
 def _read_segment_broadcasts(
-    h5obj, group: str, data_source: dict, levels: dict, n_base: int, read_fn=None
+    h5obj,
+    group: str,
+    data_source: dict,
+    levels: dict,
+    n_base: int,
+    read_fn=None,
+    base_rows: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Read each segment-level variable and broadcast it to a base-rate column (issue #30).
 
@@ -233,6 +338,12 @@ def _read_segment_broadcasts(
     ``{name: base_rate_array}`` (length ``n_base``), ready to be sliced through the
     same spatial / keep masks the base-rate variables are. A variable name colliding
     with a ``data_source.variables`` column is rejected (it would shadow the read).
+
+    ``base_rows`` (issue #452) hands back the same values at the read's rows only
+    — length ``len(base_rows)``, gathered via :func:`_gather_segment_at_rows`
+    instead of built at length ``n_base`` and sliced. The vlen route passes its
+    plan's rows: ``n_base`` is sample rate there, so the base-rate form costs
+    ~1.2 GB per companion variable on a GEDI beam group.
     """
     seg_vars = _segment_level_variables(data_source)
     if not seg_vars:
@@ -263,9 +374,14 @@ def _read_segment_broadcasts(
                 seg_values = np.asarray(h5obj.readDatasets([seg_path])[seg_path])
             else:
                 seg_values = np.asarray(read_fn(seg_path))
-            out[col_name] = _broadcast_segment_to_base(
-                seg_values, ibeg_arr, cnt_arr, index_base, n_base
-            )
+            if base_rows is None:
+                out[col_name] = _broadcast_segment_to_base(
+                    seg_values, ibeg_arr, cnt_arr, index_base, n_base
+                )
+            else:
+                out[col_name] = _gather_segment_at_rows(
+                    seg_values, ibeg_arr, cnt_arr, index_base, n_base, base_rows
+                )
     return out
 
 

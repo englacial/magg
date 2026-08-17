@@ -18,11 +18,14 @@ from zagg.processing import (
     _concat_and_group,
     _empty_cell_value,
     _eval_chunk_precompute,
+    _expand_mask_at_rows,
     _expand_mask_to_base,
+    _gather_segment_at_rows,
     _group_columns,
     _has_ragged_fields,
     _has_vector_fields,
     _iter_carrier_columns,
+    _link_parent_at_rows,
     _predicate_mask,
     _read_group,
     _read_segment_broadcasts,
@@ -4523,6 +4526,71 @@ class TestLinkBaseExtent:
             ("/heights/lat_ph", ((2, 6),)),
             ("/heights/lon_ph", ((2, 6),)),
         ]
+
+
+class TestPlannedRateExpansion:
+    """The planned-rate twins of the paint-and-slice expansions (issue #452).
+
+    Each must equal ``<base-rate form>(...)[base_rows]`` exactly — the base-rate
+    arrays were only ever consumed at the read's rows, so the gather is a pure
+    memory win (7 GB per GEDI beam group)."""
+
+    STRIDED_IBEG = np.array([1, 11, 21, 31], dtype=np.int64)  # origin-1, stride 10
+    STRIDED_CNT = np.array([5, 3, 0, 4], dtype=np.int64)  # record 2 is empty
+
+    def test_parent_at_rows_matches_the_paint_order(self):
+        rows = np.arange(34, dtype=np.int64)
+        parent = _link_parent_at_rows(self.STRIDED_IBEG, self.STRIDED_CNT, 1, rows)
+        expected = np.full(34, -1, dtype=np.int64)
+        expected[0:5] = 0
+        expected[10:13] = 1
+        expected[30:34] = 3
+        np.testing.assert_array_equal(parent, expected)
+
+    def test_parent_at_rows_handles_edges(self):
+        empty_link = _link_parent_at_rows(np.array([0, 0]), np.array([0, 0]), 1, np.arange(3))
+        np.testing.assert_array_equal(empty_link, [-1, -1, -1])
+        no_rows = _link_parent_at_rows(
+            self.STRIDED_IBEG, self.STRIDED_CNT, 1, np.array([], dtype=np.int64)
+        )
+        assert no_rows.shape == (0,)
+
+    def test_expand_mask_at_rows_equals_base_rate_form(self):
+        coarse = np.array([True, False, True, True])
+        rows = np.array([0, 4, 5, 9, 10, 12, 13, 30, 33], dtype=np.int64)
+        base = _expand_mask_to_base(coarse, self.STRIDED_IBEG, self.STRIDED_CNT, 1, 34)
+        at_rows = _expand_mask_at_rows(coarse, self.STRIDED_IBEG, self.STRIDED_CNT, 1, rows)
+        np.testing.assert_array_equal(at_rows, base[rows])
+        # Slack rows (owned by no record) are False, never a neighbour's verdict.
+        assert at_rows.tolist() == [True, True, False, False, False, False, False, True, True]
+
+    def test_expand_mask_at_rows_validates_negative_start(self):
+        with pytest.raises(ValueError, match="less than index_base"):
+            _expand_mask_at_rows(np.array([True]), np.array([0]), np.array([3]), 1, np.arange(3))
+
+    def test_gather_segment_at_rows_equals_base_rate_form(self):
+        seg = np.array([10.0, 20.0, 0.0, 40.0], dtype=np.float32)
+        rows = np.array([0, 4, 5, 9, 10, 12, 13, 30, 33], dtype=np.int64)
+        base = _broadcast_segment_to_base(seg, self.STRIDED_IBEG, self.STRIDED_CNT, 1, 34)
+        at_rows = _gather_segment_at_rows(seg, self.STRIDED_IBEG, self.STRIDED_CNT, 1, 34, rows)
+        np.testing.assert_array_equal(at_rows, base[rows])
+        assert at_rows.dtype == seg.dtype
+        # Float fill for a row no record owns is NaN, as in the base-rate form.
+        assert np.isnan(at_rows[2])
+
+    def test_gather_segment_at_rows_zero_fills_non_float(self):
+        seg = np.array([7, 8], dtype=np.int32)
+        ibeg = np.array([0, 10])
+        cnt = np.array([2, 2])
+        out = _gather_segment_at_rows(seg, ibeg, cnt, 0, 12, np.array([0, 5, 11]))
+        assert out.tolist() == [7, 0, 8]
+        assert out.dtype == seg.dtype
+
+    def test_gather_segment_at_rows_validates_overrun(self):
+        with pytest.raises(ValueError, match="exceeds base size"):
+            _gather_segment_at_rows(
+                np.array([1.0]), np.array([1]), np.array([5]), 1, 3, np.arange(3)
+            )
 
 
 class TestReadGroupCrossLevel:
