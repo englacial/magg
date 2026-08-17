@@ -147,12 +147,14 @@ def canonical_granule_id(entry) -> str:
     datetimes, neither of which carries a path separator).
 
     Paired-asset worker payloads (issue #425) arrive as ``{"url", "assets"}``
-    mappings; the record's granule identity is the **primary**, exactly as
-    before, so a caller passing resolved strings (the local backend) and one
-    passing the worker payload verbatim (the Lambda handler) still agree. Each
-    sibling asset href normalizes by this same rule wherever it is taken, so a
-    paired entry is href-form-independent in every component, not just its
-    primary.
+    mappings; the record's granule identity is the **primary alone** — issue
+    #425's invariant, unchanged by this epoch — which is what keeps a caller
+    passing resolved strings (the local backend) and one passing the worker
+    payload verbatim (the Lambda handler) on one hash. The ``assets`` are
+    dropped, so a sibling href never reaches a digest at all: swap the sibling
+    for a genuinely different granule and :func:`granules_sha256` does not move.
+    Whether the recorded catalog identity *should* cover the sibling a paired
+    read consumes is a separate ruling, not implied here.
 
     Accepted cost of the ruling: two granules whose hrefs differ only in
     prefix collapse to one identity. Every catalog zagg reads names granules

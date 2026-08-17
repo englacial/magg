@@ -306,11 +306,14 @@ class TestCanonicalGranuleIdentity:
         assert s3["granule_ids"] == https["granule_ids"] == sorted(self.BARE)
         assert s3["granules_sha256"] == https["granules_sha256"] == granules_sha256(self.BARE)
 
-    def test_paired_asset_entries_normalize_in_every_component(self, tmp_path):
-        # Paired entries (issue #425) identify by their PRIMARY, which is what
-        # keeps the local backend (resolved strings) and the Lambda handler
-        # (payload entries verbatim) on one hash. Every component normalizes,
-        # so the sibling href form cannot move the identity either.
+    def test_paired_asset_entries_identify_by_their_primary(self, tmp_path):
+        # Paired entries (issue #425) identify by their PRIMARY ALONE, which is
+        # what keeps the local backend (resolved strings) and the Lambda handler
+        # (payload entries verbatim) on one hash. The siblings are dropped
+        # outright, so this uses two ENTIRELY DIFFERENT sibling granules on the
+        # two sides: the digests must still agree, which is the property, and is
+        # also the discriminating form -- the same basename on both sides would
+        # pass whether assets are normalized, ignored, or replaced.
         from zagg.telemetry import build_record
 
         s3_entries = [
@@ -318,7 +321,7 @@ class TestCanonicalGranuleIdentity:
             self.S3[1],
         ]
         https_entries = [
-            {"url": self.HTTPS[0], "assets": {"l2a": "https://h/other/prefix/SIB_A.h5"}},
+            {"url": self.HTTPS[0], "assets": {"l2b": "https://h/other/GEDI02_B_WHOLLY_OTHER.h5"}},
             self.HTTPS[1],
         ]
         recs = [
