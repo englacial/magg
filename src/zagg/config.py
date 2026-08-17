@@ -1984,11 +1984,24 @@ def _validate_temporal_producer(name: str, meta: dict, config=None) -> None:
             f"sibling, and a digest kernel's channel is not a dense per-cell array "
             f"(spec §8.2/§8.3)"
         )
-    # The clock cross-check runs through the SAME resolver the worker encodes
+    # The clock cross-check runs through the same resolver the worker encodes
     # with (``toc_source``: ``output.time_source``, falling back to a
     # continuous-scale ``output.windowing`` block), and raises the worker's
     # exact message so the two seams read identically (issue #472) — the
-    # worker's copy stays as defense in depth.
+    # worker's copy stays as defense in depth. Two limits on that parity, both
+    # named here because this is where a reader will look (fold review):
+    #   * this seam is reachable only from ``validate_config``'s spatial,
+    #     non-raster branch (the aggregation-variable loop, after both early
+    #     returns), while ``_toc_word_column`` is ungated. Benign today —
+    #     ``calculate_cell_statistics`` is only reached from the spatial point
+    #     path, so no other branch can produce toc words — but a raster or
+    #     event toc path would inherit the gap silently.
+    #   * the resolver is shared, but the two clock declarations validate their
+    #     COLUMN against different sets: ``_validate_time_source`` accepts a
+    #     broadcast/segment-level column (GEDI's shot-rate clock) where
+    #     ``_validate_windowing`` refuses one (segment-rate window membership
+    #     is unsupported), so the fallback is not interchangeable with the
+    #     explicit block.
     if config is not None and toc_source(config) is None:
         raise ValueError(f"Variable '{name}': {TOC_NO_CLOCK_ERROR}")
 
