@@ -755,6 +755,17 @@ different products and block mixed-order processing (D24) — and the whole
 [retrofitting a pyramid declaration](#retrofitting-the-pyramid-declaration)
 onto the config that built a store still hashes identically and still works.
 
+Also **not** changed, and not an oversight: three `data_source` keys that read
+as the same fetch-mechanism class as item 1 and item 3 are still in the core,
+so they still move the digest — `read_workers` (the third fan-out width,
+beside the two spellings item 1 excluded), `source_region` (the raster
+source-store kwarg that sits in the same dict literal as the already-excluded
+`anonymous`), and `write_buffer` (the live-slab bound on the streamed raster
+sink). Excluding a key is a ruling, not housekeeping, so this epoch carries
+only what was ruled; the three stand unruled as an open question on the epoch
+PR ([#420](https://github.com/englacial/zagg/pull/420)), and excluding them
+later would be its own epoch.
+
 ### Why re-hashing is correct, not a defect
 
 The pre-epoch digest answered "do these two configs produce the same leaves"

@@ -129,6 +129,16 @@ from zagg.time_axis import DEFAULT_TIME_ENCODING
 #: without an auth knob in it: no store carries a provider-bearing hash yet
 #: (the ``lpdaac`` line lands with the GEDI template, PR #450), so this costs
 #: nothing now and cannot be taken back cheaply later.
+#:
+#: Unruled, and therefore **still hashed**: ``read_workers`` (the third
+#: fan-out width beside the two spellings above), ``source_region`` (the
+#: raster source-store kwarg that sits in the same dict literal as
+#: ``anonymous``) and ``write_buffer``
+#: (the live-slab bound on the streamed raster sink) all read as the same
+#: fetch-mechanism class as the entries here. Excluding a key is a ruling, not
+#: an assumption — the same footing ``shard_workers`` was flagged on above —
+#: so they are raised on the epoch PR rather than added, and every one of them
+#: still moves ``semantic_hash`` today.
 DATA_SOURCE_PACKAGING_KEYS = (
     "reader",
     "driver",
