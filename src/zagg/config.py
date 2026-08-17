@@ -2240,7 +2240,10 @@ def _validate_vlen_source(data_source: dict) -> None:
       linspace comes from that level's link);
     - ``data_source.assets`` entries carry a ``join`` block with string
       ``left``/``right`` key paths; every filter's ``asset`` names a declared
-      entry, and asset filters require the vlen route.
+      entry, and asset filters require the vlen route;
+    - asset-sourced level variables (issue #464) require the vlen route, live
+      on ``coordinates.level`` only (the record-key join aligns that level's
+      records), and name a declared asset.
     """
     ds = data_source or {}
     coords = ds.get("coordinates")
@@ -2308,6 +2311,35 @@ def _validate_vlen_source(data_source: dict) -> None:
                 f"filter[{i}]: 'asset' filters require the vlen route "
                 "(set data_source.coordinates.level)"
             )
+    # Asset-sourced level variables (issue #464): shape is validated in
+    # ``_validate_overviews``; the cross-checks live here because they need
+    # ``coordinates.level`` and ``assets``.
+    if isinstance(levels, dict):
+        for lvl_name, lvl in levels.items():
+            lvl_vars = lvl.get("variables") if isinstance(lvl, dict) else None
+            if not isinstance(lvl_vars, dict):
+                continue
+            for var_name, entry in lvl_vars.items():
+                if not isinstance(entry, dict):
+                    continue
+                where = f"levels.{lvl_name}.variables['{var_name}']"
+                if coord_level is None:
+                    raise ValueError(
+                        f"{where}: asset variables require the vlen route "
+                        "(set data_source.coordinates.level)"
+                    )
+                if lvl_name != coord_level:
+                    raise ValueError(
+                        f"{where}: asset variables are record-level by construction "
+                        f"(the join key aligns records); declare them on "
+                        f"coordinates.level {coord_level!r}"
+                    )
+                asset = entry.get("asset")
+                if not isinstance(assets, dict) or asset not in assets:
+                    raise ValueError(
+                        f"{where}: asset {asset!r} is not declared in data_source.assets "
+                        f"(available: {sorted(assets) if isinstance(assets, dict) else []})"
+                    )
 
 
 def _segment_variable_names(data_source: dict) -> set[str]:
@@ -2367,10 +2399,12 @@ def _validate_overviews(data_source: dict) -> None:
             raise ValueError(f"levels.{name}: 'path' is required")
         # A non-base level may declare ``variables`` as a ``{name: path-template}``
         # mapping (issue #30): a readable segment-level variable broadcast to the
-        # base rows at read time. Validate it like ``data_source.variables`` (string
-        # names -> non-empty string path templates) and forbid the mapping form on
-        # the base level (the base level uses ``data_source.variables``). The
-        # documentation-only ``list[str]`` form stays valid on any level.
+        # base rows at read time. An entry may instead be an ``{asset, path}``
+        # mapping (issue #464): the same broadcast, sourced from a sibling asset
+        # via the record-key join. Validate names and entry shapes, and forbid the
+        # mapping form on the base level (the base level uses
+        # ``data_source.variables``). The documentation-only ``list[str]`` form
+        # stays valid on any level.
         lvl_vars = lvl.get("variables")
         if isinstance(lvl_vars, dict):
             if name == base_level:
@@ -2383,10 +2417,38 @@ def _validate_overviews(data_source: dict) -> None:
                     raise ValueError(
                         f"levels.{name}.variables: variable names must be non-empty strings"
                     )
-                if not isinstance(tmpl, str) or not tmpl:
+                if isinstance(tmpl, dict):
+                    # Asset-sourced record-level variable (issue #464): the
+                    # dataset is read from the named sibling asset's handle and
+                    # joined per record on the declared ``assets.<name>.join``
+                    # key. Shape only here; cross-checks against ``assets`` and
+                    # ``coordinates.level`` live in ``_validate_vlen_source``.
+                    unknown = set(tmpl) - {"asset", "path"}
+                    if unknown:
+                        # 'column' is the near-miss worth naming: the plain
+                        # variable form takes one, while the asset form is
+                        # scoped to record-rate scalars and does not (issue
+                        # #464 review; richer L2A companions ride issue #465).
+                        hint = (
+                            "; the asset form reads 1-D datasets only, with no "
+                            "'column' selector yet (refs issue #465)"
+                            if "column" in unknown
+                            else ""
+                        )
+                        raise ValueError(
+                            f"levels.{name}.variables.{var_name}: unknown keys "
+                            f"{sorted(unknown)} (the asset form takes 'asset' and 'path'){hint}"
+                        )
+                    for key in ("asset", "path"):
+                        if not isinstance(tmpl.get(key), str) or not tmpl[key]:
+                            raise ValueError(
+                                f"levels.{name}.variables.{var_name}.{key} must be a "
+                                f"non-empty string"
+                            )
+                elif not isinstance(tmpl, str) or not tmpl:
                     raise ValueError(
                         f"levels.{name}.variables.{var_name}: path template must be a "
-                        f"non-empty string (got {tmpl!r})"
+                        f"non-empty string or an {{asset, path}} mapping (got {tmpl!r})"
                     )
                 if var_name in base_vars:
                     raise ValueError(

@@ -78,6 +78,13 @@ data_source:
         rx_energy: "/{group}/rx_energy"
         elevation_bin0: "/{group}/geolocation/elevation_bin0"
         elevation_lastbin: "/{group}/geolocation/elevation_lastbin"
+        digital_elevation_model:
+          # Asset-sourced shot variable (issue #464): read from the paired L2A
+          # sibling via the shot_number join, broadcast to sample rate like the
+          # companions above. Powers the geolocation-validity gate below only —
+          # filter-only, not stored (per-shot L2A companions: issue #465).
+          asset: l2a
+          path: "/{group}/digital_elevation_model"
   assets:
     # The paired L2A sibling (one shardmap, {l1b, l2a} per entry), joined by
     # shot_number. After the retrieval-fitness filters were dropped (espg
@@ -114,6 +121,16 @@ data_source:
       dataset: "/{group}/rx_assess/rx_clipbin_count"   # saturation counter: 0 = unclipped
       op: le
       value: 0
+    # DEM-referenced geolocation-validity gate (issue #464): epoch-poisoned
+    # absolute geolocation passes degrade == 0 (2019-121 ≈ +860 m, 2023-031 ≈
+    # +5.8 km constant offsets — the first flux store's kilometer-span cells),
+    # so gate the waveform window's MIDPOINT against the L2A DEM (espg ruling
+    # 2026-08-17: midpoint form, not elev_lowestmode — tests geolocation
+    # without entangling retrieval quality). A third VALIDITY gate, distinct
+    # from the excluded retrieval-fitness gates above. DEM-void (NaN) shots
+    # drop by plain expression semantics — including DEM-void water shots;
+    # revisiting that inclusion is tracked in issue #465.
+    - expression: "abs((elevation_bin0 + elevation_lastbin)/2 - digital_elevation_model) <= 200"
   read_plan:
     spatial_index: shots
     pad: 1
