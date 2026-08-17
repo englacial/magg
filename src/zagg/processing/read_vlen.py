@@ -763,10 +763,14 @@ def _sibling_joined_values(
     matches records by key value, and returns ``(values_by_path, matched)`` —
     row ``i`` of each gathered array is the sibling's value for primary record
     ``i``, and ``matched[i]`` says whether that record has a sibling row at
-    all. An unmatched row's value is a clamped-gather placeholder, so every
+    all. An unmatched row's value is a placeholder (the clamped gather's
+    neighbor, or a zero when the sibling has no rows to clamp to), so every
     consumer must apply its own missing-row policy against ``matched``: asset
     filters fail the record closed (:func:`_sibling_record_mask`); asset
-    variables NaN it.
+    variables NaN it. An EMPTY sibling (zero rows) is that contract's degenerate
+    case, not an error — every record is unmatched, and each path's placeholder
+    is a zeros array of length ``n_records`` shaped like the sibling dataset
+    beyond axis 0 (issue #464 review).
     """
     join = cfg["join"]
     left_path = join["left"].format(group=group)
@@ -780,17 +784,25 @@ def _sibling_joined_values(
             f"assets.{asset}.join.left has {len(left_keys)} records; the "
             f"coordinates level has {n_records}"
         )
+    if len(right_keys) == 0:
+        # No sibling row to gather: hand back the documented placeholder rather
+        # than let the clamped gather below index an empty array (the guards it
+        # used to carry kept ``matched``/``sib_idx`` alive but the gather still
+        # raised ``IndexError``, naming neither asset nor dataset).
+        return {
+            p: np.zeros(
+                (n_records, *np.asarray(sib_data[p]).shape[1:]),
+                dtype=np.asarray(sib_data[p]).dtype,
+            )
+            for p in dict.fromkeys(dataset_paths)
+        }, np.zeros(n_records, dtype=bool)
     # Key-value join: position of each left key in the sibling's rows.
     order = np.argsort(right_keys, kind="stable")
     sorted_keys = right_keys[order]
     pos = np.searchsorted(sorted_keys, left_keys, side="left")
-    pos_clip = np.minimum(pos, len(sorted_keys) - 1) if len(sorted_keys) else pos
-    matched = (
-        (sorted_keys[pos_clip] == left_keys)
-        if len(sorted_keys)
-        else np.zeros(n_records, dtype=bool)
-    )
-    sib_idx = order[pos_clip] if len(sorted_keys) else np.zeros(n_records, dtype=np.int64)
+    pos_clip = np.minimum(pos, len(sorted_keys) - 1)
+    matched = sorted_keys[pos_clip] == left_keys
+    sib_idx = order[pos_clip]
     values_by_path = {p: np.asarray(sib_data[p])[sib_idx] for p in dict.fromkeys(dataset_paths)}
     return values_by_path, matched
 

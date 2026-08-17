@@ -447,6 +447,25 @@ def _l2a_ds(**extra):
     )
 
 
+def _l2a_arrays_empty(group="BEAM0000"):
+    """A zero-row sibling: no record can match (issue #464 review)."""
+    return {
+        f"/{group}/shot_number": np.array([], dtype=np.uint64),
+        f"/{group}/quality_flag": np.array([], dtype=np.uint8),
+        f"/{group}/sensitivity": np.array([], dtype=np.float32),
+    }
+
+
+def _l2a_var_ds(**extra):
+    """``_l2a_ds`` plus an asset-sourced record-level variable (issue #464)."""
+    ds = _l2a_ds(**extra)
+    ds["levels"]["shots"]["variables"]["sensitivity"] = {
+        "asset": "l2a",
+        "path": "/{group}/sensitivity",
+    }
+    return ds
+
+
 class TestSiblingAssetJoin:
     def test_join_filters_by_shot_number(self):
         # quality_flag == 1 keeps shots 101 + 104; shot 102 fails the flag and
@@ -505,6 +524,38 @@ class TestSiblingAssetJoin:
         )
         with pytest.raises(ValueError, match="no open sibling handle"):
             _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", ds, 0, _OneShardGrid())
+
+    def test_empty_sibling_drops_every_record(self):
+        # A zero-row sibling matches nothing: the asset filter fails every
+        # record closed, and the join must not raise IndexError on the way.
+        ds = _l2a_ds(
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "ge", "value": 0}]
+        )
+        assert (
+            _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                ds,
+                0,
+                _OneShardGrid(),
+                siblings={"l2a": _FakeH5(_l2a_arrays_empty())},
+            )
+            is None
+        )
+
+    def test_empty_sibling_variable_is_all_nan(self):
+        # Same degenerate sibling on the VARIABLE arm: unmatched records NaN
+        # (they are not dropped — only asset filters fail closed).
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            _l2a_var_ds(),
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays_empty())},
+        )
+        assert len(df) == 13
+        assert np.isnan(df["sensitivity"].to_numpy()).all()
 
 
 # ── config validation of the vlen grammar ────────────────────────────────────
