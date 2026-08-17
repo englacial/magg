@@ -707,8 +707,9 @@ refresh builds it.
 ## Migration: the D19 hash epoch
 
 > **Every `semantic_hash` written before this release is invalidated, by
-> design.** Nothing in any store changed on disk; what changed is the
-> *derivation* of the digest that labels it. If you are upgrading a store
+> design** — and so is every `granules_sha256` taken over resolved hrefs
+> (item 5). Nothing in any store changed on disk; what changed is the
+> *derivation* of the digests that label it. If you are upgrading a store
 > built by an earlier zagg, read this section before rerunning into it.
 
 [Issue #415](https://github.com/englacial/zagg/issues/415) closed two ruled
@@ -716,10 +717,13 @@ defects in the semantic core ([PR #397](https://github.com/englacial/zagg/pull/3
 questions (7) and (8)), and carried two further ruled exclusions that had to
 ride the same epoch: the credential mechanism
 ([issue #449](https://github.com/englacial/zagg/issues/449)) and the
-byte-movement knobs (espg-ruled 2026-08-17 on the epoch PR). All four change
-what `zagg.semantics.semantic_hash` digests, so all four move every digest —
+byte-movement knobs (espg-ruled 2026-08-17 on the epoch PR). Those four change
+what `zagg.semantics.semantic_hash` digests, so each moves every digest —
 which is why they were deliberately landed in one release rather than one at a
-time.
+time. A fifth ruling (item 5 below) canonicalizes **granule** identity, moving
+the sidecars' `granules_sha256` rather than `semantic_hash`; it rides the same
+release for the same reason, since both halves of the identity PAIR are what
+the skip gate compares.
 
 ### What changed
 
@@ -776,6 +780,26 @@ time.
    2026-08-17 produced identical `total_obs` and `cells_with_data` in the exact
    single-block spill regime and still hashed apart, purely on
    worker/streaming/index machinery.
+5. **Granule identity is now the driver-stripped bare granule id.** This one
+   moves the *other* digest — `granules_sha256`, the **catalog** identity half
+   recorded in every D20 sidecar, and the id list in its `granules.json`
+   sibling. espg-ruled 2026-08-17: *"we want the granule to trigger the hash,
+   not how that granule is fetched."* A single granule is named three ways
+   across the paths that record it — a resolved `s3://bucket/key/FILE` href, an
+   `https://host/path/FILE` href (`data_source.driver` picks one), or the bare
+   catalog id, which for every catalog zagg reads *is* the basename of both
+   hrefs. Pre-epoch each spelling hashed differently, so a driver switch —
+   packaging in the semantic core since forever — made every leaf's recorded
+   catalog identity un-reproducible and sent the skip gate down the
+   `expansion` arm for a rerun over exactly the same granules. Both halves
+   canonicalize: the digest **and** the recorded id list, so the `missing` ids
+   a contraction names are driver-independent too. Recorded lists written
+   before this release keep working — the classifier canonicalizes the
+   *recorded* side as well, so a pre-epoch leaf diffs cleanly instead of
+   reading as a full contraction. Accepted cost of the ruling: two granules
+   whose hrefs differ only in prefix collapse to one identity; every catalog
+   zagg reads names granules globally uniquely, which is why the catalog's own
+   id equals the basename.
 
 Deliberately **not** changed: the orders (`parent_order` / `child_order` /
 `chunk_inner`) stay packaging — hashing them would make o8 and o9 runs
@@ -955,14 +979,20 @@ summary; the CLI prints them as "rewritten with the guard inert") so an
 operator can see how much of a store is still unguarded; making them refuse
 instead is a standing design fork (PR #397 question (4)).
 
-Two identity caveats operators hit in practice. The recorded id space is
-**driver-dependent** on the aggregation path (resolved `s3://` vs `https://`
-hrefs): flipping the driver between runs reads as a full mixed contraction
-and refuses per leaf — `--allow-contraction` is the escape hatch. And the
-identity pair deliberately does **not** cover leaf-*shaping* `output` knobs
-beyond the column artifact (e.g. flipping `sharded` changes the leaf's
-object layout while both identity halves hold): changing those still needs
-`--overwrite` (PR #397 question (8)).
+One identity caveat operators still hit: the identity pair does **not** cover
+`output.grid.chunk_inner`, which changes the leaf's object set through K while
+both halves hold, so changing it still needs `--overwrite`
+(espg-ruled 2026-08-17 as the bounded state — closing it costs part of D24;
+`sharded` itself *is* covered since the epoch, see
+[the migration note](#migration-the-d19-hash-epoch) item 2).
+
+The **driver-dependence** caveat is gone. The recorded id space used to be the
+resolved href, so flipping `data_source.driver` between runs read as a full
+mixed contraction and refused per leaf. Since the epoch both sides are reduced
+to the canonical driver-stripped bare granule id (item 5 of the migration
+note), so a driver switch over unchanged granules reads `equal` — including
+against leaves whose recorded list predates the epoch, since the *recorded*
+side is canonicalized on read too.
 
 ### The refusal manifest
 

@@ -9,6 +9,7 @@ import copy
 import pathlib
 
 import numpy as np
+import pytest
 import zarr
 
 from zagg import hive
@@ -265,10 +266,13 @@ class TestClassifyLeafIdentity:
         assert got == {"action": "rewrite", "classification": "expansion", "missing": []}
 
     def test_pure_contraction_refuses_and_names_ids(self):
+        # ``missing`` is named in the CANONICAL id space (espg-ruled
+        # 2026-08-17): the driver-stripped bare granule id, which is also the
+        # only name that means the same thing whatever driver the run read with.
         got = self._classify(self.IDS[:2])
         assert got["action"] == "refuse"
         assert got["classification"] == "contraction"
-        assert got["missing"] == ["s3://b/g3.h5"]
+        assert got["missing"] == ["g3.h5"]
 
     def test_mixed_add_and_drop_refuses(self):
         # The ruled predicate is recorded - planned != {} — NOT strict subset:
@@ -277,14 +281,14 @@ class TestClassifyLeafIdentity:
         got = self._classify(self.IDS[:2] + ["s3://b/new1.h5", "s3://b/new2.h5"])
         assert got["action"] == "refuse"
         assert got["classification"] == "mixed"
-        assert got["missing"] == ["s3://b/g3.h5"]
+        assert got["missing"] == ["g3.h5"]
 
     def test_contraction_beats_semantic_mismatch(self):
         # Dropping inputs refuses even when the semantic hash also changed —
         # the guard is about data loss, not intent drift.
         got = self._classify(self.IDS[:1], semantic="b" * 64)
         assert got["action"] == "refuse"
-        assert got["missing"] == sorted(self.IDS[1:])
+        assert got["missing"] == ["g2.h5", "g3.h5"]
 
     def test_no_sidecar_rewrites(self):
         got = classify_leaf_identity(None, semantic_hash=self.SEM, planned_ids=self.IDS)
@@ -326,7 +330,7 @@ class TestClassifyLeafIdentity:
         got = self._classify([])
         assert got["action"] == "refuse"
         assert got["classification"] == "contraction"
-        assert got["missing"] == sorted(self.IDS)
+        assert got["missing"] == ["g1.h5", "g2.h5", "g3.h5"]
 
     def test_unknown_planned_set_rewrites_rather_than_refusing(self):
         # None is UNKNOWN, not empty: it must not diff to "every recorded id
@@ -349,11 +353,34 @@ class TestClassifyLeafIdentity:
         got = self._classify(self.IDS, ids=self.IDS + [self.IDS[0]])
         assert got == {"action": "rewrite", "classification": "id-multiset-drift", "missing": []}
 
+    @pytest.mark.parametrize(
+        "planned",
+        [
+            ["https://h/g1.h5", "https://h/g2.h5", "https://h/g3.h5"],  # driver: https
+            ["b/g1.h5", "b/g2.h5", "b/g3.h5"],  # the s3 driver's stripped form
+            ["g1.h5", "g2.h5", "g3.h5"],  # bare catalog ids
+            [{"url": "https://h/g1.h5", "assets": {"l2a": "https://h/g1b.h5"}}, *IDS[1:]],
+        ],
+    )
+    def test_a_driver_switch_still_reads_current(self, planned):
+        # The epoch's canonical-identity ruling at the gate (espg-ruled
+        # 2026-08-17, PR #420 question (1)(b)): the driver is packaging in the
+        # D19 core, so rerunning the SAME granules through a different driver --
+        # or against a leaf whose sibling recorded the other href form -- must
+        # read `equal`. Pre-epoch every one of these renamed all three ids and
+        # the gate went down the expansion arm, rewriting the whole store.
+        got = self._classify(planned)
+        assert got == {"action": "skip", "classification": "equal", "missing": []}
+        assert self.loads == 0  # the hash fast path, not the diff, decides
+
 
 class TestLeafRecordedIds:
     """The sibling read (issue #388): pairs with its sidecar or reads absent."""
 
     IDS = ["s3://b/g2.h5", "s3://b/g1.h5"]
+    #: What the sibling records for :data:`IDS` — the canonical driver-stripped
+    #: bare ids, sorted (espg-ruled 2026-08-17).
+    CANON = ["g1.h5", "g2.h5"]
 
     def _leaf(self, tmp_path):
         leaf = hive.shard_leaf_path(str(tmp_path), WORD)
@@ -364,10 +391,13 @@ class TestLeafRecordedIds:
         return {"granules_sha256": granules_sha256(ids)}
 
     def test_round_trips_the_recorded_set_sorted(self, tmp_path):
+        # Recorded in the CANONICAL id space (espg-ruled 2026-08-17): the
+        # sibling holds bare granule ids whatever href form the caller passed,
+        # which is what makes it pair with the sidecar hash beside it.
         leaf = self._leaf(tmp_path)
         assert write_granule_ids(leaf, self.IDS) is True
         got = leaf_recorded_ids(leaf, self._sidecar(self.IDS))
-        assert got == sorted(self.IDS)
+        assert got == self.CANON
 
     def test_absent_sibling_reads_none(self, tmp_path):
         assert leaf_recorded_ids(self._leaf(tmp_path), self._sidecar(self.IDS)) is None
@@ -402,7 +432,7 @@ class TestLeafRecordedIds:
         for spec in ("zagg-granule-ids/99", None):
             body["spec"] = spec
             path.write_text(json.dumps(body))
-            assert leaf_recorded_ids(leaf, self._sidecar(self.IDS)) == sorted(self.IDS)
+            assert leaf_recorded_ids(leaf, self._sidecar(self.IDS)) == self.CANON
 
     def test_record_borne_ids_are_read_when_no_sibling_exists(self, tmp_path):
         # The 3f13af2..this-PR window: PR #397 put the id list ON the record
@@ -420,7 +450,7 @@ class TestLeafRecordedIds:
         leaf = self._leaf(tmp_path)
         write_granule_ids(leaf, self.IDS)
         recorded = dict(self._sidecar(self.IDS), granule_ids=["s3://b/stale.h5"])
-        assert leaf_recorded_ids(leaf, recorded) == sorted(self.IDS)
+        assert leaf_recorded_ids(leaf, recorded) == self.CANON
 
     def test_windowed_sibling_is_per_window(self, tmp_path):
         # Same grammar as the sidecar: two windows of one shard cannot

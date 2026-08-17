@@ -245,6 +245,108 @@ class TestBuildRecord:
         assert rec["n_granules"] == 2
 
 
+class TestCanonicalGranuleIdentity:
+    """The D19 hash epoch's canonical granule identity (espg-ruled 2026-08-17,
+    PR #420 question (1)(b)): *the granule triggers the hash, not how that
+    granule is fetched.* One physical granule is named three ways across the
+    paths that record it — a resolved ``s3://`` href, an ``https://`` href, and
+    the bare catalog id — and all three must record and hash identically.
+    """
+
+    #: One granule set, three spellings. The s3/https pair is what
+    #: ``runner._resolve_urls`` picks between on ``data_source.driver``; the
+    #: bare form is the catalog's own ``rec["id"]``, which for every CMR/STAC
+    #: catalog zagg reads IS the basename of both hrefs.
+    S3 = [
+        "s3://nsidc-prot/ATLAS/ATL06/007/2024/01/08/ATL06_20240108040423_03102212_007_01.h5",
+        "s3://nsidc-prot/ATLAS/ATL06/007/2024/01/06/ATL06_20240105235929_02772210_007_01.h5",
+    ]
+    HTTPS = [
+        "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-prot/ATLAS/ATL06/007/2024/01/08/"
+        "ATL06_20240108040423_03102212_007_01.h5",
+        "https://data.nsidc.earthdatacloud.nasa.gov/nsidc-prot/ATLAS/ATL06/007/2024/01/06/"
+        "ATL06_20240105235929_02772210_007_01.h5",
+    ]
+    BARE = [
+        "ATL06_20240108040423_03102212_007_01.h5",
+        "ATL06_20240105235929_02772210_007_01.h5",
+    ]
+
+    def test_the_three_spellings_hash_identically(self):
+        # The ruling in one line. Pre-epoch these were three catalog
+        # identities for one granule set, so a driver switch -- packaging in
+        # the D19 core -- made every recorded hash un-reproducible.
+        assert granules_sha256(self.S3) == granules_sha256(self.HTTPS)
+        assert granules_sha256(self.S3) == granules_sha256(self.BARE)
+        # ...and the s3 driver's own stripped form (``bucket/key``, what
+        # ``processing._make_url_rewriter`` hands h5coro) is the same granule.
+        stripped = [u.replace("s3://", "", 1) for u in self.S3]
+        assert granules_sha256(stripped) == granules_sha256(self.BARE)
+
+    def test_the_three_spellings_record_identical_ids(self):
+        # BOTH halves of the ruling: the recorded id LIST canonicalizes too,
+        # not only the digest over it -- otherwise the `missing` diff a
+        # contraction names would still be driver-dependent.
+        from zagg.telemetry import canonical_granule_ids
+
+        assert canonical_granule_ids(self.S3) == self.BARE
+        assert canonical_granule_ids(self.HTTPS) == self.BARE
+        assert canonical_granule_ids(self.BARE) == self.BARE  # idempotent
+        assert canonical_granule_ids(None) is None  # unknown stays unknown
+
+    def test_the_sibling_object_records_the_canonical_ids(self, tmp_path):
+        # End to end through the production writer: the object a leaf carries
+        # is byte-identical whichever driver wrote it.
+        def _written(ids):
+            leaf = str(tmp_path / ids[0][:4] / "1" / "-42.zarr")
+            assert write_granule_ids(leaf, ids) is True
+            return read_granule_ids(leaf)
+
+        s3, https = _written(self.S3), _written(self.HTTPS)
+        assert s3["granule_ids"] == https["granule_ids"] == sorted(self.BARE)
+        assert s3["granules_sha256"] == https["granules_sha256"] == granules_sha256(self.BARE)
+
+    def test_paired_asset_entries_normalize_in_every_component(self, tmp_path):
+        # Paired entries (issue #425) identify by their PRIMARY, which is what
+        # keeps the local backend (resolved strings) and the Lambda handler
+        # (payload entries verbatim) on one hash. Every component normalizes,
+        # so the sibling href form cannot move the identity either.
+        from zagg.telemetry import build_record
+
+        s3_entries = [
+            {"url": self.S3[0], "assets": {"l2a": "s3://b/prefix/SIB_A.h5"}},
+            self.S3[1],
+        ]
+        https_entries = [
+            {"url": self.HTTPS[0], "assets": {"l2a": "https://h/other/prefix/SIB_A.h5"}},
+            self.HTTPS[1],
+        ]
+        recs = [
+            build_record(shard_key=1, metadata={"total_obs": 1}, granule_ids=e)
+            for e in (s3_entries, https_entries)
+        ]
+        assert recs[0]["granules_sha256"] == recs[1]["granules_sha256"]
+        assert recs[0]["granules_sha256"] == granules_sha256(self.BARE)
+        assert recs[0]["n_granules"] == recs[1]["n_granules"] == 2
+
+    def test_the_raster_id_space_is_untouched(self):
+        # Raster units identify by STAC item id or ISO datetime
+        # (``raster_granule_ids``) -- neither carries a path separator, so the
+        # canonical form is the identity itself and no raster digest moves.
+        from zagg.telemetry import canonical_granule_ids, raster_granule_ids
+
+        ids = raster_granule_ids(
+            [{"id": "S2A_MSIL2A_20250101T160000"}, {"datetime": "2019-06-15T10:00:00Z"}]
+        )
+        assert canonical_granule_ids(ids) == ids
+
+    def test_a_trailing_slash_never_yields_an_empty_identity(self):
+        from zagg.telemetry import canonical_granule_id
+
+        assert canonical_granule_id("s3://b/prefix/") == "prefix"
+        assert canonical_granule_id("g.h5") == "g.h5"
+
+
 class TestMerge:
     def test_single_record_is_identity(self):
         rec = _record()
@@ -604,7 +706,9 @@ class TestGranuleIdsSibling:
         leaf = str(tmp_path / "-4" / "2" / "-42.zarr")
         assert write_granule_ids(leaf, self.IDS) is True
         got = read_granule_ids(leaf)
-        assert got["granule_ids"] == sorted(self.IDS)
+        # Recorded in the CANONICAL id space (espg-ruled 2026-08-17): the
+        # driver-stripped bare granule id, sorted.
+        assert got["granule_ids"] == ["g1.h5", "g2.h5"]
         # Its OWN version marker, not the D20 record's schema_version: a
         # record rev must not bump this object, nor this object the record.
         assert got["spec"] == "zagg-granule-ids/1"

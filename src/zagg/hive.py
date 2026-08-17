@@ -1453,14 +1453,17 @@ def process_and_write_hive(
         # The issue #383 column rides this seam AFTER the gate, and its
         # declaration moves neither identity half — so the gate verifies the
         # artifact itself (leaf_column_expectation).
+        from zagg.telemetry import canonical_granule_ids
+
         column_path, column_declared = leaf_column_expectation(
             store_root, shard_key, grid, config, window
         )
         identity, unit_meta = leaf_identity_gate(
             leaf_path,
-            # Paired-asset entries (issue #425) identify by their primary URL,
-            # so the planned-id space matches the strings-only local path.
-            [u["url"] if isinstance(u, dict) else str(u) for u in granule_urls],
+            # ONE canonical id space for both sides of the gate (espg-ruled
+            # 2026-08-17): the driver-stripped bare id, with paired-asset
+            # entries (issue #425) identifying by their primary.
+            canonical_granule_ids(granule_urls),
             semantic_hash=semantic_hash,
             allow_contraction=allow_contraction,
             sidecar_spec=sidecar_spec,
@@ -1684,13 +1687,14 @@ def process_and_write_hive(
         # Fail-open inside (telemetry class, D9). Inside the write bracket:
         # it is a write this seam performs, so ``phase_timings["write"]``
         # must account for it.
-        from zagg.telemetry import write_granule_ids
+        from zagg.telemetry import canonical_granule_ids, write_granule_ids
 
         write_granule_ids(
             leaf_path,
-            # Same primary-URL identity as the gate above (issue #425): the
-            # recorded and planned id spaces must share one shape.
-            [u["url"] if isinstance(u, dict) else str(u) for u in granule_urls],
+            # Same canonical identity as the gate above: the recorded and
+            # planned id spaces must share one shape (``write_granule_ids``
+            # canonicalizes too — this keeps the two call sites reading alike).
+            canonical_granule_ids(granule_urls),
             spec=sidecar_spec,
             **store_kwargs,
         )

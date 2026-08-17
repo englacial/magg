@@ -772,7 +772,10 @@ neither gap and is safe now.
   through the middle of one decision. The live demonstration is dated: two
   GEDI flux builds of one shard on 2026-08-17 produced identical `total_obs`
   and `cells_with_data` in the exact single-block spill regime and still
-  hashed apart on worker/streaming machinery alone. Operator
+  hashed apart on worker/streaming machinery alone. (e) The epoch also
+  canonicalized the OTHER half of the identity pair, the catalog hash below
+  (espg-ruled 2026-08-17: *"we want the granule to trigger the hash, not how
+  that granule is fetched"*) — see that clause. Operator
   consequences — every pre-epoch hash invalidated, and the three migration
   paths — are in `docs/hive_layout.md`, "Migration: the D19 hash epoch".
   The hash is a
@@ -798,7 +801,19 @@ neither gap and is safe now.
   granule count + sha256 of sorted granule ids + zagg version;
   dedup/`has_run` consults the computed path, the `semantic_hash`, *and*
   the sidecar catalog identity (a catalog-grown shard is "stale", not
-  "hit"). Immutable-provenance naming (product root
+  "hit"). **Amended at the D19 hash epoch** (espg-ruled 2026-08-17, PR #420
+  question (1)(b)): the ids are canonicalized to the **driver-stripped bare
+  granule id** before hashing, and the recorded id list beside the hash is
+  written in that same space. One granule reaches these seams as an `s3://`
+  href, an `https://` href or a bare catalog id depending only on
+  `data_source.driver` — which the semantic core has always treated as
+  packaging — so hashing the href form made a driver switch look like a
+  catalog change and rewrote whole stores over a fetch-mechanism edit. The
+  canonical form is the basename because it is the only component the s3 and
+  https spellings of one granule agree on; the accepted cost is that two
+  granules whose hrefs differ only in prefix collapse to one identity, which
+  every catalog zagg reads rules out by naming granules globally uniquely
+  (that is why the catalog's own id equals the basename). Immutable-provenance naming (product root
   `{name}+{catalog-hash}/`) stays an opt-in for frozen-catalog archival
   runs. The output content hash that makes dedup *verifiable* is O11
   (resolved — adopted; it complements the semantic hash — "intended identical" vs
