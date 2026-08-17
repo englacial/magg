@@ -880,8 +880,8 @@ class SpillAggregator:
         whether a ``where`` param happens to be present, so the fold can never
         substitute a reducer the config did not declare. A ``temporal:
         per-centroid`` field (spec §8.3) additionally rides the derived toc word
-        column, encoded once per partition below and passed as the build's
-        ``temporal=`` channel — and then, per the field's fold law: **k-way**
+        column, encoded per cell below (as the pooled path does) and passed as
+        the build's ``temporal=`` channel — and then, per the field's fold law: **k-way**
         fields stash the block digest (+ every declared channel's words) for one
         order-independent collapse at finalize (:meth:`_finalize_kway`);
         **pairwise** fields merge it into the running digest here, the companion
@@ -901,16 +901,6 @@ class SpillAggregator:
             self.spill_read_s += time.perf_counter() - t0
             col_arrays, cell_to_slice = _group_columns(cols, cells)
             del cells, cols
-            if self._needs_toc:
-                # The derived toc word column (spec §8.3), encoded ONCE per
-                # partition rather than per cell: the conversion is elementwise
-                # over the declared clock column, so a cell's slice of it is
-                # exactly the vector ``calculate_cell_statistics`` derives for
-                # that cell pooled, and the encode stays one pass over the
-                # block's rows. It also keeps ``_resolve_param``'s namespace
-                # equal to the pooled one, which carries the column too.
-                toc = _toc_word_column(col_arrays, self.config)
-                col_arrays = {**col_arrays, TOC_WORD_COLUMN: toc}
             for cell, (start, end) in cell_to_slice.items():
                 self._counts[cell] = self._counts.get(cell, 0) + (end - start)
                 # One namespace per cell, not per field — the pooled path's
@@ -918,6 +908,16 @@ class SpillAggregator:
                 # and the strata config declares two complementary `where`
                 # fields over the same source.
                 cell_data = {col: arr[start:end] for col, arr in col_arrays.items()}
+                if self._needs_toc:
+                    # The derived toc word column (spec §8.3), encoded where the
+                    # pooled path encodes it — right after the namespace is
+                    # built (``calculate_cell_statistics``) — so the two
+                    # ``cell_data`` dicts match and a ``where`` reading the
+                    # column resolves identically. Per cell, not once per
+                    # partition: this path exists because memory is scarce, and
+                    # the encode's transient allocation is unbudgeted by
+                    # ``_default_block_bytes`` / ``_BUILD_MULT``.
+                    cell_data[TOC_WORD_COLUMN] = _toc_word_column(cell_data, self.config)
                 for name, f in self._digest_fields.items():
                     values = cell_data[f.source]
                     chans = {
