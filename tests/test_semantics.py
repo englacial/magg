@@ -382,6 +382,12 @@ class TestLeafShapingOutputKnobs:
     """
 
     WINDOWING = {"schedule": "annual", "time_field": "delta_time", "epoch": "2018-01-01"}
+    TIME_SOURCE = {
+        "field": "delta_time",
+        "epoch": "2018-01-01T00:00:00",
+        "scale": "gps",
+        "units": "seconds",
+    }
 
     def test_sharded_flip_is_identity(self):
         # The knob question (8) checked by hand: flipping it changes the
@@ -441,7 +447,17 @@ class TestLeafShapingOutputKnobs:
         # two cannot drift.
         from zagg.semantics import GRID_LEAF_SHAPING_KEYS, OUTPUT_LEAF_SHAPING_KEYS
 
-        core = semantic_core(_cfg(output__windowing=self.WINDOWING))
+        # Every key must be PRESENT in the built core for the comparison to
+        # mean anything, and each is pruned when it resolves to None — so the
+        # config has to declare all of them: a schedule for `windowing`, and a
+        # temporal companion plus its clock for `time_source` (issue #410).
+        core = semantic_core(
+            _cfg(
+                output__windowing=self.WINDOWING,
+                output__time_source=self.TIME_SOURCE,
+                aggregation__variables__h_mean__temporal="per-centroid",
+            )
+        )
         assert set(core["output"]) == set(OUTPUT_LEAF_SHAPING_KEYS)
         assert set(core["grid"]) - {"type", "indexing_scheme"} == set(GRID_LEAF_SHAPING_KEYS)
 
@@ -552,6 +568,11 @@ class TestTimeSourceHashing:
     from the declared epoch on the declared scale, so ``output.time_source`` is
     output-defining in the strongest sense — more directly than
     ``time_encoding``, which only changes how one axis is spelled.
+
+    It composes into the **merged** issue #415 hash epoch (PR #420) rather than
+    standing beside it: the clock is one of that epoch's leaf-shaping ``output``
+    knobs, folded resolved through its accessor under ``core["output"]``, which
+    is the same discipline ``aoi_mask`` and ``windowing`` follow there.
     """
 
     def _cfg(self, temporal=None, clock=None, windowing=None) -> PipelineConfig:
@@ -582,16 +603,30 @@ class TestTimeSourceHashing:
         "units": "seconds",
     }
 
+    def test_it_composes_into_the_epochs_output_block(self):
+        # Placement, pinned: `time_source` is one of the issue #415 epoch's
+        # leaf-shaping `output` knobs (OUTPUT_LEAF_SHAPING_KEYS), not a
+        # top-level core key. It sits there and `time_encoding` does not
+        # because no store carries a temporal companion yet, so placing this
+        # one coherently costs nothing, where relocating `time_encoding` would
+        # move digests that already exist (the shipped S2 config declares toc).
+        from zagg.semantics import OUTPUT_LEAF_SHAPING_KEYS
+
+        assert "time_source" in OUTPUT_LEAF_SHAPING_KEYS
+        core = semantic_core(self._cfg("per-centroid", self.CLOCK))
+        assert core["output"]["time_source"] == self.CLOCK
+        assert "time_source" not in core
+
     def test_a_clock_no_field_consumes_does_not_move_the_hash(self):
         # Declaring a clock that nothing reads moves no store byte, so it must
         # not move the product identity either — the same absent-key discipline
         # `time_encoding: microseconds` gets.
         assert semantic_hash(self._cfg(clock=self.CLOCK)) == semantic_hash(self._cfg())
-        assert "time_source" not in semantic_core(self._cfg(clock=self.CLOCK))
+        assert "time_source" not in semantic_core(self._cfg(clock=self.CLOCK))["output"]
 
     def test_the_clock_is_semantic_once_a_companion_declares(self):
         declared = self._cfg("per-centroid", self.CLOCK)
-        assert semantic_core(declared)["time_source"] == self.CLOCK
+        assert semantic_core(declared)["output"]["time_source"] == self.CLOCK
         assert semantic_hash(declared) != semantic_hash(self._cfg("per-centroid"))
 
     def test_a_different_epoch_is_a_different_product(self):
@@ -622,11 +657,11 @@ class TestTimeSourceHashing:
                 "scale": "gps",
             },
         )
-        assert semantic_core(windowed)["time_source"]["field"] == "delta_time"
-        assert semantic_core(windowed)["time_source"]["scale"] == "gps"
+        clock = semantic_core(windowed)["output"]["time_source"]
+        assert clock["field"] == "delta_time" and clock["scale"] == "gps"
 
     def test_pre_410_configs_hash_unchanged(self):
         # Every packaged config predates #410 and declares no companion, so none
         # of them may gain the key.
         for name in ("atl06", "atl03_tdigest_healpix", "atl03_tdigest_located_healpix"):
-            assert "time_source" not in semantic_core(default_config(name))
+            assert "time_source" not in semantic_core(default_config(name)).get("output", {})

@@ -40,7 +40,13 @@ Included (the semantic core):
 - the raster **time-coordinate encoding** (``output.time_encoding``, spec §8 /
   issue #443), keyed only when non-default: toc words and legacy microseconds
   are different stored values meaning different things, exactly as
-  ``weights: "flux"`` is.
+  ``weights: "flux"`` is;
+- the **per-observation clock** (``output.time_source``, spec §8.2/§8.3 /
+  issue #410) a temporal companion encodes its toc words from — one of the
+  leaf-shaping ``output`` knobs above, keyed only when a field declares a
+  companion. Two configs differing only in the declared epoch write different
+  words for the same observations, so a rerun under a corrected epoch must not
+  inherit the identity of the store it contradicts.
 
 Excluded as packaging: all orders (``parent_order``/``child_order``/
 ``chunk_inner`` — the D24 resolution axis, which the epoch deliberately did
@@ -264,6 +270,13 @@ GRID_LEAF_SHAPING_KEYS = ("sharded",)
 #:   NORMALIZED form (:func:`zagg.config.get_windowing`), so ``epoch``
 #:   spellings and the issue #355 point-window sugar canonicalize.
 #:
+#: - ``time_source`` (issue #410) — the per-observation clock a spec §8.2/§8.3
+#:   temporal companion encodes its toc words from, so the declared column,
+#:   epoch, scale and units decide the companion's stored VALUES. Keyed only
+#:   when a field declares a companion and folded in its RESOLVED form
+#:   (:func:`_toc_source_leaf_shape`), so a clock nothing consumes hashes as
+#:   absent and the ``output.windowing`` fallback is not a second product.
+#:
 #: ``output.pyramid`` is deliberately NOT here, though it does shape the leaf
 #: (issue #383's column artifact), for three reasons that all point the same
 #: way: the artifact half is already covered by reading the artifact —
@@ -275,7 +288,7 @@ GRID_LEAF_SHAPING_KEYS = ("sharded",)
 #: precisely to add a pyramid declaration to the config that built a store,
 #: which its own semantic guard would then refuse. Hashing it would break a
 #: supported workflow to re-cover ground already covered.
-OUTPUT_LEAF_SHAPING_KEYS = ("aoi_mask", "windowing")
+OUTPUT_LEAF_SHAPING_KEYS = ("aoi_mask", "windowing", "time_source")
 
 
 #: D24 exact merge laws: aggregator name -> fold law. These are the reducers
@@ -461,6 +474,52 @@ def _windowing_leaf_shape(config: PipelineConfig):
         return block
 
 
+def _toc_source_leaf_shape(config: PipelineConfig):
+    """The per-observation clock a temporal companion encodes from, or ``None``.
+
+    ``output.time_source`` (issue #410) is leaf-shaping in the most literal
+    sense :data:`OUTPUT_LEAF_SHAPING_KEYS` admits: a §8.2/§8.3 companion's
+    stored toc words ARE the declared column converted from the declared epoch
+    on the declared scale, so two configs differing only here write different
+    words for the same observations. Without it in the core, a rerun under a
+    corrected epoch would reuse the product identity of the store it
+    contradicts — the failure D19 exists to refuse.
+
+    Two conditions narrow it, both the epoch's own discipline:
+
+    - ``None`` unless some field actually **declares** a companion. Declaring a
+      clock nothing consumes moves no store byte, so it must not move the hash
+      (the ``windowing``-prunes-when-unwindowed rule, one level down).
+    - Folded **resolved** through :func:`zagg.time_axis.toc_source`, which
+      applies the continuous-scale ``output.windowing`` fallback, so the two
+      spellings of one clock — explicit block, or inherited from the windowing
+      declaration beside it — are the same product rather than two.
+
+    It sits INSIDE the ``output`` block, unlike ``time_encoding``: no store
+    carries a temporal companion yet (the producer gate lifted in this same
+    change), so placing it coherently costs nothing, where relocating
+    ``time_encoding`` would move digests that already exist.
+
+    Total by contract, exactly as :func:`_windowing_leaf_shape` is: a
+    malformed block is ``_validate_time_source``'s refusal to raise, not the
+    hash's, so a shape fault hashes as spelled rather than raising inside a
+    digest the Lambda worker computes without ``validate_config``.
+    """
+    from zagg.config import get_agg_fields
+    from zagg.time_axis import toc_source
+
+    if not any(m.get("temporal") is not None for m in get_agg_fields(config).values()):
+        return None
+    block = (config.output or {}).get("time_source")
+    if block is not None and not isinstance(block, dict):
+        return block
+    try:
+        resolved = toc_source(config)
+    except (KeyError, ValueError, TypeError):
+        return block
+    return dict(resolved) if resolved is not None else None
+
+
 def semantic_core(config: PipelineConfig) -> dict:
     """The output-defining subset of ``config`` (D19), as a plain dict.
 
@@ -511,38 +570,21 @@ def semantic_core(config: PipelineConfig) -> dict:
         "output": {
             "aoi_mask": get_aoi_mask(config),
             "windowing": _windowing_leaf_shape(config),
+            "time_source": _toc_source_leaf_shape(config),
         },
     }
     # The time coordinate's encoding (spec §8, issue #443) is output-defining
     # for the same reason `weights: "flux"` is: the stored axis MEANS
     # something else. Keyed only when non-default, so every config written
     # before §8 — and the explicit `microseconds` spelling of the absent-key
-    # default — hashes byte-identically to today.
+    # default — hashes byte-identically to today. It stays TOP-LEVEL rather
+    # than joining the `output` block above: stores carrying it already exist
+    # (the shipped S2 config declares `toc`), so relocating the key would move
+    # their committed digests for no gain. `time_source` has no such
+    # constraint — see :func:`_toc_source_leaf_shape`.
     encoding = (config.output or {}).get("time_encoding")
     if encoding not in (None, DEFAULT_TIME_ENCODING):
         core["time_encoding"] = encoding
-    # The per-observation clock (issue #410) is output-defining for exactly the
-    # same reason, and more directly: a temporal companion's stored toc words ARE
-    # the declared column converted from the declared epoch on the declared
-    # scale, so two configs differing only in ``output.time_source`` write
-    # different words for the same observations. Without this a re-run under a
-    # corrected epoch would reuse the product identity of the store it
-    # contradicts, which is the whole thing the D19 hash exists to refuse.
-    #
-    # Keyed only when a field actually DECLARES a companion, and recorded
-    # RESOLVED (:func:`zagg.time_axis.toc_source`, which folds in the
-    # ``output.windowing`` fallback): declaring a clock no field consumes moves
-    # no store byte, so it must not move the hash either, and the two spellings
-    # of one clock — explicit block vs. windowing fallback — are the same
-    # product. Every config written before #410 hashes byte-identically.
-    from zagg.config import get_agg_fields
-
-    if any(m.get("temporal") is not None for m in get_agg_fields(config).values()):
-        from zagg.time_axis import toc_source
-
-        clock = toc_source(config)
-        if clock is not None:
-            core["time_source"] = dict(clock)
     return _prune_nulls(core)
 
 
