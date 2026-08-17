@@ -822,6 +822,21 @@ class TestChunkMapCacheEviction:
             for r in caplog.records
         )
 
+    def test_deferred_lines_touched_logged_at_debug(self, caplog):
+        # Review finding on PR #462: the counter above only fires on the
+        # IMMEDIATE branch, which production never takes with ``write_back`` off
+        # (the shipped default) -- every default-config build defers. Drive the
+        # real seam (a read_fn lazy build) and pin the per-path record there too,
+        # so the group-level aggregate is not the only attribution.
+        h5obj = _open_fixture_small_lines()
+        read_fn = InlineIndex()._chunk_aligned_read_fn(h5obj, planned=True)
+        with caplog.at_level("DEBUG", logger="zagg.index.inline"):
+            read_fn(self.PATH, hyperslice=[(300, 1500)])
+        assert any(
+            "cache line" in r.message and self.PATH in r.message and "deferred" in r.message
+            for r in caplog.records
+        )
+
 
 class TestInlineReadGroup:
     def _read_both(self, group, leaves, arrow=False):

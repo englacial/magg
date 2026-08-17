@@ -326,7 +326,19 @@ def build_chunk_map(h5obj, path: str, *, evict_into: set | None = None) -> Chunk
         return _chunk_map_from_dataset(h5obj, ds, path)
     finally:
         if evict_into is not None:
-            evict_into.update(_cache_keys(h5obj) - before)
+            added = _cache_keys(h5obj) - before
+            evict_into.update(added)
+            if added:
+                # Per-build attribution on the DEFERRED branch too (review
+                # finding on PR #462): with ``write_back`` off — the shipped
+                # default — every build goes through here, so without this line
+                # the only DEBUG record is ``_evict_deferred_lines``' group-level
+                # aggregate, which cannot single out the one pathological dataset
+                # (GEDI L1B's ``rxwaveform``) inside a group of dozens.
+                logger.debug(
+                    f"  chunk map {path}: walk touched {len(added)} cache line(s); "
+                    "deferred for post-read eviction"
+                )
         else:
             evicted = _evict_new_cache_lines(h5obj, before)
             if evicted:
