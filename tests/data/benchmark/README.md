@@ -212,11 +212,11 @@ places the panel.
 ICESat-2 turning-latitude ring, where all ~1,387 RGTs converge. They reuse the
 NEON tdigest configs and temporal window; only the AOI override differs.
 
-- **Pins.** o9: the ring's densest shard by granule count (5,620 granules over
-  576 ring shards / 2.04M pairs / 35,639 catalog granules — ~95× NEON o9's 59).
+- **Pins.** o9: the ring's densest shard by granule count (5,536 granules over
+  564 ring shards / 2.07M pairs / 35,639 catalog granules — ~84× NEON o9's 66).
   o10: the densest o10 shard **nested inside** the pinned o9 shard
-  (`nested_in` in `targets.json`; 4,605 granules vs the global o10 max of
-  4,642 at another longitude), so one o9 boundary-extraction pass covers both
+  (`nested_in` in `targets.json`; 4,991 granules vs the global o10 max of
+  4,992 at another longitude), so one o9 boundary-extraction pass covers both
   orders. The drift test derives the same nested quantity when `nested_in` is
   set.
 - **Pruned shard maps.** The full ring maps are ~0.7 GB (o9) / ~1.7 GB (o10) of
@@ -250,7 +250,7 @@ top-level default (issue #121).
    **Full-longitude rings must be sectorized.** A single lat/lon rectangle
    spanning `-180..180` collapses under spherical polygon fill (mortie traces
    the ring's edges as great circles, so coverage degenerates to an
-   antimeridian sliver — 10 cells instead of ~576 at o9). `antarctic_88s.geojson`
+   antimeridian sliver — 10 cells instead of ~564 at o9). `antarctic_88s.geojson`
    is therefore a MultiPolygon of eight 45° sectors with vertices sampled every
    1° of longitude; follow that pattern for any AOI that wraps the globe.
 
