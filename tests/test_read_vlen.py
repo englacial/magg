@@ -14,7 +14,12 @@ from zagg.config import (
     PipelineConfig,
     validate_config,
 )
-from zagg.processing.read import _read_group, link_base_extent
+from zagg.processing.read import (
+    _link_parent_at_rows,
+    _read_group,
+    _validate_link_disjoint,
+    link_base_extent,
+)
 from zagg.processing.read_vlen import (
     expand_link_indices,
     synthesize_linspace,
@@ -192,6 +197,59 @@ class TestExpandLinkIndices:
     def test_overrun_raises(self):
         with pytest.raises(ValueError, match="exceeds base size"):
             expand_link_indices(np.array([1]), np.array([5]), 1, 3)
+
+
+class TestLinkDisjointValidation:
+    """Overlapping records are refused where a level's link is assembled (#452).
+
+    The precondition was assumed everywhere and checked nowhere. The reviewer's
+    construction ``index_beg=[0, 5]``, ``count=[10, 2]`` is the whole problem in
+    three records' worth of data: the paint maps resolve rows 7-9 to record 0
+    (later record shadows earlier, then the paint ends) while the searchsorted
+    derivation resolves them to nobody, so coordinates and the synthesized
+    column would disagree with every companion column and every record-level
+    filter verdict, row by row, with nothing raised."""
+
+    OVERLAP_BEG = np.array([0, 5], dtype=np.int64)
+    OVERLAP_CNT = np.array([10, 2], dtype=np.int64)
+
+    def test_the_two_owner_derivations_disagree_on_the_overlap(self):
+        # Why the check has to exist: unvalidated, these are the columns that
+        # would ship side by side out of one read.
+        painted, _ = expand_link_indices(self.OVERLAP_BEG, self.OVERLAP_CNT, 0, 10)
+        searched = _link_parent_at_rows(self.OVERLAP_BEG, self.OVERLAP_CNT, 0, np.arange(10))
+        assert painted.tolist() == [0, 0, 0, 0, 0, 1, 1, 0, 0, 0]
+        assert searched.tolist() == [0, 0, 0, 0, 0, 1, 1, -1, -1, -1]
+
+    def test_overlapping_records_raise(self):
+        with pytest.raises(ValueError, match="requires disjoint record ranges"):
+            _validate_link_disjoint(self.OVERLAP_BEG, self.OVERLAP_CNT, 0)
+
+    def test_the_message_names_the_level_and_both_records(self):
+        with pytest.raises(ValueError) as e:
+            _validate_link_disjoint(self.OVERLAP_BEG, self.OVERLAP_CNT, 0, level="shots")
+        msg = str(e.value)
+        assert "level 'shots'" in msg
+        assert "record 0 covers base rows [0:10]" in msg
+        assert "record 1 starts at 5" in msg
+
+    def test_disjoint_links_pass(self):
+        # The shipped fixtures, both packed and strided, plus an unsorted link
+        # with gaps and an issue #116 empty (start sentinel 0 under origin-1).
+        _validate_link_disjoint(STARTS, COUNTS, 1)
+        _validate_link_disjoint(STARTS_STRIDED, COUNTS, 1)
+        _validate_link_disjoint(np.array([10, 1, 0, 5]), np.array([2, 3, 0, 4]), 1)
+
+    def test_touching_records_are_disjoint(self):
+        # A record starting exactly where the previous ends is contiguous, not
+        # overlapping — the ATL03 shape, which must keep passing.
+        _validate_link_disjoint(np.array([0, 5, 8]), np.array([5, 3, 2]), 0)
+
+    def test_the_vlen_route_refuses_an_overlapping_coordinates_link(self):
+        arrays = _l1b_arrays()
+        arrays["/BEAM0000/rx_sample_count"] = np.array([6, 3, 1, 4], dtype=np.uint16)
+        with pytest.raises(ValueError, match="level 'shots'.*disjoint record ranges"):
+            _read_group(_FakeH5(arrays), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
 
 
 class TestSynthesizeLinspace:
@@ -1104,6 +1162,6 @@ class TestVlenMemoryPosture:
         # per-companion broadcasts) are all <= n_base; nothing may exceed it.
         assert sizes, "the allocation spy saw nothing — is it still wired to the read modules?"
         assert max(sizes) <= self.N_BASE, f"an over-base-rate allocation: {sorted(sizes)[-3:]}"
-        assert (
-            sum(1 for s in sizes if s >= self.N_BASE) <= 6
-        ), f"more base-rate allocations than the base-rate forms need: {sorted(sizes)[-8:]}"
+        assert sum(1 for s in sizes if s >= self.N_BASE) <= 6, (
+            f"more base-rate allocations than the base-rate forms need: {sorted(sizes)[-8:]}"
+        )
