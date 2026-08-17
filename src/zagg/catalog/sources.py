@@ -672,8 +672,10 @@ class Catalog:
         tuple or None
             ``(values, offsets, order)`` where ``values`` is the concatenated
             ``uint64`` morton words of every **table row** (not every
-            ``granule_records`` entry -- ``build`` aligns the two by granule id)
-            and ``offsets`` are arrow list offsets into it, so row ``i``'s MOC is
+            ``granule_records`` entry -- ``build`` aligns the two by row position,
+            via ``np.flatnonzero(granule_row_mask())``, since the screened rows
+            carry a zero-length run rather than being absent) and ``offsets`` are
+            arrow list offsets into it, so row ``i``'s MOC is
             ``values[offsets[i]:offsets[i + 1]]``.
         """
         order = (self.metadata or {}).get(FOOTPRINT_CELLS_ORDER)

@@ -1228,8 +1228,15 @@ class TestDeferredRecords:
         ]
         # The geometry path is unaffected, then and now.
         assert ShardMap.build(cat, hp_grid, region=region, backend="mortie").shard_keys
-        with pytest.raises(ValueError, match="duplicate granule ids .*1 repeats over 3 rows"):
+        # The message must state the mechanism the code implements: alignment is
+        # positional, so the refusal is about the catalog's integrity, not about
+        # an id lookup going last-wins (that lookup was deleted in #439).
+        with pytest.raises(
+            ValueError,
+            match="duplicate granule ids .*1 repeats over 3 rows.*matched to rows by position",
+        ) as exc:
             ShardMap.build(cat.index_footprints(11), hp_grid, region=region, backend="mortie")
+        assert "by id" not in str(exc.value)
 
     def test_order_refusal_precedes_any_record_decode(self, hp_grid, monkeypatch):
         # The order guard now runs before ``granule_records`` rather than after
