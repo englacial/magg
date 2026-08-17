@@ -1011,7 +1011,12 @@ class TestTemporalDeclaration:
         )[:]
         assert words.dtype == np.uint64
         np.testing.assert_array_equal(words, np.array(exp["time_words"], dtype=np.uint64))
-        # §8.1: ascending acquisition order, reproduced by a plain sort.
+        # These particular words ascend, but that is INCIDENTAL to this
+        # fixture: its three groups are days apart, so no envelope start can
+        # lead the row before it. §8.1 does NOT promise ascending stored
+        # words -- the span-lead counterexample is pinned by
+        # test_raster_pipeline.py::TestTocTimeIndex::
+        # test_a_leading_span_puts_the_stored_words_out_of_row_order.
         np.testing.assert_array_equal(np.sort(words), words)
 
     def test_decode_matches_the_golden_bounds(self):

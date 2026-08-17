@@ -1625,13 +1625,21 @@ and nothing else in §8 changes.
   interval MUST be encoded as a **range** word whose envelope conservatively
   contains that interval. A conforming writer therefore never widens an
   instant into a range, and never narrows a real interval into an instant.
-- Words are stored in **ascending acquisition order** — the order the time
-  axis has always had, and the order the `(time, cells)` slabs were indexed
-  by. Unsigned word order is order by conservative encoded *start*, so a
-  plain ascending sort of the stored words reproduces the stored order
-  except where two timesteps fall in one start quantum, where the grammar's
-  own tiebreak decides. A reader MUST NOT assume the stored words are
-  strictly increasing.
+- **Row order is the acquisition-group order**: timesteps are ordered by the
+  group's **earliest member observation time** — the order the time axis has
+  always had, the order the `(time, cells)` slabs were indexed by, and
+  identical under both encodings, so a row assignment never drifts with the
+  encoding.
+- **Stored word order is not that key, and a reader MUST NOT assume the
+  stored words ascend.** Unsigned word order is order by the *encoded* start,
+  which is the conservative envelope start — and an envelope may begin before
+  its group's earliest member observation time, by an amount nothing in this
+  section bounds. Where it does, the word leads the row key and the stored
+  axis is materially out of order: `np.sort(words)` yields ascending
+  *envelope-start* order, which is **not guaranteed to equal row order**. In
+  particular a reader MUST NOT bisect the stored axis to resolve a time
+  window; use the overlap predicate below, which is correct regardless of
+  stored order.
 - Decoding to wall time yields **`(start, end)`** per timestep: for a
   timestamp both bounds are its exact instant; for a range `end` is the
   envelope's **exclusive** upper bound. A reader that must present one

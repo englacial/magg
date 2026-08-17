@@ -107,14 +107,27 @@ class TestRoundTrip:
         exact = np.datetime64(BASE_US, "us").astype("datetime64[ns]")
         assert lo[0] == exact and hi[0] == exact
 
-    def test_mixed_variants_sort_chronologically(self):
-        # The stored axis is ascending acquisition order; a plain unsigned
-        # sort reproduces it, mixing timestamp and range words.
+    def test_mixed_variants_sort_by_envelope_start(self):
+        # Unsigned word order IS order by encoded envelope start (§8.1), so
+        # envelopes that themselves ascend encode to ascending words, mixing
+        # timestamp and range variants.
         day = 86_400_000_000
         starts = np.array([BASE_US, BASE_US + day, BASE_US + 2 * day])
         ends = np.array([BASE_US + 9_000_000, BASE_US + day, BASE_US + 2 * day + 3_000_000])
         words = encode_time_axis(starts, ends, encoding="toc")
         np.testing.assert_array_equal(np.sort(words), words)
+
+    def test_a_leading_envelope_start_breaks_stored_word_order(self):
+        # The §8.1 divergence, at the encode layer: row order is the group's
+        # earliest MEMBER time, but the word encodes the ENVELOPE start. A
+        # later row whose envelope begins before an earlier row's encodes a
+        # smaller word, so the stored axis is materially unsorted -- which is
+        # why §8.1 forbids bisecting it.
+        starts = np.array([BASE_US, BASE_US - 63_000_000])
+        ends = np.array([BASE_US, BASE_US + 10_000_000])
+        words = encode_time_axis(starts, ends, encoding="toc")
+        assert words[1] < words[0]
+        assert not np.array_equal(np.sort(words), words)
 
     def test_empty_axis(self):
         words = encode_time_axis([], [], encoding="toc")

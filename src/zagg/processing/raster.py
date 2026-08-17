@@ -531,9 +531,12 @@ def raster_time_index(
     where it is not. A datatake's tiles are sensed seconds apart, which is
     the range this encoding exists to state honestly.
 
-    Group ORDER is the earliest item datetime either way, so the axis is
-    ascending acquisition order under both encodings and a leaf's row
-    assignment cannot drift with the encoding.
+    Row ORDER is the group's earliest item datetime either way, so a leaf's
+    row assignment cannot drift with the encoding. That is *not* the same as
+    ascending stored words under ``toc``: the word encodes the ENVELOPE
+    start, which a declared ``time_start`` can push before an earlier row's
+    key, so the returned words may descend (§8.1 — a reader must use the
+    overlap predicate, never a bisect).
 
     Parameters
     ----------
@@ -548,8 +551,8 @@ def raster_time_index(
     -------
     (time_index, times)
         ``{group_key: t_idx}`` and the encoded time coordinate (int64
-        microseconds, or uint64 toc words under ``toc``), both in ascending
-        time order.
+        microseconds, or uint64 toc words under ``toc``), both in row order
+        — ascending group earliest-item datetime.
     """
     earliest: dict = {}
     span: dict = {}
