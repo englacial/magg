@@ -20,9 +20,9 @@ spec-keyed naming grammar (:func:`granule_ids_key`). Both are recorded in the
 CANONICAL granule-id space — the driver-stripped bare id
 (:func:`canonical_granule_id`, espg-ruled at the D19 hash epoch) — so the
 identity a leaf carries names the granules it read and not the driver that
-fetched them. It is deliberately not a record key — identity equality is the hash compare every fan-out reader
-already makes, and the list is fetched only to name what a contraction
-dropped.
+fetched them. It is deliberately not a record key — identity equality is the
+hash compare every fan-out reader already makes, and the list is fetched only
+to name what a contraction dropped.
 
 ``build_record``/``merge`` are pure (no I/O); the sidecar/parquet helpers below
 them do object-store I/O and import their backends lazily.
