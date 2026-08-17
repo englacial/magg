@@ -980,7 +980,7 @@ class _AllocSpy:
         return _wrapped
 
 
-class TestPlannedVlenMemoryPosture:
+class TestVlenMemoryPosture:
     """A planned vlen read allocates at PLANNED rate, never at base rate.
 
     The companion half of the fix: with a correct extent but base-rate
@@ -1047,3 +1047,63 @@ class TestPlannedVlenMemoryPosture:
         np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), np.arange(1.0, 6.0))
         assert sizes, "the allocation spy saw nothing — is it still wired to the read modules?"
         assert max(sizes) <= 64, f"a base-rate allocation survived: {sorted(sizes)[-3:]}"
+
+    def test_full_read_keeps_the_base_rate_forms(self, monkeypatch):
+        """The FULL arm must not borrow the planned arm's at-rows machinery.
+
+        The at-rows helpers exist to avoid a length-``n_base`` intermediate. On
+        the full arm there is nothing to avoid — every base row is decoded — so
+        routing it through them buys nothing and costs a lot: it first has to
+        materialize the identity ``arange(n_base)`` (8 B/row) and then pays
+        33 B/row of searchsorted temporaries per companion where the paint pays
+        1-4 B/row. Measured on 2,000 records x count 700 over a 1,420 stride
+        (``n_base`` 19,998,560): ``_broadcast_segment_to_base`` 80.0 MB vs
+        ``_gather_segment_at_rows`` 660.7 MB, ``_expand_mask_to_base`` 20.0 MB
+        vs ``_expand_mask_at_rows`` 660.6 MB. So this pins the dispatch, not a
+        byte count: on the full arm no row vector is built and no owner map is
+        re-derived by searchsorted."""
+        import zagg.processing.read as rd
+        import zagg.processing.read_vlen as rv
+
+        arrays = self._arrays()
+        # A real flat array this time: the full arm decodes the whole dataset.
+        arrays["/BEAM0000/rxwaveform"] = np.arange(1.0, self.N_BASE + 1.0, dtype=np.float32)
+
+        at_rows_calls: list[str] = []
+        for name in ("_link_parent_at_rows", "_expand_mask_at_rows", "_gather_segment_at_rows"):
+            real = getattr(rd, name)
+
+            def _spy(*a, _n=name, _f=real, **k):
+                at_rows_calls.append(_n)
+                return _f(*a, **k)
+
+            monkeypatch.setattr(rd, name, _spy)
+            if hasattr(rv, name):
+                monkeypatch.setattr(rv, name, _spy)
+
+        sizes: list[int] = []
+        monkeypatch.setattr(rd, "np", _AllocSpy(sizes))
+        monkeypatch.setattr(rv, "np", _AllocSpy(sizes))
+        ds = self._data_source()
+        del ds["read_plan"]  # the full arm
+        df = _read_group(
+            _FakeH5(arrays),
+            "BEAM0000",
+            ds,
+            1,
+            _FirstShotGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        monkeypatch.undo()
+
+        assert df["shot_number"].tolist() == [101] * 5
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), np.arange(1.0, 6.0))
+        assert not at_rows_calls, f"the full arm used the at-rows helpers: {at_rows_calls}"
+        # No row vector: the identity map is never materialized. The full arm's
+        # legitimate base-rate allocations (the gather map's two arrays, the
+        # per-companion broadcasts) are all <= n_base; nothing may exceed it.
+        assert sizes, "the allocation spy saw nothing — is it still wired to the read modules?"
+        assert max(sizes) <= self.N_BASE, f"an over-base-rate allocation: {sorted(sizes)[-3:]}"
+        assert (
+            sum(1 for s in sizes if s >= self.N_BASE) <= 6
+        ), f"more base-rate allocations than the base-rate forms need: {sorted(sizes)[-8:]}"

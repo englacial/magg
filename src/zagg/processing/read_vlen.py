@@ -35,6 +35,7 @@ import pandas as pd
 from zagg.config import evaluate_filter_expression, filters_from_data_source
 from zagg.processing.read import (
     _expand_mask_at_rows,
+    _expand_mask_to_base,
     _predicate_mask,
     _read_paths_pooled,
     _read_segment_broadcasts,
@@ -372,20 +373,13 @@ def _vlen_read_group(
         global_idx = None
         parent_planned, within_planned = expand_link_indices(ibeg_arr, cnt_arr, index_base, n_base)
 
-    rows_cache: np.ndarray | None = None
-
-    def _base_rows() -> np.ndarray:
-        """Global base index of each row this read decoded.
-
-        The plan's rows, or the identity map on the full arm (which is O(n_base)
-        by necessity anyway). Built lazily and once: a read with no cross-level
-        filter and no segment-level variable never needs it, and on the full arm
-        it is a sample-rate array.
-        """
-        nonlocal rows_cache
-        if rows_cache is None:
-            rows_cache = global_idx if global_idx is not None else np.arange(n_base, dtype=np.int64)
-        return rows_cache
+    # ``global_idx`` is the arm switch for every expansion below: the plan's base
+    # rows on the planned arm, ``None`` on the full arm. On the full arm the rows
+    # ARE ``arange(n_base)``, but materializing that identity would be a
+    # regression, not a convenience — it costs 8 B/row (1.57 GB on a GEDI beam
+    # group) and turns each base-rate paint into a 33 B/row searchsorted gather.
+    # So the full arm keeps the base-rate forms it always used and never builds
+    # a row vector at all.
 
     # Rows DECODED by this group (issue #374): the planned slices (or the full
     # base extent), counted before the shard mask and filters below.
@@ -473,11 +467,13 @@ def _vlen_read_group(
         fmask = _predicate_mask(flag, f)
         keep_mask = fmask if keep_mask is None else (keep_mask & fmask)
 
-    # Both cross-level arms expand at PLANNED rate (issue #452): each record-rate
+    # The PLANNED arm expands at planned rate (issue #452): each record-rate
     # verdict is gathered onto the rows this read decoded, never painted across
     # the whole base extent and sliced afterwards (196 MB per filter on a GEDI
-    # beam group). A row owned by no record is False, exactly as the base-rate
-    # form leaves it.
+    # beam group). The FULL arm decodes every base row anyway, so it keeps the
+    # base-rate paint — cheaper there by 33x, since the at-rows form's
+    # searchsorted temporaries are 33 B/row against the paint's 1 B/row. Either
+    # way a row owned by no record is False.
     cross_planned: np.ndarray | None = None
     for f in coarse_structured:
         cf_lvl = levels[f["level"]]
@@ -488,16 +484,17 @@ def _vlen_read_group(
             cf_link["count"].format(group=group),
         ]
         cf_data = _read_full(cf_paths)
+        cf_ibeg = np.asarray(cf_data[cf_paths[1]])
+        cf_cnt = np.asarray(cf_data[cf_paths[2]])
+        cf_index_base = int(cf_link.get("index_base", 0))
         coarse_fmask = _predicate_mask(np.asarray(cf_data[cf_paths[0]]), f)
         # A non-coordinate level owns its own link, so its per-row owner comes
         # from a searchsorted over that link's starts rather than from the
         # coordinates level's gather map.
-        expanded = _expand_mask_at_rows(
-            coarse_fmask,
-            np.asarray(cf_data[cf_paths[1]]),
-            np.asarray(cf_data[cf_paths[2]]),
-            int(cf_link.get("index_base", 0)),
-            _base_rows(),
+        expanded = (
+            _expand_mask_at_rows(coarse_fmask, cf_ibeg, cf_cnt, cf_index_base, global_idx)
+            if global_idx is not None
+            else _expand_mask_to_base(coarse_fmask, cf_ibeg, cf_cnt, cf_index_base, n_base)
         )
         cross_planned = expanded if cross_planned is None else (cross_planned & expanded)
 
@@ -529,13 +526,15 @@ def _vlen_read_group(
             within_planned,
         )
 
-    # Record-level variable broadcasts, gathered straight onto this read's rows
-    # (issue #452): the base-rate form is one sample-rate array per companion
-    # variable — ~7 GB for GEDI's six against a 2 GB worker. ``_base_rows`` is
-    # only built when there is something to broadcast.
+    # Record-level variable broadcasts. On the PLANNED arm they gather straight
+    # onto this read's rows (issue #452): the base-rate form is one sample-rate
+    # array per companion variable — ~7 GB for GEDI's six against a 2 GB worker.
+    # On the FULL arm ``base_rows`` stays ``None`` and the original base-rate
+    # broadcast runs: every base row is decoded there anyway, and the at-rows
+    # gather would cost 8x the paint (33 B/row vs 4) for the same answer.
     seg_broadcasts = (
         _read_segment_broadcasts(
-            h5obj, group, data_source, levels, n_base, read_fn=read_fn, base_rows=_base_rows()
+            h5obj, group, data_source, levels, n_base, read_fn=read_fn, base_rows=global_idx
         )
         if _segment_level_variables(data_source)
         else {}
