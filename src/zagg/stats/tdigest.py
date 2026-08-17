@@ -69,13 +69,28 @@ returns a ``(digest, locations)`` pair whose second element is the ``(k,)``
 uint64 per-centroid location — the deepest morton cell enclosing each
 centroid's members (``mortie.common_ancestor``), stored as a companion vlen
 array. See ``zagg/configs/atl03_tdigest_located_healpix.yaml``.
+
+Adding ``temporal: per-centroid`` (spec §8.3, issue #410) passes the cell's
+per-observation toc words as ``temporal=`` and adds a third element to the
+returned tuple: the ``(k,)`` uint64 per-centroid **temporal envelope** — the
+grammar's semilattice join (``mortie.tocs_reduce``) over each centroid's
+members' words, an exact nanosecond timestamp for a 1-observation centroid and
+a conservative range otherwise. The two companion channels are independent and
+either may be declared alone; when both are, the returned tuple is
+``(digest, locations, temporal)`` — always payload first, then the channels in
+that order.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import overload
 
 import numpy as np
+
+#: A companion channel's per-centroid reduction: member words + the partition
+#: map ``_compress`` returns -> one word per output centroid.
+_ChannelFold = Callable[[np.ndarray, np.ndarray, int], np.ndarray]
 
 __all__ = [
     "build_tdigest",
@@ -199,17 +214,82 @@ def _centroid_ancestors(locations: np.ndarray, starts: np.ndarray, n: int) -> np
     return out
 
 
+def _centroid_envelopes(temporal: np.ndarray, starts: np.ndarray, n: int) -> np.ndarray:
+    """Reduce per-member toc words to one temporal envelope per centroid (§8.3).
+
+    ``temporal`` is member-ordered (aligned with the sorted values / combined
+    centroids), ``starts`` the first member index of each centroid.  Each
+    centroid's word is the grammar's semilattice join over its members' words
+    (``mortie.tocs_reduce``, the segmented ``toc_merge`` reduce, issue #177):
+    the conservative envelope containing every observation the centroid
+    summarizes, and — because the join is associative, commutative and
+    idempotent — **bit-identical under any fold tree**, which is what makes the
+    channel merge-order-independent where the digest payload itself is only
+    approximately so (spec §2.3/§8.3).  A single-member centroid returns that
+    member's word unchanged, so a 1-observation centroid round-trips its exact
+    nanosecond timestamp instead of widening into a range.
+
+    Unlike :func:`_centroid_ancestors` there is no per-centroid Python loop:
+    ``starts`` is already the arrow offsets layout ``tocs_reduce`` takes, so the
+    whole partition crosses into Rust once.  ``_compress`` never emits an empty
+    run, which is what the segmented reduce refuses (the join has no identity).
+    """
+    from mortie import tocs_reduce
+
+    starts = np.asarray(starts, dtype=np.int64)
+    if temporal.size and not temporal.all():
+        # 0 is spec §8.2's reserved unobserved marker and no encoder produces
+        # it, so a zero here is a fill value that leaked into the ingest words
+        # — the toc analogue of the fill-word validation the located channel
+        # gets for free from ``common_ancestor``.
+        raise ValueError(
+            "temporal words contain the reserved 0 word (spec §8.2's unobserved "
+            "marker); pass encoded toc words, not a fill value"
+        )
+    offsets = np.empty(len(starts) + 1, dtype=np.int64)
+    offsets[:-1] = starts
+    offsets[-1] = n
+    return np.asarray(tocs_reduce(temporal, offsets), dtype=np.uint64)
+
+
+def _check_words(words, label: str, shape: tuple) -> np.ndarray:
+    """Validate one companion channel's input: packed ``uint64``, shape-aligned.
+
+    A silent ``uint64`` cast would turn a mis-declared float column into
+    plausible-looking morton or toc words, so both channels require packed
+    ``uint64`` outright — what ``HealpixGrid.assign`` supplies as ``leaf_id``
+    and what :func:`zagg.time_axis.observation_words` supplies as toc words.
+    """
+    arr = np.asarray(words)
+    if arr.dtype != np.uint64:
+        raise ValueError(f"{label} dtype {arr.dtype} is not uint64; pass packed uint64 words")
+    if arr.shape != shape:
+        raise ValueError(f"{label} shape {arr.shape} does not match the expected {shape}")
+    return arr
+
+
 @overload
-def build_tdigest(values: np.ndarray, delta: int = ..., locations: None = ...) -> np.ndarray: ...
+def build_tdigest(
+    values: np.ndarray, delta: int = ..., locations: None = ..., temporal: None = ...
+) -> np.ndarray: ...
 @overload
 def build_tdigest(
     values: np.ndarray, delta: int = ..., *, locations: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]: ...
+@overload
+def build_tdigest(
+    values: np.ndarray, delta: int = ..., *, temporal: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]: ...
+@overload
+def build_tdigest(
+    values: np.ndarray, delta: int = ..., *, locations: np.ndarray, temporal: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
 def build_tdigest(
     values: np.ndarray,
     delta: int = _DEFAULT_DELTA,
     locations: np.ndarray | None = None,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    temporal: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, ...]:
     """Build a t-digest sketch from a 1-D array of values.
 
     Parameters
@@ -228,58 +308,60 @@ def build_tdigest(
         for a 1-obs centroid is that observation's exact point word.  All words
         must share one HEALPix base cell (guaranteed when they come from one
         grid cell's observations; mortie raises otherwise).
+    temporal : ndarray, optional
+        Per-observation ``uint64`` toc words (spec §8.3, issue #410), aligned
+        with ``values`` under the same NaN-drop rule as ``locations``.  When
+        given, each centroid also carries a temporal envelope: the grammar's
+        join over its members' words (``mortie.tocs_reduce``), which for a
+        1-obs centroid is that observation's exact nanosecond timestamp.
 
     Returns
     -------
     ndarray, shape (k, 2), dtype float32
         Sorted centroid array.  Column 0 is centroid mean; column 1 is weight
         (number of observations merged into that centroid).
-        With ``locations``, returns a ``(digest, locs)`` tuple instead, where
-        ``locs`` is the ``(k,)`` uint64 per-centroid location vector.
+        With either companion channel, returns a tuple instead — the digest
+        followed by each declared channel's ``(k,)`` uint64 vector, in the
+        order ``(digest, locations, temporal)``.
 
     Notes
     -----
-    Returns an empty ``(0, 2)`` array when ``values`` is empty or all-NaN
-    (an empty ``(digest, locs)`` pair with ``locations``).  The digest itself
-    is identical with or without ``locations``.
+    Returns an empty ``(0, 2)`` array when ``values`` is empty or all-NaN (with
+    empty channel vectors beside it).  The digest itself is identical whichever
+    channels are declared.
     """
     values = np.asarray(values, dtype=np.float64)
     finite = np.isfinite(values)
+    channels = []
     if locations is not None:
-        locations = np.asarray(locations)
-        if locations.dtype != np.uint64:
-            # A silent uint64 cast would truncate a float column (e.g. a
-            # mis-declared ``location:``) into garbage morton words — require
-            # packed uint64 words outright (what ``assign`` supplies as leaf_id).
-            raise ValueError(
-                f"locations dtype {locations.dtype} is not uint64; pass packed "
-                f"morton point words (the per-observation leaf_id column)"
-            )
-        if locations.shape != values.shape:
-            raise ValueError(
-                f"locations shape {locations.shape} does not match values shape {values.shape}"
-            )
-        locations = locations[finite]
+        locations = _check_words(locations, "locations", values.shape)[finite]
+        channels.append(locations)
+    if temporal is not None:
+        temporal = _check_words(temporal, "temporal", values.shape)[finite]
+        channels.append(temporal)
     values = values[finite]
     n = len(values)
     if n == 0:
         empty = np.empty((0, 2), dtype=np.float32)
-        if locations is not None:
-            return empty, np.empty(0, dtype=np.uint64)
+        if channels:
+            return (empty, *(np.empty(0, dtype=np.uint64) for _ in channels))
         return empty
 
-    if locations is not None:
-        # Stable co-sort so equal values keep a deterministic location order.
+    if channels:
+        # Stable co-sort so equal values keep a deterministic channel order.
         order = np.argsort(values, kind="stable")
         sorted_vals = values[order]
-        locations = locations[order]
+        if locations is not None:
+            locations = locations[order]
+        if temporal is not None:
+            temporal = temporal[order]
     else:
         sorted_vals = np.sort(values)
 
     # Unit-weight sub-centroids (one per observation); ``_compress`` greedily
     # merges adjacent ones under the k1 budget. ``starts`` records each output
-    # centroid's first member index in the sorted order, so the location channel
-    # can reduce member words per centroid afterwards.
+    # centroid's first member index in the sorted order, so each companion
+    # channel can reduce member words per centroid afterwards.
     out_means, out_weights, starts = _compress(
         sorted_vals, np.ones(n, dtype=np.float64), float(delta)
     )
@@ -287,9 +369,14 @@ def build_tdigest(
     out = np.empty((len(out_means), 2), dtype=np.float32)
     out[:, 0] = out_means
     out[:, 1] = out_weights
+    if not channels:
+        return out
+    folded = []
     if locations is not None:
-        return out, _centroid_ancestors(locations, starts, n)
-    return out
+        folded.append(_centroid_ancestors(locations, starts, n))
+    if temporal is not None:
+        folded.append(_centroid_envelopes(temporal, starts, n))
+    return (out, *folded)
 
 
 def build_tdigest_where(
@@ -298,7 +385,8 @@ def build_tdigest_where(
     *,
     where: np.ndarray,
     locations: np.ndarray | None = None,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    temporal: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, ...]:
     """t-digest of the observations selected by a row-aligned boolean mask.
 
     The stratified reducer for issue #321: a config declares two ragged fields
@@ -306,7 +394,7 @@ def build_tdigest_where(
     expressions (e.g. the ATBD signal predicate over the ``signal_conf``
     columns and its negation), yielding disjoint signal/noise digests whose
     total weights are the exact stratum counts. Everything else —
-    serialization, merge laws, the located channel — is inherited from
+    serialization, merge laws, the companion channels — is inherited from
     :func:`build_tdigest`, which this delegates to after masking.
     """
     values = np.asarray(values)
@@ -314,14 +402,17 @@ def build_tdigest_where(
     if where.shape != values.shape:
         raise ValueError(f"where shape {where.shape} does not match values shape {values.shape}")
     where = where.astype(bool, copy=False)
-    if locations is not None:
-        locations = np.asarray(locations)
-        if locations.shape != values.shape:
+    kwargs = {}
+    for label, channel in (("locations", locations), ("temporal", temporal)):
+        if channel is None:
+            continue
+        channel = np.asarray(channel)
+        if channel.shape != values.shape:
             raise ValueError(
-                f"locations shape {locations.shape} does not match values shape {values.shape}"
+                f"{label} shape {channel.shape} does not match values shape {values.shape}"
             )
-        return build_tdigest(values[where], delta=delta, locations=locations[where])
-    return build_tdigest(values[where], delta=delta)
+        kwargs[label] = channel[where]
+    return build_tdigest(values[where], delta=delta, **kwargs)
 
 
 @overload
@@ -336,14 +427,25 @@ def merge_tdigests(
     *,
     locations1: np.ndarray,
     locations2: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]: ...
+) -> tuple[np.ndarray, ...]: ...
+@overload
+def merge_tdigests(
+    d1: np.ndarray,
+    d2: np.ndarray,
+    delta: int = ...,
+    *,
+    temporal1: np.ndarray,
+    temporal2: np.ndarray,
+) -> tuple[np.ndarray, ...]: ...
 def merge_tdigests(
     d1: np.ndarray,
     d2: np.ndarray,
     delta: int = _DEFAULT_DELTA,
     locations1: np.ndarray | None = None,
     locations2: np.ndarray | None = None,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    temporal1: np.ndarray | None = None,
+    temporal2: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, ...]:
     """Merge two t-digest centroid arrays into one.
 
     Concatenates the centroid arrays, sorts by mean, and re-compresses with
@@ -369,52 +471,57 @@ def merge_tdigests(
         digests come from the same grid cell); mortie raises ``ValueError``
         otherwise — cross-base roll-ups need ``mortie.split_base_cells`` and
         are out of scope here.
+    temporal1, temporal2 : ndarray, optional
+        Per-centroid ``uint64`` toc words (spec §8.3, issue #410) aligned with
+        ``d1`` / ``d2``.  Pass both or neither, independently of the located
+        channel.  A merged centroid's word is the grammar's join over its
+        members' words — exact and fold-tree independent, unlike the payload.
 
     Returns
     -------
     ndarray, shape (k_merged, 2), dtype float32
-        Merged and re-compressed centroid array.  With locations, returns a
-        ``(digest, locs)`` tuple, ``locs`` the ``(k_merged,)`` uint64 vector.
+        Merged and re-compressed centroid array.  With either channel, returns
+        a tuple — the digest followed by each declared channel's
+        ``(k_merged,)`` uint64 vector, in the order
+        ``(digest, locations, temporal)``.
     """
-    located = locations1 is not None or locations2 is not None
-    if located and (locations1 is None) != (locations2 is None):
-        raise ValueError("pass both locations1 and locations2, or neither")
     d1 = np.asarray(d1, dtype=np.float64)
     d2 = np.asarray(d2, dtype=np.float64)
-    if located:
-        locations1 = np.asarray(locations1)
-        locations2 = np.asarray(locations2)
-        for d, locs, tag in ((d1, locations1, "locations1"), (d2, locations2, "locations2")):
-            if locs.dtype != np.uint64:
-                raise ValueError(
-                    f"{tag} dtype {locs.dtype} is not uint64; pass packed morton words"
-                )
-            if locs.shape != (len(d),):
-                raise ValueError(f"{tag} shape {locs.shape} does not match {len(d)} centroids")
+    # (reducer, left words, right words) per declared channel, in the fixed
+    # return order — everything below is channel-agnostic from here on.
+    channels: list[tuple[_ChannelFold, np.ndarray, np.ndarray]] = []
+    for label, reducer, c1, c2 in (
+        ("locations", _centroid_ancestors, locations1, locations2),
+        ("temporal", _centroid_envelopes, temporal1, temporal2),
+    ):
+        if c1 is None and c2 is None:
+            continue
+        if (c1 is None) != (c2 is None):
+            raise ValueError(f"pass both {label}1 and {label}2, or neither")
+        channels.append(
+            (
+                reducer,
+                _check_words(c1, f"{label}1", (len(d1),)),
+                _check_words(c2, f"{label}2", (len(d2),)),
+            )
+        )
 
     if d1.size == 0 and d2.size == 0:
         empty = np.empty((0, 2), dtype=np.float32)
-        return (empty, np.empty(0, dtype=np.uint64)) if located else empty
-    if d1.size == 0:
-        d2_out = np.asarray(d2, dtype=np.float32)
-        if locations2 is not None:
-            # Copy so the returned channel never aliases the caller's array.
-            return d2_out, locations2.copy()
-        return d2_out
-    if d2.size == 0:
-        d1_out = np.asarray(d1, dtype=np.float32)
-        if locations1 is not None:
-            return d1_out, locations1.copy()
-        return d1_out
+        if channels:
+            return (empty, *(np.empty(0, dtype=np.uint64) for _ in channels))
+        return empty
+    if d1.size == 0 or d2.size == 0:
+        # One contributor is already a valid digest; the channels pass through
+        # unreduced. Copy so the return never aliases the caller's array.
+        keep = 1 if d2.size == 0 else 2
+        kept = np.asarray(d1 if keep == 1 else d2, dtype=np.float32)
+        return (kept, *(c[keep].copy() for c in channels)) if channels else kept
 
     combined = np.concatenate([d1, d2], axis=0)
     order = np.argsort(combined[:, 0], kind="stable")
     combined = combined[order]
-    combined_locs = (
-        np.concatenate([locations1, locations2])[order]
-        if locations1 is not None and locations2 is not None
-        else None
-    )
+    joined = [np.concatenate([c1, c2])[order] for _, c1, c2 in channels]
 
     # Re-compress the concatenated sub-centroids under the same k1 budget as
     # the build path — the weighted variant of the greedy rule (issue #279).
@@ -423,24 +530,33 @@ def merge_tdigests(
     out = np.empty((len(out_means), 2), dtype=np.float32)
     out[:, 0] = out_means
     out[:, 1] = out_weights
-    if combined_locs is not None:
-        return out, _centroid_ancestors(combined_locs, starts, len(combined))
-    return out
+    if not channels:
+        return out
+    n = len(combined)
+    return (
+        out,
+        *(fold(words, starts, n) for (fold, _, _), words in zip(channels, joined, strict=True)),
+    )
 
 
 @overload
 def merge_tdigests_kway(
-    digests: list[np.ndarray], delta: int = ..., locations: None = ...
+    digests: list[np.ndarray], delta: int = ..., locations: None = ..., temporal: None = ...
 ) -> np.ndarray: ...
 @overload
 def merge_tdigests_kway(
     digests: list[np.ndarray], delta: int = ..., *, locations: list[np.ndarray]
-) -> tuple[np.ndarray, np.ndarray]: ...
+) -> tuple[np.ndarray, ...]: ...
+@overload
+def merge_tdigests_kway(
+    digests: list[np.ndarray], delta: int = ..., *, temporal: list[np.ndarray]
+) -> tuple[np.ndarray, ...]: ...
 def merge_tdigests_kway(
     digests: list[np.ndarray],
     delta: int = _DEFAULT_DELTA,
     locations: list[np.ndarray] | None = None,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    temporal: list[np.ndarray] | None = None,
+) -> np.ndarray | tuple[np.ndarray, ...]:
     """Merge many t-digests in one pass — **order-independent**.
 
     Concatenates every centroid array, sorts by mean once, and re-compresses
@@ -448,12 +564,16 @@ def merge_tdigests_kway(
     the result does **not** depend on the order the digests are combined (t-digest
     merge is not associative), and it holds the centroid count at the δ budget
     instead of drifting above it (issue #279). This is the fold law for the
-    standard ``build_tdigest`` reducer on the spill path, where each input is a
-    saturated per-block digest and the block count is small.
+    standard ``build_tdigest`` reducer on the spill path and for every pyramid
+    fold site (:func:`zagg.sweep_overview.fold_digests`).
 
-    Order-independence covers **both** channels: with ``locations``, the sort
-    breaks ``(mean, weight)`` ties on the location word, so a permutation of the
-    inputs returns the same location vector as well as the same digest.
+    Order-independence covers **every** channel: the sort breaks ``(mean,
+    weight)`` ties on the location word and then on the toc word, so a
+    permutation of the inputs returns the same companion vectors as well as the
+    same digest. The temporal channel is additionally order-independent *by
+    construction* — its reduction is the grammar's semilattice join (spec
+    §8.3), so its words are bit-identical under any fold tree, not merely under
+    a permutation of one flat k-way call.
 
     Parameters
     ----------
@@ -467,43 +587,50 @@ def merge_tdigests_kway(
         ``digests`` (one array per digest, each aligned with that digest's
         centroids). Pass for the located channel or omit entirely. All folded
         locations must share a HEALPix base cell (mortie raises otherwise).
+    temporal : list of ndarray, optional
+        Per-digest ``uint64`` toc word vectors (spec §8.3, issue #410), aligned
+        with ``digests`` the same way, and declarable independently of
+        ``locations``.
 
     Returns
     -------
     ndarray, shape (k_merged, 2), dtype float32
-        Merged, re-compressed centroid array. With ``locations``, returns a
-        ``(digest, locs)`` tuple.
+        Merged, re-compressed centroid array. With either channel, returns a
+        tuple — the digest followed by each declared channel's ``(k_merged,)``
+        uint64 vector, in the order ``(digest, locations, temporal)``.
     """
-    located = locations is not None
-    if locations is not None and len(locations) != len(digests):
-        raise ValueError(f"locations has {len(locations)} arrays but digests has {len(digests)}")
+    declared = [
+        (label, reducer, chans)
+        for label, reducer, chans in (
+            ("locations", _centroid_ancestors, locations),
+            ("temporal", _centroid_envelopes, temporal),
+        )
+        if chans is not None
+    ]
+    for label, _, chans in declared:
+        if len(chans) != len(digests):
+            raise ValueError(f"{label} has {len(chans)} arrays but digests has {len(digests)}")
     arrs: list[np.ndarray] = []
-    locs: list[np.ndarray] = []
+    # Per declared channel, the surviving (non-empty) digests' word vectors.
+    kept: list[list[np.ndarray]] = [[] for _ in declared]
     for i, d in enumerate(digests):
         d = np.asarray(d, dtype=np.float64)
         if d.size == 0:
             continue
         arrs.append(d)
-        if locations is not None:
-            li = np.asarray(locations[i])
-            if li.dtype != np.uint64:
-                raise ValueError(
-                    f"locations[{i}] dtype {li.dtype} is not uint64; pass packed morton words"
-                )
-            if li.shape != (len(d),):
-                raise ValueError(
-                    f"locations[{i}] shape {li.shape} does not match {len(d)} centroids"
-                )
-            locs.append(li)
+        for slot, (label, _, chans) in enumerate(declared):
+            kept[slot].append(_check_words(chans[i], f"{label}[{i}]", (len(d),)))
 
     if not arrs:
         empty = np.empty((0, 2), dtype=np.float32)
-        return (empty, np.empty(0, dtype=np.uint64)) if located else empty
+        if declared:
+            return (empty, *(np.empty(0, dtype=np.uint64) for _ in declared))
+        return empty
     if len(arrs) == 1:
         # A single contributor is already a valid digest; no re-compression, and
-        # copy the location channel so the return never aliases the caller.
+        # copy the channels so the return never aliases the caller.
         out = arrs[0].astype(np.float32)
-        return (out, locs[0].copy()) if located else out
+        return (out, *(words[0].copy() for words in kept)) if declared else out
 
     combined = np.concatenate(arrs, axis=0)
     # lexsort on (mean, weight) — primary key means, secondary weights — so the
@@ -512,33 +639,40 @@ def merge_tdigests_kway(
     # position (i.e. input order), which makes the k-way fold permutation-
     # dependent when means tie across digests (discrete/quantized sources).
     # Sub-centroids with identical (mean, weight) are interchangeable *for the
-    # digest*, but not for the location channel: a tie straddling a compression
-    # boundary would send different location words into different output
-    # centroids depending on input order. So the located branch adds the
-    # location word as a tertiary (least-significant) key — it changes no digest
+    # digest*, but not for a companion channel: a tie straddling a compression
+    # boundary would send different words into different output centroids
+    # depending on input order. So each declared channel contributes a further
+    # tie key, in the fixed channel order — location tertiary, toc quaternary
+    # (tertiary when it is the only channel declared) — which changes no digest
     # byte (the tied rows carry identical means and weights) and makes the
-    # companion channel permutation-independent too (issues #279/#370).
-    if located:
-        combined_locs = np.concatenate(locs)
-        order = np.lexsort((combined_locs, combined[:, 1], combined[:, 0]))
-        combined_locs = combined_locs[order]
-    else:
-        order = np.lexsort((combined[:, 1], combined[:, 0]))
+    # companions permutation-independent too (issues #279/#370/#410).
+    # ``lexsort`` takes its keys least-significant first, hence the reversal.
+    joined = [np.concatenate(words) for words in kept]
+    order = np.lexsort((*reversed(joined), combined[:, 1], combined[:, 0]))
+    joined = [words[order] for words in joined]
     combined = combined[order]
     out_means, out_weights, starts = _compress(combined[:, 0], combined[:, 1], float(delta))
     out = np.empty((len(out_means), 2), dtype=np.float32)
     out[:, 0] = out_means
     out[:, 1] = out_weights
-    if located:
-        return out, _centroid_ancestors(combined_locs, starts, len(combined))
-    return out
+    if not declared:
+        return out
+    n = len(combined)
+    return (
+        out,
+        *(
+            reducer(words, starts, n)
+            for (_, reducer, _), words in zip(declared, joined, strict=True)
+        ),
+    )
 
 
 def build_tdigest_pairwise(
     values: np.ndarray,
     delta: int = _DEFAULT_DELTA,
     locations: np.ndarray | None = None,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    temporal: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, ...]:
     """t-digest build whose cross-block fold uses the **pairwise** merge law.
 
     Output is identical to :func:`build_tdigest` — the difference is downstream,
@@ -547,8 +681,12 @@ def build_tdigest_pairwise(
     budget, marginally finer far tail), whereas ``build_tdigest`` folds with the
     order-independent :func:`merge_tdigests_kway`. This reducer preserves the
     pre-#279 end-to-end fold semantics for anyone who wants them.
+
+    The temporal channel is the exception the difference does not reach: its
+    join is associative and commutative (spec §8.3), so a pairwise left-fold
+    and a k-way fold produce bit-identical toc words.
     """
-    return build_tdigest(values, delta=delta, locations=locations)
+    return build_tdigest(values, delta=delta, locations=locations, temporal=temporal)
 
 
 def quantile_from_tdigest(digest: np.ndarray, q: float) -> float:

@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 from conftest import point_words as _point_words
+from conftest import toc_words as _toc_words
 
 from zagg.stats.tdigest import (
     build_tdigest,
@@ -835,3 +836,218 @@ class TestSingletonPreservation:
         from zagg.stats.tdigest import _DEFAULT_DELTA
 
         assert _DEFAULT_DELTA == 512
+
+
+class TestTemporalChannel:
+    """The ``temporal`` companion channel (spec §8.3, issue #410)."""
+
+    def test_digest_identical_with_and_without_temporal(self):
+        rng = np.random.default_rng(410)
+        values = rng.standard_normal(3000)
+        digest, _ = build_tdigest(values, delta=128, temporal=_toc_words(3000))
+        assert np.array_equal(digest, build_tdigest(values, delta=128))
+
+    def test_singleton_centroids_round_trip_exact_timestamps(self):
+        # Loss-free regime (n <= delta): every centroid holds one observation,
+        # so §8.3 requires its exact nanosecond timestamp word back, never a
+        # range widened around it.
+        import mortie
+
+        values = np.arange(50, dtype=np.float64)
+        words = _toc_words(50)
+        digest, out = build_tdigest(values, delta=512, temporal=words)
+        assert np.all(digest[:, 1] == 1.0)
+        assert out.dtype == np.uint64
+        np.testing.assert_array_equal(out, words)
+        assert not mortie.toc_is_range(out).any()
+
+    def test_merged_centroid_envelopes_contain_their_members(self):
+        # The §8.2/§8.3 conservative-containment claim, asserted rather than
+        # assumed: values rise with time here, so centroid i covers a
+        # contiguous run of the value-sorted observations.
+        import mortie
+
+        n = 600
+        values = np.arange(n, dtype=np.float64)
+        words = _toc_words(n)
+        digest, out = build_tdigest(values, delta=32, temporal=words)
+        assert len(out) == len(digest) < n
+        assert mortie.toc_is_range(out).any(), "a compressed digest must produce ranges"
+        bounds = np.concatenate([[0], np.cumsum(digest[:, 1]).astype(np.int64)])
+        for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+            members = mortie.toc2time(words[lo:hi])[0]
+            start, end = (int(b[0]) for b in mortie.toc2time(out[i : i + 1]))
+            assert start <= int(members.min())
+            # A range's end is EXCLUSIVE (§8.1); a timestamp's two bounds are
+            # both its exact instant, so its sole member sits on the boundary.
+            if bool(mortie.toc_is_range(out[i : i + 1])[0]):
+                assert int(members.max()) < end
+            else:
+                assert int(members.max()) == end == start
+
+    def test_reserved_zero_word_refused(self):
+        # 0 is §8.2's unobserved marker; no encoder produces it, so its
+        # presence is a fill value that leaked into the ingest words.
+        words = _toc_words(4)
+        words[2] = 0
+        with pytest.raises(ValueError, match="reserved 0 word"):
+            build_tdigest(np.arange(4.0), temporal=words)
+
+    def test_non_uint64_temporal_raises(self):
+        with pytest.raises(ValueError, match="is not uint64"):
+            build_tdigest(np.array([1.0, 2.0]), temporal=np.array([1.5, 2.5]))
+
+    def test_mismatched_lengths_raise(self):
+        with pytest.raises(ValueError, match="temporal shape"):
+            build_tdigest(np.array([1.0, 2.0]), temporal=_toc_words(3))
+
+    def test_nan_values_drop_their_words(self):
+        values = np.array([1.0, np.nan, 2.0, np.nan, 3.0])
+        words = _toc_words(5)
+        digest, out = build_tdigest(values, delta=512, temporal=words)
+        assert len(digest) == 3
+        np.testing.assert_array_equal(out, words[[0, 2, 4]])
+
+    def test_empty_returns_empty_triple_with_both_channels(self):
+        digest, locs, times = build_tdigest(
+            np.array([]),
+            locations=np.array([], dtype=np.uint64),
+            temporal=np.array([], dtype=np.uint64),
+        )
+        assert digest.shape == (0, 2)
+        assert locs.shape == (0,) and locs.dtype == np.uint64
+        assert times.shape == (0,) and times.dtype == np.uint64
+
+    def test_both_channels_return_in_fixed_order(self):
+        # (digest, locations, temporal) — the documented tuple order, and each
+        # channel is byte-identical to what declaring it alone produces.
+        values = np.linspace(0.0, 1.0, 200)
+        locs = _point_words(200, seed=410)
+        words = _toc_words(200)
+        digest, out_locs, out_times = build_tdigest(
+            values, delta=32, locations=locs, temporal=words
+        )
+        _, locs_alone = build_tdigest(values, delta=32, locations=locs)
+        _, times_alone = build_tdigest(values, delta=32, temporal=words)
+        np.testing.assert_array_equal(digest, build_tdigest(values, delta=32))
+        np.testing.assert_array_equal(out_locs, locs_alone)
+        np.testing.assert_array_equal(out_times, times_alone)
+
+    def test_where_reducer_masks_the_channel(self):
+        from zagg.stats.tdigest import build_tdigest_where
+
+        values = np.arange(10, dtype=np.float64)
+        words = _toc_words(10)
+        keep = np.array([True, False] * 5)
+        digest, out = build_tdigest_where(values, 512, where=keep, temporal=words)
+        assert len(digest) == 5
+        np.testing.assert_array_equal(out, words[keep])
+
+    def test_pairwise_build_output_identical(self):
+        values = np.linspace(0.0, 1.0, 200)
+        words = _toc_words(200)
+        d_p, t_p = build_tdigest_pairwise(values, delta=32, temporal=words)
+        d_s, t_s = build_tdigest(values, delta=32, temporal=words)
+        np.testing.assert_array_equal(d_p, d_s)
+        np.testing.assert_array_equal(t_p, t_s)
+
+
+class TestTemporalMergeLaws:
+    """The channel's fold laws: pairwise, k-way, and the §8.3 order law."""
+
+    def _parts(self, seed=410, k=4, n=120):
+        rng = np.random.default_rng(seed)
+        digests, times = [], []
+        for i in range(k):
+            vals = rng.normal(float(i), 3.0, n)
+            d, t = build_tdigest(
+                vals, delta=32, temporal=_toc_words(n, base="2020-01-0%d" % (i + 1))
+            )
+            digests.append(d)
+            times.append(t)
+        return digests, times
+
+    def test_pairwise_merge_requires_both_sides(self):
+        d = build_tdigest(np.arange(10.0), delta=8)
+        with pytest.raises(ValueError, match="pass both temporal1 and temporal2"):
+            merge_tdigests(d, d, 8, temporal1=_toc_words(len(d)))
+
+    def test_pairwise_merge_passes_an_empty_side_through(self):
+        vals = np.arange(10.0)
+        words = _toc_words(10)
+        d, t = build_tdigest(vals, delta=512, temporal=words)
+        empty = np.empty((0, 2), dtype=np.float32)
+        merged, out = merge_tdigests(
+            d, empty, 512, temporal1=t, temporal2=np.empty(0, dtype=np.uint64)
+        )
+        np.testing.assert_array_equal(merged, d)
+        np.testing.assert_array_equal(out, t)
+        assert out is not t, "the channel must not alias the caller's array"
+
+    def test_kway_fold_is_permutation_independent(self):
+        digests, times = self._parts()
+        base = merge_tdigests_kway(digests, delta=32, temporal=times)
+        for perm in ([3, 1, 0, 2], [2, 3, 1, 0], [1, 0, 3, 2]):
+            d, t = merge_tdigests_kway(
+                [digests[i] for i in perm], delta=32, temporal=[times[i] for i in perm]
+            )
+            np.testing.assert_array_equal(d, base[0])
+            np.testing.assert_array_equal(t, base[1])
+
+    def test_cell_envelope_is_fold_tree_independent(self):
+        # The §8.2 law the located channel and the digest payload cannot claim:
+        # the join is a semilattice, so a CELL-level reduction of the same
+        # member words is bit-identical however the tree is shaped — which is
+        # what licenses an overview folded from leaves and one cascaded from
+        # finer overviews to agree byte for byte (spec §8.4's reduction).
+        from zagg.stats.toc import cell_envelope
+
+        _, times = self._parts()
+        whole = int(cell_envelope(np.concatenate(times)))
+        per_part = int(cell_envelope(np.array([int(cell_envelope(t)) for t in times], "uint64")))
+        pairs = [int(cell_envelope(np.concatenate(times[i : i + 2]))) for i in (0, 2)]
+        assert whole == per_part == int(cell_envelope(np.asarray(pairs, dtype="uint64")))
+
+    def test_per_cell_envelope_is_the_envelope_of_the_per_centroid_words(self):
+        # §8.3's closing clause / §8.4's licensed reduction: an overview's
+        # per-cell word IS the envelope of the per-centroid words beneath it,
+        # and equally of the raw observations they summarize.
+        from zagg.stats.toc import cell_envelope
+
+        words = _toc_words(400)
+        _, per_centroid = build_tdigest(np.arange(400.0), delta=16, temporal=words)
+        assert int(cell_envelope(per_centroid)) == int(cell_envelope(words))
+
+    def test_kway_both_channels_independent_of_each_other(self):
+        rng = np.random.default_rng(4102)
+        digests, locs, times = [], [], []
+        for i in range(3):
+            vals = rng.normal(float(i), 2.0, 90)
+            d, lo, t = build_tdigest(
+                vals, delta=16, locations=_point_words(90, seed=i), temporal=_toc_words(90)
+            )
+            digests.append(d)
+            locs.append(lo)
+            times.append(t)
+        d_both, l_both, t_both = merge_tdigests_kway(
+            digests, delta=16, locations=locs, temporal=times
+        )
+        _, l_only = merge_tdigests_kway(digests, delta=16, locations=locs)
+        _, t_only = merge_tdigests_kway(digests, delta=16, temporal=times)
+        np.testing.assert_array_equal(d_both, merge_tdigests_kway(digests, delta=16))
+        np.testing.assert_array_equal(l_both, l_only)
+        np.testing.assert_array_equal(t_both, t_only)
+
+    def test_kway_arity_mismatch_raises(self):
+        digests, times = self._parts(k=3, n=40)
+        with pytest.raises(ValueError, match="temporal has 2 arrays"):
+            merge_tdigests_kway(digests, delta=16, temporal=times[:2])
+
+    def test_kway_single_contributor_copies_the_channel(self):
+        d, t = build_tdigest(np.arange(20.0), delta=512, temporal=_toc_words(20))
+        out_d, out_t = merge_tdigests_kway(
+            [d, np.empty((0, 2))], delta=512, temporal=[t, np.empty(0, dtype=np.uint64)]
+        )
+        np.testing.assert_array_equal(out_d, d)
+        np.testing.assert_array_equal(out_t, t)
+        assert out_t is not t

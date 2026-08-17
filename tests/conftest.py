@@ -70,6 +70,29 @@ def point_words(n, seed, lat0=45.0, lon0=45.0, spread=1e-4):
     return morton_words(MortonIndexArray.from_latlon(lats, lons, points=True))
 
 
+#: Base instant for :func:`toc_words` — well inside the toc grammar's range and
+#: far from its 1850 epoch, matching the §7 fixture generator's clock.
+TOC_BASE = "2019-05-14T02:11:07.250000000"
+
+
+def toc_words(n, step_s=3.0, base=TOC_BASE):
+    """``n`` exact toc **timestamp** words, one per observation, ``step_s`` apart.
+
+    Shared fixture helper for the temporal channel (spec §8.3, issue #410):
+    per-observation instants, so every multi-member fold produces a genuine
+    range and every singleton round-trips an exact nanosecond timestamp.
+    Returns the packed ``uint64`` words a reducer's ``temporal=`` takes.
+    """
+    import mortie
+
+    when = np.datetime64(base, "ns").astype("int64") + (
+        np.arange(n, dtype="int64") * int(step_s * 1_000_000_000)
+    )
+    return np.asarray(
+        mortie.time2toc(mortie.from_datetime64(when.astype("datetime64[ns]"))), dtype=np.uint64
+    )
+
+
 @pytest.fixture(autouse=True)
 def _no_s3_run_stats(monkeypatch):
     """Keep unit tests hermetic: never PUT the run stats parquet to real S3.
