@@ -2,10 +2,11 @@
 
 import importlib
 import inspect
+import json
 import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from importlib import resources
 from typing import Any, NotRequired, TypedDict
@@ -175,8 +176,68 @@ def load_config(path: str) -> PipelineConfig:
     return cfg
 
 
+def _is_float_nan(value) -> bool:
+    """Whether ``value`` is a float NaN (YAML ``.nan`` / ``float("nan")``).
+
+    ``np.floating`` is checked explicitly (fold review): ``np.float64`` is a
+    ``float`` subclass and would pass either way, but ``np.float32`` is not, so
+    a Python-built config carrying ``np.float32("nan")`` slipped through.
+    """
+    return isinstance(value, (float, np.floating)) and bool(np.isnan(value))
+
+
+def _has_nan_fill(node) -> bool:
+    """Whether any ``fill_value`` anywhere under ``node`` is a float NaN."""
+    if isinstance(node, dict):
+        return any(
+            _is_float_nan(v) if k == "fill_value" else _has_nan_fill(v) for k, v in node.items()
+        )
+    # Tuples traverse too (fold review): unreachable from YAML/JSON, but a
+    # Python-built config may hold ``({"fill_value": nan},)``.
+    if isinstance(node, (list, tuple)):
+        return any(_has_nan_fill(v) for v in node)
+    return False
+
+
+def _normalize_nan_fills(node):
+    """Rewrite float-NaN ``fill_value`` declarations to the string ``"NaN"``.
+
+    YAML's ``.nan`` parses to a float NaN, which ``json.dumps`` emits as the
+    non-standard token ``NaN`` -- Lambda's strict JSON parser rejects the whole
+    dispatch payload (``InvalidRequestContentException``, issue #448). The
+    string is the grammar's native form everywhere else: it is the healpix /
+    rect template default (``meta.get("fill_value", "NaN")``), what
+    :func:`_is_nan_fill` and the aggregate/spill/streaming fill checks compare
+    against, and zarr v3's JSON fill encoding. Canonicalizing at load keeps
+    ``.nan`` legal in authored YAML while guaranteeing one wire form -- and one
+    form for the semantic hash.
+
+    Returns the node unchanged (same object) when there is nothing to rewrite,
+    so the common case allocates nothing and callers keep their dict identity.
+    """
+    if not _has_nan_fill(node):
+        return node
+    if isinstance(node, dict):
+        return {
+            k: "NaN" if (k == "fill_value" and _is_float_nan(v)) else _normalize_nan_fills(v)
+            for k, v in node.items()
+        }
+    if isinstance(node, tuple):
+        return tuple(_normalize_nan_fills(v) for v in node)
+    return [_normalize_nan_fills(v) for v in node]
+
+
 def load_config_from_dict(d: dict) -> PipelineConfig:
     """Build a PipelineConfig from a plain dict (e.g. Lambda JSON payload).
+
+    Float-NaN **fill_value** declarations are canonicalized to the string
+    ``"NaN"`` here (issue #448) -- this is the single funnel every config
+    passes through (``load_config``, ``default_config``, the client, and the
+    Lambda worker's ``event["config"]``). The scope is deliberate: rewriting
+    every float NaN in the tree would silently mangle authored values. A NaN
+    somewhere else (a filter ``value``, a variable ``attrs`` entry) is a config
+    ERROR, not something to canonicalize, and :func:`validate_config` refuses
+    it -- see :func:`_validate_json_floats`.
 
     Parameters
     ----------
@@ -187,6 +248,7 @@ def load_config_from_dict(d: dict) -> PipelineConfig:
     -------
     PipelineConfig
     """
+    d = _normalize_nan_fills(d)
     return PipelineConfig(
         data_source=d.get("data_source", {}),
         aggregation=d.get("aggregation", {}),
@@ -232,6 +294,71 @@ def default_config(name: str = "atl06", *, validate: bool = True) -> PipelineCon
     return cfg
 
 
+def _nonfinite_path(node, path: str = "") -> str | None:
+    """Dotted path to the first non-finite float under ``node`` (else None).
+
+    Purely a message helper for :func:`_validate_json_floats`: ``json.dumps``
+    reports "Out of range float values are not JSON compliant" with no path, so
+    the walk locates the offender for an actionable error.
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            hit = _nonfinite_path(v, f"{path}.{k}" if path else str(k))
+            if hit is not None:
+                return hit
+        return None
+    if isinstance(node, (list, tuple)):
+        for i, v in enumerate(node):
+            hit = _nonfinite_path(v, f"{path}[{i}]")
+            if hit is not None:
+                return hit
+        return None
+    if isinstance(node, (float, np.floating)) and not np.isfinite(node):
+        return path or "<config>"
+    return None
+
+
+def _validate_json_floats(config: PipelineConfig) -> None:
+    """Refuse a config carrying a float strict JSON cannot encode (issue #448).
+
+    The dispatch event's ``config`` block is ``dataclasses.asdict(config)``
+    serialized by ``json.dumps``; Lambda's parser enforces exactly
+    ``allow_nan=False``, so a NaN/Infinity anywhere in the tree kills the whole
+    invoke with an opaque ``InvalidRequestContentException`` one dispatch
+    later. ``fill_value`` NaNs are canonicalized at load
+    (:func:`_normalize_nan_fills`) because there the float form is a legal
+    *spelling*; everywhere else -- a filter ``value``, a variable ``attrs``
+    entry -- it is a config error, and this is the backstop that says so at
+    load time, with the offending path named (fold review).
+
+    The walk runs first because it also catches ``np.float32("nan")``, which
+    ``json.dumps`` reports as an unserializable *type* rather than an
+    out-of-range float. A non-JSON type is a different (and rarer) fault than
+    the value question this check owns, so it is left to the serializer.
+    """
+    data = asdict(config)
+    path = _nonfinite_path(data)
+    if path is not None:
+        raise ValueError(
+            f"config value at {path} is a non-finite float (NaN/Infinity), which strict "
+            f"JSON refuses -- the Lambda dispatch payload would be rejected "
+            f'(InvalidRequestContentException, issue #448). Use the string "NaN" for a '
+            f"fill_value declaration; elsewhere, drop the value or spell it as a string."
+        )
+    try:
+        json.dumps(data, allow_nan=False)
+    except ValueError as exc:  # pragma: no cover - the walk catches every known case
+        raise ValueError(
+            f"config cannot be serialized as strict JSON, so it cannot be dispatched "
+            f"(issue #448): {exc}"
+        ) from exc
+    except TypeError:
+        # A non-JSON *type* (e.g. a datetime, a set) -- out of scope here; the
+        # serializer owns it, and refusing it at validation would newly reject
+        # configs that never dispatch.
+        pass
+
+
 def validate_config(config: PipelineConfig) -> None:
     """Cross-validate a PipelineConfig.
 
@@ -244,6 +371,11 @@ def validate_config(config: PipelineConfig) -> None:
     ValueError
         On any validation failure.
     """
+    # Dispatchability first (issue #448 fold review): every pipeline kind ships
+    # its config through the same strict-JSON Lambda payload, so the check runs
+    # before the kind branch and its early returns.
+    _validate_json_floats(config)
+
     # Pipeline kind drives which validation branch runs; spatial keeps the
     # full grid + aggregation cross-checks below. Temporal/event pipelines
     # validate their own (much smaller) spec shape and return early -- they

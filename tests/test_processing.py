@@ -6488,7 +6488,10 @@ class TestGranuleScopeReadErrors:
     def test_serial_granule_failure_is_counted_and_exemplared(self, monkeypatch):
         # The credential/endpoint shape: H5Coro construction raises for every
         # granule. Previously: read_errors absent, error == "No data after
-        # filtering". Now: counted, exemplared, and the scope is named.
+        # filtering". Now: counted, exemplared, and the scope is named -- and
+        # since this fixture's message is literally the credential shape, it
+        # now takes the issue #449 auth class (the generic no-data wording is
+        # covered by the non-auth failures elsewhere in this class).
         def factory(*a, **k):
             raise RuntimeError("h5coro open failed: expired token")
 
@@ -6500,8 +6503,10 @@ class TestGranuleScopeReadErrors:
         assert "read_errors" not in meta  # no GROUP read ever ran
         assert meta["read_error_exemplars"] == ["RuntimeError: h5coro open failed: expired token"]
         assert meta["error"] == (
-            "No data after filtering (2 granule reads raised; "
-            "e.g. RuntimeError: h5coro open failed: expired token)"
+            "Access denied reading source granules (2 auth-shaped failures; "
+            "2 granule reads raised): check data_source.credentials_provider names "
+            "the DAAC hosting this product; "
+            "e.g. RuntimeError: h5coro open failed: expired token"
         )
 
     def test_pool_granule_failure_is_counted_and_exemplared(self, monkeypatch):
@@ -6554,6 +6559,134 @@ class TestGranuleScopeReadErrors:
         )
         assert meta["read_errors"] == 1 and meta["granule_errors"] == 1
         assert "1 group reads raised, 1 granule reads raised" in meta["error"]
+
+
+class TestAuthFailureClass:
+    """A denied read is its own failure class (issue #449).
+
+    The GEDI template shipped without a ``credentials_provider``, so the NSIDC
+    default hit LP DAAC's ``lp-prod-protected``; each 403 came back as an empty
+    body, which the reader raised as ``TypeError: memoryview: a bytes-like
+    object is required, not 'NoneType'`` — swallowed into the per-granule path
+    and reported as the data-shaped "No data after filtering". The fault is the
+    CONFIG, not the data, so it gets its own loud message and its own counter.
+
+    Fold review: the empty-body shape is NOT proof of denial — h5coro's S3
+    driver returns the same ``None`` for a missing object, throttling, a
+    timeout or a reset (bare ``except Exception``), and zagg's own spill fold
+    raises the identical ``TypeError``. So it is a HINT on the generic no-data
+    message and never sets the class or the ``auth_errors`` counter; only a
+    status code / denial token does.
+    """
+
+    def _patch_h5(self, monkeypatch, factory):
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", factory)
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    def _run(self, monkeypatch, exc):
+        def factory(*a, **k):
+            raise exc
+
+        self._patch_h5(monkeypatch, factory)
+        return process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+        )
+
+    def test_memoryview_none_signature_is_a_hint_not_the_class(self, monkeypatch):
+        # The exact GEDI first-fleet-run exception — which is ALSO what a 404,
+        # a SlowDown, a timeout and a reset all look like through h5coro's
+        # catch-all. It must not claim the auth class or the counter...
+        _df, meta = self._run(
+            monkeypatch,
+            TypeError("memoryview: a bytes-like object is required, not 'NoneType'"),
+        )
+        assert "auth_errors" not in meta
+        assert meta["error"].startswith("No data after filtering")
+        # ...but the diagnosis that motivated the arm survives as a hint, with
+        # the credentials/DAAC check named first among the likely causes.
+        assert "EMPTY body" in meta["error"]
+        assert "credentials_provider" in meta["error"]
+        assert "missing object" in meta["error"] and "throttling" in meta["error"]
+        assert meta["error"].index("credentials_provider") < meta["error"].index("missing object")
+
+    def test_empty_body_hint_reaches_the_log(self, monkeypatch, caplog):
+        import logging as _logging
+
+        with caplog.at_level(_logging.WARNING, logger="zagg.processing.worker"):
+            self._run(
+                monkeypatch,
+                TypeError("memoryview: a bytes-like object is required, not 'NoneType'"),
+            )
+        skipped = [r.getMessage() for r in caplog.records if "No data after filtering" in r.msg]
+        assert skipped and "EMPTY body" in skipped[0]
+        # WARNING, not the auth branch's ERROR: an unproven denial is not an
+        # error-level diagnosis.
+        assert all(r.levelno == _logging.WARNING for r in caplog.records if "EMPTY" in r.msg)
+
+    def test_no_empty_body_means_no_hint(self, monkeypatch):
+        _df, meta = self._run(monkeypatch, KeyError("/gt1l/h_li"))
+        assert "EMPTY body" not in meta["error"]
+
+    def test_botocore_shaped_403_is_auth_shaped(self, monkeypatch):
+        # Duck-typed on the ClientError ``response`` mapping (no botocore
+        # import in the worker), both by status code and by error code.
+        class _ClientError(Exception):
+            def __init__(self, response):
+                super().__init__("An error occurred")
+                self.response = response
+
+        by_status = _ClientError({"ResponseMetadata": {"HTTPStatusCode": 403}})
+        by_code = _ClientError({"Error": {"Code": "AccessDenied"}})
+        for exc in (by_status, by_code):
+            _df, meta = self._run(monkeypatch, exc)
+            assert meta["auth_errors"] == 2
+            assert meta["error"].startswith("Access denied reading source granules")
+
+    def test_ordinary_read_failure_keeps_the_no_data_message(self, monkeypatch):
+        # The classifier must not swallow the generic path: a schema fault is
+        # still reported as "No data after filtering (...)", with no counter.
+        _df, meta = self._run(monkeypatch, KeyError("/gt1l/h_li"))
+        assert "auth_errors" not in meta
+        assert meta["error"].startswith("No data after filtering (2 granule reads raised")
+
+    def test_auth_errors_counted_even_when_the_shard_produces_data(self, monkeypatch):
+        # One granule denied, one fine: the shard succeeds (no error), but the
+        # partial denial is still visible in the payload — a partially-denied
+        # read is a partially-wrong product.
+        calls = {"n": 0}
+
+        def factory(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("S3 GetObject: AccessDenied")
+            return _CloseRecordingH5(_canned_arrays(), [])
+
+        self._patch_h5(monkeypatch, factory)
+        df, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+        )
+        assert not df.empty
+        assert meta["error"] is None
+        assert meta["auth_errors"] == 1
+
+    def test_classifier_units(self):
+        from zagg.processing.worker import is_auth_failure, is_empty_body_failure
+
+        assert is_auth_failure(RuntimeError("S3 GetObject: AccessDenied"))
+        assert is_auth_failure(RuntimeError("The provided token has expired token"))
+        assert is_auth_failure(OSError("HTTP 403 Forbidden"))
+        assert not is_auth_failure(KeyError("/gt1l/h_li"))
+        # A bare 403 in a URL/granule name must NOT classify (deliberate).
+        assert not is_auth_failure(RuntimeError("bad granule GEDI01_B_403_x.h5"))
+        # The empty-body shape is a hint, never the class: a 404'd granule and
+        # a throttled read raise this byte-for-byte, so does spill's
+        # ``memoryview(arr).cast("B")`` on a None array.
+        none_body = TypeError("memoryview: a bytes-like object is required, not 'NoneType'")
+        assert not is_auth_failure(none_body)
+        assert is_empty_body_failure(none_body)
+        # A memoryview TypeError with a different cause is not the signature.
+        assert not is_empty_body_failure(TypeError("memoryview: invalid stride"))
+        assert not is_empty_body_failure(KeyError("/gt1l/h_li"))
 
 
 class TestGranuleReadPool:

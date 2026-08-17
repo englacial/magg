@@ -102,6 +102,22 @@ class TestCanonicalization:
         cfg.output["grid"]["emit_cell_ids"] = True
         assert semantic_hash(cfg) == base
 
+    def test_credentials_provider_is_not_in_the_packaging_list(self):
+        # PIN of TODAY's behavior, not an endorsement (issue #449): the
+        # provider selects HOW source bytes are fetched, never WHAT is
+        # computed, so it reads as packaging -- but it is not in
+        # DATA_SOURCE_PACKAGING_KEYS, so declaring it moves the hash. Adding
+        # `credentials_provider: lpdaac` to the GEDI template therefore moves
+        # that template's identity (no GEDI store exists yet, so nothing
+        # rehashes). Flagged for review; if it is ruled packaging, this test
+        # flips to the equality assertion.
+        from zagg.semantics import DATA_SOURCE_PACKAGING_KEYS
+
+        assert "credentials_provider" not in DATA_SOURCE_PACKAGING_KEYS
+        cfg = _cfg(data_source__credentials_provider="lpdaac")
+        assert semantic_core(cfg)["data_source"]["credentials_provider"] == "lpdaac"
+        assert semantic_hash(cfg) != semantic_hash(_cfg())
+
     def test_semantic_edits_always_change_hash(self):
         base = semantic_hash(_cfg())
         cfg = _cfg()

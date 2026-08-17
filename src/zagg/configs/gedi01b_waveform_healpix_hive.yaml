@@ -21,6 +21,11 @@ data_source:
   granule_workers: 4
   reader: h5coro
   driver: s3
+  # DAAC S3 credentials are per-DAAC: GEDI is LP DAAC's lp-prod-protected,
+  # which the NSIDC default cannot read -- the 403 comes back as an empty
+  # body, so every granule read raises memoryview(None) and the shard reports
+  # "No data after filtering" (issue #449, first-fleet-run failure).
+  credentials_provider: lpdaac
   # No index block: the hierarchical route is the pinned baseline for the
   # first GEDI builds; the vlen route also runs behind index: inline.
   groups: [BEAM0000, BEAM0001, BEAM0010, BEAM0011, BEAM0101, BEAM0110, BEAM1000, BEAM1011]
@@ -63,27 +68,37 @@ data_source:
         elevation_bin0: "/{group}/geolocation/elevation_bin0"
         elevation_lastbin: "/{group}/geolocation/elevation_lastbin"
   assets:
-    # The paired L2A sibling (one shardmap, {l1b, l2a} per entry): per-shot
-    # quality datasets joined by shot_number -- L1B carries none of them, and
-    # clipped waveforms are radiometrically invalid, so the join is core to
-    # the flux currency (issue #422 ruling).
+    # The paired L2A sibling (one shardmap, {l1b, l2a} per entry), joined by
+    # shot_number. After the retrieval-fitness filters were dropped (espg
+    # ruling 2026-08-17, refs #425) the one consumed L2A dataset is the
+    # saturation counter ``rx_assess/rx_clipbin_count`` -- L1B carries no such
+    # per-shot assessment, and clipped waveforms are radiometrically invalid,
+    # so the join stays core to the flux currency (issue #422 ruling).
     l2a:
       join:
         left: "/{group}/shot_number"
         right: "/{group}/shot_number"
   filters:
+    # Two VALIDITY gates only -- geolocation validity and saturation. The L2A
+    # retrieval-fitness gates (quality_flag == 1, sensitivity >= 0.9) are
+    # deliberately NOT here (espg ruling 2026-08-17, refs #425 / issue #422):
+    #   - They gate GROUND-RETRIEVAL fitness, not waveform validity, and
+    #     quality_flag already contains a sensitivity test internally, so the
+    #     AND is brutally tight -- measured on a real SERC granule, 1.61% of
+    #     shots pass quality_flag and 0 of 434 in-shard shots survive the
+    #     joint stack.
+    #   - zagg's own ratified clip policy IS the signal criterion (issue #422:
+    #     the declared false-positive operating point against each shot's
+    #     noise model), so a second, differently-derived signal gate would
+    #     double-count.
+    #   - Sensitivity gating biases the flux store against low-SNR /
+    #     dense-canopy shots, asymmetrically vs the ATL03 products.
+    # Sensitivity stays per-shot recoverable downstream through the L2A join
+    # on shot_number.
     - level: shots
       dataset: "/{group}/geolocation/degrade"
       op: eq
       value: 0
-    - asset: l2a
-      dataset: "/{group}/quality_flag"
-      op: eq
-      value: 1
-    - asset: l2a
-      dataset: "/{group}/sensitivity"
-      op: ge
-      value: 0.9
     - asset: l2a
       dataset: "/{group}/rx_assess/rx_clipbin_count"   # saturation counter: 0 = unclipped
       op: le
@@ -157,27 +172,27 @@ aggregation:
       function: "zagg.stats.waveform.single_shot_value"
       source: noise_mean
       dtype: float32
-      fill_value: .nan
+      fill_value: "NaN"
     noise_stddev:
       function: "zagg.stats.waveform.single_shot_value"
       source: noise_stddev
       dtype: float32
-      fill_value: .nan
+      fill_value: "NaN"
     rx_energy:
       function: "zagg.stats.waveform.single_shot_value"
       source: rx_energy
       dtype: float32
-      fill_value: .nan
+      fill_value: "NaN"
     elevation_bin0:
       function: "zagg.stats.waveform.single_shot_value"
       source: elevation_bin0
       dtype: float64
-      fill_value: .nan
+      fill_value: "NaN"
     elevation_lastbin:
       function: "zagg.stats.waveform.single_shot_value"
       source: elevation_lastbin
       dtype: float64
-      fill_value: .nan
+      fill_value: "NaN"
 
 output:
   grid:

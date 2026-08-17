@@ -772,7 +772,7 @@ class TestInlineWriteBackPrebuild:
         built = self._built_paths(monkeypatch, cfg.data_source)
         # The L2A predicates read the paired granule; this backend never opens
         # it, so mapping them here would KeyError on the primary.
-        assert not [p for p in built if "quality_flag" in p or "rx_assess" in p]
+        assert not [p for p in built if "rx_assess" in p]
 
     def test_vlen_prebuild_runs_without_a_read_plan(self, monkeypatch):
         # No read_plan: the record level still has to contribute its link, or
@@ -788,8 +788,8 @@ class TestInlineWriteBackPrebuild:
 class TestGediTemplate:
     """The shipped gedi01b_waveform_healpix_hive template: validated shape,
     and the whole declared surface driven over the synthetic mini-granule —
-    read (gather/expand/synthesis + degrade + the L2A trio) into cell stats
-    (flux digest + companions)."""
+    read (gather/expand/synthesis + degrade + the L2A saturation counter) into
+    cell stats (flux digest + companions)."""
 
     @pytest.fixture
     def cfg(self):
@@ -810,6 +810,20 @@ class TestGediTemplate:
         assert flux["attrs"]["gain_name"]
         assert len(cfg.data_source["groups"]) == 8
 
+    def test_filters_are_validity_gates_only(self, cfg):
+        # espg ruling 2026-08-17 (refs #425 / issue #422): the template filters
+        # on geolocation validity and saturation ONLY. quality_flag and
+        # sensitivity are L2A GROUND-RETRIEVAL fitness gates — quality_flag
+        # contains a sensitivity test internally, so the AND is brutally tight
+        # (1.61% quality-pass, 0 of 434 in-shard shots surviving the joint
+        # stack on a real SERC granule), and zagg's ratified clip policy is
+        # already the signal criterion. Pinned so they cannot drift back in.
+        datasets = [f["dataset"] for f in cfg.data_source["filters"]]
+        assert datasets == [
+            "/{group}/geolocation/degrade",
+            "/{group}/rx_assess/rx_clipbin_count",
+        ]
+
     def test_template_reads_and_aggregates_the_fixture(self, cfg):
         from zagg.processing import calculate_cell_statistics
 
@@ -821,13 +835,29 @@ class TestGediTemplate:
             _OneShardGrid(),
             siblings={"l2a": _FakeH5(_l2a_arrays())},
         )
-        # Survivors: shot 101 only — 103 fails degrade, 102 fails quality_flag,
-        # 104 fails sensitivity (0.50 < 0.9), 103 also has no L2A row.
-        assert df["shot_number"].tolist() == [101] * 5
-        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), WAVE[:5])
-        np.testing.assert_allclose(df["elevation"].to_numpy(), _expected_elevation(0))
+        # Survivors under the two VALIDITY filters the template now declares
+        # (espg ruling 2026-08-17, refs #425 / issue #422 — the L2A
+        # retrieval-fitness gates quality_flag/sensitivity are dropped): only
+        # 103 goes, failing degrade (and it has no L2A row either). 102 (once
+        # excluded by quality_flag) and 104 (once excluded by sensitivity 0.50)
+        # are kept — their waveforms are valid, and the flux clip policy, not a
+        # ground-retrieval gate, is the signal criterion.
+        assert df["shot_number"].tolist() == [101] * 5 + [102] * 3 + [104] * 4
+        np.testing.assert_array_equal(
+            df["rxwaveform"].to_numpy(), np.concatenate([WAVE[:5], WAVE[5:8], WAVE[9:13]])
+        )
+        np.testing.assert_allclose(
+            df["elevation"].to_numpy(),
+            np.concatenate(
+                [_expected_elevation(0), _expected_elevation(1), _expected_elevation(3)]
+            ),
+        )
 
-        cell = {c: df[c].to_numpy() for c in df.columns if c != "leaf_id"}
+        # The per-shot companions are defined for a SINGLE-shot cell, so the
+        # stats below aggregate shot 101's rows (the pooled sentinels have
+        # their own coverage in the stats tests).
+        one = df[df["shot_number"] == 101]
+        cell = {c: one[c].to_numpy() for c in one.columns if c != "leaf_id"}
         stats = calculate_cell_statistics(cell, config=cfg)
         assert stats["count"] == 5
         assert stats["shot_count"] == 1
