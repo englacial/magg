@@ -331,7 +331,24 @@ class TestObservationWords:
         )
 
     def test_post_ceiling_time_refused(self):
-        # ~2142 is the grammar's ceiling (1850 + 2^63 ns); past it the cast
+        # ~2142 is the grammar's ceiling (1850 + 2^63 - 2^32 ns); past it the cast
         # would wrap into a plausible-looking word.
         with pytest.raises(ValueError, match="exceeds the toc grammar's range"):
             self._words([1e18])
+
+    def test_the_ceiling_is_the_grammars_own_span_not_the_naive_63rd_bit(self):
+        # mortie refuses at TOC_MAX_NS = 2^63 - 2^32 (its quantum-aligned span
+        # ceiling), so a 2^63 - 1 bound here lets the last 4.29 s through and the
+        # caller gets mortie's message instead of this one (issue #410 review).
+        from mortie.toc import TOC_MAX_NS
+
+        from zagg.time_axis import _internal_ns
+
+        base = int(_internal_ns(np.array([np.datetime64(self.EPOCH, "us")]))[0])
+        # An offset landing inside [TOC_MAX_NS, 2^63) — refused by the grammar,
+        # accepted by the naive bound.
+        with pytest.raises(ValueError, match="exceeds the toc grammar's range"):
+            self._words([(TOC_MAX_NS + 2**31 - base) / 1e9])
+        # ...and the band just below it still encodes, so the bound is not simply
+        # tightened past the domain.
+        assert self._words([(TOC_MAX_NS - 2**31 - base) / 1e9]).dtype == np.uint64
