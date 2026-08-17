@@ -543,6 +543,26 @@ class TestSiblingAssetJoin:
             is None
         )
 
+    def test_duplicate_sibling_keys_raise(self):
+        # Two L2A rows for shot 101: which one is "the" row is undefined, so the
+        # join refuses the product rather than pick by sort order.
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/shot_number"] = np.array([101, 101, 102, 104], dtype=np.uint64)
+        arrays["/BEAM0000/quality_flag"] = np.array([1, 0, 0, 1], dtype=np.uint8)
+        arrays["/BEAM0000/sensitivity"] = np.array([0.95, 0.10, 0.99, 0.50], dtype=np.float32)
+        ds = _l2a_ds(
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1}]
+        )
+        with pytest.raises(ValueError, match="duplicate key 101"):
+            _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                ds,
+                0,
+                _OneShardGrid(),
+                siblings={"l2a": _FakeH5(arrays)},
+            )
+
     def test_empty_sibling_variable_is_all_nan(self):
         # Same degenerate sibling on the VARIABLE arm: unmatched records NaN
         # (they are not dropped — only asset filters fail closed).

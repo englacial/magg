@@ -770,7 +770,9 @@ def _sibling_joined_values(
     variables NaN it. An EMPTY sibling (zero rows) is that contract's degenerate
     case, not an error — every record is unmatched, and each path's placeholder
     is a zeros array of length ``n_records`` shaped like the sibling dataset
-    beyond axis 0 (issue #464 review).
+    beyond axis 0 (issue #464 review). A DUPLICATED right key raises: it would
+    make "the sibling's value" one of N candidates chosen by sort order, which
+    is the silent-junk shape this reader exists to refuse.
     """
     join = cfg["join"]
     left_path = join["left"].format(group=group)
@@ -799,6 +801,18 @@ def _sibling_joined_values(
     # Key-value join: position of each left key in the sibling's rows.
     order = np.argsort(right_keys, kind="stable")
     sorted_keys = right_keys[order]
+    # The join is only a join if the right key identifies a row: a duplicated
+    # key would resolve to whichever row sorts first, so a filter verdict — and
+    # since issue #464 a STORED value — would be one of N candidates with
+    # nothing recording the ambiguity. A duplicate-key sibling is a malformed
+    # product; refuse it here (one vectorized pass at record rate).
+    dup = sorted_keys[1:] == sorted_keys[:-1]
+    if dup.any():
+        i = int(np.argmax(dup))
+        raise ValueError(
+            f"assets.{asset}.join.right {right_path!r} has duplicate key "
+            f"{sorted_keys[i]}; the record join requires unique sibling keys"
+        )
     pos = np.searchsorted(sorted_keys, left_keys, side="left")
     pos_clip = np.minimum(pos, len(sorted_keys) - 1)
     matched = sorted_keys[pos_clip] == left_keys
