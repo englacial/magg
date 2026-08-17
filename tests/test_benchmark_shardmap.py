@@ -211,9 +211,18 @@ def test_pinned_shardmap_no_drift(sm_key):
 OFFLINE_PINS = [k for k, v in MANIFEST["shardmaps"].items() if v.get("catalog_parquet")]
 
 
+# ``tools/`` is not an installed package, so it goes on the path ONCE here --
+# matching the ``bench_metrics`` pattern above -- rather than on every
+# ``_driver()`` call, which stacked one identical entry per test.
+sys.path.insert(0, str(REPO / "tools"))
+
+
 def _driver():
-    """The re-pin driver, imported from ``tools/`` (not an installed module)."""
-    sys.path.insert(0, str(REPO / "tools"))
+    """The re-pin driver, imported from ``tools/`` (not an installed module).
+
+    The import itself stays lazy: the driver imports THIS module for the
+    rebuild recipe, so importing it at module scope would be circular.
+    """
     import repin_benchmark_shardmaps
 
     return repin_benchmark_shardmaps
