@@ -338,11 +338,23 @@ def observation_words(values, *, epoch, scale: str, units: str) -> np.ndarray:
             "toc ingest met a non-finite observation time; a NaN or inf instant has no "
             "word, and silently dropping it would misalign the companion from its payload"
         )
+    # Nearest ns in two exact steps rather than one lossy multiply: at ICESat-2
+    # magnitudes (``delta_time`` ~2.5e8 s) ``offsets * 1e9`` lands near 2.5e17
+    # where a float64 ulp is 32 ns, so a single ``rint`` quantizes before it
+    # rounds and can miss the nearest ns by 16 ns — against §8.3's "exact to the
+    # nanosecond" MUST. ``whole`` is integral and the residue lies in [0, 1), so
+    # each part is exact/nearest and the int64 combine below carries the nearest
+    # ns of the float64 offset the reader delivered, which is the strongest claim
+    # a writer can make (the column's own ~30 ns ulp is inherent to the source).
+    whole = np.floor(offsets)
+    frac_ns = np.rint((offsets - whole) * 1_000_000_000.0)
     # Bound-check in float, BEFORE the int64 cast: an out-of-domain offset
     # overflows the cast (numpy warns and yields garbage) where the grammar's
     # own limits are what the caller needs named. The window is the timestamp
-    # variant's own domain — ns since the epoch, below the 63rd bit.
-    ns = np.rint(offsets * 1_000_000_000.0)
+    # variant's own domain — ns since the epoch, below the 63rd bit. The float
+    # sum is only good to a ulp, which is ample for a decision over a 2^63 ns
+    # span; the exact figure is the int64 combine.
+    ns = whole * 1_000_000_000.0 + frac_ns
     ceiling = float(2**63 - 1 - base)
     if ns.size and float(ns.min()) < -float(base):
         raise ValueError(
@@ -355,7 +367,7 @@ def observation_words(values, *, epoch, scale: str, units: str) -> np.ndarray:
             f"observation time exceeds the toc grammar's range ({TOC_EPOCH} + 2^63 ns, "
             f"~2142) by {float(ns.max()) - ceiling:.0f} ns (spec §8)"
         )
-    internal = base + ns.astype(np.int64)
+    internal = base + whole.astype(np.int64) * 1_000_000_000 + frac_ns.astype(np.int64)
     return np.asarray(mortie.time2toc(internal.astype(np.uint64)), dtype=np.uint64)
 
 
