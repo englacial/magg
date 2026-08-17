@@ -959,56 +959,64 @@ def _aggregate_chunk_cells(
         else None
     )
 
+    # Batch the per-centroid companion folds across the loop (issue #476): each
+    # ``build_tdigest`` inside defers its ``tocs_reduce``/``common_ancestor``
+    # partition and the context exit runs ONE fold per channel over the whole
+    # chunk, filling the collected vectors in place — byte-identically, before
+    # anything reads them (the ragged writer runs after this returns).
+    from zagg.stats.tdigest import batched_companion_folds
+
     cells_with_data = 0
-    for i, child_morton in enumerate(children):
-        child_key = int(child_morton)
-        if child_key in cell_to_slice:
-            start, end = cell_to_slice[child_key]
-            cell_data: dict[str, np.ndarray] = {
-                col: arr[start:end] for col, arr in col_arrays.items()
-            }
-            if cell_toc is not None:
-                cell_data[TOC_WORD_COLUMN] = cell_toc[child_key]
-            cells_with_data += 1
-        else:
-            cell_data = _empty
-        # Inject the chunk-level scalars into this cell's namespace (no-op when
-        # empty, so non-precompute configs are unchanged).
-        cell_namespace: dict[str, Any] = (
-            {**cell_data, **chunk_scalars} if chunk_scalars else cell_data
-        )
-        stats = calculate_cell_statistics(
-            cell_namespace, value_col="h_li", sigma_col="s_li", config=config
-        )
-        for key, value in stats.items():
-            if key in ragged_payloads:
-                # Ragged field: collect non-empty payloads with their chunk-local
-                # cell index. Empty cells (``_empty_cell_value`` -> []) are skipped.
-                # A companion-carrying field delivers ``(payload, *channel words)``
-                # in the kernel's fixed order; the words are collected
-                # index-aligned with the payloads.
-                if isinstance(value, tuple):
-                    payload, *words = value
-                else:
-                    payload, words = np.asarray(value), []
-                if payload.size == 0:
-                    continue
-                # Fail fast if the value's arity disagrees with the declared
-                # signature (empty cells are exempt, having been skipped above) —
-                # a silent mismatch would surface much later as a length error in
-                # the ragged writer, or as a companion silently dropped.
-                channels = ragged_channels.get(key, {})
-                if len(channels) != len(words):
-                    raise ValueError(
-                        f"ragged field {key!r}: the reducer returned {len(words)} companion "
-                        f"channel(s) but the declared signature has {len(channels)} "
-                        f"({sorted(channels) or 'none'})"
-                    )
-                ragged_payloads[key].append(payload)
-                ragged_cell_indices[key].append(i)
-                for channel, word_vector in zip(channels.values(), words, strict=True):
-                    channel.append(word_vector)
+    with batched_companion_folds():
+        for i, child_morton in enumerate(children):
+            child_key = int(child_morton)
+            if child_key in cell_to_slice:
+                start, end = cell_to_slice[child_key]
+                cell_data: dict[str, np.ndarray] = {
+                    col: arr[start:end] for col, arr in col_arrays.items()
+                }
+                if cell_toc is not None:
+                    cell_data[TOC_WORD_COLUMN] = cell_toc[child_key]
+                cells_with_data += 1
             else:
-                stats_arrays[key][i] = value
+                cell_data = _empty
+            # Inject the chunk-level scalars into this cell's namespace (no-op when
+            # empty, so non-precompute configs are unchanged).
+            cell_namespace: dict[str, Any] = (
+                {**cell_data, **chunk_scalars} if chunk_scalars else cell_data
+            )
+            stats = calculate_cell_statistics(
+                cell_namespace, value_col="h_li", sigma_col="s_li", config=config
+            )
+            for key, value in stats.items():
+                if key in ragged_payloads:
+                    # Ragged field: collect non-empty payloads with their chunk-local
+                    # cell index. Empty cells (``_empty_cell_value`` -> []) are skipped.
+                    # A companion-carrying field delivers ``(payload, *channel words)``
+                    # in the kernel's fixed order; the words are collected
+                    # index-aligned with the payloads.
+                    if isinstance(value, tuple):
+                        payload, *words = value
+                    else:
+                        payload, words = np.asarray(value), []
+                    if payload.size == 0:
+                        continue
+                    # Fail fast if the value's arity disagrees with the declared
+                    # signature (empty cells are exempt, having been skipped above) —
+                    # a silent mismatch would surface much later as a length error in
+                    # the ragged writer, or as a companion silently dropped.
+                    channels = ragged_channels.get(key, {})
+                    if len(channels) != len(words):
+                        raise ValueError(
+                            f"ragged field {key!r}: the reducer returned {len(words)} "
+                            f"companion channel(s) but the declared signature has "
+                            f"{len(channels)} ({sorted(channels) or 'none'})"
+                        )
+                    ragged_payloads[key].append(payload)
+                    ragged_cell_indices[key].append(i)
+                    for channel, word_vector in zip(channels.values(), words, strict=True):
+                        channel.append(word_vector)
+                else:
+                    stats_arrays[key][i] = value
 
     return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_channels, cells_with_data

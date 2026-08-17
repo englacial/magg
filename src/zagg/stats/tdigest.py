@@ -84,6 +84,8 @@ that order.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import overload
 
 import numpy as np
@@ -178,6 +180,88 @@ def _compress(
     return out_means, out_weights, starts
 
 
+class _CompanionBatch:
+    """Cross-cell batcher for the per-centroid companion folds (issue #476).
+
+    Inside :func:`batched_companion_folds`, each :func:`_centroid_ancestors` /
+    :func:`_centroid_envelopes` call *defers*: it hands back an unfilled
+    ``uint64`` placeholder of the right length and records its ``(member
+    words, offset-adjusted starts)``. The flush then runs the real fold ONCE
+    per channel over the concatenated layout and fills every placeholder in
+    place.  Both folds are segment-independent — each output word reduces over
+    its own member slice — and ``_compress`` always emits starts partitioning
+    ``[0, n)`` from 0, so the concatenation is itself a valid ``(words,
+    starts, n)`` fold input and the batched result is byte-for-byte the
+    per-call results, sliced back apart.
+
+    Correctness requires deferred outputs to be **write-only until the
+    flush**, which holds for the one activation site
+    (``_aggregate_chunk_cells``' per-cell loop): the channel vectors are only
+    collected for the ragged writer, which runs after that function returns.
+    """
+
+    def __init__(self) -> None:
+        #: fold -> [(member words, offset-adjusted starts, placeholder)]
+        self._pending: dict[_ChannelFold, list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+        #: fold -> running member-row count (the next deferral's offset)
+        self._rows: dict[_ChannelFold, int] = {}
+
+    def defer(self, fold: _ChannelFold, words: np.ndarray, starts, n: int) -> np.ndarray:
+        starts = np.asarray(starts, dtype=np.int64)
+        out = np.empty(len(starts), dtype=np.uint64)
+        rows = self._rows.get(fold, 0)
+        self._pending.setdefault(fold, []).append((words[:n], starts + rows, out))
+        self._rows[fold] = rows + n
+        return out
+
+    def flush(self) -> None:
+        """Run each channel's fold once over its concatenated deferrals."""
+        for fold, entries in self._pending.items():
+            if len(entries) == 1:
+                words, starts, out = entries[0]
+                out[:] = fold(words, starts, len(words))
+                continue
+            words_all = np.concatenate([w for w, _, _ in entries])
+            starts_all = np.concatenate([s for _, s, _ in entries])
+            reduced = fold(words_all, starts_all, self._rows[fold])
+            pos = 0
+            for _, _, out in entries:
+                out[:] = reduced[pos : pos + len(out)]
+                pos += len(out)
+        self._pending.clear()
+        self._rows.clear()
+
+
+#: The active cross-cell fold batch; ``None`` outside ``batched_companion_folds``.
+_FOLD_BATCH: ContextVar[_CompanionBatch | None] = ContextVar("_FOLD_BATCH", default=None)
+
+
+@contextmanager
+def batched_companion_folds():
+    """Defer the per-centroid companion folds; run each once per channel at exit.
+
+    The issue #476 hoist: at CA shard shape the per-cell loop makes ~46k
+    segmented ``mortie.tocs_reduce`` calls (one per populated cell-field) whose
+    cost is Python/FFI dispatch, not reduction — under this context they
+    collapse to one call per channel per chunk, byte-identically (see
+    :class:`_CompanionBatch`).  Activated by ``_aggregate_chunk_cells`` around
+    its per-cell loop; nested activation is a passthrough into the outer batch's
+    scope.  The flush runs only on a clean exit — after an exception the
+    placeholders are never read, so they are dropped, and the batch is always
+    deactivated before flushing so the folds it runs execute for real.
+    """
+    if _FOLD_BATCH.get() is not None:
+        yield
+        return
+    batch = _CompanionBatch()
+    token = _FOLD_BATCH.set(batch)
+    try:
+        yield
+    finally:
+        _FOLD_BATCH.reset(token)
+    batch.flush()
+
+
 def _centroid_ancestors(locations: np.ndarray, starts: np.ndarray, n: int) -> np.ndarray:
     """Reduce per-member morton locations to one enclosing cell per centroid.
 
@@ -198,7 +282,14 @@ def _centroid_ancestors(locations: np.ndarray, starts: np.ndarray, n: int) -> np
     prefix raises), so the copy-through keeps that guarantee by validating the
     whole singleton set in one kernel pass; otherwise a bad word would raise
     only in the compressed regime.
+
+    Under :func:`batched_companion_folds` the call defers instead (issue
+    #476): the singleton validation and the multi-member loop then run once
+    over the whole batch's concatenated partition, byte-identically.
     """
+    batch = _FOLD_BATCH.get()
+    if batch is not None:
+        return batch.defer(_centroid_ancestors, locations, starts, n)
     from mortie import common_ancestor, validate_morton
 
     starts = np.asarray(starts, dtype=np.int64)
@@ -244,7 +335,14 @@ def _centroid_envelopes(temporal: np.ndarray, starts: np.ndarray, n: int) -> np.
     The reserved-``0`` refusal lives in :func:`_check_words`, which every caller
     passes its words through — including the merge arms that pass a channel
     straight back without reducing it.
+
+    Under :func:`batched_companion_folds` the call defers instead (issue
+    #476): one ``tocs_reduce`` then crosses into Rust per batch rather than
+    per cell-field, byte-identically (the reduce is segmented).
     """
+    batch = _FOLD_BATCH.get()
+    if batch is not None:
+        return batch.defer(_centroid_envelopes, temporal, starts, n)
     from mortie import tocs_reduce
 
     starts = np.asarray(starts, dtype=np.int64)
