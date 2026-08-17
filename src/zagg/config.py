@@ -574,22 +574,29 @@ def validate_config(config: PipelineConfig) -> None:
     ds_vars = set(config.data_source.get("variables", {}).keys()) | _segment_variable_names(
         config.data_source
     )
-    # The derived toc word column (spec §8.2/§8.3, issue #410): materialized
-    # per observation from ``output.time_source``, so it is a real base-rate
-    # column everywhere one is valid — a ``per-cell`` companion names it as its
-    # ``source``. Only present when the clock is declared, so no config written
-    # before #410 gains a name.
+    agg_vars = config.aggregation.get("variables", {})
+    # The derived toc word column (spec §8.2/§8.3, issue #410): materialized per
+    # observation from ``output.time_source``, so it is a real base-rate column —
+    # but READABLE only under exactly the condition
+    # ``aggregate.calculate_cell_statistics`` materializes it on, which is a field
+    # declaring a ``temporal:`` companion. Widening on the clock alone is true of
+    # every windowed gps/tai store via the ``toc_source`` fallback, so a config
+    # naming ``toc_word`` there validated clean and then died in the worker with
+    # ``KeyError``/``NameError`` (issue #410 review). The NAME is reserved
+    # unconditionally, like ``leaf_id`` — that side belongs to the reservation,
+    # not to whether the column happens to exist.
     from zagg.time_axis import TOC_WORD_COLUMN, toc_source
 
-    if toc_source(config) is not None:
-        if TOC_WORD_COLUMN in ds_vars:
-            raise ValueError(
-                f"data_source.variables declares {TOC_WORD_COLUMN!r}, which is the "
-                f"reserved name of the derived toc word column output.time_source "
-                f"materializes (spec §8.2/§8.3) — rename the column"
-            )
+    if TOC_WORD_COLUMN in ds_vars:
+        raise ValueError(
+            f"data_source.variables declares {TOC_WORD_COLUMN!r}, which is the "
+            f"reserved name of the derived toc word column output.time_source "
+            f"materializes (spec §8.2/§8.3) — rename the column"
+        )
+    if toc_source(config) is not None and any(
+        isinstance(m, dict) and m.get("temporal") for m in agg_vars.values()
+    ):
         ds_vars = ds_vars | {TOC_WORD_COLUMN}
-    agg_vars = config.aggregation.get("variables", {})
 
     # Validate the per-chunk precompute hook (issue #30, item 1). Each entry is
     # evaluated ONCE per chunk over the shard's pooled column data, before the

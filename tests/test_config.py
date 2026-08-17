@@ -2609,11 +2609,48 @@ class TestTimeSource:
             validate_config(cfg)
         validate_config(_clocked(cfg))
 
+    def test_derived_column_is_only_readable_where_it_is_materialized(self):
+        # Validation and materialization must gate on the SAME condition — a
+        # declared ``temporal:`` companion. Widening on the clock alone is true of
+        # every windowed gps/tai store via the fallback, so these two configs
+        # validated clean and then raised KeyError/NameError in the worker
+        # (issue #410 review).
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.aggregation["variables"]["t_max"] = {
+            "function": "numpy.max",
+            "source": "toc_word",
+            "dtype": "uint64",
+            "fill_value": 0,
+        }
+        with pytest.raises(ValueError, match="source 'toc_word' not in data_source.variables"):
+            validate_config(cfg)
+        # Declaring a companion materializes the column, and both readers resolve.
+        cfg.aggregation["variables"]["observed"] = {
+            "function": "zagg.stats.toc.cell_envelope",
+            "source": "toc_word",
+            "dtype": "uint64",
+            "fill_value": 0,
+            "temporal": "per-cell",
+        }
+        validate_config(cfg)
+
+    def test_chunk_precompute_cannot_read_the_unmaterialized_derived_column(self):
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.aggregation["chunk_precompute"] = {"tmax": {"expression": "toc_word.max()"}}
+        with pytest.raises(ValueError, match="expression references 'toc_word'"):
+            validate_config(cfg)
+
     def test_declared_column_may_not_shadow_the_derived_name(self):
         cfg = _clocked(_ragged_cfg(inner_shape=[2]))
         cfg.data_source["variables"]["toc_word"] = "{group}/toc_word"
         with pytest.raises(ValueError, match="reserved name of the derived toc word column"):
             validate_config(cfg)
+        # The NAME is reserved unconditionally — the reservation does not depend
+        # on whether a clock (or a companion) happens to be declared.
+        bare = _ragged_cfg(inner_shape=[2])
+        bare.data_source["variables"]["toc_word"] = "{group}/toc_word"
+        with pytest.raises(ValueError, match="reserved name of the derived toc word column"):
+            validate_config(bare)
 
     def test_both_clock_declarations_must_agree(self):
         # The fallback single-sources the clock only when time_source is ABSENT.
