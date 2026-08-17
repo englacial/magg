@@ -695,9 +695,13 @@ def build_tdigest_pairwise(
     order-independent :func:`merge_tdigests_kway`. This reducer preserves the
     pre-#279 end-to-end fold semantics for anyone who wants them.
 
-    The temporal channel is the exception the difference does not reach: its
-    join is associative and commutative (spec §8.3), so a pairwise left-fold
-    and a k-way fold produce bit-identical toc words.
+    The temporal channel does not escape that difference either: the two laws
+    reach different centroid partitions (different counts, even), so their
+    per-centroid toc vectors differ. What the join being a semilattice (spec
+    §8.3) buys is the *cell-level* statement —
+    :func:`zagg.stats.toc.cell_envelope` over either fold's words returns the
+    same token — since the words are exact given the partition they describe,
+    not independently of it.
     """
     return build_tdigest(values, delta=delta, locations=locations, temporal=temporal)
 
