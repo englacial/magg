@@ -23,6 +23,7 @@ from zagg.processing.read import (
     link_base_extent,
 )
 from zagg.processing.read_vlen import (
+    _sibling_joined_values,
     expand_link_indices,
     synthesize_linspace,
 )
@@ -120,11 +121,15 @@ def _l1b_arrays(group="BEAM0000"):
 
 def _l2a_arrays(group="BEAM0000"):
     # Shot 103 has NO sibling row: the join must drop it, never borrow a row.
+    # The DEM sits within 200 m of every matched shot's window midpoint
+    # (98 / 49 / 78.5), so the template's geolocation-validity gate (issue
+    # #464) keeps all matched shots unless a test poisons it deliberately.
     return {
         f"/{group}/shot_number": np.array([101, 102, 104], dtype=np.uint64),
         f"/{group}/quality_flag": np.array([1, 0, 1], dtype=np.uint8),
         f"/{group}/sensitivity": np.array([0.95, 0.99, 0.50], dtype=np.float32),
         f"/{group}/rx_assess/rx_clipbin_count": np.array([0, 0, 0], dtype=np.uint16),
+        f"/{group}/digital_elevation_model": np.array([60.0, 30.0, 40.0], dtype=np.float32),
     }
 
 
@@ -447,6 +452,35 @@ def _l2a_ds(**extra):
     )
 
 
+def _l2a_arrays_empty(group="BEAM0000"):
+    """A zero-row sibling: no record can match (issue #464 review)."""
+    return {
+        f"/{group}/shot_number": np.array([], dtype=np.uint64),
+        f"/{group}/quality_flag": np.array([], dtype=np.uint8),
+        f"/{group}/sensitivity": np.array([], dtype=np.float32),
+    }
+
+
+def _l2a_var_ds(**extra):
+    """``_l2a_ds`` plus an asset-sourced record-level variable (issue #464)."""
+    ds = _l2a_ds(**extra)
+    ds["levels"]["shots"]["variables"]["sensitivity"] = {
+        "asset": "l2a",
+        "path": "/{group}/sensitivity",
+    }
+    return ds
+
+
+def _dem_var_ds(**extra):
+    """``_l2a_ds`` plus the DEM as an asset variable (the issue #464 gate shape)."""
+    ds = _l2a_ds(**extra)
+    ds["levels"]["shots"]["variables"]["dem"] = {
+        "asset": "l2a",
+        "path": "/{group}/digital_elevation_model",
+    }
+    return ds
+
+
 class TestSiblingAssetJoin:
     def test_join_filters_by_shot_number(self):
         # quality_flag == 1 keeps shots 101 + 104; shot 102 fails the flag and
@@ -483,6 +517,90 @@ class TestSiblingAssetJoin:
         # 104 fails sensitivity (0.50), 102 fails quality, 103 unmatched.
         assert sorted(set(df["shot_number"].tolist())) == [101]
 
+    def test_two_predicates_on_one_dataset_anded(self):
+        # Both predicates name the SAME sibling dataset: the join reads and
+        # gathers it once per unique path (issue #464 phase 1) and the verdicts
+        # still AND, so the result matches the single-predicate form.
+        ds = _l2a_ds(
+            filters=[
+                {"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "ge", "value": 1},
+                {"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "le", "value": 1},
+            ]
+        )
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            ds,
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        assert sorted(set(df["shot_number"].tolist())) == [101, 104]
+        assert len(df) == 9
+
+    def test_variable_only_asset_without_sibling_nans_and_warns(self, caplog):
+        # No filter rides this asset, so the missing handle is recoverable: the
+        # column degrades to NaN with one warning per granule (a FILTER on the
+        # same asset raises instead — test_missing_sibling_handle_raises).
+        with caplog.at_level("WARNING", logger="zagg.processing.read_vlen"):
+            df = _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", _l2a_var_ds(), 0, _OneShardGrid())
+        assert np.isnan(df["sensitivity"].to_numpy()).all()
+        assert sum("no open sibling handle" in r.getMessage() for r in caplog.records) == 1
+
+    def test_one_join_per_asset_serves_both_arms(self, monkeypatch):
+        # The shipped GEDI shape: one asset feeding BOTH a filter and a variable.
+        # The route joins once over the union of their datasets (issue #464
+        # review) — a join per consumer would pay a second primary key read, a
+        # second sibling read and a second argsort per group per granule.
+        from zagg.processing import read_vlen
+
+        calls = []
+        real_join = read_vlen._sibling_joined_values
+
+        def _spy(sibling, group, asset, cfg, n_records, dataset_paths, read_full):
+            calls.append((asset, list(dataset_paths)))
+            return real_join(sibling, group, asset, cfg, n_records, dataset_paths, read_full)
+
+        monkeypatch.setattr(read_vlen, "_sibling_joined_values", _spy)
+        sib = _FakeH5(_l2a_arrays())
+        sib_reads = []
+        real_read = sib.readDatasets
+        monkeypatch.setattr(
+            sib,
+            "readDatasets",
+            lambda datasets: (sib_reads.append(list(datasets)), real_read(datasets))[1],
+        )
+        ds = _l2a_var_ds(
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "ge", "value": 0}]
+        )
+        df = _read_group(
+            _FakeH5(_l1b_arrays()), "BEAM0000", ds, 0, _OneShardGrid(), siblings={"l2a": sib}
+        )
+        assert len(calls) == 1
+        assert set(calls[0][1]) == {"/BEAM0000/quality_flag", "/BEAM0000/sensitivity"}
+        assert len(sib_reads) == 1
+        # Both arms still get their answer off that single join.
+        assert 103 not in df["shot_number"].tolist()
+        assert np.allclose(df["sensitivity"].to_numpy()[df["shot_number"].to_numpy() == 101], 0.95)
+
+    def test_asset_variable_nans_the_unmatched_record(self):
+        # The variable arm's missing-row policy (issue #464 phase 2): shot 103
+        # has no L2A row, so its samples carry NaN rather than a neighbor's
+        # sensitivity — and the record is NOT dropped (only filters fail closed).
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            _l2a_var_ds(),
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        shots = df["shot_number"].to_numpy()
+        sens = df["sensitivity"].to_numpy()
+        assert np.isnan(sens[shots == 103]).all()
+        assert np.allclose(sens[shots == 101], 0.95)
+        assert np.allclose(sens[shots == 104], 0.50)
+
     def test_unmatched_record_never_borrows(self):
         # With no predicates beyond the join itself there are no asset filters,
         # so declare a tautology: every matched shot passes, unmatched drop.
@@ -505,6 +623,424 @@ class TestSiblingAssetJoin:
         )
         with pytest.raises(ValueError, match="no open sibling handle"):
             _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", ds, 0, _OneShardGrid())
+
+    def test_empty_sibling_drops_every_record(self):
+        # A zero-row sibling matches nothing: the asset filter fails every
+        # record closed, and the join must not raise IndexError on the way.
+        ds = _l2a_ds(
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "ge", "value": 0}]
+        )
+        assert (
+            _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                ds,
+                0,
+                _OneShardGrid(),
+                siblings={"l2a": _FakeH5(_l2a_arrays_empty())},
+            )
+            is None
+        )
+
+    def test_duplicate_sibling_keys_raise(self):
+        # Two L2A rows for shot 101: which one is "the" row is undefined, so the
+        # join refuses the product rather than pick by sort order.
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/shot_number"] = np.array([101, 101, 102, 104], dtype=np.uint64)
+        arrays["/BEAM0000/quality_flag"] = np.array([1, 0, 0, 1], dtype=np.uint8)
+        arrays["/BEAM0000/sensitivity"] = np.array([0.95, 0.10, 0.99, 0.50], dtype=np.float32)
+        ds = _l2a_ds(
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1}]
+        )
+        with pytest.raises(ValueError, match="duplicate key 101"):
+            _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                ds,
+                0,
+                _OneShardGrid(),
+                siblings={"l2a": _FakeH5(arrays)},
+            )
+
+    def test_empty_sibling_variable_is_all_nan(self):
+        # Same degenerate sibling on the VARIABLE arm: unmatched records NaN
+        # (they are not dropped — only asset filters fail closed).
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            _l2a_var_ds(),
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays_empty())},
+        )
+        assert len(df) == 13
+        assert np.isnan(df["sensitivity"].to_numpy()).all()
+
+
+class TestSiblingJoinedValues:
+    """The record-key join itself, direct (the contract both consumers share)."""
+
+    JOIN_CFG = {"join": {"left": "/{group}/shot_number", "right": "/{group}/shot_number"}}
+
+    @staticmethod
+    def _read_full(paths):
+        return _FakeH5(_l1b_arrays()).readDatasets(list(paths))
+
+    def _join(self, dataset_paths, n_records=4, sibling_arrays=None):
+        return _sibling_joined_values(
+            _FakeH5(_l2a_arrays() if sibling_arrays is None else sibling_arrays),
+            "BEAM0000",
+            "l2a",
+            self.JOIN_CFG,
+            n_records,
+            dataset_paths,
+            self._read_full,
+        )
+
+    def test_matched_vector_and_gather_order(self):
+        vals, matched = self._join(
+            ["/BEAM0000/quality_flag", "/BEAM0000/sensitivity"],
+        )
+        # Shots 101/102/104 have L2A rows; 103 does not.
+        assert matched.tolist() == [True, True, False, True]
+        # Row i is the sibling's value for primary record i — L2A file order is
+        # (101, 102, 104), so the gather is a reorder, not a slice.
+        assert vals["/BEAM0000/quality_flag"][[0, 1, 3]].tolist() == [1, 0, 1]
+        assert np.allclose(vals["/BEAM0000/sensitivity"][[0, 1, 3]], [0.95, 0.99, 0.50])
+
+    def test_unmatched_row_is_a_placeholder_only(self):
+        # The unmatched row carries the clamped gather's neighbor (shot 104's
+        # values), which is exactly why a consumer must test ``matched``.
+        vals, matched = self._join(["/BEAM0000/sensitivity"])
+        assert not matched[2]
+        assert np.isclose(vals["/BEAM0000/sensitivity"][2], 0.50)
+
+    def test_duplicate_paths_collapse_to_one_key(self):
+        vals, _ = self._join(["/BEAM0000/quality_flag", "/BEAM0000/quality_flag"])
+        assert list(vals) == ["/BEAM0000/quality_flag"]
+
+    def test_record_count_mismatch_raises(self):
+        with pytest.raises(ValueError, match=r"join\.left has 4 records"):
+            self._join(["/BEAM0000/quality_flag"], n_records=5)
+
+    def test_empty_sibling_returns_placeholder_arrays(self):
+        vals, matched = self._join(["/BEAM0000/quality_flag"], sibling_arrays=_l2a_arrays_empty())
+        assert not matched.any()
+        assert vals["/BEAM0000/quality_flag"].shape == (4,)
+        assert vals["/BEAM0000/quality_flag"].dtype == np.uint8
+
+    def test_dataset_at_a_different_rate_raises(self):
+        # A gathered dataset shorter than the join key would answer with another
+        # record's row (or raise a bare IndexError naming nothing), so name the
+        # asset and the dataset (issue #464 review).
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/sensitivity"] = np.array([0.95, 0.99], dtype=np.float32)
+        with pytest.raises(
+            ValueError, match=r"assets.l2a dataset '/BEAM0000/sensitivity' has 2 rows"
+        ):
+            self._join(["/BEAM0000/sensitivity"], sibling_arrays=arrays)
+
+    def test_longer_dataset_raises_too(self):
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/quality_flag"] = np.array([1, 0, 1, 1], dtype=np.uint8)
+        with pytest.raises(ValueError, match=r"the join key '/BEAM0000/shot_number' has 3"):
+            self._join(["/BEAM0000/quality_flag"], sibling_arrays=arrays)
+
+    def test_populated_dataset_beside_an_empty_key_raises(self):
+        # The empty-sibling placeholder is for a sibling with NO rows at all; a
+        # zero-row key beside a populated dataset is malformed, not degenerate.
+        arrays = _l2a_arrays_empty()
+        arrays["/BEAM0000/quality_flag"] = np.array([1, 0, 1], dtype=np.uint8)
+        with pytest.raises(ValueError, match=r"has 3 rows; the join key .* has 0"):
+            self._join(["/BEAM0000/quality_flag"], sibling_arrays=arrays)
+
+    def test_duplicate_right_keys_raise(self):
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/shot_number"] = np.array([101, 102, 102, 104], dtype=np.uint64)
+        arrays["/BEAM0000/quality_flag"] = np.array([1, 1, 0, 1], dtype=np.uint8)
+        with pytest.raises(ValueError, match="duplicate key 102"):
+            self._join(["/BEAM0000/quality_flag"], sibling_arrays=arrays)
+
+
+# ── asset-sourced shot-level variables through the read route (issue #464) ───
+
+
+class TestAssetVariables:
+    """Design (B) end to end: the record-key join feeding the existing
+    coordinates-level broadcast, on both arms, with the stock expression
+    machinery consuming the result unchanged."""
+
+    def test_full_read_joins_and_broadcasts(self):
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            _dem_var_ds(),
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        # Per-shot DEM repeated by count; shot 103 has no L2A row -> NaN.
+        np.testing.assert_array_equal(
+            df["dem"].to_numpy(), np.array([60.0] * 5 + [30.0] * 3 + [np.nan] + [40.0] * 4)
+        )
+
+    def test_planned_matches_full(self):
+        ds_plan = _dem_var_ds(read_plan={"spatial_index": "shots", "pad": 1})
+        ds_full = _dem_var_ds()
+        for shard in (0, 1):
+            a = _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                ds_plan,
+                shard,
+                _LatGrid(),
+                siblings={"l2a": _FakeH5(_l2a_arrays())},
+            )
+            b = _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                ds_full,
+                shard,
+                _LatGrid(),
+                siblings={"l2a": _FakeH5(_l2a_arrays())},
+            )
+            np.testing.assert_array_equal(a["dem"].to_numpy(), b["dem"].to_numpy())
+
+    def test_strided_planned_read(self):
+        # The production GEDI shape: strided records under a plan. Shard 1
+        # holds shots 103 (unmatched -> NaN) + 104.
+        ds = _dem_var_ds(read_plan={"spatial_index": "shots", "pad": 0})
+        df = _read_group(
+            _FakeH5(_l1b_arrays_strided()),
+            "BEAM0000",
+            ds,
+            1,
+            _LatGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        np.testing.assert_array_equal(df["dem"].to_numpy(), np.array([np.nan] + [40.0] * 4))
+
+    def test_float32_sibling_stays_float32(self):
+        # The NaN fill needs a float column, not a WIDER one (issue #464
+        # review): the fixture DEM is float32, so the stored column is too —
+        # promoting to float64 would double the paint of every asset column.
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            _dem_var_ds(),
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        assert df["dem"].to_numpy().dtype == np.float32
+        assert np.isnan(df["dem"].to_numpy()[df["shot_number"].to_numpy() == 103]).all()
+
+    def test_integer_sibling_promotes_to_float(self):
+        # An integer sibling dataset has nowhere to put the unmatched-row NaN,
+        # so it promotes to a float type able to hold the values (uint8 ->
+        # float32); shot 103 still NaNs rather than borrowing a neighbor.
+        ds = _l2a_ds()
+        ds["levels"]["shots"]["variables"]["quality_flag"] = {
+            "asset": "l2a",
+            "path": "/{group}/quality_flag",
+        }
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            ds,
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        qf = df["quality_flag"].to_numpy()
+        shots = df["shot_number"].to_numpy()
+        assert np.issubdtype(qf.dtype, np.floating)
+        assert qf.dtype == np.float32
+        assert np.isnan(qf[shots == 103]).all()
+        np.testing.assert_array_equal(qf[shots == 101], np.ones(5, dtype=np.float32))
+        np.testing.assert_array_equal(qf[shots == 102], np.zeros(3, dtype=np.float32))
+
+    def test_nan_fill_never_mutates_the_shared_join(self, monkeypatch):
+        # One join serves every consumer of an asset (issue #464 review), so the
+        # variable arm's unmatched-row NaN must land on a COPY — a float32
+        # sibling dataset is a dtype the fill could write in place. Capture the
+        # join's own arrays and check them after the read.
+        from zagg.processing import read_vlen
+
+        real_join = read_vlen._sibling_joined_values
+        captured: list[dict] = []
+
+        def _spy(*args, **kwargs):
+            values_by_path, matched = real_join(*args, **kwargs)
+            captured.append(values_by_path)
+            return values_by_path, matched
+
+        monkeypatch.setattr(read_vlen, "_sibling_joined_values", _spy)
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            _dem_var_ds(),
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        assert np.isnan(df["dem"].to_numpy()[df["shot_number"].to_numpy() == 103]).all()
+        # Shot 103 is unmatched, so its joined row is the clamped placeholder
+        # (shot 104's DEM) — untouched by the NaN the column carries.
+        joined = captured[0]["/BEAM0000/digital_elevation_model"]
+        assert not np.isnan(joined).any()
+        np.testing.assert_array_equal(joined, np.array([60.0, 30.0, 40.0, 40.0], dtype=np.float32))
+
+    def test_short_sibling_dataset_raises_through_the_route(self):
+        # The rate check rides the join, so the route surfaces it with the asset
+        # and dataset named rather than an IndexError from the gather (issue
+        # #464 review).
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/digital_elevation_model"] = np.array([60.0, 30.0], dtype=np.float32)
+        with pytest.raises(
+            ValueError, match=r"assets.l2a dataset '/BEAM0000/digital_elevation_model' has 2 rows"
+        ):
+            _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                _dem_var_ds(),
+                0,
+                _OneShardGrid(),
+                siblings={"l2a": _FakeH5(arrays)},
+            )
+
+    def test_two_dimensional_sibling_dataset_raises_articulately(self):
+        # The asset form is scoped to record-rate scalars (issue #464 review):
+        # an N-D sibling dataset must not report "requires an integer 'column'"
+        # like a plain variable, because the asset form rejects that key —
+        # richer L2A companions (rh percentiles) ride issue #465.
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/rh"] = np.zeros((3, 101), dtype=np.float32)
+        ds = _l2a_ds()
+        ds["levels"]["shots"]["variables"]["rh"] = {"asset": "l2a", "path": "/{group}/rh"}
+        with pytest.raises(ValueError, match=r"no 'column' selector yet.*issue #465"):
+            _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                ds,
+                0,
+                _OneShardGrid(),
+                siblings={"l2a": _FakeH5(arrays)},
+            )
+
+    def test_expression_filter_mixes_primary_and_asset_columns(self):
+        # The issue #464 gate shape: a primary shot-level column against an
+        # asset-sourced one through the STOCK expression machinery — no filter
+        # changes. Shot 102's DEM is poisoned by ~5.8 km (the 2023-031 epoch
+        # analogue) and drops; shot 103's NaN (no sibling row) drops by plain
+        # comparison semantics.
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/digital_elevation_model"] = np.array([10.5, 5800.0, 9.0])
+        ds = _dem_var_ds(filters=[{"expression": "abs(noise_mean - dem) <= 200"}])
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            ds,
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(arrays)},
+        )
+        assert sorted(set(df["shot_number"].tolist())) == [101, 104]
+        assert len(df) == 9
+
+    def test_missing_sibling_warns_once_per_granule_not_per_group(self, caplog):
+        # The read runs once per beam group; the NaN warning is deduped on the
+        # granule's open primary handle, so a granule's eight groups warn once.
+        arrays = {**_l1b_arrays("BEAM0000"), **_l1b_arrays("BEAM0001")}
+        h5 = _FakeH5(arrays)
+        with caplog.at_level("WARNING", logger="zagg.processing.read_vlen"):
+            for group in ("BEAM0000", "BEAM0001"):
+                df = _read_group(h5, group, _dem_var_ds(), 0, _OneShardGrid())
+                assert np.isnan(df["dem"].to_numpy()).all()
+        assert sum("no open sibling handle" in r.getMessage() for r in caplog.records) == 1
+
+    def test_asset_filter_still_fails_closed_beside_a_variable(self):
+        # Declaring an asset VARIABLE must not soften the FILTER policy: with
+        # no sibling handle, the filter on the same asset raises as before.
+        ds = _dem_var_ds(
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1}]
+        )
+        with pytest.raises(ValueError, match="no open sibling handle"):
+            _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", ds, 0, _OneShardGrid())
+
+
+class TestAssetVariableValidation:
+    """Config-side validation of the ``{asset, path}`` level-variable form."""
+
+    def test_valid_config_passes(self):
+        validate_config(_cfg(_dem_var_ds()))
+
+    def test_undeclared_asset_rejected(self):
+        ds = _dem_var_ds()
+        ds["levels"]["shots"]["variables"]["dem"] = {"asset": "nope", "path": "/{group}/x"}
+        with pytest.raises(ValueError, match="asset 'nope' is not declared in data_source.assets"):
+            validate_config(_cfg(ds))
+
+    def test_non_coordinates_level_rejected(self):
+        # The join is keyed to the coordinates level's records; any other
+        # level's rows have no defined key alignment.
+        ds = _l2a_ds()
+        ds["levels"]["blocks"] = {
+            "path": "/{group}",
+            "link": {
+                "to": "samples",
+                "index_beg": "/{group}/block_start",
+                "count": "/{group}/block_count",
+            },
+            "variables": {"dem": {"asset": "l2a", "path": "/{group}/digital_elevation_model"}},
+        }
+        with pytest.raises(ValueError, match="declare them on coordinates.level 'shots'"):
+            validate_config(_cfg(ds))
+
+    def test_requires_vlen_route(self):
+        ds = _dem_var_ds()
+        del ds["coordinates"]["level"]
+        del ds["variables"]["elevation"]  # synthesize needs the vlen route too
+        with pytest.raises(ValueError, match="asset variables require the vlen route"):
+            validate_config(_cfg(ds))
+
+    def test_unknown_keys_rejected(self):
+        ds = _dem_var_ds()
+        ds["levels"]["shots"]["variables"]["dem"] = {
+            "asset": "l2a",
+            "path": "/{group}/x",
+            "column": 0,
+        }
+        with pytest.raises(ValueError, match="the asset form takes 'asset' and 'path'"):
+            validate_config(_cfg(ds))
+
+    def test_column_key_says_why_it_is_unsupported(self):
+        # 'column' is the near-miss: the plain variable form takes one, so the
+        # config error names the scope rather than just listing the key (issue
+        # #464 review).
+        ds = _dem_var_ds()
+        ds["levels"]["shots"]["variables"]["dem"] = {
+            "asset": "l2a",
+            "path": "/{group}/x",
+            "column": 0,
+        }
+        with pytest.raises(ValueError, match=r"no 'column' selector yet.*issue #465"):
+            validate_config(_cfg(ds))
+
+    def test_non_string_path_rejected(self):
+        ds = _dem_var_ds()
+        ds["levels"]["shots"]["variables"]["dem"] = {"asset": "l2a", "path": ""}
+        with pytest.raises(ValueError, match="variables.dem.path must be a non-empty string"):
+            validate_config(_cfg(ds))
+
+    def test_collision_with_base_variable_rejected(self):
+        ds = _dem_var_ds()
+        ds["levels"]["shots"]["variables"]["rxwaveform"] = {
+            "asset": "l2a",
+            "path": "/{group}/digital_elevation_model",
+        }
+        with pytest.raises(ValueError, match="collides with a data_source.variables column"):
+            validate_config(_cfg(ds))
 
 
 # ── config validation of the vlen grammar ────────────────────────────────────
@@ -774,6 +1310,15 @@ class TestInlineWriteBackPrebuild:
         # it, so mapping them here would KeyError on the primary.
         assert not [p for p in built if "rx_assess" in p]
 
+    def test_asset_variables_are_not_mapped(self, monkeypatch):
+        from zagg.config import default_config
+
+        cfg = default_config("gedi01b_waveform_healpix_hive")
+        built = self._built_paths(monkeypatch, cfg.data_source)
+        # Asset-sourced variables (issue #464) read the paired granule too:
+        # mapping the DEM here would KeyError on the primary the same way.
+        assert not [p for p in built if "digital_elevation_model" in p]
+
     def test_vlen_prebuild_runs_without_a_read_plan(self, monkeypatch):
         # No read_plan: the record level still has to contribute its link, or
         # the full-read arm's link datasets go unmapped.
@@ -828,17 +1373,54 @@ class TestGediTemplate:
 
     def test_filters_are_validity_gates_only(self, cfg):
         # espg ruling 2026-08-17 (refs #425 / issue #422): the template filters
-        # on geolocation validity and saturation ONLY. quality_flag and
-        # sensitivity are L2A GROUND-RETRIEVAL fitness gates — quality_flag
-        # contains a sensitivity test internally, so the AND is brutally tight
-        # (1.61% quality-pass, 0 of 434 in-shard shots surviving the joint
-        # stack on a real SERC granule), and zagg's ratified clip policy is
-        # already the signal criterion. Pinned so they cannot drift back in.
-        datasets = [f["dataset"] for f in cfg.data_source["filters"]]
+        # on VALIDITY only — geolocation (degrade + the issue #464 DEM gate)
+        # and saturation. quality_flag and sensitivity are L2A GROUND-RETRIEVAL
+        # fitness gates — quality_flag contains a sensitivity test internally,
+        # so the AND is brutally tight (1.61% quality-pass, 0 of 434 in-shard
+        # shots surviving the joint stack on a real SERC granule), and zagg's
+        # ratified clip policy is already the signal criterion. Pinned so they
+        # cannot drift back in.
+        datasets = [f["dataset"] for f in cfg.data_source["filters"] if "dataset" in f]
         assert datasets == [
             "/{group}/geolocation/degrade",
             "/{group}/rx_assess/rx_clipbin_count",
         ]
+        # The DEM-referenced geolocation-validity gate (issue #464): the
+        # window-MIDPOINT form (espg ruling 2026-08-17 — not elev_lowestmode,
+        # which would entangle retrieval quality), pinned verbatim.
+        expressions = [f["expression"] for f in cfg.data_source["filters"] if "expression" in f]
+        assert expressions == [
+            "abs((elevation_bin0 + elevation_lastbin)/2 - digital_elevation_model) <= 200"
+        ]
+
+    def test_template_gate_drops_an_epoch_poisoned_shot(self, cfg):
+        # The issue #464 failure mode through the SHIPPED template: shot 102's
+        # DEM sits ~5.75 km from its window midpoint (the 2023-031 constant
+        # offset, scaled to the fixture), while 101 and 104 stay within 200 m.
+        # Only the geolocation gate separates them — degrade and the saturation
+        # counter pass all three.
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/digital_elevation_model"] = np.array([60.0, 5800.0, 40.0])
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            cfg.data_source,
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(arrays)},
+        )
+        assert df["shot_number"].tolist() == [101] * 5 + [104] * 4
+
+    def test_pairless_granule_fails_the_group(self, cfg):
+        # The template's DEM variable and its rx_clipbin_count filter ride the
+        # SAME asset (l2a), and the filter's fail-closed raise happens first —
+        # so a granule with no open sibling handle fails the group outright and
+        # the variable arm's NaN degradation never fires for this config (issue
+        # #464 review). The NaN arm serves a config whose asset carries
+        # variables only (test_variable_only_asset_without_sibling_nans_and_warns).
+        assert {f["asset"] for f in cfg.data_source["filters"] if "asset" in f} == {"l2a"}
+        with pytest.raises(ValueError, match="no open sibling handle"):
+            _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", cfg.data_source, 0, _OneShardGrid())
 
     def test_template_reads_and_aggregates_the_fixture(self, cfg):
         from zagg.processing import calculate_cell_statistics
@@ -968,8 +1550,13 @@ class TestOwnerMapReuse:
         # (companion count, filter levels), unlike the pinned harness above.
         ds = dict(default_config("gedi01b_waveform_healpix_hive").data_source)
         shot_vars = ds["levels"][ds["coordinates"]["level"]]["variables"]
-        # The count the finding is scaled by: six re-derivations, not one.
-        assert len(shot_vars) == 6
+        # The count the finding is scaled by: six re-derivations, not one. The
+        # asset-sourced DEM (issue #464) rides the same held gather map, so it
+        # adds a consumer without adding a derivation.
+        plain = {k: v for k, v in shot_vars.items() if isinstance(v, str)}
+        asset = {k: v for k, v in shot_vars.items() if isinstance(v, dict)}
+        assert len(plain) == 6
+        assert list(asset) == ["digital_elevation_model"]
         assert [f["level"] for f in ds["filters"] if "level" in f] == ["shots"]
 
     def test_a_genuinely_different_link_still_derives_its_own(self, monkeypatch):

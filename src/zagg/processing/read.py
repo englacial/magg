@@ -384,6 +384,11 @@ def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
     ``chunk_precompute`` can reduce. Returns ``{level_key: {name: template}}`` for
     every non-base level carrying a dict ``variables``; empty when none do, so the
     read path is unchanged for configs without it.
+
+    Asset-sourced entries (the ``{asset, path}`` mapping form, issue #464) are
+    excluded: they read the PAIRED granule via the sibling join, never this
+    handle — the vlen route collects them separately
+    (:func:`zagg.processing.read_vlen.asset_variable_specs`).
     """
     levels = data_source.get("levels")
     base_level = data_source.get("base_level")
@@ -395,7 +400,9 @@ def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
             continue
         lvl_vars = lvl.get("variables")
         if isinstance(lvl_vars, dict) and lvl_vars:
-            out[name] = dict(lvl_vars)
+            plain = {k: v for k, v in lvl_vars.items() if not isinstance(v, dict)}
+            if plain:
+                out[name] = plain
     return out
 
 
