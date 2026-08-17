@@ -20,11 +20,12 @@ validated up front (:func:`validate_streaming`):
   the shard fits in a single buffer, since one flush == one pooled build).
 
 Everything else (expressions, vector fields, ``resolution: chunk`` companions,
-``chunk_precompute``) has no incremental-merge story and raises. Located
-ragged fields, ``build_tdigest_where`` strata, and the packed composition word
+``chunk_precompute``) has no incremental-merge story and raises. Companion-
+carrying ragged fields (located and ``temporal: per-centroid``),
+``build_tdigest_where`` strata, and the packed composition word
 also raise **here** (per-flush folding would degrade locations continuously /
 re-quantize lanes per flush) but fold on the spill path's rare block closes —
-:func:`validate_spill_fold`, issue #370. A fixed-size
+:func:`validate_spill_fold`, issues #370/#477. A fixed-size
 buffer is used rather than pure granule-by-granule updates because each flush
 costs one merge round over the touched cells (~10 µs/cell, see
 ``zagg/stats/tdigest.py``): near 88S a tangent-running granule touches most of
@@ -42,6 +43,7 @@ from zagg.config import (
     get_output_signature,
 )
 from zagg.stats.tdigest import _DEFAULT_DELTA, build_tdigest, merge_tdigests
+from zagg.time_axis import TOC_SHAPE_PER_CENTROID
 
 #: Ragged reducers with a cross-block merge law wired up. ``build_tdigest`` folds
 #: k-way (order-independent) on the spill path; ``build_tdigest_pairwise`` folds
@@ -131,8 +133,9 @@ def validate_streaming(config: PipelineConfig) -> None:
             problems.append(
                 f"field '{name}': temporal companions (temporal: {sig['temporal']!r}) cannot "
                 f"stream under mode: merge — the running merged state carries no companion "
-                f"channel, so the §8.3 sibling would be stamped and left empty; run the "
-                f"pooled path (no aggregation.streaming block)"
+                f"channel, so the §8.3 sibling would be stamped and left empty; use "
+                f"mode: spill, whose block close folds a 'per-centroid' companion "
+                f"(issue #477), or run the pooled path (no aggregation.streaming block)"
             )
         elif "expression" in meta:
             problems.append(f"field '{name}': expression fields cannot stream")
@@ -208,9 +211,11 @@ def validate_spill_fold(config: PipelineConfig) -> None:
     :func:`validate_streaming` (``mode: merge``): merge mode folds every
     ``buffer_granules`` flush, so a located field's centroid locations would
     coarsen continuously, whereas spill folds only on the rare block close.
-    Accepted here beyond the merge-mode set: **located** ragged fields (the
-    located ``merge_tdigests``/``merge_tdigests_kway`` overloads carry the
-    channel), **``build_tdigest_where`` strata** (row selection precedes
+    Accepted here beyond the merge-mode set: **located** ragged fields and
+    **``temporal: per-centroid``** ones (the ``merge_tdigests`` /
+    ``merge_tdigests_kway`` channel overloads carry both, in one merge, so a
+    field declaring both keeps its siblings row-aligned — issues #370/#477),
+    **``build_tdigest_where`` strata** (row selection precedes
     the build, so per-block stratum digests merge like any digest), and the
     **packed composition word** (``merge_composition_kway`` over the per-block
     ``(word, n_signal)`` pairs — presence exact, counts within one
@@ -234,18 +239,19 @@ def validate_spill_fold(config: PipelineConfig) -> None:
         problems.append("chunk_precompute is chunk-scoped and has no cross-block fold")
     for name, meta in get_agg_fields(config).items():
         sig = get_output_signature(meta)
-        if sig["temporal"] is not None:
-            # The words THEMSELVES fold exactly (the §8.2 join is associative,
-            # commutative and idempotent), but the block close's per-field channel
-            # state is located-only today, so a temporal field would emit a
-            # companion missing every block past the first — a §8.3 row-alignment
-            # break, not an approximation. Refuse until the channel is threaded
-            # through the close (issue #410).
+        if sig["temporal"] not in (None, TOC_SHAPE_PER_CENTROID):
+            # ``per-centroid`` folds: the block close carries the channel beside
+            # the located one and both ride one merge (issue #477). The other
+            # shapes do not — a ``per-cell`` companion is a scalar reducer over
+            # the derived word column (``zagg.stats.toc.cell_envelope``), which
+            # has no per-block accumulator here, and the scalar branch below
+            # would report it as an unmergeable function rather than naming the
+            # companion that put it there. Refuse by name (spec §8.2, #410).
             problems.append(
-                f"field '{name}': temporal companions (temporal: {sig['temporal']!r}) have "
-                f"no cross-block fold state yet — the spill block close carries the located "
-                f"channel only; run the pooled path (no aggregation.streaming block) for a "
-                f"temporal store (spec §8.2/§8.3, issue #410)"
+                f"field '{name}': temporal companions of shape {sig['temporal']!r} have no "
+                f"cross-block fold state — the spill block close folds 'per-centroid' "
+                f"companions only; run the pooled path (no aggregation.streaming block) "
+                f"for this store (spec §8.2/§8.3, issues #410/#477)"
             )
         elif "expression" in meta:
             problems.append(f"field '{name}': expression fields have no cross-block fold")
