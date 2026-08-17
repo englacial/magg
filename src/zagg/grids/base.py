@@ -112,9 +112,9 @@ def located_declaration(attrs) -> dict | None:
     """The §9 ``located`` block from a sibling array's attrs, strict-checked.
 
     Returns ``None`` when the key is absent — which §9 defines as §2.2
-    verbatim (order-29 point words at leaves, deepest common ancestors after
-    a merge), never a refusal, so every located store written before the
-    declaration stays conformant. Raises on a block this reader cannot
+    verbatim (kind-keyed words decoded per word, and the deepest common
+    ancestor of the members' words after a merge), never a refusal, so every
+    located store written before the declaration stays conformant. Raises on a block this reader cannot
     decode: an unknown ``spec``, an unimplemented ``shape``, or an uncited
     word ``grammar``. Unrecognized keys are informative and ignored.
     """
