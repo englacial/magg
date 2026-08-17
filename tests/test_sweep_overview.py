@@ -227,6 +227,14 @@ class TestComposabilityClasses:
     def test_non_composable_metas(self, meta):
         assert field_composability(meta) == "none"
 
+    def test_temporal_companion_is_not_composable(self):
+        # A per-cell toc companion's fold law is the word grammar's join
+        # (spec §8.2), which no zagg fold implements yet — folding it through
+        # its own reducer would emit a false envelope (issue #410).
+        meta = {"function": "nanmax", "dtype": "uint64", "temporal": "per-cell"}
+        assert field_composability(meta) == "none"
+        assert field_composability({k: v for k, v in meta.items() if k != "temporal"}) == "exact"
+
     def test_pairwise_tdigest_builder_is_approximate(self):
         meta = {
             "kind": "ragged",
