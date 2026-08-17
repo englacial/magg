@@ -49,7 +49,10 @@ aggregation:
                                # (mergeable reducers only). Pairs with worker.extra_disk.
                                # buffer_granules defaults to 20 (issue #474);
                                # block_bytes caps a spill block before it closes
-                               # and folds (absent: disk-derived default).
+                               # and folds (absent: disk-derived default). Keep it
+                               # at or below ~45% of the variant's ephemeral storage:
+                               # a closing block stays resident beside the filling
+                               # one, and the /tmp guard reserves both.
   coordinates:
     morton:
       dtype: uint64
