@@ -220,14 +220,22 @@ def _centroid_envelopes(temporal: np.ndarray, starts: np.ndarray, n: int) -> np.
     ``temporal`` is member-ordered (aligned with the sorted values / combined
     centroids), ``starts`` the first member index of each centroid.  Each
     centroid's word is the grammar's semilattice join over its members' words
-    (``mortie.tocs_reduce``, the segmented ``toc_merge`` reduce, issue #177):
-    the conservative envelope containing every observation the centroid
-    summarizes, and — because the join is associative, commutative and
-    idempotent — **bit-identical under any fold tree**, which is what makes the
-    channel merge-order-independent where the digest payload itself is only
-    approximately so (spec §2.3/§8.3).  A single-member centroid returns that
-    member's word unchanged, so a 1-observation centroid round-trips its exact
-    nanosecond timestamp instead of widening into a range.
+    (``mortie.tocs_reduce``, the segmented ``toc_merge`` reduce,
+    espg/mortie#177): the conservative envelope containing every observation the
+    centroid summarizes.  A single-member centroid returns that member's word
+    unchanged, so a 1-observation centroid round-trips its exact nanosecond
+    timestamp instead of widening into a range.
+
+    The join being associative, commutative and idempotent buys **cell-level**
+    invariance, not per-centroid invariance: a per-centroid vector is indexed by
+    the centroid partition, and its words are exact *given* that partition, not
+    independently of it (spec §8.3) — the partition moves with the fold tree.  A
+    different fold tree over the same observations therefore generally yields
+    different per-centroid words, while :func:`zagg.stats.toc.cell_envelope`
+    over either vector returns the same word.  That cell-level identity is what
+    licenses §8.4's per-centroid → per-cell coarsening, and it is what
+    ``test_cell_envelope_is_fold_tree_independent`` pins; the channel's
+    exactness does not lift the field's composability class (spec §2.3/§8.3).
 
     Unlike :func:`_centroid_ancestors` there is no per-centroid Python loop:
     ``starts`` is already the arrow offsets layout ``tocs_reduce`` takes, so the
@@ -475,7 +483,9 @@ def merge_tdigests(
         Per-centroid ``uint64`` toc words (spec §8.3, issue #410) aligned with
         ``d1`` / ``d2``.  Pass both or neither, independently of the located
         channel.  A merged centroid's word is the grammar's join over its
-        members' words — exact and fold-tree independent, unlike the payload.
+        members' words — exact for the partition it describes, though that
+        partition (and so the vector) still moves with the fold tree; only the
+        cell-level envelope over the words is fold-tree invariant (spec §8.3).
 
     Returns
     -------
@@ -570,10 +580,13 @@ def merge_tdigests_kway(
     Order-independence covers **every** channel: the sort breaks ``(mean,
     weight)`` ties on the location word and then on the toc word, so a
     permutation of the inputs returns the same companion vectors as well as the
-    same digest. The temporal channel is additionally order-independent *by
-    construction* — its reduction is the grammar's semilattice join (spec
-    §8.3), so its words are bit-identical under any fold tree, not merely under
-    a permutation of one flat k-way call.
+    same digest. That is permutation-independence of one flat k-way call, and it
+    is *not* fold-tree independence: the temporal channel's reduction is the
+    grammar's semilattice join (spec §8.3), but a per-centroid vector is indexed
+    by the centroid partition, so what survives an arbitrary fold tree is the
+    **cell-level** envelope over the words
+    (:func:`zagg.stats.toc.cell_envelope`), not the words themselves — a
+    pairwise left-fold reaches a different partition and so different words.
 
     Parameters
     ----------
