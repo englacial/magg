@@ -236,26 +236,66 @@ LOCATED_FIELDS = {**FIELDS, "h_tdigest": {**FIELDS["h_tdigest"], "location": "le
 #: ``_close`` closes over BY NAME, rebound each iteration) are exercised by more
 #: than one iteration — the late-binding shape a later edit breaks silently.
 TWO_LOCATED_FIELDS = {**LOCATED_FIELDS, "h2_tdigest": dict(LOCATED_FIELDS["h_tdigest"])}
+#: ONE field carrying BOTH channels — the arity the ``channels=`` map exists for
+#: (espg ruling of 2026-08-17: temporal is per-centroid at every level too).
+#: ``TWO_LOCATED_FIELDS`` above is two located FIELDS, a different shape.
+BOTH_CHANNEL_FIELDS = {
+    **LOCATED_FIELDS,
+    "h_tdigest": {**LOCATED_FIELDS["h_tdigest"], "temporal": "per-centroid"},
+}
+#: And the temporal channel alone, which is what a digest field with a clock and
+#: no ``location:`` declares.
+TIMED_FIELDS = {
+    **FIELDS,
+    "h_tdigest": {**FIELDS["h_tdigest"], "temporal": "per-centroid"},
+}
+
+
+def _companion_kwargs(meta):
+    """The ``build_tdigest`` channel kwargs ``meta`` declares, in table order."""
+    return [
+        kwarg
+        for key, kwarg in (("location", "locations"), ("temporal", "temporal"))
+        if meta.get(key) is not None
+    ]
 
 
 def _located_leaf_slabs(i, fields=LOCATED_FIELDS):
-    """``_leaf_slabs`` plus a ``{field}_locations`` sibling per located field."""
-    from conftest import point_words
+    """``_leaf_slabs`` plus each digest field's declared companion siblings.
+
+    ``{field}_locations`` for a ``location:`` field and ``{field}_times`` for a
+    ``temporal:`` one — both when it declares both, built in the SAME
+    ``build_tdigest`` call so the two siblings describe one partition.
+    """
+    from conftest import TOC_BASE, point_words, toc_words
 
     from zagg.stats.tdigest import build_tdigest
 
     slabs = _leaf_slabs(i)
     for name, meta in fields.items():
-        if meta.get("location") is None:
+        declared = _companion_kwargs(meta)
+        if not declared:
             continue
         dig = np.full(16, b"", dtype=object)
-        locs = np.full(16, b"", dtype=object)
+        sibs = {kwarg: np.full(16, b"", dtype=object) for kwarg in declared}
         for j in range(16):
-            words = point_words(1, seed=3000 + i * 16 + j)
-            d, w = build_tdigest(np.asarray([float(i * 100 + j)]), 16, locations=words)
+            kw = {}
+            if "locations" in declared:
+                kw["locations"] = point_words(1, seed=3000 + i * 16 + j)
+            if "temporal" in declared:
+                # A distinct instant per (leaf, cell), so no two envelopes are
+                # confusable and a word from the wrong cell is visible.
+                when = np.datetime64(TOC_BASE, "ns") + np.timedelta64(60 * (i * 16 + j), "s")
+                kw["temporal"] = toc_words(1, base=str(when))
+            d, *words = build_tdigest(np.asarray([float(i * 100 + j)]), 16, **kw)
             dig[j] = encode_digest(d, "float32")
-            locs[j] = encode_digest(w, "uint64")
-        slabs[name], slabs[f"{name}_locations"] = dig, locs
+            for kwarg, w in zip(kw, words, strict=True):
+                sibs[kwarg][j] = encode_digest(w, "uint64")
+        slabs[name] = dig
+        if "locations" in declared:
+            slabs[f"{name}_locations"] = sibs["locations"]
+        if "temporal" in declared:
+            slabs[f"{name}_times"] = sibs["temporal"]
     return slabs
 
 
@@ -305,10 +345,10 @@ def _stage_store(root, leaves=LEAVES, skip_columns=(), write_moc=True, fields=FI
         "generated_at": _utcnow(),
     }
     (root / MANIFEST_NAME).write_text(json.dumps(manifest, indent=1))
-    located = any(m.get("location") is not None for m in fields.values())
+    companioned = any(_companion_kwargs(m) for m in fields.values())
     for i, dec in enumerate(leaves):
         if dec not in skip_columns:
-            slabs = _located_leaf_slabs(i, fields) if located else None
+            slabs = _located_leaf_slabs(i, fields) if companioned else None
             _write_leaf(root, dec, i, fields=fields, slabs=slabs)
     if write_moc:
         write_root_coverage(str(root), build_root_coverage([morton_word(d) for d in leaves], 3))
@@ -452,11 +492,11 @@ class TestLocatedStageSweep:
     the half-read-pair bug lived (review finding).
     """
 
-    def _words(self, group, res, name="h_tdigest"):
+    def _words(self, group, res, name="h_tdigest", sibling="locations"):
         from zagg.sweep_overview import decode_digest
 
         payloads = group[str(res)][name][:]
-        siblings = group[str(res)][f"{name}_locations"][:]
+        siblings = group[str(res)][f"{name}_{sibling}"][:]
         return [
             (
                 decode_digest(bytes(p or b""), "float32"),
@@ -597,6 +637,128 @@ class TestLocatedStageSweep:
         g = _artifact(tmp_path / "s", "1/1/1/all.zarr")
         assert "h_tdigest_locations" not in g["3"]
         assert "locations" not in dict(g["3"]["h_tdigest"].attrs)["ragged"]
+
+
+class TestBothChannelsStageSweep:
+    """One field, TWO channels, through the staged ladder (issue #410).
+
+    Every located test above declares a single channel, where the ``channels=``
+    map has one key and ``_companion_group``'s partial rule degenerates to the
+    old two-array shape. These declare both on ``h_tdigest``, so
+    ``_gather_slabs``' prealloc/read loop and ``_merge_slabs``' per-cell
+    accumulation carry a 3-array group — and each sibling is checked against its
+    OWN grammar, which is what catches a channel dropped, folded separately, or
+    swapped with the other (the two word grammars accept each other's words, so
+    a swap raises nowhere by itself).
+    """
+
+    _words = TestLocatedStageSweep._words
+
+    def _pairs(self, group, res, sibling):
+        return [(p, w) for p, w in self._words(group, res, sibling=sibling) if len(p)]
+
+    def test_the_ladder_carries_both_channels_row_aligned(self, tmp_path):
+        from mortie import toc_is_range, validate_morton
+
+        m = _stage_store(tmp_path / "s", fields=BOTH_CHANNEL_FIELDS)
+        (row,) = _sweep(tmp_path / "s", m)["stages"]
+        assert row["written"] == 7 and row["failed"] == 0
+        # A gather level (order 2) and a merge level (order 0).
+        for rel, res in (("1/1/1/all.zarr", 3), ("1/all.zarr", 1)):
+            g = _artifact(tmp_path / "s", rel)
+            locs = self._pairs(g, res, "locations")
+            times = self._pairs(g, res, "times")
+            assert locs and len(locs) == len(times)
+            for (payload, lw), (_p, tw) in zip(locs, times, strict=True):
+                assert lw.shape == tw.shape == (payload.shape[0],), "§1.1, both siblings"
+                validate_morton(lw)
+                toc_is_range(tw)  # a well-formed word in its own grammar
+                assert not np.array_equal(lw, tw)
+
+    def test_the_gather_relays_each_channel_into_its_own_slot(self, tmp_path):
+        # The gather assigns a gen-1 child's bytes through untouched, so the
+        # parent's two siblings must be the leaf's two siblings — not each
+        # other's. A swap here is byte-detectable, which is the point.
+        m = _stage_store(tmp_path / "s", fields=BOTH_CHANNEL_FIELDS)
+        _sweep(tmp_path / "s", m)
+        leaf = _artifact(tmp_path / "s", "1/1/1/1/all.pyramid.zarr")
+        parent = _artifact(tmp_path / "s", "1/1/1/all.zarr")
+        for sibling in ("locations", "times"):
+            src = leaf["3"][f"h_tdigest_{sibling}"][:]
+            out = parent["3"][f"h_tdigest_{sibling}"][:]
+            assert bytes(out[0]) == bytes(src[0]) != b""
+            assert bytes(out[2]) == b""  # uninhabited: fill on both siblings
+        assert bytes(parent["3"]["h_tdigest_locations"][:][0]) != bytes(
+            parent["3"]["h_tdigest_times"][:][0]
+        )
+
+    def test_the_merge_satisfies_both_containment_claims(self, tmp_path):
+        # The root merge folds the three '1***' leaves' relay partials into one
+        # cell. Its located words must ENCLOSE their sources' (§9.1) and its toc
+        # words must COVER their sources' instants (§8.3) — one partition, two
+        # claims, and neither holds for the other channel's bytes.
+        from mortie import common_ancestor
+
+        from zagg.stats.toc import cell_envelope
+
+        m = _stage_store(tmp_path / "s", fields=BOTH_CHANNEL_FIELDS)
+        _sweep(tmp_path / "s", m)
+        merged = _artifact(tmp_path / "s", "1/all.zarr")
+        src_l, src_t = [], []
+        for dec in ("1111", "1112", "1121"):
+            col = _artifact(tmp_path / "s", f"1/{dec[1]}/{dec[2]}/{dec[3]}/all.pyramid.zarr")
+            for _p, w in self._pairs(col, 3, "locations"):
+                src_l.extend(w.tolist())
+            for _p, w in self._pairs(col, 3, "times"):
+                src_t.extend(w.tolist())
+        out_l = self._words(merged, 1, sibling="locations")[0][1]
+        out_t = self._words(merged, 1, sibling="times")[0][1]
+        assert len(out_l) and len(out_t) and src_l and src_t
+        hull = int(common_ancestor(np.asarray(sorted(set(src_l)), dtype=np.uint64)))
+        for word in out_l.tolist():
+            assert int(common_ancestor(np.asarray([hull, word], dtype=np.uint64))) == hull
+        span = int(cell_envelope(np.asarray(src_t, dtype=np.uint64)))
+        assert int(cell_envelope(out_t)) == span, "§8.3 cell-level envelope identity"
+        # The located bytes do NOT satisfy the temporal claim, which is exactly
+        # what a swapped slot would have to.
+        assert int(cell_envelope(np.asarray(out_l, dtype=np.uint64))) != span
+
+    def test_one_channel_missing_refuses_the_whole_group(self, tmp_path):
+        # ``_companion_group``'s partial rule at the arity it was added for:
+        # payload + ONE of two siblings present. The half-group must be refused
+        # whole, never written as a payload with one channel row-aligned and the
+        # other at b"" (spec §1.1).
+        root = tmp_path / "s"
+        m = _stage_store(root, fields=BOTH_CHANNEL_FIELDS)
+        import shutil
+
+        shutil.rmtree(root / "1/1/1/1/all.pyramid.zarr" / "3" / "h_tdigest_times")
+        (row,) = _sweep(root, m)["stages"]
+        assert row["failed"] == 0, "one stale child must not fail the level"
+        g = _artifact(root, "1/1/1/all.zarr")
+        payloads = g["3"]["h_tdigest"][:]
+        assert bytes(payloads[0]) == b"", "the refused contributor stays fill"
+        intact = g["3"]["h_tdigest_locations"][:]
+        assert bytes(intact[0]) == b"", "and so does its INTACT sibling"
+        assert bytes(payloads[1]) != b"", "its sibling child still gathers"
+        assert dict(g.attrs)["zagg_overview"]["source_children"] == {
+            "folded": 1,
+            "missing": 0,
+            "unreadable": 1,
+        }
+
+    def test_a_timed_only_field_folds_through_the_ladder(self, tmp_path):
+        # A digest field with a clock and no ``location:`` — the temporal channel
+        # on its own, which no other test declares.
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
+        (row,) = _sweep(tmp_path / "s", m)["stages"]
+        assert row["written"] == 7 and row["failed"] == 0
+        g = _artifact(tmp_path / "s", "1/all.zarr")
+        assert "h_tdigest_locations" not in g["1"]
+        pairs = self._pairs(g, 1, "times")
+        assert pairs
+        for payload, words in pairs:
+            assert words.shape == (payload.shape[0],)
 
 
 class TestSameSecondSkipGate:
