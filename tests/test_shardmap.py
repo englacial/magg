@@ -1467,6 +1467,48 @@ class TestLiveCover:
         )
         assert self._payload(live, tmp_path, "p.json") == self._payload(oracle, tmp_path, "o.json")
 
+    def test_a_pinned_indexed_build_covers_live_too(self, hp_grid, tmp_path, monkeypatch):
+        # The third population whose assignment moves. ``_footprint_cells_plan``
+        # declines a pinned order (a persisted column cannot restate one), and
+        # since #445 what catches that is THIS plan, not the geometry path -- so
+        # an indexed catalog built with ``mortie_order=`` covers from WKB and
+        # inherits the MultiPolygon superset, exactly as the unindexed build
+        # does. Pinned three ways: same assignment as the unindexed pinned
+        # build, a strict superset of the pre-#445 records path, and the
+        # ``footprint_cells: False`` metadata unchanged (the stored column
+        # really did go unused).
+        def _ring(lon0, lon1):
+            return [[lon0, 38.85], [lon1, 38.85], [lon1, 38.93], [lon0, 38.93], [lon0, 38.85]]
+
+        def _cat():
+            multi = _item("MULTI", -76.62, -76.60)
+            multi["geometry"] = {
+                "type": "MultiPolygon",
+                "coordinates": [[_ring(-76.62, -76.60)], [_ring(-76.53, -76.52)]],
+            }
+            return _catalog([_item("G00", -76.56, -76.54), multi])
+
+        indexed = ShardMap.build(_cat().index_footprints(11), hp_grid, mortie_order=13)
+        unindexed = ShardMap.build(_cat(), hp_grid, backend="mortie", mortie_order=13)
+        monkeypatch.setattr(shardmap, "_live_cells_plan", lambda *a, **k: None)
+        records = ShardMap.build(_cat().index_footprints(11), hp_grid, mortie_order=13)
+        assert indexed.metadata["footprint_cells"] is False
+        assert records.metadata["footprint_cells"] is False
+        assert indexed.metadata["mortie_order"] == 13
+        # ``footprint_cells_order`` is the CATALOG's own metadata, carried
+        # through by the indexed build and legitimately absent from the
+        # unindexed one; everything else must match key for key.
+        drop = ("build_wall_s", "footprint_cells", "footprint_cells_order")
+        assert self._payload(indexed, tmp_path, "i.json", drop=drop) == self._payload(
+            unindexed, tmp_path, "u.json", drop=drop
+        )
+        assert set(records.shard_keys) < set(indexed.shard_keys), (
+            "the pinned indexed build must inherit the cover's MultiPolygon superset"
+        )
+        by_shard = dict(zip(indexed.shard_keys, indexed.granules, strict=True))
+        extra = set(indexed.shard_keys) - set(records.shard_keys)
+        assert all([g["id"] for g in by_shard[k]] == ["MULTI"] for k in extra)
+
     def test_pinned_order_coarser_than_the_shards_still_refuses(self, hp_grid):
         # The pin is validated exactly as the records path validates it (#92),
         # and before any cover runs.
