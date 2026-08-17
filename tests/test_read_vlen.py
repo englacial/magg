@@ -100,6 +100,11 @@ class _OneShardGrid:
 
 NOISE_STDDEV = np.array([2.0, 1.0, 1.5, 1.0], dtype=np.float32)
 RX_ENERGY = np.array([50.0, 30.0, 5.0, 40.0], dtype=np.float32)
+#: Per-shot transmit time, the clock the §8.3 companion encodes from (issue
+#: #410). Continuous GPS seconds since 2018-01-01, spread seconds apart so a
+#: pooled cell's centroids produce genuine ranges while a single-shot cell's
+#: stay exact timestamps.
+DELTA_TIME = np.array([1.0, 4.5, 9.25, 30.0], dtype=np.float64)
 
 
 def _l1b_arrays(group="BEAM0000"):
@@ -116,6 +121,7 @@ def _l1b_arrays(group="BEAM0000"):
         f"/{group}/geolocation/elevation_bin0": E0,
         f"/{group}/geolocation/elevation_lastbin": E1,
         f"/{group}/geolocation/degrade": DEGRADE,
+        f"/{group}/geolocation/delta_time": DELTA_TIME,
     }
 
 
@@ -1466,11 +1472,27 @@ class TestGediTemplate:
         assert stats["elevation_lastbin"] == pytest.approx(E1[0])
         # Flux digest: WAVE values 100-104 sit far above the noise floor, so
         # all five samples survive the clip loss-free (weight = count - mean).
-        flux = stats["rx_flux"]
+        # The field declares `temporal: per-centroid` (issue #410), so the
+        # reducer returns the payload paired with its toc words.
+        flux, times = stats["rx_flux"]
         assert flux.shape == (5, 2)
         np.testing.assert_allclose(
             np.sort(flux[:, 1]), np.sort((WAVE[:5] - NOISE_MEAN[0]).astype(np.float32))
         )
+        # §8.3 row alignment, and the honesty property ruling 2 named: this cell
+        # holds ONE shot (`shot_count == 1` above), so every sample carries that
+        # shot's single instant and every centroid word is an exact timestamp —
+        # never a range widened around it. Ranges appear only where shots pool.
+        import mortie
+
+        assert times.shape == (5,) and times.dtype == np.uint64
+        assert not mortie.toc_is_range(times).any()
+        assert len(set(times.tolist())) == 1, "one shot, one instant"
+        decoded = mortie.to_datetime64(mortie.toc2time(times[:1])[0])[0]
+        expected = np.datetime64("2018-01-01T00:00:00", "ns") + np.timedelta64(
+            int(DELTA_TIME[0] * 1e9), "ns"
+        )
+        assert decoded == expected
 
 
 def _count_owner_derivations(monkeypatch):
@@ -1543,7 +1565,7 @@ class TestOwnerMapReuse:
         assert df["shot_number"].tolist() == expected
         assert calls == [], f"a coordinates-level consumer re-derived the owner map: {calls}"
 
-    def test_the_template_hangs_six_companions_off_the_coordinates_level(self):
+    def test_the_template_hangs_its_companions_off_the_coordinates_level(self):
         from zagg.config import default_config
 
         # LIVE config on purpose: this test tracks the real template's shape
@@ -1555,7 +1577,7 @@ class TestOwnerMapReuse:
         # adds a consumer without adding a derivation.
         plain = {k: v for k, v in shot_vars.items() if isinstance(v, str)}
         asset = {k: v for k, v in shot_vars.items() if isinstance(v, dict)}
-        assert len(plain) == 6
+        assert len(plain) == 7
         assert list(asset) == ["digital_elevation_model"]
         assert [f["level"] for f in ds["filters"] if "level" in f] == ["shots"]
 
