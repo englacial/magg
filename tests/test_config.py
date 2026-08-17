@@ -2430,15 +2430,28 @@ class TestTemporalShapeDeclaration:
 
     def test_per_centroid_requires_a_temporal_capable_reducer(self):
         # A reducer with no ``temporal`` keyword would raise per cell; reject at
-        # load, exactly as the located channel does for ``locations``.
+        # load, exactly as the located channel does for ``locations``. Note the
+        # producer allowlist is checked too, so a reducer must fail BOTH gates to
+        # be a clean case — ``np.sort`` takes no such keyword and produces no
+        # words. (``build_waveform_digest`` carries the channel as of phase 4, so
+        # it is no longer the example here.)
         cfg = self._centroid_cfg()
-        cfg.aggregation["variables"]["h_ph_tdigest"]["function"] = (
-            "zagg.stats.waveform.build_waveform_digest"
-        )
+        cfg.aggregation["variables"]["h_ph_tdigest"]["function"] = "np.sort"
         with pytest.raises(
             ValueError, match="does not accept a 'temporal' keyword|does not produce"
         ):
             validate_config(cfg)
+
+    def test_the_waveform_reducer_carries_the_channel(self):
+        # Phase 4 (issue #410): GEDI's flux reducer accepts ``temporal=`` and is
+        # on the producer allowlist, so a waveform field may declare a companion.
+        import inspect
+
+        from zagg.stats.waveform import build_waveform_digest
+        from zagg.time_axis import TOC_PRODUCING_FUNCTIONS
+
+        assert "temporal" in inspect.signature(build_waveform_digest).parameters
+        assert "zagg.stats.waveform.build_waveform_digest" in TOC_PRODUCING_FUNCTIONS
 
     def test_undeclared_fields_are_untouched_by_the_gate(self):
         # The gate is scoped to `temporal:` — every other config still loads.
@@ -2548,7 +2561,7 @@ class TestTimeSource:
     def test_field_must_be_a_declared_variable(self):
         cfg = _clocked(_ragged_cfg(inner_shape=[2]))
         del cfg.data_source["variables"]["delta_time"]
-        with pytest.raises(ValueError, match="not a declared data_source.variables column"):
+        with pytest.raises(ValueError, match="not a declared data_source variable"):
             validate_config(cfg)
 
     def test_field_may_not_be_the_derived_word_column(self):
@@ -2861,18 +2874,30 @@ class TestLocationChannel:
         assert "location" not in plain
 
     def test_located_builtin_config_loads_and_validates(self):
-        """The shipped located t-digest template (issue #87) loads, validates,
-        and differs from the value-only template ONLY by the location channel."""
+        """The shipped companion t-digest template loads, validates, and differs
+        from the value-only template only by its two COMPANION channels.
+
+        Issue #87 added the location channel; issue #410 added the §8.3 temporal
+        one, which brings its clock with it — the ``delta_time`` read column and
+        the ``output.time_source`` block that says how to convert it. Everything
+        else must still be the plain template's, which is what this pins.
+        """
         located = default_config("atl03_tdigest_located_healpix")
         plain = default_config("atl03_tdigest_healpix")
         sig = get_output_signature(get_agg_fields(located)["h_tdigest"])
         assert sig["location"] == "leaf_id"
+        assert sig["temporal"] == "per-centroid"
         assert sig["kind"] == "ragged" and sig["inner_shape"] == (2,)
-        # Same read plan and grid; the only variables delta is the location key.
-        assert located.data_source == plain.data_source
-        assert located.output == plain.output
+        # Same read plan and grid, modulo the clock the temporal channel needs.
+        ds = {k: dict(v) if k == "variables" else v for k, v in located.data_source.items()}
+        assert ds["variables"].pop("delta_time") == "/{group}/heights/delta_time"
+        assert ds == plain.data_source
+        out = dict(located.output)
+        assert out.pop("time_source")["scale"] == "gps"
+        assert out == plain.output
         located_meta = dict(get_agg_fields(located)["h_tdigest"])
         located_meta.pop("location")
+        located_meta.pop("temporal")
         assert located_meta == get_agg_fields(plain)["h_tdigest"]
 
 

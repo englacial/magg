@@ -660,8 +660,17 @@ class TestTimeSourceHashing:
         clock = semantic_core(windowed)["output"]["time_source"]
         assert clock["field"] == "delta_time" and clock["scale"] == "gps"
 
-    def test_pre_410_configs_hash_unchanged(self):
-        # Every packaged config predates #410 and declares no companion, so none
-        # of them may gain the key.
-        for name in ("atl06", "atl03_tdigest_healpix", "atl03_tdigest_located_healpix"):
+    def test_configs_declaring_no_companion_hash_unchanged(self):
+        # A packaged config that declares no companion must not gain the key —
+        # that is what keeps every store built before #410 verifiable.
+        for name in ("atl06", "atl03_tdigest_healpix", "atl06_polar", "sentinel2_l2a"):
             assert "time_source" not in semantic_core(default_config(name)).get("output", {})
+
+    def test_the_shipped_companion_templates_carry_their_clock(self):
+        # ...and the two that DO declare one carry it, resolved. These are the
+        # products whose identity must be born with the clock in it (the
+        # California rebuild), so the key is asserted present rather than merely
+        # allowed.
+        for name in ("atl03_tdigest_located_healpix", "gedi01b_waveform_healpix_hive"):
+            clock = semantic_core(default_config(name))["output"]["time_source"]
+            assert clock["field"] == "delta_time" and clock["scale"] == "gps"
