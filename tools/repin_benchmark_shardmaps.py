@@ -74,11 +74,27 @@ import test_benchmark_shardmap as drift  # noqa: E402
 
 from zagg.catalog.shardmap import ShardMap  # noqa: E402
 
-#: Metadata keys a faithful rebuild may still move, reported by ``--check`` as
-#: such rather than as a changed pin: the build's own wall clock, and the MOC
-#: cover order, whose unpinned default became the shard order in PR #447 (the
-#: committed maps predate it; the assignment it produces is unchanged).
-VOLATILE_META = ("build_wall_s", "mortie_order")
+#: Genuinely volatile: the build's own wall clock, different every run.
+#: Legitimately excused from the comparison forever.
+VOLATILE_META = ("build_wall_s",)
+
+#: NOT volatile — deterministic on both sides, and simply STALE in the
+#: committed bytes: PR #447 made the unpinned HEALPix cover order the SHARD
+#: order, where the committed maps recorded the chunk order they were built at
+#: (13 -> the grid's 9/10). The assignment it produces is unchanged.
+#:
+#: This exemption is meant to EXPIRE. The next deliberate re-pin — a run of
+#: this script — writes the current value and makes both sides agree, at which
+#: point the exemption stops excusing a known delta and starts masking a real
+#: regression. ``test_offline_pin_reproduces_committed_map`` pins the stale
+#: committed value so it fails loudly then and this tuple gets emptied.
+STALE_META = ("mortie_order",)
+
+#: How ``--check`` labels a metadata key that moved without the pin moving.
+EXCUSED_META = {
+    **{k: " (volatile)" for k in VOLATILE_META},
+    **{k: " (stale committed value, drop at the next re-pin)" for k in STALE_META},
+}
 
 
 def entry(sm_key: str) -> dict:
@@ -157,8 +173,8 @@ def differences(sm_key: str, mapped: ShardMap) -> list[str]:
     old, new = old_map["metadata"], mapped.metadata
     for key in sorted(set(old) | set(new)):
         if old.get(key) != new.get(key):
-            volatile = " (volatile)" if key in VOLATILE_META else ""
-            out.append(f"metadata.{key}: {old.get(key)!r} -> {new.get(key)!r}{volatile}")
+            why = EXCUSED_META.get(key, "")
+            out.append(f"metadata.{key}: {old.get(key)!r} -> {new.get(key)!r}{why}")
     return out
 
 

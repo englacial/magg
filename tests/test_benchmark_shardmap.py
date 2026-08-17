@@ -259,8 +259,8 @@ def test_offline_pin_reproduces_committed_map(sm_key, tmp_path):
 
     written = tmp_path / "rebuilt.json"
     mapped.to_json(str(written))
-    assert _without_volatile(written.read_text(), driver.VOLATILE_META) == _without_volatile(
-        (BENCH / sm_meta["path"]).read_text(), driver.VOLATILE_META
+    assert _without_volatile(written.read_text(), driver.EXCUSED_META) == _without_volatile(
+        (BENCH / sm_meta["path"]).read_text(), driver.EXCUSED_META
     )
 
     from zagg.config import load_config
@@ -273,6 +273,13 @@ def test_offline_pin_reproduces_committed_map(sm_key, tmp_path):
     # showed, over the same catalog.
     grid = from_config(load_config(str(_config_for_shardmap(sm_key))))
     assert mapped.metadata["mortie_order"] == grid.parent_order
+    # ...and the OTHER side, which nothing else constrains. ``mortie_order`` is
+    # deterministic on both sides, so its exemption is a stale-fixture excuse
+    # with an expiry, not a standing licence: pinning the committed value makes
+    # this test fail at the next deliberate re-pin, when ``STALE_META`` must be
+    # emptied rather than left to mask a genuine regression.
+    assert json.loads((BENCH / sm_meta["path"]).read_text())["metadata"]["mortie_order"] == 13
+    assert driver.STALE_META == ("mortie_order",)
 
 
 def test_repin_updates_only_the_pin_literals_in_targets():
