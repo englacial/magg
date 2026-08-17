@@ -194,6 +194,33 @@ def _cache_keys(h5obj) -> set:
     return set(getattr(h5obj, "cache", None) or ())
 
 
+def _drop_cache_lines(h5obj, keys) -> int:
+    """Pop ``keys`` from ``h5obj.cache`` **and** their ``cache_locks`` entries.
+
+    ``H5Coro.cache_locks`` is a ``defaultdict(threading.Lock)`` keyed by the
+    same aligned offsets, so evicting the line alone still retains a ``Lock``
+    plus a dict slot for every line ever touched — ~13.8k entries for a GEDI
+    L1B beam group's ``rxwaveform`` B-tree, ~110k (order 15-20 MB) per granule
+    (review finding on PR #462). Pruning it is safe only because every eviction
+    point is single-threaded on the handle (immediate: ``_prebuild_group_maps``,
+    the full-coverage walk, direct use; deferred: after the read pool joined —
+    :func:`_evict_deferred_lines`). Were another thread mid-``ioRequest``, it
+    could hold the popped lock while a third thread took the fresh defaultdict
+    entry — two locks for one line, and a duplicate fetch. ``pop(k, None)`` on
+    both tables (``cache_locks`` is absent on stub handles) keeps this
+    non-raising. Returns the number of cache lines actually dropped.
+    """
+    cache = h5obj.cache
+    locks = getattr(h5obj, "cache_locks", None)
+    dropped = 0
+    for k in keys:
+        if cache.pop(k, None) is not None:
+            dropped += 1
+        if locks is not None:
+            locks.pop(k, None)
+    return dropped
+
+
 def _evict_new_cache_lines(h5obj, before: set) -> int:
     """Drop every h5coro cache line added since ``before`` was snapshotted.
 
@@ -207,8 +234,9 @@ def _evict_new_cache_lines(h5obj, before: set) -> int:
     transient peak; a later read that does want an evicted line just
     re-fetches it (B-tree nodes are not data, so in practice none does).
     Only keys absent from ``before`` are dropped — pre-existing lines (the
-    front-of-file metadata block every parse shares) always survive. Returns
-    the number of lines evicted.
+    front-of-file metadata block every parse shares) always survive, and each
+    dropped line takes its ``cache_locks`` entry with it
+    (:func:`_drop_cache_lines`). Returns the number of lines evicted.
 
     Structurally non-raising, which matters because callers run it from a
     ``finally`` where a raise would replace a successful ``ChunkMap`` return
@@ -223,9 +251,7 @@ def _evict_new_cache_lines(h5obj, before: set) -> int:
     if not cache:
         return 0
     added = [k for k in list(cache) if k not in before]
-    for k in added:
-        cache.pop(k, None)
-    return len(added)
+    return _drop_cache_lines(h5obj, added)
 
 
 def _evict_deferred_lines(h5obj, deferred: set) -> int:
@@ -250,7 +276,7 @@ def _evict_deferred_lines(h5obj, deferred: set) -> int:
     cache = getattr(h5obj, "cache", None)
     if not cache or not deferred:
         return 0
-    evicted = sum(cache.pop(k, None) is not None for k in list(deferred))
+    evicted = _drop_cache_lines(h5obj, list(deferred))
     deferred.clear()
     if evicted:
         logger.debug(f"  chunk maps: evicted {evicted} deferred cache line(s) after the fan-out")

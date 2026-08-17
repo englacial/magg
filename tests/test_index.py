@@ -679,16 +679,27 @@ class TestChunkMapCacheEviction:
     def test_cache_stays_flat_across_repeated_builds(self):
         # Issue #460 phase 3 guard: N successive build_chunk_map calls leave
         # len(h5obj.cache) flat. The leak this pins against was ~a cache line
-        # per B-tree node per build, retained until granule close.
+        # per B-tree node per build, retained until granule close. The lock
+        # table is pinned too (review finding on PR #462): cache_locks is a
+        # defaultdict keyed by the same offsets, so an eviction that left it
+        # alone kept a Lock + dict slot per line ever touched.
         h5obj = _open_fixture_small_lines()
         paths = ("/gt1l/heights/h_ph", "/gt1l/heights/lat_ph", "/gt1l/heights/signal_conf_ph")
         for p in paths:  # first round warms the shared object-header lines
             build_chunk_map(h5obj, p)
-        baseline = len(h5obj.cache)
+        baseline, baseline_locks = len(h5obj.cache), len(h5obj.cache_locks)
+        assert baseline_locks  # the walks really did populate the lock table
         for _ in range(5):
             for p in paths:
                 build_chunk_map(h5obj, p)
             assert len(h5obj.cache) == baseline
+            assert len(h5obj.cache_locks) == baseline_locks
+        # The counts alone are weak (a rebuild re-fetches the same offsets, so
+        # even an unpruned lock table stays flat across identical builds): pin
+        # that no evicted line is still holding a lock.
+        _, walk_lines, _ = self._unevicted_reference()
+        assert walk_lines and not walk_lines & set(h5obj.cache_locks)
+        assert set(h5obj.cache_locks) <= set(h5obj.cache)
 
     def test_pooled_read_fn_defers_eviction_under_concurrency(self):
         # Review finding on PR #462: read_fn's lazy map builds run across
