@@ -2797,6 +2797,124 @@ class TestNanFillCanonicalization:
         group = zarr.open_group(store, path=grid.group_path, mode="r")
         assert np.isnan(group["h_mean"].fill_value)
 
+    def test_nan_in_a_tuple_normalizes(self):
+        # Fold review: the walk recursed into dict/list only, so a
+        # Python-built config holding a tuple of dicts slipped past it.
+        d = self._cfg_dict(0.0)
+        d["data_source"]["filters"] = ({"dataset": "/h", "op": "le", "fill_value": float("nan")},)
+        cfg = load_config_from_dict(d)
+        assert cfg.data_source["filters"][0]["fill_value"] == "NaN"
+        assert isinstance(cfg.data_source["filters"], tuple)  # container type preserved
+
+    def test_np_float32_nan_normalizes(self):
+        # Fold review: np.float64 is a float subclass (caught either way);
+        # np.float32 is not, and survived as a float NaN.
+        cfg = load_config_from_dict(self._cfg_dict(np.float32("nan")))
+        assert cfg.aggregation["variables"]["h_mean"]["fill_value"] == "NaN"
+
+
+class TestNonFiniteFloatsAreRefusedAtValidation:
+    """Any non-finite float OUTSIDE ``fill_value`` is a config error (issue
+    #448 fold review).
+
+    Canonicalization is scoped to ``fill_value`` on purpose — rewriting every
+    float NaN in the tree would silently mangle authored values — so the
+    guarantee "no config reaches a dispatch payload strict JSON refuses" is
+    made real at validation instead: one ``json.dumps(asdict(cfg),
+    allow_nan=False)``-equivalent check, with the offending path named, so the
+    failure lands at load time rather than as an opaque
+    ``InvalidRequestContentException`` one dispatch later.
+    """
+
+    def _cfg_dict(self):
+        return {
+            "data_source": {
+                "reader": "h5coro",
+                "coordinates": {"latitude": "/lat", "longitude": "/lon"},
+                "variables": {"h": "/h"},
+            },
+            "aggregation": {
+                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+                "variables": {
+                    "h_mean": {
+                        "function": "mean",
+                        "source": "h",
+                        "dtype": "float32",
+                        "fill_value": "NaN",
+                    }
+                },
+            },
+            "output": {
+                "store": ".",
+                "grid": {"type": "healpix", "parent_order": 6, "child_order": 12},
+            },
+        }
+
+    def test_baseline_config_validates(self):
+        validate_config(load_config_from_dict(self._cfg_dict()))
+
+    def test_filter_value_nan_is_refused_with_its_path(self):
+        d = self._cfg_dict()
+        d["data_source"]["filters"] = [{"dataset": "/h", "op": "le", "value": float("nan")}]
+        with pytest.raises(ValueError, match=r"data_source\.filters\[0\]\.value"):
+            validate_config(load_config_from_dict(d))
+
+    def test_attrs_nan_is_refused_with_its_path(self):
+        d = self._cfg_dict()
+        d["aggregation"]["variables"]["h_mean"]["attrs"] = {"scale": float("nan")}
+        with pytest.raises(ValueError, match=r"aggregation\.variables\.h_mean\.attrs\.scale"):
+            validate_config(load_config_from_dict(d))
+
+    def test_infinity_is_refused_too(self):
+        # allow_nan=False rejects Infinity on the same line as NaN.
+        d = self._cfg_dict()
+        d["bounds"] = {"max_h": float("inf")}
+        with pytest.raises(ValueError, match=r"bounds\.max_h"):
+            validate_config(load_config_from_dict(d))
+
+    def test_np_float32_nan_is_refused(self):
+        # json.dumps calls this an unserializable TYPE, not an out-of-range
+        # float, so the walk (not the serializer) is what catches it.
+        d = self._cfg_dict()
+        d["bounds"] = {"max_h": np.float32("nan")}
+        with pytest.raises(ValueError, match=r"bounds\.max_h"):
+            validate_config(load_config_from_dict(d))
+
+    def test_error_names_the_remedy(self):
+        d = self._cfg_dict()
+        d["bounds"] = {"max_h": float("nan")}
+        with pytest.raises(ValueError) as e:
+            validate_config(load_config_from_dict(d))
+        assert "issue #448" in str(e.value) and "strict" in str(e.value)
+
+    def test_canonicalized_fill_value_still_validates(self):
+        # The load-time canonicalization is the semantic normalization; this
+        # check is the backstop, not a replacement -- a YAML ``.nan``
+        # fill_value must still sail through.
+        d = self._cfg_dict()
+        d["aggregation"]["variables"]["h_mean"]["fill_value"] = float("nan")
+        validate_config(load_config_from_dict(d))
+
+    def test_temporal_pipeline_is_checked_too(self):
+        # The check runs before validate_config's pipeline-kind branch, so a
+        # temporal config (which returns early) is covered as well.
+        d = self._cfg_dict()
+        d["pipeline"] = {"type": "temporal"}
+        d["bounds"] = {"max_h": float("nan")}
+        with pytest.raises(ValueError, match=r"bounds\.max_h"):
+            validate_config(load_config_from_dict(d))
+
+    def test_non_json_types_are_left_alone(self):
+        # A non-JSON *type* is a different fault; validation must not newly
+        # reject configs over it.
+        from datetime import datetime as _dt
+
+        from zagg.config import _validate_json_floats
+
+        d = self._cfg_dict()
+        d["bounds"] = {"temporal": {"start": _dt(2020, 1, 1)}}
+        _validate_json_floats(load_config_from_dict(d))  # must not raise
+
 
 class TestPackagedConfigsAreDispatchable:
     """Every packaged config must survive the strict JSON the Lambda dispatch
