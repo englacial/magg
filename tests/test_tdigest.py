@@ -1259,6 +1259,17 @@ class TestBatchedCompanionFolds:
             with batched_companion_folds():
                 _centroid_envelopes(words, starts, 9)
 
+    def test_a_partition_not_starting_at_zero_is_refused(self):
+        # The concatenation rebases on each entry's rows, so a partition that
+        # does not start at 0 would silently fold its first rows into the
+        # previous entry's last centroid — neither fold notices.
+        from zagg.stats.tdigest import _centroid_ancestors, batched_companion_folds
+
+        locs, starts = _point_words(6, seed=3), np.array([1, 4], dtype=np.int64)
+        with pytest.raises(ValueError, match="requires each centroid partition to start at 0"):
+            with batched_companion_folds():
+                _centroid_ancestors(locs, starts, 6)
+
     def test_batch_deactivates_after_exit(self):
         # The context always resets, so a later unbatched call folds for real.
         from zagg.stats.tdigest import batched_companion_folds
