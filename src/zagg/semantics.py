@@ -24,7 +24,11 @@ Included (the semantic core):
 - the **pipeline type** (``spatial`` | ``temporal`` | ``event``; absent
   normalizes to ``spatial`` — espg-ruled on the PR #316 review: a temporal
   engine over the same aggregation block is a different product; D19's
-  ratified list omitted it only because the temporal path wasn't in frame).
+  ratified list omitted it only because the temporal path wasn't in frame);
+- the raster **time-coordinate encoding** (``output.time_encoding``, spec §8 /
+  issue #443), keyed only when non-default: toc words and legacy microseconds
+  are different stored values meaning different things, exactly as
+  ``weights: "flux"`` is.
 
 Excluded as packaging: all orders (``parent_order``/``child_order``/
 ``chunk_inner``), ``sharded``, store layout/path, ``emit_cell_ids`` (the
@@ -55,6 +59,7 @@ import hashlib
 import json
 
 from zagg.config import PipelineConfig, get_pipeline_type
+from zagg.time_axis import DEFAULT_TIME_ENCODING
 
 #: ``data_source`` keys that are read machinery, not output semantics (D19).
 #: Changing any of these must never change the ``semantic_hash``.
@@ -258,6 +263,14 @@ def semantic_core(config: PipelineConfig) -> dict:
         # every existing config hashes stably.
         "pipeline": {"type": get_pipeline_type(config)},
     }
+    # The time coordinate's encoding (spec §8, issue #443) is output-defining
+    # for the same reason `weights: "flux"` is: the stored axis MEANS
+    # something else. Keyed only when non-default, so every config written
+    # before §8 — and the explicit `microseconds` spelling of the absent-key
+    # default — hashes byte-identically to today.
+    encoding = (config.output or {}).get("time_encoding")
+    if encoding not in (None, DEFAULT_TIME_ENCODING):
+        core["time_encoding"] = encoding
     return _prune_nulls(core)
 
 

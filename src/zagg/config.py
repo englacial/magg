@@ -395,6 +395,13 @@ def validate_config(config: PipelineConfig) -> None:
     # validated before the kind branch, like credentials_provider above.
     _validate_worker(config)
 
+    # The time coordinate's encoding (spec §8, issue #443) is checked on every
+    # pipeline kind, like the two blocks above: the value is only meaningful
+    # where a time coordinate exists, so declaring it elsewhere is a typo
+    # worth catching at submission rather than a knob that silently does
+    # nothing.
+    _validate_time_encoding(config)
+
     ptype = get_pipeline_type(config)
     if ptype != "spatial":
         _validate_temporal_config(config)
@@ -891,6 +898,24 @@ def _validate_temporal_config(config: PipelineConfig) -> None:
                 f"temporal variable '{name}' params must be a mapping (got {params!r})"
             )
     _validate_collection_options(config)
+
+
+def _validate_time_encoding(config: PipelineConfig) -> None:
+    """Validate ``output.time_encoding`` (spec §8, issue #443).
+
+    The knob declares how the ``(time, cells)`` time coordinate is encoded —
+    legacy int64 microseconds (absent/default) or mortie toc words. It is
+    raster-only: the spatial and temporal pipelines write no time coordinate,
+    so a declaration there would be inert.
+    """
+    from zagg.time_axis import DEFAULT_TIME_ENCODING, time_encoding
+
+    encoding = time_encoding(config)
+    if encoding != DEFAULT_TIME_ENCODING and (config.data_source or {}).get("reader") != "raster":
+        raise ValueError(
+            f"output.time_encoding: {encoding!r} applies to raster (time, cells) "
+            f"products only — this pipeline writes no time coordinate (spec §8)"
+        )
 
 
 def _validate_raster_config(config: PipelineConfig) -> None:

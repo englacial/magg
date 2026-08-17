@@ -81,7 +81,11 @@ writes the raster (time, cells) template instead, from a synchronous invoke):
         block for the manifest, sourced from the ShardMap metadata by the
         orchestrator (matching the local dispatcher). Absent on flat runs.
     "times_us": [int, ...] (raster only, issue #264) -- the catalog-derived
-        time coordinate, int64 microseconds since the epoch; the orchestrator
+        time coordinate, in whatever encoding "config" declares: int64
+        microseconds since the Unix epoch by default, or uint64 mortie toc
+        words under output.time_encoding: toc (spec §8, issue #443). Plain
+        ints either way; the worker re-derives the dtype from the config, so
+        the key name is historical and NOT a width claim. The orchestrator
         owns the global timestep index and threads it here so the template
         write needs no S3 access from the dispatcher.
     "run_manifest": dict (optional, issue #327) -- {"run_id", "shards"
@@ -838,10 +842,13 @@ def _handle_setup(event: Dict[str, Any]) -> Dict[str, Any]:
             import numpy as np
 
             from zagg.processing.raster import emit_raster_template
+            from zagg.time_axis import time_axis_dtype, time_encoding
 
             store = open_store(event["store_path"], **_output_store_kwargs(event))
             grid = from_config(config)
-            times_us = np.asarray(event["times_us"], dtype=np.int64)
+            # The wire carries plain ints; the cast is the config's declared
+            # time encoding (spec §8) — a toc word does not fit int64.
+            times_us = np.asarray(event["times_us"], dtype=time_axis_dtype(time_encoding(config)))
             if times_us.size == 0:
                 # A zero-timestep template is degenerate: the arrays get a
                 # 0-length time axis no worker can slab-write into.

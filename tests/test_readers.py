@@ -1295,3 +1295,92 @@ class TestReadParityWithoutConsolidation:
         assert set(locs_cons) == set(locs_plain)
         for key in locs_plain:
             np.testing.assert_array_equal(locs_plain[key], locs_cons[key])
+
+
+class TestTimeAxisReader:
+    """The §8 time-coordinate read surface (issue #443).
+
+    One code path for both encodings: the reader resolves the declaration
+    from the array's own attrs, so a caller never has to know which era a
+    store was written in.
+    """
+
+    def _store(self, encoding):
+        from zagg.config import load_config_from_dict
+        from zagg.processing.raster import emit_raster_template, raster_time_index
+
+        cfg = load_config_from_dict(
+            {
+                "data_source": {
+                    "reader": "raster",
+                    "bands": {"red": {"asset": "red", "dtype": "uint16"}},
+                },
+                "output": {
+                    "grid": {"type": "healpix", "parent_order": 4, "child_order": 6},
+                    "time_encoding": encoding,
+                },
+            }
+        )
+        grid = HealpixGrid(4, 6, config=cfg)
+        granules = [
+            [
+                {
+                    "id": "a",
+                    "assets": {"red": "x"},
+                    "datetime": "2025-06-15T15:06:40+00:00",
+                    "time_key": "dt-1",
+                },
+                {
+                    "id": "b",
+                    "assets": {"red": "y"},
+                    "datetime": "2025-06-15T15:06:47+00:00",
+                    "time_key": "dt-1",
+                },
+                {
+                    "id": "c",
+                    "assets": {"red": "z"},
+                    "datetime": "2025-06-16T15:06:40+00:00",
+                    "time_key": "dt-2",
+                },
+            ]
+        ]
+        _index, times = raster_time_index(granules, encoding=encoding)
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, times)
+        return store, grid, times
+
+    def test_toc_axis_decodes_to_conservative_bounds(self):
+        from zagg.readers import read_time_axis
+
+        store, grid, _times = self._store("toc")
+        lo, hi = read_time_axis(store, grid.group_path)
+        assert lo.dtype == np.dtype("datetime64[ns]") and lo.shape == (2,)
+        # The datatake's two tiles are 7 s apart: a range that contains both.
+        assert lo[0] <= np.datetime64("2025-06-15T15:06:40", "ns")
+        assert hi[0] > np.datetime64("2025-06-15T15:06:47", "ns")
+        # The single-item group stays an exact instant.
+        assert lo[1] == hi[1] == np.datetime64("2025-06-16T15:06:40", "ns")
+
+    def test_legacy_axis_reads_through_the_same_call(self):
+        from zagg.readers import read_time_axis
+
+        store, grid, _times = self._store("microseconds")
+        lo, hi = read_time_axis(store, grid.group_path)
+        np.testing.assert_array_equal(lo, hi)
+        assert lo[0] == np.datetime64("2025-06-15T15:06:40", "ns")
+
+    def test_window_selection_runs_on_the_stored_words(self):
+        import zarr as _zarr
+
+        from zagg.readers import time_axis_overlaps
+
+        store, grid, times = self._store("toc")
+        arr = _zarr.open_array(
+            store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False
+        )
+        mask = time_axis_overlaps(
+            arr[:], dict(arr.attrs), "2025-06-16T00:00:00", "2025-06-17T00:00:00"
+        )
+        np.testing.assert_array_equal(mask, [False, True])
+        # No decode happened: the predicate consumed the raw uint64 words.
+        assert arr.dtype == np.uint64 and times.dtype == np.uint64

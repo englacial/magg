@@ -1,0 +1,32 @@
+{
+ "spec": "morton-hive/1",
+ "dataset": {
+  "short_name": "SPEC_FIXTURE_RASTER",
+  "version": "1"
+ },
+ "semantic_hash": "af17d15801d112a1d6378896e9bf22ceffa4404f7d3b70731aa7ef3920dca3d6",
+ "cell_order": 6,
+ "shard_order": 4,
+ "split_schedule": [
+  1,
+  1,
+  1,
+  1
+ ],
+ "path_grouping": 1,
+ "pyramid": {
+  "spec": "zagg-pyramid/1",
+  "overview": {
+   "spacing": 2,
+   "orders": [
+    2,
+    0
+   ],
+   "all_time": false,
+   "fold_source": "cascade",
+   "exact_levels": 1,
+   "fields": {}
+  }
+ },
+ "generated_at": "2026-08-17T01:39:28+00:00"
+}

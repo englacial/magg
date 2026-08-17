@@ -11,6 +11,7 @@ import json
 import pathlib
 import sys
 import tempfile
+import time
 import types
 
 import numpy as np
@@ -125,6 +126,20 @@ def fake_spherely(monkeypatch):
     mod.intersects = _fake_intersects
     monkeypatch.setitem(sys.modules, "spherely", mod)
     return mod
+
+
+@pytest.fixture
+def pre_445_path(monkeypatch):
+    """Force ``build`` back onto the pre-#445 records-first path -- the oracle.
+
+    Before issue #445 an unindexed mortie build decoded every record and covered
+    each footprint from its rings (``_intersect_mortie``). Returning ``None``
+    from the ephemeral plan restores exactly that branch, so the two-stage cover
+    can be pinned against the path it replaced without a build kwarg that would
+    exist only for tests. The stored-column plan is untouched, so an indexed
+    build under this fixture still takes its own fast path.
+    """
+    monkeypatch.setattr(shardmap, "_live_cells_plan", lambda *a, **k: None)
 
 
 class TestBuildSpherelyBrute:
@@ -303,11 +318,18 @@ class TestMortieOrder:
 
     def test_default_keys_to_chunk_order(self, catalog):
         # chunk_inner=13 (the shipped ATL03 config) -> MOC order 13, the inner
-        # chunk the worker dispatches at.
+        # chunk the worker dispatches at. That is the resolver's contract, and
+        # it still governs every path that covers from decoded rings (beams,
+        # non-HEALPix, reproject). A HEALPix swath build covers from WKB instead
+        # and defaults to parent_order (issue #445), so it records 11 -- pinned
+        # beside the resolver so the two defaults can't drift unnoticed.
+        from zagg.catalog.shardmap import _resolve_mortie_order
+
         g = HealpixGrid(11, 19, layout="fullsphere", chunk_inner=13)
         assert g.chunk_order == 13
+        assert _resolve_mortie_order(None, g) == 13
         sm = ShardMap.build(catalog, g, backend="mortie")
-        assert sm.metadata["mortie_order"] == 13
+        assert sm.metadata["mortie_order"] == 11
 
     def test_default_falls_back_to_parent_order(self, catalog, hp_grid):
         # chunk_inner unset -> chunk_order == parent_order, so the MOC order is the
@@ -316,8 +338,11 @@ class TestMortieOrder:
         sm = ShardMap.build(catalog, hp_grid, backend="mortie")
         assert sm.metadata["mortie_order"] == 11
 
-    def test_default_under_mortie_cap_at_leaf_order_19(self, catalog):
-        # The shipped production grid (chunk_inner 13) -> 13, under the order-18 cap.
+    def test_default_under_mortie_cap_at_leaf_order_19(self, catalog, pre_445_path):
+        # The shipped production grid (chunk_inner 13) -> 13, under the order-18
+        # cap. Read on the records path, which is where the derived order is
+        # still what a build runs at (issue #445 moved the WKB path to
+        # parent_order); the leaf order 19 must not leak into either.
         g = HealpixGrid(11, 19, layout="fullsphere", chunk_inner=13)
         sm = ShardMap.build(catalog, g, backend="mortie")
         assert sm.metadata["mortie_order"] == 13
@@ -731,13 +756,16 @@ class TestFootprintCells:
         fast = ShardMap.build(cat.index_footprints(11), hp_grid, backend="mortie")
         assert _shard_ids(fast) == _shard_ids(geometry)
 
-    def test_multipolygon_is_a_superset_not_an_identity(self, hp_grid):
+    def test_multipolygon_is_a_superset_not_an_identity(self, hp_grid, pre_445_path):
         # The one place the fast path is deliberately NOT the geometry path.
         # ``index_footprints`` covers the union of the rings in each blob;
         # ``granule_records`` reads the largest part's exterior ring only. So a
         # two-part footprint gets the second part's shards from the index and
         # not from geometry -- a superset, and the intended answer. Alignment is
         # unaffected: every geometry shard is still present, with the same ids.
+        # The oracle is the pre-#445 records path (``pre_445_path``): the live
+        # path now shares this cover, so it shares the superset too -- pinned in
+        # ``TestLiveCover`` rather than smuggled in here as an equality.
         multi = _item("MULTI", -76.62, -76.60)
 
         def _ring(lon0, lon1):
@@ -1222,7 +1250,7 @@ class TestDeferredRecords:
         assert assigned == {"G0", "G1"}
         assert sm.metadata["total_granules"] == 2
 
-    def test_null_geometry_refuses_on_both_paths(self, hp_grid):
+    def test_null_geometry_refuses_on_both_paths(self, hp_grid, fake_spherely):
         # Predicate parity, the one input where the vectorised screen and the
         # row-wise loop see different things: ``shapely.from_wkb`` maps a null
         # WKB to ``None``, whose ``get_type_id`` is -1 (screened) while
@@ -1235,8 +1263,14 @@ class TestDeferredRecords:
         indexed = _with_null_geometry(_catalog(items).index_footprints(11), 0)
         with pytest.raises(ValueError, match="null geometry .*first at row 0"):
             ShardMap.build(indexed, hp_grid, backend="mortie")
-        with pytest.raises(AttributeError):
+        # The unindexed mortie build now runs the same screen (issue #445), so
+        # it refuses by name where it used to die on ``None.is_empty``. Still a
+        # refusal, and the record-decoding backends still give the old one --
+        # what must never happen is one path dropping the granule in silence.
+        with pytest.raises(ValueError, match="null geometry .*first at row 0"):
             ShardMap.build(_with_null_geometry(_catalog(items), 0), hp_grid, backend="mortie")
+        with pytest.raises(AttributeError):
+            ShardMap.build(_with_null_geometry(_catalog(items), 0), hp_grid, backend="spherely")
 
     def test_duplicate_ids_outside_the_aoi_still_refuse(self, hp_grid):
         # The duplicate-id refusal is a statement about the catalog, not about
@@ -1277,11 +1311,13 @@ class TestDeferredRecords:
         with pytest.raises(ValueError, match="order 9, coarser than.*parent_order 11"):
             ShardMap.build(cat, hp_grid, backend="mortie")
 
-    def test_multipolygon_superset_survives_the_inversion(self, hp_grid):
+    def test_multipolygon_superset_survives_the_inversion(self, hp_grid, pre_445_path):
         # The disclosed divergence (the column covers every part, the record
         # reads the largest part's ring) is a property of the COLUMN, so
         # intersecting first must not narrow it -- the second part's shards
-        # still appear, still carrying the granule's own record.
+        # still appear, still carrying the granule's own record. Oracle is the
+        # pre-#445 records path, since the live one now shares the column's
+        # cover (issue #445) and so shares its superset.
         def _ring(lon0, lon1):
             return [[lon0, 38.85], [lon1, 38.85], [lon1, 38.93], [lon0, 38.93], [lon0, 38.85]]
 
@@ -1298,6 +1334,324 @@ class TestDeferredRecords:
         by_shard = dict(zip(fast.shard_keys, fast.granules, strict=True))
         assert all([g["id"] for g in by_shard[k]] == ["MULTI"] for k in extra)
         assert all(g["s3"] == "s3://b/MULTI.h5" for k in extra for g in by_shard[k])
+
+
+class TestLiveCover:
+    """An UNINDEXED mortie build covers from WKB too (issue #445).
+
+    Same inversion as #439, applied to the path that had kept the old order:
+    cover the geometry column, intersect, then decode records for the hits. The
+    oracle is the path it replaces -- ``pre_445_path`` restores the record-first
+    ``_intersect_mortie`` build -- and the pin is the serialized manifest, so
+    "faster" cannot quietly become "different". The intended divergences (the
+    MultiPolygon superset, inherited with the cover; the cover order, now
+    ``parent_order``, and the superset it admits at coarse shard orders) are
+    pinned as divergences, each on its own.
+    """
+
+    @pytest.fixture
+    def hp_grid(self):
+        # chunk_inner=13 with parent_order=11 -- the shipped ATL03 shape, and
+        # the one that separates the two defaults: the records path covers at
+        # the chunk order 13, this one at the shard order 11.
+        return HealpixGrid(11, 19, layout="fullsphere", chunk_inner=13)
+
+    @staticmethod
+    def _payload(sm, tmp_path, name, *, drop=("build_wall_s",)):
+        """The serialized manifest, minus the keys that are not the assignment."""
+        path = str(tmp_path / name)
+        sm.to_json(path)
+        payload = json.loads(pathlib.Path(path).read_text())
+        for key in drop:
+            payload["metadata"].pop(key, None)
+        return payload
+
+    def _region(self):
+        return [
+            (
+                np.array([38.85, 38.85, 38.93, 38.93, 38.85]),
+                np.array([-76.62, -76.55, -76.55, -76.62, -76.62]),
+            )
+        ]
+
+    def test_serializes_identically_to_the_pre_445_path(self, hp_grid, tmp_path, monkeypatch):
+        # The invariant the issue rests on: same catalog, same grid, same AOI ->
+        # the same JSON, key for key, on the single-part footprints every CMR
+        # ATL03/06 granule has. Includes a screened (non-polygonal) row and an
+        # AOI narrower than the catalog, so the ``rows`` map is not the identity
+        # and most records go unassigned.
+        #
+        # It doubles as an in-suite check of the order-sweep invariant quoted in
+        # ``_resolve_mortie_order``: the oracle covers at the chunk order 13 and
+        # this path at the shard order 11, and the assignment is the same,
+        # because a shard map states order-11 membership and nothing finer.
+        items = [_item(f"G{i:02d}", -76.62 + 0.008 * i, -76.60 + 0.008 * i) for i in range(24)]
+        pt = _item("PT", -76.60, -76.58)
+        pt["geometry"] = {"type": "Point", "coordinates": [-76.59, 38.89]}
+        cat = _catalog(items[:11] + [pt] + items[11:])
+        live = ShardMap.build(cat, hp_grid, region=self._region(), backend="mortie")
+        monkeypatch.setattr(shardmap, "_live_cells_plan", lambda *a, **k: None)
+        oracle = ShardMap.build(cat, hp_grid, region=self._region(), backend="mortie")
+        assert 0 < live.metadata["granules_assigned"] < live.metadata["total_granules"], (
+            "the AOI must discard records, or the inversion is untested here"
+        )
+        assert live.metadata["mortie_order"] == 11
+        assert oracle.metadata["mortie_order"] == 13
+        drop = ("build_wall_s", "mortie_order")
+        assert self._payload(live, tmp_path, "live.json", drop=drop) == self._payload(
+            oracle, tmp_path, "oracle.json", drop=drop
+        )
+
+    def test_default_order_is_the_shard_order(self, hp_grid, monkeypatch):
+        # espg's ruling (2026-08-16): the map records order-11 shard membership,
+        # and the sweep in ``_resolve_mortie_order`` measures granules/shard flat
+        # for every order >= parent_order, so covering at the chunk order buys
+        # nothing and costs ~2x the MOC words per order. One cover, at 11.
+        orders = []
+        real = Catalog.cover_footprints
+        monkeypatch.setattr(
+            Catalog,
+            "cover_footprints",
+            lambda self, order: (orders.append(order), real(self, order))[1],
+        )
+        sm = ShardMap.build(_overlapping_catalog(), hp_grid, backend="mortie")
+        assert orders == [11]
+        assert sm.metadata["mortie_order"] == 11
+        assert "footprint_cells" not in sm.metadata, "nothing was persisted"
+
+    def test_coarse_shard_order_covers_a_superset(self, monkeypatch):
+        # The order default is flat by MEASUREMENT, not identical by
+        # construction: mortie's coverage is conservative per order, so a cover
+        # at ``parent_order`` can keep a boundary cell that the chunk-order
+        # cover refined down does not -- never the reverse. Every production
+        # pair measured flat (9/13, 11/13, 8/12, 9/11: 0/200 rows differing over
+        # random polygons), so it takes a coarse grid to see the gap at all:
+        # parent 6 against chunk 10, one rectangle straddling an order-6 seam.
+        # The assertion is the DIRECTION -- a future change that made the
+        # default a subset (dropping a real granule/shard pair) fails here.
+        coarse = HealpixGrid(6, 12, layout="fullsphere", chunk_inner=10)
+        cat = _catalog([_item("G00", 86.389228, 88.222362, lat0=-61.180344, lat1=-60.706814)])
+        region = [
+            (
+                np.array([-62.0, -62.0, -60.0, -60.0, -62.0]),
+                np.array([85.0, 89.0, 89.0, 85.0, 85.0]),
+            )
+        ]
+        live = ShardMap.build(cat, coarse, region=region, backend="mortie")
+        monkeypatch.setattr(shardmap, "_live_cells_plan", lambda *a, **k: None)
+        oracle = ShardMap.build(cat, coarse, region=region, backend="mortie")
+        assert live.metadata["mortie_order"] == 6
+        assert oracle.metadata["mortie_order"] == 10
+        assert set(oracle.shard_keys) < set(live.shard_keys), (
+            "the coarse cover must be a STRICT superset on this fixture, or it has stopped "
+            "reproducing the divergence and no longer pins the direction"
+        )
+        assert len(live.shard_keys) == 4 and len(oracle.shard_keys) == 3
+        by_shard = dict(zip(live.shard_keys, live.granules, strict=True))
+        extra = set(live.shard_keys) - set(oracle.shard_keys)
+        assert all([g["id"] for g in by_shard[k]] == ["G00"] for k in extra)
+
+    def test_pinned_order_is_honored_and_matches_the_oracle(self, hp_grid, tmp_path, monkeypatch):
+        # An explicit order is a request for a cover at that order -- nothing is
+        # persisted here, so unlike the stored plan (which refuses a pin it
+        # cannot restate) this path simply covers there, and must land the
+        # oracle's assignment at the same pin.
+        cat = _overlapping_catalog()
+        live = ShardMap.build(
+            cat, hp_grid, region=self._region(), backend="mortie", mortie_order=13
+        )
+        assert live.metadata["mortie_order"] == 13
+        monkeypatch.setattr(shardmap, "_live_cells_plan", lambda *a, **k: None)
+        oracle = ShardMap.build(
+            cat, hp_grid, region=self._region(), backend="mortie", mortie_order=13
+        )
+        assert self._payload(live, tmp_path, "p.json") == self._payload(oracle, tmp_path, "o.json")
+
+    def test_a_pinned_indexed_build_covers_live_too(self, hp_grid, tmp_path, monkeypatch):
+        # The third population whose assignment moves. ``_footprint_cells_plan``
+        # declines a pinned order (a persisted column cannot restate one), and
+        # since #445 what catches that is THIS plan, not the geometry path -- so
+        # an indexed catalog built with ``mortie_order=`` covers from WKB and
+        # inherits the MultiPolygon superset, exactly as the unindexed build
+        # does. Pinned three ways: same assignment as the unindexed pinned
+        # build, a strict superset of the pre-#445 records path, and the
+        # ``footprint_cells: False`` metadata unchanged (the stored column
+        # really did go unused).
+        def _ring(lon0, lon1):
+            return [[lon0, 38.85], [lon1, 38.85], [lon1, 38.93], [lon0, 38.93], [lon0, 38.85]]
+
+        def _cat():
+            multi = _item("MULTI", -76.62, -76.60)
+            multi["geometry"] = {
+                "type": "MultiPolygon",
+                "coordinates": [[_ring(-76.62, -76.60)], [_ring(-76.53, -76.52)]],
+            }
+            return _catalog([_item("G00", -76.56, -76.54), multi])
+
+        indexed = ShardMap.build(_cat().index_footprints(11), hp_grid, mortie_order=13)
+        unindexed = ShardMap.build(_cat(), hp_grid, backend="mortie", mortie_order=13)
+        monkeypatch.setattr(shardmap, "_live_cells_plan", lambda *a, **k: None)
+        records = ShardMap.build(_cat().index_footprints(11), hp_grid, mortie_order=13)
+        assert indexed.metadata["footprint_cells"] is False
+        assert records.metadata["footprint_cells"] is False
+        assert indexed.metadata["mortie_order"] == 13
+        # ``footprint_cells_order`` is the CATALOG's own metadata, carried
+        # through by the indexed build and legitimately absent from the
+        # unindexed one; everything else must match key for key.
+        drop = ("build_wall_s", "footprint_cells", "footprint_cells_order")
+        assert self._payload(indexed, tmp_path, "i.json", drop=drop) == self._payload(
+            unindexed, tmp_path, "u.json", drop=drop
+        )
+        assert set(records.shard_keys) < set(indexed.shard_keys), (
+            "the pinned indexed build must inherit the cover's MultiPolygon superset"
+        )
+        by_shard = dict(zip(indexed.shard_keys, indexed.granules, strict=True))
+        extra = set(indexed.shard_keys) - set(records.shard_keys)
+        assert all([g["id"] for g in by_shard[k]] == ["MULTI"] for k in extra)
+
+    def test_pinned_order_coarser_than_the_shards_still_refuses(self, hp_grid):
+        # The pin is validated exactly as the records path validates it (#92),
+        # and before any cover runs.
+        with pytest.raises(ValueError, match="coarser than the grid's parent_order"):
+            ShardMap.build(_overlapping_catalog(), hp_grid, backend="mortie", mortie_order=8)
+
+    def test_total_granules_counts_the_screen(self, hp_grid, monkeypatch):
+        # ``total_granules`` is the records CONSIDERED. The live path never
+        # builds that list, so it counts the row screen -- and must land on the
+        # number the records path reports from ``len(records)``, screened row
+        # and all.
+        good = [_item(f"G{i:02d}", -76.62 + 0.008 * i, -76.60 + 0.008 * i) for i in range(6)]
+        pt = _item("PT", -76.62, -76.60)
+        pt["geometry"] = {"type": "Point", "coordinates": [-76.61, 38.89]}
+        cat = _catalog(good[:3] + [pt] + good[3:])
+        assert len(cat.granule_records()) == 6, "the fixture must screen exactly one row"
+        live = ShardMap.build(cat, hp_grid, backend="mortie")
+        monkeypatch.setattr(shardmap, "_live_cells_plan", lambda *a, **k: None)
+        oracle = ShardMap.build(cat, hp_grid, backend="mortie")
+        assert live.metadata["total_granules"] == oracle.metadata["total_granules"] == 6
+        assert live.metadata["granules_assigned"] == oracle.metadata["granules_assigned"]
+
+    def test_records_are_decoded_for_the_hits_only(self, hp_grid, monkeypatch):
+        # The point of the inversion: an AOI that keeps a handful of granules
+        # must not pay to decode the rest (~25 s of a 29.5 s clone-scale build).
+        cat = _overlapping_catalog(n=24)
+        decoded: list = []
+        real = Catalog.granule_records
+        monkeypatch.setattr(
+            Catalog,
+            "granule_records",
+            lambda self: (decoded.append(self.table.num_rows), real(self))[1],
+        )
+        narrow = [
+            (
+                np.array([38.85, 38.85, 38.93, 38.93, 38.85]),
+                np.array([-76.62, -76.60, -76.60, -76.62, -76.62]),
+            )
+        ]
+        sm = ShardMap.build(cat, hp_grid, region=narrow, backend="mortie")
+        assigned = sm.metadata["granules_assigned"]
+        assert 0 < assigned < 24, "the AOI must discard granules, or nothing is being pinned"
+        assert decoded == [assigned], f"decoded {decoded} rows for {assigned} assigned granules"
+
+    def test_multipolygon_is_a_superset_of_the_records_path(self, hp_grid, monkeypatch):
+        # The disclosed divergence, now inherited by the live path: ``from_wkbs``
+        # covers the union of the parts inside each blob, where
+        # ``granule_records`` reads the largest part's exterior ring only. So a
+        # multi-part footprint assigns to shards the pre-#445 build never saw --
+        # a superset, never a swap, and never for a CMR ATL03/06 granule (all
+        # single-part).
+        def _ring(lon0, lon1):
+            return [[lon0, 38.85], [lon1, 38.85], [lon1, 38.93], [lon0, 38.93], [lon0, 38.85]]
+
+        multi = _item("MULTI", -76.62, -76.60)
+        multi["geometry"] = {
+            "type": "MultiPolygon",
+            "coordinates": [[_ring(-76.62, -76.60)], [_ring(-76.53, -76.52)]],
+        }
+        cat = _catalog([_item("G00", -76.56, -76.54), multi])
+        live = ShardMap.build(cat, hp_grid, backend="mortie")
+        monkeypatch.setattr(shardmap, "_live_cells_plan", lambda *a, **k: None)
+        oracle = ShardMap.build(cat, hp_grid, backend="mortie")
+        extra = set(live.shard_keys) - set(oracle.shard_keys)
+        assert extra, "the second part must contribute shards the records path never sees"
+        assert set(oracle.shard_keys) <= set(live.shard_keys)
+        by_shard = dict(zip(live.shard_keys, live.granules, strict=True))
+        assert all([g["id"] for g in by_shard[k]] == ["MULTI"] for k in extra)
+
+    def test_build_wall_spans_the_cover_but_not_the_records(self, hp_grid, monkeypatch):
+        # ``build_wall_s`` has always covered the plan and the intersection and
+        # never the record decode (issue #439); the ephemeral cover is
+        # intersection work, so it lands inside. Pinned with a sleep on each
+        # side rather than by reading the code.
+        real_cover, real_records = Catalog.cover_footprints, Catalog.granule_records
+        monkeypatch.setattr(
+            Catalog,
+            "cover_footprints",
+            lambda self, order: (time.sleep(0.05), real_cover(self, order))[1],
+        )
+        monkeypatch.setattr(
+            Catalog, "granule_records", lambda self: (time.sleep(0.2), real_records(self))[1]
+        )
+        sm = ShardMap.build(_overlapping_catalog(n=4), hp_grid, backend="mortie")
+        assert 0.05 <= sm.metadata["build_wall_s"] < 0.2
+
+    def test_the_budget_refusal_names_a_remedy_that_exists(self, hp_grid, monkeypatch):
+        # The cell-budget refusal is shared with the stored path, but its
+        # remedy is not: "re-index the catalog / drop the footprint_cells
+        # column" names two things an unindexed build does not have, and
+        # re-indexing would not move it anyway (the cover is flattened to
+        # ``parent_order`` whatever order it ran at). ``build`` knows which
+        # cover it holds, so the message must say so.
+        import mortie
+
+        cat = _overlapping_catalog(n=2)
+        indexed_cat = cat.index_footprints(11)
+
+        def boom(*args, **kwargs):
+            raise ValueError("MOC 0 would expand to more than 1048576 cells at order 11")
+
+        monkeypatch.setattr(mortie, "mocs_to_orders", boom)
+        with pytest.raises(ValueError) as live:
+            ShardMap.build(cat, hp_grid, backend="mortie")
+        with pytest.raises(ValueError) as stored:
+            ShardMap.build(indexed_cat, hp_grid, backend="mortie")
+        assert "footprint cover batch failed" in str(live.value)
+        assert "no footprint_cells column to re-cut or drop" in str(live.value)
+        assert "coarser parent_order" in str(live.value) and "parent_order 11" in str(live.value)
+        assert "Re-index the catalog" not in str(live.value)
+        assert "footprint_cells batch failed" in str(stored.value)
+        assert "Re-index the catalog at a coarser order" in str(stored.value)
+
+    def test_empty_catalog_builds_an_empty_map(self, hp_grid):
+        # ``filter_bbox`` can cut a catalog to nothing, and the records path
+        # handled that by returning ``{}`` out of ``_flatten_rings``. The cover
+        # has to land in the same place: no blob for ``from_wkbs`` to parse, and
+        # an offsets array that is still one entry per (zero) row.
+        cat = _overlapping_catalog(n=2)
+        empty = Catalog(cat.table.slice(0, 0), dict(cat.metadata))
+        sm = ShardMap.build(empty, hp_grid, backend="mortie")
+        assert sm.shard_keys == []
+        assert sm.metadata["total_granules"] == 0
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            pytest.param({"chosen": "spherely"}, id="spherely-backend"),
+            pytest.param({"footprint": "beams"}, id="beams-footprint"),
+        ],
+    )
+    def test_gated_off_for_the_paths_that_need_records(self, hp_grid, grid, kwargs):
+        # Each exclusion is a path whose geometry the cover does not describe:
+        # spherely is exact S2 (a MOC swap would change semantics behind the
+        # caller, espg/mortie#32), ``beams`` covers per-beam corridors rather
+        # than the CMR swath (#65), and a rectilinear grid has no shard order
+        # for the cover to key to. Each must fall through to the records path.
+        args = {"chosen": "mortie", "footprint": "swath", **kwargs}
+        cat = _overlapping_catalog(n=2)
+        gated = shardmap._live_cells_plan(cat, hp_grid, args["chosen"], args["footprint"], None)
+        assert gated is None
+        assert shardmap._live_cells_plan(cat, grid, "mortie", "swath", None) is None
+        assert shardmap._live_cells_plan(cat, hp_grid, "mortie", "swath", None) is not None
 
 
 class TestIO:
@@ -2124,6 +2478,23 @@ class TestPairedAssetBuild:
         for gid in assigned:  # only paired primaries; the pairless third never appears
             assert not gid.startswith("GEDI01_B_2019120")
         assert {p["id"][:10] for p in sm.metadata["pairless"]} == {"GEDI01_B_2", "GEDI02_A_2"}
+
+    def test_paired_build_skips_the_ephemeral_cover_too(self, monkeypatch):
+        """Pairing filters records, so neither cover-first path may engage.
+
+        The ephemeral cover (issue #445) aligns positionally to the raw catalog
+        table exactly as the stored column does, so a paired build has to stay
+        on the records path for the same reason -- and unlike the stored plan,
+        this one engages on an *unindexed* catalog, which is every paired build.
+        """
+        l1b, l2a = self._catalogs()
+        monkeypatch.setattr(
+            shardmap,
+            "_live_cells_plan",
+            lambda *a, **k: pytest.fail("a paired build must not cover-and-intersect"),
+        )
+        sm = ShardMap.build(l1b, HealpixGrid(11, 17, layout="fullsphere"), sibling_catalog=l2a)
+        assert {rec["id"] for shard in sm.granules for rec in shard}
 
     def test_pairless_excluded_and_reported(self, grid, fake_spherely):
         l1b, l2a = self._catalogs()
