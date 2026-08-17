@@ -33,9 +33,10 @@ x86_64 / py3.12 is available for local/testing parity.
 
 ### What's in the layer vs function code
 
-**Layer** (built by `build_layer.sh` — the normative build entry point; its pins
-are co-owned with the `lambda` extra in `pyproject.toml`, and mortie's version
-spec is read from `pyproject.toml` at build time — issue #322):
+**Layer** (built by `build_layer.sh` — the normative build entry point; it holds
+no pins of its own: every exact pin is read out of the `lambda` extra in
+`pyproject.toml` at build time by its `lambda_pin` helper, as mortie's version
+spec already was — issue #322, PR #436):
 numpy, pandas, arro3-core, fastparquet, cramjam, xarray, h5netcdf, h5py, shapely,
 pyproj, odc-geo, affine, cachetools, h5coro, h5coro-hidefix, mortie, async-tiff,
 obspec, and their transitive deps. (`earthaccess` is orchestrator-only and
@@ -96,11 +97,16 @@ GB-seconds per full run, this saves ~$0.60/run. Over many runs it adds up.
 ### The build (containerized — the one normative path)
 
 `deployment/aws/build_layer.sh` is the normative build entry point for the layer
-(package set, numpy page-alignment build, bloat strip, 250 MB gate). Its pins
-are co-owned with the `lambda` extra in `pyproject.toml` — the script says "keep
-in sync" at each one — and mortie's spec is read out of `pyproject.toml`
-directly (issue #322), so a floor bump there reaches the layer with no second
-edit. Do not hand-maintain a parallel pip recipe.
+(package set, numpy page-alignment build, bloat strip, 250 MB gate). It declares
+no versions itself: the `lambda` extra in `pyproject.toml` is the sole edit site,
+and the script derives every exact pin from it at build time (PR #436) with the
+`lambda_pin` helper — `NAME_PIN=$(lambda_pin <dist>)` before any install —
+extending the mortie spec read that issue #322 introduced. So a version change
+in the extra reaches the layer with no second edit, and a *literal* pin
+reintroduced into the script is a second declaration site that
+`tests/test_lambda_build.py::TestLayerExtraParity` fails on (as it does on a pin
+derived but never passed to a `$PIP install` line). Do not hand-maintain a
+parallel pip recipe.
 
 The script must run inside an arch-matched `manylinux_2_28` container (cp312),
 and it hard-fails on a mismatch (`ERROR: building <arch> layer on <machine>
@@ -138,8 +144,9 @@ docker run --rm \
 On an SELinux-enforcing Linux host, add `:z` to the podman volume mount
 (`-v "$(pwd)":/workspace:z`). Without it the container cannot *read* the
 unlabeled mount either, so the build dies at the top (`chmod +x build_layer.sh`,
-or reading `../../pyproject.toml` for `MORTIE_SPEC`) rather than at zip-write
-time. Note `:z` relabels the mount **recursively with a shared label** — and the
+or the first `../../pyproject.toml` read — since PR #436 that is every
+`lambda_pin` call, before any install, not just `MORTIE_SPEC`) rather than at
+zip-write time. Note `:z` relabels the mount **recursively with a shared label** — and the
 mount here is the whole repo root, not a scratch dir; `:Z` is the private-label
 variant. Neither is needed on macOS (`podman machine`).
 

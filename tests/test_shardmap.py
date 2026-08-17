@@ -8,6 +8,7 @@ they run in the default venv (#36).
 """
 
 import json
+import pathlib
 import sys
 import tempfile
 import types
@@ -405,6 +406,17 @@ def _overlapping_catalog(n=12):
     """
     items = [_item(f"G{i:02d}", -76.62 + 0.008 * i, -76.60 + 0.008 * i) for i in range(n)]
     return _catalog(items)
+
+
+def _with_null_geometry(cat, row):
+    """Copy of ``cat`` with row ``row``'s geometry WKB set to null."""
+    field = cat.table.schema.field("geometry")
+    wkb = cat.table.column("geometry").to_pylist()
+    wkb[row] = None
+    table = cat.table.set_column(
+        cat.table.column_names.index("geometry"), field, pa.array(wkb, field.type)
+    )
+    return Catalog(table, dict(cat.metadata or {}))
 
 
 class TestMortieBatch:
@@ -895,9 +907,10 @@ class TestFootprintCells:
             all_shards = {
                 int(s) for s in hp_grid.coverage(shardmap._region_parts(region, cat.metadata))
             }
-            values, offsets, order, rows = shardmap._footprint_cells_plan(
-                cat, records, hp_grid, "mortie", "swath", None
+            values, offsets, order, rows, considered = shardmap._footprint_cells_plan(
+                cat, hp_grid, "mortie", "swath", None
             )
+            assert considered == len(records), "the plan must count the records it aligns"
             assert order == index_order, "the plan must carry the column's own order"
             oracle = _intersect_cells_serial(rows, values, offsets, hp_grid, all_shards)
             assigned = {g for v in oracle.values() for g in v}
@@ -933,9 +946,8 @@ class TestFootprintCells:
         #   an earlier record and fail the equality.
         items = [_item(f"G{i}", -76.62 + 0.15 * i, -76.60 + 0.15 * i) for i in range(10)]
         cat = _catalog(items).index_footprints(11)
-        records = cat.granule_records()
-        values, offsets, _order, rows = shardmap._footprint_cells_plan(
-            cat, records, hp_grid, "mortie", "swath", None
+        values, offsets, _order, rows, _considered = shardmap._footprint_cells_plan(
+            cat, hp_grid, "mortie", "swath", None
         )
 
         def box(w, e, s=38.84, n=38.94):
@@ -954,7 +966,7 @@ class TestFootprintCells:
 
         for block in (1, 3, 4, 10):
             assert run(box(-76.63, -75.24, s=-40.0, n=-39.9), block) == set()
-            assert run(box(-76.63, -75.24), block) == set(range(len(records)))
+            assert run(box(-76.63, -75.24), block) == set(range(rows.size))
             # Records 4 and 5 exactly -- a middle run, so ``surv[0] != 0`` and
             # the trailing records are dropped too.
             assert run(box(-76.03, -75.84), block) == {4, 5}
@@ -974,9 +986,8 @@ class TestFootprintCells:
 
         items = [_item(f"G{i}", -76.62 + 0.05 * i, -76.60 + 0.05 * i) for i in range(6)]
         cat = _catalog(items).index_footprints(11)
-        records = cat.granule_records()
-        values, offsets, _order, rows = shardmap._footprint_cells_plan(
-            cat, records, hp_grid, "mortie", "swath", None
+        values, offsets, _order, rows, _considered = shardmap._footprint_cells_plan(
+            cat, hp_grid, "mortie", "swath", None
         )
         far = [
             (
@@ -1003,10 +1014,9 @@ class TestFootprintCells:
         import mortie
 
         cat = _overlapping_catalog().index_footprints(11)
-        records = cat.granule_records()
         all_shards = {int(s) for s in hp_grid.coverage(shardmap._region_parts(None, cat.metadata))}
-        values, offsets, _order, rows = shardmap._footprint_cells_plan(
-            cat, records, hp_grid, "mortie", "swath", None
+        values, offsets, _order, rows, _considered = shardmap._footprint_cells_plan(
+            cat, hp_grid, "mortie", "swath", None
         )
         real, calls = mortie.mocs_to_orders, []
 
@@ -1035,9 +1045,8 @@ class TestFootprintCells:
 
         items = [_item(f"G{i}", -76.62 + 0.15 * i, -76.60 + 0.15 * i) for i in range(8)]
         cat = _catalog(items).index_footprints(11)
-        records = cat.granule_records()
-        values, offsets, _order, rows = shardmap._footprint_cells_plan(
-            cat, records, hp_grid, "mortie", "swath", None
+        values, offsets, _order, rows, _considered = shardmap._footprint_cells_plan(
+            cat, hp_grid, "mortie", "swath", None
         )
 
         def box(w, e):
@@ -1114,6 +1123,181 @@ class TestFootprintCells:
         rows = np.arange(len(cat.granule_records()), dtype=np.int64)
         assert shardmap._intersect_footprint_cells(rows, values, offsets, hp_grid, set()) == {}
         assert shardmap._intersect_footprint_cells(rows[:0], values, offsets, hp_grid, {1}) == {}
+
+
+def _eager_hit_records(catalog, rows, shard_to_idx):  # noqa: ARG001 (mirror real sig)
+    """The pre-#439 shape of the fast path's record step -- the parity oracle.
+
+    Before the inversion, ``build`` called ``granule_records()`` up front and the
+    intersection's indices *were* indices into that list. Monkeypatching
+    ``_hit_records`` to this restores exactly that: every record decoded, the
+    assignment untouched. Anything the shipped path serializes differently is a
+    regression in the renumbering, not a difference of opinion about ordering.
+    """
+    return catalog.granule_records(), shard_to_idx
+
+
+class TestDeferredRecords:
+    """Phase 5: the intersection runs BEFORE any record is decoded (issue #439).
+
+    The measured problem: over the 555,867-granule ATL03 clone against a
+    California AOI, ``granule_records()`` was ~25 s of a 29.5 s build and 99.6%
+    of what it decoded was then discarded. Inverting the two is only safe if the
+    manifest is bit-for-bit what the eager order produced, so the oracle here is
+    that order itself (``_eager_hit_records``), and the traps it has to clear are
+    the ones the id-alignment used to cover: the row screen, and duplicate ids
+    among rows the AOI never sees.
+    """
+
+    @pytest.fixture
+    def hp_grid(self):
+        return HealpixGrid(11, 17, layout="fullsphere")
+
+    @staticmethod
+    def _payload(sm, tmp_path, name):
+        """The serialized manifest, minus the one key that is a stopwatch."""
+        path = str(tmp_path / name)
+        sm.to_json(path)
+        payload = json.loads(pathlib.Path(path).read_text())
+        payload["metadata"].pop("build_wall_s")
+        return payload
+
+    def test_serializes_identically_to_the_eager_order(self, hp_grid, tmp_path, monkeypatch):
+        # The invariant the whole issue rests on: same catalog, same grid, same
+        # AOI -> the same JSON, key for key. Includes a screened row and an AOI
+        # narrower than the catalog, so the renumbering is exercised over a
+        # non-identity ``rows`` map with most records unassigned.
+        items = [_item(f"G{i:02d}", -76.62 + 0.008 * i, -76.60 + 0.008 * i) for i in range(24)]
+        pt = _item("PT", -76.60, -76.58)
+        pt["geometry"] = {"type": "Point", "coordinates": [-76.59, 38.89]}
+        cat = _catalog(items[:11] + [pt] + items[11:]).index_footprints(11)
+        region = [
+            (
+                np.array([38.85, 38.85, 38.93, 38.93, 38.85]),
+                np.array([-76.62, -76.55, -76.55, -76.62, -76.62]),
+            )
+        ]
+        deferred = ShardMap.build(cat, hp_grid, region=region, backend="mortie")
+        monkeypatch.setattr(shardmap, "_hit_records", _eager_hit_records)
+        eager = ShardMap.build(cat, hp_grid, region=region, backend="mortie")
+        assert deferred.metadata["footprint_cells"] is True
+        assert 0 < deferred.metadata["granules_assigned"] < deferred.metadata["total_granules"], (
+            "the AOI must discard records, or the inversion is untested here"
+        )
+        assert self._payload(deferred, tmp_path, "d.json") == self._payload(
+            eager, tmp_path, "e.json"
+        )
+
+    def test_total_granules_still_counts_the_records_considered(self, hp_grid):
+        # ``total_granules`` is provenance: the catalog records CONSIDERED, not
+        # the ones assigned. The deferred path never builds that list, so it
+        # counts the row screen instead -- and must land on the same number the
+        # geometry path reports from ``len(records)``, screened row and all.
+        good = [_item(f"G{i:02d}", -76.62 + 0.008 * i, -76.60 + 0.008 * i) for i in range(6)]
+        pt = _item("PT", -76.62, -76.60)
+        pt["geometry"] = {"type": "Point", "coordinates": [-76.61, 38.89]}
+        cat = _catalog(good[:3] + [pt] + good[3:])
+        assert len(cat.granule_records()) == 6, "the fixture must screen exactly one row"
+        geometry = ShardMap.build(cat, hp_grid, backend="mortie")
+        fast = ShardMap.build(cat.index_footprints(11), hp_grid, backend="mortie")
+        assert fast.metadata["total_granules"] == geometry.metadata["total_granules"] == 6
+        assert fast.metadata["granules_assigned"] == geometry.metadata["granules_assigned"]
+
+    def test_screened_row_inside_the_aoi_is_never_assigned(self, hp_grid):
+        # The alignment trap. The column is table-row-ordered, so intersecting
+        # it first walks rows ``granule_records`` would have dropped -- and a
+        # non-polygonal row sitting INSIDE the AOI cover is the case where that
+        # matters: ``index_footprints`` gives it an empty MOC, so it must fall
+        # out of the intersection rather than be handed a neighbour's slot.
+        # (mortie's coverage would refuse the Point outright, so an unscreened
+        # index would not even build.)
+        pt = _item("PT", -76.60, -76.58)
+        pt["geometry"] = {"type": "Point", "coordinates": [-76.59, 38.89]}
+        empty = _item("EMPTY", -76.60, -76.58)
+        empty["geometry"] = {"type": "Polygon", "coordinates": []}
+        items = [_item("G0", -76.62, -76.56), pt, empty, _item("G1", -76.58, -76.52)]
+        cat = _catalog(items).index_footprints(11)
+        sm = ShardMap.build(cat, hp_grid, backend="mortie")
+        assigned = {g["id"] for shard in sm.granules for g in shard}
+        assert assigned == {"G0", "G1"}
+        assert sm.metadata["total_granules"] == 2
+
+    def test_null_geometry_refuses_on_both_paths(self, hp_grid):
+        # Predicate parity, the one input where the vectorised screen and the
+        # row-wise loop see different things: ``shapely.from_wkb`` maps a null
+        # WKB to ``None``, whose ``get_type_id`` is -1 (screened) while
+        # ``None.is_empty`` raises. Screening it would let an indexed build drop
+        # the granule silently -- and not even count it in ``total_granules`` --
+        # while the same catalog on the geometry path still crashed. Both refuse.
+        items = [_item("G0", -76.62, -76.60), _item("G1", -76.58, -76.56)]
+        with pytest.raises(ValueError, match="null geometry .*first at row 0"):
+            _with_null_geometry(_catalog(items), 0).index_footprints(11)
+        indexed = _with_null_geometry(_catalog(items).index_footprints(11), 0)
+        with pytest.raises(ValueError, match="null geometry .*first at row 0"):
+            ShardMap.build(indexed, hp_grid, backend="mortie")
+        with pytest.raises(AttributeError):
+            ShardMap.build(_with_null_geometry(_catalog(items), 0), hp_grid, backend="mortie")
+
+    def test_duplicate_ids_outside_the_aoi_still_refuse(self, hp_grid):
+        # The duplicate-id refusal is a statement about the catalog, not about
+        # this build's hits, so it must fire on rows the intersection would have
+        # thrown away. Put both copies of the repeated id far outside the region
+        # -- under a hits-only check the build would sail through and the
+        # operator would never learn the column cannot be trusted.
+        far = dict(_item("DUP", 12.00, 12.02))
+        far2 = dict(_item("DUP", 12.10, 12.12))
+        cat = _catalog([_item("NEAR", -76.62, -76.60), far, far2])
+        region = [
+            (
+                np.array([38.85, 38.85, 38.93, 38.93, 38.85]),
+                np.array([-76.62, -76.59, -76.59, -76.62, -76.62]),
+            )
+        ]
+        # The geometry path is unaffected, then and now.
+        assert ShardMap.build(cat, hp_grid, region=region, backend="mortie").shard_keys
+        # The message must state the mechanism the code implements: alignment is
+        # positional, so the refusal is about the catalog's integrity, not about
+        # an id lookup going last-wins (that lookup was deleted in #439).
+        with pytest.raises(
+            ValueError,
+            match="duplicate granule ids .*1 repeats over 3 rows.*matched to rows by position",
+        ) as exc:
+            ShardMap.build(cat.index_footprints(11), hp_grid, region=region, backend="mortie")
+        assert "by id" not in str(exc.value)
+
+    def test_order_refusal_precedes_any_record_decode(self, hp_grid, monkeypatch):
+        # The order guard now runs before ``granule_records`` rather than after
+        # it, which must not change WHAT it says -- and while we are here, pin
+        # that the refused build decodes nothing at all (the point of the
+        # inversion is that no path to a refusal pays the 25 s).
+        cat = _overlapping_catalog().index_footprints(9)
+        monkeypatch.setattr(
+            Catalog, "granule_records", lambda self: pytest.fail("records must not be decoded")
+        )
+        with pytest.raises(ValueError, match="order 9, coarser than.*parent_order 11"):
+            ShardMap.build(cat, hp_grid, backend="mortie")
+
+    def test_multipolygon_superset_survives_the_inversion(self, hp_grid):
+        # The disclosed divergence (the column covers every part, the record
+        # reads the largest part's ring) is a property of the COLUMN, so
+        # intersecting first must not narrow it -- the second part's shards
+        # still appear, still carrying the granule's own record.
+        def _ring(lon0, lon1):
+            return [[lon0, 38.85], [lon1, 38.85], [lon1, 38.93], [lon0, 38.93], [lon0, 38.85]]
+
+        multi = _item("MULTI", -76.62, -76.60)
+        multi["geometry"] = {
+            "type": "MultiPolygon",
+            "coordinates": [[_ring(-76.62, -76.60)], [_ring(-76.53, -76.52)]],
+        }
+        cat = _catalog([_item("G00", -76.56, -76.54), multi]).index_footprints(11)
+        fast = ShardMap.build(cat, hp_grid, backend="mortie")
+        geometry = ShardMap.build(_catalog([_item("G00", -76.56, -76.54), multi]), hp_grid)
+        extra = set(fast.shard_keys) - set(geometry.shard_keys)
+        assert extra, "the second part must contribute shards geometry never sees"
+        by_shard = dict(zip(fast.shard_keys, fast.granules, strict=True))
+        assert all([g["id"] for g in by_shard[k]] == ["MULTI"] for k in extra)
+        assert all(g["s3"] == "s3://b/MULTI.h5" for k in extra for g in by_shard[k])
 
 
 class TestIO:
@@ -1922,6 +2106,24 @@ class TestPairedAssetBuild:
             assert sib["s3"] and sib["https"]
             # The sibling is THIS acquisition's, not another's.
             assert sibling_join_key(sib["id"]) == sibling_join_key(rec["id"])
+
+    def test_paired_build_skips_the_stored_index_plan(self):
+        """Pairing filters records; the positional fast path must not engage.
+
+        The ``footprint_cells`` plan aligns positionally to the raw catalog
+        table (issue #439), which cannot represent a pairing-filtered record
+        list (issue #425) -- so a paired build takes the geometry path even on
+        an indexed catalog, and still pairs/excludes correctly.
+        """
+        l1b, l2a = self._catalogs()
+        hp = HealpixGrid(11, 17, layout="fullsphere")
+        sm = ShardMap.build(l1b.index_footprints(11), hp, sibling_catalog=l2a)
+        assert sm.metadata.get("footprint_cells") is not True  # plan skipped
+        assigned = {rec["id"] for shard in sm.granules for rec in shard}
+        assert assigned  # the paired primaries still assign
+        for gid in assigned:  # only paired primaries; the pairless third never appears
+            assert not gid.startswith("GEDI01_B_2019120")
+        assert {p["id"][:10] for p in sm.metadata["pairless"]} == {"GEDI01_B_2", "GEDI02_A_2"}
 
     def test_pairless_excluded_and_reported(self, grid, fake_spherely):
         l1b, l2a = self._catalogs()
