@@ -1088,6 +1088,53 @@ class TestFixtureSemanticHash:
         assert self._recorded(PYRAMID) == semantic_hash(cfg_v1)
 
 
+class TestFixtureGranuleIdentity:
+    """The OTHER half of the identity pair: each leaf's ``granules.json``
+    sibling (issue #388) must self-pair and be recorded in the CANONICAL
+    granule-id space (issue #415's granule ruling).
+
+    Nothing else in the suite reads that object —
+    :class:`TestFixtureSemanticHash` recomputes ``semantic_hash`` only — so the
+    epoch's edits to the committed siblings were covered by no assertion at
+    all. Both properties matter to a reader: a sibling whose digest does not
+    pair with its own id list is rejected as ``unrecorded-ids``
+    (``zagg.dedup._sibling_ids``), which silently disarms the contraction guard
+    on that leaf; and an id list still in the pre-epoch href space would pair
+    with nothing a post-epoch run plans.
+    """
+
+    #: Every committed sibling, enumerated over the tree the way
+    #: ``test_every_fixture_is_covered`` is, so a new fixture cannot ship one
+    #: unguarded.
+    SIBLINGS = sorted(
+        p.relative_to(SPEC_DATA).as_posix() for p in SPEC_DATA.glob("**/granules.json")
+    )
+
+    def test_every_leaf_fixture_carries_the_sibling(self):
+        # The gate on the gate, on ``test_every_fixture_is_covered``'s pattern:
+        # a fixture with a leaf but no recorded id list ships a leaf the
+        # contraction guard cannot protect. ``pyramid/`` is manifest-only (no
+        # leaf, hence no sibling), which is why this keys on the leaf.
+        want = {
+            f"{name}/{Path(_expected(name)['leaf']).parent.as_posix()}/granules.json"
+            for name in TestFixtureSemanticHash.COVERED
+            if _expected(name).get("leaf")
+        }
+        assert set(self.SIBLINGS) == want
+
+    @pytest.mark.parametrize("rel", SIBLINGS)
+    def test_the_sibling_self_pairs_on_canonical_ids(self, rel):
+        from zagg.telemetry import GRANULE_IDS_SPEC, canonical_granule_ids, granules_sha256
+
+        sibling = json.loads((SPEC_DATA / rel).read_text())
+        ids = sibling["granule_ids"]
+        assert sibling["spec"] == GRANULE_IDS_SPEC
+        assert granules_sha256(ids) == sibling["granules_sha256"]
+        # Already canonical, and sorted as the writer records them: the epoch is
+        # a fixed point on these ids, so re-canonicalizing moves nothing.
+        assert canonical_granule_ids(ids) == ids == sorted(ids)
+
+
 class TestTemporalDeclaration:
     """§8 — the temporal declaration, pinned on the committed `raster_toc/`.
 
