@@ -1346,7 +1346,9 @@ element dtype and trailing inner shape — exactly the pair the `/1` attrs
 block declares:
 
 - element dtype `float32`, inner shape `(2,)` for a digest payload array;
-- element dtype `uint64`, inner shape `()` for a locations sibling.
+- element dtype `uint64`, inner shape `()` for a locations sibling (§2.2), and
+  the same pair for a `{field}_times` temporal sibling (§8.3) — the two
+  companions are one dtype, differing only in the declaration they carry.
 
 A cell's logical value is the `(n, *inner_shape)` array itself rather than
 its raw bytes; everything else about the array — shape, cells axis,
@@ -1775,11 +1777,20 @@ storage geometry (§1.5). It is an ordinary dense array — not a
 
 - The array's `fill_value` MUST be `0`, and **`0` is reserved**: it marks a
   cell the writer left unobserved and MUST NOT be read as an acquisition. A
-  writer MUST NOT store `0` for an observed cell. (The one word the grammar
-  encodes as `0` is a degenerate range whose conservative envelope is the
-  epoch instant itself; every mission this store form serves postdates the
-  epoch by more than a century, so the collision is a documented exclusion,
-  not a live case.)
+  writer MUST NOT store `0` for an observed cell. **The reservation is
+  cost-free**: `0` is not a value the grammar's encoders can produce, and it
+  is empty where it is decoded, so the sentinel excludes nothing.
+  - No encoder emits it. The epoch instant encodes as `2147483648` (the flag
+    bit sits at position 31, not at the bottom of the word), and the shortest
+    range word is `1`, because the range encoder's end code is a
+    strictly-greater ceiling and is therefore `≥ 1` for every input, `(0, 0)`
+    included.
+  - `toc_merge` cannot introduce it. The join is over encoded words, so a
+    reduction over words no encoder produced as `0` does not produce `0`.
+  - It is empty, not an instant. `0` decodes as a **range** word whose
+    envelope is the half-open `[0, 0)` — it overlaps no window, including one
+    containing the epoch — so a reader that meets it under the grammar's
+    overlap predicate selects nothing, with or without this reservation.
 - A cell whose word covers **exactly one** observation MUST be a
   **timestamp** word, exact to the nanosecond. A cell pooling more than one
   MUST be a **range** word whose envelope conservatively contains every
