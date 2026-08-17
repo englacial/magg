@@ -251,17 +251,19 @@ class TestExecuteReadPlan:
         np.testing.assert_array_equal(out, expected)
 
     def test_single_element_run_zero_dim_part(self):
-        # h5coro's readDatasets returns a 0-d array (numpy scalar) for a
-        # single-element hyperslice; np.concatenate raises on 0-d inputs
-        # ("zero-dimensional arrays cannot be concatenated"). Regression for
-        # the 2026-08-17 GEDI fleet run, which dropped 26 group reads this way.
+        # h5coro itself returns shape (1,) for a single-element hyperslice
+        # (h5dataset.py reshapes only when ndims > 1), so this fake stands in
+        # for a scalar-returning ``read_fn`` WRAPPER, not for h5coro: a bridge
+        # that indexes rather than slices hands back a 0-d numpy scalar, and
+        # np.concatenate rejects 0-d inputs ("zero-dimensional arrays cannot be
+        # concatenated"). Pin that atleast_1d absorbs it.
         data = np.arange(100.0, dtype=np.float32)
         plan = self._make_plan([(42, 43)])
 
         def read_fn(path, hyperslice=None):
             lo, hi = hyperslice[0]
             if hi - lo == 1:
-                return data[lo]  # 0-d numpy scalar, as h5coro returns
+                return data[lo]  # 0-d numpy scalar from a wrapper that indexes
             return data[lo:hi]
 
         out = execute_read_plan(plan, read_fn, "/h", np.float32)
@@ -269,7 +271,8 @@ class TestExecuteReadPlan:
         np.testing.assert_array_equal(out, data[42:43])
 
     def test_mixed_single_and_multi_element_runs(self):
-        # A single-element run alongside normal runs: order and values of the
+        # A scalar-returning single-element run (see above -- a wrapper's shape,
+        # not h5coro's) alongside normal runs: order and values of the
         # multi-element parts must be unchanged.
         data = np.arange(100.0, dtype=np.float32)
         plan = self._make_plan([(5, 10), (42, 43), (20, 25)])
@@ -299,6 +302,25 @@ class TestExecuteReadPlan:
         plan = ReadPlan(parent_runs=[], base_slices=[], chunk_lists=[], full_read=True)
         with pytest.raises(ValueError, match="returned None"):
             execute_read_plan(plan, lambda *a, **k: None, "/h", np.float32)
+
+    def test_two_dim_parts_keep_their_columns(self):
+        # 2-D datasets really do flow through here: _select_column/_predicate_mask
+        # in processing/read.py take a ``column`` selector into an N-D array
+        # (ATL03 signal_conf_ph is (n, 5)), and h5coro returns (1, 5) for a
+        # single-row hyperslice. atleast_1d is a no-op on 2-D -- pin that, so a
+        # later reshape/ravel-flavored normalization can't silently flatten
+        # (n, 5) to (5n,) and resurface as "'column' set but array is 1-D".
+        data = np.arange(100.0, dtype=np.float32).reshape(20, 5)
+        plan = self._make_plan([(2, 5), (12, 13), (17, 20)])
+
+        def read_fn(path, hyperslice=None):
+            lo, hi = hyperslice[0]
+            return data[lo:hi]  # (k, 5), incl. the single-row (1, 5) part
+
+        out = execute_read_plan(plan, read_fn, "/h", np.float32)
+        assert out.shape == (7, 5)
+        expected = np.concatenate([data[2:5], data[12:13], data[17:20]])
+        np.testing.assert_array_equal(out, expected)
 
     def test_full_read_plan_calls_without_hyperslice(self):
         data = np.arange(50.0, dtype=np.float32)
