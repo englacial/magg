@@ -38,14 +38,7 @@ output:
   # int64 microseconds cannot state and a toc word can. Output-defining: a
   # store born on toc is a different product from a legacy-axis one.
   time_encoding: toc
-  # Overview family OFF, declared rather than left absent (issue #459): an
-  # absent key means the every-2-orders default is ON (`get_pyramid` -> {}), so
-  # every raster run dispatches a rollup sweep whose overview family generates
-  # nothing -- raster fields have no fold law (issue #399 ruled option (b), a
-  # raster column writer, and it is unimplemented; raster leaves stay
-  # column-less by construction, PR #416 phase 5). Mirrors the benchmark leg's
-  # opt-out in tests/data/benchmark/configs/s2_neon_o9.yaml (issue #201).
-  pyramid: false
+  pyramid: false                 # overview family off: raster leaves are column-less (issue #399, issue #459)
   grid:
     type: healpix
     parent_order: 11
