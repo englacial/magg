@@ -184,12 +184,45 @@ def _walk_chunk_btree(ds) -> list[tuple[tuple[int, ...], int, int, int]]:
     return entries
 
 
+def _cache_keys(h5obj) -> set:
+    """Snapshot of ``h5obj.cache``'s keys (empty for cache-less handles)."""
+    return set(getattr(h5obj, "cache", None) or ())
+
+
+def _evict_new_cache_lines(h5obj, before: set) -> int:
+    """Drop every h5coro cache line added since ``before`` was snapshotted.
+
+    The snapshot-and-evict half of issue #460: ``H5Coro.cache`` retains a full
+    ``cacheLineSize`` line (4 MiB default) for every byte range a cached
+    ``ioRequest`` touches, and releases nothing until granule close. A chunk
+    B-tree walk reads each node exactly once, but on a sparse file the nodes
+    rarely share a line (GEDI L1B ``rxwaveform``: 13,790 chunks → +531 MB
+    retained per beam group, ~4.2 GB per granule), so the walk's lines are
+    pure dead weight afterwards. Evicting them caps residency at one walk's
+    transient peak; a later read that does want an evicted line just
+    re-fetches it (B-tree nodes are not data, so in practice none does).
+    Only keys absent from ``before`` are dropped — pre-existing lines (the
+    front-of-file metadata block every parse shares) always survive. Returns
+    the number of lines evicted.
+    """
+    cache = getattr(h5obj, "cache", None)
+    if not cache:
+        return 0
+    added = [k for k in cache if k not in before]
+    for k in added:
+        cache.pop(k, None)
+    return len(added)
+
+
 def build_chunk_map(h5obj, path: str) -> ChunkMap:
     """Build a :class:`ChunkMap` for one dataset by walking its metadata.
 
     Metadata-only: no chunk is ever read or decompressed. A contiguous-layout
     dataset yields a single pseudo-chunk covering the full first axis
     (mirroring h5py's ``get_offset()`` treatment in the bench extractor).
+    Cache lines the B-tree walk pulls into ``h5obj.cache`` are evicted before
+    returning (issue #460) — the object-header lines the ``H5Dataset`` parse
+    touched stay cached, since every dataset in the group shares them.
 
     Raises ``KeyError`` for an absent path (h5coro's ``metaOnly`` traversal
     never raises on its own — it just leaves default metadata) and
@@ -200,7 +233,11 @@ def build_chunk_map(h5obj, path: str) -> ChunkMap:
     ds = H5Dataset(h5obj, path, earlyExit=True, metaOnly=True, enableAttributes=False)
     if ds.meta.typeSize == 0:
         raise KeyError(path)
-    return _chunk_map_from_dataset(h5obj, ds, path)
+    before = _cache_keys(h5obj)
+    try:
+        return _chunk_map_from_dataset(h5obj, ds, path)
+    finally:
+        _evict_new_cache_lines(h5obj, before)
 
 
 def _chunk_map_from_dataset(h5obj, ds, path: str) -> ChunkMap:

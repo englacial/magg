@@ -445,6 +445,32 @@ def _open_fixture():
     return h5c.H5Coro(str(FIXTURE_H5), filedriver.FileDriver, errorChecking=True, verbose=False)
 
 
+def _open_fixture_small_lines(counting=False):
+    """Fixture handle with tiny (512-byte) cache lines, for the issue #460
+    eviction tests: at the default 4 MiB line the whole 86 KB fixture is one
+    cache line, so walk-added and pre-existing keys are indistinguishable; at
+    512 bytes the B-tree node lands on its own line(s), outside the
+    object-header metadata lines. ``counting=True`` wraps the driver so each
+    ranged read is counted (``h5obj.driver.reads``)."""
+    from h5coro import filedriver
+    from h5coro import h5coro as h5c
+
+    driver = filedriver.FileDriver
+    if counting:
+
+        class _CountingFileDriver(filedriver.FileDriver):
+            def __init__(self, resource, credentials):
+                super().__init__(resource, credentials)
+                self.reads = 0
+
+            def read(self, pos, size):
+                self.reads += 1
+                return super().read(pos, size)
+
+        driver = _CountingFileDriver
+    return h5c.H5Coro(str(FIXTURE_H5), driver, errorChecking=True, verbose=False, cacheLineSize=512)
+
+
 def _fixture_data_source(**extra):
     """ATL03-shaped hierarchical data_source over the fixture (mirrors the
     shipped atl03.yaml: photon base level, segment spatial index, TEP filter)."""
@@ -579,6 +605,76 @@ class TestChunkMap:
         assert not cm.starts_on_boundary(255)
         assert not cm.starts_on_boundary(257)
         assert not cm.starts_on_boundary(2432)  # dataset end, not a chunk start
+
+
+class TestChunkMapCacheEviction:
+    """Issue #460: the B-tree walk must not strand h5coro cache lines.
+
+    ``H5Coro.cache`` keeps a full cache line per touched byte range until
+    granule close; on sparse files (GEDI L1B) the walk's node lines stranded
+    ~4 MiB per chunk B-tree node (+531 MB per beam group). ``build_chunk_map``
+    now snapshots the cache keys after the object-header parse and evicts
+    every key the walk added.
+    """
+
+    PATH = "/gt1l/heights/h_ph"
+
+    def _unevicted_reference(self):
+        """Parse + raw (unevicted) walk on a fresh handle: returns the handle's
+        parse-line keys, the walk-added keys, and the resulting map."""
+        from h5coro.h5dataset import H5Dataset
+
+        from zagg.index.inline import _chunk_map_from_dataset
+
+        ref = _open_fixture_small_lines()
+        ds = H5Dataset(ref, self.PATH, earlyExit=True, metaOnly=True, enableAttributes=False)
+        parse_lines = set(ref.cache)
+        cm = _chunk_map_from_dataset(ref, ds, self.PATH)
+        walk_lines = set(ref.cache) - parse_lines
+        return parse_lines, walk_lines, cm
+
+    def test_walk_lines_evicted_preexisting_lines_survive(self):
+        h5obj = _open_fixture_small_lines()
+        pre = set(h5obj.cache)  # the open's superblock/root lines
+        assert pre
+        build_chunk_map(h5obj, self.PATH)
+        post = set(h5obj.cache)
+        assert pre <= post  # pre-existing lines are never evicted
+        parse_lines, walk_lines, _ = self._unevicted_reference()
+        assert walk_lines  # the fixture's B-tree node lives outside the metadata lines
+        assert post == parse_lines  # exactly the parse's lines are retained...
+        assert not post & walk_lines  # ...and none of the walk's
+
+    def test_map_identical_to_unevicted_walk(self):
+        cm = build_chunk_map(_open_fixture_small_lines(), self.PATH)
+        _, _, ref = self._unevicted_reference()
+        assert cm.raw == ref.raw
+        for f in ("elem_start", "elem_end", "byte_offset", "nbytes", "filter_mask"):
+            assert getattr(cm, f).tolist() == getattr(ref, f).tolist()
+        assert (cm.dims, cm.chunk_dims, cm.dtype, cm.gzip, cm.shuffle) == (
+            ref.dims,
+            ref.chunk_dims,
+            ref.dtype,
+            ref.gzip,
+            ref.shuffle,
+        )
+
+    def test_rebuild_refetches_only_the_walk_lines(self):
+        # The eviction's whole cost: a rebuild re-fetches the walk's lines
+        # (the parse's lines stayed cached), nothing else.
+        h5obj = _open_fixture_small_lines(counting=True)
+        first = build_chunk_map(h5obj, self.PATH)
+        r1 = h5obj.driver.reads
+        second = build_chunk_map(h5obj, self.PATH)
+        _, walk_lines, _ = self._unevicted_reference()
+        assert h5obj.driver.reads - r1 == len(walk_lines)
+        assert second.raw == first.raw
+
+    def test_cache_less_handle_is_a_noop(self):
+        from zagg.index.inline import _cache_keys, _evict_new_cache_lines
+
+        assert _cache_keys(object()) == set()
+        assert _evict_new_cache_lines(object(), set()) == 0
 
 
 class TestInlineReadGroup:
