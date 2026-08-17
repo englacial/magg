@@ -94,6 +94,9 @@ import numpy as np
 #: map ``_compress`` returns -> one word per output centroid.
 _ChannelFold = Callable[[np.ndarray, np.ndarray, int], np.ndarray]
 
+#: One deferred fold: member words, offset-adjusted starts, placeholder, declared n.
+_Deferred = tuple[np.ndarray, np.ndarray, np.ndarray, int]
+
 __all__ = [
     "build_tdigest",
     "build_tdigest_pairwise",
@@ -186,7 +189,7 @@ class _CompanionBatch:
     Inside :func:`batched_companion_folds`, each :func:`_centroid_ancestors` /
     :func:`_centroid_envelopes` call *defers*: it hands back an unfilled
     ``uint64`` placeholder of the right length and records its ``(member
-    words, offset-adjusted starts)``. The flush then runs the real fold ONCE
+    words, offset-adjusted starts, n)``. The flush then runs the real fold ONCE
     per channel over the concatenated layout and fills every placeholder in
     place.  Both folds are segment-independent — each output word reduces over
     its own member slice — and ``_compress`` always emits starts partitioning
@@ -201,8 +204,8 @@ class _CompanionBatch:
     """
 
     def __init__(self) -> None:
-        #: fold -> [(member words, offset-adjusted starts, placeholder)]
-        self._pending: dict[_ChannelFold, list[tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+        #: fold -> its deferrals, in call order
+        self._pending: dict[_ChannelFold, list[_Deferred]] = {}
         #: fold -> running member-row count (the next deferral's offset)
         self._rows: dict[_ChannelFold, int] = {}
 
@@ -210,7 +213,12 @@ class _CompanionBatch:
         starts = np.asarray(starts, dtype=np.int64)
         out = np.empty(len(starts), dtype=np.uint64)
         rows = self._rows.get(fold, 0)
-        self._pending.setdefault(fold, []).append((words[:n], starts + rows, out))
+        # The declared ``n`` rides along rather than being re-derived from
+        # ``len(words)`` at the flush: the two agree for every current caller, but a
+        # deferral whose ``n`` overruns its words must fail where the unbatched call
+        # would (mortie's exact-cover check) rather than silently fold a different
+        # partition on the single-entry arm.
+        self._pending.setdefault(fold, []).append((words[:n], starts + rows, out, n))
         self._rows[fold] = rows + n
         return out
 
@@ -218,14 +226,14 @@ class _CompanionBatch:
         """Run each channel's fold once over its concatenated deferrals."""
         for fold, entries in self._pending.items():
             if len(entries) == 1:
-                words, starts, out = entries[0]
-                out[:] = fold(words, starts, len(words))
+                words, starts, out, n = entries[0]
+                out[:] = fold(words, starts, n)
                 continue
-            words_all = np.concatenate([w for w, _, _ in entries])
-            starts_all = np.concatenate([s for _, s, _ in entries])
+            words_all = np.concatenate([w for w, _, _, _ in entries])
+            starts_all = np.concatenate([s for _, s, _, _ in entries])
             reduced = fold(words_all, starts_all, self._rows[fold])
             pos = 0
-            for _, _, out in entries:
+            for _, _, out, _ in entries:
                 out[:] = reduced[pos : pos + len(out)]
                 pos += len(out)
         self._pending.clear()
