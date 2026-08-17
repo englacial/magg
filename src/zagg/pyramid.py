@@ -192,6 +192,17 @@ def declared_fields(config) -> tuple[dict, list]:
                     {"delta": delta, "overview_delta": meta.get("overview_delta")}
                 ),
             }
+            # The §9 located companion (ruling 4 on issue #410): a located field
+            # folds through the pyramid, so every overview level carries the
+            # ``{field}_locations`` sibling and the sweep folds it with the
+            # digest. Recorded because the manifest is the ONLY thing the
+            # overview writer reconstructs a field from
+            # (``sweep_overview._overview_config``) — without it the overview
+            # template would emit no sibling and the fold would have nowhere to
+            # write. Keyed only when set, so an unlocated field's manifest entry
+            # is byte-identical to pre-#410.
+            if meta.get("location") is not None:
+                fields[name]["location"] = str(meta["location"])
             # The §2.0 weights declaration, keyed only when non-default so
             # existing manifests stay byte-identical; the sweep's fold gate
             # compares it against the stored arrays (issue #424). Its

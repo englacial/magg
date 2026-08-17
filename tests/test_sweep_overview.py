@@ -194,8 +194,11 @@ class TestComposabilityClasses:
         classes = composability_classes(default_config("atl03_tdigest_healpix"))
         assert classes["h_tdigest"] == "approximate"
 
-    def test_located_tdigest_is_none(self):
-        # The located channel has no streaming merge law yet -> excluded.
+    def test_located_tdigest_is_approximate(self):
+        # Ruling 4 on issue #410: a located field folds THROUGH the pyramid --
+        # the located k-way merge is its channel's fold law (spec §9.1), and the
+        # old `none` classification was the bug (a `location:` declaration used
+        # to remove the digest from every overview level).
         meta = {
             "kind": "ragged",
             "function": "zagg.stats.tdigest.build_tdigest",
@@ -203,7 +206,55 @@ class TestComposabilityClasses:
             "location": "leaf_id",
             "dtype": "float32",
         }
+        assert field_composability(meta) == "approximate"
+
+    def test_temporal_companion_is_still_none(self):
+        # Ruling 3's per-centroid -> per-cell coarsening at overview levels
+        # (spec §8.4) is not wired through the fold sites, so a temporal field
+        # stays at native resolution: folding it through its own reducer would
+        # emit a word whose envelope claim is false.
+        meta = {
+            "kind": "ragged",
+            "function": "zagg.stats.tdigest.build_tdigest",
+            "inner_shape": [2],
+            "location": "leaf_id",
+            "temporal": "per-centroid",
+            "dtype": "float32",
+        }
         assert field_composability(meta) == "none"
+
+    def test_located_declaration_rides_the_manifest_entry(self):
+        # The manifest is the only description the overview WRITER has of a
+        # field (``_overview_config``), so the channel has to be recorded there
+        # or the overview template emits no sibling for the fold to write.
+        from zagg.config import PipelineConfig
+        from zagg.pyramid import declared_fields
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "h_tdigest": {
+                        "kind": "ragged",
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "inner_shape": [2],
+                        "location": "leaf_id",
+                        "dtype": "float32",
+                    },
+                    "h_plain": {
+                        "kind": "ragged",
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "inner_shape": [2],
+                        "dtype": "float32",
+                    },
+                }
+            }
+        )
+        fields, excluded = declared_fields(cfg)
+        assert excluded == []
+        assert fields["h_tdigest"]["location"] == "leaf_id"
+        # Keyed only when set: an unlocated field's entry is byte-identical to
+        # what pre-#410 wrote.
+        assert "location" not in fields["h_plain"]
 
     @pytest.mark.parametrize("name", ["min", "np.min", "numpy.min", "nanmax", "np.nansum"])
     def test_prefix_normalization(self, name):
@@ -920,6 +971,200 @@ class TestPyramidV2Gate:
         manifest["pyramid"] = {"spec": "zagg-pyramid/2"}
         counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
         assert counts["declared"] is False and counts["regime"] == "stages"
+
+
+#: A located declaration for the harness above: the same ``h_tdigest`` field,
+#: plus the §9 channel ruling 4 makes foldable (issue #410).
+LOCATED_FIELDS_DECL = {
+    **{k: v for k, v in FIELDS_DECL.items() if k != "h_tdigest"},
+    "h_tdigest": {**FIELDS_DECL["h_tdigest"], "location": "leaf_id"},
+}
+
+
+def _located_leaf_cfg():
+    from zagg.config import PipelineConfig
+
+    return PipelineConfig(
+        aggregation={
+            "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+            "variables": {
+                "count": {"function": "len", "dtype": "int32", "fill_value": 0},
+                "h_min": {"function": "min", "dtype": "float32"},
+                "h_mean": {"function": "mean", "dtype": "float32"},
+                "h_tdigest": {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest",
+                    "inner_shape": [2],
+                    "dtype": "float32",
+                    "fill_value": 0,
+                    "location": "leaf_id",
+                },
+            },
+        }
+    )
+
+
+def _make_located_leaf(root, decimal, cells, *, window=None):
+    """A committed leaf carrying the payload AND its ``h_tdigest_locations``.
+
+    ``cells`` maps leaf row -> observation values; each cell's per-observation
+    morton point words come from ``conftest.point_words``, seeded on the row so
+    two cells never share a word.
+    """
+    from conftest import point_words
+    from mortie import generate_morton_children
+
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.stats.tdigest import build_tdigest
+
+    grid = HealpixGrid(SHARD_ORDER, CELL_ORDER, config=_located_leaf_cfg())
+    word = morton_word(decimal)
+    store = open_store(shard_leaf_path(str(root), word, window=window))
+    grid.emit_shard_template(store, overwrite=True)
+    group = zarr.open_group(store, path=str(CELL_ORDER), mode="r+", zarr_format=3)
+    n = 4 ** (CELL_ORDER - SHARD_ORDER)
+    group["morton"][:] = np.asarray(generate_morton_children(word, CELL_ORDER), dtype=np.uint64)
+    count = np.zeros(n, np.int32)
+    h_min = np.full(n, np.nan, np.float32)
+    h_mean = np.full(n, np.nan, np.float32)
+    digest = np.full(n, b"", dtype=object)
+    locs = np.full(n, b"", dtype=object)
+    truth = {}
+    for i, obs in cells.items():
+        obs = np.asarray(obs, dtype=np.float64)
+        words = point_words(len(obs), seed=1000 + i)
+        d, w = build_tdigest(obs, 64, locations=words)
+        count[i] = len(obs)
+        h_min[i] = obs.min()
+        h_mean[i] = obs.mean()
+        digest[i] = encode_digest(d, "float32")
+        locs[i] = encode_digest(w, "uint64")
+        truth[i] = words
+    group["count"][:] = count
+    group["h_min"][:] = h_min
+    group["h_mean"][:] = h_mean
+    group["h_tdigest"][:] = digest
+    group["h_tdigest_locations"][:] = locs
+    stamp_commit(store, cells_with_data=len(cells), granule_count=1, window=window)
+    return truth
+
+
+def _contains_all(ancestor, members):
+    """True when ``ancestor``'s cell contains every member word (spec §9.1).
+
+    Compared against ``common_ancestor([ancestor, ancestor])`` rather than
+    ``ancestor`` itself, because the fold is kind-aware: an order-29 POINT word
+    carries no area claim (spec §2.2), so folding one with itself yields that
+    cell's AREA word, not the point word back. The invariant that matters is
+    that adding the members coarsens no further than the ancestor's own cell.
+    """
+    from mortie import common_ancestor
+
+    a = np.uint64(ancestor)
+    own = int(common_ancestor(np.asarray([a, a], dtype=np.uint64)))
+    return int(common_ancestor(np.asarray([a, *members], dtype=np.uint64))) == own
+
+
+class TestLocatedOverviewFold:
+    """Ruling 4 on issue #410: a located field folds THROUGH the pyramid.
+
+    Before this, `location:` put the field in class ``none`` and the digest
+    vanished from every overview level. These pin the channel end to end: the
+    sibling is emitted by the overview template, folded in the SAME k-way call
+    as its payload, and its words satisfy §9.1's containment claim.
+    """
+
+    def test_leaf_fold_writes_the_sibling_row_aligned(self, tmp_path):
+        _write_manifest(tmp_path, orders=(1,), fields=LOCATED_FIELDS_DECL)
+        truth = _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0, 3.0], 1: [7.0]})
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["failed"] == 0
+        g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        assert "h_tdigest_locations" in g
+        # Overview cell 0 folds leaf rows 0..3, so it merges both populated
+        # cells' digests -- and its words must contain every contributor.
+        payload = decode_digest(bytes(g["h_tdigest"][:][0]), "float32")
+        words = decode_digest(bytes(g["h_tdigest_locations"][:][0]), "uint64", ())
+        assert words.dtype == np.uint64
+        assert words.shape == (payload.shape[0],), "the sibling stays row-aligned (§1.1)"
+        members = np.concatenate([truth[0], truth[1]])
+        assert _contains_all(int(np.uint64(words[0])), members[:1])
+        # Every stored word contains at least itself and is a real morton word.
+        from mortie import validate_morton
+
+        validate_morton(words)
+
+    def test_overview_words_contain_their_contributors(self, tmp_path):
+        # §9.1's whole claim: a merged centroid's word is a cell containing
+        # every observation merged into it. Values rise with the observation
+        # index here, so a centroid's members are a contiguous run of the
+        # value-sorted words -- which is what makes the claim checkable.
+        _write_manifest(tmp_path, orders=(1,), fields=LOCATED_FIELDS_DECL)
+        truth = _make_located_leaf(tmp_path, "-311", {0: list(np.arange(40.0))})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        payload = decode_digest(bytes(g["h_tdigest"][:][0]), "float32")
+        words = decode_digest(bytes(g["h_tdigest_locations"][:][0]), "uint64", ())
+        bounds = np.concatenate([[0], np.cumsum(payload[:, 1]).astype(np.int64)])
+        src = truth[0]  # already in observation order == value order
+        for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+            assert _contains_all(int(np.uint64(words[i])), src[lo:hi])
+
+    def test_the_overview_sibling_carries_the_section_9_declaration(self, tmp_path):
+        from zagg.grids.base import located_declaration
+
+        _write_manifest(tmp_path, orders=(1,), fields=LOCATED_FIELDS_DECL)
+        _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        assert located_declaration(dict(g["h_tdigest_locations"].attrs)) == {
+            "spec": "zagg-located/1",
+            "shape": "per-centroid",
+            "grammar": "mortie-morton/1",
+        }
+        # The payload binds the sibling by NAME (§1.2), never by convention.
+        assert dict(g["h_tdigest"].attrs)["ragged"]["locations"] == "h_tdigest_locations"
+
+    def test_cascade_folds_the_sibling_too(self, tmp_path):
+        # The fold-of-folds path (issue #376) reads an overview's own sibling
+        # and re-merges it; a cascade that folded only the payload would emit an
+        # overview whose channel described a stale partition.
+        _write_manifest(
+            tmp_path,
+            orders=(1, 0),
+            fields=LOCATED_FIELDS_DECL,
+            fold_source="cascade",
+            exact_levels=1,
+        )
+        truth = _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0], 5: [9.0]})
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["failed"] == 0
+        coarse = _overview_group(tmp_path, "-3", "all.zarr", 2)
+        assert "h_tdigest_locations" in coarse
+        payload = decode_digest(bytes(coarse["h_tdigest"][:][0]), "float32")
+        words = decode_digest(bytes(coarse["h_tdigest_locations"][:][0]), "uint64", ())
+        assert words.shape == (payload.shape[0],)
+        assert _contains_all(int(np.uint64(words[0])), np.concatenate([truth[0], truth[5]])[:1])
+
+    def test_a_leaf_without_the_sibling_is_skipped_loudly(self, tmp_path):
+        # The channel is read in the payload's guarded block, so a leaf that
+        # carries the payload but not the sibling contributes NEITHER -- never a
+        # digest folded with its channel silently dropped.
+        _write_manifest(tmp_path, orders=(1,), fields=LOCATED_FIELDS_DECL)
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0]})  # unlocated leaf writer
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["failed"] == 1
+        assert result["families"]["overview"]["written"] == 0
+
+    def test_unlocated_fields_are_byte_identical(self, tmp_path):
+        # The channel is opt-in: an undeclared field's overview must be exactly
+        # what it was before ruling 4.
+        _write_manifest(tmp_path, orders=(1,))
+        _make_leaf(tmp_path, "-311", {0: [1.0, 2.0, 3.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        assert "h_tdigest_locations" not in g
+        assert "locations" not in dict(g["h_tdigest"].attrs)["ragged"]
 
 
 class TestOverviewWriter:
