@@ -991,12 +991,14 @@ class TestTemporalDeclaration:
         exp, meta = self._time_meta()
         attrs = meta["attributes"]
         assert attrs == exp["time_attrs"]
-        block = attrs["temporal"]
-        assert block["spec"] == "zagg-toc/1"
-        assert block["shape"] == "axis"
-        assert block["epoch"] == "1850-01-01T00:00:00"
-        assert block["timescale"] == "gps-continuous"
-        assert (block["quantum_start_ns"], block["quantum_end_ns"]) == (2**31, 2**32)
+        # §8: exactly the #410-ruled {spec, shape, versioned grammar
+        # citation} -- the committed bytes carry NO per-store epoch,
+        # timescale, or quantum keys.
+        assert attrs["temporal"] == {
+            "spec": "zagg-toc/1",
+            "shape": "axis",
+            "grammar": "mortie/toc@0.9.6",
+        }
         # §8.1: uint64 words, one per timestep, no CF pair to mislead a
         # units/calendar-decoding client.
         assert meta["data_type"] == "uint64"

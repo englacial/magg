@@ -12,10 +12,7 @@
   "temporal": {
    "spec": "zagg-toc/1",
    "shape": "axis",
-   "epoch": "1850-01-01T00:00:00",
-   "timescale": "gps-continuous",
-   "quantum_start_ns": 2147483648,
-   "quantum_end_ns": 4294967296
+   "grammar": "mortie/toc@0.9.6"
   }
  },
  "time_words": [

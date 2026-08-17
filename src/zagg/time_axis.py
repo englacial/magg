@@ -31,11 +31,15 @@ TOC_SPEC = "zagg-toc/1"
 #: time coordinate. Per-cell / per-centroid companions (#410) land as further
 #: values under the same marker.
 TOC_SHAPE_AXIS = "axis"
-#: Fixed properties of the toc word grammar (mortie), echoed into the
-#: declaration so a reader can state its decode tolerance without hard-coding
-#: mortie's constants. Not writer choices — a mismatch is a future revision.
+#: The §8 versioned grammar citation — the word grammar these values follow,
+#: as {module}@{release}. A fixed token of this revision (espg/mortie#193
+#: will replace the referent with a frozen spec section), NOT a stamp of the
+#: writer's installed mortie: stores must not move when a floor moves.
+TOC_GRAMMAR = "mortie/toc@0.9.6"
+#: The cited grammar's time origin. A grammar property, not a declared key
+#: (#410 ruled out per-store epoch/quantization guards); kept here only to
+#: refuse a time the words cannot represent.
 TOC_EPOCH = "1850-01-01T00:00:00"
-TOC_TIMESCALE = "gps-continuous"
 #: The legacy encoding's CF attrs, stamped only when ``temporal`` is absent.
 LEGACY_TIME_ATTRS = {
     "units": "microseconds since 1970-01-01T00:00:00",
@@ -53,9 +57,9 @@ __all__ = [
     "TEMPORAL_ATTR",
     "TIME_ENCODINGS",
     "TOC_EPOCH",
+    "TOC_GRAMMAR",
     "TOC_SHAPE_AXIS",
     "TOC_SPEC",
-    "TOC_TIMESCALE",
     "decode_time_axis",
     "encode_time_axis",
     "read_time_axis",
@@ -98,16 +102,11 @@ def time_axis_attrs(encoding: str) -> dict:
     """
     if encoding != "toc":
         return dict(LEGACY_TIME_ATTRS)
-    from mortie.toc import Q_END_NS, Q_START_NS
-
     return {
         TEMPORAL_ATTR: {
             "spec": TOC_SPEC,
             "shape": TOC_SHAPE_AXIS,
-            "epoch": TOC_EPOCH,
-            "timescale": TOC_TIMESCALE,
-            "quantum_start_ns": int(Q_START_NS),
-            "quantum_end_ns": int(Q_END_NS),
+            "grammar": TOC_GRAMMAR,
         }
     }
 
@@ -118,7 +117,8 @@ def temporal_declaration(attrs) -> dict | None:
     Returns ``None`` for the legacy encoding (absent key) — never raises for
     a store written before §8, which is the schema-evolution rule. Raises on
     a declaration this revision cannot decode: an unknown ``spec``, an
-    unimplemented ``shape``, or a re-based epoch/timescale.
+    unimplemented ``shape``, or an uncited word ``grammar``. Unrecognized
+    keys are informative by §8 and ignored, never a refusal.
     """
     block = dict(attrs or {}).get(TEMPORAL_ATTR)
     if block is None:
@@ -137,12 +137,12 @@ def temporal_declaration(attrs) -> dict | None:
             f"temporal declaration shape {shape!r} is not implemented "
             f"(spec §8 defines {TOC_SHAPE_AXIS!r} for a time coordinate)"
         )
-    epoch, timescale = block.get("epoch"), block.get("timescale")
-    if epoch != TOC_EPOCH or timescale != TOC_TIMESCALE:
+    grammar = block.get("grammar")
+    if grammar != TOC_GRAMMAR:
         raise ValueError(
-            f"temporal declaration epoch/timescale ({epoch!r}, {timescale!r}) differs from "
-            f"the toc word grammar's ({TOC_EPOCH!r}, {TOC_TIMESCALE!r}) — a differing origin "
-            f"is a future spec revision, not a re-basing hint (spec §8)"
+            f"temporal declaration cites word grammar {grammar!r}, not {TOC_GRAMMAR!r} "
+            f"(spec §8); refusing to decode words under a grammar this reader does not "
+            f"implement"
         )
     return block
 
