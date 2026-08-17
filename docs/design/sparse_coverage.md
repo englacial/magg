@@ -813,7 +813,12 @@ neither gap and is safe now.
   https spellings of one granule agree on; the accepted cost is that two
   granules whose hrefs differ only in prefix collapse to one identity, which
   every catalog zagg reads rules out by naming granules globally uniquely
-  (that is why the catalog's own id equals the basename). Immutable-provenance naming (product root
+  (that is why the catalog's own id equals the basename). Where a collapse
+  *does* happen the cost is not only a collision: the contraction guard's
+  set diff loses per-granule resolution inside the collapsed group, so a
+  dropped member reads as `id-multiset-drift` and rewrites rather than
+  refusing — logged loudly per leaf, with the predicate question left
+  standing (PR #420 review finding (2)). Immutable-provenance naming (product root
   `{name}+{catalog-hash}/`) stays an opt-in for frozen-catalog archival
   runs. The output content hash that makes dedup *verifiable* is O11
   (resolved — adopted; it complements the semantic hash — "intended identical" vs

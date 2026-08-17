@@ -374,6 +374,26 @@ class TestClassifyLeafIdentity:
         assert got == {"action": "skip", "classification": "equal", "missing": []}
         assert self.loads == 0  # the hash fast path, not the diff, decides
 
+    def test_collapsed_recorded_ids_degrade_the_guard_loudly(self, caplog):
+        # The accepted cost of the canonical-identity ruling, pinned where it
+        # actually lands: two recorded hrefs differing only in prefix are ONE
+        # canonical id, so a genuine drop of one of them leaves the set diff
+        # unchanged and the leaf REWRITES where the pre-epoch href-space diff
+        # refused and named the dropped href. Resolving that the other way is a
+        # ruling on the contraction predicate (a multiset diff would refuse the
+        # duplicate-drift case `test_duplicate_drift_with_equal_sets_rewrites`
+        # pins as a rewrite), so this pins the state as-shipped -- and pins that
+        # it is never silent.
+        recorded_ids = ["s3://v006/ATL06_X.h5", "s3://v007/ATL06_X.h5", "s3://v007/ATL06_Y.h5"]
+        with caplog.at_level("WARNING", logger="zagg.dedup"):
+            got = self._classify(
+                ["s3://v007/ATL06_X.h5", "s3://v007/ATL06_Y.h5"],  # one granule dropped
+                ids=recorded_ids,
+            )
+        assert got == {"action": "rewrite", "classification": "id-multiset-drift", "missing": []}
+        assert "collapsed distinct recorded granule ids" in caplog.text
+        assert "ATL06_X.h5" in caplog.text  # the colliding canonical id is named
+
     @pytest.mark.parametrize(
         "planned",
         [

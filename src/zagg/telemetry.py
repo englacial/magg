@@ -158,7 +158,15 @@ def canonical_granule_id(entry) -> str:
     prefix collapse to one identity. Every catalog zagg reads names granules
     globally uniquely (that is *why* ``rec["id"]`` equals the basename), and
     the alternative — keeping any part of the fetch path — is exactly what the
-    ruling excludes.
+    ruling excludes. The cost is not only an identity collision: it also
+    degrades the **contraction guard's** per-granule resolution inside a
+    collapsed group, and in the unsafe direction — dropping one member of a
+    collided pair leaves ``zagg.dedup.classify_leaf_identity``'s set diff
+    unchanged, so the leaf reads ``id-multiset-drift`` and rewrites where the
+    pre-epoch href-space diff refused and named the dropped href. Such a leaf
+    is logged loudly (``zagg.dedup._warn_on_collapsed_recorded_ids``); making
+    it refuse instead is a ruling on the contraction predicate, standing for
+    espg (PR #420 review finding (2)).
     """
     if isinstance(entry, dict):
         entry = entry.get("url")

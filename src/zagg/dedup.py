@@ -229,6 +229,39 @@ def _sibling_ids(leaf_path, recorded, spec, store_kwargs):
     return ids
 
 
+def _warn_on_collapsed_recorded_ids(rec_ids, canonical) -> None:
+    """Say so when canonicalization collapsed DISTINCT recorded ids.
+
+    The canonical form is a basename (:func:`zagg.telemetry.canonical_granule_id`,
+    espg-ruled 2026-08-17), so two recorded hrefs differing only in prefix
+    become one id. The diff in :func:`classify_leaf_identity` is over SETS, so
+    for such a leaf the contraction guard loses its per-granule resolution
+    *inside* the collapsed group: dropping one member of a collided pair leaves
+    the set unchanged, and the leaf reads ``id-multiset-drift`` and REWRITES
+    where the pre-epoch href-space diff refused and named the dropped href.
+
+    Resolving that either way is a ruling on the ruled predicate itself
+    (``recorded − planned ≠ ∅``) rather than an implementation choice: after
+    collapse a recorded duplicate and two distinct collapsed granules are
+    byte-identical data, so a multiset diff would recover the refusal here at
+    the price of refusing the duplicate-drift case that
+    ``test_duplicate_drift_with_equal_sets_rewrites`` pins as a rewrite. Left
+    standing for espg (PR #420 review finding (2)) — but never silent.
+    """
+    groups: dict[str, set[str]] = {}
+    for original, canon in zip(rec_ids, canonical):
+        groups.setdefault(canon, set()).add(str(original))
+    collided = sorted(c for c, originals in groups.items() if len(originals) > 1)
+    if collided:
+        logger.warning(
+            f"canonicalization collapsed distinct recorded granule ids onto "
+            f"{collided} — the contraction guard cannot resolve a drop WITHIN a "
+            f"collapsed group on this leaf (it would read as id-multiset-drift "
+            f"and rewrite); ids that collide only in basename are outside what "
+            f"the canonical identity ruling can distinguish (issue #415)"
+        )
+
+
 def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorded_ids=None) -> dict:
     """Classify one planned unit against its leaf's recorded identity (#388).
 
@@ -271,7 +304,12 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorde
     from the ordinary rewrites (the phase-2 run stats, the phase-4 operator
     docs), because the guard cannot protect any leaf written before this
     release — no leaf written before issue #388 has the granule-id sibling
-    that records its input set.
+    that records its input set. The canonical-identity epoch opened one more
+    seam on that same side: two recorded hrefs differing only in prefix
+    collapse to ONE canonical id, and this set diff then cannot see a drop
+    *within* that group — the leaf rewrites where the pre-epoch diff refused.
+    Never silent (:func:`_warn_on_collapsed_recorded_ids`), and left standing
+    as a question on the predicate rather than resolved here.
 
     Parameters
     ----------
@@ -356,7 +394,9 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorde
         # ordinary rewrites and say so in the operator docs (see the class
         # docstring's one-sided-conservatism note).
         return {"action": "rewrite", "classification": "unrecorded-ids", "missing": []}
-    recorded_set = set(canonical_granule_ids(rec_ids) or [])
+    recorded_canonical = canonical_granule_ids(rec_ids) or []
+    _warn_on_collapsed_recorded_ids(rec_ids, recorded_canonical)
+    recorded_set = set(recorded_canonical)
     missing = sorted(recorded_set - set(planned))
     if missing:
         added = set(planned) - recorded_set

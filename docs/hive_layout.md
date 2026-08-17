@@ -799,7 +799,14 @@ the skip gate compares.
    reading as a full contraction. Accepted cost of the ruling: two granules
    whose hrefs differ only in prefix collapse to one identity; every catalog
    zagg reads names granules globally uniquely, which is why the catalog's own
-   id equals the basename.
+   id equals the basename. That cost lands in two places, not one — besides the
+   identity collision it **degrades the contraction guard** inside a collapsed
+   group, and the safe way is not the way it falls: dropping one member of a
+   collided pair leaves the set diff unchanged, so the leaf reads
+   `id-multiset-drift` and rewrites where the pre-epoch diff refused and named
+   the dropped href. Any leaf whose recorded ids collapse is logged loudly for
+   exactly that reason; making it refuse instead is a standing question on the
+   contraction predicate (PR #420 review finding (2)).
 
 Deliberately **not** changed: the orders (`parent_order` / `child_order` /
 `chunk_inner`) stay packaging — hashing them would make o8 and o9 runs
