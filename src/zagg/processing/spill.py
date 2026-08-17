@@ -467,8 +467,12 @@ def _default_block_bytes(n_partitions: int, tmp_dir: str | None = None) -> int:
     closing block beside the filling one, so the result is capped at 45% of
     the spill directory's current free space. A finer ``chunk_inner`` raises
     K and with it the usable block (the build unit is one partition, not the
-    block). Injectable for tests and ops via
-    ``SpillAggregator(block_bytes=...)``.
+    block). Overridable from **config** —
+    ``aggregation.streaming.block_bytes`` (issue #474), the route operators
+    take — and from ``SpillAggregator(block_bytes=...)`` for tests and ops.
+    An explicit value replaces this whole formula, 45% cap included, so the
+    constructor headroom-checks the pair it will actually hold (2x under
+    overlap); keep it at or below ~45% of the tier's ephemeral storage.
     """
     mem = _memory_budget_bytes()
     st = os.statvfs(tmp_dir or tempfile.gettempdir())
@@ -498,8 +502,8 @@ class SpillAggregator:
       the output is byte-identical to pooled **by construction**: the
       partition holds exactly the chunk's rows in global read order, so the
       stable sort reproduces the pooled per-cell slices bit for bit.
-    - **Multi block** (bytes hit the threshold — see
-      :func:`_default_block_bytes`): each closing block is reduced
+    - **Multi block** (bytes hit the threshold — ``aggregation.streaming.block_bytes``
+      when the config sets it, else :func:`_default_block_bytes`): each closing block is reduced
       partition-by-partition into running mergeable state (counts by
       summation, tdigests via ``merge_tdigests``/``merge_tdigests_kway`` —
       including located fields and ``build_tdigest_where`` strata, whose
