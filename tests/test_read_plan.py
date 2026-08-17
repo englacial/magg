@@ -285,6 +285,21 @@ class TestExecuteReadPlan:
         assert out.dtype == np.float32
         np.testing.assert_array_equal(out, expected)
 
+    def test_none_read_still_raises(self):
+        # A FAILED h5coro read returns None (h5promise substitutes a null
+        # dataset); np.asarray(None, float32) is a 0-d NaN, which the
+        # concatenate used to reject as a side effect. Pin that None stays a
+        # loud error rather than a widened, fabricated NaN row -- the
+        # chunk-boundary guard in tests/test_index.py relies on the raise.
+        plan = self._make_plan([(42, 43)])
+        with pytest.raises(ValueError, match="returned None"):
+            execute_read_plan(plan, lambda *a, **k: None, "/h", np.float32)
+
+    def test_none_full_read_raises(self):
+        plan = ReadPlan(parent_runs=[], base_slices=[], chunk_lists=[], full_read=True)
+        with pytest.raises(ValueError, match="returned None"):
+            execute_read_plan(plan, lambda *a, **k: None, "/h", np.float32)
+
     def test_full_read_plan_calls_without_hyperslice(self):
         data = np.arange(50.0, dtype=np.float32)
         plan = ReadPlan(

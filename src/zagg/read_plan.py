@@ -239,15 +239,44 @@ def execute_read_plan(plan: ReadPlan, read_fn, dataset_path: str, dtype) -> np.n
     np.ndarray
         Concatenated data for all runs in the plan, or an empty array if the
         plan matched nothing. If ``plan.full_read``, returns the full dataset.
+
+    Raises
+    ------
+    ValueError
+        If ``read_fn`` returns ``None`` -- h5coro's read-failure signal.
     """
     if plan.full_read:
-        return np.asarray(read_fn(dataset_path, hyperslice=None), dtype=dtype)
+        return np.asarray(
+            _require_read(read_fn(dataset_path, hyperslice=None), dataset_path, None), dtype=dtype
+        )
     if not plan.parent_runs:
         return np.empty(0, dtype=dtype)
-    # h5coro's readDatasets returns a 0-d array for a single-element
-    # hyperslice; np.atleast_1d keeps concatenate from raising on it.
+    # h5coro returns shape ``(1,)`` -- NOT a 0-d array -- for a single-element
+    # hyperslice: ``h5dataset.py`` reshapes only when ``ndims > 1``. So the
+    # ``np.atleast_1d`` below is cheap defense against a ``read_fn`` wrapper
+    # that hands back a scalar, not a fix for the reader itself.
+    #
+    # What actually produces a 0-d array is a FAILED read: h5coro warns and
+    # substitutes a null dataset, and ``np.asarray(None, dtype)`` is 0-d
+    # (``array(nan)`` for a float dtype). ``np.concatenate`` used to reject
+    # that as a side effect; ``_require_read`` now rejects it on purpose, so
+    # widening can never fabricate a NaN row and silently drop the group. A
+    # read that comes back SHORT is caught one level up, by the consumer that
+    # knows the declared extent (``read_vlen._read_group``, issue #452).
     parts = [
-        np.atleast_1d(np.asarray(read_fn(dataset_path, hyperslice=chunk), dtype=dtype))
+        np.atleast_1d(
+            np.asarray(
+                _require_read(read_fn(dataset_path, hyperslice=chunk), dataset_path, chunk),
+                dtype=dtype,
+            )
+        )
         for chunk in plan.chunk_lists
     ]
     return np.concatenate(parts)
+
+
+def _require_read(raw, dataset_path, hyperslice):
+    """Reject a ``None`` read (h5coro's failure signal) before dtype coercion."""
+    if raw is None:
+        raise ValueError(f"read returned None for {dataset_path} (hyperslice={hyperslice})")
+    return raw
