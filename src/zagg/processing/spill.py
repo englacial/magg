@@ -98,7 +98,9 @@ class SpillReduceError(RuntimeError):
     """
 
 
-def check_tmp_headroom(need_bytes: int, tmp_dir: str | None = None) -> None:
+def check_tmp_headroom(
+    need_bytes: int, tmp_dir: str | None = None, from_config: bool = False
+) -> None:
     """Refuse to enable spill when ``/tmp`` cannot hold its working set.
 
     Standalone spill guard (issue #217 plan: written independently of the
@@ -106,14 +108,24 @@ def check_tmp_headroom(need_bytes: int, tmp_dir: str | None = None) -> None:
     config-style ``RuntimeError`` naming the deployment fix when the spill
     directory's free space is below ``need_bytes`` — typically the block
     threshold, the most a single spill block is allowed to grow.
+
+    ``from_config`` says the requirement is derived from an operator-set
+    ``aggregation.streaming.block_bytes`` (issue #474), which puts lowering
+    that knob at the head of the remedies — otherwise the message quotes a
+    number the operator controls without naming what controls it.
     """
     tmp_dir = tmp_dir or tempfile.gettempdir()
     st = os.statvfs(tmp_dir)
     avail = st.f_bavail * st.f_frsize
     if avail < need_bytes:
+        knob = (
+            "lower aggregation.streaming.block_bytes (this requirement is derived from it), "
+            if from_config
+            else ""
+        )
         raise RuntimeError(
             f"aggregation.streaming.mode: spill needs {need_bytes:,} bytes of free "
-            f"space in {tmp_dir!r} but only {avail:,} are available; deploy on a "
+            f"space in {tmp_dir!r} but only {avail:,} are available; {knob}deploy on a "
             f"function variant with larger ephemeral storage (the '-disk' variants, "
             f"e.g. process-shard-4096-disk) or fall back to mode: merge."
         )
@@ -594,10 +606,14 @@ class SpillAggregator:
             # the failure check_tmp_headroom exists to pre-empt (issue #474).
             self.block_bytes = int(block_bytes)
             resident = self.block_bytes * (2 if overlap else 1)
-            check_tmp_headroom(max(_MIN_SPILL_BYTES, resident), self.tmp_dir)
+            check_tmp_headroom(max(_MIN_SPILL_BYTES, resident), self.tmp_dir, from_config=True)
         else:
             check_tmp_headroom(_MIN_SPILL_BYTES, self.tmp_dir)
             self.block_bytes = _default_block_bytes(self._n_partitions, self.tmp_dir)
+        # Whether the threshold is the operator's (aggregation.streaming.block_bytes)
+        # or disk-derived — the overflow message only offers the knob when it is
+        # actually the thing that set the number (issue #474).
+        self._block_bytes_from_config = block_bytes is not None
         self._block = SpillBlock(self.tmp_dir)
         self._closed_blocks = 0
         self._finalized = False
@@ -754,6 +770,14 @@ class SpillAggregator:
         the sequential path. ``overlap=False`` reduces inline.
         """
         if not self._mergeable:
+            # The threshold is the operator's own number when it came from
+            # config, so raising it — the one remedy that keeps this shard in
+            # the exact single-block regime — leads the list (issue #474).
+            knob = (
+                "a larger aggregation.streaming.block_bytes (this threshold came from it), "
+                if self._block_bytes_from_config
+                else ""
+            )
             raise SpillOverflowError(
                 f"spill block hit the {self.block_bytes:,}-byte threshold but the "
                 f"config carries reducers with no cross-block fold law, so per-block "
@@ -761,8 +785,8 @@ class SpillAggregator:
                 f"fields — located, where-strata, pairwise — and the packed "
                 f"composition word; single-block spill is exact for every reducer). "
                 f"{self._fold_problems}. "
-                f"Remedies: a bigger memory tier, a '-disk' function variant with "
-                f"more ephemeral storage, or a finer parent_order (smaller shards)."
+                f"Remedies: {knob}a bigger memory tier, a '-disk' function variant "
+                f"with more ephemeral storage, or a finer parent_order (smaller shards)."
             )
         if self._closed_blocks == 0:
             # Once per shard, at the moment the exact regime is left (issue

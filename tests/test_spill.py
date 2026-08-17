@@ -915,7 +915,24 @@ class TestSpillWorkerMultiBlock:
         )
         grid = _grid(cfg)
         dfs = _granule_dfs(grid, _shard_key(), _CELL_LISTS, seed=2)
-        with pytest.raises(SpillOverflowError, match="memory tier"):
+        with pytest.raises(SpillOverflowError, match="memory tier") as exc:
+            _run(monkeypatch, cfg, grid, _shard_key(), dfs)
+        # The derived threshold is nobody's config value, so the remedies list
+        # must not point at a knob the operator never set (issue #474).
+        assert "block_bytes" not in str(exc.value)
+
+    def test_overflow_names_the_config_knob_that_set_the_threshold(self, monkeypatch):
+        # issue #474: when the crossing came from aggregation.streaming.block_bytes,
+        # raising it is the one remedy that keeps the shard in the exact
+        # single-block regime — so it heads the list.
+        cfg = _config(
+            streaming={"buffer_granules": 1, "mode": "spill", "block_bytes": 1},
+            variables=_matrix_variables(),
+            chunk_precompute=_ANCHOR,
+        )
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, _shard_key(), _CELL_LISTS, seed=2)
+        with pytest.raises(SpillOverflowError, match="larger aggregation.streaming.block_bytes"):
             _run(monkeypatch, cfg, grid, _shard_key(), dfs)
 
     def test_overlap_reduce_error_raises_through_worker(self, monkeypatch):
@@ -1026,6 +1043,13 @@ class TestTmpGuard:
         monkeypatch.setattr(_os, "statvfs", lambda _p: _Tiny())
         with pytest.raises(RuntimeError, match="-disk"):
             check_tmp_headroom(10**9)
+        # The number is the operator's own when it came from config, so the
+        # remedy they control leads the list — and is absent otherwise (#474).
+        with pytest.raises(RuntimeError, match="lower aggregation.streaming.block_bytes"):
+            check_tmp_headroom(10**9, from_config=True)
+        with pytest.raises(RuntimeError) as exc:
+            check_tmp_headroom(10**9)
+        assert "block_bytes" not in str(exc.value)
 
     def test_happy_path_is_silent(self):
         check_tmp_headroom(1)
