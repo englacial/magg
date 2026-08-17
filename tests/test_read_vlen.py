@@ -14,7 +14,14 @@ from zagg.config import (
     PipelineConfig,
     validate_config,
 )
-from zagg.processing.read import _read_group
+from zagg.processing.read import (
+    _expand_mask_at_rows,
+    _expand_mask_to_base,
+    _link_parent_at_rows,
+    _read_group,
+    _validate_link_disjoint,
+    link_base_extent,
+)
 from zagg.processing.read_vlen import (
     expand_link_indices,
     synthesize_linspace,
@@ -194,6 +201,59 @@ class TestExpandLinkIndices:
             expand_link_indices(np.array([1]), np.array([5]), 1, 3)
 
 
+class TestLinkDisjointValidation:
+    """Overlapping records are refused where a level's link is assembled (#452).
+
+    The precondition was assumed everywhere and checked nowhere. The reviewer's
+    construction ``index_beg=[0, 5]``, ``count=[10, 2]`` is the whole problem in
+    three records' worth of data: the paint maps resolve rows 7-9 to record 0
+    (later record shadows earlier, then the paint ends) while the searchsorted
+    derivation resolves them to nobody, so coordinates and the synthesized
+    column would disagree with every companion column and every record-level
+    filter verdict, row by row, with nothing raised."""
+
+    OVERLAP_BEG = np.array([0, 5], dtype=np.int64)
+    OVERLAP_CNT = np.array([10, 2], dtype=np.int64)
+
+    def test_the_two_owner_derivations_disagree_on_the_overlap(self):
+        # Why the check has to exist: unvalidated, these are the columns that
+        # would ship side by side out of one read.
+        painted, _ = expand_link_indices(self.OVERLAP_BEG, self.OVERLAP_CNT, 0, 10)
+        searched = _link_parent_at_rows(self.OVERLAP_BEG, self.OVERLAP_CNT, 0, np.arange(10))
+        assert painted.tolist() == [0, 0, 0, 0, 0, 1, 1, 0, 0, 0]
+        assert searched.tolist() == [0, 0, 0, 0, 0, 1, 1, -1, -1, -1]
+
+    def test_overlapping_records_raise(self):
+        with pytest.raises(ValueError, match="requires disjoint record ranges"):
+            _validate_link_disjoint(self.OVERLAP_BEG, self.OVERLAP_CNT, 0)
+
+    def test_the_message_names_the_level_and_both_records(self):
+        with pytest.raises(ValueError) as e:
+            _validate_link_disjoint(self.OVERLAP_BEG, self.OVERLAP_CNT, 0, level="shots")
+        msg = str(e.value)
+        assert "level 'shots'" in msg
+        assert "record 0 covers base rows [0:10]" in msg
+        assert "record 1 starts at 5" in msg
+
+    def test_disjoint_links_pass(self):
+        # The shipped fixtures, both packed and strided, plus an unsorted link
+        # with gaps and an issue #116 empty (start sentinel 0 under origin-1).
+        _validate_link_disjoint(STARTS, COUNTS, 1)
+        _validate_link_disjoint(STARTS_STRIDED, COUNTS, 1)
+        _validate_link_disjoint(np.array([10, 1, 0, 5]), np.array([2, 3, 0, 4]), 1)
+
+    def test_touching_records_are_disjoint(self):
+        # A record starting exactly where the previous ends is contiguous, not
+        # overlapping — the ATL03 shape, which must keep passing.
+        _validate_link_disjoint(np.array([0, 5, 8]), np.array([5, 3, 2]), 0)
+
+    def test_the_vlen_route_refuses_an_overlapping_coordinates_link(self):
+        arrays = _l1b_arrays()
+        arrays["/BEAM0000/rx_sample_count"] = np.array([6, 3, 1, 4], dtype=np.uint16)
+        with pytest.raises(ValueError, match="level 'shots'.*disjoint record ranges"):
+            _read_group(_FakeH5(arrays), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+
+
 class TestSynthesizeLinspace:
     def test_endpoints_exact_and_single_sample(self):
         parent, within = expand_link_indices(STARTS, COUNTS, 1, 13)
@@ -211,6 +271,46 @@ class TestSynthesizeLinspace:
         )
         assert np.isnan(vals[5]) and np.isnan(vals[6])
         np.testing.assert_allclose(vals[:5], [0, 1, 2, 3, 4])
+
+
+class TestExpandMaskAtRowsEquivalence:
+    """``_expand_mask_at_rows`` is ``_expand_mask_to_base(...)[base_rows]``,
+    validation scope included (PR #454 review).
+
+    The base-rate form's ``beg < 0`` check sits after the predicate guard, so a
+    record the predicate rejects is never validated. The reviewer's
+    construction is a record with a malformed origin-0 start that the mask
+    filters *out*: the base-rate form reads it fine, and the at-rows twin must
+    not fail-hard on the production route where the original does not."""
+
+    def test_a_filtered_out_record_is_not_validated(self):
+        ibeg = np.array([0, 1])
+        cnt = np.array([2, 3])
+        mask = np.array([False, True])
+        base = _expand_mask_to_base(mask, ibeg, cnt, 1, 4)
+        at_rows = _expand_mask_at_rows(mask, ibeg, cnt, 1, np.arange(4))
+        assert base.tolist() == [True, True, True, False]
+        assert at_rows.tolist() == base.tolist()
+
+    def test_a_kept_record_with_a_malformed_start_still_raises(self):
+        # The refusal is narrowed, not removed: flip the same record's verdict
+        # to keep and both forms raise the same way.
+        ibeg = np.array([0, 1])
+        cnt = np.array([2, 3])
+        mask = np.array([True, True])
+        with pytest.raises(ValueError, match="less than index_base"):
+            _expand_mask_to_base(mask, ibeg, cnt, 1, 4)
+        with pytest.raises(ValueError, match="less than index_base"):
+            _expand_mask_at_rows(mask, ibeg, cnt, 1, np.arange(4))
+
+    def test_equivalence_on_the_shipped_strided_fixture(self):
+        for mask in ([True] * 4, [False] * 4, [True, False, True, False]):
+            m = np.array(mask)
+            base = _expand_mask_to_base(m, STARTS_STRIDED, COUNTS, 1, STRIDED_EXTENT)
+            rows = np.arange(STRIDED_EXTENT)
+            np.testing.assert_array_equal(
+                _expand_mask_at_rows(m, STARTS_STRIDED, COUNTS, 1, rows), base
+            )
 
 
 class TestPlannedGatherMap:
@@ -672,7 +772,7 @@ class TestInlineWriteBackPrebuild:
         built = self._built_paths(monkeypatch, cfg.data_source)
         # The L2A predicates read the paired granule; this backend never opens
         # it, so mapping them here would KeyError on the primary.
-        assert not [p for p in built if "quality_flag" in p or "rx_assess" in p]
+        assert not [p for p in built if "rx_assess" in p]
 
     def test_vlen_prebuild_runs_without_a_read_plan(self, monkeypatch):
         # No read_plan: the record level still has to contribute its link, or
@@ -688,8 +788,8 @@ class TestInlineWriteBackPrebuild:
 class TestGediTemplate:
     """The shipped gedi01b_waveform_healpix_hive template: validated shape,
     and the whole declared surface driven over the synthetic mini-granule —
-    read (gather/expand/synthesis + degrade + the L2A trio) into cell stats
-    (flux digest + companions)."""
+    read (gather/expand/synthesis + degrade + the L2A saturation counter) into
+    cell stats (flux digest + companions)."""
 
     @pytest.fixture
     def cfg(self):
@@ -710,6 +810,20 @@ class TestGediTemplate:
         assert flux["attrs"]["gain_name"]
         assert len(cfg.data_source["groups"]) == 8
 
+    def test_filters_are_validity_gates_only(self, cfg):
+        # espg ruling 2026-08-17 (refs #425 / issue #422): the template filters
+        # on geolocation validity and saturation ONLY. quality_flag and
+        # sensitivity are L2A GROUND-RETRIEVAL fitness gates — quality_flag
+        # contains a sensitivity test internally, so the AND is brutally tight
+        # (1.61% quality-pass, 0 of 434 in-shard shots surviving the joint
+        # stack on a real SERC granule), and zagg's ratified clip policy is
+        # already the signal criterion. Pinned so they cannot drift back in.
+        datasets = [f["dataset"] for f in cfg.data_source["filters"]]
+        assert datasets == [
+            "/{group}/geolocation/degrade",
+            "/{group}/rx_assess/rx_clipbin_count",
+        ]
+
     def test_template_reads_and_aggregates_the_fixture(self, cfg):
         from zagg.processing import calculate_cell_statistics
 
@@ -721,13 +835,29 @@ class TestGediTemplate:
             _OneShardGrid(),
             siblings={"l2a": _FakeH5(_l2a_arrays())},
         )
-        # Survivors: shot 101 only — 103 fails degrade, 102 fails quality_flag,
-        # 104 fails sensitivity (0.50 < 0.9), 103 also has no L2A row.
-        assert df["shot_number"].tolist() == [101] * 5
-        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), WAVE[:5])
-        np.testing.assert_allclose(df["elevation"].to_numpy(), _expected_elevation(0))
+        # Survivors under the two VALIDITY filters the template now declares
+        # (espg ruling 2026-08-17, refs #425 / issue #422 — the L2A
+        # retrieval-fitness gates quality_flag/sensitivity are dropped): only
+        # 103 goes, failing degrade (and it has no L2A row either). 102 (once
+        # excluded by quality_flag) and 104 (once excluded by sensitivity 0.50)
+        # are kept — their waveforms are valid, and the flux clip policy, not a
+        # ground-retrieval gate, is the signal criterion.
+        assert df["shot_number"].tolist() == [101] * 5 + [102] * 3 + [104] * 4
+        np.testing.assert_array_equal(
+            df["rxwaveform"].to_numpy(), np.concatenate([WAVE[:5], WAVE[5:8], WAVE[9:13]])
+        )
+        np.testing.assert_allclose(
+            df["elevation"].to_numpy(),
+            np.concatenate(
+                [_expected_elevation(0), _expected_elevation(1), _expected_elevation(3)]
+            ),
+        )
 
-        cell = {c: df[c].to_numpy() for c in df.columns if c != "leaf_id"}
+        # The per-shot companions are defined for a SINGLE-shot cell, so the
+        # stats below aggregate shot 101's rows (the pooled sentinels have
+        # their own coverage in the stats tests).
+        one = df[df["shot_number"] == 101]
+        cell = {c: one[c].to_numpy() for c in one.columns if c != "leaf_id"}
         stats = calculate_cell_statistics(cell, config=cfg)
         assert stats["count"] == 5
         assert stats["shot_count"] == 1
@@ -742,4 +872,589 @@ class TestGediTemplate:
         assert flux.shape == (5, 2)
         np.testing.assert_allclose(
             np.sort(flux[:, 1]), np.sort((WAVE[:5] - NOISE_MEAN[0]).astype(np.float32))
+        )
+
+
+def _count_owner_derivations(monkeypatch):
+    """Record every ``_link_parent_at_rows`` call and its argument identity."""
+    import zagg.processing.read as rd
+
+    calls: list[tuple] = []
+    real = rd._link_parent_at_rows
+
+    def _spy(ibeg, cnt, base, rows):
+        calls.append(
+            (tuple(np.asarray(ibeg).tolist()), tuple(np.asarray(cnt).tolist()), base, len(rows))
+        )
+        return real(ibeg, cnt, base, rows)
+
+    monkeypatch.setattr(rd, "_link_parent_at_rows", _spy)
+    return calls
+
+
+class TestOwnerMapReuse:
+    """The route derives ONE owner map per link, not one per consumer (#454 review).
+
+    The shipped template declares six companion variables and one structured
+    filter on ``shots`` — which *is* ``coordinates.level``, so the gather map
+    already holds every one of their per-row owners. Each used to re-derive it
+    by searchsorted: six identical derivations over the planned rows per beam
+    group, eight groups per granule, and — worse than the cost — a second owner
+    map built by last-start-wins riding alongside the paint-order one it has to
+    agree with."""
+
+    def _template_ds(self, **read_plan):
+        from zagg.config import default_config
+
+        ds = dict(default_config("gedi01b_waveform_healpix_hive").data_source)
+        # Pin the filter list explicitly (issue #457): this class tests owner-map
+        # DERIVATION counts, not filter policy, and its expected rows were sized
+        # to the quality gate. Inheriting the packaged config's filters let the
+        # #450 science-knob change (gates dropped, espg ruling) shift the row
+        # universe under the #454 pins -- a semantic conflict CI never saw
+        # because each PR was green alone. The six-companion count test below
+        # deliberately KEEPS the live-config coupling; this one must not.
+        ds["filters"] = [
+            {"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1},
+            {"asset": "l2a", "dataset": "/{group}/sensitivity", "op": "ge", "value": 0.9},
+        ]
+        if read_plan:
+            ds["read_plan"] = read_plan
+        return ds
+
+    @pytest.mark.parametrize(
+        "read_plan, shard, grid, expected",
+        [
+            ({}, 0, _OneShardGrid(), [101] * 5),
+            ({"spatial_index": "shots", "pad": 0}, 0, _LatGrid(), [101] * 5),
+        ],
+        ids=["full", "planned"],
+    )
+    def test_coordinates_level_consumers_derive_no_owner_map(
+        self, monkeypatch, read_plan, shard, grid, expected
+    ):
+        calls = _count_owner_derivations(monkeypatch)
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            self._template_ds(**read_plan),
+            shard,
+            grid,
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        assert df["shot_number"].tolist() == expected
+        assert calls == [], f"a coordinates-level consumer re-derived the owner map: {calls}"
+
+    def test_the_template_hangs_six_companions_off_the_coordinates_level(self):
+        from zagg.config import default_config
+
+        # LIVE config on purpose: this test tracks the real template's shape
+        # (companion count, filter levels), unlike the pinned harness above.
+        ds = dict(default_config("gedi01b_waveform_healpix_hive").data_source)
+        shot_vars = ds["levels"][ds["coordinates"]["level"]]["variables"]
+        # The count the finding is scaled by: six re-derivations, not one.
+        assert len(shot_vars) == 6
+        assert [f["level"] for f in ds["filters"] if "level" in f] == ["shots"]
+
+    def test_a_genuinely_different_link_still_derives_its_own(self, monkeypatch):
+        # The reuse must not swallow a level whose link really is different:
+        # ``blocks`` gets exactly one derivation, over the planned rows.
+        calls = _count_owner_derivations(monkeypatch)
+        ds = _vlen_ds_blocks(read_plan={"spatial_index": "shots", "pad": 0})
+        df = _read_group(_FakeH5(_l1b_arrays_blocks()), "BEAM0000", ds, 1, _LatGrid())
+        assert df["shot_number"].tolist() == [104, 104]
+        assert len(calls) == 1, calls
+        # The blocks link, over the plan's rows — not the shots link.
+        assert calls[0] == (tuple(BLOCK_STARTS.tolist()), tuple(BLOCK_COUNTS.tolist()), 0, 10)
+
+
+# ── strided records (the GEDI L1B shape — issue #452) ────────────────────────
+#
+# The packed fixture above is the pathological case that hid the bug: its
+# records tile ``rxwaveform`` end to end, so ``Σcount`` happens to equal the
+# array length. Real GEDI L1B is STRIDED — ``rx_sample_start_index`` steps by a
+# fixed 1,420-sample window per shot while ``rx_sample_count`` is the valid
+# sample count — and the slack between a record's valid samples and the next
+# window is ZERO-FILLED in the product. Same four shots, same counts, starts
+# strided by 6, and 2 samples of tail padding past the last record:
+#
+#   row   0 1 2 3 4 | 5 | 6 7 8 | 9 10 11 | 12 | 13..17 | 18 19 20 21 | 22 23
+#   shot  101 ..... | . | 102 . | ....... | 103| ...... | 104 ....... | .....
+#
+# ``Σcount`` is 13 but the link's extent is 22: under the old derivation
+# ``plan_read`` clamped every run to ``base_end <= base_start`` and the group
+# returned zero rows with no error (the 0.45.0 fleet smoke).
+
+STARTS_STRIDED = np.array([1, 7, 13, 19], dtype=np.uint64)  # origin-1, stride 6
+WAVE_STRIDED = np.zeros(24, dtype=np.float32)  # slack is zero-filled, as in GEDI
+WAVE_STRIDED[0:5] = WAVE[0:5]
+WAVE_STRIDED[6:9] = WAVE[5:8]
+WAVE_STRIDED[12] = WAVE[8]
+WAVE_STRIDED[18:22] = WAVE[9:13]
+STRIDED_EXTENT = 22
+SLACK_ROWS = [5, 9, 10, 11, 13, 14, 15, 16, 17, 22, 23]
+
+
+def _l1b_arrays_strided(group="BEAM0000"):
+    arrays = _l1b_arrays(group)
+    arrays[f"/{group}/rxwaveform"] = WAVE_STRIDED
+    arrays[f"/{group}/rx_sample_start_index"] = STARTS_STRIDED
+    return arrays
+
+
+class _LastShotGrid:
+    """Grid stub: shard 1 for lat >= 12.5 (the last shot only), else 0."""
+
+    @staticmethod
+    def assign(lats, lons):
+        return (np.asarray(lats) >= 12.5).astype(np.uint64)
+
+    @staticmethod
+    def shards_of(leaf_ids):
+        return np.asarray(leaf_ids).astype(int)
+
+
+class _FirstShotGrid:
+    """Grid stub: shard 1 for lat <= 10.5 (the first shot only), else 0."""
+
+    @staticmethod
+    def assign(lats, lons):
+        return (np.asarray(lats) <= 10.5).astype(np.uint64)
+
+    @staticmethod
+    def shards_of(leaf_ids):
+        return np.asarray(leaf_ids).astype(int)
+
+
+class TestStridedRecords:
+    """A strided twin of the packed fixture: same rows out, none from the slack."""
+
+    def test_extent_exceeds_sum_of_counts(self):
+        assert link_base_extent(STARTS_STRIDED, COUNTS, 1) == STRIDED_EXTENT
+        assert int(COUNTS.sum()) == 13 < STRIDED_EXTENT
+
+    def test_full_read_row_parity_with_the_packed_fixture(self):
+        strided = _read_group(
+            _FakeH5(_l1b_arrays_strided()), "BEAM0000", _vlen_ds(), 0, _OneShardGrid()
+        )
+        packed = _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+        assert len(strided) == len(packed) == 13
+        for col in ("rxwaveform", "shot_number", "noise_mean", "elevation"):
+            np.testing.assert_allclose(strided[col].to_numpy(), packed[col].to_numpy())
+
+    def test_no_slack_row_leaks_into_the_output(self):
+        df = _read_group(_FakeH5(_l1b_arrays_strided()), "BEAM0000", _vlen_ds(), 0, _OneShardGrid())
+        # Every returned sample comes from a record's valid range; the slack is
+        # zero-filled in the product, so a leaked row would show up as a real
+        # zero-amplitude sample (and inflate the row count).
+        assert (df["rxwaveform"].to_numpy() != 0.0).all()
+        np.testing.assert_array_equal(
+            df["rxwaveform"].to_numpy(), WAVE_STRIDED[[r for r in range(24) if r not in SLACK_ROWS]]
+        )
+
+    def test_planned_read_selects_shard_records(self):
+        # Shard 1 holds shots 103 + 104 (lat >= 11.5) -> one run -> base rows
+        # 12..21: 5 real samples and 5 slack, the ~1.9x read amplification
+        # striding costs. Only the real ones come back.
+        ds = _vlen_ds(read_plan={"spatial_index": "shots", "pad": 0})
+        io_stats: dict = {}
+        df = _read_group(
+            _FakeH5(_l1b_arrays_strided()), "BEAM0000", ds, 1, _LatGrid(), io_stats=io_stats
+        )
+        assert io_stats["obs_read"] == 10  # rows DECODED, slack included
+        assert len(df) == 5
+        assert df["shot_number"].tolist() == [103] + [104] * 4
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), WAVE[8:13])
+
+    def test_planned_matches_full(self):
+        ds_plan = _vlen_ds(read_plan={"spatial_index": "shots", "pad": 1})
+        for shard in (0, 1):
+            a = _read_group(_FakeH5(_l1b_arrays_strided()), "BEAM0000", ds_plan, shard, _LatGrid())
+            b = _read_group(
+                _FakeH5(_l1b_arrays_strided()), "BEAM0000", _vlen_ds(), shard, _LatGrid()
+            )
+            for col in ("rxwaveform", "shot_number", "noise_mean", "elevation"):
+                np.testing.assert_allclose(a[col].to_numpy(), b[col].to_numpy())
+
+    def test_sum_of_counts_extent_returns_the_silent_zero(self, monkeypatch):
+        # The bug, pinned: with the extent derived as Σcount (13), the last
+        # shot's run starts past the phantom end (row 18), ``plan_read`` clamps
+        # it to ``base_end <= base_start``, and the group returns no rows and no
+        # error -- the 0.45.0 fleet smoke, one shard at a time.
+        import zagg.processing.read_vlen as rv
+
+        ds = _vlen_ds(read_plan={"spatial_index": "shots", "pad": 0})
+        h5, grid = _FakeH5(_l1b_arrays_strided()), _LastShotGrid()
+        io_stats: dict = {}
+        monkeypatch.setattr(rv, "link_base_extent", lambda ibeg, cnt, base: int(np.sum(cnt)))
+        assert _read_group(h5, "BEAM0000", ds, 1, grid, io_stats=io_stats) is None
+        assert io_stats["obs_read"] == 0
+        monkeypatch.undo()
+        df = _read_group(_FakeH5(_l1b_arrays_strided()), "BEAM0000", ds, 1, grid)
+        assert df["shot_number"].tolist() == [104] * 4
+
+    def test_record_level_filter_expands_at_planned_rate(self):
+        # degrade == 0 at the shots level drops shot 103's single sample; the
+        # cross-level expansion now gathers per planned row (searchsorted over
+        # the level's link) instead of painting the base extent.
+        ds = _vlen_ds(
+            read_plan={"spatial_index": "shots", "pad": 0},
+            filters=[
+                {
+                    "level": "shots",
+                    "dataset": "/{group}/geolocation/degrade",
+                    "op": "eq",
+                    "value": 0,
+                }
+            ],
+        )
+        df = _read_group(_FakeH5(_l1b_arrays_strided()), "BEAM0000", ds, 1, _LatGrid())
+        assert df["shot_number"].tolist() == [104] * 4
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), WAVE[9:13])
+
+    def test_sibling_join_expands_at_planned_rate(self):
+        ds = _vlen_ds(
+            read_plan={"spatial_index": "shots", "pad": 0},
+            assets={
+                "l2a": {"join": {"left": "/{group}/shot_number", "right": "/{group}/shot_number"}}
+            },
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1}],
+        )
+        df = _read_group(
+            _FakeH5(_l1b_arrays_strided()),
+            "BEAM0000",
+            ds,
+            1,
+            _LatGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        # Shot 103 has no L2A row (dropped); 104 passes the flag.
+        assert df["shot_number"].tolist() == [104] * 4
+
+    def test_slack_rows_nan_under_linspace_synthesis(self):
+        from zagg.processing.read_vlen import _planned_gather_map
+
+        gidx, parent, within = _planned_gather_map(
+            STARTS_STRIDED, COUNTS, 1, STRIDED_EXTENT, [(0, STRIDED_EXTENT)]
+        )
+        vals = synthesize_linspace(E0, E1, COUNTS, parent, within)
+        slack = [r for r in SLACK_ROWS if r < STRIDED_EXTENT]
+        assert np.isnan(vals[slack]).all()
+        assert not np.isnan(vals[[0, 4, 6, 8, 12, 18, 21]]).any()
+        np.testing.assert_allclose(vals[0:5], _expected_elevation(0))
+        np.testing.assert_allclose(vals[18:22], _expected_elevation(3))
+        assert gidx.tolist() == list(range(STRIDED_EXTENT))
+
+    def test_gather_map_marks_every_slack_row_unassigned(self):
+        parent, _ = expand_link_indices(STARTS_STRIDED, COUNTS, 1, STRIDED_EXTENT)
+        assert [int(r) for r in np.flatnonzero(parent < 0)] == [
+            r for r in SLACK_ROWS if r < STRIDED_EXTENT
+        ]
+
+    @pytest.mark.parametrize(
+        "read_plan, grid",
+        [
+            (None, _OneShardGrid()),
+            ({"spatial_index": "shots", "pad": 0}, _LastShotGrid()),
+        ],
+        ids=["full", "planned"],
+    )
+    def test_dataset_shorter_than_the_link_extent_raises(self, read_plan, grid):
+        # BOTH arms refuse a truncated dataset in the same domain words. The
+        # planned arm is the production GEDI route; before the fold it surfaced
+        # the same corruption as an opaque ``IndexError: boolean index did not
+        # match indexed array`` from deep in the column assembly.
+        arrays = _l1b_arrays_strided()
+        arrays["/BEAM0000/rxwaveform"] = WAVE_STRIDED[:20]  # link reaches row 21
+        ds = _vlen_ds() if read_plan is None else _vlen_ds(read_plan=read_plan)
+        shard = 0 if read_plan is None else 1
+        with pytest.raises(ValueError, match="does not tile the declared base extent"):
+            _read_group(_FakeH5(arrays), "BEAM0000", ds, shard, grid)
+
+
+# ── a third level, with a link of its own (#452 review) ─────────────────────
+#
+# Every level in the fixtures above is either ``samples`` (base) or ``shots``
+# (coordinates), so the cross-level expansion has only ever run against the
+# very link the gather map was built from — the searchsorted derivation
+# compared against itself. ``blocks`` is a genuinely different link over the
+# same 24-row strided base: ORIGIN-0 (``shots`` is origin-1), two records with
+# their own starts and counts, boundaries that cut *inside* a shot's samples.
+#
+#   row     0 .......................... 18 | 19 | 20 21 | 22 23
+#   block   0 ...........................  | -- | 1 .... | -----
+#   shot    101 .. | 102 .. | 103 |    | 104 ......... |
+#
+# Keeping block 1 keeps base rows 20-21 only: the last two samples of shot 104
+# and nothing else — an answer no ``shots``-level filter can produce, and one
+# that shifts by a row if the level's ``index_base`` is taken from the
+# coordinates link instead of its own.
+
+BLOCK_STARTS = np.array([0, 20], dtype=np.uint64)  # ORIGIN-0, unlike shots
+BLOCK_COUNTS = np.array([19, 2], dtype=np.uint16)
+BLOCK_FLAG = np.array([0, 1], dtype=np.uint8)
+
+
+def _l1b_arrays_blocks(group="BEAM0000"):
+    arrays = _l1b_arrays_strided(group)
+    arrays[f"/{group}/block_start"] = BLOCK_STARTS
+    arrays[f"/{group}/block_count"] = BLOCK_COUNTS
+    arrays[f"/{group}/block_flag"] = BLOCK_FLAG
+    return arrays
+
+
+def _vlen_ds_blocks(**extra):
+    ds = _vlen_ds()
+    ds["levels"] = dict(ds["levels"])
+    ds["levels"]["blocks"] = {
+        "path": "/{group}",
+        "link": {
+            "to": "samples",
+            "index_beg": "/{group}/block_start",
+            "count": "/{group}/block_count",
+            "index_base": 0,
+        },
+    }
+    ds["filters"] = [{"level": "blocks", "dataset": "/{group}/block_flag", "op": "eq", "value": 1}]
+    ds.update(extra)
+    return ds
+
+
+class TestThirdLevelLink:
+    """A cross-level filter on a link that is NOT the coordinates link."""
+
+    # Shard 1 (shots 103 + 104, pad 0) plans base rows 12..21; of those, rows
+    # 12 and 18-21 carry samples and 13-17 are slack. Block 1 covers 20-21.
+    PLANNED_ROWS = np.arange(12, 22)
+
+    def test_searchsorted_expansion_matches_the_hand_computed_owner_map(self):
+        expanded = _expand_mask_at_rows(
+            BLOCK_FLAG.astype(bool), BLOCK_STARTS, BLOCK_COUNTS, 0, self.PLANNED_ROWS
+        )
+        # rows 12-18 -> block 0 (flag 0), row 19 -> no block, rows 20-21 -> block 1.
+        assert expanded.tolist() == [False] * 8 + [True, True]
+        np.testing.assert_array_equal(
+            expanded,
+            _expand_mask_to_base(
+                BLOCK_FLAG.astype(bool), BLOCK_STARTS, BLOCK_COUNTS, 0, STRIDED_EXTENT
+            )[self.PLANNED_ROWS],
+        )
+
+    def test_a_wrong_index_base_on_the_second_link_changes_the_answer(self):
+        # The property the two-level fixtures could not see: read the level's
+        # own origin wrong and the window slides by a row.
+        shifted = _expand_mask_at_rows(
+            BLOCK_FLAG.astype(bool), BLOCK_STARTS, BLOCK_COUNTS, 1, self.PLANNED_ROWS
+        )
+        assert shifted.tolist() == [False] * 7 + [True, True, False]
+
+    def test_planned_read_filters_on_the_third_level(self):
+        ds = _vlen_ds_blocks(read_plan={"spatial_index": "shots", "pad": 0})
+        df = _read_group(_FakeH5(_l1b_arrays_blocks()), "BEAM0000", ds, 1, _LatGrid())
+        assert df["shot_number"].tolist() == [104, 104]
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), WAVE[11:13])
+
+    def test_planned_matches_full_on_the_third_level(self):
+        plan_df = _read_group(
+            _FakeH5(_l1b_arrays_blocks()),
+            "BEAM0000",
+            _vlen_ds_blocks(read_plan={"spatial_index": "shots", "pad": 0}),
+            1,
+            _LatGrid(),
+        )
+        full_df = _read_group(
+            _FakeH5(_l1b_arrays_blocks()), "BEAM0000", _vlen_ds_blocks(), 1, _LatGrid()
+        )
+        for col in ("rxwaveform", "shot_number", "noise_mean", "elevation"):
+            np.testing.assert_allclose(plan_df[col].to_numpy(), full_df[col].to_numpy())
+
+    def test_a_shots_level_filter_cannot_produce_the_same_rows(self):
+        # Guards against the fixture degenerating back into a no-op: the block
+        # boundary cuts inside shot 104, so no per-shot verdict yields these rows.
+        ds = _vlen_ds(
+            read_plan={"spatial_index": "shots", "pad": 0},
+            filters=[
+                {
+                    "level": "shots",
+                    "dataset": "/{group}/geolocation/degrade",
+                    "op": "eq",
+                    "value": 0,
+                }
+            ],
+        )
+        df = _read_group(_FakeH5(_l1b_arrays_blocks()), "BEAM0000", ds, 1, _LatGrid())
+        assert df["shot_number"].tolist() == [104] * 4
+
+
+# ── memory posture: nothing at base rate on a planned vlen read (#452) ───────
+
+
+class _RampBase:
+    """Stand-in for a huge flat base dataset: value == row index, never
+    materialized. Only the plan's hyperslices are ever sliced out of it, which
+    is the property under test — a route that touched it whole would have to
+    allocate ``n_base`` and would trip the spy below."""
+
+    def __init__(self, n):
+        self._n = n
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, key):
+        start, stop, step = key.indices(self._n)
+        return np.arange(start, stop, step, dtype=np.float32) + 1.0
+
+
+class _AllocSpy:
+    """``numpy`` proxy recording the length of every array a module allocates.
+
+    Installed over the module-global ``np`` of ``read`` / ``read_vlen`` so only
+    those two modules' own allocations are seen (pandas, the grid stub and the
+    fixture keep the real numpy)."""
+
+    _TRACKED = ("zeros", "ones", "empty", "full", "arange", "repeat", "concatenate")
+
+    def __init__(self, sizes: list[int]):
+        self._sizes = sizes
+
+    def __getattr__(self, name):
+        attr = getattr(np, name)
+        if name not in self._TRACKED:
+            return attr
+
+        def _wrapped(*args, **kwargs):
+            out = attr(*args, **kwargs)
+            self._sizes.append(int(np.size(out)))
+            return out
+
+        return _wrapped
+
+
+class TestVlenMemoryPosture:
+    """A planned vlen read allocates at PLANNED rate, never at base rate.
+
+    The companion half of the fix: with a correct extent but base-rate
+    expansion, one GEDI beam group builds ~7 GB of per-shot broadcasts against
+    a 2 GB worker. The fixture strides the same four shots across 3,000,004
+    base rows while the shard touches five of them, so any surviving base-rate
+    allocation is six orders of magnitude larger than the plan and impossible
+    to miss."""
+
+    STRIDE = 1_000_000
+    N_BASE = 3 * STRIDE + 4
+
+    def _arrays(self, group="BEAM0000"):
+        arrays = _l1b_arrays(group)
+        arrays[f"/{group}/rx_sample_start_index"] = np.array(
+            [1, self.STRIDE + 1, 2 * self.STRIDE + 1, 3 * self.STRIDE + 1], dtype=np.uint64
+        )
+        arrays[f"/{group}/rxwaveform"] = _RampBase(self.N_BASE)
+        return arrays
+
+    def _data_source(self):
+        # All three expansion paths at once: a cross-level (record) filter, a
+        # sibling-asset join, and the segment-level variable broadcasts the
+        # shared fixture already declares (shot_number, noise_mean).
+        return _vlen_ds(
+            read_plan={"spatial_index": "shots", "pad": 0},
+            assets={
+                "l2a": {"join": {"left": "/{group}/shot_number", "right": "/{group}/shot_number"}}
+            },
+            filters=[
+                {
+                    "level": "shots",
+                    "dataset": "/{group}/geolocation/degrade",
+                    "op": "eq",
+                    "value": 0,
+                },
+                {"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "eq", "value": 1},
+            ],
+        )
+
+    def test_planned_read_allocates_nothing_at_base_rate(self, monkeypatch):
+        import zagg.processing.read as rd
+        import zagg.processing.read_vlen as rv
+
+        arrays = self._arrays()
+        assert link_base_extent(arrays["/BEAM0000/rx_sample_start_index"], COUNTS, 1) == self.N_BASE
+
+        sizes: list[int] = []
+        spy = _AllocSpy(sizes)
+        monkeypatch.setattr(rd, "np", spy)
+        monkeypatch.setattr(rv, "np", spy)
+        df = _read_group(
+            _FakeH5(arrays),
+            "BEAM0000",
+            self._data_source(),
+            1,
+            _FirstShotGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        monkeypatch.undo()
+
+        # The shard holds shot 101 only: 5 planned rows, all kept.
+        assert df["shot_number"].tolist() == [101] * 5
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), np.arange(1.0, 6.0))
+        assert sizes, "the allocation spy saw nothing — is it still wired to the read modules?"
+        assert max(sizes) <= 64, f"a base-rate allocation survived: {sorted(sizes)[-3:]}"
+
+    def test_full_read_keeps_the_base_rate_forms(self, monkeypatch):
+        """The FULL arm must not borrow the planned arm's at-rows machinery.
+
+        The at-rows helpers exist to avoid a length-``n_base`` intermediate. On
+        the full arm there is nothing to avoid — every base row is decoded — so
+        routing it through them buys nothing and costs a lot: it first has to
+        materialize the identity ``arange(n_base)`` (8 B/row) and then pays
+        33 B/row of searchsorted temporaries per companion where the paint pays
+        1-4 B/row. Measured on 2,000 records x count 700 over a 1,420 stride
+        (``n_base`` 19,998,560): ``_broadcast_segment_to_base`` 80.0 MB vs
+        ``_gather_segment_at_rows`` 660.7 MB, ``_expand_mask_to_base`` 20.0 MB
+        vs ``_expand_mask_at_rows`` 660.6 MB. So this pins the dispatch, not a
+        byte count: on the full arm no row vector is built and no owner map is
+        re-derived by searchsorted."""
+        import zagg.processing.read as rd
+        import zagg.processing.read_vlen as rv
+
+        arrays = self._arrays()
+        # A real flat array this time: the full arm decodes the whole dataset.
+        arrays["/BEAM0000/rxwaveform"] = np.arange(1.0, self.N_BASE + 1.0, dtype=np.float32)
+
+        at_rows_calls: list[str] = []
+        for name in ("_link_parent_at_rows", "_expand_mask_at_rows", "_gather_segment_at_rows"):
+            real = getattr(rd, name)
+
+            def _spy(*a, _n=name, _f=real, **k):
+                at_rows_calls.append(_n)
+                return _f(*a, **k)
+
+            monkeypatch.setattr(rd, name, _spy)
+            if hasattr(rv, name):
+                monkeypatch.setattr(rv, name, _spy)
+
+        sizes: list[int] = []
+        monkeypatch.setattr(rd, "np", _AllocSpy(sizes))
+        monkeypatch.setattr(rv, "np", _AllocSpy(sizes))
+        ds = self._data_source()
+        del ds["read_plan"]  # the full arm
+        df = _read_group(
+            _FakeH5(arrays),
+            "BEAM0000",
+            ds,
+            1,
+            _FirstShotGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        monkeypatch.undo()
+
+        assert df["shot_number"].tolist() == [101] * 5
+        np.testing.assert_array_equal(df["rxwaveform"].to_numpy(), np.arange(1.0, 6.0))
+        assert not at_rows_calls, f"the full arm used the at-rows helpers: {at_rows_calls}"
+        # No row vector: the identity map is never materialized. The full arm's
+        # legitimate base-rate allocations (the gather map's two arrays, the
+        # per-companion broadcasts) are all <= n_base; nothing may exceed it.
+        assert sizes, "the allocation spy saw nothing — is it still wired to the read modules?"
+        assert max(sizes) <= self.N_BASE, f"an over-base-rate allocation: {sorted(sizes)[-3:]}"
+        assert sum(1 for s in sizes if s >= self.N_BASE) <= 6, (
+            f"more base-rate allocations than the base-rate forms need: {sorted(sizes)[-8:]}"
         )

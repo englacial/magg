@@ -1,4 +1,13 @@
-"""The time coordinate's encoding contract (spec §8, issues #443/#410).
+"""The temporal declaration and the time axis' encoding (spec §8, #443/#410).
+
+Spec §8 declares a word-typed array by the domain-neutral triple
+``{spec, shape, grammar}``, stamped on the array that HOLDS the words. This
+module owns the temporal domain: the ``temporal`` attrs key, the shape
+vocabulary (:data:`TOC_SHAPES` — a time ``coordinate``, a ``per-cell``
+companion, a ``per-centroid`` companion), and the coordinate shape's encode
+and decode. The companion shapes' words are produced by the aggregation
+kernel; what lives here is their declaration, so writer and reader agree on
+one grammar.
 
 A raster ``(time, cells)`` product's ``time`` array carries one value per
 acquisition group. Two encodings are defined:
@@ -27,11 +36,32 @@ import numpy as np
 TEMPORAL_ATTR = "temporal"
 #: The §8 convention revision, strict-checked on read.
 TOC_SPEC = "zagg-toc/1"
-#: The only §8 ``shape`` this revision defines: the declaring array IS the
-#: CF/xarray coordinate variable of the time dimension. Per-cell /
-#: per-centroid companions (#410) land as further values under the same
-#: marker, from the same domain-neutral shape vocabulary.
+#: §8's domain-neutral shape vocabulary, all three defined by this revision
+#: (issue #410). ``coordinate`` — the declaring array IS the CF/xarray
+#: coordinate variable of the time dimension (§8.1). ``per-cell`` — a dense
+#: uint64 companion, one word per cell of the cell grid (§8.2).
+#: ``per-centroid`` — a ragged uint64 sibling, one word per centroid of the
+#: digest it accompanies (§8.3). The declaring array is always the array
+#: that HOLDS the words; a payload array carries a binding, never a
+#: declaration.
 TOC_SHAPE_COORDINATE = "coordinate"
+TOC_SHAPE_PER_CELL = "per-cell"
+TOC_SHAPE_PER_CENTROID = "per-centroid"
+TOC_SHAPES = (TOC_SHAPE_COORDINATE, TOC_SHAPE_PER_CELL, TOC_SHAPE_PER_CENTROID)
+#: The subset a config declares per FIELD (``temporal:`` on an aggregation
+#: variable). ``coordinate`` is not among them — a time axis is declared by
+#: ``output.time_encoding``, not by a field.
+TOC_FIELD_SHAPES = (TOC_SHAPE_PER_CELL, TOC_SHAPE_PER_CENTROID)
+#: The §8.2 reserved word: a per-cell companion's ``fill_value``, marking a
+#: cell the writer never observed. Never an acquisition.
+TOC_UNOBSERVED = 0
+#: The reducers that PRODUCE toc words, and may therefore declare a field-level
+#: ``temporal:`` companion (issue #410). **Empty in this release**: the §8.2/§8.3
+#: declaration surface landed ahead of the aggregation kernel, so
+#: ``zagg.config`` refuses ``temporal:`` outright rather than let a run stamp a
+#: declaration over words nothing produced. The kernel PR lifts the gate by
+#: naming its reducer here — that is the whole of lifting it.
+TOC_PRODUCING_FUNCTIONS: frozenset[str] = frozenset()
 #: The §8 word-grammar citation — a grammar REVISION token in the ecosystem's
 #: {name}/{major} style (``zagg-ragged/1``, ``morton-hive/2``), never a
 #: documentation URL or a stamp of the writer's installed mortie: store bytes
@@ -60,13 +90,21 @@ __all__ = [
     "TEMPORAL_ATTR",
     "TIME_ENCODINGS",
     "TOC_EPOCH",
+    "TOC_FIELD_SHAPES",
     "TOC_GRAMMAR",
+    "TOC_PRODUCING_FUNCTIONS",
     "TOC_SHAPE_COORDINATE",
+    "TOC_SHAPE_PER_CELL",
+    "TOC_SHAPE_PER_CENTROID",
+    "TOC_SHAPES",
     "TOC_SPEC",
+    "TOC_UNOBSERVED",
     "decode_time_axis",
     "encode_time_axis",
     "read_time_axis",
+    "temporal_attrs",
     "temporal_declaration",
+    "temporal_declaration_block",
     "time_axis_attrs",
     "time_axis_dtype",
     "time_axis_overlaps",
@@ -105,23 +143,48 @@ def time_axis_attrs(encoding: str) -> dict:
     """
     if encoding != "toc":
         return dict(LEGACY_TIME_ATTRS)
-    return {
-        TEMPORAL_ATTR: {
-            "spec": TOC_SPEC,
-            "shape": TOC_SHAPE_COORDINATE,
-            "grammar": TOC_GRAMMAR,
-        }
-    }
+    return {TEMPORAL_ATTR: temporal_declaration_block(TOC_SHAPE_COORDINATE)}
 
 
-def temporal_declaration(attrs) -> dict | None:
+def temporal_declaration_block(shape: str) -> dict:
+    """The §8 declaration a writer stamps for ``shape``.
+
+    Three keys and no more (#410): the convention revision, the shape, and
+    the word-grammar revision. The epoch, the timescale and the range
+    variant's quanta are properties of the cited grammar and are deliberately
+    NOT echoed into store bytes.
+    """
+    if shape not in TOC_SHAPES:
+        raise ValueError(f"temporal shape {shape!r} is not one of {TOC_SHAPES} (spec §8)")
+    return {"spec": TOC_SPEC, "shape": str(shape), "grammar": TOC_GRAMMAR}
+
+
+def temporal_attrs(shape: str) -> dict:
+    """The attrs a writer stamps on the array that HOLDS the words (§8).
+
+    The declaring array is the companion itself — a dense uint64 array for
+    ``per-cell``, a ragged uint64 sibling for ``per-centroid`` — never the
+    digest payload it accompanies, which carries only the ``times`` binding
+    (§8.3). The whole attrs mapping, so a caller merges rather than guesses
+    the key.
+    """
+    return {TEMPORAL_ATTR: temporal_declaration_block(shape)}
+
+
+def temporal_declaration(attrs, *, shape: str | None = None) -> dict | None:
     """The §8 ``temporal`` block from an array's attrs, strict-checked.
 
-    Returns ``None`` for the legacy encoding (absent key) — never raises for
-    a store written before §8, which is the schema-evolution rule. Raises on
-    a declaration this revision cannot decode: an unknown ``spec``, an
-    unimplemented ``shape``, or an uncited word ``grammar``. Unrecognized
-    keys are informative by §8 and ignored, never a refusal.
+    Returns ``None`` when the key is absent — never raises for a store
+    written before §8, which is the schema-evolution rule (§8.4: an absent
+    declaration is never a refusal). Raises on a declaration this reader
+    cannot decode: an unknown ``spec``, a ``shape`` outside the vocabulary,
+    or an uncited word ``grammar``. Unrecognized keys are informative by §8
+    and ignored, never a refusal.
+
+    ``shape`` narrows the check to one expected value — what a caller that
+    can only consume one shape (e.g. the time-axis decode, which is
+    ``coordinate``-only) passes, so a companion's block is refused rather
+    than decoded as an axis.
     """
     block = dict(attrs or {}).get(TEMPORAL_ATTR)
     if block is None:
@@ -134,11 +197,11 @@ def temporal_declaration(attrs) -> dict | None:
             f"unknown temporal declaration spec {spec!r} (spec §8 defines {TOC_SPEC!r}); "
             f"refusing to guess a future revision's time encoding"
         )
-    shape = block.get("shape")
-    if shape != TOC_SHAPE_COORDINATE:
+    expected = TOC_SHAPES if shape is None else (shape,)
+    if block.get("shape") not in expected:
         raise ValueError(
-            f"temporal declaration shape {shape!r} is not implemented "
-            f"(spec §8 defines {TOC_SHAPE_COORDINATE!r} for a time coordinate)"
+            f"temporal declaration shape {block.get('shape')!r} is not implemented "
+            f"(spec §8 defines {expected} here)"
         )
     grammar = block.get("grammar")
     if grammar != TOC_GRAMMAR:
@@ -200,7 +263,7 @@ def decode_time_axis(values, attrs) -> tuple[np.ndarray, np.ndarray]:
     because the envelope's midpoint is not an observation, and because the
     reader surface is numpy tuples by convention (D13).
     """
-    if temporal_declaration(attrs) is None:
+    if temporal_declaration(attrs, shape=TOC_SHAPE_COORDINATE) is None:
         when = np.asarray(values, dtype="int64").astype("datetime64[us]").astype("datetime64[ns]")
         return when, when
     import mortie
@@ -222,7 +285,7 @@ def time_axis_overlaps(values, attrs, start, end) -> np.ndarray:
     q_start, q_end = np.datetime64(start, "us"), np.datetime64(end, "us")
     if q_end < q_start:
         raise ValueError(f"time window is inverted ({q_start} .. {q_end})")
-    if temporal_declaration(attrs) is None:
+    if temporal_declaration(attrs, shape=TOC_SHAPE_COORDINATE) is None:
         when = np.asarray(values, dtype="int64").astype("datetime64[us]")
         return (when >= q_start) & (when < q_end)
     import mortie

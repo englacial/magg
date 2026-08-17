@@ -1059,7 +1059,8 @@ Raster (pull-NN) pipelines write the same tree with **windowed `(time, cells)`
 leaves**: one vanilla zarr v3 leaf per **(shard, window)** unit at
 `shard_leaf_path(root, shard, window=label)`, each carrying leaf-local `time`
 (int64 microseconds with CF attrs by default, or `uint64` mortie toc words
-carrying the spec §8 `temporal` declaration and no CF attrs under
+carrying the spec §8.1 `temporal` declaration at `shape: "coordinate"`
+and no CF attrs under
 `output.time_encoding: toc` — which the shipped Sentinel-2 config sets, issue
 #443) and `morton` (packed u64 words) as the sole cell
 coordinate — `cell_ids` (NESTED) rides only the `emit_cell_ids` transition hatch

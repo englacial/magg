@@ -119,10 +119,36 @@ def test_gesdisc_s3_credentials_requests_gesdisc_daac(monkeypatch):
     assert creds["daac"] == "GES_DISC"
 
 
+def test_lpdaac_s3_credentials_requests_lpdaac_daac(monkeypatch):
+    """LP DAAC creds are the same parameterized flow — GEDI lives in
+    ``lp-prod-protected``, which NSIDC creds cannot read (issue #449)."""
+    _login_seq(monkeypatch, _FakeAuth())
+    creds = auth.get_lpdaac_s3_credentials()
+    assert creds["daac"] == "LPDAAC"
+
+
 def test_daac_credential_providers_registered():
-    """nsidc/gesdisc resolve by name so configs can select them (issue #213 Phase 4)."""
+    """nsidc/gesdisc/lpdaac resolve by name so configs can select them
+    (issue #213 Phase 4; lpdaac added by issue #449)."""
     from zagg import registry
 
-    assert {"nsidc", "gesdisc"} <= set(registry.list_credential_providers())
+    assert {"nsidc", "gesdisc", "lpdaac"} <= set(registry.list_credential_providers())
     assert registry.get_credential_provider("nsidc") is auth.get_nsidc_s3_credentials
     assert registry.get_credential_provider("gesdisc") is auth.get_gesdisc_s3_credentials
+    assert registry.get_credential_provider("lpdaac") is auth.get_lpdaac_s3_credentials
+
+
+def test_gedi_template_selects_the_lpdaac_provider(monkeypatch):
+    """The packaged GEDI template declares the provider AND it resolves through
+    the runner's source-credential seam (issue #449): the first fleet run fell
+    back to NSIDC and every granule read 403'd.
+
+    ``earthaccess.login`` is patched, so no network call is made.
+    """
+    from zagg.config import default_config
+    from zagg.runner import _resolve_source_credentials
+
+    cfg = default_config("gedi01b_waveform_healpix_hive")
+    assert cfg.data_source["credentials_provider"] == "lpdaac"
+    _login_seq(monkeypatch, _FakeAuth())
+    assert _resolve_source_credentials(cfg)["daac"] == "LPDAAC"

@@ -297,13 +297,23 @@ def field_composability(meta: dict) -> str:
       equality class, cf. D24);
     - ``none`` — everything else: expressions, vector fields, chunk-resolution
       companions, located ragged (no streaming merge law for the location
-      channel yet), and any scalar reducer without an exact law (mean, std,
-      median, quantiles, ...).
+      channel yet), temporal companions (spec §8.2/§8.3 — see below), and any
+      scalar reducer without an exact law (mean, std, median, quantiles, ...).
+
+    A field declaring a ``temporal`` companion (issue #410) is ``none``
+    whatever its reducer: the companion's fold law is the word grammar's
+    semilattice join (spec §8.2), and no zagg fold implements it yet. Folding
+    such a field through its reducer instead — ``max`` over toc words, say —
+    would emit a word whose conservative-envelope claim is simply false, so
+    the honest state until the #410 kernel PR is that the companion exists at
+    native resolution only.
     """
     from zagg.config import get_output_signature
 
     sig = get_output_signature(meta)
     if meta.get("expression") is not None or sig["resolution"] != "cell":
+        return "none"
+    if sig.get("temporal") is not None:
         return "none"
     function = _fold_function_name(meta.get("function"))
     if sig["kind"] == "ragged":

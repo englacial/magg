@@ -3383,6 +3383,110 @@ class TestContainerTelemetrySummary:
         assert summary["worker_rss_start_max_by_gen"] is None
 
 
+class TestPartialAuthDenialWarning:
+    """A shard that PRODUCED data while some of its reads were denied leaves a
+    partial leaf and no trace in the run summary (espg ruling, 2026-08-17, on
+    issue #449). One dispatch-side WARNING names the shard count and the
+    provider check; the all-denied case already surfaces through the worker's
+    own error, so it is not double-reported here."""
+
+    def _warn(self, metas, caplog):
+        import logging as _logging
+
+        from zagg.runner import _warn_partial_auth_denials
+
+        with caplog.at_level(_logging.WARNING, logger="zagg.runner"):
+            n = _warn_partial_auth_denials(metas)
+        return n, caplog.text
+
+    def test_data_producing_shard_with_denials_warns(self, caplog):
+        metas = [
+            {"shard_key": 1, "total_obs": 10, "auth_errors": 2, "error": None},
+            {"shard_key": 2, "total_obs": 5, "error": None},
+        ]
+        n, text = self._warn(metas, caplog)
+        assert n == 1
+        assert "1 shard(s) wrote data despite DENIED source reads" in text
+        assert "2 auth-shaped read failures" in text
+        assert "credentials_provider" in text
+
+    def test_counts_are_summed_across_shards(self, caplog):
+        metas = [{"total_obs": 10, "auth_errors": 2}, {"total_obs": 1, "auth_errors": 3}]
+        n, text = self._warn(metas, caplog)
+        assert n == 2
+        assert "2 shard(s)" in text and "5 auth-shaped" in text
+
+    def test_clean_run_is_silent(self, caplog):
+        n, text = self._warn([{"total_obs": 10}, {"total_obs": 0, "error": "x"}], caplog)
+        assert n == 0
+        assert "DENIED" not in text
+
+    def test_all_denied_shard_is_not_double_reported(self, caplog):
+        # No data + auth_errors -> the worker already returned the "Access
+        # denied reading source granules" error, which reaches the summary
+        # through cells_error. This warning is only for the silent case.
+        metas = [{"total_obs": 0, "auth_errors": 4, "error": "Access denied reading source ..."}]
+        n, text = self._warn(metas, caplog)
+        assert n == 0
+        assert "DENIED" not in text
+
+    def test_non_dict_rows_are_ignored(self, caplog):
+        n, _text = self._warn([None, "x", {"total_obs": 1, "auth_errors": 1}], caplog)
+        assert n == 1
+
+    def test_lambda_run_warns_from_the_worker_envelopes(self, monkeypatch, atl06_config, caplog):
+        import logging as _logging
+
+        with caplog.at_level(_logging.WARNING, logger="zagg.runner"):
+            _run_lambda_with_durations(
+                monkeypatch,
+                atl06_config,
+                [1.0, 1.0, 1.0, 1.0],
+                # ``containers`` merges straight into each result body.
+                containers=[{"auth_errors": 1}, {}, {}, {}],
+            )
+        assert "wrote data despite DENIED source reads" in caplog.text
+
+    def test_local_run_warns_from_the_result_metas(self, monkeypatch, atl06_config, caplog):
+        import logging as _logging
+
+        import zagg.grids as grids_mod
+        from zagg import runner
+
+        atl06_config.output["store_layout"] = "flat"
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
+        monkeypatch.setattr(runner, "consolidate_metadata", lambda *a, **k: None)
+
+        def fake_paw(shard_key, chunk_idx, records, grid, s3_creds, zarr_store, config, **kw):
+            meta = {"shard_key": shard_key, "total_obs": 7, "error": None}
+            if int(shard_key) == 10:
+                meta["auth_errors"] = 3
+            return meta
+
+        monkeypatch.setattr(runner, "_process_and_write", fake_paw)
+
+        with caplog.at_level(_logging.WARNING, logger="zagg.runner"):
+            runner._run_local(
+                atl06_config,
+                _run_catalog(),
+                "./out.zarr",
+                12,
+                max_cells=None,
+                morton_cell=None,
+                max_workers=2,
+                overwrite=False,
+                dry_run=False,
+                region="us-west-2",
+            )
+        assert "1 shard(s) wrote data despite DENIED source reads" in caplog.text
+
+
 class TestProfilePlumbing:
     """Phase 2 of issue #100: the opt-in --profile path. Default runs stay
     byte-identical (no profile event key, no worker_phase_max summary key); when
