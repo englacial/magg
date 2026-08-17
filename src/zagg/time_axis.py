@@ -68,6 +68,7 @@ TOC_PRODUCING_FUNCTIONS: frozenset[str] = frozenset(
         "zagg.stats.tdigest.build_tdigest",
         "zagg.stats.tdigest.build_tdigest_pairwise",
         "zagg.stats.tdigest.build_tdigest_where",
+        "zagg.stats.waveform.build_waveform_digest",
         "zagg.stats.toc.cell_envelope",
     }
 )

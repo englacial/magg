@@ -352,33 +352,42 @@ def field_composability(meta: dict) -> str:
       centroid inner shape, **located or not** (merge is order-dependent;
       ``np.isclose`` equality class, cf. D24);
     - ``none`` — everything else: expressions, vector fields, chunk-resolution
-      companions, temporal companions (spec §8.2/§8.3 — see below), and any
+      companions, a ``temporal: per-cell`` dense companion (see below), and any
       scalar reducer without an exact law (mean, std, median, quantiles, ...).
 
-    **A located field folds through the pyramid** (ruling 4 on issue #410): the
-    ``location`` channel's fold law is the located k-way merge the kernel has
-    carried since #279 (``merge_tdigests_kway(..., locations=)``, the deepest
-    common ancestor of the contributors' words), and the overview fold sites
-    thread it. Its words then sit at heterogeneous orders within one overview
-    array, which spec §9.1 makes normative. Excluding located fields was the
-    bug, not the design — a `location:` declaration used to *remove* the digest
-    from every overview level.
+    **Both companion channels fold through the pyramid** (issue #410, rulings 3
+    and 4): a digest field's companions are reduced over the same centroid
+    partition the payload merge produces, by the k-way merge the kernel has
+    carried since #279 — ``locations=`` to the deepest common ancestor of the
+    contributors' words (spec §9.1), ``temporal=`` to their toc envelope (spec
+    §8.3). Neither declaration removes the digest from the pyramid, and
+    excluding located fields was the bug, not the design: a ``location:``
+    declaration used to make the field vanish from every overview level.
 
-    A field declaring a ``temporal`` companion (issue #410) is still ``none``
-    whatever its reducer, and for a narrower reason than before: the words fold
-    exactly (the §8.2 join is a semilattice), but ruling 3 puts a **per-cell**
-    toc range at overview levels where the leaves are per-centroid, and that
-    shape-coarsening reduction (§8.4) is not wired through the fold sites yet.
-    Folding the field through its own reducer instead — ``max`` over toc words,
-    say — would emit a word whose conservative-envelope claim is false, so the
-    honest state remains native resolution only.
+    The temporal channel stays **per-centroid at every level**, symmetric with
+    located — espg-ruled 2026-08-17, amending ruling 3, which had put a per-cell
+    toc range at overview levels. §8.4's shape-coarsening reduction stays
+    licensed for producers that want it, but zagg's digest pyramids do not use
+    it: one companion shape means readers bind one contract, and the ranges an
+    overview's per-centroid words carry degrade toward per-cell information
+    content on their own as δ falls, which is what makes them informative
+    exactly where elevation and time correlate.
+
+    A ``temporal: per-cell`` field — the §8.2 dense shape, GEDI's leaf companion
+    (ruling 2) — is a different object and stays ``none``. Its fold law is the
+    word grammar's join over a cell group, not its own reducer, so classifying
+    it by ``function`` would fold e.g. ``nanmax`` over toc words and emit a word
+    whose conservative-envelope claim is false. Wiring a dense toc law is not
+    what the ruling asked for, and no shipped config needs it (the GEDI template
+    declares ``pyramid: false``), so it is left out rather than guessed at.
     """
     from zagg.config import get_output_signature
+    from zagg.time_axis import TOC_SHAPE_PER_CELL
 
     sig = get_output_signature(meta)
     if meta.get("expression") is not None or sig["resolution"] != "cell":
         return "none"
-    if sig.get("temporal") is not None:
+    if sig.get("temporal") == TOC_SHAPE_PER_CELL:
         return "none"
     function = _fold_function_name(meta.get("function"))
     if sig["kind"] == "ragged":

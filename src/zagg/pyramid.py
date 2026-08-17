@@ -203,6 +203,14 @@ def declared_fields(config) -> tuple[dict, list]:
             # is byte-identical to pre-#410.
             if meta.get("location") is not None:
                 fields[name]["location"] = str(meta["location"])
+            # The §8.3 temporal companion, on the same footing (espg-ruled
+            # 2026-08-17, amending ruling 3): per-centroid at every level, so
+            # the overview template needs the sibling and the fold needs to know
+            # to thread the channel. Recorded as the SHAPE, which is all a level
+            # above the leaf can act on — the leaf's ingest column is not
+            # re-read by any fold. Keyed only when set.
+            if meta.get("temporal") is not None:
+                fields[name]["temporal"] = str(meta["temporal"])
             # The §2.0 weights declaration, keyed only when non-default so
             # existing manifests stay byte-identical; the sweep's fold gate
             # compares it against the stored arrays (issue #424). Its

@@ -1057,12 +1057,22 @@ def _validate_time_source(config: PipelineConfig) -> None:
             f"output.time_source.field {field!r} is the DERIVED toc word column, not a "
             f"source — name the dataset-time column it is encoded from (issue #410)"
         )
-    declared = set((config.data_source or {}).get("variables") or {})
+    # Base-rate means "one value per observation AFTER the read", which includes
+    # a coarser-level variable the reader broadcasts down (issue #30): GEDI's
+    # clock is shot-rate and every sample of a waveform carries its shot's
+    # instant, which is exactly what makes a single-shot cell's centroids exact
+    # timestamps. So the accepted set is the same one every other column
+    # reference validates against — declared variables plus broadcast level
+    # variables — and NOT ``data_source.variables`` alone.
+    declared = set((config.data_source or {}).get("variables") or {}) | _segment_variable_names(
+        config.data_source or {}
+    )
     if field not in declared:
         raise ValueError(
-            f"output.time_source.field {field!r} is not a declared "
-            f"data_source.variables column (available: {sorted(declared)}) — a temporal "
-            f"companion is one word per observation, so the column must be base-rate"
+            f"output.time_source.field {field!r} is not a declared data_source variable "
+            f"(available, including broadcast level variables: {sorted(declared)}) — a "
+            f"temporal companion is one word per observation, so the column must reach "
+            f"base rate"
         )
     if "epoch" not in block:
         raise ValueError(

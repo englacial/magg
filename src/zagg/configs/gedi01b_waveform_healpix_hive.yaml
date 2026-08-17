@@ -73,6 +73,11 @@ data_source:
         # Per-shot L1B pass-throughs, broadcast to sample rate (plain
         # companion names per the issue #422 ruling).
         shot_number: "/{group}/shot_number"
+        # The clock the section-8.3 temporal companion encodes from (issue
+        # #410). Shot-rate on GEDI, so it broadcasts to sample rate here: every
+        # sample of one waveform shares its shot's instant, which is what makes
+        # a single-shot cell's centroids exact timestamps.
+        delta_time: "/{group}/geolocation/delta_time"
         noise_mean: "/{group}/noise_mean_corrected"
         noise_stddev: "/{group}/noise_stddev_corrected"
         rx_energy: "/{group}/rx_energy"
@@ -152,6 +157,13 @@ aggregation:
       kind: ragged
       function: "zagg.stats.waveform.build_waveform_digest"
       source: elevation
+      # Per-centroid toc words (spec section 8.3, issue #410). Ruling 2 called
+      # for GEDI's companion per CELL; the 2026-08-17 amendment makes every
+      # companion per-centroid, and the honesty property is unchanged -- all of
+      # a shot's samples carry its one instant, so a single-shot cell's
+      # centroids are exact timestamps and only genuinely pooled cells produce
+      # ranges. One shape means readers bind one contract across sensors.
+      temporal: per-centroid
       inner_shape: [2]
       dtype: float32
       fill_value: 0
@@ -217,6 +229,19 @@ aggregation:
       fill_value: "NaN"
 
 output:
+  # The store's per-observation clock (issue #410). GEDI `delta_time` shares
+  # ICESat-2's convention: seconds on the CONTINUOUS GPS scale since
+  # 2018-01-01. Verified against two real granules rather than assumed --
+  # BEAM0000/ancillary/master_time_epoch reads exactly 1198800018.000000 in
+  # GEDI01_B_2019128… and GEDI01_B_2020024…, i.e. the 2018-01-01 epoch in
+  # leap-aware GPS seconds (a naive UTC count would be 1198800000; the +18 is
+  # GPS-UTC at 2018). That is what admits `scale: gps` here -- a nominal-UTC
+  # column would be refused by name (spec section 8.3's nanosecond MUST).
+  time_source:
+    field: delta_time
+    epoch: "2018-01-01T00:00:00"
+    scale: gps
+    units: seconds
   grid:
     type: healpix
     indexing_scheme: nested

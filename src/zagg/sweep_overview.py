@@ -41,7 +41,7 @@ from typing import overload
 
 import numpy as np
 
-from zagg.grids.base import ragged_locations_name
+from zagg.grids.base import ragged_locations_name, ragged_times_name
 
 logger = logging.getLogger(__name__)
 
@@ -243,46 +243,84 @@ def check_weights_match(attrs, meta: dict, field: str) -> None:
         )
 
 
-def check_located_match(attrs, field: str) -> None:
-    """Refuse a digest fold over a §9 located declaration this zagg cannot join.
+def check_companion_match(attrs, field: str, kwarg: str = "locations") -> None:
+    """Refuse a digest fold over a companion declaration this zagg cannot join.
 
-    The located analogue of :func:`check_weights_match`, called on the
-    SIBLING's attrs — where §9 puts the block. §9.2 imports §8.4 verbatim:
+    The companion analogue of :func:`check_weights_match`, called on the
+    SIBLING's attrs — where §8.3/§9 put the block. §9.2 imports §8.4 verbatim:
     declared companions compose only when they match on ``{shape, grammar}``,
-    and a writer joining ones that differ MUST refuse. ``zagg-located/1``
-    defines exactly one of each, so strict-checking every contributor's
-    declaration IS the match check: any two blocks that pass agree by
-    construction, and one that does not pass is a shape or grammar this fold
-    has no words for. An absent block is §2.2 verbatim (§9's absent-key rule —
-    every located store written before the declaration stays conformant) and
-    joins cleanly, so it is not drift.
+    and a writer joining ones that differ MUST refuse. Each convention defines
+    exactly one of each for the per-centroid shape, so strict-checking every
+    contributor's declaration IS the match check: any two blocks that pass agree
+    by construction, and one that does not pass is a shape or grammar this fold
+    has no words for. An absent block is the convention's absent-key rule (§2.2
+    verbatim for located; no companion for temporal) and joins cleanly, so it is
+    not drift.
 
-    Reading the words under the wrong shape would not fail loudly — a
-    ``per-cell`` sibling's rows decode as per-centroid vectors and fold into
-    words whose containment claim is false — which is why the refusal is here
-    and not left to the arithmetic. The per-leaf and per-child fold guards turn
-    it into a loud skip; :func:`_field_drift` refuses the same store at
-    retrofit time, so a disagreement is caught before the declaration lands.
+    The temporal arm additionally pins the SHAPE to ``per-centroid``, which the
+    espg ruling of 2026-08-17 makes the only shape a digest pyramid folds: a
+    ``per-cell`` block reaching a per-centroid fold would decode one word per
+    cell as a per-centroid vector and produce envelopes whose containment claim
+    is false. §8.4's shape-coarsening reduction stays licensed for producers
+    that want it — zagg's digest pyramids simply do not use it, so meeting one
+    here is a store this fold has no law for.
+
+    Reading words under the wrong shape would not fail loudly, which is why the
+    refusal is here and not left to the arithmetic. The per-leaf and per-child
+    fold guards turn it into a loud skip; :func:`_field_drift` refuses the same
+    store at retrofit time, so a disagreement is caught before the declaration
+    lands.
     """
     from zagg.grids.base import located_declaration
+    from zagg.time_axis import TOC_SHAPE_PER_CENTROID, temporal_declaration
 
     try:
-        located_declaration(dict(attrs or {}))
+        if kwarg == "temporal":
+            temporal_declaration(dict(attrs or {}), shape=TOC_SHAPE_PER_CENTROID)
+        else:
+            located_declaration(dict(attrs or {}))
     except ValueError as e:
         raise ValueError(f"field {field!r}: {e}") from e
 
 
+#: A digest field's companion channels, in the FIXED order the kernel returns
+#: them (``(digest, locations, temporal)``): the field-meta key that declares
+#: the channel, the reducer/kernel keyword it rides under, and the sibling array
+#: namer. Both channels are per-centroid at every pyramid level — espg-ruled
+#: 2026-08-17, amending ruling 3 on issue #410 — so a level above the leaf folds
+#: them identically and this table is the single place the order lives.
+COMPANION_CHANNELS = (
+    ("location", "locations", ragged_locations_name),
+    ("temporal", "temporal", ragged_times_name),
+)
+
+
+def field_companions(name: str, meta: dict) -> list[tuple[str, str]]:
+    """``(kernel kwarg, sibling array name)`` per channel this field declares.
+
+    In :data:`COMPANION_CHANNELS` order, so a caller can zip the kernel's extra
+    tuple elements onto the siblings positionally. Empty for a field declaring
+    neither, which is what keeps every pre-companion store's fold on the code
+    path it always took.
+    """
+    return [
+        (kwarg, namer(name))
+        for key, kwarg, namer in COMPANION_CHANNELS
+        if meta.get(key) is not None
+    ]
+
+
 @overload
 def fold_digests(
-    cell_digests: list, *, delta: int, dtype: str = ..., locations: None = ...
+    cell_digests: list, *, delta: int, dtype: str = ..., channels: None = ...
 ) -> bytes: ...
 @overload
 def fold_digests(
-    cell_digests: list, *, delta: int, dtype: str = ..., locations: list
-) -> tuple[bytes, bytes]: ...
+    cell_digests: list, *, delta: int, dtype: str = ..., channels: dict
+) -> tuple[bytes, ...]: ...
 def fold_digests(
-    cell_digests: list, *, delta: int, dtype: str = "float32", locations: list | None = None
-) -> bytes | tuple[bytes, bytes]:
+    cell_digests: list, *, delta: int, dtype: str = "float32", channels: dict | None = None
+) -> bytes | tuple[bytes, ...]:
     """Merge one overview cell's accumulated t-digests into its payload bytes.
 
     The approximate-class fold law (D24): the **order-independent k-way
@@ -291,19 +329,24 @@ def fold_digests(
     leaves reproduces identical bytes. An empty accumulation folds to the
     empty payload (the ragged fill).
 
-    ``locations`` is the §9 located channel (ruling 4 on issue #410): per-digest
-    ``uint64`` morton word vectors aligned with ``cell_digests``, threaded
-    through the same merge so a merged centroid's word is the deepest common
-    ancestor of its contributors'. Given, the return is a ``(payload_bytes,
-    location_bytes)`` pair; omitted, the bare payload bytes every unlocated
-    field still gets. **The two must come from one call** — the words are keyed
-    on the centroid partition the merge produces (spec §9.1), so folding them
-    separately would describe a different partition than the payload's. A
-    located empty accumulation folds to a pair of empty payloads, keeping the
-    sibling row-aligned with the digest at zero rows.
+    ``channels`` carries the companion channels (issue #410) as
+    ``{kernel kwarg: [per-digest word vector]}`` — ``locations`` for the §9
+    morton words, ``temporal`` for the §8.3 toc words, in
+    :data:`COMPANION_CHANNELS` order. Each vector list is aligned with
+    ``cell_digests``, and every declared channel is threaded through the SAME
+    merge, so a merged centroid's location is the deepest common ancestor of its
+    contributors' words and its toc word is their envelope. Given, the return is
+    ``(payload_bytes, *channel_bytes)`` in that order; omitted, the bare payload
+    bytes a field with no companion still gets.
 
-    Every pair is length-checked HERE rather than at the call sites, because
-    this function is the documented seam the two must come from together: the
+    **The payload and its channels must come from one call.** The words are
+    exact only *given* the centroid partition the merge produces (spec
+    §9.1/§8.3), so folding a channel in a second pass would describe a different
+    partition than the payload's. An empty accumulation folds to empty payloads
+    throughout, keeping every sibling row-aligned with the digest at zero rows.
+
+    Every vector is length-checked HERE rather than at the call sites, because
+    this function is the documented seam they must come from together: the
     k-way merge validates the pairing itself, but the single-contributor arm
     below bypasses the merge — and it is the majority case at the finest
     overview level, where an output cell usually has exactly one populated
@@ -313,28 +356,38 @@ def fold_digests(
     """
     from zagg.stats.tdigest import merge_tdigests_kway
 
-    if locations is None:
+    if channels is None:
         digests = [d for d in cell_digests if len(d)]
         if not digests:
             return b""
         if len(digests) == 1:
             return encode_digest(digests[0], dtype)
         return encode_digest(merge_tdigests_kway(digests, delta=int(delta)), dtype)
-    pairs = [(d, w) for d, w in zip(cell_digests, locations, strict=True) if len(d)]
-    for d, w in pairs:
-        if len(w) != len(d):
+    keep = [i for i, d in enumerate(cell_digests) if len(d)]
+    for kwarg, vectors in channels.items():
+        if len(vectors) != len(cell_digests):
             raise ValueError(
-                f"located sibling has {len(w)} words for a {len(d)}-centroid digest — "
-                f"the channel must be row-aligned with its payload (spec §1.1)"
+                f"{kwarg} channel has {len(vectors)} vectors for "
+                f"{len(cell_digests)} accumulated digests"
             )
-    if not pairs:
-        return b"", b""
-    digests = [d for d, _ in pairs]
-    words = [w for _, w in pairs]
+        for i in keep:
+            if len(vectors[i]) != len(cell_digests[i]):
+                raise ValueError(
+                    f"{kwarg} sibling has {len(vectors[i])} words for a "
+                    f"{len(cell_digests[i])}-centroid digest — the channel must be "
+                    f"row-aligned with its payload (spec §1.1)"
+                )
+    if not keep:
+        return (b"", *(b"" for _ in channels))
+    digests = [cell_digests[i] for i in keep]
+    kept = {kwarg: [vectors[i] for i in keep] for kwarg, vectors in channels.items()}
     if len(digests) == 1:
-        return encode_digest(digests[0], dtype), encode_digest(words[0], "uint64")
-    merged, merged_words = merge_tdigests_kway(digests, delta=int(delta), locations=words)
-    return encode_digest(merged, dtype), encode_digest(merged_words, "uint64")
+        return (
+            encode_digest(digests[0], dtype),
+            *(encode_digest(v[0], "uint64") for v in kept.values()),
+        )
+    payload, *words = merge_tdigests_kway(digests, delta=int(delta), **kept)
+    return (encode_digest(payload, dtype), *(encode_digest(w, "uint64") for w in words))
 
 
 # ---------------------------------------------------------------------------
@@ -840,7 +893,7 @@ def _field_drift(group, name, meta) -> str | None:
     from zagg.grids.base import (
         RAGGED_ELEMENT_ATTR,
         RAGGED_SPEC,
-        located_declaration,
+        TIMES_ATTR,
         weights_declaration,
     )
 
@@ -892,52 +945,52 @@ def _field_drift(group, name, meta) -> str | None:
                 f"declared {declared_weights!r} — merges are legal only between "
                 f"matching declarations (spec §2.0)"
             )
-        # A declared location channel (ruling 4 on issue #410) is one more thing
-        # a leaf can falsify, and the same argument applies: without the check
-        # ``declare_pyramid`` installs a located declaration over a store with no
-        # sibling, and every fold then dies reading an array that is not there.
-        # The declaration is checked on the SIBLING, which is where §9 puts it.
-        if meta.get("location") is not None:
-            sibling = ragged_locations_name(name)
+        # A declared companion channel (issue #410) is one more thing a leaf can
+        # falsify, and the same argument applies: without the check
+        # ``declare_pyramid`` installs a companion declaration over a store with
+        # no sibling, and every fold then dies reading an array that is not
+        # there. Each declaration is checked on its own SIBLING, which is where
+        # §8.3/§9 put it.
+        for kwarg, sibling in field_companions(name, meta):
+            binding = ragged.get("locations") if kwarg == "locations" else arr.attrs.get(TIMES_ATTR)
             try:
                 sib = group[sibling]
             except KeyError:
                 return (
-                    f"field {name!r}: declared a location channel but the sibling "
-                    f"{sibling!r} is absent from the leaf (spec §9/§1.1)"
+                    f"field {name!r}: declared a {kwarg} channel but the sibling "
+                    f"{sibling!r} is absent from the leaf (spec §8.3/§9, §1.1)"
                 )
-            if ragged.get("locations") != sibling:
+            if binding != sibling:
                 return (
-                    f"field {name!r}: the payload binds locations "
-                    f"{ragged.get('locations')!r}, not the declared {sibling!r} — a "
-                    f"reader binds the channel by that declaration (spec §1.2)"
+                    f"field {name!r}: the payload binds {kwarg} {binding!r}, not the "
+                    f"declared {sibling!r} — a reader binds the channel by that "
+                    f"declaration (spec §1.2/§8.3)"
                 )
-            # The §9 declaration itself, strict-checked: §9.2 imports §8.4, so
+            # The declaration itself, strict-checked: §9.2 imports §8.4, so
             # companions compose only on matching ``{shape, grammar}`` and a
-            # writer joining ones that differ MUST refuse. This revision defines
-            # one of each, so the strict check IS the match check — and it RAISES
-            # rather than reporting drift (docstring posture: a sibling declaring
-            # an unimplemented shape is unreadable, not merely mis-declared).
-            located_declaration(dict(sib.attrs))
+            # writer joining ones that differ MUST refuse. The per-centroid shape
+            # defines one of each, so the strict check IS the match check — and
+            # it RAISES rather than reporting drift (docstring posture: a sibling
+            # declaring an unimplemented shape is unreadable, not merely
+            # mis-declared).
+            check_companion_match(dict(sib.attrs), name, kwarg)
             sib_element = (dict(sib.attrs.get(RAGGED_ELEMENT_ATTR) or {})).get("element") or {}
             sib_dtype = sib_element.get("dtype")
-            # Normalized like the payload's compare five lines up: an equivalent
+            # Normalized like the payload's compare above: an equivalent
             # spelling (``"<u8"``) is the same dtype and must not read as drift.
             if sib_dtype is None or np.dtype(sib_dtype) != np.dtype("uint64"):
                 return (
-                    f"field {name!r}: the location sibling declares element dtype "
+                    f"field {name!r}: the {kwarg} sibling declares element dtype "
                     f"{sib_dtype!r}, not 'uint64' (spec §6.1)"
                 )
-            # The words are decoded as a flat vector (``decode_digest(...,
-            # ())``), so an inner shape would be silently reinterpreted by the
-            # fold — exactly the store-contradicts-the-recipe class this gate
-            # exists for.
-            sib_inner = [int(s) for s in (sib_element.get("shape") or [-1])[1:]]
-            if sib_inner:
+            # The words are decoded as a flat vector (``decode_digest(..., ())``),
+            # so an inner shape would be silently reinterpreted by the fold —
+            # exactly the store-contradicts-the-recipe class this gate exists for.
+            if [int(x) for x in (sib_element.get("shape") or [-1])[1:]]:
                 return (
-                    f"field {name!r}: the location sibling declares element shape "
-                    f"{sib_element.get('shape')!r}; the §9 channel is one flat uint64 "
-                    f"word per centroid row (spec §9/§1.1)"
+                    f"field {name!r}: the {kwarg} sibling declares element shape "
+                    f"{sib_element.get('shape')!r}; the channel is one flat uint64 "
+                    f"word per centroid row (spec §8.3/§9, §1.1)"
                 )
     elif meta["class"] == "exact":
         declared_dt = np.dtype(meta.get("dtype") or "float32")
@@ -1467,17 +1520,19 @@ def _fold_node(
     leaf_cells = 4 ** (cell_order - shard_order)
     slabs: dict = {}
     digests: dict = {}
-    # Per located field, the accumulated sibling word vectors, index-aligned with
-    # ``digests[name]`` cell by cell so the fold merges the pair in one call
-    # (ruling 4 on issue #410, spec §9.1).
-    located: dict = {}
+    # Per field, per declared companion channel, the accumulated word vectors —
+    # index-aligned with ``digests[name]`` cell by cell so the fold merges the
+    # payload and every channel in ONE call (issue #410, spec §9.1/§8.3).
+    # ``{field: {kernel kwarg: [per-cell list of vectors]}}``.
+    channels: dict = {}
     for name, meta in fields.items():
         if meta["class"] == "exact":
             slabs[name] = _empty_slab(meta, n_cells)
         else:
             digests[name] = [[] for _ in range(n_cells)]
-            if meta.get("location") is not None:
-                located[name] = [[] for _ in range(n_cells)]
+            declared = field_companions(name, meta)
+            if declared:
+                channels[name] = {kw: [[] for _ in range(n_cells)] for kw, _ in declared}
     if target_order >= shard_order:
         span = 4 ** (target_order - shard_order)
         fold_factor = 4 ** (shard_order - k)
@@ -1529,22 +1584,26 @@ def _fold_node(
                         values = arr[:]
                         dtype = meta.get("dtype") or "float32"
                         inner = tuple(meta.get("inner_shape") or (2,))
-                        # A located field's sibling is read in the SAME guarded
+                        # Every declared companion is read in the SAME guarded
                         # block as its payload, so a leaf missing or failing on
-                        # one contributes neither — never a digest folded with
-                        # its channel silently dropped (spec §9.1's words are
-                        # keyed on the partition the payload describes). A §9
+                        # one contributes NEITHER — never a digest folded with a
+                        # channel silently dropped (the words are keyed on the
+                        # partition the payload describes, spec §9.1/§8.3). A
                         # declaration this fold cannot join refuses here, exactly
                         # as a mismatched §2.0 one does above.
-                        sib = group[ragged_locations_name(name)] if name in located else None
-                        if sib is not None:
-                            check_located_match(dict(sib.attrs), name)
-                        words = None if sib is None else sib[:]
+                        raw: dict = {}
+                        for kwarg, sibling_name in field_companions(name, meta):
+                            sib = group[sibling_name]
+                            check_companion_match(dict(sib.attrs), name, kwarg)
+                            raw[kwarg] = sib[:]
                         cell_digests[name] = [
                             (
                                 start + i // fold_factor,
                                 decode_digest(payload, dtype, inner),
-                                None if words is None else decode_digest(words[i], "uint64", ()),
+                                {
+                                    kwarg: decode_digest(col[i], "uint64", ())
+                                    for kwarg, col in raw.items()
+                                },
                             )
                             for i, payload in enumerate(values)
                             if payload is not None and len(payload)
@@ -1562,8 +1621,8 @@ def _fold_node(
             for name, decoded in cell_digests.items():
                 for j, digest, words in decoded:
                     digests[name][j].append(digest)
-                    if words is not None:
-                        located[name][j].append(words)
+                    for kwarg, vector in words.items():
+                        channels[name][kwarg][j].append(vector)
             n_leaves += 1
             timestamps.append(stamp.get("written_at"))
             granules += int(stamp.get("granule_count") or 0)
@@ -1576,20 +1635,27 @@ def _fold_node(
         dtype = meta.get("dtype") or "float32"
         delta = overview_fold_delta(meta)
         slab = np.full(n_cells, b"", dtype=object)
-        words = located.get(name)
-        sibling = np.full(n_cells, b"", dtype=object) if words is not None else None
+        declared = field_companions(name, meta)
+        acc_channels = channels.get(name)
+        sibling_slabs = {kwarg: np.full(n_cells, b"", dtype=object) for kwarg, _ in declared}
         for j, cell in enumerate(acc):
             if not cell:
                 continue
-            if sibling is None:
+            if not declared:
                 slab[j] = fold_digests(cell, delta=delta, dtype=dtype)
-            else:
-                slab[j], sibling[j] = fold_digests(
-                    cell, delta=delta, dtype=dtype, locations=words[j]
-                )
+                continue
+            payload, *words = fold_digests(
+                cell,
+                delta=delta,
+                dtype=dtype,
+                channels={kw: acc_channels[kw][j] for kw, _ in declared},
+            )
+            slab[j] = payload
+            for (kwarg, _), encoded in zip(declared, words, strict=True):
+                sibling_slabs[kwarg][j] = encoded
         slabs[name] = slab
-        if sibling is not None:
-            slabs[ragged_locations_name(name)] = sibling
+        for kwarg, sibling_name in declared:
+            slabs[sibling_name] = sibling_slabs[kwarg]
     stamps = [t for t in timestamps if t is not None]
     return {
         "slabs": slabs,
@@ -1673,8 +1739,10 @@ def _cascade_node(
     # #410): ``_fold_child`` returns it beside the payload, and children own
     # disjoint spans, so it assigns exactly as every other slab does.
     for name, meta in fields.items():
-        if meta["class"] != "exact" and meta.get("location") is not None:
-            slabs[ragged_locations_name(name)] = np.full(n_cells, b"", dtype=object)
+        if meta["class"] == "exact":
+            continue
+        for _kwarg, sibling_name in field_companions(name, meta):
+            slabs[sibling_name] = np.full(n_cells, b"", dtype=object)
     basename = _overview_basename(key)
     n_sources, n_leaves, timestamps, granules, ranges = 0, 0, [], 0, []
     missing, unreadable = 0, 0
@@ -1799,14 +1867,17 @@ def _fold_child(group, fields, factor, span, path) -> dict:
         dtype = meta.get("dtype") or "float32"
         inner = tuple(meta.get("inner_shape") or (2,))
         delta = overview_fold_delta(meta)
-        sibling_name = ragged_locations_name(name)
-        # A §9 declaration this fold cannot join refuses beside the §2.0 one.
-        sib = group[sibling_name] if meta.get("location") is not None else None
-        if sib is not None:
-            check_located_match(dict(sib.attrs), name)
-        words = None if sib is None else sib[:]
+        declared = field_companions(name, meta)
+        # A companion declaration this fold cannot join refuses beside the §2.0
+        # one — read in the same guarded block, so a child failing on one
+        # contributes neither.
+        raw: dict = {}
+        for kwarg, sibling_name in declared:
+            sib = group[sibling_name]
+            check_companion_match(dict(sib.attrs), name, kwarg)
+            raw[kwarg] = sib[:]
         folded = np.full(span, b"", dtype=object)
-        sibling = np.full(span, b"", dtype=object) if words is not None else None
+        sibling_slabs = {kwarg: np.full(span, b"", dtype=object) for kwarg, _ in declared}
         for j in range(span):
             rows = [
                 i
@@ -1816,18 +1887,24 @@ def _fold_child(group, fields, factor, span, path) -> dict:
             if not rows:
                 continue
             cell = [decode_digest(values[i], dtype, inner) for i in rows]
-            if sibling is None:
+            if not declared:
                 folded[j] = fold_digests(cell, delta=delta, dtype=dtype)
-            else:
-                folded[j], sibling[j] = fold_digests(
-                    cell,
-                    delta=delta,
-                    dtype=dtype,
-                    locations=[decode_digest(words[i], "uint64", ()) for i in rows],
-                )
+                continue
+            payload, *words = fold_digests(
+                cell,
+                delta=delta,
+                dtype=dtype,
+                channels={
+                    kwarg: [decode_digest(raw[kwarg][i], "uint64", ()) for i in rows]
+                    for kwarg, _ in declared
+                },
+            )
+            folded[j] = payload
+            for (kwarg, _), encoded in zip(declared, words, strict=True):
+                sibling_slabs[kwarg][j] = encoded
         partials[name] = folded
-        if sibling is not None:
-            partials[sibling_name] = sibling
+        for kwarg, sibling_name in declared:
+            partials[sibling_name] = sibling_slabs[kwarg]
     return partials
 
 
@@ -1952,6 +2029,13 @@ def _overview_config(fields):
             # normative.
             if meta.get("location") is not None:
                 variables[name]["location"] = str(meta["location"])
+            # The §8.3 temporal companion rides the same way (espg-ruled
+            # 2026-08-17): per-centroid at every level, so the overview template
+            # emits the ``{field}_times`` sibling and its declaration exactly as
+            # a leaf does. The SHAPE is what the template needs; the leaf's
+            # ingest clock is never re-read by a fold.
+            if meta.get("temporal") is not None:
+                variables[name]["temporal"] = str(meta["temporal"])
             if meta.get("weights") not in (None, "counts"):
                 variables[name]["weights"] = meta["weights"]
                 if meta.get("gain") is not None:
