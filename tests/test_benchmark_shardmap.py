@@ -229,12 +229,25 @@ def _driver():
 
 
 def _without_volatile(text: str, volatile) -> str:
-    """A written map's text minus the metadata lines a rebuild legitimately moves."""
-    return "".join(
-        line
-        for line in text.splitlines(keepends=True)
-        if not any(f'"{k}"' in line for k in volatile)
+    """A written map's text minus the metadata lines a rebuild legitimately moves.
+
+    Line-oriented on purpose: what issue #444 asks for is "byte-identically",
+    which a parsed comparison would soften to structural equality. The cost is
+    a silent dependency on ``ShardMap.to_json`` pretty-printing one metadata key
+    per line -- were it ever to emit compact JSON, the whole map would become a
+    single line carrying ``"build_wall_s"``, both sides would filter down to
+    ``""``, and the acceptance test would pass while comparing NOTHING.
+
+    So the filter checks its own work: exactly one line per excused key, no
+    more (a key string surfacing inside a granule record) and no less.
+    """
+    lines = text.splitlines(keepends=True)
+    kept = [line for line in lines if not any(f'"{k}"' in line for k in volatile)]
+    assert len(lines) - len(kept) == len(volatile), (
+        f"expected one line per excused metadata key, dropped {len(lines) - len(kept)} of "
+        f"{len(lines)} -- has ShardMap.to_json stopped pretty-printing?"
     )
+    return "".join(kept)
 
 
 @pytest.mark.slow
