@@ -1520,6 +1520,17 @@ class TestLiveCover:
         sm = ShardMap.build(_overlapping_catalog(n=4), hp_grid, backend="mortie")
         assert 0.05 <= sm.metadata["build_wall_s"] < 0.2
 
+    def test_empty_catalog_builds_an_empty_map(self, hp_grid):
+        # ``filter_bbox`` can cut a catalog to nothing, and the records path
+        # handled that by returning ``{}`` out of ``_flatten_rings``. The cover
+        # has to land in the same place: no blob for ``from_wkbs`` to parse, and
+        # an offsets array that is still one entry per (zero) row.
+        cat = _overlapping_catalog(n=2)
+        empty = Catalog(cat.table.slice(0, 0), dict(cat.metadata))
+        sm = ShardMap.build(empty, hp_grid, backend="mortie")
+        assert sm.shard_keys == []
+        assert sm.metadata["total_granules"] == 0
+
     @pytest.mark.parametrize(
         "kwargs",
         [
