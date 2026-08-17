@@ -48,9 +48,11 @@ Run from a zagg checkout::
     uv run python tools/repin_benchmark_shardmaps.py --check healpix_o9_88s
     uv run python tools/repin_benchmark_shardmaps.py healpix_o9_88s healpix_o10_88s
 
-The ``sm_rect_*`` entries declare the ``spherely`` backend, the non-PyPI
-exact-S2 fork (README): without it installed ``ShardMap.build`` raises rather
-than quietly rebuilding them on the mortie backend.
+Every ``targets.json`` shard map is HEALPix today, so every re-pin runs on the
+mortie backend. If a rectilinear map is ever added to the manifest, re-pinning
+it will need the non-PyPI exact-S2 ``spherely`` fork installed (README): the
+rebuild takes the committed map's own ``metadata.backend``, so ``ShardMap.build``
+raises rather than quietly falling back to mortie.
 """
 
 from __future__ import annotations
