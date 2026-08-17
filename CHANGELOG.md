@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- rename parent_morton event field to shard_key (#24) ([#42](https://github.com/englacial/zagg/pull/42)) by @espg
+- Concurrency-aware Lambda orchestrator: pre-flight probe + FD-exhaustion guard ([#41](https://github.com/englacial/zagg/pull/41)) by @espg
+- drop shapely as an intersection backend (#36) ([#39](https://github.com/englacial/zagg/pull/39)) by @espg
+- CLAUDE.md: per-issue claude/ branches, multi-PR, and PR label states ([#37](https://github.com/englacial/zagg/pull/37)) by @espg
+- docs: mark SSO execution-role path out of date ([#35](https://github.com/englacial/zagg/pull/35)) by @espg
+- sort/hash grouping refactor (#30) ([#33](https://github.com/englacial/zagg/pull/33)) by @espg
+- Rectilinear grid: chunk-driven auto-padding + run enablement ([#32](https://github.com/englacial/zagg/pull/32)) by @espg
+
+## [0.46.0] - 2026-08-17
+
 - unindexed shard-map builds cover at `parent_order` and intersect before decoding records (#445) ([#447](https://github.com/englacial/zagg/pull/447)) by @espg
   - An unpinned unindexed HEALPix mortie `swath` build now covers at the output
     grid's `parent_order` instead of its chunk order, so `metadata["mortie_order"]`
@@ -25,13 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Disclosed: an explicit `mortie_order=` pin always covers live, indexed or not,
     so a MultiPolygon footprint assigns as a union-of-parts superset; single-part
     CMR granules are unaffected.
-- rename parent_morton event field to shard_key (#24) ([#42](https://github.com/englacial/zagg/pull/42)) by @espg
-- Concurrency-aware Lambda orchestrator: pre-flight probe + FD-exhaustion guard ([#41](https://github.com/englacial/zagg/pull/41)) by @espg
-- drop shapely as an intersection backend (#36) ([#39](https://github.com/englacial/zagg/pull/39)) by @espg
-- CLAUDE.md: per-issue claude/ branches, multi-PR, and PR label states ([#37](https://github.com/englacial/zagg/pull/37)) by @espg
-- docs: mark SSO execution-role path out of date ([#35](https://github.com/englacial/zagg/pull/35)) by @espg
-- sort/hash grouping refactor (#30) ([#33](https://github.com/englacial/zagg/pull/33)) by @espg
-- Rectilinear grid: chunk-driven auto-padding + run enablement ([#32](https://github.com/englacial/zagg/pull/32)) by @espg
 
 ## [0.3.0] - 2026-06-11
 
