@@ -1727,6 +1727,15 @@ class TestFullCoverageWalk:
         maps_ref = full_granule_maps(ref, read_ref)
         # Eviction actually removed the walks' lines...
         assert set(h5obj.cache) < set(ref.cache)
+        # ...and this is the many-distinct-datasets shape the GEDI residual
+        # lives in (review finding on PR #462): with the whole granule mapped,
+        # residency tracks the parses' object-header lines (a couple per
+        # dataset at the fixture's 512-B lines) and NOT the walks' per-B-tree-
+        # node lines. On GEDI L1B at the 4 MiB default those headers co-locate:
+        # 11 lines / 46 MB resident per beam group, 90 distinct lines touched.
+        assert len(maps) > 20  # every dataset in the granule, not just one
+        assert len(h5obj.cache) <= 2 * len(maps)  # parse-line growth only...
+        assert len(ref.cache) > 2 * len(maps)  # ...which the unevicted arm busts
         # ...and altered no map.
         assert set(maps) == set(maps_ref)
         for p in maps:

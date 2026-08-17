@@ -290,8 +290,17 @@ def build_chunk_map(h5obj, path: str, *, evict_into: set | None = None) -> Chunk
     dataset yields a single pseudo-chunk covering the full first axis
     (mirroring h5py's ``get_offset()`` treatment in the bench extractor).
     Cache lines the B-tree walk pulls into ``h5obj.cache`` are evicted before
-    returning (issue #460) — the object-header lines the ``H5Dataset`` parse
-    touched stay cached, since every dataset in the group shares them.
+    returning (issue #460); the lines the ``H5Dataset`` parse itself touched
+    are deliberately kept (the snapshot is taken after the parse). Parse-line
+    residency does grow per *distinct* dataset rather than being fully shared,
+    but it is bounded by the group's object-header / metadata footprint, not by
+    the chunk count: measured on a real GEDI L1B beam group (PR #462 evidence),
+    a whole group's read left **11 lines / 46 MB** resident at the 4 MiB
+    default — the data path's own lines included — out of **90 distinct lines**
+    ever touched across the group, against the hundreds of MB the unevicted
+    walks stranded. The absent-path ``KeyError`` below returns before the
+    snapshot on purpose: nothing walk-touched exists yet, and its parse lines
+    are retained by the same choice.
 
     ``evict_into`` defers that eviction for a caller whose builds run
     concurrently on one handle: pass a set and the walk's keys are *added* to
