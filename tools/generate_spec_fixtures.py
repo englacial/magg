@@ -772,27 +772,12 @@ def _raster_slab(t_idx: int, n_cells: int):
     return {"red": red, "scl": scl}, valid
 
 
-def build_raster_toc(out: Path) -> None:
-    """The §8 ``raster_toc/`` fixture: a toc-declared ``(time, cells)`` leaf.
-
-    Written through the production raster hive seam
-    (``processing.raster.process_and_write_raster_hive`` — leaf template,
-    per-timestep slab streaming, coverage sidecar, commit stamp, O11
-    hashing), with only the COG **sampling** faked: the fixture pins the
-    stored bytes and the time-axis declaration, not the pull-NN arithmetic
-    (``tests/test_raster.py`` owns that), and a committed fixture must never
-    need network or GDAL to regenerate.
-    """
-    import zarr
-
-    from zagg import hive
+def _raster_toc_config():
+    """The ``raster_toc/`` fixture's config, factored out of the builder so a
+    test can recompute the fixture's ``semantic_hash`` from it (issue #415)."""
     from zagg.config import load_config_from_dict
-    from zagg.grids import from_config
-    from zagg.grids.morton import morton_word
-    from zagg.processing import raster as raster_mod
-    from zagg.time_axis import decode_time_axis, time_axis_attrs
 
-    cfg = load_config_from_dict(
+    return load_config_from_dict(
         {
             "data_source": {"reader": "raster", "bands": RASTER_BANDS, "nodata": 0},
             "output": {
@@ -810,6 +795,28 @@ def build_raster_toc(out: Path) -> None:
             },
         }
     )
+
+
+def build_raster_toc(out: Path) -> None:
+    """The §8 ``raster_toc/`` fixture: a toc-declared ``(time, cells)`` leaf.
+
+    Written through the production raster hive seam
+    (``processing.raster.process_and_write_raster_hive`` — leaf template,
+    per-timestep slab streaming, coverage sidecar, commit stamp, O11
+    hashing), with only the COG **sampling** faked: the fixture pins the
+    stored bytes and the time-axis declaration, not the pull-NN arithmetic
+    (``tests/test_raster.py`` owns that), and a committed fixture must never
+    need network or GDAL to regenerate.
+    """
+    import zarr
+
+    from zagg import hive
+    from zagg.grids import from_config
+    from zagg.grids.morton import morton_word
+    from zagg.processing import raster as raster_mod
+    from zagg.time_axis import decode_time_axis, time_axis_attrs
+
+    cfg = _raster_toc_config()
     grid = from_config(cfg)
     shard = morton_word(SHARD_KEY)
     n_cells = grid.cells_per_shard

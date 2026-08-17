@@ -1471,9 +1471,13 @@ point of the revision):
 
 *(Informative.)* Writing `/2` will be a per-product opt-in
 (`output.ragged_encoding: typed`), which shifts the product's
-`semantic_hash` — a new product identity, by design. The default stays `/1`;
-flipping it is a schema epoch deferred to its own ruling (public/interop
-stores may deliberately stay `/1` for vanilla-zarr openability).
+`semantic_hash` — a new product identity, by design. That shift is not
+automatic: `output.*` keys reach the semantic core only by being listed as
+leaf-shaping (`zagg.semantics.OUTPUT_LEAF_SHAPING_KEYS`, issue #415), so the
+`/2` implementation PR must add the knob there in the same change. The
+default stays `/1`; flipping it is a schema epoch deferred to its own ruling
+(public/interop stores may deliberately stay `/1` for vanilla-zarr
+openability).
 
 ## 7. Conformance fixtures
 

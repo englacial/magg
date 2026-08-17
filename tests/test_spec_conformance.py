@@ -990,6 +990,151 @@ class TestColumnArtifact:
         assert exp["declared"] == {"overviews": 5}
 
 
+class TestFixtureSemanticHash:
+    """The committed ``semantic_hash`` must be reproducible from the config
+    that built the fixture (issue #415).
+
+    Nothing else in the suite reads that manifest field — the §5 hashes cover
+    decoded values, not identity — so before this pin a semantic-core edit
+    could ship fixtures carrying a digest no zagg reproduces, and moczarr
+    would vendor them (espg/moczarr#19/#20) with every parity gate green. The
+    D19 hash epoch is exactly the change that would have done it.
+    """
+
+    @staticmethod
+    def _generator():
+        """The fixture generator as a module (the ``test_content_hash`` precedent)."""
+        import importlib.util
+
+        path = Path(__file__).parent.parent / "tools" / "generate_spec_fixtures.py"
+        spec = importlib.util.spec_from_file_location("zagg_spec_fixture_generator", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @staticmethod
+    def _recorded(name):
+        return json.loads((SPEC_DATA / name / "morton_hive.json").read_text())["semantic_hash"]
+
+    #: Every fixture this class recomputes, and how its config is rebuilt.
+    #: ``test_every_fixture_is_covered`` refuses a fixture that is not here.
+    COVERED = ("minimal", "kitchen_sink", "column", "flux", PYRAMID, "raster_toc", "temporal")
+
+    @pytest.mark.parametrize(
+        "name,kwargs",
+        [
+            ("minimal", {"kitchen_sink": False}),
+            ("kitchen_sink", {"kitchen_sink": True}),
+            ("column", {"kitchen_sink": False, "pyramid": {"overviews": 5}}),
+            # The §2.0 flux fixture (issue #424) landed after the epoch's
+            # phase 3, so its committed digest was pre-epoch until now.
+            ("flux", {"kitchen_sink": False, "flux": True}),
+        ],
+    )
+    def test_leaf_fixture_hash_is_reproducible(self, name, kwargs):
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded(name) == semantic_hash(gen._config(**kwargs))
+
+    def test_the_raster_toc_fixture_hash_is_reproducible(self):
+        # The §8 fixture (issue #443) is built from its own config literal
+        # rather than `_config`, so the builder hands it over through
+        # `_raster_toc_config`. It also pins the one INCLUDED output key that
+        # is not leaf-shaping: `time_encoding: toc` is in the core, so this
+        # digest is not the same product as the default-encoding raster.
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded("raster_toc") == semantic_hash(gen._raster_toc_config())
+
+    def test_the_temporal_fixture_hash_is_reproducible(self):
+        # The §8.2/§8.3 fixture (issue #410) merged in carrying a pre-epoch
+        # digest — the third fixture this gate has caught (after `flux/` and
+        # `raster_toc/`) — and was regenerated at the sync. Its config is its
+        # own literal too, handed over through `_temporal_config`.
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded("temporal") == semantic_hash(gen._temporal_config())
+
+    def test_every_fixture_is_covered(self):
+        # The gate on the gate: a fixture added without a hash pin ships a
+        # digest nothing reproduces, which is exactly how `flux/` and
+        # `raster_toc/` came to carry pre-epoch values while the suite stayed
+        # green. Adding a fixture now fails here until it is pinned above.
+        recorded = {
+            p.parent.relative_to(SPEC_DATA).as_posix()
+            for p in SPEC_DATA.glob("**/morton_hive.json")
+            if json.loads(p.read_text()).get("semantic_hash")
+        }
+        assert recorded == set(self.COVERED)
+
+    def test_the_pyramid_fixture_hash_is_reproducible(self):
+        # Its manifest is built from the /1 config and then retrofitted by
+        # declare_pyramid under the /2 one, so the recorded hash pins BOTH
+        # halves at once: the digest reproduces, and the two configs agree —
+        # which is the property that keeps the retrofit legal (the pyramid
+        # block is deliberately outside the semantic core, issue #415).
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        cfg_v1 = gen._config(False)
+        cfg_v2 = gen._config(False, pyramid=gen.PYRAMID_KNOB)
+        for cfg in (cfg_v1, cfg_v2):
+            cfg.aggregation["variables"].update(gen.PYRAMID_EXTRA_VARIABLES)
+            cfg.output["grid"] = dict(gen.PYRAMID_GRID)
+        assert semantic_hash(cfg_v1) == semantic_hash(cfg_v2)
+        assert self._recorded(PYRAMID) == semantic_hash(cfg_v1)
+
+
+class TestFixtureGranuleIdentity:
+    """The OTHER half of the identity pair: each leaf's ``granules.json``
+    sibling (issue #388) must self-pair and be recorded in the CANONICAL
+    granule-id space (issue #415's granule ruling).
+
+    Nothing else in the suite reads that object —
+    :class:`TestFixtureSemanticHash` recomputes ``semantic_hash`` only — so the
+    epoch's edits to the committed siblings were covered by no assertion at
+    all. Both properties matter to a reader: a sibling whose digest does not
+    pair with its own id list is rejected as ``unrecorded-ids``
+    (``zagg.dedup._sibling_ids``), which silently disarms the contraction guard
+    on that leaf; and an id list still in the pre-epoch href space would pair
+    with nothing a post-epoch run plans.
+    """
+
+    #: Every committed sibling, enumerated over the tree the way
+    #: ``test_every_fixture_is_covered`` is, so a new fixture cannot ship one
+    #: unguarded.
+    SIBLINGS = sorted(
+        p.relative_to(SPEC_DATA).as_posix() for p in SPEC_DATA.glob("**/granules.json")
+    )
+
+    def test_every_leaf_fixture_carries_the_sibling(self):
+        # The gate on the gate, on ``test_every_fixture_is_covered``'s pattern:
+        # a fixture with a leaf but no recorded id list ships a leaf the
+        # contraction guard cannot protect. ``pyramid/`` is manifest-only (no
+        # leaf, hence no sibling), which is why this keys on the leaf.
+        want = {
+            f"{name}/{Path(_expected(name)['leaf']).parent.as_posix()}/granules.json"
+            for name in TestFixtureSemanticHash.COVERED
+            if _expected(name).get("leaf")
+        }
+        assert set(self.SIBLINGS) == want
+
+    @pytest.mark.parametrize("rel", SIBLINGS)
+    def test_the_sibling_self_pairs_on_canonical_ids(self, rel):
+        from zagg.telemetry import GRANULE_IDS_SPEC, canonical_granule_ids, granules_sha256
+
+        sibling = json.loads((SPEC_DATA / rel).read_text())
+        ids = sibling["granule_ids"]
+        assert sibling["spec"] == GRANULE_IDS_SPEC
+        assert granules_sha256(ids) == sibling["granules_sha256"]
+        # Already canonical, and sorted as the writer records them: the epoch is
+        # a fixed point on these ids, so re-canonicalizing moves nothing.
+        assert canonical_granule_ids(ids) == ids == sorted(ids)
+
+
 class TestTemporalDeclaration:
     """§8 — the temporal declaration, pinned on the committed `raster_toc/`.
 
