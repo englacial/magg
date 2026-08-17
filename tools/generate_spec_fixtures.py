@@ -723,6 +723,29 @@ RASTER_BANDS = {
 }
 
 
+def _raster_acquisitions() -> list[dict]:
+    """The real acquisition envelope per group, from ``RASTER_GRANULES``.
+
+    The same grouping the encoder applies (``time_key``, ``time_start``/
+    ``time_end`` falling back to ``datetime``), in the same row order the
+    axis has (ascending group earliest-item ``datetime``), with the ``+00:00``
+    suffix trimmed so the values compare as naive ISO instants.
+    """
+    span: dict[str, tuple[str, str, str]] = {}
+    for g in RASTER_GRANULES:
+        key = g["time_key"]
+        lo, hi = g.get("time_start", g["datetime"]), g.get("time_end", g["datetime"])
+        if key in span:
+            was_lo, was_hi, was_dt = span[key]
+            span[key] = (min(was_lo, lo), max(was_hi, hi), min(was_dt, g["datetime"]))
+        else:
+            span[key] = (lo, hi, g["datetime"])
+    return [
+        {"key": key, "start": lo[:-6], "end": hi[:-6]}
+        for key, (lo, hi, _dt) in sorted(span.items(), key=lambda kv: (kv[1][2], kv[0]))
+    ]
+
+
 def _raster_slab(t_idx: int, n_cells: int):
     """One deterministic ``(cells,)`` slab per band, with fill holes.
 
@@ -847,11 +870,10 @@ def build_raster_toc(out: Path) -> None:
         ],
         # The REAL acquisition envelopes the stored words must contain — the
         # §8 conservative-containment claim, pinned on committed bytes.
-        "acquisitions": [
-            {"key": "dt-1", "start": "2025-06-15T15:06:40", "end": "2025-06-15T15:06:47"},
-            {"key": "dt-2", "start": "2025-06-18T15:06:38", "end": "2025-06-18T15:06:49"},
-            {"key": "dt-3", "start": "2025-06-21T15:06:40", "end": "2025-06-21T15:06:40"},
-        ],
+        # DERIVED from RASTER_GRANULES, never transcribed: a hand-typed copy
+        # would keep passing after an input edit moved the words, which is
+        # the one drift this block exists to catch.
+        "acquisitions": _raster_acquisitions(),
         "morton": [str(int(w)) for w in group["morton"][:]],
         "bands": {name: group[name][:].tolist() for name in RASTER_BANDS},
         "content_hashes": _o11_hashes(str(out / leaf_rel)),
