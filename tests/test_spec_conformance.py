@@ -999,12 +999,19 @@ class TestFixtureSemanticHash:
     def _recorded(name):
         return json.loads((SPEC_DATA / name / "morton_hive.json").read_text())["semantic_hash"]
 
+    #: Every fixture this class recomputes, and how its config is rebuilt.
+    #: ``test_every_fixture_is_covered`` refuses a fixture that is not here.
+    COVERED = ("minimal", "kitchen_sink", "column", "flux", PYRAMID, "raster_toc")
+
     @pytest.mark.parametrize(
         "name,kwargs",
         [
             ("minimal", {"kitchen_sink": False}),
             ("kitchen_sink", {"kitchen_sink": True}),
             ("column", {"kitchen_sink": False, "pyramid": {"overviews": 5}}),
+            # The §2.0 flux fixture (issue #424) landed after the epoch's
+            # phase 3, so its committed digest was pre-epoch until now.
+            ("flux", {"kitchen_sink": False, "flux": True}),
         ],
     )
     def test_leaf_fixture_hash_is_reproducible(self, name, kwargs):
@@ -1012,6 +1019,29 @@ class TestFixtureSemanticHash:
 
         gen = self._generator()
         assert self._recorded(name) == semantic_hash(gen._config(**kwargs))
+
+    def test_the_raster_toc_fixture_hash_is_reproducible(self):
+        # The §8 fixture (issue #443) is built from its own config literal
+        # rather than `_config`, so the builder hands it over through
+        # `_raster_toc_config`. It also pins the one INCLUDED output key that
+        # is not leaf-shaping: `time_encoding: toc` is in the core, so this
+        # digest is not the same product as the default-encoding raster.
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded("raster_toc") == semantic_hash(gen._raster_toc_config())
+
+    def test_every_fixture_is_covered(self):
+        # The gate on the gate: a fixture added without a hash pin ships a
+        # digest nothing reproduces, which is exactly how `flux/` and
+        # `raster_toc/` came to carry pre-epoch values while the suite stayed
+        # green. Adding a fixture now fails here until it is pinned above.
+        recorded = {
+            p.parent.relative_to(SPEC_DATA).as_posix()
+            for p in SPEC_DATA.glob("**/morton_hive.json")
+            if json.loads(p.read_text()).get("semantic_hash")
+        }
+        assert recorded == set(self.COVERED)
 
     def test_the_pyramid_fixture_hash_is_reproducible(self):
         # Its manifest is built from the /1 config and then retrofitted by

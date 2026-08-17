@@ -4,7 +4,7 @@
   "short_name": "SPEC_FIXTURE_RASTER",
   "version": "1"
  },
- "semantic_hash": "af17d15801d112a1d6378896e9bf22ceffa4404f7d3b70731aa7ef3920dca3d6",
+ "semantic_hash": "3e0398bf07f70b0c17ac7113121ebf9c71c9c4b3bf99db496a2304ec130d47e8",
  "cell_order": 6,
  "shard_order": 4,
  "split_schedule": [
@@ -28,5 +28,5 @@
    "fields": {}
   }
  },
- "generated_at": "2026-08-17T01:39:28+00:00"
+ "generated_at": "2026-08-17T03:34:05+00:00"
 }
