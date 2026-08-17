@@ -55,7 +55,7 @@ def _composition_field(threshold=2):
     }
 
 
-def _variables(located=False, strata=False, pairwise=False, delta=16):
+def _variables(located=False, strata=False, pairwise=False, delta=16, temporal=False):
     fn = "zagg.stats.tdigest.build_tdigest" + ("_pairwise" if pairwise else "")
     base = {
         "kind": "ragged",
@@ -68,6 +68,8 @@ def _variables(located=False, strata=False, pairwise=False, delta=16):
     }
     if located:
         base["location"] = "leaf_id"
+    if temporal:
+        base["temporal"] = "per-centroid"
     variables = {
         "count": {"function": "len", "source": "h_ph", "dtype": "int32", "fill_value": 0},
     }
@@ -81,10 +83,19 @@ def _variables(located=False, strata=False, pairwise=False, delta=16):
     return variables
 
 
+#: The declared clock a ``temporal:`` config encodes its words from (§8.3): a
+#: base-rate ``delta_time`` column on a continuous scale, epoched at the ATL03
+#: mission epoch. Materialized by ``_config`` only when a field declares a
+#: companion, so every pre-#410 config in this module is untouched.
+_EPOCH = "2018-01-01T00:00:00"
+_TIME_SOURCE = {"field": "delta_time", "epoch": _EPOCH, "scale": "gps", "units": "seconds"}
+
+
 def _config(variables, streaming=None):
     agg = {"variables": variables}
     if streaming is not None:
         agg["streaming"] = streaming
+    output = {"time_source": _TIME_SOURCE} if _has_temporal(variables) else {}
     return PipelineConfig(
         data_source={
             "reader": "h5coro",
@@ -94,7 +105,12 @@ def _config(variables, streaming=None):
             "shard_workers": 1,
         },
         aggregation=agg,
+        output=output,
     )
+
+
+def _has_temporal(variables) -> bool:
+    return any(v.get("temporal") for v in variables.values())
 
 
 _SPILL = {"buffer_granules": 1, "mode": "spill"}
@@ -127,18 +143,22 @@ def _point_leafs(grid, cell, n, rng):
 
 
 def _granule_dfs(
-    grid, shard_key, cell_idx_lists, obs_per_cell=60, seed=0, conf=False, nan_cells=()
+    grid, shard_key, cell_idx_lists, obs_per_cell=60, seed=0, conf=False, nan_cells=(), times=False
 ):
     """One DataFrame per granule; real order-29 point leafs per chosen cell.
 
     ``conf=True`` adds the five ``signal_conf_*`` columns (ATL03's ``-1..4``
     range) for composition tests. Cells in ``nan_cells`` get all-NaN heights
-    (an empty digest but a nonzero count).
+    (an empty digest but a nonzero count). ``times=True`` adds the
+    ``delta_time`` clock column ``_TIME_SOURCE`` declares — one granule per
+    DAY, rows a millisecond apart within it, so every granule (and therefore
+    every forced block) covers a disjoint instant range: a cross-block fold
+    that dropped or mispaired a block's words could not still envelope them.
     """
     rng = np.random.default_rng(seed)
     children = np.asarray(grid.children(shard_key), dtype=np.uint64)
     dfs = []
-    for idxs in cell_idx_lists:
+    for g, idxs in enumerate(cell_idx_lists):
         n = obs_per_cell * len(idxs)
         h, leaf = [], []
         for ci in idxs:
@@ -148,6 +168,8 @@ def _granule_dfs(
             h.append(vals)
             leaf.append(_point_leafs(grid, int(children[ci]), obs_per_cell, rng))
         cols = {"h_ph": np.concatenate(h), "leaf_id": np.concatenate(leaf)}
+        if times:
+            cols["delta_time"] = 86400.0 * (g + 1) + 1e-3 * np.arange(n, dtype=np.float64)
         if conf:
             for name in _CONF_COLS:
                 cols[name] = rng.integers(-1, 5, n).astype(np.int8)
@@ -290,26 +312,42 @@ class TestSpillFoldProbe:
         with pytest.raises(ValueError, match="chunk_precompute.*no cross-block fold"):
             validate_spill_fold(cfg)
 
-    def test_temporal_companion_has_no_cross_block_fold_yet(self):
-        # The toc join itself is exact and fold-tree independent (spec §8.2), but
-        # the block close's per-field channel state is located-only, so a
-        # temporal field would emit a companion missing every block past the
-        # first — a §8.3 row-alignment break. Named, not silently approximated.
-        variables = _variables(located=True)
-        variables["h_tdigest"]["temporal"] = "per-centroid"
-        with pytest.raises(ValueError, match="temporal companions.*no cross-block fold state"):
-            validate_spill_fold(_config(variables, streaming=_SPILL))
+    @pytest.mark.parametrize("located", [False, True])
+    def test_per_centroid_temporal_config_is_mergeable(self, located):
+        # The refusal-removal pin (issue #477): the per-centroid companion has a
+        # cross-block fold state now, alone and beside the located channel, so
+        # the probe accepts it and the field classifies with both channels.
+        cfg = _config(_variables(located=located, temporal=True), streaming=_SPILL)
+        validate_spill_fold(cfg)  # no raise
+        agg = SpillAggregator(cfg, _grid(cfg), "pandas", 1)
+        assert agg._mergeable
+        f = agg._digest_fields["h_tdigest"]
+        assert f.temporal and bool(f.location) == located
+        agg.close()
 
-    def test_temporal_refusal_names_the_pooled_path(self):
+    def test_per_cell_temporal_still_has_no_cross_block_fold(self):
+        # Only the per-centroid shape folds. A per-cell companion is a scalar
+        # reducer over the derived word column with no per-block accumulator
+        # here, and it must be refused BY NAME rather than reported as a plain
+        # unmergeable scalar function.
         variables = _variables()
-        variables["h_tdigest"]["temporal"] = "per-centroid"
-        with pytest.raises(ValueError, match="run the pooled path"):
+        variables["observed"] = {
+            "function": "zagg.stats.toc.cell_envelope",
+            "source": "toc_word",
+            "dtype": "uint64",
+            "fill_value": 0,
+            "temporal": "per-cell",
+        }
+        with pytest.raises(ValueError, match="'observed'.*'per-cell'.*no cross-block fold state"):
             validate_spill_fold(_config(variables, streaming=_SPILL))
 
     def test_temporal_cannot_stream_under_merge_mode_either(self):
-        variables = _variables()
-        variables["h_tdigest"]["temporal"] = "per-centroid"
+        # mode: merge carries no companion channel at all, so it still refuses —
+        # and now routes to the mode that folds one.
+        variables = _variables(temporal=True)
         with pytest.raises(ValueError, match="temporal companions.*cannot stream"):
+            validate_streaming(_config(variables))
+        with pytest.raises(ValueError, match="mode: spill"):
             validate_streaming(_config(variables))
 
     def test_mis_declared_inner_shape_still_has_no_fold(self):
