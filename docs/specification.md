@@ -1561,12 +1561,14 @@ MUST NOT refuse a store for lacking the declaration.
 "temporal": {
   "spec": "zagg-toc/1",
   "shape": "axis",
-  "epoch": "1850-01-01T00:00:00",
-  "timescale": "gps-continuous",
-  "quantum_start_ns": 2147483648,
-  "quantum_end_ns": 4294967296
+  "grammar": "mortie/toc@0.9.6"
 }
 ```
+
+Three keys, and deliberately no more —
+[ruled on #410](https://github.com/englacial/zagg/issues/410#issuecomment-5310533396):
+the declaration is `{shape, versioned grammar citation}` under the `spec`
+marker, with **no per-store epoch or quantization guards**.
 
 - **`spec`** — the convention revision. Readers MUST strict-check it: an
   unknown or future revision raises, never half-parses under a guessed
@@ -1578,13 +1580,25 @@ MUST NOT refuse a store for lacking the declaration.
   in the same group. The discriminator exists so a later per-cell or
   per-centroid temporal companion declares itself in *this* grammar rather
   than a parallel one; a reader MUST refuse a `shape` it does not implement.
-- **`epoch`** / **`timescale`** — the word grammar's fixed time origin and
-  time scale. They are properties of the grammar, not writer choices; a
-  reader MUST refuse a declaration whose values differ from the grammar it
-  implements (a differing epoch is a future revision, not a re-basing hint).
-- **`quantum_start_ns`** / **`quantum_end_ns`** — the range variant's
-  outward-rounding grids in nanoseconds, echoed so a reader can state its
-  own decode tolerance without hard-coding the grammar's constants.
+- **`grammar`** — the versioned citation of the word grammar the values
+  follow: the mortie module and the release whose reference the section below
+  pins. It is a fixed token of this revision, not a stamp of the writer's
+  installed mortie, so a store's bytes do not move when a dependency floor
+  moves. A reader MUST refuse a `grammar` it does not implement, and SHOULD
+  record it as what it decoded against.
+
+**The epoch, the timescale, and the range variant's rounding quanta are
+properties of the cited grammar and are deliberately NOT echoed here.** A
+store cannot re-base them — a differing origin would be a different grammar,
+which is precisely what `grammar` (and `spec` above it) already discriminates
+— so a per-store copy could only ever restate a constant, while entering the
+committed conformance bytes and the §5 content hash and forcing a fixture
+regeneration for any upstream constant that changed.
+
+A writer MAY add further **informative** keys to the block (source-time
+lineage and the like). They are non-normative: nothing in §8 is decoded from
+them, and a reader MUST ignore keys it does not recognize rather than refuse
+the store.
 
 ### The word grammar is mortie's
 

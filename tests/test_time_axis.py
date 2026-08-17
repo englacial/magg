@@ -14,8 +14,8 @@ from mortie.toc import Q_END_NS, Q_START_NS
 from zagg.time_axis import (
     LEGACY_TIME_ATTRS,
     TOC_EPOCH,
+    TOC_GRAMMAR,
     TOC_SPEC,
-    TOC_TIMESCALE,
     decode_time_axis,
     encode_time_axis,
     temporal_declaration,
@@ -48,13 +48,19 @@ class TestDeclaration:
         # client must find nothing to decode rather than plausible garbage.
         assert set(TOC_ATTRS) == {"temporal"}
         block = TOC_ATTRS["temporal"]
-        assert block["spec"] == TOC_SPEC
-        assert block["shape"] == "axis"
-        assert (block["epoch"], block["timescale"]) == (TOC_EPOCH, TOC_TIMESCALE)
-        # The quanta are echoed from the grammar, never re-derived here.
-        assert block["quantum_start_ns"] == int(Q_START_NS)
-        assert block["quantum_end_ns"] == int(Q_END_NS)
+        # Exactly the #410-ruled shape: {spec, shape, versioned grammar
+        # citation}. NO per-store epoch/timescale/quantum guards -- those are
+        # properties of the cited grammar, and echoing them would only put a
+        # restated constant into the fixture bytes and the §5 hash.
+        assert block == {"spec": TOC_SPEC, "shape": "axis", "grammar": TOC_GRAMMAR}
         assert time_axis_dtype("toc") == "uint64"
+
+    def test_the_cited_grammar_is_the_one_this_reader_decodes_with(self):
+        # The citation is a fixed token, but it must not drift from the
+        # constants the decode actually runs on.
+        assert TOC_GRAMMAR.startswith("mortie/toc@")
+        assert TOC_EPOCH == "1850-01-01T00:00:00"
+        assert (int(Q_START_NS), int(Q_END_NS)) == (2**31, 2**32)
 
     def test_absent_key_is_legacy_never_a_refusal(self):
         for attrs in (None, {}, {"units": "microseconds since 1970-01-01T00:00:00"}):
@@ -70,10 +76,16 @@ class TestDeclaration:
         with pytest.raises(ValueError, match="shape 'per-centroid' is not implemented"):
             temporal_declaration({"temporal": block})
 
-    def test_rebased_epoch_refused(self):
-        block = {**TOC_ATTRS["temporal"], "epoch": "1970-01-01T00:00:00"}
-        with pytest.raises(ValueError, match="epoch/timescale"):
+    def test_uncited_grammar_refused(self):
+        block = {**TOC_ATTRS["temporal"], "grammar": "mortie/toc@2.0.0"}
+        with pytest.raises(ValueError, match="cites word grammar"):
             temporal_declaration({"temporal": block})
+
+    def test_informative_keys_are_ignored_not_refused(self):
+        # §8: unrecognized keys are non-normative provenance, so a reader
+        # passes them through rather than refusing the store.
+        block = {**TOC_ATTRS["temporal"], "source_time_field": "start_datetime"}
+        assert temporal_declaration({"temporal": block}) == block
 
     def test_non_mapping_declaration_refused(self):
         with pytest.raises(ValueError, match="must be a mapping"):
