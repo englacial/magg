@@ -18,7 +18,14 @@
 # would make `op: le, value: 0` admit or reject every shot), is what to check
 # there first.
 data_source:
-  granule_workers: 4
+  shard_workers: 4               # measured optimized envelope (run 5d081b68):
+                                 # workers=4 on the 4096-disk tier runs 300 s/shard
+                                 # at 60% memory (vs 587-757 s serial on 8192,
+                                 # run 8344cde5) for identical output. If a denser
+                                 # AOI pinches 4096 on MEMORY at workers=4, drop
+                                 # shard_workers to 2 before raising the tier --
+                                 # but not for a SpillOverflowError, which this
+                                 # knob cannot move (see worker.extra_disk).
   reader: h5coro
   driver: s3
   # DAAC S3 credentials are per-DAAC: GEDI is LP DAAC's lp-prod-protected,
@@ -26,8 +33,12 @@ data_source:
   # body, so every granule read raises memoryview(None) and the shard reports
   # "No data after filtering" (issue #449, first-fleet-run failure).
   credentials_provider: lpdaac
-  # No index block: the hierarchical route is the pinned baseline for the
-  # first GEDI builds; the vlen route also runs behind index: inline.
+  index:
+    backend: hierarchical      # pinned: an ABSENT block resolves to inline since
+                               # issue #170, and inline's chunk-map B-tree walk
+                               # strands 4 MiB h5coro cache lines on GEDI (issue
+                               # #460). Re-benchmark inline on GEDI after #460
+                               # lands before flipping.
   groups: [BEAM0000, BEAM0001, BEAM0010, BEAM0011, BEAM0101, BEAM0110, BEAM1000, BEAM1011]
   coordinates:
     # The base (sample) level carries no native coordinates: lat/lon expand
@@ -108,9 +119,20 @@ data_source:
     pad: 1
 
 aggregation:
-  # Pooled (no streaming block): o9 shards are light at GEDI density, and the
-  # flux field's composability is `none` initially (issue #422 -- no pyramid,
-  # no spill whitelist growth). Promote alongside overviews when needed.
+  # o9 shards are NOT light at GEDI density: the first successful run (run
+  # 8344cde5, issue #460) read 50-82 M rows/shard pre-clip (21-33 M kept) --
+  # the pooled-mode assumption here reasoned about post-clip density and
+  # undersized the envelope. The other GEDI failure rounds had unrelated
+  # causes (issue #449 DAAC credentials, issue #452 read-plan striding, issue
+  # #460 inline cache-line residency -- the index.backend: hierarchical pin
+  # above is what unblocked that one, not this streaming block). Spill wrote
+  # 1.6-2.5 GB /tmp per shard with spill_blocks_closed: 0 (exact single-block
+  # regime, pooled-identical results). Pairs with worker.extra_disk below.
+  streaming:
+    mode: spill
+    buffer_granules: 8           # optimized probe (run 5d081b68): 8 with
+                                 # shard_workers 4 held container HWM at 2,472 MB
+                                 # (60% of the 4096 tier), identical output
   coordinates:
     morton:
       dtype: uint64
@@ -206,4 +228,42 @@ output:
   pyramid: false                 # composability none initially (issue #422)
 
 worker:
-  memory: 2048                   # pooled path, no spill: the light variant
+  memory: 4096                   # optimized probe (run 5d081b68, 4/4 green):
+                                 # process-shard-4096-disk at shard_workers 4 /
+                                 # buffer_granules 8 -> 300 s/shard, worker
+                                 # max_memory 2,464 MB / container HWM 2,472 MB
+                                 # (60% of tier), $0.069/run vs $0.286 at
+                                 # 8192/serial (run 8344cde5), identical output.
+                                 # Fallback ladder, BY FAILURE MODE:
+                                 #   memory pinch (OOM / container HWM near the
+                                 #     tier) -> shard_workers 4 -> 2, then raise
+                                 #     the tier; shard_workers is what bounds
+                                 #     concurrent in-memory read buffers.
+                                 #   SpillOverflowError (block close, see below)
+                                 #     -> the 8192-disk tier (10240 MB /tmp,
+                                 #     4608 MB threshold) or a finer
+                                 #     parent_order. shard_workers is INERT for
+                                 #     this one: it does not change total
+                                 #     spilled bytes, only in-flight buffers.
+  extra_disk: true               # the -disk twin sizes /tmp at memory + 2048 MB,
+                                 # so 6144 MB here. The spill block-close
+                                 # threshold is min(0.2 x memory x K, 0.45 x free
+                                 # /tmp); K = 4^(12-9) = 64 puts the memory term
+                                 # at ~52 GB, so /tmp always dominates -> ~2765
+                                 # MB. Measured spill is 1.6-2.5 GB/shard (run
+                                 # 8344cde5), a ~1.16x margin on the worst shard,
+                                 # and f_bavail is read live so anything else in
+                                 # /tmp eats into it. Clearing the threshold for
+                                 # a 2.5 GB block needs ~5.6 GB free /tmp, not
+                                 # 2.5 GB: /tmp holds the closing block beside
+                                 # the filling one, which is what the 45% is for.
+                                 # This is a cliff, not a slope, because the
+                                 # config is EXACT-SINGLE-BLOCK-ONLY --
+                                 # validate_spill_fold rejects it
+                                 # (build_waveform_digest and the
+                                 # single_shot_value companions have no
+                                 # cross-block fold law), so a threshold
+                                 # crossing raises SpillOverflowError instead of
+                                 # degrading. spill_blocks_closed: 0 is a
+                                 # PRECONDITION of these results, not merely an
+                                 # observation of them.
