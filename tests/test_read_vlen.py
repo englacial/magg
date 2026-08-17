@@ -845,6 +845,84 @@ class TestGediTemplate:
         )
 
 
+def _count_owner_derivations(monkeypatch):
+    """Record every ``_link_parent_at_rows`` call and its argument identity."""
+    import zagg.processing.read as rd
+
+    calls: list[tuple] = []
+    real = rd._link_parent_at_rows
+
+    def _spy(ibeg, cnt, base, rows):
+        calls.append(
+            (tuple(np.asarray(ibeg).tolist()), tuple(np.asarray(cnt).tolist()), base, len(rows))
+        )
+        return real(ibeg, cnt, base, rows)
+
+    monkeypatch.setattr(rd, "_link_parent_at_rows", _spy)
+    return calls
+
+
+class TestOwnerMapReuse:
+    """The route derives ONE owner map per link, not one per consumer (#454 review).
+
+    The shipped template declares six companion variables and one structured
+    filter on ``shots`` — which *is* ``coordinates.level``, so the gather map
+    already holds every one of their per-row owners. Each used to re-derive it
+    by searchsorted: six identical derivations over the planned rows per beam
+    group, eight groups per granule, and — worse than the cost — a second owner
+    map built by last-start-wins riding alongside the paint-order one it has to
+    agree with."""
+
+    def _template_ds(self, **read_plan):
+        from zagg.config import default_config
+
+        ds = dict(default_config("gedi01b_waveform_healpix_hive").data_source)
+        if read_plan:
+            ds["read_plan"] = read_plan
+        return ds
+
+    @pytest.mark.parametrize(
+        "read_plan, shard, grid, expected",
+        [
+            ({}, 0, _OneShardGrid(), [101] * 5),
+            ({"spatial_index": "shots", "pad": 0}, 0, _LatGrid(), [101] * 5),
+        ],
+        ids=["full", "planned"],
+    )
+    def test_coordinates_level_consumers_derive_no_owner_map(
+        self, monkeypatch, read_plan, shard, grid, expected
+    ):
+        calls = _count_owner_derivations(monkeypatch)
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            self._template_ds(**read_plan),
+            shard,
+            grid,
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        assert df["shot_number"].tolist() == expected
+        assert calls == [], f"a coordinates-level consumer re-derived the owner map: {calls}"
+
+    def test_the_template_hangs_six_companions_off_the_coordinates_level(self):
+        ds = self._template_ds()
+        shot_vars = ds["levels"][ds["coordinates"]["level"]]["variables"]
+        # The count the finding is scaled by: six re-derivations, not one.
+        assert len(shot_vars) == 6
+        assert [f["level"] for f in ds["filters"] if "level" in f] == ["shots"]
+
+    def test_a_genuinely_different_link_still_derives_its_own(self, monkeypatch):
+        # The reuse must not swallow a level whose link really is different:
+        # ``blocks`` gets exactly one derivation, over the planned rows.
+        calls = _count_owner_derivations(monkeypatch)
+        ds = _vlen_ds_blocks(read_plan={"spatial_index": "shots", "pad": 0})
+        df = _read_group(_FakeH5(_l1b_arrays_blocks()), "BEAM0000", ds, 1, _LatGrid())
+        assert df["shot_number"].tolist() == [104, 104]
+        assert len(calls) == 1, calls
+        # The blocks link, over the plan's rows — not the shots link.
+        assert calls[0] == (tuple(BLOCK_STARTS.tolist()), tuple(BLOCK_COUNTS.tolist()), 0, 10)
+
+
 # ── strided records (the GEDI L1B shape — issue #452) ────────────────────────
 #
 # The packed fixture above is the pathological case that hid the bug: its
