@@ -517,14 +517,17 @@ def _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order):
         falling through to geometry would hide that the index the operator built
         is useless for this grid. Refuse and say which order to re-index at.
 
-        Also when the catalog has **duplicate granule ids**. The column is
-        aligned to records by id, so a repeated id makes the lookup last-wins and
-        hands every earlier record with that id another granule's footprint --
-        silently, since the shard count stays plausible. Refuse rather than
-        misassign; the geometry path reads each record's own ring and is unaffected.
-        The check stays **table-wide**, not hits-only: it is a statement about the
-        catalog's integrity, so a duplicate among rows this build's AOI would have
-        discarded must refuse the build just as it did before the inversion.
+        Also when the catalog has **duplicate granule ids**. Alignment is
+        positional (``np.flatnonzero`` of the row screen), so a repeat cannot
+        misdirect a lookup -- there is none -- but it is evidence the table was
+        concatenated or re-keyed, and a column stored beside rows that repeat an
+        id cannot be shown to belong to them. Assigning from it anyway would put
+        one granule's footprint on another under an id that names both, silently,
+        since the shard count stays plausible. Refuse rather than misassign; the
+        geometry path reads each record's own ring and is unaffected. The check
+        stays **table-wide**, not hits-only: it is a statement about the catalog's
+        integrity, so a duplicate among rows this build's AOI would have discarded
+        must refuse the build just as it did before the inversion.
     """
     if chosen != "mortie" or footprint != "swath" or mortie_order is not None:
         return None
@@ -552,8 +555,10 @@ def _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order):
         raise ValueError(
             f"catalog has duplicate granule ids ({catalog.table.num_rows - distinct} "
             f"repeats over {catalog.table.num_rows} rows); the footprint_cells column is "
-            f"aligned to records by id, so a repeat would hand records another granule's "
-            f"footprint. De-duplicate the catalog, or drop the column to build from geometry."
+            f"matched to rows by position, so a repeated id means the table was concatenated "
+            f"or re-keyed and the stored footprints can no longer be shown to belong to the "
+            f"rows they sit beside -- building from them could put one granule's footprint on "
+            f"another. De-duplicate the catalog, or drop the column to build from geometry."
         )
     # ``granule_records`` skips rows with empty or non-polygonal geometry and
     # keeps table order otherwise, so record ``i`` is the ``i``-th surviving
