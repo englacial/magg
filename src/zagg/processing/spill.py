@@ -501,9 +501,14 @@ class SpillAggregator:
     ``chunk_outputs`` returns the 5-tuple ``_aggregate_chunk_cells`` contract
     (``stats_arrays, ragged_payloads, ragged_cell_indices, ragged_channels,
     cells_with_data``) — one element more than StreamingAggregator, since
-    spill serves located fields. The §8.3 temporal channel is NOT among them:
-    ``validate_spill_fold`` refuses a ``temporal:`` field, so the channel
-    mapping this path emits carries ``locations`` only (issue #410).
+    spill serves located fields. The §8.3 temporal channel rides the SINGLE-BLOCK
+    regime exactly: ``validate_spill_fold`` is a *probe* here, not a refusal — a
+    ``temporal:`` config simply lands ``_mergeable = False``, so ``chunk_outputs``
+    routes to ``_aggregate_chunk_cells`` and the channel mapping carries ``times``
+    beside ``locations``. What refuses is a block CLOSE
+    (:class:`SpillOverflowError`, carrying ``_fold_problems``), because the
+    cross-block channel state is located-only — loudly, so nothing is silently
+    dropped (issue #410).
     """
 
     def __init__(
@@ -1090,8 +1095,10 @@ class SpillAggregator:
         ragged_cell_indices: dict[str, list[int]] = {n: [] for n in self._digest_fields}
         # Located fields only (issue #87): keyed presence tells the worker to
         # deliver the 3-tuple ragged contract, mirroring _aggregate_chunk_cells.
-        # ``temporal:`` never reaches here (refused by validate_spill_fold), so
-        # ``locations`` is the only channel this mapping ever carries.
+        # ``temporal:`` never reaches here — not because the config was rejected,
+        # but because this method only runs when ``_mergeable``, and a
+        # ``temporal:`` field is outside the ``validate_spill_fold`` surface that
+        # sets it. So ``locations`` is the only channel this mapping ever carries.
         ragged_channels: dict[str, dict[str, list]] = {
             n: {"locations": []} for n, f in self._digest_fields.items() if f.location
         }
