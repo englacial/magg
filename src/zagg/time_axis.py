@@ -265,9 +265,14 @@ def toc_source(config) -> dict | None:
     ``output.windowing``** when that block already carries a continuous-scale
     clock: window routing and toc ingest then derive from ONE declaration, which
     is what keeps them from disagreeing at a window boundary (an observation
-    routed into window *W* whose stored word reads as outside it). A windowed
-    store on ``scale: utc`` gets no fallback — see :data:`TOC_SOURCE_SCALES` —
-    and must declare a continuous column explicitly.
+    routed into window *W* whose stored word reads as outside it). When BOTH are
+    declared the fallback cannot single-source anything, so
+    ``config._validate_time_source`` requires the two to agree on all four keys
+    instead (issue #410 review) — otherwise a store would route on one clock and
+    encode words from another. A windowed store on ``scale: utc`` gets no
+    fallback — see :data:`TOC_SOURCE_SCALES` — and must declare a continuous
+    column explicitly; that pairing is exempt from the cross-check by design, and
+    is the one path where the same column is declared twice on two scales.
 
     Shape and vocabulary are validated in :mod:`zagg.config`
     (``_validate_time_source``); this is the read point every consumer uses.

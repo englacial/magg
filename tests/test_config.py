@@ -2615,6 +2615,44 @@ class TestTimeSource:
         with pytest.raises(ValueError, match="reserved name of the derived toc word column"):
             validate_config(cfg)
 
+    def test_both_clock_declarations_must_agree(self):
+        # The fallback single-sources the clock only when time_source is ABSENT.
+        # Unchecked, a store declaring both routes windows on one clock and
+        # encodes its §8.3 words from another (issue #410 review).
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+            "units": "seconds",
+        }
+        validate_config(cfg)  # an agreeing pair is the normal case
+        cfg.data_source["variables"]["other_time"] = "{group}/other_time"
+        cfg.output["time_source"].update(
+            {
+                "field": "other_time",
+                "epoch": "2020-06-01T00:00:00",
+                "scale": "tai",
+                "units": "days",
+            }
+        )
+        with pytest.raises(ValueError, match="disagrees with output.windowing"):
+            validate_config(cfg)
+
+    def test_a_utc_windowing_block_is_exempt_from_the_cross_check(self):
+        # The one path that deliberately carries two declarations of the same
+        # column on two scales: a utc windowing block gets no fallback, so the
+        # explicit continuous declaration must be allowed to differ from it.
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "utc",
+        }
+        validate_config(cfg)
+
     def test_chunk_precompute_may_not_shadow_the_derived_name(self):
         cfg = _clocked(_ragged_cfg(inner_shape=[2]))
         cfg.aggregation["chunk_precompute"] = {"toc_word": {"function": "mean", "source": "h_ph"}}

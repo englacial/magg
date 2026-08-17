@@ -1068,6 +1068,41 @@ def _validate_time_source(config: PipelineConfig) -> None:
         raise ValueError(
             f"output.time_source.units must be one of {sorted(UNIT_SECONDS)} (got {units!r})"
         )
+    # Cross-check the two clocks (issue #410 review). ``toc_source``'s fallback
+    # single-sources the clock only when THIS block is absent, so when both are
+    # declared nothing else stops a store from routing windows on one clock and
+    # encoding its §8.3 words from another — unbounded disagreement, not a
+    # one-quantum edge effect. A windowing block on ``scale: utc`` is the
+    # deliberate exception: it gets no fallback (a nominal-UTC column cannot
+    # carry a nanosecond-exact word), so an explicit continuous declaration is
+    # the only way to carry words there, and the residual routing gap is
+    # windows.py's own documented tolerance.
+    try:
+        windowing = get_windowing(config)
+    except (KeyError, TypeError, ValueError):
+        return  # malformed windowing block: _validate_windowing names it
+    if windowing is None or windowing["scale"] not in TOC_SOURCE_SCALES:
+        return
+    disagree = [
+        (key, value, windowing[wkey])
+        for key, wkey, value in (
+            ("field", "time_field", field),
+            ("scale", "scale", scale),
+            ("units", "units", units),
+        )
+        if value != windowing[wkey]
+    ]
+    if parse_utc(block["epoch"]) != parse_utc(windowing["epoch"]):
+        disagree.append(("epoch", block["epoch"], windowing["epoch"]))
+    if disagree:
+        detail = ", ".join(f"{k}: {a!r} vs {b!r}" for k, a, b in disagree)
+        raise ValueError(
+            f"output.time_source disagrees with output.windowing ({detail}) — window "
+            f"routing and the spec §8.3 toc words would run on two different clocks, so "
+            f"an observation could be routed into a window its own stored word reads as "
+            f"outside of. Make them agree, or drop output.time_source and let it derive "
+            f"from output.windowing (issue #410)"
+        )
 
 
 def _validate_raster_config(config: PipelineConfig) -> None:
