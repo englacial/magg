@@ -729,6 +729,31 @@ class TestSiblingJoinedValues:
         assert vals["/BEAM0000/quality_flag"].shape == (4,)
         assert vals["/BEAM0000/quality_flag"].dtype == np.uint8
 
+    def test_dataset_at_a_different_rate_raises(self):
+        # A gathered dataset shorter than the join key would answer with another
+        # record's row (or raise a bare IndexError naming nothing), so name the
+        # asset and the dataset (issue #464 review).
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/sensitivity"] = np.array([0.95, 0.99], dtype=np.float32)
+        with pytest.raises(
+            ValueError, match=r"assets.l2a dataset '/BEAM0000/sensitivity' has 2 rows"
+        ):
+            self._join(["/BEAM0000/sensitivity"], sibling_arrays=arrays)
+
+    def test_longer_dataset_raises_too(self):
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/quality_flag"] = np.array([1, 0, 1, 1], dtype=np.uint8)
+        with pytest.raises(ValueError, match=r"the join key '/BEAM0000/shot_number' has 3"):
+            self._join(["/BEAM0000/quality_flag"], sibling_arrays=arrays)
+
+    def test_populated_dataset_beside_an_empty_key_raises(self):
+        # The empty-sibling placeholder is for a sibling with NO rows at all; a
+        # zero-row key beside a populated dataset is malformed, not degenerate.
+        arrays = _l2a_arrays_empty()
+        arrays["/BEAM0000/quality_flag"] = np.array([1, 0, 1], dtype=np.uint8)
+        with pytest.raises(ValueError, match=r"has 3 rows; the join key .* has 0"):
+            self._join(["/BEAM0000/quality_flag"], sibling_arrays=arrays)
+
     def test_duplicate_right_keys_raise(self):
         arrays = _l2a_arrays()
         arrays["/BEAM0000/shot_number"] = np.array([101, 102, 102, 104], dtype=np.uint64)
@@ -865,6 +890,24 @@ class TestAssetVariables:
         joined = captured[0]["/BEAM0000/digital_elevation_model"]
         assert not np.isnan(joined).any()
         np.testing.assert_array_equal(joined, np.array([60.0, 30.0, 40.0, 40.0], dtype=np.float32))
+
+    def test_short_sibling_dataset_raises_through_the_route(self):
+        # The rate check rides the join, so the route surfaces it with the asset
+        # and dataset named rather than an IndexError from the gather (issue
+        # #464 review).
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/digital_elevation_model"] = np.array([60.0, 30.0], dtype=np.float32)
+        with pytest.raises(
+            ValueError, match=r"assets.l2a dataset '/BEAM0000/digital_elevation_model' has 2 rows"
+        ):
+            _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                _dem_var_ds(),
+                0,
+                _OneShardGrid(),
+                siblings={"l2a": _FakeH5(arrays)},
+            )
 
     def test_two_dimensional_sibling_dataset_raises_articulately(self):
         # The asset form is scoped to record-rate scalars (issue #464 review):

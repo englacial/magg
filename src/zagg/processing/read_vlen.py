@@ -844,7 +844,9 @@ def _sibling_joined_values(
     is a zeros array of length ``n_records`` shaped like the sibling dataset
     beyond axis 0 (issue #464 review). A DUPLICATED right key raises: it would
     make "the sibling's value" one of N candidates chosen by sort order, which
-    is the silent-junk shape this reader exists to refuse.
+    is the silent-junk shape this reader exists to refuse. So does a gathered
+    dataset at a different RATE than the join key — the gather would answer with
+    another record's row, or raise an ``IndexError`` naming nothing.
     """
     join = cfg["join"]
     left_path = join["left"].format(group=group)
@@ -858,6 +860,18 @@ def _sibling_joined_values(
             f"assets.{asset}.join.left has {len(left_keys)} records; the "
             f"coordinates level has {n_records}"
         )
+    # Every gathered dataset must be at the join key's rate, or ``[sib_idx]``
+    # silently answers with the wrong row — or raises a bare ``IndexError``
+    # naming neither asset nor dataset (issue #464 review). Checked here, before
+    # the empty-sibling placeholder too: a zero-row key beside a populated
+    # dataset is the same malformed product.
+    for p in dict.fromkeys(dataset_paths):
+        n_rows = len(np.asarray(sib_data[p]))
+        if n_rows != len(right_keys):
+            raise ValueError(
+                f"assets.{asset} dataset {p!r} has {n_rows} rows; the join key "
+                f"{right_path!r} has {len(right_keys)}"
+            )
     if len(right_keys) == 0:
         # No sibling row to gather: hand back the documented placeholder rather
         # than let the clamped gather below index an empty array (the guards it
