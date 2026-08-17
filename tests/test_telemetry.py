@@ -349,6 +349,24 @@ class TestCanonicalGranuleIdentity:
         assert canonical_granule_id("s3://b/prefix/") == "prefix"
         assert canonical_granule_id("g.h5") == "g.h5"
 
+    @pytest.mark.parametrize("entry", [{"assets": {}}, {"url": None}, {"url": ""}, None, ""])
+    def test_a_malformed_entry_raises_rather_than_minting_an_identity(self, entry):
+        # Keeps the pre-epoch loudness (`build_record`'s `g["url"]` raised
+        # KeyError on a url-less mapping): every such entry would otherwise
+        # stringify to the SAME id, so N of them collapse onto one recorded id
+        # and silently shrink the recorded set -- the shape that hides a
+        # contraction. An identity is never silently wrong.
+        from zagg.telemetry import canonical_granule_id, canonical_granule_ids, granules_sha256
+
+        with pytest.raises(ValueError, match="canonical identity"):
+            canonical_granule_id(entry)
+        # ...and it raises through the list/digest helpers rather than being
+        # swallowed on the way to a sidecar.
+        with pytest.raises(ValueError, match="canonical identity"):
+            canonical_granule_ids([self.S3[0], entry])
+        with pytest.raises(ValueError, match="canonical identity"):
+            granules_sha256([self.S3[0], entry])
+
 
 class TestMerge:
     def test_single_record_is_identity(self):

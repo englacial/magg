@@ -169,9 +169,26 @@ def canonical_granule_id(entry) -> str:
     is logged loudly (``zagg.dedup._warn_on_collapsed_recorded_ids``); making
     it refuse instead is a ruling on the contraction predicate, standing for
     espg (PR #420 review finding (2)).
+
+    A malformed entry RAISES rather than minting an identity: a mapping with no
+    ``url`` primary, or an empty/``None`` id, has no canonical form, and
+    stringifying it would give every such entry the SAME id — collapsing N of
+    them onto one recorded id, silently shrinking the recorded set the same way
+    the collision above degrades the contraction guard. Nothing in the
+    dispatchers produces one (``zagg.runner._resolve_granule_entries`` always
+    sets a non-empty ``url``), and the pre-epoch ``build_record`` raised
+    ``KeyError`` here; the whole point of the D19/D20 identity pair is that an
+    identity is never silently wrong.
     """
     if isinstance(entry, dict):
-        entry = entry.get("url")
+        if not entry.get("url"):
+            raise ValueError(
+                f"granule entry has no 'url' primary, so it has no canonical "
+                f"identity (issue #425's paired-asset shape): {entry!r}"
+            )
+        entry = entry["url"]
+    if entry is None or entry == "":
+        raise ValueError("granule entry is empty, so it has no canonical identity")
     text = str(entry).rstrip("/")
     return text.rpartition("/")[2] or text
 
@@ -188,14 +205,18 @@ def canonical_granule_ids(granule_ids: Iterable[Any] | None) -> list[str] | None
     return [canonical_granule_id(g) for g in granule_ids]
 
 
-def granules_sha256(granule_ids: Iterable[str] | None) -> str | None:
+def granules_sha256(granule_ids: Iterable[Any] | None) -> str | None:
     """Catalog identity of a shard: sha256 over its sorted granule ids.
 
     Ids are whatever uniquely names the shard's inputs (granule URLs for the
     aggregation path, item ids/datetimes for raster), reduced to their
     canonical form first (:func:`canonical_granule_id`) so the digest names
-    the GRANULES and not the driver that fetched them. Sorted so the hash is
-    order-independent; ``None``/empty -> ``None`` (no catalog identity).
+    the GRANULES and not the driver that fetched them. Any href form is
+    accepted, and so are the paired-asset mappings (issue #425) — hence
+    ``Iterable[Any]``, matching :func:`canonical_granule_ids` and the callers,
+    not the ``Iterable[str]`` this annotation carried pre-epoch. Sorted so the
+    hash is order-independent; ``None``/empty -> ``None`` (no catalog
+    identity).
     """
     ids = sorted(canonical_granule_ids(granule_ids) or [])
     if not ids:
@@ -234,7 +255,7 @@ def build_record(
     *,
     shard_key,
     metadata: dict,
-    granule_ids: Iterable[str] | None = None,
+    granule_ids: Iterable[Any] | None = None,
     invoked_by: dict | None = None,
     run_id: str | None = None,
     window: str | None = None,
