@@ -1797,8 +1797,14 @@ class TestFullCoverageWalk:
         # node lines. On GEDI L1B at the 4 MiB default those headers co-locate:
         # 11 lines / 46 MB resident per beam group, 90 distinct lines touched.
         assert len(maps) > 20  # every dataset in the granule, not just one
-        assert len(h5obj.cache) <= 2 * len(maps)  # parse-line growth only...
-        assert len(ref.cache) > 2 * len(maps)  # ...which the unevicted arm busts
+        # Pin the WALK's lines directly rather than a count bound: a magic
+        # lines-per-dataset factor sat five lines from flipping either way on
+        # this fixture, and was carried by parse lines, not walk lines (second
+        # review finding on PR #462). These keys are scale-free -- the walk
+        # lines of a known dataset, present in the unevicted arm and gone here.
+        _, walk_lines, _ = TestChunkMapCacheEviction()._unevicted_reference()
+        assert walk_lines <= set(ref.cache)  # the unevicted arm strands them...
+        assert not walk_lines & set(h5obj.cache)  # ...and eviction dropped them
         # ...and altered no map.
         assert set(maps) == set(maps_ref)
         for p in maps:
