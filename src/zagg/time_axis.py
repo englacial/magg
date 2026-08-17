@@ -320,6 +320,7 @@ def observation_words(values, *, epoch, scale: str, units: str) -> np.ndarray:
     convention, not something this encode can bridge.
     """
     import mortie
+    from mortie.toc import TOC_MAX_NS
 
     from zagg.windows import UNIT_SECONDS, parse_utc
 
@@ -348,25 +349,29 @@ def observation_words(values, *, epoch, scale: str, units: str) -> np.ndarray:
     # a writer can make (the column's own ~30 ns ulp is inherent to the source).
     whole = np.floor(offsets)
     frac_ns = np.rint((offsets - whole) * 1_000_000_000.0)
-    # Bound-check in float, BEFORE the int64 cast: an out-of-domain offset
-    # overflows the cast (numpy warns and yields garbage) where the grammar's
-    # own limits are what the caller needs named. The window is the timestamp
-    # variant's own domain — ns since the epoch, below the 63rd bit. The float
-    # sum is only good to a ulp, which is ample for a decision over a 2^63 ns
-    # span; the exact figure is the int64 combine.
-    ns = whole * 1_000_000_000.0 + frac_ns
-    ceiling = float(2**63 - 1 - base)
-    if ns.size and float(ns.min()) < -float(base):
-        raise ValueError(
-            f"observation time precedes the toc epoch {TOC_EPOCH} by "
-            f"{-(float(ns.min()) + base):.0f} ns — the word grammar cannot represent it "
-            f"(spec §8)"
-        )
-    if ns.size and float(ns.max()) > ceiling:
-        raise ValueError(
-            f"observation time exceeds the toc grammar's range ({TOC_EPOCH} + 2^63 ns, "
-            f"~2142) by {float(ns.max()) - ceiling:.0f} ns (spec §8)"
-        )
+    # Bound-check BEFORE the int64 combine, which an out-of-domain offset would
+    # overflow silently, and against the grammar's REAL domain: mortie refuses
+    # at ``TOC_MAX_NS`` (2^63 - 2^32, its quantum-aligned span ceiling), not at
+    # 2^63 - 1, so the last 4.29 s of the naive range would otherwise reach
+    # mortie and get its message where the caller needs this one. Both extremes
+    # are compared as Python ints — ``base`` exceeds 2^53, so ``float(base)``
+    # floats the bound by up to a ulp (512 ns for an odd-second epoch) and this
+    # check claims to BE the domain check.
+    ceiling = TOC_MAX_NS - 1 - base
+    if offsets.size:
+        lo, hi = int(np.argmin(offsets)), int(np.argmax(offsets))
+        low = int(whole[lo]) * 1_000_000_000 + int(frac_ns[lo])
+        high = int(whole[hi]) * 1_000_000_000 + int(frac_ns[hi])
+        if low < -base:
+            raise ValueError(
+                f"observation time precedes the toc epoch {TOC_EPOCH} by "
+                f"{-(low + base)} ns — the word grammar cannot represent it (spec §8)"
+            )
+        if high > ceiling:
+            raise ValueError(
+                f"observation time exceeds the toc grammar's range ({TOC_EPOCH} + "
+                f"2^63 - 2^32 ns, ~2142) by {high - ceiling} ns (spec §8)"
+            )
     internal = base + whole.astype(np.int64) * 1_000_000_000 + frac_ns.astype(np.int64)
     return np.asarray(mortie.time2toc(internal.astype(np.uint64)), dtype=np.uint64)
 
