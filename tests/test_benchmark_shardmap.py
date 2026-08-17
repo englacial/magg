@@ -35,6 +35,7 @@ granules, so it is built on the fly at dispatch
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -278,6 +279,34 @@ def test_repin_updates_only_the_pin_literals_in_targets():
     assert entry["note"] == MANIFEST["shardmaps"]["healpix_o9"]["note"]
     changed = [(a, b) for a, b in zip(text.splitlines(), out.splitlines(), strict=True) if a != b]
     assert len(changed) == 2, changed
+
+
+def test_repin_prune_slices_the_aoi_mask_with_the_shard_keys():
+    """The prune is the one place the driver hand-rebuilds a ``ShardMap``.
+
+    ``aoi_mask`` is parallel to ``shard_keys`` (issue #101), so it has to be
+    sliced with them. Latent today -- no committed benchmark map carries one,
+    the strict-AOI arm building its mask at dispatch instead
+    (``run_benchmark._shardmap_with_mask``, issue #202) -- but a field dropped
+    here would be written out as a maskless map without a word.
+    """
+    from zagg.catalog.shardmap import ShardMap
+
+    driver = _driver()
+    rebuilt = ShardMap(
+        {"grid": "healpix"},
+        [10, 11],
+        [[{"granule": "a"}], [{"granule": "b"}]],
+        {"total_shards": 2},
+        aoi_mask=[[1, 2], [3, 4]],
+    )
+    pruned = driver.prune_to_pin(rebuilt, 11, "pruned to the pinned shard")
+
+    assert (pruned.shard_keys, pruned.granules) == ([11], [[{"granule": "b"}]])
+    assert pruned.aoi_mask == [[3, 4]]
+    # metadata stays the FULL build's, plus the carried note
+    assert pruned.metadata == {"total_shards": 2, "pruned": "pruned to the pinned shard"}
+    assert driver.prune_to_pin(replace(rebuilt, aoi_mask=None), 10, "note").aoi_mask is None
 
 
 def test_repin_targets_write_back_is_anchored_on_the_key():
