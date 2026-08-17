@@ -15,6 +15,8 @@ from zagg.config import (
     validate_config,
 )
 from zagg.processing.read import (
+    _expand_mask_at_rows,
+    _expand_mask_to_base,
     _link_parent_at_rows,
     _read_group,
     _validate_link_disjoint,
@@ -269,6 +271,46 @@ class TestSynthesizeLinspace:
         )
         assert np.isnan(vals[5]) and np.isnan(vals[6])
         np.testing.assert_allclose(vals[:5], [0, 1, 2, 3, 4])
+
+
+class TestExpandMaskAtRowsEquivalence:
+    """``_expand_mask_at_rows`` is ``_expand_mask_to_base(...)[base_rows]``,
+    validation scope included (PR #454 review).
+
+    The base-rate form's ``beg < 0`` check sits after the predicate guard, so a
+    record the predicate rejects is never validated. The reviewer's
+    construction is a record with a malformed origin-0 start that the mask
+    filters *out*: the base-rate form reads it fine, and the at-rows twin must
+    not fail-hard on the production route where the original does not."""
+
+    def test_a_filtered_out_record_is_not_validated(self):
+        ibeg = np.array([0, 1])
+        cnt = np.array([2, 3])
+        mask = np.array([False, True])
+        base = _expand_mask_to_base(mask, ibeg, cnt, 1, 4)
+        at_rows = _expand_mask_at_rows(mask, ibeg, cnt, 1, np.arange(4))
+        assert base.tolist() == [True, True, True, False]
+        assert at_rows.tolist() == base.tolist()
+
+    def test_a_kept_record_with_a_malformed_start_still_raises(self):
+        # The refusal is narrowed, not removed: flip the same record's verdict
+        # to keep and both forms raise the same way.
+        ibeg = np.array([0, 1])
+        cnt = np.array([2, 3])
+        mask = np.array([True, True])
+        with pytest.raises(ValueError, match="less than index_base"):
+            _expand_mask_to_base(mask, ibeg, cnt, 1, 4)
+        with pytest.raises(ValueError, match="less than index_base"):
+            _expand_mask_at_rows(mask, ibeg, cnt, 1, np.arange(4))
+
+    def test_equivalence_on_the_shipped_strided_fixture(self):
+        for mask in ([True] * 4, [False] * 4, [True, False, True, False]):
+            m = np.array(mask)
+            base = _expand_mask_to_base(m, STARTS_STRIDED, COUNTS, 1, STRIDED_EXTENT)
+            rows = np.arange(STRIDED_EXTENT)
+            np.testing.assert_array_equal(
+                _expand_mask_at_rows(m, STARTS_STRIDED, COUNTS, 1, rows), base
+            )
 
 
 class TestPlannedGatherMap:

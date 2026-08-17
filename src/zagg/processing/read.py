@@ -289,10 +289,18 @@ def _expand_mask_at_rows(
     Identical to ``_expand_mask_to_base(...)[base_rows]`` — a row owned by no
     record is ``False`` there and here — without the length-``n_base``
     intermediate (196 MB per cross-level filter on a GEDI beam group).
+
+    Equivalence includes the *scope* of the ``beg < 0`` refusal: the base-rate
+    form checks it inside a loop the predicate guard has already ``continue``\\ d
+    past, so a record the predicate rejects is never validated. Widening that to
+    every non-empty record would fail-hard on a granule the production route
+    reads fine (a malformed start on a record that is filtered out anyway), so
+    the keep-mask is part of the test here too.
     """
+    keep = np.asarray(coarse_mask, dtype=bool)
     beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
     cnt = np.asarray(count_arr).astype(np.int64)
-    bad = (cnt > 0) & (beg < 0)
+    bad = keep & (cnt > 0) & (beg < 0)
     if bad.any():
         p = int(np.argmax(bad))
         raise ValueError(
@@ -300,7 +308,7 @@ def _expand_mask_at_rows(
         )
     parent = _link_parent_at_rows(index_beg_arr, count_arr, index_base, base_rows)
     valid = parent >= 0
-    return np.asarray(coarse_mask, dtype=bool)[np.where(valid, parent, 0)] & valid
+    return keep[np.where(valid, parent, 0)] & valid
 
 
 def _gather_segment_at_rows(
