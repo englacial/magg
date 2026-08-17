@@ -459,6 +459,34 @@ class TestSpillConfig:
         with pytest.raises(ValueError, match="unknown key"):
             get_streaming(_config(streaming={"mode": "spill", "state_layout": "arena"}))
 
+    @pytest.mark.parametrize("block_bytes", [None, 123456])
+    def test_block_bytes_reaches_the_worker_constructor(self, monkeypatch, block_bytes):
+        # issue #474: the config knob must thread through process_shard to the
+        # SpillAggregator construction — spied at the constructor seam. None
+        # (absent) keeps the disk-derived _default_block_bytes behavior.
+        seen = {}
+        real_init = SpillAggregator.__init__
+
+        def spy(agg, *args, **kwargs):
+            seen["block_bytes"] = kwargs.get("block_bytes")
+            real_init(agg, *args, **kwargs)
+            seen["resolved"] = agg.block_bytes
+
+        monkeypatch.setattr(SpillAggregator, "__init__", spy)
+        streaming = {"mode": "spill"}
+        if block_bytes is not None:
+            streaming["block_bytes"] = block_bytes
+        cfg = _config(streaming=streaming)
+        grid = _grid(cfg)
+        key = _shard_key()
+        dfs = _granule_dfs(grid, key, _CELL_LISTS[:2])
+        _run(monkeypatch, cfg, grid, key, dfs)
+        assert seen["block_bytes"] == block_bytes
+        if block_bytes is not None:
+            assert seen["resolved"] == block_bytes
+        else:
+            assert seen["resolved"] > 0  # disk-derived default, unchanged
+
     def test_spill_fold_state_carries_the_declared_delta(self):
         # Issue #424: the spill fold honors the field's declared δ (the 8,192
         # leaf budget), never the module default.
