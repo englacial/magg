@@ -47,7 +47,7 @@ aggregation:
                                # single-block regime; every reducer). Omit the block for
                                # the fully-pooled path; mode: merge folds incrementally
                                # (mergeable reducers only). Pairs with worker.extra_disk.
-                               # buffer_granules defaults to 50;
+                               # buffer_granules defaults to 20 (issue #474);
                                # block_bytes caps a spill block before it closes
                                # and folds (absent: disk-derived default).
   coordinates:
