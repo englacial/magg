@@ -211,6 +211,16 @@ class _CompanionBatch:
 
     def defer(self, fold: _ChannelFold, words: np.ndarray, starts, n: int) -> np.ndarray:
         starts = np.asarray(starts, dtype=np.int64)
+        # The concatenation is a valid segmented layout only if each deferral's
+        # partition starts at 0 (``_compress`` guarantees it). Neither fold would
+        # catch a violation — the exact-cover check still passes, the offending
+        # rows just fold into the previous entry's last centroid — so make the
+        # invariant load-bearing rather than documented (O(1) per deferral).
+        if len(starts) and starts[0] != 0:
+            raise ValueError(
+                f"deferred companion fold got starts[0]={int(starts[0])}; the cross-cell "
+                "batch requires each centroid partition to start at 0 (see _compress)"
+            )
         out = np.empty(len(starts), dtype=np.uint64)
         rows = self._rows.get(fold, 0)
         # The declared ``n`` rides along rather than being re-derived from
