@@ -300,17 +300,25 @@ def build_chunk_map(h5obj, path: str, *, evict_into: set | None = None) -> Chunk
     ever touched across the group, against the hundreds of MB the unevicted
     walks stranded. The absent-path ``KeyError`` below returns before the
     snapshot on purpose: nothing walk-touched exists yet, and its parse lines
-    are retained by the same choice.
+    are retained by the same choice. That retention is exact only on the
+    immediate path (single-threaded); the deferred path below drops some parse
+    lines too, so the GEDI figure above — measured through it at the default
+    ``read_workers`` — is if anything the lower residency of the two.
 
     ``evict_into`` defers that eviction for a caller whose builds run
     concurrently on one handle: pass a set and the walk's keys are *added* to
     it (a GIL-atomic ``set.update``) instead of popped, for the caller to
     evict once its fan-out has joined — see :func:`_evict_deferred_lines`.
-    Keys other threads' reads happen to add inside the same window are
-    over-attributed to the walk, which is harmless: they are still this
-    group's lines and are dropped only after the pool joins. The default
-    (``None``) evicts immediately, which is what every single-threaded caller
-    wants (``_prebuild_group_maps``, the full-coverage walk, direct use).
+    The window is a plain before/after key diff, so lines *other threads* add
+    inside it are swept in as well — measurably, including other datasets'
+    object-header parse lines (review finding on PR #462: 23 of 40 concurrent
+    rounds on the test fixture). Those lines re-fetch on next touch (one small
+    ranged read each), and that bounded cost is the deliberate price of a
+    race-free drain: the alternative — subtracting a floor of every build's
+    ``before`` snapshot — is extra machinery to protect what is a memory *win*.
+    The default (``None``) evicts immediately, which is what every
+    single-threaded caller wants (``_prebuild_group_maps``, the full-coverage
+    walk, direct use).
 
     Raises ``KeyError`` for an absent path (h5coro's ``metaOnly`` traversal
     never raises on its own — it just leaves default metadata) and
@@ -435,7 +443,12 @@ def _iter_datasets(h5obj):
     whole enumeration is served from the front-of-file metadata block h5coro
     already cached — one ranged GET, no chunk data (issue #190; the full walk
     stays inside the single ~4 MiB cache line the config's read already paid
-    for, measured on real ATL03). A node whose ``typeSize == 0`` is a group
+    for, measured on real ATL03). Since issue #460 that "already cached" is a
+    best case rather than a guarantee: each group's deferred drain may have
+    swept out object-header lines the read had cached (see ``evict_into`` in
+    :func:`build_chunk_map`), so on a sparse file this walk re-fetches some of
+    them — bounded extra ranged reads, still no chunk data. A node whose
+    ``typeSize == 0`` is a group
     (or a typeless link) and is descended; anything else is a dataset yielded
     with the ``H5Dataset`` its classification already parsed, so the caller
     can build its chunk map without re-parsing the object header. Each node's
