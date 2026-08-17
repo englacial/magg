@@ -393,6 +393,35 @@ class TestTocTimeIndex:
         _index, times = raster_time_index(granules)
         assert times.dtype == np.int64 and times[0] == np.int64(1_783_958_540_000_000)
 
+    def test_a_leading_span_puts_the_stored_words_out_of_row_order(self):
+        # The §8.1 divergence, on the production function: row order keys on
+        # the group's earliest ITEM datetime, but the word encodes the
+        # ENVELOPE start. A later row whose declared start_datetime precedes
+        # an earlier row's item datetime therefore encodes a SMALLER word --
+        # so the stored axis is materially unsorted and MUST NOT be bisected,
+        # while the row assignment stays identical to the legacy encoding.
+        granules = [
+            [
+                _entry("a", {"red": "x"}, T0, time_key="dt-1"),
+                _entry(
+                    "b",
+                    {"red": "y"},
+                    "2026-07-13T16:02:30+00:00",
+                    time_key="dt-2",
+                    time_start="2026-07-13T16:00:59+00:00",
+                    time_end="2026-07-13T16:02:40+00:00",
+                ),
+            ]
+        ]
+        index, words = raster_time_index(granules, encoding="toc")
+        # Row assignment is stable across encodings — the load-bearing claim.
+        assert index == raster_time_index(granules)[0] == {"dt-1": 0, "dt-2": 1}
+        # ...but the stored words descend, by the span's ~81 s lead.
+        assert words[1] < words[0]
+        assert not np.array_equal(np.sort(words), words)
+        lo, _hi = decode_time_axis(words, time_axis_attrs("toc"))
+        assert lo[1] <= np.datetime64("2026-07-13T16:00:59", "ns") < lo[0]
+
     def test_empty_toc_axis(self):
         index, words = raster_time_index([[]], encoding="toc")
         assert index == {} and words.dtype == np.uint64 and words.size == 0
