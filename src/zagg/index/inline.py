@@ -237,7 +237,9 @@ def build_chunk_map(h5obj, path: str) -> ChunkMap:
     try:
         return _chunk_map_from_dataset(h5obj, ds, path)
     finally:
-        _evict_new_cache_lines(h5obj, before)
+        evicted = _evict_new_cache_lines(h5obj, before)
+        if evicted:
+            logger.debug(f"  chunk map {path}: evicted {evicted} cache line(s) the walk touched")
 
 
 def _chunk_map_from_dataset(h5obj, ds, path: str) -> ChunkMap:
@@ -405,7 +407,11 @@ def full_granule_maps(h5obj, existing: dict[str, ChunkMap]) -> dict[str, ChunkMa
             # sinking the whole granule's write-back.
             logger.warning(f"  write-back: no chunk map for {path} ({exc}); skipping")
         finally:
-            _evict_new_cache_lines(h5obj, before)
+            evicted = _evict_new_cache_lines(h5obj, before)
+            if evicted:
+                logger.debug(
+                    f"  write-back map {path}: evicted {evicted} cache line(s) the walk touched"
+                )
     return maps
 
 

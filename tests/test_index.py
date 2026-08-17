@@ -676,6 +676,31 @@ class TestChunkMapCacheEviction:
         assert _cache_keys(object()) == set()
         assert _evict_new_cache_lines(object(), set()) == 0
 
+    def test_cache_stays_flat_across_repeated_builds(self):
+        # Issue #460 phase 3 guard: N successive build_chunk_map calls leave
+        # len(h5obj.cache) flat. The leak this pins against was ~a cache line
+        # per B-tree node per build, retained until granule close.
+        h5obj = _open_fixture_small_lines()
+        paths = ("/gt1l/heights/h_ph", "/gt1l/heights/lat_ph", "/gt1l/heights/signal_conf_ph")
+        for p in paths:  # first round warms the shared object-header lines
+            build_chunk_map(h5obj, p)
+        baseline = len(h5obj.cache)
+        for _ in range(5):
+            for p in paths:
+                build_chunk_map(h5obj, p)
+            assert len(h5obj.cache) == baseline
+
+    def test_lines_touched_logged_at_debug(self, caplog):
+        # Issue #460 phase 3: each map build reports the walk's cache-line
+        # footprint at DEBUG, so a pathological granule is visible in logs.
+        h5obj = _open_fixture_small_lines()
+        with caplog.at_level("DEBUG", logger="zagg.index.inline"):
+            build_chunk_map(h5obj, self.PATH)
+        assert any(
+            "cache line" in r.message and self.PATH in r.message and "evicted" in r.message
+            for r in caplog.records
+        )
+
 
 class TestInlineReadGroup:
     def _read_both(self, group, leaves, arrow=False):
