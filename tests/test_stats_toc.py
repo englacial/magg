@@ -77,7 +77,7 @@ class TestCellEnvelopes:
 
     def test_empty_group_raises(self):
         words = _toc_words(6)
-        with pytest.raises(ValueError, match="empty segment|empty"):
+        with pytest.raises(ValueError, match="empty segment"):
             cell_envelopes(words, np.array([0, 3, 3, 6], dtype=np.int64))
 
     def test_reserved_zero_refused(self):
