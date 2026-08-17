@@ -1045,9 +1045,37 @@ LOCATED_FIELDS_DECL = {
 }
 
 
-def _located_leaf_cfg():
+#: The same field carrying BOTH companion channels (espg ruling of 2026-08-17:
+#: temporal is per-centroid at every level, symmetric with located). This is the
+#: arity the ``channels=`` plumbing exists for — one field, two siblings folded
+#: through one k-way call.
+BOTH_CHANNEL_FIELDS_DECL = {
+    **LOCATED_FIELDS_DECL,
+    "h_tdigest": {**LOCATED_FIELDS_DECL["h_tdigest"], "temporal": "per-centroid"},
+}
+
+#: And the temporal channel ALONE, which is what a ``build_tdigest`` field with
+#: a clock and no ``location:`` declares.
+TIMED_FIELDS_DECL = {
+    **{k: v for k, v in FIELDS_DECL.items() if k != "h_tdigest"},
+    "h_tdigest": {**FIELDS_DECL["h_tdigest"], "temporal": "per-centroid"},
+}
+
+
+def _located_leaf_cfg(*, location=True, temporal=False):
     from zagg.config import PipelineConfig
 
+    digest = {
+        "kind": "ragged",
+        "function": "zagg.stats.tdigest.build_tdigest",
+        "inner_shape": [2],
+        "dtype": "float32",
+        "fill_value": 0,
+    }
+    if location:
+        digest["location"] = "leaf_id"
+    if temporal:
+        digest["temporal"] = "per-centroid"
     return PipelineConfig(
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
@@ -1055,33 +1083,33 @@ def _located_leaf_cfg():
                 "count": {"function": "len", "dtype": "int32", "fill_value": 0},
                 "h_min": {"function": "min", "dtype": "float32"},
                 "h_mean": {"function": "mean", "dtype": "float32"},
-                "h_tdigest": {
-                    "kind": "ragged",
-                    "function": "zagg.stats.tdigest.build_tdigest",
-                    "inner_shape": [2],
-                    "dtype": "float32",
-                    "fill_value": 0,
-                    "location": "leaf_id",
-                },
+                "h_tdigest": digest,
             },
         }
     )
 
 
-def _make_located_leaf(root, decimal, cells, *, window=None):
-    """A committed leaf carrying the payload AND its ``h_tdigest_locations``.
+def _make_located_leaf(root, decimal, cells, *, window=None, location=True, temporal=False):
+    """A committed leaf carrying the payload AND its declared companions.
 
     ``cells`` maps leaf row -> observation values; each cell's per-observation
     morton point words come from ``conftest.point_words``, seeded on the row so
-    two cells never share a word.
+    two cells never share a word, and its toc words from ``conftest.toc_words``
+    offset by the row so two cells never share an instant either.
+
+    Returns the per-row truth: the location words alone in the located-only
+    default (what every pre-#410 caller reads), and ``(locations, temporal)``
+    dicts whenever more than one channel is written.
     """
-    from conftest import point_words
+    from conftest import TOC_BASE, point_words, toc_words
     from mortie import generate_morton_children
 
     from zagg.grids.healpix import HealpixGrid
     from zagg.stats.tdigest import build_tdigest
 
-    grid = HealpixGrid(SHARD_ORDER, CELL_ORDER, config=_located_leaf_cfg())
+    grid = HealpixGrid(
+        SHARD_ORDER, CELL_ORDER, config=_located_leaf_cfg(location=location, temporal=temporal)
+    )
     word = morton_word(decimal)
     store = open_store(shard_leaf_path(str(root), word, window=window))
     grid.emit_shard_template(store, overwrite=True)
@@ -1093,24 +1121,42 @@ def _make_located_leaf(root, decimal, cells, *, window=None):
     h_mean = np.full(n, np.nan, np.float32)
     digest = np.full(n, b"", dtype=object)
     locs = np.full(n, b"", dtype=object)
-    truth = {}
+    times = np.full(n, b"", dtype=object)
+    truth: dict = {}
+    time_truth: dict = {}
     for i, obs in cells.items():
         obs = np.asarray(obs, dtype=np.float64)
-        words = point_words(len(obs), seed=1000 + i)
-        d, w = build_tdigest(obs, 64, locations=words)
+        kw = {}
+        if location:
+            kw["locations"] = point_words(len(obs), seed=1000 + i)
+        if temporal:
+            # Distinct base per row so no two cells' envelopes overlap.
+            base = str(np.datetime64(TOC_BASE, "ns") + np.timedelta64(3600 * (i + 1), "s"))
+            kw["temporal"] = toc_words(len(obs), base=base)
+        d, *words = build_tdigest(obs, 64, **kw)
         count[i] = len(obs)
         h_min[i] = obs.min()
         h_mean[i] = obs.mean()
         digest[i] = encode_digest(d, "float32")
-        locs[i] = encode_digest(w, "uint64")
-        truth[i] = words
+        emitted = dict(zip(kw, words, strict=True))
+        if location:
+            locs[i] = encode_digest(emitted["locations"], "uint64")
+            truth[i] = kw["locations"]
+        if temporal:
+            times[i] = encode_digest(emitted["temporal"], "uint64")
+            time_truth[i] = kw["temporal"]
     group["count"][:] = count
     group["h_min"][:] = h_min
     group["h_mean"][:] = h_mean
     group["h_tdigest"][:] = digest
-    group["h_tdigest_locations"][:] = locs
+    if location:
+        group["h_tdigest_locations"][:] = locs
+    if temporal:
+        group["h_tdigest_times"][:] = times
     stamp_commit(store, cells_with_data=len(cells), granule_count=1, window=window)
-    return truth
+    if location and temporal:
+        return truth, time_truth
+    return time_truth if temporal else truth
 
 
 def _contains_all(ancestor, members):
@@ -1265,6 +1311,163 @@ class TestLocatedOverviewFold:
         g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
         assert "h_tdigest_locations" not in g
         assert "locations" not in dict(g["h_tdigest"].attrs)["ragged"]
+
+
+def _toc_contains(envelope, members):
+    """True when ``envelope`` covers every member instant (spec §8.3).
+
+    The temporal analogue of :func:`_contains_all`: the grammar's join is
+    idempotent and monotone, so adding the members widens nothing exactly when
+    the envelope already covers them. Compared against the envelope joined with
+    itself for the same reason the located helper is — a singleton timestamp
+    word is not the same bit pattern as a range covering that instant.
+    """
+    from zagg.stats.toc import cell_envelope
+
+    e = np.uint64(envelope)
+    own = int(cell_envelope(np.asarray([e, e], dtype=np.uint64)))
+    return int(cell_envelope(np.asarray([e, *members], dtype=np.uint64))) == own
+
+
+class TestBothChannelsOverviewFold:
+    """Two channels on ONE field, folded through a single k-way call (#410).
+
+    The espg ruling of 2026-08-17 makes temporal per-centroid at every level,
+    symmetric with located, and the fold plumbing generalized from one
+    ``locations=`` kwarg to a ``channels=`` map to carry it. With a single
+    channel the return is a 2-tuple and every ordering question degenerates, so
+    nothing pinned the arity the map exists for. These fold BOTH siblings and
+    check each against its OWN grammar, which is what fails when a channel is
+    dropped, folded in a second pass, or swapped with its sibling — and the two
+    word grammars are mutually accepting, so a swap raises nowhere on its own
+    (review finding).
+    """
+
+    def _fold(self, tmp_path, cells, *, fields=None, decl=None):
+        _write_manifest(tmp_path, orders=(1,), fields=fields or BOTH_CHANNEL_FIELDS_DECL)
+        truth = _make_located_leaf(tmp_path, "-311", cells, **(decl or {"temporal": True}))
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["failed"] == 0
+        return truth, _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+
+    @staticmethod
+    def _row(g, j=0):
+        payload = decode_digest(bytes(g["h_tdigest"][:][j]), "float32")
+        locs = decode_digest(bytes(g["h_tdigest_locations"][:][j]), "uint64", ())
+        times = decode_digest(bytes(g["h_tdigest_times"][:][j]), "uint64", ())
+        return payload, locs, times
+
+    def test_both_siblings_are_emitted_row_aligned_and_declared(self, tmp_path):
+        from zagg.grids.base import located_declaration
+        from zagg.time_axis import temporal_declaration
+
+        _, g = self._fold(tmp_path, {0: [1.0, 2.0, 3.0], 1: [7.0]})
+        assert "h_tdigest_locations" in g and "h_tdigest_times" in g
+        payload, locs, times = self._row(g)
+        assert locs.dtype == times.dtype == np.uint64
+        assert locs.shape == times.shape == (payload.shape[0],), "§1.1 row alignment, both"
+        # Each sibling declares its OWN convention, and the payload binds both
+        # by name (§1.2) — never one block covering two channels.
+        assert located_declaration(dict(g["h_tdigest_locations"].attrs)) == {
+            "spec": "zagg-located/1",
+            "shape": "per-centroid",
+            "grammar": "mortie-morton/1",
+        }
+        assert temporal_declaration(dict(g["h_tdigest_times"].attrs)) == {
+            "spec": "zagg-toc/1",
+            "shape": "per-centroid",
+            "grammar": "mortie-toc/1",
+        }
+        attrs = dict(g["h_tdigest"].attrs)
+        assert attrs["ragged"]["locations"] == "h_tdigest_locations"
+        assert attrs["times"] == "h_tdigest_times"
+
+    # Leaf rows 0..3 all fold into overview cell 0, so ONE populated row takes
+    # ``fold_digests``' single-contributor arm — which bypasses the k-way merge,
+    # and is the majority case at the finest level — and two take the merge arm.
+    # Both must put the same word in the same slot.
+    @pytest.mark.parametrize("rows", [[0], [0, 1]], ids=["single-arm", "merge-arm"])
+    def test_singleton_centroids_round_trip_both_words_unswapped(self, tmp_path, rows):
+        # At delta=64 these observations merge nothing, so every centroid is a
+        # singleton and BOTH channels must reproduce their contributor's exact
+        # word. This is the decisive anti-swap pin: the toc slot holding the
+        # morton word (or vice versa) is a well-formed word in either grammar
+        # and raises nowhere, but it is not THIS word.
+        cells = {r: [1.0 + 8 * r, 2.0 + 8 * r] for r in rows}
+        (locs_truth, times_truth), g = self._fold(tmp_path, cells)
+        payload, locs, times = self._row(g)
+        assert (payload[:, 1] == 1.0).all(), "need singleton centroids"
+        # Values ascend across the rows, so the value-sorted centroids are row
+        # 0's, then row 1's.
+        np.testing.assert_array_equal(locs, np.concatenate([locs_truth[r] for r in rows]))
+        np.testing.assert_array_equal(times, np.concatenate([times_truth[r] for r in rows]))
+        assert not np.array_equal(locs, times)
+
+    def test_merged_centroids_contain_their_members_in_both_grammars(self, tmp_path):
+        # The real fold: 400 observations at delta=64 forces genuine merges, and
+        # each centroid's location must ENCLOSE its members (§9.1) while its toc
+        # word must COVER their instants (§8.3) — one partition, two claims.
+        (locs_truth, times_truth), g = self._fold(tmp_path, {0: list(np.arange(400.0))})
+        payload, locs, times = self._row(g)
+        assert (payload[:, 1] > 1.0).any(), "need merged centroids"
+        bounds = np.concatenate([[0], np.cumsum(payload[:, 1]).astype(np.int64)])
+        for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+            assert _contains_all(int(np.uint64(locs[i])), locs_truth[0][lo:hi])
+            assert _toc_contains(times[i], times_truth[0][lo:hi])
+        # And neither slot satisfies the OTHER channel's claim, which is what a
+        # swap would look like on bytes that pass every validator.
+        assert not _toc_contains(locs[0], times_truth[0][: int(payload[0, 1])])
+
+    def test_cascade_folds_both_siblings(self, tmp_path):
+        # The fold-of-folds path re-reads an overview's own companions; one that
+        # carried only the located channel forward would leave the temporal
+        # sibling describing the finer level's partition.
+        _write_manifest(
+            tmp_path,
+            orders=(1, 0),
+            fields=BOTH_CHANNEL_FIELDS_DECL,
+            fold_source="cascade",
+            exact_levels=1,
+        )
+        locs_truth, times_truth = _make_located_leaf(
+            tmp_path, "-311", {0: [1.0, 2.0], 5: [9.0]}, temporal=True
+        )
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["failed"] == 0
+        coarse = _overview_group(tmp_path, "-3", "all.zarr", 2)
+        payload, locs, times = self._row(coarse)
+        assert locs.shape == times.shape == (payload.shape[0],)
+        # Cell-level identity: the coarse envelope over the column equals the
+        # envelope over every leaf instant that reached it, whatever partition
+        # the two folds passed through (spec §8.3).
+        from mortie import common_ancestor
+
+        from zagg.stats.toc import cell_envelope
+
+        members_t = np.concatenate([times_truth[0], times_truth[5]])
+        members_l = np.concatenate([locs_truth[0], locs_truth[5]])
+        assert int(cell_envelope(times)) == int(cell_envelope(members_t))
+        assert int(common_ancestor(np.asarray(locs, dtype=np.uint64))) == int(
+            common_ancestor(np.asarray(members_l, dtype=np.uint64))
+        )
+
+    def test_temporal_alone_folds_through_the_pyramid(self, tmp_path):
+        # A ``build_tdigest`` field with a clock and no ``location:``. Every
+        # other temporal test carries a location too, so nothing pinned the
+        # one-channel temporal shape on its own (review finding).
+        times_truth, g = self._fold(
+            tmp_path,
+            {0: list(np.arange(400.0))},
+            fields=TIMED_FIELDS_DECL,
+            decl={"location": False, "temporal": True},
+        )
+        assert "h_tdigest_locations" not in g
+        payload = decode_digest(bytes(g["h_tdigest"][:][0]), "float32")
+        times = decode_digest(bytes(g["h_tdigest_times"][:][0]), "uint64", ())
+        assert times.shape == (payload.shape[0],)
+        bounds = np.concatenate([[0], np.cumsum(payload[:, 1]).astype(np.int64)])
+        for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+            assert _toc_contains(times[i], times_truth[0][lo:hi])
 
 
 class TestLocatedDeclarationGate:
