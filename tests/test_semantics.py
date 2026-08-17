@@ -327,3 +327,90 @@ class TestTimeEncodingHashing:
     def test_packaged_s2_config_declares_toc(self):
         cfg = default_config("sentinel2_l2a")
         assert semantic_core(cfg)["time_encoding"] == "toc"
+
+
+class TestTimeSourceHashing:
+    """Issue #410: the per-observation clock is output-defining.
+
+    A temporal companion's stored toc words ARE the declared column converted
+    from the declared epoch on the declared scale, so ``output.time_source`` is
+    output-defining in the strongest sense — more directly than
+    ``time_encoding``, which only changes how one axis is spelled.
+    """
+
+    def _cfg(self, temporal=None, clock=None, windowing=None) -> PipelineConfig:
+        meta = {
+            "kind": "ragged",
+            "function": "zagg.stats.tdigest.build_tdigest",
+            "inner_shape": [2],
+            "dtype": "float32",
+            "source": "h_ph",
+        }
+        if temporal:
+            meta["temporal"] = temporal
+        output: dict = {"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}}
+        if clock:
+            output["time_source"] = clock
+        if windowing:
+            output["windowing"] = windowing
+        return PipelineConfig(
+            data_source={"variables": {"h_ph": "/h_ph", "delta_time": "/delta_time"}},
+            aggregation={"coordinates": {}, "variables": {"h_tdigest": meta}},
+            output=output,
+        )
+
+    CLOCK = {
+        "field": "delta_time",
+        "epoch": "2018-01-01T00:00:00",
+        "scale": "gps",
+        "units": "seconds",
+    }
+
+    def test_a_clock_no_field_consumes_does_not_move_the_hash(self):
+        # Declaring a clock that nothing reads moves no store byte, so it must
+        # not move the product identity either — the same absent-key discipline
+        # `time_encoding: microseconds` gets.
+        assert semantic_hash(self._cfg(clock=self.CLOCK)) == semantic_hash(self._cfg())
+        assert "time_source" not in semantic_core(self._cfg(clock=self.CLOCK))
+
+    def test_the_clock_is_semantic_once_a_companion_declares(self):
+        declared = self._cfg("per-centroid", self.CLOCK)
+        assert semantic_core(declared)["time_source"] == self.CLOCK
+        assert semantic_hash(declared) != semantic_hash(self._cfg("per-centroid"))
+
+    def test_a_different_epoch_is_a_different_product(self):
+        # The failure this exists to refuse: a re-run under a corrected epoch
+        # writes different words for the same observations, so it must not reuse
+        # the identity of the store it contradicts.
+        moved = dict(self.CLOCK, epoch="2019-01-01T00:00:00")
+        assert semantic_hash(self._cfg("per-centroid", moved)) != semantic_hash(
+            self._cfg("per-centroid", self.CLOCK)
+        )
+
+    def test_scale_and_units_are_semantic_too(self):
+        base = semantic_hash(self._cfg("per-centroid", self.CLOCK))
+        for changed in (dict(self.CLOCK, scale="tai"), dict(self.CLOCK, units="days")):
+            assert semantic_hash(self._cfg("per-centroid", changed)) != base
+
+    def test_recorded_resolved_so_the_windowing_fallback_is_one_product(self):
+        # `toc_source` falls back to a continuous-scale `output.windowing`, so
+        # the explicit block and the fallback are two spellings of ONE clock and
+        # must hash identically. Recording the RESOLVED value is what makes that
+        # true rather than accidental.
+        windowed = self._cfg(
+            "per-centroid",
+            windowing={
+                "schedule": "yearly",
+                "time_field": "delta_time",
+                "epoch": "2018-01-01T00:00:00",
+                "scale": "gps",
+            },
+        )
+        assert semantic_core(windowed)["time_source"]["field"] == "delta_time"
+        assert semantic_core(windowed)["time_source"]["scale"] == "gps"
+
+    def test_pre_410_configs_hash_unchanged(self):
+        # Every packaged config predates #410 and declares no companion, so none
+        # of them may gain the key.
+        for name in ("atl06", "atl03_tdigest_healpix", "atl03_tdigest_located_healpix"):
+            assert "time_source" not in semantic_core(default_config(name))
