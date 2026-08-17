@@ -664,32 +664,61 @@ def _sibling_record_mask(
                 f"granule carries no open sibling handle for asset {asset!r}; "
                 f"was the shard map built with the paired-asset join?"
             )
-        join = cfg["join"]
-        left_path = join["left"].format(group=group)
-        right_path = join["right"].format(group=group)
-        left_keys = np.asarray(read_full([left_path])[left_path])
-        sib_paths = [right_path] + [f["dataset"].format(group=group) for f in filters]
-        sib_data = sibling.readDatasets(list(dict.fromkeys(sib_paths)))
-        right_keys = np.asarray(sib_data[right_path])
-        if len(left_keys) != n_records:
-            raise ValueError(
-                f"assets.{asset}.join.left has {len(left_keys)} records; the "
-                f"coordinates level has {n_records}"
-            )
-        # Key-value join: position of each left key in the sibling's rows.
-        order = np.argsort(right_keys, kind="stable")
-        sorted_keys = right_keys[order]
-        pos = np.searchsorted(sorted_keys, left_keys, side="left")
-        pos_clip = np.minimum(pos, len(sorted_keys) - 1) if len(sorted_keys) else pos
-        matched = (
-            (sorted_keys[pos_clip] == left_keys)
-            if len(sorted_keys)
-            else np.zeros(n_records, dtype=bool)
+        dataset_paths = [f["dataset"].format(group=group) for f in filters]
+        values_by_path, matched = _sibling_joined_values(
+            sibling, group, asset, cfg, n_records, dataset_paths, read_full
         )
-        sib_idx = order[pos_clip] if len(sorted_keys) else np.zeros(n_records, dtype=np.int64)
         asset_mask = matched.copy()
         for f in filters:
-            flag = np.asarray(sib_data[f["dataset"].format(group=group)])[sib_idx]
-            asset_mask &= _predicate_mask(flag, f)
+            asset_mask &= _predicate_mask(values_by_path[f["dataset"].format(group=group)], f)
         mask &= asset_mask
     return mask
+
+
+def _sibling_joined_values(
+    sibling,
+    group: str,
+    asset: str,
+    cfg: dict,
+    n_records: int,
+    dataset_paths: list[str],
+    read_full,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Sibling-asset datasets joined to the primary's record order (the key join).
+
+    The record-rate join factored out of :func:`_sibling_record_mask` (issue
+    #464): reads the ``join`` block's key dataset on both sides plus
+    ``dataset_paths`` from the sibling handle (all per-record rate, small),
+    matches records by key value, and returns ``(values_by_path, matched)`` —
+    row ``i`` of each gathered array is the sibling's value for primary record
+    ``i``, and ``matched[i]`` says whether that record has a sibling row at
+    all. An unmatched row's value is a clamped-gather placeholder, so every
+    consumer must apply its own missing-row policy against ``matched``: asset
+    filters fail the record closed (:func:`_sibling_record_mask`); asset
+    variables NaN it.
+    """
+    join = cfg["join"]
+    left_path = join["left"].format(group=group)
+    right_path = join["right"].format(group=group)
+    left_keys = np.asarray(read_full([left_path])[left_path])
+    sib_paths = [right_path] + list(dataset_paths)
+    sib_data = sibling.readDatasets(list(dict.fromkeys(sib_paths)))
+    right_keys = np.asarray(sib_data[right_path])
+    if len(left_keys) != n_records:
+        raise ValueError(
+            f"assets.{asset}.join.left has {len(left_keys)} records; the "
+            f"coordinates level has {n_records}"
+        )
+    # Key-value join: position of each left key in the sibling's rows.
+    order = np.argsort(right_keys, kind="stable")
+    sorted_keys = right_keys[order]
+    pos = np.searchsorted(sorted_keys, left_keys, side="left")
+    pos_clip = np.minimum(pos, len(sorted_keys) - 1) if len(sorted_keys) else pos
+    matched = (
+        (sorted_keys[pos_clip] == left_keys)
+        if len(sorted_keys)
+        else np.zeros(n_records, dtype=bool)
+    )
+    sib_idx = order[pos_clip] if len(sorted_keys) else np.zeros(n_records, dtype=np.int64)
+    values_by_path = {p: np.asarray(sib_data[p])[sib_idx] for p in dict.fromkeys(dataset_paths)}
+    return values_by_path, matched
