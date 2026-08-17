@@ -552,10 +552,32 @@ def _vlen_read_group(
             )
         cross_planned = expanded if cross_planned is None else (cross_planned & expanded)
 
-    if asset_filters:
-        record_mask = _sibling_record_mask(
-            h5obj, group, data_source, asset_filters, len(coarse_lats), siblings, _read_full
+    # One record-key join per sibling asset, shared by the predicate arm here and
+    # the variable arm below (issue #464 review): the shipped GEDI template hangs
+    # both a saturation filter and the DEM variable off its ``l2a`` asset, and a
+    # join per consumer would pay two primary key reads, two sibling
+    # ``readDatasets`` and two argsorts per group per granule — ``_read_full`` has
+    # no cache, so that is real I/O.
+    asset_var_paths: dict[str, dict[str, str]] = {}
+    for name, entry in asset_variable_specs(data_source).items():
+        asset_var_paths.setdefault(entry["asset"], {})[name] = entry["path"].format(group=group)
+    asset_joins = (
+        _sibling_joins(
+            h5obj,
+            group,
+            data_source,
+            asset_filters,
+            asset_var_paths,
+            len(coarse_lats),
+            siblings,
+            _read_full,
         )
+        if asset_filters or asset_var_paths
+        else {}
+    )
+
+    if asset_filters:
+        record_mask = _sibling_record_mask(group, asset_filters, len(coarse_lats), asset_joins)
         # The sibling join is keyed to the coordinates level, whose per-row owner
         # the gather map already carries.
         expanded = record_mask[parent_safe] & valid
@@ -612,38 +634,26 @@ def _vlen_read_group(
     # sibling handle degrades to all-NaN columns with one warning per granule
     # (asset FILTERS above keep their fail-closed semantics).
     asset_cols: dict[str, np.ndarray] = {}
-    asset_vars = asset_variable_specs(data_source)
-    if asset_vars:
-        by_asset_vars: dict[str, dict[str, str]] = {}
-        for name, entry in asset_vars.items():
-            by_asset_vars.setdefault(entry["asset"], {})[name] = entry["path"].format(group=group)
-        for asset, name_paths in by_asset_vars.items():
-            sibling = (siblings or {}).get(asset)
-            if sibling is None:
-                _warn_missing_sibling_once(h5obj, asset, sorted(name_paths))
-                record_vals = {
-                    name: np.full(len(coarse_lats), np.nan, dtype=np.float64) for name in name_paths
-                }
-            else:
-                values_by_path, matched = _sibling_joined_values(
-                    sibling,
-                    group,
-                    asset,
-                    data_source["assets"][asset],
-                    len(coarse_lats),
-                    list(name_paths.values()),
-                    _read_full,
-                )
-                record_vals = {}
-                for name, path in name_paths.items():
-                    # Always float64: the unmatched-row NaN (and the missing-
-                    # sibling arm above) need a float column either way.
-                    vals = _select_column(np.asarray(values_by_path[path]), None, name)
-                    vals = vals.astype(np.float64)
-                    vals[~matched] = np.nan
-                    record_vals[name] = vals
-            for name, vals in record_vals.items():
-                asset_cols[name] = _gather_segment_at_parents(vals, parent_safe, valid)
+    for asset, name_paths in asset_var_paths.items():
+        join = asset_joins.get(asset)
+        if join is None:
+            # Absent from the joins means no open sibling handle for this
+            # granule; the one-per-granule warning was logged there.
+            record_vals = {
+                name: np.full(len(coarse_lats), np.nan, dtype=np.float64) for name in name_paths
+            }
+        else:
+            values_by_path, matched = join
+            record_vals = {}
+            for name, path in name_paths.items():
+                # Always float64: the unmatched-row NaN (and the missing-
+                # sibling arm above) need a float column either way.
+                vals = _select_column(np.asarray(values_by_path[path]), None, name)
+                vals = vals.astype(np.float64)
+                vals[~matched] = np.nan
+                record_vals[name] = vals
+        for name, vals in record_vals.items():
+            asset_cols[name] = _gather_segment_at_parents(vals, parent_safe, valid)
 
     # ---- Assemble columns: gathered variables, synthesized, broadcasts, leaf.
     data_dict: dict[str, np.ndarray] = {}
@@ -698,47 +708,84 @@ def _vlen_read_group(
     return pd.DataFrame(data_dict)
 
 
-def _sibling_record_mask(
+def _sibling_joins(
     h5obj,
     group: str,
     data_source: dict,
     asset_filters: list[dict],
+    asset_var_paths: dict[str, dict[str, str]],
     n_records: int,
     siblings: dict | None,
     read_full,
-) -> np.ndarray:
-    """Per-record keep-mask from sibling-asset predicates (the L2A join).
+) -> dict[str, tuple[dict[str, np.ndarray], np.ndarray]]:
+    """One record-key join per sibling asset, covering every consumer's datasets.
 
     Each declared sibling asset (``data_source.assets``) carries a ``join``
     block naming the record-level key dataset on both sides (GEDI:
-    ``shot_number`` on L1B and L2A). The sibling's key and filter datasets are
-    read fully (per-record rate, small), records are matched by key value, and
-    each predicate evaluates on the matched sibling rows. A record with no
-    sibling match fails every predicate on that asset — an unfilterable record
-    must not pass a quality gate silently (the pairless-granule posture of the
-    shardmap build, applied per record).
+    ``shot_number`` on L1B and L2A). This collects the UNION of the datasets
+    that asset's consumers need — the predicates' ``dataset`` paths plus the
+    asset variables' ``path`` values — and joins once
+    (:func:`_sibling_joined_values`), so an asset used by both arms pays one key
+    read, one sibling read and one argsort instead of two (issue #464 review).
+
+    Returns ``{asset: (values_by_path, matched)}``. An asset the granule carries
+    no open handle for is ABSENT from the result: a VARIABLE-only asset degrades
+    to NaN columns with one warning per granule
+    (:func:`_warn_missing_sibling_once`), while an asset carrying a filter raises
+    instead — an unfilterable record must not pass a quality gate silently (the
+    pairless-granule posture of the shardmap build, applied per record). So every
+    filter asset is guaranteed present for :func:`_sibling_record_mask`.
     """
     assets_cfg = data_source.get("assets")
     if not isinstance(assets_cfg, dict):
-        raise ValueError("asset filters require a data_source.assets block")
+        raise ValueError("asset filters and asset variables require a data_source.assets block")
+    paths_by_asset: dict[str, list[str]] = {}
+    for f in asset_filters:
+        paths_by_asset.setdefault(f["asset"], []).append(f["dataset"].format(group=group))
+    for asset, name_paths in asset_var_paths.items():
+        paths_by_asset.setdefault(asset, []).extend(name_paths.values())
+    filter_assets = {f["asset"] for f in asset_filters}
+    joins: dict[str, tuple[dict[str, np.ndarray], np.ndarray]] = {}
+    for asset, paths in paths_by_asset.items():
+        cfg = assets_cfg.get(asset)
+        if cfg is None:
+            raise ValueError(f"asset {asset!r} is not declared in data_source.assets")
+        sibling = (siblings or {}).get(asset)
+        if sibling is None:
+            if asset in filter_assets:
+                raise ValueError(
+                    f"granule carries no open sibling handle for asset {asset!r}; "
+                    f"was the shard map built with the paired-asset join?"
+                )
+            _warn_missing_sibling_once(h5obj, asset, sorted(asset_var_paths.get(asset, {})))
+            continue
+        joins[asset] = _sibling_joined_values(
+            sibling, group, asset, cfg, n_records, paths, read_full
+        )
+    return joins
+
+
+def _sibling_record_mask(
+    group: str,
+    asset_filters: list[dict],
+    n_records: int,
+    joins: dict[str, tuple[dict[str, np.ndarray], np.ndarray]],
+) -> np.ndarray:
+    """Per-record keep-mask from sibling-asset predicates (the L2A join).
+
+    Evaluates each predicate on the joined sibling values ``_sibling_joins``
+    already gathered for this asset (the join is shared with the asset-variable
+    arm, issue #464 review). A record with no sibling match fails every
+    predicate on that asset — an unfilterable record must not pass a quality
+    gate silently — and an asset carrying a filter is guaranteed to be in
+    ``joins``: :func:`_sibling_joins` raises rather than omit one.
+    """
     mask = np.ones(n_records, dtype=bool)
     by_asset: dict[str, list[dict]] = {}
     for f in asset_filters:
         by_asset.setdefault(f["asset"], []).append(f)
     for asset, filters in by_asset.items():
-        cfg = assets_cfg.get(asset)
-        if cfg is None:
-            raise ValueError(f"filter asset {asset!r} is not declared in data_source.assets")
-        sibling = (siblings or {}).get(asset)
-        if sibling is None:
-            raise ValueError(
-                f"granule carries no open sibling handle for asset {asset!r}; "
-                f"was the shard map built with the paired-asset join?"
-            )
-        dataset_paths = [f["dataset"].format(group=group) for f in filters]
-        values_by_path, matched = _sibling_joined_values(
-            sibling, group, asset, cfg, n_records, dataset_paths, read_full
-        )
+        values_by_path, matched = joins[asset]
         asset_mask = matched.copy()
         for f in filters:
             asset_mask &= _predicate_mask(values_by_path[f["dataset"].format(group=group)], f)
@@ -757,7 +804,7 @@ def _sibling_joined_values(
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
     """Sibling-asset datasets joined to the primary's record order (the key join).
 
-    The record-rate join factored out of :func:`_sibling_record_mask` (issue
+    The record-rate join one :func:`_sibling_joins` call runs per asset (issue
     #464): reads the ``join`` block's key dataset on both sides plus
     ``dataset_paths`` from the sibling handle (all per-record rate, small),
     matches records by key value, and returns ``(values_by_path, matched)`` —

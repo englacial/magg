@@ -524,6 +524,51 @@ class TestSiblingAssetJoin:
         assert sorted(set(df["shot_number"].tolist())) == [101, 104]
         assert len(df) == 9
 
+    def test_variable_only_asset_without_sibling_nans_and_warns(self, caplog):
+        # No filter rides this asset, so the missing handle is recoverable: the
+        # column degrades to NaN with one warning per granule (a FILTER on the
+        # same asset raises instead — test_missing_sibling_handle_raises).
+        with caplog.at_level("WARNING", logger="zagg.processing.read_vlen"):
+            df = _read_group(_FakeH5(_l1b_arrays()), "BEAM0000", _l2a_var_ds(), 0, _OneShardGrid())
+        assert np.isnan(df["sensitivity"].to_numpy()).all()
+        assert sum("no open sibling handle" in r.getMessage() for r in caplog.records) == 1
+
+    def test_one_join_per_asset_serves_both_arms(self, monkeypatch):
+        # The shipped GEDI shape: one asset feeding BOTH a filter and a variable.
+        # The route joins once over the union of their datasets (issue #464
+        # review) — a join per consumer would pay a second primary key read, a
+        # second sibling read and a second argsort per group per granule.
+        from zagg.processing import read_vlen
+
+        calls = []
+        real_join = read_vlen._sibling_joined_values
+
+        def _spy(sibling, group, asset, cfg, n_records, dataset_paths, read_full):
+            calls.append((asset, list(dataset_paths)))
+            return real_join(sibling, group, asset, cfg, n_records, dataset_paths, read_full)
+
+        monkeypatch.setattr(read_vlen, "_sibling_joined_values", _spy)
+        sib = _FakeH5(_l2a_arrays())
+        sib_reads = []
+        real_read = sib.readDatasets
+        monkeypatch.setattr(
+            sib,
+            "readDatasets",
+            lambda datasets: (sib_reads.append(list(datasets)), real_read(datasets))[1],
+        )
+        ds = _l2a_var_ds(
+            filters=[{"asset": "l2a", "dataset": "/{group}/quality_flag", "op": "ge", "value": 0}]
+        )
+        df = _read_group(
+            _FakeH5(_l1b_arrays()), "BEAM0000", ds, 0, _OneShardGrid(), siblings={"l2a": sib}
+        )
+        assert len(calls) == 1
+        assert set(calls[0][1]) == {"/BEAM0000/quality_flag", "/BEAM0000/sensitivity"}
+        assert len(sib_reads) == 1
+        # Both arms still get their answer off that single join.
+        assert 103 not in df["shot_number"].tolist()
+        assert np.allclose(df["sensitivity"].to_numpy()[df["shot_number"].to_numpy() == 101], 0.95)
+
     def test_asset_variable_nans_the_unmatched_record(self):
         # The variable arm's missing-row policy (issue #464 phase 2): shot 103
         # has no L2A row, so its samples carry NaN rather than a neighbor's
