@@ -320,12 +320,14 @@ with the payload:
   encoding (mortie spec §4), never by the payload's weights — under a
   `"flux"` payload (§2.0) `sum(weights)` is not a member count, so weight
   identifies nothing:
-  - a **point word** (order-29 by mortie's grammar) is an exact observation
-    position;
-  - an **area word** is the finest morton cell containing every observation
-    beneath it — whether it entered that way (an observation located only
-    to a cell: a footprint, a pre-aggregated input) or arose from a fold.
-- An observation whose position is exact enters as its point word; one
+  - a **point word** (order-29 by mortie's grammar) is the observation's
+    reported position, carrying **no area claim** — not an assertion that
+    the observation is dimensionless;
+  - an **area word** is a cell known to contain every observation beneath
+    it — whether it entered that way (an observation whose *only* known
+    location is a cell: a pre-gridded or pre-aggregated input) or arose
+    from a fold.
+- An observation located to a position enters as its point word; one
   resolved only to a cell enters as that cell's area word — positions never
   narrowed into points, the discipline §8.1 states for time, spatially.
   (Zagg's own writers ingest point instruments as order-29 point words,
