@@ -1594,11 +1594,26 @@ outward-rounded, conservative **range**, on a continuous, leap-free,
 GPS-aligned timescale with a fixed `1850-01-01T00:00:00` epoch. The bit
 layout, the flag position, the unsigned sort order, and the semilattice
 merge law are normative in mortie's
-[`mortie.toc` reference](https://espg.github.io/mortie/api/toc/) and its
-decision ledger ([espg/mortie#175](https://github.com/espg/mortie/issues/175)),
-and are **not restated here** — exactly as §2.2 defers the morton word's
-layout to mortie's specification §1/§4. What follows is zagg's half of the
-contract.
+[`mortie.toc` reference](https://espg.github.io/mortie/0.9.6/api/toc/) and
+its decision ledger
+([espg/mortie#175](https://github.com/espg/mortie/issues/175)), and are
+**not restated here**. What follows is zagg's half of the contract.
+
+The citation is **release-pinned deliberately**. Mortie's documentation is
+`mike`-versioned and the unversioned `/api/toc/` path was never published, so
+only a versioned URL resolves; the pin is `0.9.6`, the earliest release
+carrying the reference, and the page's normative words are unchanged through
+the current dependency floor.
+
+**It is also not yet the same class of citation as §2.2's**, and §8 does not
+claim it is. §2.2 defers the morton word's layout to mortie's
+`docs/specification.md` §1/§4 — sections that document's §10 *"Frozen for
+1.x"* enumerates as immutable within the major version. Mortie's frozen
+specification contains **no toc section**: the grammar above is normative as
+a module reference pinned by mortie's own golden fixtures, which is a weaker
+guarantee. [espg/mortie#193](https://github.com/espg/mortie/issues/193)
+tracks adding the frozen section; when it lands, this citation swaps to it
+and nothing else in §8 changes.
 
 ### 8.1 `shape: "axis"`
 
