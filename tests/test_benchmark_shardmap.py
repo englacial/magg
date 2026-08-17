@@ -384,6 +384,61 @@ def test_repin_targets_write_back_is_anchored_on_the_key():
     assert maps["child"] == json.loads(text)["shardmaps"]["child"]
 
 
+def test_repin_orders_by_nesting_depth():
+    """Depth, not a parent/child boolean -- a grandchild must follow its parent."""
+    driver = _driver()
+    known = {"a": {}, "b": {"nested_in": "a"}, "c": {"nested_in": "b"}}
+
+    assert [driver.nesting_depth(known, k) for k in ("a", "b", "c")] == [0, 1, 2]
+    assert sorted("cab", key=lambda k: driver.nesting_depth(known, k)) == ["a", "b", "c"]
+    with pytest.raises(ValueError, match="cycle"):
+        driver.nesting_depth({"x": {"nested_in": "y"}, "y": {"nested_in": "x"}}, "x")
+
+
+def test_repin_writes_parents_before_children(monkeypatch, tmp_path):
+    """``main()``'s write path, and the ordering claim it rests on.
+
+    A ``nested_in`` child extracts against its parent's pin as it stands on
+    disk (issue #148), so a child re-pinned FIRST would be extracted against
+    the parent's stale shard and commit a wrong fixture -- one the drift
+    guard's +/-1 count tolerance need not catch. ``repin`` is stubbed, so this
+    pins the ordering and the write-back without two shard-map builds.
+    """
+    driver = _driver()
+    bench = tmp_path / "benchmark"
+    (bench / "shardmaps").mkdir(parents=True)
+    (bench / "targets.json").write_text((BENCH / "targets.json").read_text())
+    monkeypatch.setattr(driver, "BENCH", bench)
+    monkeypatch.setattr(driver, "TARGETS", bench / "targets.json")
+
+    class _Stub:
+        metadata: dict = {}
+
+        def to_json(self, path):
+            Path(path).write_text("{}")
+
+    seen = []
+
+    def fake_repin(sm_key):
+        # record the parent pin VISIBLE ON DISK as this entry is re-pinned
+        seen.append((sm_key, int(driver.entry("healpix_o9_88s")["shard_key"])))
+        return _Stub(), 4242 if sm_key == "healpix_o9_88s" else 99, 7
+
+    monkeypatch.setattr(driver, "repin", fake_repin)
+    monkeypatch.setattr(driver, "differences", lambda sm_key, mapped: [])
+
+    assert driver.main(["healpix_o10_88s", "healpix_o9_88s"]) == 0
+
+    assert [k for k, _ in seen] == ["healpix_o9_88s", "healpix_o10_88s"]
+    # the child was extracted against the parent's NEW pin, not the run's start state
+    assert seen[1][1] == 4242
+    maps = json.loads((bench / "targets.json").read_text())["shardmaps"]
+    assert (maps["healpix_o9_88s"]["shard_key"], maps["healpix_o9_88s"]["n_granules"]) == (4242, 7)
+    assert (maps["healpix_o10_88s"]["shard_key"], maps["healpix_o10_88s"]["n_granules"]) == (99, 7)
+    # ...and the prose the driver refuses to write is still the committed prose
+    assert maps["healpix_o10_88s"]["note"] == MANIFEST["shardmaps"]["healpix_o10_88s"]["note"]
+
+
 def test_repin_refuses_an_unknown_shardmap(capsys):
     driver = _driver()
     with pytest.raises(SystemExit):

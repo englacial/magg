@@ -204,6 +204,24 @@ def update_targets(text: str, sm_key: str, key: int, n: int) -> str:
     return text[:entry_at] + entry + text[entry_end:]
 
 
+def nesting_depth(known: dict, sm_key: str) -> int:
+    """How many ``nested_in`` hops separate an entry from an unnested ancestor.
+
+    Re-pin order keys on this depth rather than on a parent/child boolean: a
+    grandchild (an o11 nested in an o10 nested in an o9 — the nested-pin design
+    of issue #148 does not forbid it) sorts EQUAL to its own parent under a
+    boolean, leaving whatever order the command line happened to give, which
+    can be the wrong one.
+    """
+    seen: list[str] = []
+    while known[sm_key].get("nested_in"):
+        seen.append(sm_key)
+        sm_key = known[sm_key]["nested_in"]
+        if sm_key in seen:
+            raise ValueError(f"targets.json nested_in cycle at {sm_key!r}")
+    return len(seen)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -222,9 +240,11 @@ def main(argv=None) -> int:
     unknown = sorted(set(args.shardmaps) - set(known))
     if unknown:
         parser.error(f"unknown shard map(s) {unknown} (known: {sorted(known)})")
-    # A nested entry extracts against its parent's pin, so re-pin parents first
-    # even when the command line names them the other way round.
-    for sm_key in sorted(args.shardmaps, key=lambda k: bool(known[k].get("nested_in"))):
+    # A nested entry extracts against its parent's pin as it stands on disk, so
+    # re-pin shallowest-first even when the command line names them the other
+    # way round -- a child re-pinned before its parent would extract against
+    # the STALE parent shard and commit a wrong fixture.
+    for sm_key in sorted(args.shardmaps, key=lambda k: nesting_depth(known, k)):
         mapped, key, n = repin(sm_key)
         print(f"{sm_key}: pin {key} at {n} granules")
         for line in differences(sm_key, mapped) or ["identical to the committed map"]:
