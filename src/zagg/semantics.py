@@ -16,9 +16,10 @@ Included (the semantic core):
   read and how observations are filtered (``filters``/``quality_filter``,
   photon ``base_level``/``levels``, raster ``bands``/``nodata``/
   ``collections``/``static_data``) — minus the read machinery, the credential
-  mechanism and fan-out sizing (``reader``, ``driver``, ``read_plan``,
-  ``anonymous``, ``credentials_provider``,
-  ``shard_workers``/``granule_workers``);
+  mechanism, the byte-movement bounds and fan-out sizing (``reader``,
+  ``driver``, ``read_plan``, ``anonymous``, ``credentials_provider``,
+  ``source_region``, ``shard_workers``/``granule_workers``, ``read_workers``,
+  ``write_buffer``);
 - the grid **type + indexing scheme** (D19: cell order is a resolution axis
   (D24), parent/shard order and chunking are packaging — hashing the whole
   template would have made o8 and o9 runs different products and blocked
@@ -49,9 +50,14 @@ block mixed-order processing), store layout/path/name, ``coverage_moc`` and
 (a derived finalize blob), the whole ``pyramid`` block (D11 keeps it out of
 the manifest's frozen keys because the §7 sweep populates it; the leaf column
 it declares is verified by READING the artifact instead — see
-:data:`OUTPUT_LEAF_SHAPING_KEYS`), worker sizing, streaming mode, read knobs,
-the credential mechanism (``credentials_provider``/``anonymous`` select how
-source bytes are fetched, never what is computed — espg-ruled 2026-08-17),
+:data:`OUTPUT_LEAF_SHAPING_KEYS`), ``emit_cell_ids`` (the issue #304 D16
+transition hatch — leaf-shaping, but scheduled for removal, so hashing it
+would strand stores whose digest no legal config reproduces; see
+:data:`GRID_LEAF_SHAPING_KEYS`), worker sizing, streaming mode, read knobs,
+the credential mechanism and the byte-movement knobs
+(``credentials_provider``/``anonymous``/``source_region``/``read_workers``/
+``write_buffer`` select how source bytes are fetched or moved, never what is
+computed — espg-ruled 2026-08-17),
 catalog/bounds (run inputs, recorded per-run — catalog identity lives in the
 D20 sidecar, never the product identity), and the per-variable
 ``overview_delta`` (issue #424 — the pyramid-fold budget shapes overview
@@ -132,23 +138,48 @@ from zagg.time_axis import DEFAULT_TIME_ENCODING
 #: (the ``lpdaac`` line lands with the GEDI template, PR #450), so this costs
 #: nothing now and cannot be taken back cheaply later.
 #:
-#: Unruled, and therefore **still hashed**: ``read_workers`` (the third
-#: fan-out width beside the two spellings above), ``source_region`` (the
-#: raster source-store kwarg that sits in the same dict literal as
-#: ``anonymous``) and ``write_buffer``
-#: (the live-slab bound on the streamed raster sink) all read as the same
-#: fetch-mechanism class as the entries here. Excluding a key is a ruling, not
-#: an assumption — the same footing ``shard_workers`` was flagged on above —
-#: so they are raised on the epoch PR rather than added, and every one of them
-#: still moves ``semantic_hash`` today.
+#: ``read_workers``, ``write_buffer`` and ``source_region`` joined at the same
+#: epoch, **espg-ruled 2026-08-17** (PR #420 question (2)(c)): each selects how
+#: bytes are fetched or moved, never what is computed from them — the same D19
+#: class as ``credentials_provider``, and it passes the same three-part test.
+#:
+#: * *Mechanism, not computation.* ``read_workers`` (issue #170) is the third
+#:   fan-out width beside the two spellings above — the read budget is sized as
+#:   ``granule_workers × read_workers × fetch width`` — and a pool width cannot
+#:   change a decoded value. ``write_buffer`` bounds how many slabs are alive
+#:   under the streamed raster sink (``zagg.processing.raster._write_buffer``):
+#:   a peak-memory knob over an identical written result. ``source_region`` is
+#:   the raster source store's AWS region kwarg, and it sits in the *same dict
+#:   literal* as the already-excluded ``anonymous`` (``zagg.runner``'s
+#:   ``src_kwargs``) — hashing one and not the other split a single "how do we
+#:   open the source" decision across both sides of the D19 line.
+#: * *The failure asymmetry runs the safe way.* Each fails LOUDLY in its own
+#:   direction — a too-small pool is slower, a wrong region is a connection
+#:   error, an over-large buffer is an OOM — so nothing depended on the digest
+#:   to catch them, while hashing them silently splits one product in two.
+#:   The live demonstration is dated: two GEDI flux builds of the same shard on
+#:   2026-08-17 produced identical ``total_obs`` and ``cells_with_data`` in the
+#:   exact single-block spill regime and still hashed apart, purely on
+#:   worker/streaming machinery.
+#: * *A machinery migration must never rehash unchanged data* — retuning a pool
+#:   width or a buffer bound over an existing store would otherwise refuse
+#:   every leaf as ``semantic-mismatch`` and rewrite it to produce the same
+#:   bytes.
+#:
+#: Ruled at the epoch deliberately: the digest moves once here, and excluding
+#: them later would cost a second epoch for knobs that never belonged in the
+#: core.
 DATA_SOURCE_PACKAGING_KEYS = (
     "reader",
     "driver",
     "read_plan",
     "anonymous",
     "credentials_provider",
+    "source_region",
     "shard_workers",
     "granule_workers",
+    "read_workers",
+    "write_buffer",
 )
 
 #: ``aggregation`` keys that are packaging: the per-cell carrier choice
@@ -185,9 +216,10 @@ GRID_SPATIAL_KEYS = ("crs", "resolution", "bounds")
 #:   K) stay excluded — D24's resolution axis is untouched, so this is
 #:   deliberately the one packing knob in the core.
 #:
-#:   Two consequences of hashing the DECLARATION rather than the effective
-#:   layout, both known and both deliberate (resolving the effective layout
-#:   needs K, and K needs the orders D24 keeps out):
+#:   The DECLARATION is hashed, not the effective layout, and the two limits
+#:   that follow are **espg-ruled 2026-08-17** (PR #420 question (3)(a)): left
+#:   exactly as landed, because resolving the effective layout needs K and K
+#:   needs the orders D24 keeps out. Both are known, both are bounded:
 #:
 #:   * at ``K == 1`` the grid silently no-ops sharding (issue #215), so
 #:     ``sharded: true`` and ``sharded: false`` write identical leaves and
@@ -196,14 +228,21 @@ GRID_SPATIAL_KEYS = ("crs", "resolution", "bounds")
 #:     is not");
 #:   * ``chunk_inner`` changes K, hence the leaf's object set, and still
 #:     hashes equal — the object-layout hole is narrowed here, not closed.
-#: - ``emit_cell_ids`` (issue #304) — the D16 transition hatch writes an
-#:   ADDITIONAL ``cell_ids`` array into every leaf, which is a leaf-content
-#:   difference by the same test, not a display preference. **Inferred from
-#:   the criterion, not named by issue #415** (and previously excluded here
-#:   by name), so it is flagged for ruling on the epoch PR alongside
-#:   ``shard_workers``. Note the hatch is scheduled for removal: after that,
-#:   a store built with it ON has a hash no legal config reproduces.
-GRID_LEAF_SHAPING_KEYS = ("sharded", "emit_cell_ids")
+#:     Closing it costs part of D24, which is why it stays open by ruling
+#:     rather than by omission.
+#:
+#: ``emit_cell_ids`` (issue #304) is deliberately NOT here, though the D16
+#: transition hatch does write an ADDITIONAL ``cell_ids`` array into every leaf
+#: — excluded by name before the epoch, briefly folded in on the criterion
+#: alone, and **ruled back out 2026-08-17** (PR #420 question (4)(b)). The
+#: hatch is scheduled for REMOVAL, and a hashed hatch would leave every store
+#: built with it ON carrying a digest that no legal config can reproduce once
+#: the knob is gone — a permanently unverifiable identity, traded for a leaf
+#: shape that artifact-level reading already covers. That is the same
+#: precedent, and the same closing argument, that keeps ``output.pyramid`` out
+#: (see :data:`OUTPUT_LEAF_SHAPING_KEYS`): a leaf's ARRAY INVENTORY is verified
+#: by reading the leaf, not by the digest.
+GRID_LEAF_SHAPING_KEYS = ("sharded",)
 
 #: ``output`` keys outside ``grid`` that shape the LEAF (issue #415 epoch).
 #:
@@ -422,7 +461,7 @@ def semantic_core(config: PipelineConfig) -> dict:
     YAML explicit-null hashes identically to an absent key (§8.3). The returned
     structure is JSON-serializable plain data (the YAML loader guarantees it).
     """
-    from zagg.config import get_aoi_mask, get_emit_cell_ids, get_sharded
+    from zagg.config import get_aoi_mask, get_sharded
 
     grid_cfg = (config.output or {}).get("grid", {}) or {}
     grid_type = grid_cfg.get("type", "healpix")
@@ -440,8 +479,9 @@ def semantic_core(config: PipelineConfig) -> dict:
     # grid-family-shaped exactly as `grids.from_config` resolves it — HEALPix
     # output defaults to sharded (issue #215), rect does not — so an explicit
     # `sharded: true` on a HEALPix config hashes identically to omitting it.
+    # `emit_cell_ids` is NOT folded in (espg-ruled 2026-08-17) — see the
+    # constant.
     grid["sharded"] = get_sharded(config, default=grid_type == "healpix")
-    grid["emit_cell_ids"] = get_emit_cell_ids(config)
     core: dict = {
         "aggregation": _normalize_variables(
             _without(config.aggregation, AGGREGATION_PACKAGING_KEYS)

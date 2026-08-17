@@ -103,6 +103,21 @@ class TestCanonicalization:
         cfg.worker = {"memory": 8192, "extra_disk": True}
         assert semantic_hash(cfg) == base
 
+    def test_emit_cell_ids_is_packaging(self):
+        # The issue #304 D16 transition hatch. It DOES add a `cell_ids` array
+        # to every leaf, so it met the epoch's leaf-shaping criterion and was
+        # briefly folded in — and espg ruled it back OUT (2026-08-17, PR #420
+        # question (4)(b)) for the consequence the criterion does not price:
+        # the hatch is scheduled for REMOVAL, after which a store built with it
+        # ON would carry a digest no legal config can reproduce. A leaf's array
+        # inventory is verified by READING the leaf (the same precedent that
+        # keeps output.pyramid out), so the digest buys nothing here and costs a
+        # permanently unverifiable identity.
+        base = semantic_hash(_cfg())
+        cfg = _cfg(output__grid__emit_cell_ids=True)
+        assert semantic_hash(cfg) == base
+        assert "emit_cell_ids" not in semantic_core(cfg)["grid"]
+
     def test_worker_fan_out_width_is_packaging(self):
         # The issue #415 epoch, half (7)(b): D19's ratified exclusion list
         # already named "worker size" as packaging, but the keys were never in
@@ -163,6 +178,47 @@ class TestCanonicalization:
         both.data_source["anonymous"] = True
         assert semantic_hash(both) == base
 
+    @pytest.mark.parametrize(
+        "key,value",
+        [("read_workers", 16), ("write_buffer", 4), ("source_region", "us-east-1")],
+    )
+    def test_byte_movement_knobs_are_packaging(self, key, value):
+        # The epoch's fourth ruling (espg, 2026-08-17, PR #420 question (2)(c)):
+        # the same class as credentials_provider -- each selects how bytes are
+        # fetched or moved, never what is computed. read_workers (issue #170) is
+        # the third fan-out width beside shard/granule_workers; write_buffer
+        # bounds the live slabs under the streamed raster sink; source_region
+        # sits in the SAME dict literal as the already-excluded `anonymous`
+        # (runner's src_kwargs), so hashing one and not the other split one
+        # decision across both sides of the D19 line.
+        from zagg.semantics import DATA_SOURCE_PACKAGING_KEYS
+
+        assert key in DATA_SOURCE_PACKAGING_KEYS
+        cfg = _cfg(**{f"data_source__{key}": value})
+        assert key not in semantic_core(cfg)["data_source"]
+        assert semantic_hash(cfg) == semantic_hash(_cfg())
+
+    @pytest.mark.parametrize(
+        "key,before,after",
+        [
+            ("read_workers", 8, 2),
+            ("write_buffer", 1, 8),
+            ("source_region", "us-west-2", "us-east-1"),
+        ],
+    )
+    def test_a_machinery_migration_never_rehashes(self, key, before, after):
+        # The trap each exclusion closes, and the reason the epoch is the moment
+        # to close it: retuning a pool width, a buffer bound, or a source region
+        # over an EXISTING store must be one product. Otherwise every leaf reads
+        # `semantic-mismatch` and the store rewrites itself to produce the same
+        # bytes -- which is exactly what espg measured on 2026-08-17, when two
+        # GEDI flux builds of shard 5347294481781620745 produced identical
+        # total_obs (23,353,274) and cells_with_data (27,727) in the exact
+        # single-block spill regime and still hashed apart.
+        base = semantic_hash(_cfg())
+        assert semantic_hash(_cfg(**{f"data_source__{key}": before})) == base
+        assert semantic_hash(_cfg(**{f"data_source__{key}": after})) == base
+
     def test_semantic_edits_always_change_hash(self):
         base = semantic_hash(_cfg())
         cfg = _cfg()
@@ -190,13 +246,13 @@ class TestCanonicalization:
 
     def test_grid_family_is_semantic(self):
         # Grid TYPE (+ indexing scheme) is identity; the orders are not (D24).
-        # The two leaf-shaping grid knobs ride resolved (issue #415 epoch).
+        # The one leaf-shaping grid knob rides resolved (issue #415 epoch);
+        # `emit_cell_ids` is packaging by ruling, so it never appears.
         healpix = semantic_core(_cfg())
         assert healpix["grid"] == {
             "type": "healpix",
             "indexing_scheme": "nested",
             "sharded": True,
-            "emit_cell_ids": False,
         }
         rect = default_config("atl06_polar")
         rect = copy.deepcopy(rect)
@@ -216,7 +272,6 @@ class TestCanonicalization:
             "resolution": 100,
             "bounds": [0, 0, 1000, 1000],
             "sharded": False,
-            "emit_cell_ids": False,
         }
         assert semantic_hash(rect) != semantic_hash(_cfg())
 
@@ -261,8 +316,10 @@ class TestCanonicalization:
     def test_golden_hash_pin(self):
         # F4: a fully-inline config with fixed dicts, pinned to its exact
         # digest (re-pinned when pipeline.type joined the core, espg-ruled
-        # 2026-07-21; re-pinned again at the issue #415 hash epoch, when the
-        # leaf-shaping output knobs joined). This catches accidental
+        # 2026-07-21; re-pinned at the issue #415 hash epoch, when the
+        # leaf-shaping output knobs joined; re-pinned once more when espg ruled
+        # `emit_cell_ids` back out of the core, 2026-08-17). This catches
+        # accidental
         # canonicalization drift — any change to key ordering, null pruning,
         # the packaging-key sets, or the JSON separators would move this hash,
         # so an unintended edit fails loudly. Moving it deliberately is a
@@ -289,7 +346,7 @@ class TestCanonicalization:
             output={"grid": {"type": "healpix", "parent_order": 6, "child_order": 12}},
         )
         assert semantic_hash(cfg) == (
-            "96e5b12005fcf09a9508e643abb7eecd7893220adef2ae75cf2b34f40c04d4c1"
+            "fb15224f7265938d71039aeb6a0516f72e565609cd1993a25d41f7dc862a53a9"
         )
 
     def test_pipeline_type_is_semantic(self):
@@ -332,14 +389,8 @@ class TestLeafShapingOutputKnobs:
         # mint a new product — the pipeline.type discipline (§8.3).
         base = semantic_hash(_cfg())
         assert semantic_hash(_cfg(output__grid__sharded=True)) == base
-        assert semantic_hash(_cfg(output__grid__emit_cell_ids=False)) == base
         assert semantic_hash(_cfg(output__aoi_mask=False)) == base
         assert semantic_hash(_cfg(output__windowing={"schedule": "none"})) == base
-
-    def test_emit_cell_ids_is_identity(self):
-        # The issue #304 hatch writes an ADDITIONAL cell_ids array into every
-        # leaf — a leaf-content difference, not a display preference.
-        assert semantic_hash(_cfg(output__grid__emit_cell_ids=True)) != semantic_hash(_cfg())
 
     def test_aoi_mask_is_identity(self):
         # Masks cells outside the AOI: the leaf's VALUES differ (issue #101).

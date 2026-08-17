@@ -713,11 +713,13 @@ refresh builds it.
 
 [Issue #415](https://github.com/englacial/zagg/issues/415) closed two ruled
 defects in the semantic core ([PR #397](https://github.com/englacial/zagg/pull/397)
-questions (7) and (8)), and carried one further ruled exclusion
-([issue #449](https://github.com/englacial/zagg/issues/449)) that had to ride
-the same epoch. All three change what `zagg.semantics.semantic_hash` digests,
-so all three move every digest — which is why they were deliberately landed in
-one release rather than one at a time.
+questions (7) and (8)), and carried two further ruled exclusions that had to
+ride the same epoch: the credential mechanism
+([issue #449](https://github.com/englacial/zagg/issues/449)) and the
+byte-movement knobs (espg-ruled 2026-08-17 on the epoch PR). All four change
+what `zagg.semantics.semantic_hash` digests, so all four move every digest —
+which is why they were deliberately landed in one release rather than one at a
+time.
 
 ### What changed
 
@@ -731,10 +733,17 @@ one release rather than one at a time.
    unclamped shards collapsed `semantic_hash` to `null`.
 2. **The leaf-shaping `output` knobs entered the core** —
    `zagg.semantics.OUTPUT_LEAF_SHAPING_KEYS` (`aoi_mask`, `windowing`) and
-   `GRID_LEAF_SHAPING_KEYS` (`sharded`, `emit_cell_ids`). Before, the whole
+   `GRID_LEAF_SHAPING_KEYS` (`sharded`). Before, the whole
    `output` block was outside the core, so a config edit that changed what a
    leaf *contains* moved neither half of the skip gate's identity pair and a
-   rerun read the stale leaf as `current`.
+   rerun read the stale leaf as `current`. `output.grid.emit_cell_ids` meets
+   that criterion too and is still **excluded** (espg-ruled 2026-08-17): the
+   D16 hatch is scheduled for removal
+   ([issue #304](https://github.com/englacial/zagg/issues/304)), and hashing it
+   would leave every store built with it ON carrying a digest that no legal
+   config can reproduce once the knob is gone. A leaf's *array inventory* is
+   verified by reading the leaf — the same argument that keeps `output.pyramid`
+   out.
 3. **The credential mechanism left the core.** `data_source.credentials_provider`
    joined `DATA_SOURCE_PACKAGING_KEYS` (espg-ruled 2026-08-17): the provider
    name selects *how* source bytes are fetched, never *what* is computed from
@@ -751,23 +760,30 @@ one release rather than one at a time.
    that ran without it — no longer refuses the store and rewrites it to produce
    the same bytes.
 
+4. **Three more byte-movement knobs left the core.** `read_workers`,
+   `write_buffer` and `source_region` joined `DATA_SOURCE_PACKAGING_KEYS`
+   (espg-ruled 2026-08-17): `read_workers` is the third fan-out width beside
+   the two spellings item 1 excluded, `write_buffer` bounds how many slabs are
+   alive under the streamed raster sink, and `source_region` is the raster
+   source store's AWS region kwarg — which sat in the *same dict literal* as
+   the already-excluded `anonymous`, so hashing one and not the other split a
+   single "how do we open the source" decision across both sides of the line.
+   Each fails loudly in its own direction (a small pool is slower, a wrong
+   region is a connection error, an over-large buffer is an OOM), so nothing
+   depended on the digest to catch them. The operator consequence matches item
+   3: **retuning machinery over unchanged data no longer rehashes.** The live
+   demonstration is dated — two GEDI flux builds of the same shard on
+   2026-08-17 produced identical `total_obs` and `cells_with_data` in the exact
+   single-block spill regime and still hashed apart, purely on
+   worker/streaming/index machinery.
+
 Deliberately **not** changed: the orders (`parent_order` / `child_order` /
 `chunk_inner`) stay packaging — hashing them would make o8 and o9 runs
 different products and block mixed-order processing (D24) — and the whole
 `pyramid` block stays out, so
 [retrofitting a pyramid declaration](#retrofitting-the-pyramid-declaration)
 onto the config that built a store still hashes identically and still works.
-
-Also **not** changed, and not an oversight: three `data_source` keys that read
-as the same fetch-mechanism class as item 1 and item 3 are still in the core,
-so they still move the digest — `read_workers` (the third fan-out width,
-beside the two spellings item 1 excluded), `source_region` (the raster
-source-store kwarg that sits in the same dict literal as the already-excluded
-`anonymous`), and `write_buffer` (the live-slab bound on the streamed raster
-sink). Excluding a key is a ruling, not housekeeping, so this epoch carries
-only what was ruled; the three stand unruled as an open question on the epoch
-PR ([#420](https://github.com/englacial/zagg/pull/420)), and excluding them
-later would be its own epoch.
+`emit_cell_ids` stays out for the reason recorded under item 2.
 
 ### Why re-hashing is correct, not a defect
 

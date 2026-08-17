@@ -742,22 +742,37 @@ neither gap and is safe now.
   per-cell `min(K, n_granules)` clamp made a small shard's worker-side hash
   differ from the run's — `shard_workers`/`granule_workers` now exclude
   properly. (b) The **leaf-shaping `output` knobs** — `aoi_mask`,
-  `windowing`, `grid.sharded`, `grid.emit_cell_ids` — are now *included*:
+  `windowing`, `grid.sharded` — are now *included*:
   they change what a leaf contains, so leaving them out made the D20 skip
   gate (#388) read a config-changed rerun as `equal`. `sharded` therefore
   moves from the exclusion list above into the core; the orders it sits
   beside do **not** (D24 is untouched, and the object-layout hole is
   narrowed rather than closed — `chunk_inner` still moves K without moving
-  the digest). The `pyramid` block stays excluded: D11 keeps it out of the
+  the digest, espg-ruled 2026-08-17 as the bounded state to ship). The
+  `pyramid` block stays excluded: D11 keeps it out of the
   frozen manifest keys, and the leaf column it declares is verified by
-  reading the artifact (§4.6) rather than by the digest. (c) A third
+  reading the artifact (§4.6) rather than by the digest —
+  and `grid.emit_cell_ids` stays excluded on the *same* argument
+  (espg-ruled 2026-08-17): the #304 hatch is scheduled for removal, so a
+  hashed hatch would strand every store built with it ON behind a digest
+  no legal config can reproduce, in exchange for an array inventory that
+  reading the leaf already verifies. (c) A third
   exclusion rode the same epoch (espg-ruled 2026-08-17, issue #449):
   `credentials_provider` is packaging — it selects how source bytes are
   fetched (the same class as the read knobs and as `anonymous`, already
   excluded), never what is computed, and a wrong credential fails the fetch
   loudly rather than silently. Ruled at the epoch so the first GEDI store's
   identity is born without an auth knob, and so a credential migration over
-  unchanged data (the MERRA-2/gesdisc path) never rehashes. Operator
+  unchanged data (the MERRA-2/gesdisc path) never rehashes. (d) The same
+  ruling extended to the **byte-movement knobs** `read_workers`,
+  `write_buffer` and `source_region` (espg-ruled 2026-08-17 on the epoch
+  PR): each selects how bytes are fetched or moved, never what is computed;
+  each fails loudly rather than silently; and `source_region` sat in the
+  same dict literal as the already-excluded `anonymous`, so the D19 line ran
+  through the middle of one decision. The live demonstration is dated: two
+  GEDI flux builds of one shard on 2026-08-17 produced identical `total_obs`
+  and `cells_with_data` in the exact single-block spill regime and still
+  hashed apart on worker/streaming machinery alone. Operator
   consequences — every pre-epoch hash invalidated, and the three migration
   paths — are in `docs/hive_layout.md`, "Migration: the D19 hash epoch".
   The hash is a
