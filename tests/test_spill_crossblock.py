@@ -242,6 +242,66 @@ def _assert_ancestor_or_equal(locs, contributors):
         )
 
 
+def _contributor_times(dfs, grid, cell, mask_fn=None):
+    """Every toc word the granules contribute to ``cell``, encoded as pooled does.
+
+    Straight through :func:`zagg.time_axis.observation_words` with the declared
+    clock, which is the ONE conversion both paths use — so this is the raw
+    instant set the fold's per-centroid envelopes must account for, not a
+    re-derivation of them.
+    """
+    from zagg.time_axis import observation_words
+
+    out = []
+    for df in dfs:
+        keep = np.asarray(grid.cells_of(df["leaf_id"].values)) == cell
+        if mask_fn is not None:
+            keep = keep & mask_fn(df)
+        out.append(
+            observation_words(
+                df["delta_time"].values[keep], epoch=_EPOCH, scale="gps", units="seconds"
+            )
+        )
+    return np.concatenate(out)
+
+
+def _assert_envelope_conservation(times, contributors):
+    """The folded words account for every observation, and escape none of them.
+
+    Membership per centroid is not observable from the output (as with
+    locations), so pin the two statements that are — both EXACT at any fold
+    depth, because the §8.2 join is a semilattice and a fold partitions the
+    members:
+
+    (a) the join over the stored per-centroid words equals the join over the raw
+    observation words — no instant dropped by a block close, none invented; and
+    (b) every stored word's ``[start, end)`` lies inside that whole envelope,
+    which is what a reader's §8.3 containment claim rests on.
+    """
+    import mortie
+
+    from zagg.stats.toc import cell_envelope
+
+    times = np.asarray(times, dtype=np.uint64)
+    contributors = np.asarray(contributors, dtype=np.uint64)
+    whole = int(cell_envelope(contributors))
+    assert int(cell_envelope(times)) == whole, "the folded words lost or gained an instant"
+    lo, hi = (int(b[0]) for b in mortie.toc2time(np.array([whole], dtype=np.uint64)))
+    starts, ends = mortie.toc2time(times)
+    assert int(starts.min()) >= lo and int(ends.max()) <= hi, "a folded word escapes the envelope"
+
+
+def _channels_of(entry):
+    """``(payloads, cell_indices, locations, times)`` from any ragged arity.
+
+    Through the production normalizer rather than a local unpack, so the test
+    reads the sink entry by the same contract the writer does.
+    """
+    from zagg.processing.write import _ragged_entry
+
+    return _ragged_entry(entry)
+
+
 def _pooled_build(meta, n=8):
     """Call one ragged field's declared reducer exactly as the pooled path does.
 
@@ -542,6 +602,162 @@ class TestLocatedMultiBlock:
         assert len(ragged["h_tdigest"]) == 3  # located 3-tuple delivered
 
 
+class TestTemporalMultiBlock:
+    """The §8.3 per-centroid companion across forced block closes (issue #477).
+
+    Each granule covers its own day (``_granule_dfs(times=True)``) and
+    ``_force_tiny_blocks`` closes a block per flush, so every emitted centroid
+    that spans more than one granule spans more than one block: a channel that
+    was dropped, truncated, or paired with the wrong partition could not still
+    envelope its members.
+    """
+
+    def _run_spill(self, monkeypatch, seed, located=False, pairwise=False, delta=16, obs=60):
+        key = _shard_key()
+        cfg = _config(
+            _variables(located=located, pairwise=pairwise, delta=delta, temporal=True),
+            streaming=_SPILL,
+        )
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=obs, seed=seed, times=True)
+        _force_tiny_blocks(monkeypatch)
+        df_out, ragged, meta = _run(monkeypatch, cfg, grid, key, list(dfs))
+        assert meta["phase_timings"]["spill_blocks_closed"] == len(_CELL_LISTS)
+        return grid, key, dfs, ragged
+
+    @pytest.mark.parametrize("pairwise", [False, True])
+    def test_envelope_conservation_across_block_closes(self, monkeypatch, pairwise):
+        grid, key, dfs, ragged = self._run_spill(monkeypatch, seed=21, pairwise=pairwise)
+        import mortie
+
+        vals, idx, locs, times = _channels_of(ragged["h_tdigest"])
+        assert locs is None  # temporal-only: no location slot claimed
+        assert len(times) == len(vals) > 0
+        children = np.asarray(grid.children(key), dtype=np.uint64)
+        merged = False
+        for cell_i, digest, words in zip(idx, vals, times, strict=True):
+            assert words.dtype == np.uint64
+            assert words.shape == (len(digest),)
+            _assert_envelope_conservation(
+                words, _contributor_times(dfs, grid, int(children[cell_i]))
+            )
+            merged |= bool(mortie.toc_is_range(words).any())
+        # δ=16 over 300 observations per cell: compression is real, so at least
+        # one stored word must be a RANGE — otherwise conservation above would be
+        # trivially satisfied by untouched per-observation timestamps.
+        assert merged, "no centroid merged; the fold was not exercised"
+
+    def test_below_knee_words_are_the_exact_observation_instants(self, monkeypatch):
+        # n <= delta across every block: no compression anywhere, every centroid
+        # is weight 1, and its word is that observation's exact timestamp. The
+        # multiset check alone is permutation-invariant, so the per-row map is
+        # what pins the channel's alignment to the payload (mirrors the located
+        # below-knee test one channel over).
+        grid, key, dfs, ragged = self._run_spill(monkeypatch, seed=22, delta=512, obs=20)
+        vals, idx, _, times = _channels_of(ragged["h_tdigest"])
+        children = np.asarray(grid.children(key), dtype=np.uint64)
+        assert len(vals) > 0
+        for cell_i, digest, words in zip(idx, vals, times, strict=True):
+            assert (digest[:, 1] == 1.0).all()
+            cell = int(children[cell_i])
+            values, _ = _contributor_rows(dfs, grid, cell)
+            instants = _contributor_times(dfs, grid, cell)
+            np.testing.assert_array_equal(np.sort(words), np.sort(instants))
+            keys = values.astype(np.float32)
+            assert len(np.unique(keys)) == len(keys)
+            value_to_word = dict(zip(keys.tolist(), instants.tolist(), strict=True))
+            for centroid, word in zip(digest, words, strict=True):
+                assert value_to_word[float(centroid[0])] == int(word)
+
+    def test_kway_fold_is_block_order_independent(self, monkeypatch):
+        # The k-way collapse is one pass over all parts, so permuting the block
+        # (== granule) order permutes only the parts list: payload AND companion
+        # bytes must come back identical. The channel would break this if its
+        # ties were resolved by input position rather than by the word.
+        key = _shard_key()
+        cfg = _config(_variables(temporal=True, located=True), streaming=_SPILL)
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=60, seed=23, times=True)
+        _force_tiny_blocks(monkeypatch)
+        forward = _run(monkeypatch, cfg, grid, key, list(dfs))
+        reverse = _run(monkeypatch, cfg, _grid(cfg), key, list(reversed(dfs)))
+        pd.testing.assert_frame_equal(forward[0], reverse[0])
+        f_vals, f_idx, f_locs, f_times = _channels_of(forward[1]["h_tdigest"])
+        r_vals, r_idx, r_locs, r_times = _channels_of(reverse[1]["h_tdigest"])
+        assert f_idx == r_idx
+        for a, b in zip(f_vals, r_vals, strict=True):
+            np.testing.assert_array_equal(a, b)
+        for a, b in zip(f_times, r_times, strict=True):
+            np.testing.assert_array_equal(a, b)
+        for a, b in zip(f_locs, r_locs, strict=True):
+            np.testing.assert_array_equal(a, b)
+
+    def test_cell_envelope_agrees_with_pooled(self, monkeypatch):
+        # The cross-regime statement §8.3 licenses: the folded centroid
+        # partition differs from pooled's (t-digest merge is approximate across
+        # fold orders), so the WORDS differ — but the cell-level join over them
+        # is the same token either way, and the digest stays within the fold
+        # law's bounds (exact total weight, close quantiles).
+        from zagg.stats.toc import cell_envelope
+
+        key = _shard_key()
+        pooled_cfg = _config(_variables(temporal=True))
+        spill_cfg = _config(_variables(temporal=True), streaming=_SPILL)
+        grid = _grid(pooled_cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=100, seed=24, times=True)
+        df_p, ragged_p, _ = _run(monkeypatch, pooled_cfg, grid, key, list(dfs))
+        _force_tiny_blocks(monkeypatch)
+        df_s, ragged_s, _ = _run(monkeypatch, spill_cfg, _grid(spill_cfg), key, list(dfs))
+        pd.testing.assert_series_equal(df_p["count"], df_s["count"])
+        vals_p, idx_p, _, times_p = _channels_of(ragged_p["h_tdigest"])
+        vals_s, idx_s, _, times_s = _channels_of(ragged_s["h_tdigest"])
+        assert idx_p == idx_s
+        for dp, ds, tp, ts in zip(vals_p, vals_s, times_p, times_s, strict=True):
+            assert int(cell_envelope(tp)) == int(cell_envelope(ts))
+            assert float(dp[:, 1].sum()) == float(ds[:, 1].sum())
+            for q in (0.1, 0.5, 0.9):
+                assert abs(quantile_from_tdigest(ds, q) - quantile_from_tdigest(dp, q)) < 1.0
+
+    def test_located_and_temporal_ride_the_same_fold(self, monkeypatch):
+        # The CA shape (issue #477's blocked config): build_tdigest_where strata
+        # carrying BOTH channels. Each stratum's siblings must stay row-aligned
+        # with its own payload, with each channel bounded by that stratum's own
+        # contributors — a channel folded against the other's partition, or
+        # against the unmasked population, would fail one of the two.
+        key = _shard_key()
+        cfg = _config(_variables(strata=True, located=True, temporal=True), streaming=_SPILL)
+        grid = _grid(cfg)
+        dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=100, seed=25, times=True)
+        _force_tiny_blocks(monkeypatch)
+        _, ragged, meta = _run(monkeypatch, cfg, grid, key, list(dfs))
+        assert meta["phase_timings"]["spill_blocks_closed"] == len(_CELL_LISTS)
+        children = np.asarray(grid.children(key), dtype=np.uint64)
+        for name, mask_fn in (
+            ("h_sig", lambda df: df["h_ph"].values > 0),
+            ("h_noise", lambda df: ~(df["h_ph"].values > 0)),
+        ):
+            vals, idx, locs, times = _channels_of(ragged[name])
+            assert len(vals) == len(locs) == len(times) > 0
+            for cell_i, digest, cell_locs, words in zip(idx, vals, locs, times, strict=True):
+                cell = int(children[cell_i])
+                assert cell_locs.shape == words.shape == (len(digest),)
+                _assert_ancestor_or_equal(cell_locs, _contributors(dfs, grid, cell, mask_fn))
+                _assert_envelope_conservation(words, _contributor_times(dfs, grid, cell, mask_fn))
+
+    def test_the_derived_word_column_is_never_spilled(self, monkeypatch):
+        # The channel costs the spill record nothing beyond the clock column the
+        # config already reads: the toc words are DERIVED at fold time, so
+        # ``toc_word`` must not appear in the block schema.
+        cfg = _config(_variables(temporal=True), streaming=_SPILL)
+        grid = _grid(cfg)
+        df = _granule_dfs(grid, _shard_key(), [[0, 4]], obs_per_cell=5, seed=1, times=True)[0]
+        agg = SpillAggregator(cfg, grid, "pandas", 1)
+        agg.add_read(df)
+        agg.flush()
+        assert [name for name, _ in agg._block.schema] == ["h_ph", "leaf_id", "delta_time"]
+        agg.close()
+
+
 class TestStrataMultiBlock:
     """build_tdigest_where strata across forced block closes."""
 
@@ -830,6 +1046,26 @@ class TestFoldColumnDiagnostics:
         agg = self._agg_with_block(variables, {"h_ph": np.zeros(1, np.float32)})
         with pytest.raises(ValueError, match="h_sig.*where: 'flag > 0'.*\\['flag'\\]"):
             agg._fold_block(agg._block)
+        agg.close()
+
+    def test_missing_clock_column_named(self):
+        # The temporal channel's words are derived from output.time_source.field,
+        # which is a read column like any other: a block that never carried it
+        # must fail with the POOLED path's named message, not a bare KeyError.
+        agg = self._agg_with_block(_variables(temporal=True), {"h_ph": np.zeros(1, np.float32)})
+        with pytest.raises(ValueError, match="output.time_source.field 'delta_time' is not"):
+            agg._fold_block(agg._block)
+        agg.close()
+
+    def test_where_may_read_the_derived_word_column(self):
+        # The fold's namespace carries the derived toc_word column exactly as
+        # the pooled one does, so a where expression over it must resolve rather
+        # than be reported as a column the block never carried.
+        variables = _variables(strata=True, temporal=True)
+        variables["h_sig"]["params"] = {**variables["h_sig"]["params"], "where": "toc_word > 0"}
+        cols = {"h_ph": np.ones(1, np.float32), "delta_time": np.ones(1, np.float64)}
+        agg = self._agg_with_block(variables, cols)
+        agg._fold_block(agg._block)  # no raise
         agg.close()
 
     def test_expression_over_spilled_columns_passes(self):
