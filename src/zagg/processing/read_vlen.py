@@ -43,6 +43,7 @@ from zagg.processing.read import (
     _record_obs_read,
     _segment_level_variables,
     _select_column,
+    _validate_link_disjoint,
     _variable_specs,
     link_base_extent,
 )
@@ -322,6 +323,11 @@ def _vlen_read_group(
     # product (the tail of each 1,420-sample window past ``rx_sample_count``
     # reads as literal zeros), so any row that leaked through would land in a
     # cell as a real zero-amplitude sample — ~46% of the fetched span.
+    # First assembly of the coordinates link: the whole route hangs off it, and
+    # both owner derivations (the paint maps below, the searchsorted twins in
+    # read.py) are only equivalent on disjoint records — so refuse an
+    # overlapping link here, once, rather than emit silently mismatched columns.
+    _validate_link_disjoint(ibeg_arr, cnt_arr, index_base, level=coord_key)
     n_base = link_base_extent(ibeg_arr, cnt_arr, index_base)
     if n_base <= 0:
         _record_obs_read(io_stats, 0)
@@ -487,6 +493,7 @@ def _vlen_read_group(
         cf_ibeg = np.asarray(cf_data[cf_paths[1]])
         cf_cnt = np.asarray(cf_data[cf_paths[2]])
         cf_index_base = int(cf_link.get("index_base", 0))
+        _validate_link_disjoint(cf_ibeg, cf_cnt, cf_index_base, level=f["level"])
         coarse_fmask = _predicate_mask(np.asarray(cf_data[cf_paths[0]]), f)
         # A non-coordinate level owns its own link, so its per-row owner comes
         # from a searchsorted over that link's starts rather than from the

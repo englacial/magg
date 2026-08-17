@@ -196,6 +196,52 @@ def link_base_extent(index_beg_arr, count_arr, index_base: int) -> int:
     return int((beg[nonempty] + cnt[nonempty]).max())
 
 
+def _validate_link_disjoint(
+    index_beg_arr, count_arr, index_base: int, level: str | None = None
+) -> None:
+    """Refuse a link whose non-empty records overlap (issue #452).
+
+    Disjointness is the link grammar's standing precondition (#43's contiguity
+    assumption, minus the requirement that the ranges also *tile* — a strided
+    product leaves gaps). Until now it was assumed everywhere and checked
+    nowhere: the paint maps (:func:`zagg.processing.read_vlen.expand_link_indices`,
+    :func:`zagg.processing.read_vlen._planned_gather_map`,
+    :func:`_broadcast_segment_to_base`) validate only ``beg >= 0`` and
+    ``beg + cnt <= n_base``, and *resolve* an overlap by paint order — a later
+    record silently shadows an earlier one.
+
+    That mattered because the route carries two independently-derived owner
+    maps: paint order above, and last-start-wins in
+    :func:`_link_parent_at_rows`. On disjoint records they agree exactly (3,000
+    randomized links, 0 divergences); on overlapping ones they do not, and the
+    disagreement is per-row and silent — coordinates and the synthesized column
+    would come from one record while a companion variable and any record-level
+    filter verdict came from another. Validating here, once per level where the
+    link is first assembled, turns the precondition into enforced truth: a
+    malformed product now fails loudly instead of writing mismatched columns.
+
+    Empty records (``count == 0``) own no rows and are skipped (issue #116).
+    """
+    beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
+    cnt = np.asarray(count_arr).astype(np.int64)
+    nonempty = np.flatnonzero(cnt > 0)
+    if nonempty.size < 2:
+        return
+    order = nonempty[np.argsort(beg[nonempty], kind="stable")]
+    beg_sorted = beg[order]
+    end_sorted = beg_sorted + cnt[order]
+    bad = np.flatnonzero(beg_sorted[1:] < end_sorted[:-1])
+    if bad.size:
+        i = int(bad[0])
+        where = f" on level {level!r}" if level is not None else ""
+        raise ValueError(
+            f"link records{where} overlap: record {int(order[i])} covers base rows "
+            f"[{int(beg_sorted[i])}:{int(end_sorted[i])}] but record {int(order[i + 1])} "
+            f"starts at {int(beg_sorted[i + 1])}; the link grammar requires disjoint "
+            f"record ranges"
+        )
+
+
 def _link_parent_at_rows(
     index_beg_arr, count_arr, index_base: int, base_rows: np.ndarray
 ) -> np.ndarray:
@@ -209,10 +255,13 @@ def _link_parent_at_rows(
     the difference is a 2 GB worker surviving or not (the issue #43 OOM
     posture, applied to the expansion side).
 
-    Records are assumed not to overlap — the link grammar's contract, which the
-    gather maps validate — and ties on an identical start resolve to the later
-    record, matching the paint order of :func:`_broadcast_segment_to_base`.
-    Empty records (``count == 0``) own nothing (issue #116).
+    Records must not overlap — the link grammar's contract, enforced by
+    :func:`_validate_link_disjoint` where each level's link is assembled, since
+    this derivation (last start at or before the row wins) and the paint maps'
+    (later record shadows earlier) agree only on disjoint records. Ties on an
+    identical start resolve to the later record either way, matching the paint
+    order of :func:`_broadcast_segment_to_base`. Empty records (``count == 0``)
+    own nothing (issue #116).
     """
     beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
     cnt = np.asarray(count_arr).astype(np.int64)
@@ -363,6 +412,10 @@ def _read_segment_broadcasts(
         else:
             ibeg_arr = read_fn(ibeg_path)
             cnt_arr = read_fn(cnt_path)
+        # First assembly of this level's link on this route: refuse overlapping
+        # records once here rather than let the two owner derivations disagree
+        # per row further down (issue #452).
+        _validate_link_disjoint(ibeg_arr, cnt_arr, index_base, level=level_key)
         for col_name, tmpl in mapping.items():
             if col_name in base_cols:
                 raise ValueError(
