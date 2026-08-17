@@ -705,10 +705,10 @@ class Catalog:
         a peak rather than stacking with the cover, but a whole-clone index
         wants headroom for it. :meth:`cover_footprints`' ``keep.all()``
         short-circuit avoids a second ~334 MB WKB copy in the case that actually
-        occurs (nothing screened out -- every catalog in the tree). Reading the geometry-type word straight out
-        of the WKB, or chunking the ``from_wkb`` call, would drop the screen's
-        peak entirely; not done here because it trades the shared shapely
-        predicate for a hand-rolled one.
+        occurs (nothing screened out -- every catalog in the tree). Reading the
+        geometry-type word straight out of the WKB, or chunking the
+        ``from_wkb`` call, would drop the screen's peak entirely; not done here
+        because it trades the shared shapely predicate for a hand-rolled one.
         """
         from mortie.arrow import from_morton_index
 
