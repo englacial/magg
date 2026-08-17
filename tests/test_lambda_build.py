@@ -6,6 +6,7 @@ These tests verify that:
 3. The zagg package can be imported as Lambda would see it
 """
 
+import inspect
 import re
 import subprocess
 from pathlib import Path
@@ -66,11 +67,21 @@ class TestLambdaImports:
     def test_h5coro_hidefix_available(self):
         """h5coro-hidefix ships the compiled reader for the sidecar backend (issue #149).
 
-        importorskip, not a bare import: the pinned 0.2.0 is not on PyPI until
-        upstream cuts that release, so an env that could not install it yet
-        skips here instead of failing the whole suite.
+        importorskip, not a bare import: the floor can sit ahead of what PyPI
+        has published, so an env that could not install it yet skips here
+        instead of failing the whole suite.
+
+        The signature assertion pins the >=0.3.2 floor's reason: the worker
+        forwards io_stats to every backend ungated (``worker.py`` read_kwargs,
+        issue #374), and 0.3.1's read_group raised TypeError on every sidecar
+        group read — silently, as a caught per-group error reported as "No data
+        after filtering". Fails loudly wherever a below-floor hidefix installs.
         """
         pytest.importorskip("h5coro_hidefix")
+
+        from h5coro_hidefix.zagg_backend import SidecarIndex
+
+        assert "io_stats" in inspect.signature(SidecarIndex.read_group).parameters
 
 
 class TestFunctionBuild:
@@ -581,39 +592,175 @@ class TestLayerExtraParity:
 
     # Distributions whose layer spec build_layer.sh *derives* from
     # ``[project.dependencies]`` instead of hard-coding (issue #322), keyed to the
-    # shell fragment that does the deriving. No literal ``"name==x.y.z"`` string
+    # shell fragment that does the deriving. No literal ``name==x.y.z`` string
     # exists for these, so the substring check below cannot apply — and the two
     # mechanisms are mutually exclusive: an exact pin added to the ``lambda`` extra
     # would not reach the layer, which the failure message has to say out loud.
     _DERIVED = {"mortie": "MORTIE_SPEC=$("}
 
+    @staticmethod
+    def _install_lines(script):
+        """The script's ``$PIP install`` invocations, backslash continuations joined.
+
+        Deriving a pin is only half the contract — it has to be handed to pip.
+        The installs span continuation lines (``build_layer.sh:93-96``), so a
+        raw per-line scan would miss most of them.
+        """
+        logical, buf = [], ""
+        for line in script.splitlines():
+            if line.endswith("\\"):
+                buf += line[:-1]
+                continue
+            logical.append(buf + line)
+            buf = ""
+        if buf:
+            logical.append(buf)
+        return [line for line in logical if "$PIP install" in line]
+
     def test_every_lambda_extra_pin_is_in_build_layer(self):
+        """Every exact ``lambda`` pin reaches the layer via ``lambda_pin`` derivation.
+
+        Since PR #436 the script derives each exact pin from the extra at build
+        time (extending issue #322's mortie pattern), so the contract inverts:
+        every pinned name must be *fetched* via ``$(lambda_pin name)``, and no
+        literal ``name==x.y.z`` may exist in the script in any quoting — a
+        literal is a second declaration site, exactly the drift this closes.
+
+        Deriving alone is not enough: the assignment block sits far from the
+        installs, so a pin can be fetched and never passed to pip — the issue
+        #218 async-tiff gap in a new costume. The name -> shell-var mapping is
+        parsed out of the script (not hard-coded) so renaming a var cannot
+        quietly drop its install check, and each var must appear quoted on a
+        ``$PIP install`` line.
+        """
         import tomllib
 
         pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
         pins = pyproject["project"]["optional-dependencies"]["lambda"]
         script = (REPO_ROOT / "deployment" / "aws" / "build_layer.sh").read_text()
+        pin_vars = {
+            name: var
+            for var, name in re.findall(
+                r"^([A-Z0-9_]+_PIN)=\$\(lambda_pin (.+)\)$", script, re.MULTILINE
+            )
+        }
+        installs = "\n".join(self._install_lines(script))
         missing = []
+        uninstalled = []
+        literal = []
         derived = []
         for pin in pins:
             m = re.match(r"([A-Za-z0-9._-]+)==([A-Za-z0-9.]+)$", pin)
             if not m:  # unpinned entries (cramjam, astropy) aren't layer-exact
                 continue
-            if m.group(1) in self._DERIVED:
+            name = m.group(1)
+            if name in self._DERIVED:
                 derived.append(pin)
                 continue
-            if f'"{pin}"' not in script:
-                missing.append(pin)
+            var = pin_vars.get(name)
+            if var is None:
+                missing.append(name)
+            elif f'"${var}"' not in installs:
+                uninstalled.append(f"{name} (${var})")
+            # Unquoted and single-quoted args are as common as double-quoted
+            # ones here (`fastparquet cramjam`, `obspec`), so anchor on a name
+            # boundary + a version-ish tail instead of a leading quote.
+            if re.search(rf"(?<![\w.-]){re.escape(name)}==\d", script):
+                literal.append(name)
         assert not missing, (
-            f"lambda-extra pins absent from deployment/aws/build_layer.sh: {missing} "
-            "(the layer would ship without them — see issue #218's async-tiff gap)"
+            f"lambda-extra pins not derived in deployment/aws/build_layer.sh: {missing} "
+            "(the layer would ship without them — see issue #218's async-tiff gap; "
+            "fetch each with NAME_PIN=$(lambda_pin <name>))"
+        )
+        assert not uninstalled, (
+            f"lambda-extra pins derived but never installed: {uninstalled} — the layer "
+            'ships without them (issue #218). Pass each as "$NAME_PIN" on a $PIP '
+            "install line."
+        )
+        assert not literal, (
+            f"build_layer.sh hard-codes {literal} — exact pins are single-sourced from "
+            "the lambda extra via lambda_pin (PR #436); a literal pin is a second "
+            "declaration site and will drift"
         )
         assert not derived, (
             f"{derived} is pinned in the lambda extra, but build_layer.sh derives that "
             "spec from [project.dependencies] (issue #322), so the exact pin never "
             "reaches the layer. Either move the pin to [project.dependencies], or "
-            "replace the derivation in build_layer.sh with a literal pin."
+            "derive it from the extra via lambda_pin instead."
         )
+
+    def test_lambda_pin_derivation_resolves_every_exact_pin(self):
+        """Execute the script's ``lambda_pin`` python: its output IS the extra's pin.
+
+        The parity test above matches text; this one runs the actual extraction
+        snippet out of build_layer.sh against the real pyproject.toml, so a
+        broken derivation (renamed table, quoting slip, a name it cannot find)
+        fails here instead of at layer-build time.
+        """
+        import subprocess
+        import sys
+        import tomllib
+
+        script = (REPO_ROOT / "deployment" / "aws" / "build_layer.sh").read_text()
+        m = re.search(r"lambda_pin\(\)\s*\{\s*\$PYTHON -c '(.*?)'", script, re.DOTALL)
+        assert m, "lambda_pin() helper missing from build_layer.sh"
+        code = m.group(1)
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        pins = [
+            p
+            for p in pyproject["project"]["optional-dependencies"]["lambda"]
+            if "==" in p and p.split("==")[0].strip() not in self._DERIVED
+        ]
+        assert pins  # the extra stopped pinning anything: the layer is unpinned
+        for pin in pins:
+            name = pin.split("==")[0].strip()
+            out = subprocess.run(
+                [sys.executable, "-c", code, str(REPO_ROOT / "pyproject.toml"), name],
+                capture_output=True,
+                text=True,
+            )
+            assert out.returncode == 0, f"lambda_pin({name}) failed: {out.stderr}"
+            assert out.stdout.strip() == pin, (
+                f"lambda_pin({name}) derived {out.stdout.strip()!r}, extra declares {pin!r}"
+            )
+
+    @staticmethod
+    def _release(version):
+        """``"0.3.10"`` -> ``(0, 3, 10)``, so pins order numerically not lexically."""
+        return tuple(int(part) for part in version.split("."))
+
+    def test_every_lambda_extra_pin_satisfies_its_core_floor(self):
+        """A ``lambda`` exact pin must not contradict the core floor for the same dist.
+
+        The parity check above compares the pin to build_layer.sh; nothing
+        compared it to ``[project.dependencies]``. A floor bumped past its pin
+        (core ``>=0.3.2`` against extra ``==0.3.1``) makes ``zagg[lambda]``
+        outright unresolvable — an extra carries the base requirements too, so
+        the two specs intersect to nothing — which is why a floor bump and its
+        pin are one atomic change and cannot be landed half each.
+        """
+        import tomllib
+
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        floors = {}
+        for dep in pyproject["project"]["dependencies"]:
+            m = re.match(r"([A-Za-z0-9._-]+)>=([0-9][0-9.]*)$", dep)
+            if m:
+                floors[m.group(1)] = m.group(2)
+        checked = []
+        for pin in pyproject["project"]["optional-dependencies"]["lambda"]:
+            m = re.match(r"([A-Za-z0-9._-]+)==([0-9][0-9.]*)$", pin)
+            if not m or m.group(1) not in floors:
+                continue  # unpinned entries, or layer-only dists with no core floor
+            name, exact = m.group(1), m.group(2)
+            assert self._release(exact) >= self._release(floors[name]), (
+                f"lambda extra pins {name}=={exact}, below the [project.dependencies] "
+                f"floor >={floors[name]} — zagg[lambda] would be unresolvable"
+            )
+            checked.append(name)
+        # Guard the regexes above: a naming/spec drift that matched nothing
+        # would make this test vacuously green.
+        assert "h5coro-hidefix" in checked
 
     def test_derived_specs_still_come_from_project_dependencies(self):
         """The derivation the test above exempts must actually exist and resolve."""

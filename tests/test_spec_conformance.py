@@ -63,7 +63,10 @@ SENTINEL = 2**64 - 1
 #: change is a silent cross-implementation divergence.
 FROZEN_COMBINED = {
     "minimal": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
-    "kitchen_sink": "57c413489b33fd82187072504a51b76dbb6455d357c4702d9bf92f77bcafab31",
+    # kitchen_sink re-pinned under the authalic convention (mortie >=0.9.8,
+    # issue #438): its located point words moved, so the fixture's two
+    # ``*_locations`` arrays -- and only those -- hash differently.
+    "kitchen_sink": "7ee8ad9278eaa6ccbfa95aed978d09768ff0865b569c025b6f8e2b91e46843c7",
     # column/'s LEAF is minimal's, byte for byte — the same literal is the
     # cross-fixture pin that writing a column perturbs nothing.
     "column": "2f4ff37de621de05962ab720cec05fd643757977f1afbd0e859ca588a143b72e",
@@ -87,7 +90,7 @@ FROZEN_ARRAYS = {
     (
         "kitchen_sink",
         "6/h_tdigest_signal_locations",
-    ): "ffd8bcc3be76c43184fd9ce6ddef16e24dba6c5615e302d6a8ad3b3cb603734a",
+    ): "11e0a598b7f695d7fe816ecc853deba86d2006b8470bb94a49acc36db9de8af9",
     (
         "kitchen_sink",
         "6/composition",

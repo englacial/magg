@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
+import re
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -158,6 +160,101 @@ def _granule_entry(rec: dict) -> dict:
         if rec.get(key) is not None:
             entry[key] = rec[key]
     return entry
+
+
+#: Granule-id core for the catalog-time sibling join (issue #425): the
+#: datetime / orbit / sub-orbit-granule / track fields shared between the
+#: products of one acquisition (GEDI01_B_* and GEDI02_A_* of the same
+#: sub-orbit), plus the trailing collection-generation suffix (``V002``) so
+#: pairing is pinned within a product generation (v2<->v2, never across a
+#: release boundary). The product prefix and the release/production fields
+#: between track and generation differ per product and are ignored.
+_SIBLING_ID_RE = re.compile(r"_(\d{13})_(O\d+)_(\d+)_(T\d+)_.*_(V\d+)(?:\.\w+)?$")
+
+#: Unpaired fraction of the PRIMARY catalog above which the pairless warning
+#: escalates (issue #425). An unpaired primary is excluded, so a sibling
+#: catalog queried over a different AOI / time window (or a dropped page)
+#: thins the product silently — per granule that is indistinguishable from a
+#: genuinely missing sibling, in aggregate it is not.
+_PAIRLESS_ALERT_FRACTION = 0.5
+
+
+def sibling_join_key(granule_id: str) -> tuple | None:
+    """The cross-product join key of a granule id, or ``None`` if unkeyed.
+
+    ``(datetime, orbit, sub-orbit granule, track, generation)`` — identical
+    between sibling products of one acquisition, distinct otherwise. ``None``
+    (id does not carry the orbital core) means the granule cannot be paired.
+    """
+    m = _SIBLING_ID_RE.search(granule_id or "")
+    return m.groups() if m is not None else None
+
+
+def _pair_sibling_records(records, sibling_records, asset: str) -> tuple[list, list]:
+    """Catalog-time sibling join (issue #425): one shard map, paired assets.
+
+    Each primary record gaining a sibling match (on :func:`sibling_join_key`)
+    carries the sibling's hrefs under ``assets[asset]`` — the STAC
+    one-item-multiple-assets model, flowing into the shard-map entries via
+    ``_granule_entry``'s existing ``assets`` passthrough. Pairless granules are
+    **excluded and reported**, never silently kept: a primary without a
+    sibling cannot be quality-filtered (the L2A join is core to the flux
+    currency), and a sibling without a primary has no data to contribute.
+
+    The join key deliberately ignores the release/production fields, so two
+    records of one product can share it (a reprocessed sibling, a paginated
+    query returning a granule twice). The join keeps the **first** record on a
+    key — deterministic in catalog order — and reports every record it shadows
+    as ``"duplicate-key"``: a shadowed sibling contributes nothing to the
+    build, and nothing may leave the build silently. Duplicate keys on the
+    PRIMARY side pair to one sibling and are kept (excluding a primary is
+    destructive), but warn.
+
+    Returns ``(paired_records, pairless)`` where ``pairless`` entries are
+    ``{"id": <granule id>, "missing": <asset name | "primary" |
+    "duplicate-key">}``.
+    """
+    sib_by_key: dict = {}
+    pairless: list = []
+    for rec in sibling_records:
+        key = sibling_join_key(rec["id"])
+        if key is None:
+            continue
+        if key in sib_by_key:
+            pairless.append({"id": rec["id"], "missing": "duplicate-key"})
+            continue
+        sib_by_key[key] = rec
+    paired: list = []
+    matched: set = set()
+    duplicate_primaries: list = []
+    for rec in records:
+        key = sibling_join_key(rec["id"])
+        sib = sib_by_key.get(key) if key is not None else None
+        if sib is None:
+            pairless.append({"id": rec["id"], "missing": asset})
+            continue
+        if key in matched:
+            duplicate_primaries.append(rec["id"])
+        matched.add(key)
+        rec = dict(rec)
+        rec["assets"] = {
+            **(rec.get("assets") or {}),
+            asset: {"id": sib["id"], "s3": sib["s3"], "https": sib["https"]},
+        }
+        paired.append(rec)
+    for key, sib in sib_by_key.items():
+        if key not in matched:
+            pairless.append({"id": sib["id"], "missing": "primary"})
+    if duplicate_primaries:
+        logging.warning(
+            "ShardMap.build: %d primary granule(s) share a join key with another "
+            "primary and pair to the SAME %s sibling (kept, not excluded — check "
+            "the primary catalog for duplicates); e.g. %s",
+            len(duplicate_primaries),
+            asset,
+            duplicate_primaries[:5],
+        )
+    return paired, pairless
 
 
 def _to_spherely_polygon(lats, lons):
@@ -475,7 +572,7 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     return _regroup_hits(hit_shards, hit_owners)
 
 
-def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_order):
+def _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order):
     """Inputs for the :func:`_intersect_footprint_cells` fast path, or ``None``.
 
     Engages only on the shape the stored column can answer *exactly*, so a build
@@ -494,6 +591,19 @@ def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_orde
       a cover at *that* order, which the column cannot restate;
     - the grid is HEALPix and the catalog carries the column.
 
+    Takes no records and materializes none (issue #439): the plan is what lets
+    ``build`` intersect first and decode granules only for the rows that survive,
+    so it derives its own record alignment from the catalog's row screen.
+
+    Returns
+    -------
+    tuple or None
+        ``(values, offsets, order, rows, considered)``. ``rows`` maps record
+        index -> table row (``np.flatnonzero`` of the screen, which is exactly
+        the order :meth:`~zagg.catalog.Catalog.granule_records` emits) and
+        ``considered`` is the record count that alignment implies -- the
+        ``total_granules`` the eager path would have reported as ``len(records)``.
+
     Raises
     ------
     ValueError
@@ -504,11 +614,17 @@ def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_orde
         falling through to geometry would hide that the index the operator built
         is useless for this grid. Refuse and say which order to re-index at.
 
-        Also when the catalog has **duplicate granule ids**. The column is
-        aligned to records by id, so a repeated id makes the lookup last-wins and
-        hands every earlier record with that id another granule's footprint --
-        silently, since the shard count stays plausible. Refuse rather than
-        misassign; the geometry path reads each record's own ring and is unaffected.
+        Also when the catalog has **duplicate granule ids**. Alignment is
+        positional (``np.flatnonzero`` of the row screen), so a repeat cannot
+        misdirect a lookup -- there is none -- but it is evidence the table was
+        concatenated or re-keyed, and a column stored beside rows that repeat an
+        id cannot be shown to belong to them. Assigning from it anyway would put
+        one granule's footprint on another under an id that names both, silently,
+        since the shard count stays plausible. Refuse rather than misassign; the
+        geometry path reads each record's own ring and is unaffected. The check
+        stays **table-wide**, not hits-only: it is a statement about the catalog's
+        integrity, so a duplicate among rows this build's AOI would have discarded
+        must refuse the build just as it did before the inversion.
     """
     if chosen != "mortie" or footprint != "swath" or mortie_order is not None:
         return None
@@ -526,18 +642,66 @@ def _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_orde
             f"Catalog.index_footprints(order>={parent_order}), or build against a grid "
             f"with parent_order <= {order}."
         )
-    # ``granule_records`` skips rows with empty or non-polygonal geometry, so
-    # record index != table row; align on the granule id both sides carry.
-    row_of = {gid: i for i, gid in enumerate(catalog.table.column("id").to_pylist())}
-    if len(row_of) != catalog.table.num_rows:
+    import pyarrow.compute as pc
+
+    # ``mode="all"`` counts a null id as its own value, matching the id ->
+    # row dict this replaces (which the pre-#439 plan built from the whole
+    # column, unique-or-not, purely to align records back to rows).
+    distinct = pc.count_distinct(catalog.table.column("id"), mode="all").as_py()
+    if distinct != catalog.table.num_rows:
         raise ValueError(
-            f"catalog has duplicate granule ids ({catalog.table.num_rows - len(row_of)} "
+            f"catalog has duplicate granule ids ({catalog.table.num_rows - distinct} "
             f"repeats over {catalog.table.num_rows} rows); the footprint_cells column is "
-            f"aligned to records by id, so a repeat would hand records another granule's "
-            f"footprint. De-duplicate the catalog, or drop the column to build from geometry."
+            f"matched to rows by position, so a repeated id means the table was concatenated "
+            f"or re-keyed and the stored footprints can no longer be shown to belong to the "
+            f"rows they sit beside -- building from them could put one granule's footprint on "
+            f"another. De-duplicate the catalog, or drop the column to build from geometry."
         )
-    rows = np.fromiter((row_of[r["id"]] for r in records), dtype=np.int64, count=len(records))
-    return values, offsets, order, rows
+    # ``granule_records`` skips rows with empty or non-polygonal geometry and
+    # keeps table order otherwise, so record ``i`` is the ``i``-th surviving
+    # row: the screen's ``flatnonzero`` *is* the record -> row map, and its
+    # popcount is the record count, neither needing a record. Ids no longer
+    # carry the alignment (they cannot -- there are no records yet), but a
+    # repeat still refuses above: it means the column cannot be trusted to
+    # belong to the rows it sits beside.
+    rows = np.flatnonzero(catalog.granule_row_mask()).astype(np.int64, copy=False)
+    return values, offsets, order, rows, int(rows.size)
+
+
+def _hit_records(catalog, rows, shard_to_idx):
+    """Decode granule records for the assigned rows only (issue #439).
+
+    The fast path intersects the stored column before any record exists, so the
+    indices in ``shard_to_idx`` are positions in the records the eager path
+    *would* have built. Take just the rows those indices name, decode that slice,
+    and renumber the assignment onto it -- at clone scale against a regional AOI
+    that is ~2.4k rows decoded instead of ~556k, which is the whole point.
+
+    Returns
+    -------
+    tuple
+        ``(records, shard_to_idx)`` -- records in ascending original-record
+        order, and the same dict with the same keys and per-shard ordering,
+        its values renumbered into ``records``.
+    """
+    if not shard_to_idx:
+        return [], shard_to_idx
+    from zagg.catalog.sources import Catalog
+
+    hits = np.unique(np.concatenate([np.asarray(v, dtype=np.int64) for v in shard_to_idx.values()]))
+    hit_rows = np.asarray(rows, dtype=np.int64)[hits]
+    records = Catalog(catalog.table.take(hit_rows), dict(catalog.metadata or {})).granule_records()
+    if len(records) != hits.size:
+        # Unreachable while the screen and ``granule_records`` share a
+        # predicate; if they ever diverge the renumbering below silently shifts
+        # every granule onto its neighbour's entry, so refuse instead.
+        raise ValueError(
+            f"footprint_cells row screen and granule_records disagree: {hits.size} rows taken "
+            f"yielded {len(records)} records. Drop the footprint_cells column to build from "
+            f"geometry, and report this (issue #439)."
+        )
+    renum = {int(h): i for i, h in enumerate(hits)}
+    return records, {k: [renum[i] for i in v] for k, v in shard_to_idx.items()}
 
 
 def _resolve_mortie_order(mortie_order, grid) -> int:
@@ -908,6 +1072,8 @@ class ShardMap:
         backend: str = "auto",
         mortie_order: int | None = None,
         footprint: str = "swath",
+        sibling_catalog=None,
+        sibling_asset: str = "l2a",
     ) -> "ShardMap":
         """Build a ShardMap from a ``Catalog`` and an output grid.
 
@@ -954,6 +1120,30 @@ class ShardMap:
                 ``beams.py``); remove it once native per-beam CMR geometry, the
                 memory-handling robustness in #66, or data virtualization (#97)
                 lands.
+        sibling_catalog : Catalog, optional
+            Paired-asset sibling product (issue #425), e.g. the GEDI02_A
+            catalog beside a GEDI01_B primary. Granules are joined at build
+            time on :func:`sibling_join_key` (the shared orbital id core,
+            pinned within a product generation); each paired entry carries the
+            sibling's hrefs under ``assets[sibling_asset]``, spatial
+            intersection runs once on the primary footprints (the products
+            share them). **Pairless granules are excluded and reported**:
+            ``metadata["pairless"]`` lists ``{id, missing}`` for every primary
+            without a sibling, sibling without a primary, and sibling shadowed
+            by an earlier record on the same join key (``"duplicate-key"``),
+            and a build-time warning fires when the list is non-empty. The
+            sibling catalog is taken as authoritative, so it **must be queried
+            over the same AOI and time window as the primary** — a narrower
+            one reports genuinely-paired acquisitions as missing and thins the
+            product; past ``_PAIRLESS_ALERT_FRACTION`` of the primary catalog
+            the warning escalates to name that cause. A paired build always
+            takes the eager/geometry path: pairing filters the record list,
+            which the ``footprint_cells`` fast path cannot follow (its
+            alignment is positional over the raw table -- issue #439), so the
+            stored-index plan is skipped even on an indexed catalog.
+        sibling_asset : str
+            Asset key the sibling's hrefs are stored under (default ``"l2a"``);
+            matches the ``data_source.assets`` name the reader joins on.
 
         Returns
         -------
@@ -975,10 +1165,52 @@ class ShardMap:
         granule in shards the geometry path misses. A column **coarser** than the
         grid's ``parent_order`` raises rather than answering (see
         :func:`_footprint_cells_plan`).
+
+        That path also **materializes no granule records until after the
+        intersection** (issue #439). Decoding every row's WKB and asset map ran
+        ~25 s of a 29.5 s build over the 555,867-granule ATL03 clone against a
+        California AOI, to feed an intersection that assigned 2,357 of them; the
+        stored column is already table-row-ordered, so the build intersects on it
+        and then decodes only the rows it kept. The manifest is unchanged --
+        ``total_granules`` still counts the records *considered* (the whole
+        post-screen catalog), which :meth:`~zagg.catalog.Catalog.granule_row_mask`
+        supplies without decoding any.
         """
         if footprint not in ("swath", "beams"):
             raise ValueError(f"footprint must be 'swath' or 'beams' (got {footprint!r})")
-        records = catalog.granule_records()
+        # Catalog-time sibling join (issue #425): pair before any intersection
+        # so the geometry backends see only paired records; pairless granules
+        # are excluded and reported. Pairing FILTERS the record list, which the
+        # stored-index fast path cannot follow -- its alignment is positional
+        # over the raw catalog table (issue #439) -- so a paired build skips
+        # the plan below and takes the eager/geometry path.
+        pairless: list | None = None
+        paired_records: list | None = None
+        if sibling_catalog is not None:
+            paired_records, pairless = _pair_sibling_records(
+                catalog.granule_records(), sibling_catalog.granule_records(), sibling_asset
+            )
+            if pairless:
+                logging.warning(
+                    "ShardMap.build: %d pairless granule(s) excluded from the build "
+                    "(no %s sibling / no primary); e.g. %s",
+                    len(pairless),
+                    sibling_asset,
+                    [p["id"] for p in pairless[:5]],
+                )
+                unpaired = sum(1 for p in pairless if p["missing"] == sibling_asset)
+                n_primary = len(paired_records) + unpaired
+                if n_primary and unpaired > _PAIRLESS_ALERT_FRACTION * n_primary:
+                    logging.warning(
+                        "ShardMap.build: %d of %d primary granules (%.0f%%) have no %s "
+                        "sibling and are EXCLUDED — check that the sibling catalog was "
+                        "queried over the same AOI and time window as the primary "
+                        "(a mis-scoped sibling query thins the product silently)",
+                        unpaired,
+                        n_primary,
+                        100.0 * unpaired / n_primary,
+                        sibling_asset,
+                    )
         # Product short-name drives beam decomposition (collection like "ATL03_007").
         product = ((catalog.metadata or {}).get("collection") or "").split("_")[0].upper()
         if footprint == "beams":
@@ -1005,14 +1237,44 @@ class ShardMap:
         if chosen not in _BACKENDS:
             raise ValueError(f"unknown backend: {backend!r} (resolved to {chosen!r})")
 
-        t0 = time.perf_counter()
         # Fast path (issue #396): an indexed catalog already carries every
         # granule's MOC, so the build is set algebra against the AOI with no
         # geometry work. Resolved before the geometry backends because it is the
         # same mortie intersection they would run, minus the cover.
-        plan = _footprint_cells_plan(catalog, records, grid, chosen, footprint, mortie_order)
+        #
+        # Inside the timer, as it was before the inversion: ``build_wall_s`` has
+        # always spanned the plan as well as the intersection, and the plan is
+        # where the record -> row alignment lives (an id -> row dict then, the
+        # ``granule_row_mask`` screen now -- 0.47 s at clone scale). Timing only
+        # the intersection would make this branch's number incomparable with the
+        # ``build_wall_s`` already recorded in existing manifests. Two segments
+        # rather than one span because the geometry path's ``granule_records``
+        # sits between them and has always been outside (issue #439).
+        t0 = time.perf_counter()
+        # A paired build never plans: pairing filtered the records, and the
+        # plan's positional table alignment cannot represent that (issue #425).
+        plan = (
+            None
+            if paired_records is not None
+            else _footprint_cells_plan(catalog, grid, chosen, footprint, mortie_order)
+        )
+        plan_wall = time.perf_counter() - t0
+        # Records are the fast path's whole remaining cost -- shapely-parsing
+        # every row's WKB and ``to_pylist``-ing the nested assets column ran ~25 s
+        # of a 29.5 s clone-scale build, to feed an intersection that discards
+        # 99.6% of them (issue #439). So decode them AFTER the intersection
+        # there, for its hit rows only; every other path needs them all up front.
+        if paired_records is not None:
+            records = paired_records
+        elif plan is not None:
+            records = None
+        else:
+            records = catalog.granule_records()
+        considered = plan[4] if plan is not None else len(records)
+
+        t0 = time.perf_counter()
         if plan is not None:
-            values, offsets, mortie_order, rows = plan
+            values, offsets, mortie_order, rows, _ = plan
             shard_to_idx = _intersect_footprint_cells(rows, values, offsets, grid, all_shards)
         elif chosen == "mortie":
             mortie_order = _resolve_mortie_order(mortie_order, grid)
@@ -1032,7 +1294,11 @@ class ShardMap:
                 footprint=footprint,
                 product=product,
             )
-        wall = time.perf_counter() - t0
+        wall = plan_wall + (time.perf_counter() - t0)
+        if plan is not None:
+            # Outside the timer on purpose: ``build_wall_s`` covers the plan and
+            # the intersection, and record decode has never been part of it.
+            records, shard_to_idx = _hit_records(catalog, rows, shard_to_idx)
 
         from zagg.catalog.sources import FOOTPRINT_CELLS_ORDER
 
@@ -1042,7 +1308,7 @@ class ShardMap:
             **(catalog.metadata or {}),
             "backend": chosen,
             "footprint": footprint,
-            "total_granules": len(records),
+            "total_granules": considered,
             # Distinct granules the exact intersection ASSIGNED to some shard —
             # ``total_granules`` above is the catalog records CONSIDERED (the
             # input, often a conservative bbox-prefilter superset), and reading
@@ -1054,6 +1320,12 @@ class ShardMap:
         }
         if chosen == "mortie":
             meta["mortie_order"] = mortie_order
+        if pairless is not None:
+            # Present (possibly empty) exactly when a sibling join ran, so the
+            # caller can distinguish "nothing dropped" from "never joined";
+            # rides the manifest JSON as part of the build result.
+            meta["pairless"] = pairless
+            meta["sibling_asset"] = sibling_asset
         if plan is not None or FOOTPRINT_CELLS_ORDER in meta:
             # Says whether the stored index answered *this* build, which the
             # catalog's own ``footprint_cells_order`` (carried in via the
@@ -1219,7 +1491,13 @@ class ShardMap:
                         f"map, but the catalog is missing {len(missing)} of them (e.g. "
                         f"{missing[:5]}{extra})"
                     )
-                sub_records = [records_by_id[gid] for gid in ids]
+                # Sibling assets (issue #425) live on the MAP's entries, not
+                # the catalog's records — carry them through the refine so a
+                # paired map stays paired at the finer order.
+                sub_records = [
+                    {**records_by_id[gid], **({"assets": g["assets"]} if "assets" in g else {})}
+                    for gid, g in zip(ids, gran_list)
+                ]
                 descendants = set(
                     int(s) for s in generate_morton_children(int(shard_key), target_order)
                 )
@@ -1366,4 +1644,4 @@ class ShardMap:
         return cls(d["grid_signature"], shard_keys, granules, d.get("metadata", {}), aoi_mask)
 
 
-__all__ = ["ShardMap"]
+__all__ = ["ShardMap", "sibling_join_key"]

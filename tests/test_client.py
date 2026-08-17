@@ -284,6 +284,24 @@ class TestDispatch:
             "granules": [_rec(3)],
         }
 
+    def test_pairless_report_stays_out_of_the_cell_submap(self, catalog):
+        # The sibling join's exclusion report (issue #425) holds one entry per
+        # unpaired granule — unbounded in the catalog size — so it must not
+        # ride every cell event: it counts against the 256 KB async cap, whose
+        # only remedy is silently dropping the whole submap block, and
+        # ``write_leaf_submap`` strips it again on the way out anyway (review
+        # finding, PR #432).
+        catalog["metadata"]["pairless"] = [{"id": f"g{i}", "missing": "l2a"} for i in range(500)]
+        catalog["metadata"]["sibling_asset"] = "l2a"
+        stub = StubLambdaClient()
+        _run(catalog, client=stub).dispatch(shard_keys=[_WORDS[1]]).results()
+        (_, _, event) = stub.cell_events()[0]
+        meta = event["submap"]["metadata"]
+        assert "pairless" not in meta
+        # The small identity fields still ride along.
+        assert meta["sibling_asset"] == "l2a"
+        assert meta["short_name"] == "ATL06"
+
     def test_hive_setup_handshake_precedes_cells(self, catalog):
         stub = StubLambdaClient()
         _run(catalog, client=stub).dispatch().wait(timeout=10)
@@ -645,6 +663,30 @@ class TestRunnerParity:
         href = _rec(3)["s3"] if driver == "s3" else _rec(3)["https"]
         assert client_events[_WORDS[1]]["granule_urls"] == [href]
         assert agg_events[_WORDS[1]]["granule_urls"] == [href]
+
+    def test_paired_asset_entries_reach_both_paths(self, tmp_path, monkeypatch):
+        """A paired-asset map's sibling hrefs (issue #425) ride the facade's
+        cell events too: the agg path resolved through
+        ``_resolve_granule_entries`` while the client still resolved bare urls,
+        so every paired run would have failed on the missing sibling handle
+        (review finding, PR #432)."""
+        paired = _catalog_dict()
+        sib = {"id": "s4", "s3": "s3://bucket/s4.h5", "https": "https://h/s4.h5"}
+        paired["granules"] = [[{**_rec(4), "assets": {"l2a": sib}}], [_rec(3)], [_rec(1)]]
+        path = tmp_path / "paired.json"
+        path.write_text(json.dumps(paired))
+
+        agg_events = self._agg_cell_events(str(path), monkeypatch)
+        stub = StubLambdaClient()
+        _run(paired, client=stub).dispatch().results()
+        client_events = {e["shard_key"]: e for _, _, e in stub.cell_events()}
+
+        entry = {"url": _rec(4)["s3"], "assets": {"l2a": sib["s3"]}}
+        assert client_events[_WORDS[0]]["granule_urls"] == [entry]
+        assert agg_events[_WORDS[0]]["granule_urls"] == [entry]
+        # Single-asset cells stay plain url strings on both paths.
+        assert client_events[_WORDS[1]]["granule_urls"] == [_rec(3)["s3"]]
+        assert agg_events[_WORDS[1]]["granule_urls"] == [_rec(3)["s3"]]
 
 
 # -- dispatch manifest (issue #327 phase 2) ------------------------------------
