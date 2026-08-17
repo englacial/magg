@@ -690,6 +690,68 @@ class TestChunkMapCacheEviction:
                 build_chunk_map(h5obj, p)
             assert len(h5obj.cache) == baseline
 
+    def test_pooled_read_fn_defers_eviction_under_concurrency(self):
+        # Review finding on PR #462: read_fn's lazy map builds run across
+        # ``read_workers`` threads sharing one h5obj (_read_paths_pooled), and
+        # h5coro's cached ioRequest reads ``self.cache`` OUTSIDE cache_locks --
+        # so evicting there raced concurrent readDatasets (KeyError inside
+        # ioRequest, or a silently degraded H5Promise parse). read_fn now only
+        # records its lines; read_group drops them after the pool joins. This
+        # drives the real seam: read_fn hyperslices concurrently with plain
+        # readDatasets on one handle, with the switch interval tightened.
+        import sys
+        import threading
+        import time
+
+        from zagg.index.inline import _evict_deferred_lines
+
+        mapped = [f"/gt1l/heights/{n}" for n in ("h_ph", "lat_ph", "lon_ph", "delta_time")]
+        other = [f"/gt2l/heights/{n}" for n in ("h_ph", "lat_ph", "lon_ph", "delta_time")]
+        lo, hi = 300, 1500  # spans several 256-photon chunks, not chunk-aligned
+        ref = _open_fixture()
+        expect = {p: ref.readDatasets([p])[p] for p in mapped + other}
+
+        h5obj = _open_fixture_small_lines()
+        errors: list = []
+        deferred_seen: set = set()
+
+        def mapped_read(read_fn, path):
+            try:
+                got = read_fn(path, hyperslice=[(lo, hi)])
+                assert np.array_equal(got, expect[path][lo:hi]), path
+            except Exception as exc:
+                errors.append((path, repr(exc)))
+
+        def direct_read(path):
+            try:
+                assert np.array_equal(h5obj.readDatasets([path])[path], expect[path]), path
+            except Exception as exc:
+                errors.append((path, repr(exc)))
+
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-7)
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not errors:
+                # A fresh read_fn per round: its map cache starts empty, so the
+                # lazy builds (and their deferred lines) happen again.
+                read_fn = InlineIndex()._chunk_aligned_read_fn(h5obj, planned=True)
+                threads = [threading.Thread(target=mapped_read, args=(read_fn, p)) for p in mapped]
+                threads += [threading.Thread(target=direct_read, args=(p,)) for p in other]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                # Single-threaded again -- the point read_group evicts at.
+                lines = set(read_fn.deferred_lines)
+                deferred_seen |= lines
+                _evict_deferred_lines(h5obj, read_fn.deferred_lines)
+                assert not lines & set(h5obj.cache)  # every deferred line dropped
+        finally:
+            sys.setswitchinterval(interval)
+        assert not errors
+        assert deferred_seen  # the walks really did strand lines to evict
+
     def test_lines_touched_logged_at_debug(self, caplog):
         # Issue #460 phase 3: each map build reports the walk's cache-line
         # footprint at DEBUG, so a pathological granule is visible in logs.
@@ -1033,9 +1095,9 @@ class TestSelectionReads:
         built = []
         orig = inline_mod.build_chunk_map
 
-        def spy(h5obj, path):
+        def spy(h5obj, path, **kwargs):  # kwargs: evict_into (issue #460)
             built.append(path)
-            return orig(h5obj, path)
+            return orig(h5obj, path, **kwargs)
 
         monkeypatch.setattr(inline_mod, "build_chunk_map", spy)
         return built
