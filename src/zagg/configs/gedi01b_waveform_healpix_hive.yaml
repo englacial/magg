@@ -77,18 +77,26 @@ data_source:
         left: "/{group}/shot_number"
         right: "/{group}/shot_number"
   filters:
+    # Two VALIDITY gates only -- geolocation validity and saturation. The L2A
+    # retrieval-fitness gates (quality_flag == 1, sensitivity >= 0.9) are
+    # deliberately NOT here (espg ruling 2026-08-17, refs #425 / issue #422):
+    #   - They gate GROUND-RETRIEVAL fitness, not waveform validity, and
+    #     quality_flag already contains a sensitivity test internally, so the
+    #     AND is brutally tight -- measured on a real SERC granule, 1.61% of
+    #     shots pass quality_flag and 0 of 434 in-shard shots survive the
+    #     joint stack.
+    #   - zagg's own ratified clip policy IS the signal criterion (issue #422:
+    #     the declared false-positive operating point against each shot's
+    #     noise model), so a second, differently-derived signal gate would
+    #     double-count.
+    #   - Sensitivity gating biases the flux store against low-SNR /
+    #     dense-canopy shots, asymmetrically vs the ATL03 products.
+    # Sensitivity stays per-shot recoverable downstream through the L2A join
+    # on shot_number.
     - level: shots
       dataset: "/{group}/geolocation/degrade"
       op: eq
       value: 0
-    - asset: l2a
-      dataset: "/{group}/quality_flag"
-      op: eq
-      value: 1
-    - asset: l2a
-      dataset: "/{group}/sensitivity"
-      op: ge
-      value: 0.9
     - asset: l2a
       dataset: "/{group}/rx_assess/rx_clipbin_count"   # saturation counter: 0 = unclipped
       op: le
