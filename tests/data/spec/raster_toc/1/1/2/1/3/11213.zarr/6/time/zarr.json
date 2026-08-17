@@ -1,0 +1,52 @@
+{
+  "shape": [
+    3
+  ],
+  "data_type": "uint64",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        3
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": 0,
+  "codecs": [
+    {
+      "name": "bytes",
+      "configuration": {
+        "endian": "little"
+      }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 3,
+        "checksum": false
+      }
+    }
+  ],
+  "attributes": {
+    "temporal": {
+      "spec": "zagg-toc/1",
+      "shape": "axis",
+      "epoch": "1850-01-01T00:00:00",
+      "timescale": "gps-continuous",
+      "quantum_start_ns": 2147483648,
+      "quantum_end_ns": 4294967296
+    }
+  },
+  "dimension_names": [
+    "time"
+  ],
+  "zarr_format": 3,
+  "node_type": "array",
+  "storage_transformers": []
+}

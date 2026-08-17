@@ -1,13 +1,14 @@
 """Generate the committed spec-conformance fixtures with zagg's REAL writers.
 
 The `docs/specification.md` §7 fixtures (issue #340), under
-``tests/data/spec/``: two tiny hive stores, each one shard leaf written by
-the production write path — ``hive.ensure_manifest`` +
+``tests/data/spec/``: tiny hive stores, each one shard leaf written by the
+production write path — ``hive.ensure_manifest`` +
 ``hive.process_and_write_hive`` (leaf template, sharded dense + ragged
-writes, coverage sidecar, commit stamp) — plus one MANIFEST-ONLY pyramid
-declaration written by the production declaration paths (issue #382, no
-leaf beneath it). Each carries a committed ``*.expected.json`` recording the
-decoded values and the §5 O11 content hashes.
+writes, coverage sidecar, commit stamp), or its raster twin
+``processing.raster.process_and_write_raster_hive`` — plus one MANIFEST-ONLY
+pyramid declaration written by the production declaration paths (issue #382,
+no leaf beneath it). Each carries a committed ``*.expected.json`` recording
+the decoded values and the §5 O11 content hashes.
 ``tests/test_spec_conformance.py`` asserts
 the fixtures against the shipping readers AND against spec-text-only
 decoders, so the spec, the fixtures, and the reader cannot drift apart
@@ -58,6 +59,18 @@ conformance tests assert decoded values, never object bytes.
   it on purpose — the block is a template-time artifact, decodable from
   ``morton_hive.json`` alone; the ``/2`` artifacts a fleet writes are the
   ``column/`` fixture's job (issue #383 — sweep-side levels are issue #384).
+- ``raster_toc/`` — the §8 temporal-declaration surface (issue #443): a
+  RASTER ``(time, cells)`` hive leaf (two bands + ``morton`` + ``time``, the
+  one unsharded fixture — raster never shards) whose ``time`` coordinate is
+  ``uint64`` toc words carrying the ``temporal`` attrs block and no CF
+  ``units``/``calendar``. Its three timesteps commit BOTH word variants: two
+  multi-member acquisition groups become conservative RANGE words (one from
+  member instants seconds apart, one from the STAC ``start_datetime``/
+  ``end_datetime`` pair) and a single-member group stays an exact TIMESTAMP.
+  Written through ``processing.raster.process_and_write_raster_hive`` with
+  only the COG *sampling* faked — a committed fixture must regenerate with
+  no network and no GDAL. The other four fixtures, which carry no
+  ``temporal`` key anywhere, are the absent-key ⇒ legacy pin.
 
 STALE BY DESIGN: ``minimal/`` and ``kitchen_sink/`` were committed before
 issue #382 and their ``morton_hive.json`` still carries the pre-#382
@@ -670,6 +683,183 @@ def build_pyramid(out: Path) -> None:
     print(f"{out.name}: manifest-only, {len(levels)} level entries, /1 actuals preserved")
 
 
+#: The ``raster_toc/`` fixture's acquisition groups (§8, issue #443). Three
+#: timesteps that between them exercise both toc word variants: two
+#: multi-member datatakes (a RANGE word — one derived from member instants
+#: seconds apart, one from the STAC ``start_datetime``/``end_datetime`` pair)
+#: and one single-member acquisition (an exact TIMESTAMP word).
+RASTER_GRANULES = [
+    {
+        "id": "dt-1-a",
+        "assets": {"red": "s3://fixture/dt1a_red.tif", "scl": "s3://fixture/dt1a_scl.tif"},
+        "datetime": "2025-06-15T15:06:40+00:00",
+        "time_key": "dt-1",
+    },
+    {
+        "id": "dt-1-b",
+        "assets": {"red": "s3://fixture/dt1b_red.tif", "scl": "s3://fixture/dt1b_scl.tif"},
+        "datetime": "2025-06-15T15:06:47+00:00",
+        "time_key": "dt-1",
+    },
+    {
+        "id": "dt-2-a",
+        "assets": {"red": "s3://fixture/dt2a_red.tif", "scl": "s3://fixture/dt2a_scl.tif"},
+        "datetime": "2025-06-18T15:06:40+00:00",
+        "time_key": "dt-2",
+        "time_start": "2025-06-18T15:06:38+00:00",
+        "time_end": "2025-06-18T15:06:49+00:00",
+    },
+    {
+        "id": "dt-3-a",
+        "assets": {"red": "s3://fixture/dt3a_red.tif", "scl": "s3://fixture/dt3a_scl.tif"},
+        "datetime": "2025-06-21T15:06:40+00:00",
+        "time_key": "dt-3",
+    },
+]
+#: The raster fixture's bands: the shipped Sentinel-2 pair, trimmed to two.
+RASTER_BANDS = {
+    "red": {"asset": "red", "dtype": "uint16", "fill_value": 0, "scale": 0.0001, "offset": -0.1},
+    "scl": {"asset": "scl", "dtype": "uint8", "fill_value": 0},
+}
+
+
+def _raster_slab(t_idx: int, n_cells: int):
+    """One deterministic ``(cells,)`` slab per band, with fill holes.
+
+    Cells whose ordinal is congruent to the timestep mod 5 stay at the band
+    fill — pull-NN leaves a cell outside the source footprint untouched, so a
+    reader must not assume every band row is populated.
+    """
+    ordinals = np.arange(n_cells)
+    valid = (ordinals % 5) != (t_idx % 5)
+    red = np.where(valid, 1000 + 37 * t_idx + ordinals, 0).astype(np.uint16)
+    scl = np.where(valid, 4 + (ordinals % 3), 0).astype(np.uint8)
+    return {"red": red, "scl": scl}, valid
+
+
+def build_raster_toc(out: Path) -> None:
+    """The §8 ``raster_toc/`` fixture: a toc-declared ``(time, cells)`` leaf.
+
+    Written through the production raster hive seam
+    (``processing.raster.process_and_write_raster_hive`` — leaf template,
+    per-timestep slab streaming, coverage sidecar, commit stamp, O11
+    hashing), with only the COG **sampling** faked: the fixture pins the
+    stored bytes and the time-axis declaration, not the pull-NN arithmetic
+    (``tests/test_raster.py`` owns that), and a committed fixture must never
+    need network or GDAL to regenerate.
+    """
+    import zarr
+
+    from zagg import hive
+    from zagg.config import load_config_from_dict
+    from zagg.grids import from_config
+    from zagg.grids.morton import morton_word
+    from zagg.processing import raster as raster_mod
+    from zagg.time_axis import decode_time_axis, time_axis_attrs
+
+    cfg = load_config_from_dict(
+        {
+            "data_source": {"reader": "raster", "bands": RASTER_BANDS, "nodata": 0},
+            "output": {
+                "grid": {
+                    "type": "healpix",
+                    "parent_order": 4,
+                    "child_order": 6,
+                    "chunk_inner": 5,
+                    # Raster never shards (§8/#247): K = 4 inner chunks of 4
+                    # cells, one object per (timestep, chunk).
+                    "sharded": False,
+                },
+                "store_layout": "hive",
+                "time_encoding": "toc",
+            },
+        }
+    )
+    grid = from_config(cfg)
+    shard = morton_word(SHARD_KEY)
+    n_cells = grid.cells_per_shard
+
+    def _fake_process_raster_shard(
+        _grid, shard_key, granules, _config, time_index, *, on_slab=None, occupied_out=None, **_kw
+    ):
+        cells = np.asarray(_grid.children(int(shard_key)), dtype=np.uint64)
+        occupied = np.zeros(n_cells, dtype=bool)
+        for t_idx in sorted(time_index.values()):
+            slab, valid = _raster_slab(t_idx, n_cells)
+            occupied |= valid
+            on_slab(t_idx, slab)
+        if occupied_out is not None:
+            occupied_out.append(cells[occupied])
+        return {}, {
+            "shard_key": shard_key,
+            "granule_count": len(granules),
+            "skipped": 0,
+            "timesteps": len(time_index),
+            "raster_bytes_read": 0,
+            "raster_px_decoded": 0,
+            "raster_px_sampled": 0,
+        }
+
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    root = str(out)
+    hive.ensure_manifest(
+        root,
+        hive.build_manifest(grid, dataset={"short_name": "SPEC_FIXTURE_RASTER", "version": "1"}),
+    )
+    original = raster_mod.process_raster_shard
+    raster_mod.process_raster_shard = _fake_process_raster_shard
+    try:
+        meta = raster_mod.process_and_write_raster_hive(
+            shard, RASTER_GRANULES, grid, root, cfg, store_kwargs={}
+        )
+    finally:
+        raster_mod.process_raster_shard = original
+    assert meta.get("leaf_written"), meta
+
+    leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
+    store = zarr.storage.LocalStore(str(out / leaf_rel))
+    group = zarr.open_group(store, path=grid.group_path, mode="r", zarr_format=3)
+    words = np.asarray(group["time"][:], dtype=np.uint64)
+    attrs = dict(group["time"].attrs)
+    assert attrs == time_axis_attrs("toc"), attrs
+    lo, hi = decode_time_axis(words, attrs)
+    expected = {
+        "shard": SHARD_KEY,
+        "leaf": leaf_rel,
+        "group": grid.group_path,
+        "shard_order": 4,
+        "chunk_order": 5,
+        "cell_order": 6,
+        "cells_per_chunk": grid.cells_per_chunk,
+        "cells_per_shard": n_cells,
+        "time_encoding": "toc",
+        # The ``time`` array's attrs verbatim: the §8 declaration and
+        # nothing else (no CF units/calendar under this encoding).
+        "time_attrs": attrs,
+        # uint64 words as decimal strings — JSON numbers cannot carry them.
+        "time_words": [str(int(w)) for w in words],
+        # What a conforming decode yields: ns since the Unix epoch, ``end``
+        # exclusive for a range and equal to ``start`` for a timestamp.
+        "time_bounds_ns": [
+            [str(int(bound.astype("int64"))) for bound in pair] for pair in zip(lo, hi, strict=True)
+        ],
+        # The REAL acquisition envelopes the stored words must contain — the
+        # §8 conservative-containment claim, pinned on committed bytes.
+        "acquisitions": [
+            {"key": "dt-1", "start": "2025-06-15T15:06:40", "end": "2025-06-15T15:06:47"},
+            {"key": "dt-2", "start": "2025-06-18T15:06:38", "end": "2025-06-18T15:06:49"},
+            {"key": "dt-3", "start": "2025-06-21T15:06:40", "end": "2025-06-21T15:06:40"},
+        ],
+        "morton": [str(int(w)) for w in group["morton"][:]],
+        "bands": {name: group[name][:].tolist() for name in RASTER_BANDS},
+        "content_hashes": _o11_hashes(str(out / leaf_rel)),
+    }
+    (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
+    print(f"{out.name}: leaf {leaf_rel}, {len(words)} timesteps, {n_cells} cells")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -692,6 +882,7 @@ def main() -> None:
         "column": lambda: build(args.out / "column", kitchen_sink=False, pyramid={"overviews": 5}),
         "pyramid": lambda: build_pyramid(args.out / "pyramid"),
         "flux": lambda: build(args.out / "flux", kitchen_sink=False, flux=True),
+        "raster_toc": lambda: build_raster_toc(args.out / "raster_toc"),
     }
     unknown = set(args.only or ()) - set(builders)
     if unknown:
