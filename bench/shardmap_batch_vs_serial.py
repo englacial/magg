@@ -238,13 +238,14 @@ def _measure_child(name, path, order, block):
     res_load = _resident_mb()
     if path == "cells":
         # Both halves of the stored-index build path are timed: resolving the
-        # plan (which includes the id -> table-row alignment ``build`` pays
-        # every time) and the blocked ``mocs_and``/``mocs_to_orders`` batch
-        # itself. Only ``index_footprints`` above is outside, because only it
-        # is one-time.
+        # plan (which since #439 carries the record -> table-row alignment as
+        # ``granule_row_mask``'s whole-table shapely screen, the term ``build``
+        # pays every time in place of the id lookup it used to) and the blocked
+        # ``mocs_and``/``mocs_to_orders`` batch itself. Only ``index_footprints``
+        # above is outside, because only it is one-time.
         def fn(records, grid, all_shards, order):  # unused args: the shared arm signature
-            plan = shardmap._footprint_cells_plan(cat, records, grid, "mortie", "swath", None)
-            values, offsets, _order, rows = plan
+            plan = shardmap._footprint_cells_plan(cat, grid, "mortie", "swath", None)
+            values, offsets, _order, rows, _considered = plan
             return shardmap._intersect_footprint_cells(rows, values, offsets, grid, all_shards)
     else:
         fn = _intersect_serial if path == "serial" else shardmap._intersect_mortie
