@@ -66,8 +66,10 @@ class TestStreamingConfig:
         assert get_streaming(_config()) is None
 
     def test_block_defaults_buffer(self):
+        # 20 since issue #474 (was 50): the pre-flush buffer is the
+        # obs-proportional resident term that OOM'd fat shards.
         assert get_streaming(_config(streaming={})) == {
-            "buffer_granules": 50,
+            "buffer_granules": 20,
             "mode": "merge",
             "block_bytes": None,
         }
@@ -82,7 +84,7 @@ class TestStreamingConfig:
     def test_explicit_block_bytes(self):
         # issue #474: the fold-regime threshold is reachable from config.
         assert get_streaming(_config(streaming={"mode": "spill", "block_bytes": 1 << 30})) == {
-            "buffer_granules": 50,
+            "buffer_granules": 20,
             "mode": "spill",
             "block_bytes": 1 << 30,
         }

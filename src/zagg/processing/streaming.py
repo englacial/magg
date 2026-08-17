@@ -96,7 +96,7 @@ def get_streaming(config: PipelineConfig) -> dict | None:
     if block is None:
         return None
     if not isinstance(block, dict):
-        raise ValueError("aggregation.streaming must be a mapping, e.g. {buffer_granules: 50}")
+        raise ValueError("aggregation.streaming must be a mapping, e.g. {buffer_granules: 20}")
     unknown = set(block) - {"buffer_granules", "mode", "block_bytes"}
     if unknown:
         raise ValueError(
@@ -105,7 +105,11 @@ def get_streaming(config: PipelineConfig) -> dict | None:
             f"were the #260 arena knobs, removed after the issue #217 fleet A/B refuted "
             f"the arena — use mode: spill for the disk-backed path.)"
         )
-    buffer_granules = block.get("buffer_granules", 50)
+    # 20 (issue #474; was 50): the pre-flush buffer is the obs-proportional
+    # resident term that OOM'd obs-dense shards — worker memory tracks n_obs,
+    # and up to buffer_granules granules of post-filter rows sit in RAM before
+    # the first flush. 20 drops that term ~60% on the CA o9 fat shards.
+    buffer_granules = block.get("buffer_granules", 20)
     if not isinstance(buffer_granules, int) or buffer_granules < 1:
         raise ValueError(
             f"aggregation.streaming.buffer_granules must be a positive int "
