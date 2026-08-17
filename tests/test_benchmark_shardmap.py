@@ -61,13 +61,13 @@ def resolve_aoi_temporal_cmr(sm_meta: dict) -> tuple[dict, dict, dict]:
     )
 
 
-pytestmark = [
-    pytest.mark.slow,
-    pytest.mark.skipif(
-        os.environ.get("ZAGG_BENCHMARK_DRIFT") != "1",
-        reason="set ZAGG_BENCHMARK_DRIFT=1 to run the CMR shard-map drift check",
-    ),
-]
+#: The network gate is the drift check's own, not the module's (it was
+#: module-level while the drift check was the only test here): the issue #444
+#: re-pin-driver tests below rebuild from the committed catalogs and need no CMR.
+needs_cmr = pytest.mark.skipif(
+    os.environ.get("ZAGG_BENCHMARK_DRIFT") != "1",
+    reason="set ZAGG_BENCHMARK_DRIFT=1 to run the CMR shard-map drift check",
+)
 
 
 def _containing_shard(parent_grid, shard_key: int) -> int:
@@ -101,6 +101,8 @@ def _config_for_shardmap(sm_key: str) -> Path:
     raise AssertionError(f"no target references shardmap '{sm_key}'")
 
 
+@pytest.mark.slow
+@needs_cmr
 @pytest.mark.parametrize("sm_key", list(MANIFEST["shardmaps"]))
 def test_pinned_shardmap_no_drift(sm_key):
     from zagg.catalog import load_polygon, polygon_to_bbox
@@ -170,3 +172,92 @@ def test_pinned_shardmap_no_drift(sm_key):
         f"{sm_key}: densest granule count drifted {pinned_n} -> {n} "
         f"(rebuilt densest shard {key}). Re-pin the shard map + targets.json."
     )
+
+
+# -- the deliberate re-pin driver (issue #444) --------------------------------
+#
+# ``tools/repin_benchmark_shardmaps.py`` is the counterpart of the drift check
+# above: the guard detects an accidental move, the driver makes a deliberate
+# one. It imports the guard's recipe helpers, so these tests pin the parts the
+# guard does not exercise -- the pruning, the pin write-back, and the claim the
+# driver exists to support: that it reproduces the PR #441 artifacts from the
+# committed catalogs.
+
+OFFLINE_PINS = [k for k, v in MANIFEST["shardmaps"].items() if v.get("catalog_parquet")]
+
+
+def _driver():
+    """The re-pin driver, imported from ``tools/`` (not an installed module)."""
+    sys.path.insert(0, str(REPO / "tools"))
+    import repin_benchmark_shardmaps
+
+    return repin_benchmark_shardmaps
+
+
+def _without_volatile(text: str, volatile) -> str:
+    """A written map's text minus the metadata lines a rebuild legitimately moves."""
+    return "".join(
+        line
+        for line in text.splitlines(keepends=True)
+        if not any(f'"{k}"' in line for k in volatile)
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("sm_key", OFFLINE_PINS)
+def test_offline_pin_reproduces_committed_map(sm_key, tmp_path):
+    """The driver reproduces the PR #441 artifacts from the committed catalogs.
+
+    The acceptance test issue #444 asks for, and the reason it can only cover
+    the ``catalog_parquet`` (88S ring) entries: the NEON trio rebuilds from CMR
+    by design -- an ATL03 footprint quad blankets the whole NEON box, so a local
+    full-catalog snapshot over-includes (``tests/data/benchmark/README.md``).
+
+    Byte-for-byte over the whole written manifest -- every granule record,
+    ``shard_keys``, ``grid_signature``, and the metadata the build derives --
+    except the two keys a faithful rebuild still moves, which are asserted
+    separately below.
+    """
+    driver = _driver()
+    mapped, key, n = driver.repin(sm_key)
+    sm_meta = MANIFEST["shardmaps"][sm_key]
+    assert (key, n) == (sm_meta["shard_key"], sm_meta["n_granules"])
+
+    written = tmp_path / "rebuilt.json"
+    mapped.to_json(str(written))
+    assert _without_volatile(written.read_text(), driver.VOLATILE_META) == _without_volatile(
+        (BENCH / sm_meta["path"]).read_text(), driver.VOLATILE_META
+    )
+
+    from zagg.config import load_config
+    from zagg.grids import from_config
+
+    # The one live divergence, and why it is not a pin move: PR #447 made the
+    # unpinned HEALPix ``swath`` cover order the SHARD order, where the
+    # committed maps recorded the chunk order they were built at. The
+    # assignment is unchanged -- which is what the byte comparison above just
+    # showed, over the same catalog.
+    grid = from_config(load_config(str(_config_for_shardmap(sm_key))))
+    assert mapped.metadata["mortie_order"] == grid.parent_order
+
+
+def test_repin_updates_only_the_pin_literals_in_targets():
+    # The write-back is surgical because targets.json is hand-formatted (compact
+    # inline ``worker`` objects survive a re-pin); the entry's prose ``note`` is
+    # the re-pinner's to restate, not the driver's to rewrite.
+    driver = _driver()
+    text = (BENCH / "targets.json").read_text()
+    out = driver.update_targets(text, "healpix_o9", 4242, 7)
+
+    entry = json.loads(out)["shardmaps"]["healpix_o9"]
+    assert (entry["shard_key"], entry["n_granules"]) == (4242, 7)
+    assert entry["note"] == MANIFEST["shardmaps"]["healpix_o9"]["note"]
+    changed = [(a, b) for a, b in zip(text.splitlines(), out.splitlines(), strict=True) if a != b]
+    assert len(changed) == 2, changed
+
+
+def test_repin_refuses_an_unknown_shardmap(capsys):
+    driver = _driver()
+    with pytest.raises(SystemExit):
+        driver.main(["--check", "healpix_o42"])
+    assert "unknown shard map(s) ['healpix_o42']" in capsys.readouterr().err
