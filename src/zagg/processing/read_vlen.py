@@ -495,27 +495,36 @@ def _vlen_read_group(
     # way a row owned by no record is False.
     cross_planned: np.ndarray | None = None
     for f in coarse_structured:
-        cf_lvl = levels[f["level"]]
-        cf_link = cf_lvl["link"]
-        cf_paths = [
-            f["dataset"].format(group=group),
-            cf_link["index_beg"].format(group=group),
-            cf_link["count"].format(group=group),
-        ]
-        cf_data = _read_full(cf_paths)
-        cf_ibeg = np.asarray(cf_data[cf_paths[1]])
-        cf_cnt = np.asarray(cf_data[cf_paths[2]])
-        cf_index_base = int(cf_link.get("index_base", 0))
-        _validate_link_disjoint(cf_ibeg, cf_cnt, cf_index_base, level=f["level"])
-        coarse_fmask = _predicate_mask(np.asarray(cf_data[cf_paths[0]]), f)
-        # A non-coordinate level owns its own link, so its per-row owner comes
-        # from a searchsorted over that link's starts rather than from the
-        # coordinates level's gather map.
-        expanded = (
-            _expand_mask_at_rows(coarse_fmask, cf_ibeg, cf_cnt, cf_index_base, global_idx)
-            if global_idx is not None
-            else _expand_mask_to_base(coarse_fmask, cf_ibeg, cf_cnt, cf_index_base, n_base)
-        )
+        cf_flag_path = f["dataset"].format(group=group)
+        if f["level"] == coord_key:
+            # The predicate rides the coordinates level's own link, whose per-row
+            # owner the gather map above already carries — so reuse it, exactly
+            # as the sibling-asset arm below does. Deriving it a second time (by
+            # last-start-wins, where the map was painted) would put two owner
+            # maps on the route that have to agree, for no gain.
+            coarse_fmask = _predicate_mask(np.asarray(_read_full([cf_flag_path])[cf_flag_path]), f)
+            expanded = coarse_fmask[parent_safe] & valid
+        else:
+            cf_link = levels[f["level"]]["link"]
+            cf_paths = [
+                cf_flag_path,
+                cf_link["index_beg"].format(group=group),
+                cf_link["count"].format(group=group),
+            ]
+            cf_data = _read_full(cf_paths)
+            cf_ibeg = np.asarray(cf_data[cf_paths[1]])
+            cf_cnt = np.asarray(cf_data[cf_paths[2]])
+            cf_index_base = int(cf_link.get("index_base", 0))
+            _validate_link_disjoint(cf_ibeg, cf_cnt, cf_index_base, level=f["level"])
+            coarse_fmask = _predicate_mask(np.asarray(cf_data[cf_flag_path]), f)
+            # A genuinely different link owns its own placement, so its per-row
+            # owner does have to be derived — by searchsorted over that link's
+            # starts on the planned arm, by the base-rate paint on the full one.
+            expanded = (
+                _expand_mask_at_rows(coarse_fmask, cf_ibeg, cf_cnt, cf_index_base, global_idx)
+                if global_idx is not None
+                else _expand_mask_to_base(coarse_fmask, cf_ibeg, cf_cnt, cf_index_base, n_base)
+            )
         cross_planned = expanded if cross_planned is None else (cross_planned & expanded)
 
     if asset_filters:
@@ -552,9 +561,19 @@ def _vlen_read_group(
     # On the FULL arm ``base_rows`` stays ``None`` and the original base-rate
     # broadcast runs: every base row is decoded there anyway, and the at-rows
     # gather would cost 8x the paint (33 B/row vs 4) for the same answer.
+    # Companions declared on the COORDINATES level — the common case, and all six
+    # of the shipped GEDI template's — reuse the gather map instead of each
+    # re-deriving it (issue #452 review).
     seg_broadcasts = (
         _read_segment_broadcasts(
-            h5obj, group, data_source, levels, n_base, read_fn=read_fn, base_rows=global_idx
+            h5obj,
+            group,
+            data_source,
+            levels,
+            n_base,
+            read_fn=read_fn,
+            base_rows=global_idx,
+            parents_by_level={coord_key: (parent_safe, valid)},
         )
         if _segment_level_variables(data_source)
         else {}

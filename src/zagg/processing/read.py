@@ -343,10 +343,31 @@ def _gather_segment_at_rows(
             f"{total_base_size}; the segment-level variable's link does not tile "
             f"the read's base extent"
         )
-    seg_values = np.asarray(seg_values)
     parent = _link_parent_at_rows(index_beg_arr, count_arr, index_base, base_rows)
     valid = parent >= 0
-    out = seg_values[np.where(valid, parent, 0)]
+    return _gather_segment_at_parents(seg_values, np.where(valid, parent, 0), valid)
+
+
+def _gather_segment_at_parents(
+    seg_values: np.ndarray, parent_safe: np.ndarray, valid: np.ndarray
+) -> np.ndarray:
+    """The gather half of :func:`_gather_segment_at_rows`, owner map supplied.
+
+    Split out so a caller that is ALREADY holding the per-row owner map does not
+    derive a second one (issue #452 review). On the vlen route the coordinates
+    level's gather map is exactly that map, and the shipped GEDI template hangs
+    six companion variables off that same level: without this the route ran six
+    searchsorted derivations of a map it had in hand, by a different rule (last
+    start wins) than the one that produced it (paint order) — two owner maps
+    that have to agree, where one will do.
+
+    ``parent_safe`` is the owner index per row with unowned rows clamped to 0
+    and flagged in ``valid``; unowned rows take the same fill
+    :func:`_broadcast_segment_to_base` gives an untiled row (``NaN`` for float
+    dtypes, zero otherwise).
+    """
+    seg_values = np.asarray(seg_values)
+    out = seg_values[parent_safe]
     if not valid.all():
         out[~valid] = np.nan if np.issubdtype(seg_values.dtype, np.floating) else 0
     return out
@@ -386,6 +407,7 @@ def _read_segment_broadcasts(
     n_base: int,
     read_fn=None,
     base_rows: np.ndarray | None = None,
+    parents_by_level: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict[str, np.ndarray]:
     """Read each segment-level variable and broadcast it to a base-rate column (issue #30).
 
@@ -401,6 +423,12 @@ def _read_segment_broadcasts(
     instead of built at length ``n_base`` and sliced. The vlen route passes its
     plan's rows: ``n_base`` is sample rate there, so the base-rate form costs
     ~1.2 GB per companion variable on a GEDI beam group.
+
+    ``parents_by_level`` maps a level key to a ``(parent_safe, valid)`` owner map
+    the caller already holds, for levels whose link the caller has already
+    resolved per row. Those levels skip both the link read and the owner
+    derivation and gather straight off the supplied map — one derivation, one
+    truth (issue #452 review). Levels absent from it are resolved as before.
     """
     seg_vars = _segment_level_variables(data_source)
     if not seg_vars:
@@ -408,22 +436,25 @@ def _read_segment_broadcasts(
     base_cols = set(data_source.get("variables", {}))
     out: dict[str, np.ndarray] = {}
     for level_key, mapping in seg_vars.items():
-        lvl = levels[level_key]
-        link = lvl["link"]
-        index_base = int(link.get("index_base", 0))
-        ibeg_path = link["index_beg"].format(group=group)
-        cnt_path = link["count"].format(group=group)
-        if read_fn is None:
-            link_data = h5obj.readDatasets([ibeg_path, cnt_path])
-            ibeg_arr = link_data[ibeg_path]
-            cnt_arr = link_data[cnt_path]
-        else:
-            ibeg_arr = read_fn(ibeg_path)
-            cnt_arr = read_fn(cnt_path)
-        # First assembly of this level's link on this route: refuse overlapping
-        # records once here rather than let the two owner derivations disagree
-        # per row further down (issue #452).
-        _validate_link_disjoint(ibeg_arr, cnt_arr, index_base, level=level_key)
+        held = (parents_by_level or {}).get(level_key)
+        if held is None:
+            lvl = levels[level_key]
+            link = lvl["link"]
+            index_base = int(link.get("index_base", 0))
+            ibeg_path = link["index_beg"].format(group=group)
+            cnt_path = link["count"].format(group=group)
+            if read_fn is None:
+                link_data = h5obj.readDatasets([ibeg_path, cnt_path])
+                ibeg_arr = link_data[ibeg_path]
+                cnt_arr = link_data[cnt_path]
+            else:
+                ibeg_arr = read_fn(ibeg_path)
+                cnt_arr = read_fn(cnt_path)
+            # First assembly of this level's link on this route: refuse
+            # overlapping records once here rather than let the two owner
+            # derivations disagree per row further down (issue #452). A level
+            # the caller already resolved was validated where it was assembled.
+            _validate_link_disjoint(ibeg_arr, cnt_arr, index_base, level=level_key)
         for col_name, tmpl in mapping.items():
             if col_name in base_cols:
                 raise ValueError(
@@ -435,7 +466,9 @@ def _read_segment_broadcasts(
                 seg_values = np.asarray(h5obj.readDatasets([seg_path])[seg_path])
             else:
                 seg_values = np.asarray(read_fn(seg_path))
-            if base_rows is None:
+            if held is not None:
+                out[col_name] = _gather_segment_at_parents(seg_values, held[0], held[1])
+            elif base_rows is None:
                 out[col_name] = _broadcast_segment_to_base(
                     seg_values, ibeg_arr, cnt_arr, index_base, n_base
                 )
