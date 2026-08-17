@@ -22,8 +22,10 @@ data_source:
                                  # workers=4 on the 4096-disk tier runs 300 s/shard
                                  # at 60% memory (vs 587-757 s serial on 8192,
                                  # run 8344cde5) for identical output. If a denser
-                                 # AOI pinches 4096 at workers=4, drop
-                                 # shard_workers to 2 BEFORE raising the tier.
+                                 # AOI pinches 4096 on MEMORY at workers=4, drop
+                                 # shard_workers to 2 before raising the tier --
+                                 # but not for a SpillOverflowError, which this
+                                 # knob cannot move (see worker.extra_disk).
   reader: h5coro
   driver: s3
   # DAAC S3 credentials are per-DAAC: GEDI is LP DAAC's lp-prod-protected,
@@ -229,7 +231,36 @@ worker:
                                  # max_memory 2,464 MB / container HWM 2,472 MB
                                  # (60% of tier), $0.069/run vs $0.286 at
                                  # 8192/serial (run 8344cde5), identical output.
-                                 # Fallback ladder: drop shard_workers to 2
-                                 # before raising the tier.
-  extra_disk: true               # the -disk twin: spill needs up to 2.5 GB /tmp
-                                 # per shard (aggregation.streaming.mode: spill)
+                                 # Fallback ladder, BY FAILURE MODE:
+                                 #   memory pinch (OOM / container HWM near the
+                                 #     tier) -> shard_workers 4 -> 2, then raise
+                                 #     the tier; shard_workers is what bounds
+                                 #     concurrent in-memory read buffers.
+                                 #   SpillOverflowError (block close, see below)
+                                 #     -> the 8192-disk tier (10240 MB /tmp,
+                                 #     4608 MB threshold) or a finer
+                                 #     parent_order. shard_workers is INERT for
+                                 #     this one: it does not change total
+                                 #     spilled bytes, only in-flight buffers.
+  extra_disk: true               # the -disk twin sizes /tmp at memory + 2048 MB,
+                                 # so 6144 MB here. The spill block-close
+                                 # threshold is min(0.2 x memory x K, 0.45 x free
+                                 # /tmp); K = 4^(12-9) = 64 puts the memory term
+                                 # at ~52 GB, so /tmp always dominates -> ~2765
+                                 # MB. Measured spill is 1.6-2.5 GB/shard (run
+                                 # 8344cde5), a ~1.16x margin on the worst shard,
+                                 # and f_bavail is read live so anything else in
+                                 # /tmp eats into it. Clearing the threshold for
+                                 # a 2.5 GB block needs ~5.6 GB free /tmp, not
+                                 # 2.5 GB: /tmp holds the closing block beside
+                                 # the filling one, which is what the 45% is for.
+                                 # This is a cliff, not a slope, because the
+                                 # config is EXACT-SINGLE-BLOCK-ONLY --
+                                 # validate_spill_fold rejects it
+                                 # (build_waveform_digest and the
+                                 # single_shot_value companions have no
+                                 # cross-block fold law), so a threshold
+                                 # crossing raises SpillOverflowError instead of
+                                 # degrading. spill_blocks_closed: 0 is a
+                                 # PRECONDITION of these results, not merely an
+                                 # observation of them.
