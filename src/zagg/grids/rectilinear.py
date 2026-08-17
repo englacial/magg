@@ -654,6 +654,7 @@ class RectilinearGrid:
                         element_dtype=sig["dtype"] or "float32",
                         inner_shape=sig["inner_shape"],
                         locations=located,
+                        weights=sig.get("weights"),
                         **rag_kw,
                     ),
                     meta,

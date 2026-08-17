@@ -431,11 +431,14 @@ class TestWriteColumn:
         assert set(attrs["fields"]) == {"count", "h_min", "h_tdigest"}
         assert attrs["fields"]["count"] == {"class": "exact", "method": "sum", "nan_policy": "skip"}
         # An approximate entry also carries what decided its centroid bytes:
-        # a #370 k-way gather cannot recover δ from the leaf.
+        # a #370 k-way gather cannot recover δ from the leaf. Since issue #424
+        # that is the split overview_delta (here the DELTA≤512 fallback), the
+        # budget fold_column actually compressed at; delta stays the leaf's.
         assert attrs["fields"]["h_tdigest"] == {
             "class": "approximate",
             "method": "tdigest_kway",
             "delta": DELTA,
+            "overview_delta": DELTA,
             "dtype": "float32",
             "inner_shape": [2],
         }

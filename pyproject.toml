@@ -37,11 +37,20 @@ dependencies = [
     # what PyPI has published (as 0.2.0 once was) fails resolution loudly — the
     # state build_layer.sh's MORTIE_SPEC derivation cites this block for.
     "h5coro-hidefix>=0.3.2",
-    # Floor 0.9.6 for the MOC batch twins on ShardMap.build's stored-index path
+    # Floor 0.9.8 for the authalic latitude convention (espg/mortie#186, landed
+    # in espg/mortie#188): binning is equal-area on the WGS84 ellipsoid by
+    # construction — latitude="authalic" is the new mortie default, with
+    # "geodetic-spherical" as the legacy escape. Cell ids differ between the
+    # two conventions — the offset |beta - phi| peaks near 45° lat at
+    # 0.12830°, ~14.26 km along the meridian (mortie spec §9) — so stores
+    # built on 0.9.8 defaults are not composable with pre-authalic stores;
+    # the store attr tokens are authalic-wgs84 / geodetic-spherical (same
+    # section). Earlier floors: 0.9.6
+    # for the MOC batch twins on ShardMap.build's stored-index path
     # (issue #396 phase 4): mocs_and, the 1xN broadcast intersection of the AOI
     # cover against the footprint_cells column (espg/mortie#173, landed in
-    # espg/mortie#174) — the piece 0.9.5 lacks, and the only reason for this
-    # bump — chained into mocs_to_orders, itself a 0.9.5 arrival
+    # espg/mortie#174) — the piece 0.9.5 lacks — chained into
+    # mocs_to_orders, itself a 0.9.5 arrival
     # (espg/mortie#156). Together: two Rust crossings per
     # block of records where 0.9.5 forced a Python loop of scalar
     # moc_and/moc_to_order per granule. Earlier floors: 0.9.5
@@ -62,7 +71,7 @@ dependencies = [
     # route through (issue #199) — decimal_repr / to_decimal, the
     # _decimal_to_word parse-back, hive_path, and the MortonIndexScalar decimal
     # display.
-    "mortie>=0.9.6",
+    "mortie>=0.9.8",
     "earthaccess",
     "boto3",
     "fastparquet",
