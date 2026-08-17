@@ -1465,7 +1465,7 @@ product is never sharded, §8/#247):
 
 - **`raster_toc/`** — the §8 temporal declaration surface: one raster
   `(time, cells)` hive leaf whose `time` coordinate is `uint64` toc words
-  carrying `temporal: {"spec": "zagg-toc/1", "shape": "axis", …}` and no CF
+  carrying `temporal: {"spec": "zagg-toc/1", "shape": "coordinate", …}` and no CF
   `units`/`calendar` attrs, beside `morton` and two band arrays. Its axis
   mixes both word variants deliberately — one single-item timestep encoded
   as an exact **timestamp** word and two multi-item acquisition groups
@@ -1546,10 +1546,25 @@ regeneration, and conformance never asserts them.
 — the first shape of the temporal series,
 [#410](https://github.com/englacial/zagg/issues/410)).
 
-An array that carries **time values** declares how to read them under the
-**`temporal`** attrs key on that array. The key is spec-owned: the writer
-stamps it from the config's declared encoding, never author-transcribed
-(§1.2's reserved-key discipline, extended to the time coordinate).
+An array whose elements are **packed words** rather than self-describing
+scalars carries a **word-typed coordinate declaration**: a spec-owned attrs
+block, keyed by its domain, holding `{spec, shape, grammar}` — the
+convention revision, *where the words sit* relative to the store's cells,
+and *which word grammar* the values follow. The key is spec-owned: the
+writer stamps it, never author-transcribed (§1.2's reserved-key discipline,
+extended to coordinate arrays). The `shape` vocabulary is domain-neutral and
+defined once, here:
+
+- **`"coordinate"`** — the declaring array **is** the coordinate variable of
+  a dimension (CF/xarray sense): one word per index along that dimension,
+  row-aligned with every array sharing it.
+- **`"per-cell"`** — one word per cell of the store's cell grid, aligned
+  with the `morton` coordinate.
+- **`"per-centroid"`** — one word per centroid inside a cell's ragged
+  payload, aligned element-for-element with the §1/§2 digest it accompanies.
+
+This section instantiates that pattern for the **temporal** domain: attrs key
+`temporal`, `spec: "zagg-toc/1"`, `grammar: "mortie-toc/1"`.
 
 **An absent `temporal` key MUST be read as the legacy encoding** — signed
 `int64` microseconds since `1970-01-01T00:00:00` UTC, self-described by the
@@ -1560,32 +1575,46 @@ MUST NOT refuse a store for lacking the declaration.
 ```json
 "temporal": {
   "spec": "zagg-toc/1",
-  "shape": "axis",
-  "grammar": "mortie/toc@0.9.6"
+  "shape": "coordinate",
+  "grammar": "mortie-toc/1"
 }
 ```
 
 Three keys, and deliberately no more —
 [ruled on #410](https://github.com/englacial/zagg/issues/410#issuecomment-5310533396):
-the declaration is `{shape, versioned grammar citation}` under the `spec`
-marker, with **no per-store epoch or quantization guards**.
+the declaration is `{shape, grammar revision}` under the `spec` marker, with
+**no per-store epoch or quantization guards**.
 
 - **`spec`** — the convention revision. Readers MUST strict-check it: an
   unknown or future revision raises, never half-parses under a guessed
   layout.
-- **`shape`** — where the words sit relative to the store's cells.
-  **`"axis"`** is the only value this revision defines: the declaring array
-  **is** the time coordinate of a `(time, cells)` product — one word per
-  timestep, row-aligned with the leading axis of every `(time, cells)` array
-  in the same group. The discriminator exists so a later per-cell or
-  per-centroid temporal companion declares itself in *this* grammar rather
-  than a parallel one; a reader MUST refuse a `shape` it does not implement.
-- **`grammar`** — the versioned citation of the word grammar the values
-  follow: the mortie module and the release whose reference the section below
-  pins. It is a fixed token of this revision, not a stamp of the writer's
-  installed mortie, so a store's bytes do not move when a dependency floor
-  moves. A reader MUST refuse a `grammar` it does not implement, and SHOULD
-  record it as what it decoded against.
+- **`shape`** — the vocabulary value above. **`"coordinate"`** is the only
+  one this revision defines for `temporal`: the declaring array **is** the
+  time coordinate of a `(time, cells)` product — one word per timestep,
+  row-aligned with the leading axis of every `(time, cells)` array in the
+  same group. A reader MUST refuse a `shape` it does not implement.
+- **`grammar`** — the word grammar the values follow, named as a **grammar
+  revision** in the `{name}/{major}` style this document uses throughout
+  (`zagg-ragged/1`, `morton-hive/2`). It is a fixed token of this revision —
+  not a documentation URL, and not a stamp of the writer's installed mortie
+  — so a store's bytes move neither when a dependency floor moves nor when
+  the documentation that describes the grammar moves. The pointer to that
+  documentation is prose (below), which is where it can be updated freely. A
+  reader MUST refuse a `grammar` it does not implement, and SHOULD record it
+  as what it decoded against.
+
+**Forward instantiations** (informative, both
+[#410](https://github.com/englacial/zagg/issues/410)). The temporal
+companions — one word per cell, one word per centroid — arrive as the
+`"per-cell"` and `"per-centroid"` shapes under *this* `spec` and *this*
+grammar. The **located** (spatial) companion family declares under the same
+pattern with `grammar: "mortie-morton/1"`, landing with the #410 kernel PR.
+Neither re-declares the store's **primary** morton axis: that surface stays
+declared by the `morton-hive/{1,2}` manifest grammar (`morton_hive.json`,
+`docs/hive_layout.md`) and the store's [DGGS-convention](https://github.com/zarr-conventions/dggs)
+`dggs` attrs (`docs/morton_arrow.md`). This pattern is for word-typed
+coordinate and companion arrays *beyond* that primary surface, never a
+second, competing declaration of it.
 
 **The epoch, the timescale, and the range variant's rounding quanta are
 properties of the cited grammar and are deliberately NOT echoed here.** A
@@ -1613,11 +1642,14 @@ its decision ledger
 ([espg/mortie#175](https://github.com/espg/mortie/issues/175)), and are
 **not restated here**. What follows is zagg's half of the contract.
 
-The citation is **release-pinned deliberately**. Mortie's documentation is
-`mike`-versioned and the unversioned `/api/toc/` path was never published, so
-only a versioned URL resolves; the pin is `0.9.6`, the earliest release
-carrying the reference, and the page's normative words are unchanged through
-the current dependency floor.
+The stored token is the grammar revision `mortie-toc/1`; the **URL above is
+the documentation pointer**, and it lives in this prose precisely so it can
+be re-pointed without moving a store byte. It is **release-pinned
+deliberately**: mortie's documentation is `mike`-versioned and the
+unversioned `/api/toc/` path was never published, so only a versioned URL
+resolves; the pin is `0.9.6`, the earliest release carrying the reference,
+and the page's normative words are unchanged through the current dependency
+floor.
 
 **It is also not yet the same class of citation as §2.2's**, and §8 does not
 claim it is. §2.2 defers the morton word's layout to mortie's
@@ -1626,10 +1658,10 @@ claim it is. §2.2 defers the morton word's layout to mortie's
 specification contains **no toc section**: the grammar above is normative as
 a module reference pinned by mortie's own golden fixtures, which is a weaker
 guarantee. [espg/mortie#193](https://github.com/espg/mortie/issues/193)
-tracks adding the frozen section; when it lands, this citation swaps to it
-and nothing else in §8 changes.
+tracks adding the frozen section; when it lands, this pointer swaps to it,
+the stored `grammar` token does not move, and nothing else in §8 changes.
 
-### 8.1 `shape: "axis"`
+### 8.1 `shape: "coordinate"`
 
 **Contract.**
 
@@ -1672,8 +1704,8 @@ whose values mean two different things, so a reader or writer joining two
 stores' time axes MUST refuse a mismatch. This is a *join* rule only:
 reading either store on its own is always legal.
 
-**What this revision does not cover** (informative). Per-cell and
-per-centroid temporal companions — the other shapes of #410 — are not
-defined here; they will arrive as further `shape` values under this same
-`spec` marker and this same word grammar. Nothing in §8 constrains the
+**What this revision does not cover** (informative). Only
+`shape: "coordinate"` has a contract here; the `"per-cell"` and
+`"per-centroid"` temporal companions are the forward instantiations noted
+above and carry none of §8.1's clauses yet. Nothing in §8 constrains the
 `(time, cells)` band arrays themselves, which are unchanged.
