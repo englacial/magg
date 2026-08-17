@@ -324,19 +324,22 @@ with the payload:
     reported position, carrying **no area claim** — not an assertion that
     the observation is dimensionless;
   - an **area word** is a cell known to contain every observation beneath
-    it — whether it entered that way (an observation whose *only* known
-    location is a cell: a pre-gridded or pre-aggregated input) or arose
-    from a fold.
+    it — the finest such cell its producer could establish, whether it
+    entered that way (an observation whose *only* known location is a cell:
+    a pre-gridded or pre-aggregated input) or arose from a fold (the
+    deepest common ancestor of that fold's input words).
 - An observation located to a position enters as its point word; one
   resolved only to a cell enters as that cell's area word — positions never
   narrowed into points, the discipline §8.1 states for time, spatially.
   (Zagg's own writers ingest point instruments as order-29 point words,
   `HealpixGrid.assign`; area-word ingest is legal but no shipped config
   emits it today — informative.)
-- A merged centroid carries the **deepest common ancestor** of its members'
-  words (`mortie.common_ancestor`): the finest morton cell enclosing every
-  member; a centroid folded from a single member carries that member's word
-  unchanged. Point and area words share the same path prefix, so mixed
+- A merged centroid carries the **deepest common ancestor of its members'
+  words** (`mortie.common_ancestor`): a cell containing every observation
+  merged into it, and the finest one those words establish — a fold sees
+  words, never the observations beneath them, so a coarse input word bounds
+  how fine the result can be. A centroid folded from a single member carries
+  that member's word unchanged. Point and area words share the same path prefix, so mixed
   inputs (a fresh point word folded with an earlier merge's coarser area
   word) compose under the one rule.
 
@@ -2018,9 +2021,10 @@ array's `ragged` block `locations` key (§1.2). A reader MUST refuse a shape
 it does not implement.
 
 **An absent `located` key MUST be read as §2.2 verbatim** — kind-keyed
-words (a point word an exact position, an area word the finest cell
-containing everything beneath it), deepest-common-ancestor words after a
-merge — never as an unknown encoding, and never as grounds to refuse. Every located
+words (a point word a reported position carrying no area claim, an area word
+a cell containing everything beneath it), and after a merge the deepest
+common ancestor of the members' **words** — never as an unknown encoding,
+and never as grounds to refuse. Every located
 store written before this revision is conformant as it stands, no byte
 rewritten. What the declaration adds is self-description (a generic reader
 learns the word grammar from the array rather than from this page), the
@@ -2044,17 +2048,21 @@ a grammar that cannot move under a conforming reader.
 
 **Contract.**
 
-- A word's claim is keyed on its **kind** (§2.2): a **point word** is an
-  exact observation position; an **area word** is the finest morton cell
-  containing every observation beneath it — from cell-resolved ingest or
-  from a fold. A centroid folded from a single observation carries that
+- A word's claim is keyed on its **kind** (§2.2): a **point word** is the
+  observation's reported position, carrying no area claim; an **area word**
+  is a cell known to contain every observation beneath it — the finest such
+  cell its producer could establish, from cell-resolved ingest or from a
+  fold. A centroid folded from a single observation carries that
   observation's word unchanged. (Zagg's writers ingest point instruments
   as order-29 point words — informative.)
 - A merged centroid — at a leaf, at a spill-block close, or at any level of
-  a pyramid — carries the **deepest common ancestor** of every observation
-  merged into it: the finest morton cell containing all of them. That is the
-  whole claim a reader may make from the word. It is not a centroid
-  position, not a mean, and not a cell the data fills.
+  a pyramid — carries the **deepest common ancestor of its contributors'
+  words**: a cell containing every observation merged into it, and the
+  finest one those words establish (a fold reduces words, so an ingested
+  coarse word bounds the result). Containment is the whole claim a reader may
+  make from the word: it is not a centroid position, not a mean, not a cell
+  the data fills, and not the finest cell containing the observations
+  themselves.
 - **Overview words sit at heterogeneous orders, within one array.** A fold
   coarsens only as far as its contributors force, so one overview array's
   words routinely carry different orders — an unmerged centroid's order-29
