@@ -795,6 +795,77 @@ class TestAssetVariables:
         )
         np.testing.assert_array_equal(df["dem"].to_numpy(), np.array([np.nan] + [40.0] * 4))
 
+    def test_float32_sibling_stays_float32(self):
+        # The NaN fill needs a float column, not a WIDER one (issue #464
+        # review): the fixture DEM is float32, so the stored column is too —
+        # promoting to float64 would double the paint of every asset column.
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            _dem_var_ds(),
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        assert df["dem"].to_numpy().dtype == np.float32
+        assert np.isnan(df["dem"].to_numpy()[df["shot_number"].to_numpy() == 103]).all()
+
+    def test_integer_sibling_promotes_to_float(self):
+        # An integer sibling dataset has nowhere to put the unmatched-row NaN,
+        # so it promotes to a float type able to hold the values (uint8 ->
+        # float32); shot 103 still NaNs rather than borrowing a neighbor.
+        ds = _l2a_ds()
+        ds["levels"]["shots"]["variables"]["quality_flag"] = {
+            "asset": "l2a",
+            "path": "/{group}/quality_flag",
+        }
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            ds,
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        qf = df["quality_flag"].to_numpy()
+        shots = df["shot_number"].to_numpy()
+        assert np.issubdtype(qf.dtype, np.floating)
+        assert qf.dtype == np.float32
+        assert np.isnan(qf[shots == 103]).all()
+        np.testing.assert_array_equal(qf[shots == 101], np.ones(5, dtype=np.float32))
+        np.testing.assert_array_equal(qf[shots == 102], np.zeros(3, dtype=np.float32))
+
+    def test_nan_fill_never_mutates_the_shared_join(self, monkeypatch):
+        # One join serves every consumer of an asset (issue #464 review), so the
+        # variable arm's unmatched-row NaN must land on a COPY — a float32
+        # sibling dataset is a dtype the fill could write in place. Capture the
+        # join's own arrays and check them after the read.
+        from zagg.processing import read_vlen
+
+        real_join = read_vlen._sibling_joined_values
+        captured: list[dict] = []
+
+        def _spy(*args, **kwargs):
+            values_by_path, matched = real_join(*args, **kwargs)
+            captured.append(values_by_path)
+            return values_by_path, matched
+
+        monkeypatch.setattr(read_vlen, "_sibling_joined_values", _spy)
+        df = _read_group(
+            _FakeH5(_l1b_arrays()),
+            "BEAM0000",
+            _dem_var_ds(),
+            0,
+            _OneShardGrid(),
+            siblings={"l2a": _FakeH5(_l2a_arrays())},
+        )
+        assert np.isnan(df["dem"].to_numpy()[df["shot_number"].to_numpy() == 103]).all()
+        # Shot 103 is unmatched, so its joined row is the clamped placeholder
+        # (shot 104's DEM) — untouched by the NaN the column carries.
+        joined = captured[0]["/BEAM0000/digital_elevation_model"]
+        assert not np.isnan(joined).any()
+        np.testing.assert_array_equal(joined, np.array([60.0, 30.0, 40.0, 40.0], dtype=np.float32))
+
     def test_expression_filter_mixes_primary_and_asset_columns(self):
         # The issue #464 gate shape: a primary shot-level column against an
         # asset-sourced one through the STOCK expression machinery — no filter

@@ -655,10 +655,15 @@ def _vlen_read_group(
             values_by_path, matched = join
             record_vals = {}
             for name, path in name_paths.items():
-                # Always float64: the unmatched-row NaN (and the missing-
-                # sibling arm above) need a float column either way.
+                # Upgrade only as far as the NaN needs (issue #464 review): the
+                # unmatched-row fill demands a float dtype, so promote against
+                # float32 — a float32 DEM stays float32 instead of doubling the
+                # column's paint, and an integer flag lands in a float type able
+                # to hold it. ``astype`` copies either way, so the NaN write
+                # never reaches the join's shared ``values_by_path`` (one join
+                # per asset, several consumers).
                 vals = _select_column(np.asarray(values_by_path[path]), None, name)
-                vals = vals.astype(np.float64)
+                vals = vals.astype(np.promote_types(vals.dtype, np.float32))
                 vals[~matched] = np.nan
                 record_vals[name] = vals
         for name, vals in record_vals.items():
