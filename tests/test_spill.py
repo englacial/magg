@@ -487,6 +487,40 @@ class TestSpillConfig:
         else:
             assert seen["resolved"] > 0  # disk-derived default, unchanged
 
+    def test_explicit_block_bytes_reserves_the_overlap_pair(self, monkeypatch, tmp_path):
+        # issue #474: an explicit threshold skips _default_block_bytes' 45%
+        # cap, and under overlap a closing block is resident beside the filling
+        # one — so the guard must reserve 2x. At 60% of free /tmp a 1x check
+        # passes and the run ENOSPCs mid-shard instead.
+        import os as _os
+
+        real = _os.statvfs(tempfile.gettempdir())
+        free = 1 << 30
+
+        class _Fake:
+            f_frsize = real.f_frsize
+            f_bavail = free // real.f_frsize
+
+        monkeypatch.setattr(_os, "statvfs", lambda _p: _Fake())
+        cfg = _config(streaming={"mode": "spill"})
+        block_bytes = int(0.6 * free)
+        with pytest.raises(RuntimeError, match="free space"):
+            SpillAggregator(
+                cfg, _grid(cfg), "pandas", 25, block_bytes=block_bytes, tmp_dir=str(tmp_path)
+            )
+        # overlap off keeps exactly one block resident, so the same value fits.
+        agg = SpillAggregator(
+            cfg,
+            _grid(cfg),
+            "pandas",
+            25,
+            block_bytes=block_bytes,
+            tmp_dir=str(tmp_path),
+            overlap=False,
+        )
+        assert agg.block_bytes == block_bytes
+        agg.close()
+
     def test_spill_fold_state_carries_the_declared_delta(self):
         # Issue #424: the spill fold honors the field's declared δ (the 8,192
         # leaf budget), never the module default.
