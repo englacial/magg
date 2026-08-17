@@ -939,8 +939,14 @@ class TestConfigBlockBytes:
 
     def test_large_block_bytes_stays_single_block(self, monkeypatch):
         # A generous config threshold keeps the exact single-block regime.
+        # 32 MiB, not something like 1 GiB: an explicit threshold is
+        # headroom-checked against the REAL $TMPDIR (the aggregator gets no
+        # tmp_dir), doubled for the overlap pair — so this demands exactly
+        # _MIN_SPILL_BYTES, the default path's own floor, instead of turning a
+        # small/full /tmp into a spurious "spill needs N bytes" failure. It is
+        # still ~4 orders of magnitude above the ~6 KB this test spills.
         key = _shard_key()
-        spill = {"buffer_granules": 1, "mode": "spill", "block_bytes": 1 << 30}
+        spill = {"buffer_granules": 1, "mode": "spill", "block_bytes": 1 << 25}
         cfg = _config(_variables(), streaming=spill)
         grid = _grid(cfg)
         dfs = _granule_dfs(grid, key, _CELL_LISTS, obs_per_cell=20, seed=5)
