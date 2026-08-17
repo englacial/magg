@@ -866,6 +866,25 @@ class TestAssetVariables:
         assert not np.isnan(joined).any()
         np.testing.assert_array_equal(joined, np.array([60.0, 30.0, 40.0, 40.0], dtype=np.float32))
 
+    def test_two_dimensional_sibling_dataset_raises_articulately(self):
+        # The asset form is scoped to record-rate scalars (issue #464 review):
+        # an N-D sibling dataset must not report "requires an integer 'column'"
+        # like a plain variable, because the asset form rejects that key —
+        # richer L2A companions (rh percentiles) ride issue #465.
+        arrays = _l2a_arrays()
+        arrays["/BEAM0000/rh"] = np.zeros((3, 101), dtype=np.float32)
+        ds = _l2a_ds()
+        ds["levels"]["shots"]["variables"]["rh"] = {"asset": "l2a", "path": "/{group}/rh"}
+        with pytest.raises(ValueError, match=r"no 'column' selector yet.*issue #465"):
+            _read_group(
+                _FakeH5(_l1b_arrays()),
+                "BEAM0000",
+                ds,
+                0,
+                _OneShardGrid(),
+                siblings={"l2a": _FakeH5(arrays)},
+            )
+
     def test_expression_filter_mixes_primary_and_asset_columns(self):
         # The issue #464 gate shape: a primary shot-level column against an
         # asset-sourced one through the STOCK expression machinery — no filter
@@ -950,6 +969,19 @@ class TestAssetVariableValidation:
             "column": 0,
         }
         with pytest.raises(ValueError, match="the asset form takes 'asset' and 'path'"):
+            validate_config(_cfg(ds))
+
+    def test_column_key_says_why_it_is_unsupported(self):
+        # 'column' is the near-miss: the plain variable form takes one, so the
+        # config error names the scope rather than just listing the key (issue
+        # #464 review).
+        ds = _dem_var_ds()
+        ds["levels"]["shots"]["variables"]["dem"] = {
+            "asset": "l2a",
+            "path": "/{group}/x",
+            "column": 0,
+        }
+        with pytest.raises(ValueError, match=r"no 'column' selector yet.*issue #465"):
             validate_config(_cfg(ds))
 
     def test_non_string_path_rejected(self):

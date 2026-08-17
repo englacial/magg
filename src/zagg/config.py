@@ -2425,9 +2425,19 @@ def _validate_overviews(data_source: dict) -> None:
                     # ``coordinates.level`` live in ``_validate_vlen_source``.
                     unknown = set(tmpl) - {"asset", "path"}
                     if unknown:
+                        # 'column' is the near-miss worth naming: the plain
+                        # variable form takes one, while the asset form is
+                        # scoped to record-rate scalars and does not (issue
+                        # #464 review; richer L2A companions ride issue #465).
+                        hint = (
+                            "; the asset form reads 1-D datasets only, with no "
+                            "'column' selector yet (refs issue #465)"
+                            if "column" in unknown
+                            else ""
+                        )
                         raise ValueError(
                             f"levels.{name}.variables.{var_name}: unknown keys "
-                            f"{sorted(unknown)} (the asset form takes 'asset' and 'path')"
+                            f"{sorted(unknown)} (the asset form takes 'asset' and 'path'){hint}"
                         )
                     for key in ("asset", "path"):
                         if not isinstance(tmpl.get(key), str) or not tmpl[key]:

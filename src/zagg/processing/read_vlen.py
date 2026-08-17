@@ -662,7 +662,18 @@ def _vlen_read_group(
                 # to hold it. ``astype`` copies either way, so the NaN write
                 # never reaches the join's shared ``values_by_path`` (one join
                 # per asset, several consumers).
-                vals = _select_column(np.asarray(values_by_path[path]), None, name)
+                vals = np.asarray(values_by_path[path])
+                if vals.ndim > 1:
+                    # The asset form is scoped to record-rate scalars: it has no
+                    # 'column' selector, so say that rather than borrow the
+                    # plain-variable message ("requires an integer 'column'"),
+                    # which points at a key this form rejects (issue #464
+                    # review). Richer L2A companions ride issue #465.
+                    raise ValueError(
+                        f"asset variable {name!r}: dataset {path!r} is "
+                        f"{vals.ndim}-D; the asset form takes no 'column' "
+                        f"selector yet (1-D datasets only; refs issue #465)"
+                    )
                 vals = vals.astype(np.promote_types(vals.dtype, np.float32))
                 vals[~matched] = np.nan
                 record_vals[name] = vals
