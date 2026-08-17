@@ -16,7 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     coarse grids the new default is a documented conservative superset, never a
     subset. Explicit `mortie_order=` pins are unchanged.
   - Unindexed builds cover from the catalog's WKB column and intersect before
-    materializing granule records — ~2.5x faster at clone scale (87 s -> 39 s).
+    materializing granule records. At clone scale (555,867 granules) the
+    unpinned default — the case the bullet above changes — goes 1,075 s -> 39 s
+    (~27x), no longer covering every footprint at the chunk order to answer a
+    shard-order question; a build that already pinned `mortie_order=9` goes
+    86.6 s -> 39.3 s (~2.2x).
   - Disclosed: an explicit `mortie_order=` pin always covers live, indexed or not,
     so a MultiPolygon footprint assigns as a union-of-parts superset; single-part
     CMR granules are unaffected.
