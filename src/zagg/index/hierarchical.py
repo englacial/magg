@@ -30,6 +30,7 @@ class HierarchicalIndex(VirtualIndex):
         arrow=False,
         granule_url=None,
         io_stats=None,
+        siblings=None,
     ):
         # Resolve through the package namespace at call time (not an import-time
         # binding) so tests that ``monkeypatch.setattr("zagg.processing._read_group",
@@ -48,4 +49,9 @@ class HierarchicalIndex(VirtualIndex):
         kwargs = {"arrow": arrow, "io_stats": io_stats}
         if granule_url is not None:
             kwargs["granule_url"] = granule_url
+        # Presence-gated like granule_url (issue #425): only paired-asset
+        # granules pass sibling handles, so monkeypatched fakes keep their
+        # existing signature everywhere else.
+        if siblings is not None:
+            kwargs["siblings"] = siblings
         return _processing._read_group(h5obj, group, data_source, shard_key, grid, **kwargs)

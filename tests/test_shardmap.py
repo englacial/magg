@@ -2016,3 +2016,205 @@ class TestIsBeamProduct:
         assert not is_beam_product("ATL08")
         assert not is_beam_product("")
         assert not is_beam_product(None)
+
+
+# ── paired-asset sibling join (issue #425) ───────────────────────────────────
+
+
+def _gedi_id(product, core="2019108002012_O01959_01_T03909", release="005", version="V002"):
+    return f"{product}_{core}_02_{release}_01_{version}"
+
+
+class TestSiblingJoinKey:
+    def test_siblings_share_key_across_release_fields(self):
+        from zagg.catalog.shardmap import sibling_join_key
+
+        l1b = sibling_join_key(_gedi_id("GEDI01_B", release="005"))
+        l2a = sibling_join_key(_gedi_id("GEDI02_A", release="003"))
+        assert l1b is not None
+        assert l1b == l2a
+
+    def test_generation_pins_the_pair(self):
+        from zagg.catalog.shardmap import sibling_join_key
+
+        v2 = sibling_join_key(_gedi_id("GEDI01_B", version="V002"))
+        v3 = sibling_join_key(_gedi_id("GEDI02_A", version="V003"))
+        assert v2 != v3
+
+    def test_distinct_acquisitions_distinct_keys(self):
+        from zagg.catalog.shardmap import sibling_join_key
+
+        a = sibling_join_key(_gedi_id("GEDI01_B", core="2019108002012_O01959_01_T03909"))
+        b = sibling_join_key(_gedi_id("GEDI01_B", core="2019108002012_O01959_02_T03909"))
+        assert a != b
+
+    def test_unkeyed_id_returns_none(self):
+        from zagg.catalog.shardmap import sibling_join_key
+
+        assert sibling_join_key("ATL03_20220621190618_13851506_007_01") is None
+        assert sibling_join_key("") is None
+
+
+class TestPairedAssetBuild:
+    """ShardMap.build with a sibling catalog: pairing, exclusion, reporting."""
+
+    def _catalogs(self):
+        # Primary (L1B): three acquisitions. Sibling (L2A): matches for the
+        # first two only; plus one orphan L2A with no primary.
+        l1b = _catalog(
+            [
+                _item(_gedi_id("GEDI01_B", core="2019108002012_O01959_01_T03909"), -76.62, -76.57),
+                _item(_gedi_id("GEDI01_B", core="2019115002012_O02059_02_T03910"), -76.55, -76.50),
+                _item(_gedi_id("GEDI01_B", core="2019120002012_O02159_03_T03911"), -76.55, -76.52),
+            ]
+        )
+        l2a = _catalog(
+            [
+                _item(
+                    _gedi_id("GEDI02_A", core="2019108002012_O01959_01_T03909", release="003"),
+                    -76.62,
+                    -76.57,
+                ),
+                _item(
+                    _gedi_id("GEDI02_A", core="2019115002012_O02059_02_T03910", release="003"),
+                    -76.55,
+                    -76.50,
+                ),
+                _item(
+                    _gedi_id("GEDI02_A", core="2019130002012_O02259_04_T03912", release="003"),
+                    -76.55,
+                    -76.52,
+                ),
+            ]
+        )
+        return l1b, l2a
+
+    def test_paired_entries_carry_sibling_assets(self, grid, fake_spherely):
+        from zagg.catalog.shardmap import sibling_join_key
+
+        l1b, l2a = self._catalogs()
+        sm = ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        seen = {}
+        for shard in sm.granules:
+            for rec in shard:
+                seen[rec["id"]] = rec
+        assert seen, "paired build should assign granules"
+        for rec in seen.values():
+            assert set(rec) == {"id", "s3", "https", "assets"}
+            sib = rec["assets"]["l2a"]
+            assert sib["id"].startswith("GEDI02_A_")
+            assert sib["s3"] and sib["https"]
+            # The sibling is THIS acquisition's, not another's.
+            assert sibling_join_key(sib["id"]) == sibling_join_key(rec["id"])
+
+    def test_paired_build_skips_the_stored_index_plan(self):
+        """Pairing filters records; the positional fast path must not engage.
+
+        The ``footprint_cells`` plan aligns positionally to the raw catalog
+        table (issue #439), which cannot represent a pairing-filtered record
+        list (issue #425) -- so a paired build takes the geometry path even on
+        an indexed catalog, and still pairs/excludes correctly.
+        """
+        l1b, l2a = self._catalogs()
+        hp = HealpixGrid(11, 17, layout="fullsphere")
+        sm = ShardMap.build(l1b.index_footprints(11), hp, sibling_catalog=l2a)
+        assert sm.metadata.get("footprint_cells") is not True  # plan skipped
+        assigned = {rec["id"] for shard in sm.granules for rec in shard}
+        assert assigned  # the paired primaries still assign
+        for gid in assigned:  # only paired primaries; the pairless third never appears
+            assert not gid.startswith("GEDI01_B_2019120")
+        assert {p["id"][:10] for p in sm.metadata["pairless"]} == {"GEDI01_B_2", "GEDI02_A_2"}
+
+    def test_pairless_excluded_and_reported(self, grid, fake_spherely):
+        l1b, l2a = self._catalogs()
+        sm = ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assigned = {rec["id"] for shard in sm.granules for rec in shard}
+        orphan_l1b = _gedi_id("GEDI01_B", core="2019120002012_O02159_03_T03911")
+        orphan_l2a = _gedi_id("GEDI02_A", core="2019130002012_O02259_04_T03912", release="003")
+        # The pairless primary never enters the map.
+        assert orphan_l1b not in assigned
+        # Both directions reported: primary missing its sibling, sibling
+        # missing its primary (espg amendment: report, never just count).
+        pairless = {p["id"]: p["missing"] for p in sm.metadata["pairless"]}
+        assert pairless[orphan_l1b] == "l2a"
+        assert pairless[orphan_l2a] == "primary"
+        assert sm.metadata["sibling_asset"] == "l2a"
+
+    def test_pairless_warning_fires(self, grid, fake_spherely, caplog):
+        import logging as _logging
+
+        l1b, l2a = self._catalogs()
+        with caplog.at_level(_logging.WARNING):
+            ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assert any("pairless" in r.message for r in caplog.records)
+
+    def test_duplicate_sibling_key_is_deterministic_and_reported(self, grid, fake_spherely):
+        # The join key ignores the release/production fields, so two sibling
+        # records can share one — last-writer-wins made the surviving record
+        # arbitrary and dropped the other in silence (review finding, PR #432).
+        core = "2019108002012_O01959_01_T03909"
+        l1b = _catalog([_item(_gedi_id("GEDI01_B", core=core), -76.62, -76.57)])
+        first = _gedi_id("GEDI02_A", core=core, release="003")
+        second = _gedi_id("GEDI02_A", core=core, release="004")
+        l2a = _catalog([_item(first, -76.62, -76.57), _item(second, -76.62, -76.57)])
+        sm = ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assets = {rec["assets"]["l2a"]["id"] for shard in sm.granules for rec in shard}
+        assert assets == {first}  # first in catalog order wins, not "whichever last"
+        assert {"id": second, "missing": "duplicate-key"} in sm.metadata["pairless"]
+
+    def test_duplicate_primary_keys_are_kept_but_warned(self, grid, fake_spherely, caplog):
+        import logging as _logging
+
+        core = "2019108002012_O01959_01_T03909"
+        dup_a = _gedi_id("GEDI01_B", core=core, release="005")
+        dup_b = _gedi_id("GEDI01_B", core=core, release="006")
+        l1b = _catalog([_item(dup_a, -76.62, -76.57), _item(dup_b, -76.62, -76.57)])
+        l2a = _catalog([_item(_gedi_id("GEDI02_A", core=core, release="003"), -76.62, -76.57)])
+        with caplog.at_level(_logging.WARNING):
+            sm = ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assigned = {rec["id"] for shard in sm.granules for rec in shard}
+        assert {dup_a, dup_b} <= assigned  # excluding a primary is destructive
+        assert any("share a join key" in r.message for r in caplog.records)
+
+    def test_mostly_unpaired_primary_escalates_the_warning(self, grid, fake_spherely, caplog):
+        # A mis-scoped sibling query (different AOI, narrower window, dropped
+        # page) is per-granule indistinguishable from a genuinely missing
+        # sibling, and exclusion is destructive — so say so in aggregate
+        # (review finding, PR #432).
+        import logging as _logging
+
+        l1b, l2a = self._catalogs()
+        l2a = Catalog(l2a.table.slice(0, 1), l2a.metadata)  # 1 of 3 primaries pair
+        with caplog.at_level(_logging.WARNING):
+            ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assert any("AOI and time window" in r.message for r in caplog.records)
+
+    def test_mostly_paired_primary_does_not_escalate(self, grid, fake_spherely, caplog):
+        import logging as _logging
+
+        l1b, l2a = self._catalogs()  # 2 of 3 primaries pair
+        with caplog.at_level(_logging.WARNING):
+            ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assert any("pairless" in r.message for r in caplog.records)
+        assert not any("AOI and time window" in r.message for r in caplog.records)
+
+    def test_fully_paired_reports_empty_list(self, grid, fake_spherely):
+        l1b, l2a = self._catalogs()
+        # Trim both catalogs to the two matching acquisitions.
+        l1b = Catalog(l1b.table.slice(0, 2), l1b.metadata)
+        l2a = Catalog(l2a.table.slice(0, 2), l2a.metadata)
+        sm = ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        assert sm.metadata["pairless"] == []
+
+    def test_no_sibling_catalog_no_pairless_key(self, catalog, grid, fake_spherely):
+        sm = ShardMap.build(catalog, grid, backend="spherely")
+        assert "pairless" not in sm.metadata
+
+    def test_paired_map_round_trips_json(self, grid, fake_spherely, tmp_path):
+        l1b, l2a = self._catalogs()
+        sm = ShardMap.build(l1b, grid, backend="spherely", sibling_catalog=l2a)
+        path = str(tmp_path / "paired.json")
+        sm.to_json(path)
+        sm2 = ShardMap.from_json(path)
+        assert sm2.granules == sm.granules
+        assert sm2.metadata["pairless"] == sm.metadata["pairless"]

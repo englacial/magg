@@ -2692,6 +2692,51 @@ def _resolve_urls(records: list, driver: str | None) -> list[str]:
     return [r[key] for r in records if r.get(key)]
 
 
+def _resolve_granule_entries(records: list, driver: str | None) -> list:
+    """Worker-payload granule entries: URL strings, or paired-asset mappings.
+
+    The worker-facing sibling of :func:`_resolve_urls` (issue #425). A
+    single-asset record resolves to its plain URL string — byte-identical
+    payloads for every existing map. A record whose ``assets`` carry sibling
+    href trios (``{"s3": ..., "https": ...}`` values, the paired-asset shard
+    map's shape) resolves to ``{"url": <primary>, "assets": {name: <url>}}``
+    so the worker can open each sibling beside the primary. Entries stay
+    one-to-one with :func:`_resolve_urls` (same href-less drop rule, and the
+    granule_workers clamp counts through that function); a sibling without
+    the driver's endpoint is omitted from ``assets`` — the read then raises
+    on the missing handle rather than silently reading unfiltered data.
+    """
+    key = "https" if driver == "https" else "s3"
+    out: list = []
+    for r in records:
+        url = r.get(key)
+        if not url:
+            continue
+        assets = {
+            name: a[key]
+            for name, a in (r.get("assets") or {}).items()
+            if isinstance(a, dict) and a.get(key)
+        }
+        out.append({"url": url, "assets": assets} if assets else url)
+    return out
+
+
+def _submap_metadata(metadata: dict | None) -> dict | None:
+    """Run-catalog metadata as it rides a per-cell leaf sub-map (issue #300).
+
+    Strips the run-wide fields whose size scales with the CATALOG rather than
+    the cell: ``pairless`` (issue #425) is one entry per unpaired granule, so
+    at mission scale it is O(MB) of JSON copied into every cell event — where
+    it counts against the 256 KB async cap that silently drops the whole
+    sub-map block (``_cell_payload``) — and then into every leaf object.
+    ``write_leaf_submap`` strips it on the way out for the same reason; the
+    full report stays on the run's own map, which is where it is read.
+    """
+    if not metadata or "pairless" not in metadata:
+        return metadata
+    return {k: v for k, v in metadata.items() if k != "pairless"}
+
+
 def _clamped_data_source(data_source: dict, n_granules: int) -> dict | None:
     """Per-cell ``granule_workers`` clamp: ``min(K, n_granules)`` (issue #184).
 
@@ -2781,7 +2826,7 @@ def _process_and_write(
     _df_out, metadata = process_shard(
         grid,
         int(shard_key),
-        _resolve_urls(records, driver),
+        _resolve_granule_entries(records, driver),
         s3_credentials=s3_creds,
         config=config,
         driver=driver,
@@ -2997,7 +3042,7 @@ def _run_local(
             if store_layout == "hive":
                 meta = process_and_write_hive(
                     shard_key,
-                    _resolve_urls(records, driver),
+                    _resolve_granule_entries(records, driver),
                     grid,
                     s3_creds,
                     store_path,
@@ -3606,7 +3651,7 @@ def _run_lambda(
         # (processing/worker.py:250-254), so an explicit override has to reach
         # the url selection. Was hardcoded "s3" while ``agg`` resolved driver
         # for _run_local only, which handed s3:// urls to an HTTP driver.
-        granule_urls = _resolve_urls(records, driver)
+        granule_urls = _resolve_granule_entries(records, driver)
         ds = _clamped_data_source(config.data_source, len(granule_urls))
         cell_config_dict = {**config_dict, "data_source": ds} if ds is not None else config_dict
         # Leaf sub-map fields (issue #300, D22): the worker writes the full
@@ -3616,7 +3661,7 @@ def _run_lambda(
         # (size-gated in _invoke_lambda_cell; dropped, never fatal).
         submap = {
             "grid_signature": catalog_data["grid_signature"],
-            "metadata": catalog_data.get("metadata"),
+            "metadata": _submap_metadata(catalog_data.get("metadata")),
             "granules": records,
         }
         # v2 Event transport (issue #327): the SAME event construction as the
