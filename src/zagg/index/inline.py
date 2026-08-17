@@ -387,6 +387,13 @@ def full_granule_maps(h5obj, existing: dict[str, ChunkMap]) -> dict[str, ChunkMa
     for path, ds in _iter_datasets(h5obj):
         if path in maps:
             continue
+        # Per-dataset snapshot-and-evict, same as build_chunk_map (issue
+        # #460): this walk maps EVERY dataset in the granule, so unevicted it
+        # accumulates worst of all. Evicting after each dataset keeps the
+        # transient peak one walk deep; the enumeration's own object-header
+        # lines are in each snapshot (the generator parses the next node
+        # before the loop body runs) and stay cached for the datasets after.
+        before = _cache_keys(h5obj)
         try:
             maps[path] = _chunk_map_from_dataset(h5obj, ds, path)
         except ValueError:
@@ -397,6 +404,8 @@ def full_granule_maps(h5obj, existing: dict[str, ChunkMap]) -> dict[str, ChunkMa
             # there): drop just this dataset from the manifest instead of
             # sinking the whole granule's write-back.
             logger.warning(f"  write-back: no chunk map for {path} ({exc}); skipping")
+        finally:
+            _evict_new_cache_lines(h5obj, before)
     return maps
 
 

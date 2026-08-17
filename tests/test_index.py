@@ -1607,6 +1607,34 @@ class TestFullCoverageWalk:
         assert "/gt2l/heights/lat_ph" in maps
         assert any("boom" in r.message for r in caplog.records)
 
+    def test_full_coverage_walk_evicts_its_cache_lines(self, monkeypatch):
+        # Issue #460 phase 2: the full-coverage walk maps EVERY dataset in the
+        # granule, so unevicted it accumulates walk lines worst of all. After
+        # the walk only pre-existing lines plus the enumeration's own
+        # object-header/metadata lines remain resident -- and eviction changes
+        # no map (identical to a walk with eviction disabled).
+        import zagg.index.inline as inline_mod
+        from zagg.index.inline import full_granule_maps
+
+        h5obj = _open_fixture_small_lines()
+        read = {"/gt1l/heights/h_ph": build_chunk_map(h5obj, "/gt1l/heights/h_ph")}
+        pre = set(h5obj.cache)
+        maps = full_granule_maps(h5obj, read)
+        assert pre <= set(h5obj.cache)  # pre-existing lines survive
+
+        # Reference arm: the identical read sequence with eviction off.
+        ref = _open_fixture_small_lines()
+        monkeypatch.setattr(inline_mod, "_evict_new_cache_lines", lambda *a: 0)
+        read_ref = {"/gt1l/heights/h_ph": build_chunk_map(ref, "/gt1l/heights/h_ph")}
+        maps_ref = full_granule_maps(ref, read_ref)
+        # Eviction actually removed the walks' lines...
+        assert set(h5obj.cache) < set(ref.cache)
+        # ...and altered no map.
+        assert set(maps) == set(maps_ref)
+        for p in maps:
+            a, b = maps[p], maps_ref[p]
+            assert a.raw == b.raw and a.dtype == b.dtype and a.dims == b.dims
+
 
 class TestInlineInterleavedGranules:
     """Issue #180 phase 1: with granule-level read concurrency the worker may
