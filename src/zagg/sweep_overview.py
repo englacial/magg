@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from typing import overload
 
 import numpy as np
 
@@ -242,7 +243,17 @@ def check_weights_match(attrs, meta: dict, field: str) -> None:
         )
 
 
-def fold_digests(cell_digests: list, *, delta: int, dtype="float32", locations=None):
+@overload
+def fold_digests(
+    cell_digests: list, *, delta: int, dtype: str = ..., locations: None = ...
+) -> bytes: ...
+@overload
+def fold_digests(
+    cell_digests: list, *, delta: int, dtype: str = ..., locations: list
+) -> tuple[bytes, bytes]: ...
+def fold_digests(
+    cell_digests: list, *, delta: int, dtype: str = "float32", locations: list | None = None
+) -> bytes | tuple[bytes, bytes]:
     """Merge one overview cell's accumulated t-digests into its payload bytes.
 
     The approximate-class fold law (D24): the **order-independent k-way
