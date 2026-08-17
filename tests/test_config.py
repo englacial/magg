@@ -10,6 +10,7 @@ import pytest
 
 from zagg.config import (
     PipelineConfig,
+    _segment_variable_names,
     _validate_output_kind,
     default_config,
     evaluate_expression,
@@ -2759,7 +2760,12 @@ class TestTemporalClockAtSubmission:
         # KeyError one seam later.
         cfg, located = self._graft()
         cfg.output["time_source"] = dict(located.output["time_source"])
-        assert cfg.output["time_source"]["field"] not in cfg.data_source["variables"]
+        # Guard the precondition against the SAME set the validator checks —
+        # declared variables plus broadcast level variables — so it tracks
+        # ``_validate_time_source`` rather than agreeing with it by luck of
+        # this template (fold review).
+        declared = set(cfg.data_source["variables"]) | _segment_variable_names(cfg.data_source)
+        assert cfg.output["time_source"]["field"] not in declared
         with pytest.raises(ValueError, match="not a declared data_source variable"):
             validate_config(cfg)
 
