@@ -1901,6 +1901,20 @@ class TestTemporalCompanionSeams:
         observed = zarr.open_array(store, path=f"{grid.group_path}/observed", mode="r")
         assert observed.dtype == np.uint64 and int(observed.fill_value) == 0
 
+    def test_absent_per_cell_fill_dies_in_zarr_which_is_why_config_refuses_it(self):
+        # The template half of the §8.2 fill contract. The dense default is
+        # "NaN" (grids/healpix.py, grids/rectilinear.py), so an absent
+        # fill_value reaches zarr as a NaN on a uint64 array and raises a
+        # bare TypeError with nothing about §8.2 in it. That is exactly why
+        # config validation requires the key instead of defaulting it —
+        # test_config.TestTemporalShapeDeclaration pins the message users see.
+        from zarr.storage import MemoryStore
+
+        cfg = self._cfg()
+        del cfg.aggregation["variables"]["observed"]["fill_value"]
+        with pytest.raises(TypeError, match="NaN"):
+            HealpixGrid(6, 8, layout="fullsphere", config=cfg).emit_template(MemoryStore())
+
     def test_undeclared_field_stamps_nothing(self):
         # The absent-key rule is a template property too: a field that
         # declares no companion emits byte-identical attrs to pre-#410.

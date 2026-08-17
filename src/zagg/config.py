@@ -1673,8 +1673,10 @@ def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
     will hold the words:
 
     - ``per-cell`` — the field's own DENSE array is the companion, so it must
-      be a ``uint64`` scalar field at cell resolution, with the §8.2 reserved
-      ``fill_value: 0`` marking an unobserved cell;
+      be a ``uint64`` scalar field at cell resolution, declaring the §8.2
+      reserved ``fill_value: 0`` that marks an unobserved cell EXPLICITLY (the
+      template's dense default is ``"NaN"``, so an assumed 0 here would only
+      defer the failure to zarr);
     - ``per-centroid`` — a uint64 ragged SIBLING row-aligned with the field's
       digest, so the field must be ``kind: ragged`` at cell resolution; the
       sibling shares the payload's per-cell row counts by construction, which
@@ -1720,7 +1722,20 @@ def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
                 f"dtype 'uint64' (got {meta.get('dtype')!r}) — the words are packed "
                 f"uint64 (spec §8.2)"
             )
-        fill = meta.get("fill_value", TOC_UNOBSERVED)
+        # No default here. The dense template's own default is ``"NaN"``
+        # (``grids/healpix.py``, ``grids/rectilinear.py``), so assuming 0 for
+        # an absent key would pass validation and then die in the template
+        # with a bare zarr ``TypeError: Invalid type: NaN`` — the §8.2
+        # message below is what the author must see instead. A spec-owned
+        # reservation is declared, never inferred, exactly as §2.0's
+        # ``weights`` is.
+        if "fill_value" not in meta:
+            raise ValueError(
+                f"Variable '{name}': temporal {TOC_SHAPE_PER_CELL!r} requires an explicit "
+                f"fill_value {TOC_UNOBSERVED} — §8.2 reserves it as the unobserved-cell "
+                f"marker, and the dense default ('NaN') is not a uint64 word"
+            )
+        fill = meta["fill_value"]
         if isinstance(fill, bool) or fill != TOC_UNOBSERVED:
             raise ValueError(
                 f"Variable '{name}': temporal {TOC_SHAPE_PER_CELL!r} requires "
