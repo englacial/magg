@@ -2727,15 +2727,21 @@ class TestTimeSource:
 
 
 class TestTemporalClockAtSubmission:
-    """A ``temporal:`` companion without a resolvable clock is refused at
-    submission, not first by the worker on the fleet (issue #472).
+    """``validate_config`` refuses a ``temporal:`` companion whose clock does
+    not resolve, in the worker's own words (issue #472).
 
-    The regression shape is the observed one: the ``02_write`` demo grafted
+    The config shape is the observed one: the ``02_write`` demo grafted
     ``aggregation["variables"]`` from ``atl03_tdigest_located_healpix`` (whose
     variables declare ``temporal: per-centroid``, PR #463) onto the hive base
     template without also grafting ``output.time_source`` and the
-    ``delta_time`` source column — every shard then burned an invoke on the
-    worker's refusal, for an error fully determinable from the config dict.
+    ``delta_time`` source column.
+
+    These are **validator-level** pins: the checks themselves predate this PR
+    (``a67be395``/``ef68ef74``, issue #410) and pass on ``main`` — what is new
+    here is the single-sourced message text (``test_both_seams_raise_the_same_text``).
+    The regression for the reported symptom is one seam up, where the graft
+    actually dispatched unvalidated:
+    ``tests/test_client.py::TestSubmissionValidation`` (fold review).
     """
 
     def _graft(self):
