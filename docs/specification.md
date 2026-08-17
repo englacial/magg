@@ -1554,8 +1554,8 @@ ordinal 2 is **empty** (absent from the shard index — the §1.5 sentinel, and
 that sparsity reaches the dense arrays too: the `morton` coordinate and
 `count` hold their fill across that chunk, so a reader MUST NOT assume the
 coordinate is dense across a shard), populated chunks contain empty cells
-(the `b""` fill), and one cell's digest carries merged centroids (weight > 1)
-whose location words are common ancestors (§2.2).
+(the `b""` fill), and one cell's digest carries **merged** centroids whose
+location words are common ancestors (§2.2).
 
 Every fixture **leaf** is **sharded**, so §7's leaf conformance claim is
 scoped to the §1.5 sharded geometry. The per-inner-chunk geometry — identical
