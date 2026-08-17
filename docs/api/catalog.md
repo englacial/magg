@@ -89,6 +89,21 @@ so for a multi-part granule the column is a superset and the index can place it
 in shards the geometry path misses. No CMR ATL03/06 footprint is multi-part
 today; antimeridian-split STAC footprints are the natural producer.
 
+### What indexing buys, after #445
+
+An **unindexed** mortie `swath` build on a HEALPix grid now covers the geometry
+column itself — the same `from_wkbs` cover, at the grid's `parent_order`, thrown
+away when the build ends — and runs the same intersection
+([issue #445](https://github.com/englacial/zagg/issues/445)). The column no
+longer buys a *different* code path; it buys **skipping the cover**, which is
+most of a first build. Index when many builds share one catalog; skip it for a
+one-shot build and pay the cover once, in memory. The MultiPolygon superset
+above and the null-geometry refusal are properties of that shared cover, so the
+unindexed path has them too. `footprint="beams"`, the spherely backend,
+rectilinear grids and paired builds still cover from decoded records, and the
+`footprint_cells` metadata verdict still means "the stored column answered this
+build" — an unindexed build that covered its own is not that.
+
 ### Choosing the order
 
 **Index at the grid's `parent_order`.** A MOC answers any shard order coarser
