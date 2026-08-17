@@ -521,6 +521,28 @@ def semantic_core(config: PipelineConfig) -> dict:
     encoding = (config.output or {}).get("time_encoding")
     if encoding not in (None, DEFAULT_TIME_ENCODING):
         core["time_encoding"] = encoding
+    # The per-observation clock (issue #410) is output-defining for exactly the
+    # same reason, and more directly: a temporal companion's stored toc words ARE
+    # the declared column converted from the declared epoch on the declared
+    # scale, so two configs differing only in ``output.time_source`` write
+    # different words for the same observations. Without this a re-run under a
+    # corrected epoch would reuse the product identity of the store it
+    # contradicts, which is the whole thing the D19 hash exists to refuse.
+    #
+    # Keyed only when a field actually DECLARES a companion, and recorded
+    # RESOLVED (:func:`zagg.time_axis.toc_source`, which folds in the
+    # ``output.windowing`` fallback): declaring a clock no field consumes moves
+    # no store byte, so it must not move the hash either, and the two spellings
+    # of one clock — explicit block vs. windowing fallback — are the same
+    # product. Every config written before #410 hashes byte-identically.
+    from zagg.config import get_agg_fields
+
+    if any(m.get("temporal") is not None for m in get_agg_fields(config).values()):
+        from zagg.time_axis import toc_source
+
+        clock = toc_source(config)
+        if clock is not None:
+            core["time_source"] = dict(clock)
     return _prune_nulls(core)
 
 
