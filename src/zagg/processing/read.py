@@ -166,6 +166,36 @@ def _broadcast_segment_to_base(
     return out
 
 
+def link_base_extent(index_beg_arr, count_arr, index_base: int) -> int:
+    """Length of the base array a record link tiles (issue #452).
+
+    ``max(index_beg - index_base + count)`` over the non-empty records: the last
+    base row any record reaches, which is the extent every consumer of a link
+    needs — :func:`zagg.read_plan.plan_read`'s ``base_end`` clamp, the gather
+    maps, the broadcasts.
+
+    On a **contiguous** product (records tile the base array end to end — #43's
+    assumption, ATL03's shape) this IS ``Σcount``, so substituting it is a
+    no-op. On a **strided** one it is not: GEDI L1B allocates a fixed
+    1,420-sample window per shot in ``rxwaveform`` while ``rx_sample_count`` is
+    the valid-sample count (61–1,420, typically ~700), so ``Σcount``
+    understates the flat array by ~50%, every planned run clamps to
+    ``base_end <= base_start``, and the whole read silently returns zero rows
+    (issue #452).
+
+    Empty records contribute nothing: ``count == 0`` marks them and their
+    origin-1 sentinel start (0) is not a real position (issue #116) — the same
+    skip :func:`_expand_mask_to_base` and :func:`_broadcast_segment_to_base`
+    apply. An all-empty link has extent 0.
+    """
+    beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
+    cnt = np.asarray(count_arr).astype(np.int64)
+    nonempty = cnt > 0
+    if not nonempty.any():
+        return 0
+    return int((beg[nonempty] + cnt[nonempty]).max())
+
+
 def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
     """Collect declared segment-level (non-base) readable variables (issue #30).
 
@@ -441,13 +471,14 @@ def _planned_read_group(
         _record_obs_read(io_stats, 0)
         return None
 
-    # ``n_base`` under #43's contiguity assumption ("ranges do not overlap and
-    # together tile the full base array" -- :func:`_expand_mask_to_base`).
-    # ``int(cnt_arr.sum())`` makes the assumption explicit and is identical to
-    # ``ibeg_arr[-1] - index_base + cnt_arr[-1]`` when contiguity holds. If a
-    # future granule format drops trailing photons or gaps between parents,
-    # either form under- or over-estimates -- track via a follow-up to #43.
-    n_base = int(np.asarray(cnt_arr).sum())
+    # ``n_base`` is the extent the coarse link tiles: the last base row any
+    # non-empty parent reaches (:func:`link_base_extent`, issue #452). On this
+    # route's contiguous products (#43's assumption: ranges neither overlap nor
+    # leave holes) that is exactly ``Σcount``, so the plan below is unchanged;
+    # deriving it from the link instead makes the route correct for a strided
+    # product too, where ``Σcount`` understates the array and clamps every run
+    # to an empty slice.
+    n_base = link_base_extent(ibeg_arr, cnt_arr, index_base)
     if n_base <= 0:
         _record_obs_read(io_stats, 0)
         return None
