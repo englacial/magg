@@ -2378,6 +2378,16 @@ class TestTemporalShapeDeclaration:
         with pytest.raises(ValueError, match="reserves it as the"):
             validate_config(self._cell_cfg(fill_value=1))
 
+    def test_per_cell_requires_the_reserved_fill_explicitly(self):
+        # An ABSENT key is refused here rather than defaulted: the dense
+        # template's default is "NaN", so assuming 0 would only move the
+        # failure to a bare zarr TypeError (the template half of this case
+        # is test_processing.TestTemporalCompanionSeams).
+        cfg = self._cell_cfg()
+        del cfg.aggregation["variables"]["observed"]["fill_value"]
+        with pytest.raises(ValueError, match="requires an explicit fill_value 0"):
+            validate_config(cfg)
+
     def test_chunk_resolution_rejected(self):
         with pytest.raises(ValueError, match="not supported with 'resolution: chunk'"):
             validate_config(
