@@ -1817,6 +1817,155 @@ class TestRaggedWriteGuards:
             write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(inner=2), chunk_idx=(0,))
 
 
+class TestTemporalCompanionSeams:
+    """Spec §8.2/§8.3/§9 declaration + write seams (issue #410).
+
+    Declaration-only: the words here are handed to the writer, because the
+    kernel that PRODUCES them is the follow-on PR. What is pinned is the
+    template's spec-owned stamping and the sibling's row alignment.
+    """
+
+    @staticmethod
+    def _cfg():
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+                "variables": {
+                    "h_tdigest": {
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [2],
+                        "location": "leaf_id",
+                        "temporal": "per-centroid",
+                        "dtype": "float32",
+                    },
+                    "observed": {
+                        "function": "nanmax",
+                        "source": "h_li",
+                        "dtype": "uint64",
+                        "fill_value": 0,
+                        "temporal": "per-cell",
+                    },
+                },
+            },
+        )
+
+    def _grid(self):
+        return HealpixGrid(6, 8, layout="fullsphere", config=self._cfg())
+
+    def test_template_stamps_the_declarations_on_the_word_arrays(self):
+        import zarr
+        from zarr.storage import MemoryStore
+
+        from zagg.grids.base import located_declaration
+        from zagg.time_axis import temporal_declaration
+
+        grid = self._grid()
+        store = MemoryStore()
+        grid.emit_template(store)
+
+        def attrs(name):
+            return dict(zarr.open_array(store, path=f"{grid.group_path}/{name}", mode="r").attrs)
+
+        # The payload carries the BINDING, never a declaration (§8.3) — and
+        # the binding is a sibling key, outside the versioned ragged block.
+        payload = attrs("h_tdigest")
+        assert payload["times"] == "h_tdigest_times"
+        assert "times" not in payload["ragged"]
+        assert "temporal" not in payload and "located" not in payload
+        # Each companion declares the words IT holds.
+        assert temporal_declaration(attrs("h_tdigest_times")) == {
+            "spec": "zagg-toc/1",
+            "shape": "per-centroid",
+            "grammar": "mortie-toc/1",
+        }
+        assert temporal_declaration(attrs("observed")) == {
+            "spec": "zagg-toc/1",
+            "shape": "per-cell",
+            "grammar": "mortie-toc/1",
+        }
+        assert located_declaration(attrs("h_tdigest_locations")) == {
+            "spec": "zagg-located/1",
+            "shape": "per-centroid",
+            "grammar": "mortie-morton/1",
+        }
+        # §8.2: the dense companion is uint64 with the reserved fill.
+        observed = zarr.open_array(store, path=f"{grid.group_path}/observed", mode="r")
+        assert observed.dtype == np.uint64 and int(observed.fill_value) == 0
+
+    def test_undeclared_field_stamps_nothing(self):
+        # The absent-key rule is a template property too: a field that
+        # declares no companion emits byte-identical attrs to pre-#410.
+        import zarr
+        from zarr.storage import MemoryStore
+
+        cfg = self._cfg()
+        del cfg.aggregation["variables"]["h_tdigest"]["temporal"]
+        del cfg.aggregation["variables"]["observed"]
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+        payload = dict(zarr.open_array(store, path=f"{grid.group_path}/h_tdigest", mode="r").attrs)
+        assert set(payload) == {"ragged"}
+        assert f"{grid.group_path}/h_tdigest_times/zarr.json" not in list(store._store_dict)
+
+    def test_write_fills_both_sibling_channels_row_aligned(self):
+        import zarr
+        from zarr.storage import MemoryStore
+
+        grid = self._grid()
+        store = MemoryStore()
+        grid.emit_template(store)
+        payloads = [np.array([[1.0, 1.0], [2.0, 3.0]], np.float32)]
+        locs = [np.array([11, 12], np.uint64)]
+        times = [np.array([2**31 + 5, 7], np.uint64)]
+        write_ragged_to_zarr(
+            {"h_tdigest": (payloads, [0], locs, times)},
+            store,
+            grid=grid,
+            chunk_idx=(0,),
+        )
+        stored = {}
+        for name in ("h_tdigest", "h_tdigest_locations", "h_tdigest_times"):
+            stored[name] = zarr.open_array(store, path=f"{grid.group_path}/{name}", mode="r")[0:1][
+                0
+            ]
+        rows = len(np.frombuffer(stored["h_tdigest"], "<f4")) // 2
+        for name, want in (("h_tdigest_locations", locs[0]), ("h_tdigest_times", times[0])):
+            got = np.frombuffer(stored[name], "<u8")
+            assert len(got) == rows
+            np.testing.assert_array_equal(got, want)
+
+    def test_times_values_length_mismatch_raises(self):
+        ragged = {
+            "h_tdigest": (
+                [np.ones((1, 2), np.float32)],
+                [0],
+                None,
+                [np.array([1], np.uint64), np.array([2], np.uint64)],
+            )
+        }
+        with pytest.raises(ValueError, match="times_list .* must have the same length"):
+            write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(), chunk_idx=(0,))
+
+    def test_per_cell_time_misalignment_raises(self):
+        # 2 payload rows vs 3 words: the channels would de-align in the store.
+        ragged = {
+            "h_tdigest": (
+                [np.ones((2, 2), np.float32)],
+                [0],
+                None,
+                [np.arange(3, dtype=np.uint64)],
+            )
+        }
+        with pytest.raises(ValueError, match=r"expected \(2,\) to stay row-aligned"):
+            write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(), chunk_idx=(0,))
+
+
 class TestRaggedChunkCompanion:
     """Issue #82 phase 4c: a ``kind: ragged`` + ``resolution: chunk`` field stores
     ONE variable-length payload per chunk (collapsed from the populated cells under
