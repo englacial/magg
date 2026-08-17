@@ -991,13 +991,14 @@ class TestTemporalDeclaration:
         exp, meta = self._time_meta()
         attrs = meta["attributes"]
         assert attrs == exp["time_attrs"]
-        # §8: exactly the #410-ruled {spec, shape, versioned grammar
-        # citation} -- the committed bytes carry NO per-store epoch,
-        # timescale, or quantum keys.
+        # §8: exactly the #410-ruled {spec, shape, grammar revision} -- the
+        # committed bytes carry NO per-store epoch, timescale, or quantum
+        # keys, and the grammar is a {name}/{major} revision token, never a
+        # documentation URL or a release stamp.
         assert attrs["temporal"] == {
             "spec": "zagg-toc/1",
-            "shape": "axis",
-            "grammar": "mortie/toc@0.9.6",
+            "shape": "coordinate",
+            "grammar": "mortie-toc/1",
         }
         # §8.1: uint64 words, one per timestep, no CF pair to mislead a
         # units/calendar-decoding client.

@@ -48,17 +48,19 @@ class TestDeclaration:
         # client must find nothing to decode rather than plausible garbage.
         assert set(TOC_ATTRS) == {"temporal"}
         block = TOC_ATTRS["temporal"]
-        # Exactly the #410-ruled shape: {spec, shape, versioned grammar
-        # citation}. NO per-store epoch/timescale/quantum guards -- those are
-        # properties of the cited grammar, and echoing them would only put a
-        # restated constant into the fixture bytes and the §5 hash.
-        assert block == {"spec": TOC_SPEC, "shape": "axis", "grammar": TOC_GRAMMAR}
+        # Exactly the #410-ruled shape: {spec, shape, grammar revision}. NO
+        # per-store epoch/timescale/quantum guards -- those are properties of
+        # the cited grammar, and echoing them would only put a restated
+        # constant into the fixture bytes and the §5 hash.
+        assert block == {"spec": TOC_SPEC, "shape": "coordinate", "grammar": TOC_GRAMMAR}
         assert time_axis_dtype("toc") == "uint64"
 
     def test_the_cited_grammar_is_the_one_this_reader_decodes_with(self):
-        # The citation is a fixed token, but it must not drift from the
-        # constants the decode actually runs on.
-        assert TOC_GRAMMAR.startswith("mortie/toc@")
+        # The citation is a fixed {name}/{major} revision token -- never a
+        # documentation URL or a release stamp (store bytes must not move when
+        # docs or a floor move) -- but it must not drift from the constants
+        # the decode actually runs on.
+        assert TOC_GRAMMAR == "mortie-toc/1"
         assert TOC_EPOCH == "1850-01-01T00:00:00"
         assert (int(Q_START_NS), int(Q_END_NS)) == (2**31, 2**32)
 
@@ -77,7 +79,7 @@ class TestDeclaration:
             temporal_declaration({"temporal": block})
 
     def test_uncited_grammar_refused(self):
-        block = {**TOC_ATTRS["temporal"], "grammar": "mortie/toc@2.0.0"}
+        block = {**TOC_ATTRS["temporal"], "grammar": "mortie-toc/2"}
         with pytest.raises(ValueError, match="cites word grammar"):
             temporal_declaration({"temporal": block})
 

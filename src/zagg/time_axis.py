@@ -28,14 +28,17 @@ TEMPORAL_ATTR = "temporal"
 #: The §8 convention revision, strict-checked on read.
 TOC_SPEC = "zagg-toc/1"
 #: The only §8 ``shape`` this revision defines: the declaring array IS the
-#: time coordinate. Per-cell / per-centroid companions (#410) land as further
-#: values under the same marker.
-TOC_SHAPE_AXIS = "axis"
-#: The §8 versioned grammar citation — the word grammar these values follow,
-#: as {module}@{release}. A fixed token of this revision (espg/mortie#193
-#: will replace the referent with a frozen spec section), NOT a stamp of the
-#: writer's installed mortie: stores must not move when a floor moves.
-TOC_GRAMMAR = "mortie/toc@0.9.6"
+#: CF/xarray coordinate variable of the time dimension. Per-cell /
+#: per-centroid companions (#410) land as further values under the same
+#: marker, from the same domain-neutral shape vocabulary.
+TOC_SHAPE_COORDINATE = "coordinate"
+#: The §8 word-grammar citation — a grammar REVISION token in the ecosystem's
+#: {name}/{major} style (``zagg-ragged/1``, ``morton-hive/2``), never a
+#: documentation URL or a stamp of the writer's installed mortie: store bytes
+#: must not move when a floor moves or the documentation moves. §8's prose
+#: carries the documentation pointer (the mike-versioned API page today,
+#: mortie's frozen spec section once espg/mortie#193 lands).
+TOC_GRAMMAR = "mortie-toc/1"
 #: The cited grammar's time origin. A grammar property, not a declared key
 #: (#410 ruled out per-store epoch/quantization guards); kept here only to
 #: refuse a time the words cannot represent.
@@ -58,7 +61,7 @@ __all__ = [
     "TIME_ENCODINGS",
     "TOC_EPOCH",
     "TOC_GRAMMAR",
-    "TOC_SHAPE_AXIS",
+    "TOC_SHAPE_COORDINATE",
     "TOC_SPEC",
     "decode_time_axis",
     "encode_time_axis",
@@ -105,7 +108,7 @@ def time_axis_attrs(encoding: str) -> dict:
     return {
         TEMPORAL_ATTR: {
             "spec": TOC_SPEC,
-            "shape": TOC_SHAPE_AXIS,
+            "shape": TOC_SHAPE_COORDINATE,
             "grammar": TOC_GRAMMAR,
         }
     }
@@ -132,10 +135,10 @@ def temporal_declaration(attrs) -> dict | None:
             f"refusing to guess a future revision's time encoding"
         )
     shape = block.get("shape")
-    if shape != TOC_SHAPE_AXIS:
+    if shape != TOC_SHAPE_COORDINATE:
         raise ValueError(
             f"temporal declaration shape {shape!r} is not implemented "
-            f"(spec §8 defines {TOC_SHAPE_AXIS!r} for a time coordinate)"
+            f"(spec §8 defines {TOC_SHAPE_COORDINATE!r} for a time coordinate)"
         )
     grammar = block.get("grammar")
     if grammar != TOC_GRAMMAR:

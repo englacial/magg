@@ -11,8 +11,8 @@
  "time_attrs": {
   "temporal": {
    "spec": "zagg-toc/1",
-   "shape": "axis",
-   "grammar": "mortie/toc@0.9.6"
+   "shape": "coordinate",
+   "grammar": "mortie-toc/1"
   }
  },
  "time_words": [
