@@ -408,6 +408,17 @@ def _overlapping_catalog(n=12):
     return _catalog(items)
 
 
+def _with_null_geometry(cat, row):
+    """Copy of ``cat`` with row ``row``'s geometry WKB set to null."""
+    field = cat.table.schema.field("geometry")
+    wkb = cat.table.column("geometry").to_pylist()
+    wkb[row] = None
+    table = cat.table.set_column(
+        cat.table.column_names.index("geometry"), field, pa.array(wkb, field.type)
+    )
+    return Catalog(table, dict(cat.metadata or {}))
+
+
 class TestMortieBatch:
     """The HEALPix mortie path is a batch call into mortie, not a granule loop (#396).
 
@@ -1210,6 +1221,22 @@ class TestDeferredRecords:
         assigned = {g["id"] for shard in sm.granules for g in shard}
         assert assigned == {"G0", "G1"}
         assert sm.metadata["total_granules"] == 2
+
+    def test_null_geometry_refuses_on_both_paths(self, hp_grid):
+        # Predicate parity, the one input where the vectorised screen and the
+        # row-wise loop see different things: ``shapely.from_wkb`` maps a null
+        # WKB to ``None``, whose ``get_type_id`` is -1 (screened) while
+        # ``None.is_empty`` raises. Screening it would let an indexed build drop
+        # the granule silently -- and not even count it in ``total_granules`` --
+        # while the same catalog on the geometry path still crashed. Both refuse.
+        items = [_item("G0", -76.62, -76.60), _item("G1", -76.58, -76.56)]
+        with pytest.raises(ValueError, match="null geometry .*first at row 0"):
+            _with_null_geometry(_catalog(items), 0).index_footprints(11)
+        indexed = _with_null_geometry(_catalog(items).index_footprints(11), 0)
+        with pytest.raises(ValueError, match="null geometry .*first at row 0"):
+            ShardMap.build(indexed, hp_grid, backend="mortie")
+        with pytest.raises(AttributeError):
+            ShardMap.build(_with_null_geometry(_catalog(items), 0), hp_grid, backend="mortie")
 
     def test_duplicate_ids_outside_the_aoi_still_refuse(self, hp_grid):
         # The duplicate-id refusal is a statement about the catalog, not about

@@ -520,7 +520,8 @@ class Catalog:
         polygonal, so record ``i`` is table row ``np.flatnonzero(mask)[i]`` and
         ``mask.sum()`` is the record count -- both without decoding a single
         record. Same predicate as the row-wise loop, applied with one batched
-        ``shapely.from_wkb`` instead of one call per row.
+        ``shapely.from_wkb`` instead of one call per row, and refusing on the one
+        input where "same predicate" would otherwise be false (see Raises).
 
         Two callers need the alignment without the records:
         :meth:`index_footprints`, which gives screened rows an empty MOC so the
@@ -533,6 +534,17 @@ class Catalog:
         numpy.ndarray
             ``bool``, length ``table.num_rows``.
 
+        Raises
+        ------
+        ValueError
+            When any row's ``geometry`` is **null**. ``shapely.from_wkb`` maps a
+            null to ``None``, whose ``get_type_id`` is ``-1`` -- so screening it
+            out here would be silent, while :meth:`granule_records`' row-wise
+            ``geom.is_empty`` raises ``AttributeError`` on the same row. A
+            granule that vanishes from an indexed build but crashes an
+            unindexed one is worse than either, so both paths refuse: this one
+            loudly, naming the count and the first offending row.
+
         Notes
         -----
         Time is small (0.02 s over the 35,639-granule 88S catalog, ~0.3 s over
@@ -543,8 +555,17 @@ class Catalog:
         import shapely
 
         geoms = shapely.from_wkb(self.table.column("geometry").to_numpy(zero_copy_only=False))
-        # geom_type ids 3 and 6 are Polygon and MultiPolygon.
-        return ~shapely.is_empty(geoms) & np.isin(shapely.get_type_id(geoms), (3, 6))
+        # geom_type ids 3 and 6 are Polygon and MultiPolygon; -1 is a null WKB.
+        type_ids = shapely.get_type_id(geoms)
+        null = type_ids == -1
+        if null.any():
+            rows = np.flatnonzero(null)
+            raise ValueError(
+                f"catalog has {rows.size} row(s) with a null geometry (first at row "
+                f"{int(rows[0])}); a granule with no footprint can be neither covered nor "
+                f"assigned. Drop those rows from the catalog before indexing or building."
+            )
+        return ~shapely.is_empty(geoms) & np.isin(type_ids, (3, 6))
 
     def index_footprints(self, order: int) -> "Catalog":
         """Precompute the ``footprint_cells`` morton MOC column (issue #396).
@@ -604,7 +625,9 @@ class Catalog:
         :meth:`granule_row_mask` -- one vectorised ``shapely.from_wkb``, shared
         with ``ShardMap.build``'s fast path; on the 35,639-granule 88S catalog
         it is 0.02 s against 2.65 s for the order-9 cover, so it costs under 1%
-        of a pass that runs once per catalog.
+        of a pass that runs once per catalog. A **null** geometry is the one row
+        the screen refuses instead of skipping, so this method raises where it
+        would once have indexed -- see :meth:`granule_row_mask`'s Raises.
 
         The screen is cheap in time but it is this pass's **peak in memory**, and
         it is the term ``from_wkbs``'s chunking does not bound: on the

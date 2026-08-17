@@ -501,6 +501,26 @@ class TestFootprintCells:
         assert offsets[1] > 0 and offsets[2] == offsets[1]
         assert [r["id"] for r in cat.granule_records()] == ["a"]
 
+    def test_null_geometry_raises_rather_than_screening(self):
+        # A null WKB is not a screened row: ``granule_records``' row-wise
+        # ``geom.is_empty`` raises on it, so the vectorised screen must refuse
+        # too rather than hand the fast path a quietly shorter alignment than
+        # the geometry path would build (issue #439).
+        cat = _catalog([_item("a", _h5_assets("a")), _item("b", _h5_assets("b"))])
+        field = cat.table.schema.field("geometry")
+        wkb = cat.table.column("geometry").to_pylist()
+        wkb[1] = None
+        table = cat.table.set_column(
+            cat.table.column_names.index("geometry"), field, pa.array(wkb, field.type)
+        )
+        nulled = Catalog(table, dict(cat.metadata or {}))
+        with pytest.raises(ValueError, match="1 row\\(s\\) with a null geometry .*first at row 1"):
+            nulled.granule_row_mask()
+        with pytest.raises(ValueError, match="null geometry"):
+            nulled.index_footprints(9)
+        with pytest.raises(AttributeError):
+            nulled.granule_records()
+
     def test_all_rows_screened_yields_an_empty_column(self):
         pt = dict(_item("pt", _h5_assets("pt")))
         pt["geometry"] = {"type": "Point", "coordinates": [-76.55, 38.89]}
