@@ -352,9 +352,13 @@ with the payload:
   absent-key clause) carries it too.
 
 A morton cell encodes **containment, not calibrated uncertainty**
-(informative): a small error disk straddling a cell boundary is honestly
-enclosed only by a much coarser cell, so an error-radius channel, if ever
-wanted, is a new companion declaration, not a reading of this one.
+(informative): a word records the resolution at which the producer located
+the observation, never its error budget — a small error disk straddling a
+cell boundary is honestly enclosed only by a much coarser cell, so a reader
+MUST NOT read a word's cell as an uncertainty region, and an error-radius
+channel, if ever wanted, is a new companion declaration, not a reading of
+this one. This is a reader's limit, not a writer's obligation to coarsen:
+every position-resolved observation still enters as its point word.
 
 A writer-side spill-block close (`aggregation.streaming.mode: spill` crossing
 its block threshold, issue #370) is an additional merge source under the same
