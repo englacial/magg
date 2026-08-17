@@ -39,10 +39,11 @@ dependencies = [
     # in espg/mortie#188): binning is equal-area on the WGS84 ellipsoid by
     # construction — latitude="authalic" is the new mortie default, with
     # "geodetic-spherical" as the legacy escape. Cell ids differ between the
-    # two conventions (boundaries move up to ~21 km at 45° lat), so stores
+    # two conventions — the offset |beta - phi| peaks near 45° lat at
+    # 0.12830°, ~14.26 km along the meridian (mortie spec §9) — so stores
     # built on 0.9.8 defaults are not composable with pre-authalic stores;
-    # the store attr tokens are authalic-wgs84 / geodetic-spherical (mortie
-    # spec §9). Earlier floors: 0.9.6
+    # the store attr tokens are authalic-wgs84 / geodetic-spherical (same
+    # section). Earlier floors: 0.9.6
     # for the MOC batch twins on ShardMap.build's stored-index path
     # (issue #396 phase 4): mocs_and, the 1xN broadcast intersection of the AOI
     # cover against the footprint_cells column (espg/mortie#173, landed in
