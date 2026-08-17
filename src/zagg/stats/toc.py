@@ -45,6 +45,12 @@ def _checked(words) -> np.ndarray:
     zero reaching a fold is a fill value that leaked into real words — the
     reduction would happily join it and return an envelope reaching back to the
     grammar's epoch. Refusing is the honest failure.
+
+    Deliberately separate from the digest kernel's
+    :func:`zagg.stats.tdigest._check_words`, which makes the same refusal: that
+    one's other job is aligning a channel against a digest's centroid count, a
+    shape these per-cell reducers have no analogue for, and this module names the
+    marker through :data:`zagg.time_axis.TOC_UNOBSERVED` rather than a literal.
     """
     arr = np.asarray(words)
     if arr.dtype != np.uint64:

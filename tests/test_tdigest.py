@@ -1043,6 +1043,35 @@ class TestTemporalMergeLaws:
         with pytest.raises(ValueError, match="temporal has 2 arrays"):
             merge_tdigests_kway(digests, delta=16, temporal=times[:2])
 
+    def test_pass_through_arms_still_refuse_the_reserved_zero(self):
+        # §8.2 forbids storing the reserved word for an observed cell, and the
+        # arms that hand a channel back unreduced are exactly the ones a
+        # reducer-side check misses: a single-block cell (the common spill
+        # shape) and a single-contributor overview fold.
+        d, t = build_tdigest(np.arange(10.0), delta=512, temporal=_toc_words(10))
+        leaked = t.copy()
+        leaked[3] = 0
+        empty_d = np.empty((0, 2), dtype=np.float32)
+        empty_w = np.empty(0, dtype=np.uint64)
+        with pytest.raises(ValueError, match="reserved 0 word"):
+            merge_tdigests(d, empty_d, 512, temporal1=leaked, temporal2=empty_w)
+        with pytest.raises(ValueError, match="reserved 0 word"):
+            merge_tdigests(empty_d, d, 512, temporal1=empty_w, temporal2=leaked)
+        with pytest.raises(ValueError, match="reserved 0 word"):
+            merge_tdigests_kway([d, empty_d], delta=512, temporal=[leaked, empty_w])
+
+    def test_reserved_zero_refusal_is_channel_agnostic(self):
+        # The check sits in the shared word validator, so a leaked fill is
+        # refused on the located channel's pass-through too — 0 is no more a
+        # valid morton word than it is a toc word.
+        d, locs = build_tdigest(np.arange(10.0), delta=512, locations=_point_words(10, seed=410))
+        leaked = locs.copy()
+        leaked[0] = 0
+        empty_d = np.empty((0, 2), dtype=np.float32)
+        empty_w = np.empty(0, dtype=np.uint64)
+        with pytest.raises(ValueError, match="reserved 0 word"):
+            merge_tdigests(d, empty_d, 512, locations1=leaked, locations2=empty_w)
+
     def test_kway_single_contributor_copies_the_channel(self):
         d, t = build_tdigest(np.arange(20.0), delta=512, temporal=_toc_words(20))
         out_d, out_t = merge_tdigests_kway(

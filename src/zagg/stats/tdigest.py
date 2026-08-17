@@ -241,19 +241,13 @@ def _centroid_envelopes(temporal: np.ndarray, starts: np.ndarray, n: int) -> np.
     ``starts`` is already the arrow offsets layout ``tocs_reduce`` takes, so the
     whole partition crosses into Rust once.  ``_compress`` never emits an empty
     run, which is what the segmented reduce refuses (the join has no identity).
+    The reserved-``0`` refusal lives in :func:`_check_words`, which every caller
+    passes its words through — including the merge arms that pass a channel
+    straight back without reducing it.
     """
     from mortie import tocs_reduce
 
     starts = np.asarray(starts, dtype=np.int64)
-    if temporal.size and not temporal.all():
-        # 0 is spec §8.2's reserved unobserved marker and no encoder produces
-        # it, so a zero here is a fill value that leaked into the ingest words
-        # — the toc analogue of the fill-word validation the located channel
-        # gets for free from ``common_ancestor``.
-        raise ValueError(
-            "temporal words contain the reserved 0 word (spec §8.2's unobserved "
-            "marker); pass encoded toc words, not a fill value"
-        )
     offsets = np.empty(len(starts) + 1, dtype=np.int64)
     offsets[:-1] = starts
     offsets[-1] = n
@@ -261,18 +255,33 @@ def _centroid_envelopes(temporal: np.ndarray, starts: np.ndarray, n: int) -> np.
 
 
 def _check_words(words, label: str, shape: tuple) -> np.ndarray:
-    """Validate one companion channel's input: packed ``uint64``, shape-aligned.
+    """Validate one companion channel's input: packed ``uint64``, shape-aligned,
+    no reserved ``0``.
 
     A silent ``uint64`` cast would turn a mis-declared float column into
     plausible-looking morton or toc words, so both channels require packed
     ``uint64`` outright — what ``HealpixGrid.assign`` supplies as ``leaf_id``
     and what :func:`zagg.time_axis.observation_words` supplies as toc words.
+
+    ``0`` is refused on both channels: it is the configs' fill value, spec §8.2's
+    reserved unobserved marker for a toc word, and not a valid morton word
+    either.  The refusal belongs here rather than in the per-channel reducers
+    because this is the one check every arm runs — including the pass-throughs
+    (:func:`merge_tdigests` with an empty side, :func:`merge_tdigests_kway` with
+    a single contributor), which return their channels unreduced and so never
+    reach ``common_ancestor`` / ``tocs_reduce``.  A leaked fill would otherwise
+    be stored for an observed cell, which §8.2 forbids outright.
     """
     arr = np.asarray(words)
     if arr.dtype != np.uint64:
         raise ValueError(f"{label} dtype {arr.dtype} is not uint64; pass packed uint64 words")
     if arr.shape != shape:
         raise ValueError(f"{label} shape {arr.shape} does not match the expected {shape}")
+    if arr.size and not arr.all():
+        raise ValueError(
+            f"{label} contains the reserved 0 word (spec §8.2's unobserved marker for a "
+            "toc word, and no valid morton word); pass encoded words, not a fill value"
+        )
     return arr
 
 
