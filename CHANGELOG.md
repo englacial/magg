@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- unindexed shard-map builds cover at `parent_order` and intersect before decoding records (#445) ([#447](https://github.com/englacial/zagg/pull/447)) by @espg
+  - An unpinned unindexed HEALPix mortie `swath` build now covers at the output
+    grid's `parent_order` instead of its chunk order, so `metadata["mortie_order"]`
+    in newly built manifests records the shard order (e.g. 9, not 13). Assignment
+    is measurably identical at the production order pairs (the
+    `bench/neon_order_sweep.py` invariant, verified at 555,867 granules); at
+    coarse grids the new default is a documented conservative superset, never a
+    subset. Explicit `mortie_order=` pins are unchanged.
+  - Unindexed builds cover from the catalog's WKB column and intersect before
+    materializing granule records — ~2.5x faster at clone scale (87 s -> 39 s).
+  - Disclosed: an explicit `mortie_order=` pin always covers live, indexed or not,
+    so a MultiPolygon footprint assigns as a union-of-parts superset; single-part
+    CMR granules are unaffected.
 - rename parent_morton event field to shard_key (#24) ([#42](https://github.com/englacial/zagg/pull/42)) by @espg
 - Concurrency-aware Lambda orchestrator: pre-flight probe + FD-exhaustion guard ([#41](https://github.com/englacial/zagg/pull/41)) by @espg
 - drop shapely as an intersection backend (#36) ([#39](https://github.com/englacial/zagg/pull/39)) by @espg
