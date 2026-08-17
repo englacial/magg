@@ -1553,6 +1553,33 @@ class TestLiveCover:
         sm = ShardMap.build(_overlapping_catalog(n=4), hp_grid, backend="mortie")
         assert 0.05 <= sm.metadata["build_wall_s"] < 0.2
 
+    def test_the_budget_refusal_names_a_remedy_that_exists(self, hp_grid, monkeypatch):
+        # The cell-budget refusal is shared with the stored path, but its
+        # remedy is not: "re-index the catalog / drop the footprint_cells
+        # column" names two things an unindexed build does not have, and
+        # re-indexing would not move it anyway (the cover is flattened to
+        # ``parent_order`` whatever order it ran at). ``build`` knows which
+        # cover it holds, so the message must say so.
+        import mortie
+
+        cat = _overlapping_catalog(n=2)
+        indexed_cat = cat.index_footprints(11)
+
+        def boom(*args, **kwargs):
+            raise ValueError("MOC 0 would expand to more than 1048576 cells at order 11")
+
+        monkeypatch.setattr(mortie, "mocs_to_orders", boom)
+        with pytest.raises(ValueError) as live:
+            ShardMap.build(cat, hp_grid, backend="mortie")
+        with pytest.raises(ValueError) as stored:
+            ShardMap.build(indexed_cat, hp_grid, backend="mortie")
+        assert "footprint cover batch failed" in str(live.value)
+        assert "no footprint_cells column to re-cut or drop" in str(live.value)
+        assert "coarser parent_order" in str(live.value) and "parent_order 11" in str(live.value)
+        assert "Re-index the catalog" not in str(live.value)
+        assert "footprint_cells batch failed" in str(stored.value)
+        assert "Re-index the catalog at a coarser order" in str(stored.value)
+
     def test_empty_catalog_builds_an_empty_map(self, hp_grid):
         # ``filter_bbox`` can cut a catalog to nothing, and the records path
         # handled that by returning ``{}`` out of ``_flatten_rings``. The cover

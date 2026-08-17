@@ -424,7 +424,9 @@ def _regroup_hits(hit_shards, hit_owners) -> Dict[int, List[int]]:
     return out
 
 
-def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[int, List[int]]:
+def _intersect_footprint_cells(
+    rows, values, offsets, grid, all_shards, *, stored: bool = True
+) -> Dict[int, List[int]]:
     """Shard assignment from row-aligned footprint MOCs -- no geometry (issue #396).
 
     The phase-3 fast path, and since issue #445 the *only* mortie ``swath``
@@ -442,6 +444,14 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     record ``i`` came from); it is not the identity, because
     ``granule_records`` drops rows whose geometry is empty or not polygonal
     while the cover has one entry per row.
+
+    ``stored`` says which of those two covers arrived, and is used for one
+    thing: the cell-budget refusal's remediation clause. Re-indexing or dropping
+    the ``footprint_cells`` column is only actionable when there *is* one
+    (``plan is not None`` in :meth:`ShardMap.build`); an ephemeral cover has
+    neither, so it gets the remedies that do apply to it. Nothing else branches
+    on it -- the assignment is identical either way, which is the point of the
+    shared intersection.
 
     mortie 0.9.6's batch twins (espg/mortie#173) remove the per-granule Python
     loop: one ``mocs_and(aoi_moc, ...)`` per block of records (empty results
@@ -485,8 +495,14 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
     # of quietly losing one granule. This is a real divergence from the
     # geometry path, which still swallows the same refusal per ring
     # (``_intersect_mortie``, below): the same catalog + grid can now raise
-    # where it built, depending on whether the column is present. Deliberate,
-    # and narrow -- refusal is not unreachable, but it is remote. ``aoi_moc``
+    # where it built. Since issue #445 the presence of the column is no longer
+    # what decides which side you are on -- every mortie HEALPix ``swath`` build
+    # reaches this raise, stored column or ephemeral cover alike, and only
+    # ``footprint="beams"``, spherely, rectilinear and paired builds still
+    # swallow it on the geometry path. (That is why the raise below takes
+    # ``stored``: the remedy differs even though the refusal does not.)
+    # Deliberate, and narrow -- refusal is not unreachable, but it is remote.
+    # ``aoi_moc``
     # is compressed, so the intersection can keep cells *coarser* than
     # ``parent_order`` and ``mocs_to_orders`` can genuinely expand; the bound
     # is the AOI-clipped footprint densified at ``parent_order``, so tripping
@@ -545,13 +561,31 @@ def _intersect_footprint_cells(rows, values, offsets, grid, all_shards) -> Dict[
             # un-rebased "MOC 400" out of a 512-record block is a plausible
             # record index, so it would send the operator to the wrong granule
             # rather than obviously failing. Re-raise, never swallow.
+            # The remedy depends on where the cover came from (issue #445).
+            # Telling the operator of an *unindexed* build to re-index or drop a
+            # column names two things that do not exist, and re-indexing would
+            # not move this anyway: the flattening target is ``parent_order``
+            # whatever ``mortie_order`` was. So name what is actually actionable
+            # on each path.
+            remedy = (
+                "Re-index the catalog at a coarser order, or drop the "
+                "footprint_cells column to build from geometry."
+                if stored
+                else (
+                    f"This build covered the catalog itself -- there is no "
+                    f"footprint_cells column to re-cut or drop, and the cover is "
+                    f"flattened to the grid's parent_order {parent_order} whatever "
+                    f"order it ran at. The bound is one granule's AOI-clipped "
+                    f"footprint densified at parent_order {parent_order}: build "
+                    f"against a grid with a coarser parent_order, or narrow or "
+                    f"split the region so that footprint clips smaller."
+                )
+            )
             raise ValueError(
-                f"footprint_cells batch failed within records "
-                f"{own[0]}-{own[-1]} (the MOC index in the message counts this "
-                f"block's {own.size} prefilter survivors inside that range, "
-                f"which are generally not contiguous records): {exc}. "
-                f"Re-index the catalog at a coarser order, or drop the "
-                f"footprint_cells column to build from geometry."
+                f"{'footprint_cells' if stored else 'footprint cover'} batch failed "
+                f"within records {own[0]}-{own[-1]} (the MOC index in the message "
+                f"counts this block's {own.size} prefilter survivors inside that "
+                f"range, which are generally not contiguous records): {exc}. {remedy}"
             ) from exc
         # Every slot in this block is non-empty by the predicate's contract,
         # so ``flat`` is never empty here and each owner repeats >= 1 time.
@@ -1413,7 +1447,12 @@ class ShardMap:
         t0 = time.perf_counter()
         if cells is not None:
             values, offsets, mortie_order, rows, _ = cells
-            shard_to_idx = _intersect_footprint_cells(rows, values, offsets, grid, all_shards)
+            # ``stored`` only steers the cell-budget refusal's remedy: the
+            # stored column can be re-cut or dropped, an ephemeral cover cannot
+            # (issue #445).
+            shard_to_idx = _intersect_footprint_cells(
+                rows, values, offsets, grid, all_shards, stored=plan is not None
+            )
         elif chosen == "mortie":
             mortie_order = _resolve_mortie_order(mortie_order, grid)
             shard_to_idx = _intersect_mortie(
