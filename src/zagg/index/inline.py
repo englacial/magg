@@ -185,7 +185,12 @@ def _walk_chunk_btree(ds) -> list[tuple[tuple[int, ...], int, int, int]]:
 
 
 def _cache_keys(h5obj) -> set:
-    """Snapshot of ``h5obj.cache``'s keys (empty for cache-less handles)."""
+    """Snapshot of ``h5obj.cache``'s keys (empty for cache-less handles).
+
+    ``set(dict)`` is a single C-level copy, so it cannot observe a concurrent
+    insertion mid-iteration the way a Python-level comprehension can (review
+    finding on PR #462).
+    """
     return set(getattr(h5obj, "cache", None) or ())
 
 
@@ -204,11 +209,20 @@ def _evict_new_cache_lines(h5obj, before: set) -> int:
     Only keys absent from ``before`` are dropped — pre-existing lines (the
     front-of-file metadata block every parse shares) always survive. Returns
     the number of lines evicted.
+
+    Structurally non-raising, which matters because callers run it from a
+    ``finally`` where a raise would replace a successful ``ChunkMap`` return
+    with a housekeeping error (review finding on PR #462): ``list(cache)``
+    snapshots the keys in one C-level copy instead of iterating the live dict
+    (a Python-level comprehension can hit ``RuntimeError: dictionary changed
+    size during iteration``), and ``pop(k, None)`` cannot ``KeyError`` on a
+    line another thread already dropped. Both operations complete without
+    releasing the GIL, so no blanket ``except`` is needed here.
     """
     cache = getattr(h5obj, "cache", None)
     if not cache:
         return 0
-    added = [k for k in cache if k not in before]
+    added = [k for k in list(cache) if k not in before]
     for k in added:
         cache.pop(k, None)
     return len(added)
