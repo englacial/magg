@@ -4,7 +4,7 @@
   "short_name": "SPEC_FIXTURE",
   "version": "1"
  },
- "semantic_hash": "90e7480adf3f43d46260519e9ced46624fc67e61bca2f860676336fb69475366",
+ "semantic_hash": "85572c1fed5ba728e9fbe59c9c59c01891c4c573d250a0f1dab3345d76ed37ad",
  "cell_order": 6,
  "shard_order": 4,
  "split_schedule": [
@@ -69,5 +69,5 @@
    }
   }
  },
- "generated_at": "2026-08-17T03:55:03+00:00"
+ "generated_at": "2026-08-17T08:46:30+00:00"
 }

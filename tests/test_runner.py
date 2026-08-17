@@ -1538,6 +1538,23 @@ class TestClampedDataSource:
 
         assert _clamped_data_source({"granule_workers": 1}, 5) is None
 
+    def test_canonical_key_written_back(self):
+        # The clamp must write back the key the worker actually reads. Writing
+        # the legacy name next to a canonical shard_workers leaves both in the
+        # dict, and _granule_workers prefers the canonical one -- so the clamp
+        # would go silently quiet for shipped configs on the canonical name.
+        from zagg.processing.worker import _granule_workers
+        from zagg.runner import _clamped_data_source
+
+        ds = {"shard_workers": 4}
+        assert _clamped_data_source(ds, 1) == {"shard_workers": 1}
+        assert _granule_workers(_clamped_data_source(ds, 1)) == 1
+        assert _granule_workers(_clamped_data_source(ds, 2)) == 2
+        assert _clamped_data_source(ds, 4) is None
+        assert ds == {"shard_workers": 4}  # never mutated in place
+        # Legacy-key configs keep the legacy name (no canonical key injected).
+        assert _clamped_data_source({"granule_workers": 4}, 1) == {"granule_workers": 1}
+
 
 class TestSummaryKeysByteIdentical:
     """The dispatch refactor (#63) must leave the run-summary dict keys -- and

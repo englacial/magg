@@ -15,6 +15,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - sort/hash grouping refactor (#30) ([#33](https://github.com/englacial/zagg/pull/33)) by @espg
 - Rectilinear grid: chunk-driven auto-padding + run enablement ([#32](https://github.com/englacial/zagg/pull/32)) by @espg
 
+## [0.46.0] - 2026-08-17
+
+- unindexed shard-map builds cover at `parent_order` and intersect before decoding records (#445) ([#447](https://github.com/englacial/zagg/pull/447)) by @espg
+  - An unpinned unindexed HEALPix mortie `swath` build now covers at the output
+    grid's `parent_order` instead of its chunk order, so `metadata["mortie_order"]`
+    in newly built manifests records the shard order (e.g. 9, not 13). Assignment
+    is measurably identical at the production order pairs (the
+    `bench/neon_order_sweep.py` invariant, verified at 555,867 granules); at
+    coarse grids the new default is a documented conservative superset, never a
+    subset. The order an explicit `mortie_order=` pin resolves to is unchanged
+    (it is still honored literally and still validated against `parent_order`).
+  - Unindexed builds cover from the catalog's WKB column and intersect before
+    materializing granule records. At clone scale (555,867 granules) the
+    unpinned default — the case the bullet above changes — goes 1,075 s -> 39 s
+    (~27x), no longer covering every footprint at the chunk order to answer a
+    shard-order question; a build that already pinned `mortie_order=9` goes
+    86.6 s -> 39.3 s (~2.2x).
+  - Disclosed: an explicit `mortie_order=` pin always covers live, indexed or not,
+    so a MultiPolygon footprint assigns as a union-of-parts superset; single-part
+    CMR granules are unaffected.
+
 ## [0.3.0] - 2026-06-11
 
 - Add bring-your-own-role path for IAM-constrained deploys; creds handling for external s3 bucket writes ([#27](https://github.com/englacial/zagg/pull/27)) by @espg

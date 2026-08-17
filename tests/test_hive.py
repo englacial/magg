@@ -1171,7 +1171,10 @@ class TestLeafSkipIfCurrent:
             shard, [self.URLS[0]], grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
         )
         assert meta["refused"] is True and meta["identity"] == "contraction"
-        assert meta["missing_granules"] == [self.URLS[1]]
+        # Named in the CANONICAL id space (espg-ruled 2026-08-17): the
+        # driver-stripped bare granule id, so the refusal reads the same
+        # whichever driver the run used.
+        assert meta["missing_granules"] == ["granule2.h5"]
         # A refusal writes nothing either: the committed leaf is protected —
         # and it is NOT touched (only a certified-current unit resets the
         # purge clock, issue #388 phase 3).
@@ -1189,7 +1192,7 @@ class TestLeafSkipIfCurrent:
             shard, planned, grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
         )
         assert meta["refused"] is True and meta["identity"] == "mixed"
-        assert meta["missing_granules"] == [self.URLS[1]]
+        assert meta["missing_granules"] == ["granule2.h5"]
 
     def test_allow_contraction_rewrites_wholesale(self, monkeypatch, cfg, tmp_path):
         from zagg.store import open_store
@@ -1267,6 +1270,112 @@ class TestLeafSkipIfCurrent:
         )
         assert calls == [int(shard)]
         assert meta["identity"] == "unrecorded-ids" and "refused" not in meta
+
+    def test_a_clamped_per_cell_config_still_reads_current(self, monkeypatch, cfg, tmp_path):
+        # The issue #415 epoch's (7)(b) half, pinned at the seam where the
+        # drift actually bit rather than in ``semantics`` alone: the
+        # dispatcher hands a 2-granule cell a data_source clamped to
+        # ``granule_workers: 2`` (``runner._clamped_data_source``, issue #184)
+        # and the seam hashes THAT config through its ``semantic_hash=None``
+        # fallback. Pre-epoch the clamp moved the hash, so a small shard read
+        # its own leaf as ``semantic-mismatch`` and rewrote on every rerun.
+        from dataclasses import replace
+
+        from zagg.runner import _clamped_data_source
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        clamped = _clamped_data_source(cfg.data_source, len(self.URLS))
+        assert clamped is not None and clamped["granule_workers"] == len(self.URLS)
+        self._arm_boom(monkeypatch)
+        meta = hive.process_and_write_hive(
+            shard,
+            list(self.URLS),
+            grid,
+            {},
+            root,
+            replace(cfg, data_source=clamped),
+            store_kwargs={},
+            skip_if_current=True,
+        )
+        assert meta["current"] is True and meta["identity"] == "equal"
+
+    def test_a_credential_migration_still_reads_current(self, monkeypatch, cfg, tmp_path):
+        # The credentials_provider half of the epoch (espg-ruled 2026-08-17,
+        # issue #449), pinned where the cost would land: a store written
+        # WITHOUT a provider, then rerun under a config that names one — the
+        # MERRA-2/gesdisc migration over unchanged data. The bytes a leaf holds
+        # do not depend on which registry minted the credentials that fetched
+        # them, so the gate must still read `equal` and the fold must not run.
+        from dataclasses import replace
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        migrated = {**cfg.data_source, "credentials_provider": "gesdisc"}
+        self._arm_boom(monkeypatch)
+        meta = hive.process_and_write_hive(
+            shard,
+            list(self.URLS),
+            grid,
+            {},
+            root,
+            replace(cfg, data_source=migrated),
+            store_kwargs={},
+            skip_if_current=True,
+        )
+        assert meta["current"] is True and meta["identity"] == "equal"
+
+    def test_a_driver_switch_still_reads_current(self, monkeypatch, cfg, tmp_path):
+        # The canonical granule-identity half of the epoch (espg-ruled
+        # 2026-08-17, PR #420 question (1)(b)), pinned where the cost would
+        # land: a store written from s3 hrefs, then rerun with the https hrefs
+        # of the SAME granules (``runner._resolve_urls`` picks by
+        # data_source.driver, and the driver is packaging in the D19 core). The
+        # gate must read `equal` and the fold must not run — pre-epoch every id
+        # was renamed, the recorded catalog hash could not be reproduced, and
+        # the whole store rewrote itself for a fetch-mechanism change.
+        from dataclasses import replace
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        https = [u.replace("s3://bucket/", "https://host/some/prefix/") for u in self.URLS]
+        self._arm_boom(monkeypatch)
+        meta = hive.process_and_write_hive(
+            shard,
+            https,
+            grid,
+            {},
+            root,
+            replace(cfg, data_source={**cfg.data_source, "driver": "https"}),
+            store_kwargs={},
+            skip_if_current=True,
+        )
+        assert meta["current"] is True and meta["identity"] == "equal"
+
+    def test_a_sharded_flip_defeats_the_skip(self, monkeypatch, cfg, tmp_path):
+        # The issue #415 epoch's (8)(c) half, at the gate: flipping
+        # output.grid.sharded over an existing store changes the leaf's
+        # object set while the granule set holds, so PRE-epoch both identity
+        # halves agreed and the unit read `equal` — the store kept its old
+        # layout forever. The widened core makes it a semantic change.
+        import copy
+
+        _grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        flipped = copy.deepcopy(cfg)
+        # HEALPix output defaults to sharded (issue #215), so this is a real
+        # flip; the grid is rebuilt from the flipped config, since reusing the
+        # leaf's grid would carry the OLD sharding into the rewrite.
+        flipped.output["grid"]["sharded"] = False
+        flipped_grid = self._grid(flipped)
+        calls = self._counting_fake(monkeypatch, flipped_grid)
+        meta = hive.process_and_write_hive(
+            shard,
+            list(self.URLS),
+            flipped_grid,
+            {},
+            root,
+            flipped,
+            store_kwargs={},
+            skip_if_current=True,
+        )
+        assert calls == [int(shard)] and meta["identity"] == "semantic-mismatch"
 
     def test_no_sidecar_rewrites(self, monkeypatch, cfg, tmp_path):
         # No sidecar (fresh store): unverifiable, so today's rewrite.
@@ -2124,7 +2233,9 @@ class TestRunnerWiring:
         sidecar = read_sidecar(leaf)
         # The id LIST is the sidecar's sibling, never a record key (issue #388).
         assert "granule_ids" not in sidecar
-        assert read_granule_ids(leaf)["granule_ids"] == [_rec(1)["s3"]]
+        # The canonical id space (espg-ruled 2026-08-17): the sibling records
+        # the driver-stripped bare id, not the resolved href.
+        assert read_granule_ids(leaf)["granule_ids"] == ["granule1.h5"]
 
         # Age the store-ROOT objects: ensure_manifest early-returns on a
         # frozen-key match, so without the phase-3 root touch they would keep
@@ -2234,13 +2345,15 @@ class TestRunnerWiring:
         assert manifest["cells_refused"] == 1
         unit = manifest["units"][0]
         assert unit["shard_key"] == int(shard) and unit["identity"] == "contraction"
-        assert unit["missing_granules"] == [_rec(2)["s3"]]
+        assert unit["missing_granules"] == ["granule2.h5"]
         assert os.path.basename(s2["refusal_manifest_path"]).startswith("refusals_")
 
         s3 = agg(cfg, catalog=contracted, store=root, backend="local", allow_contraction=True)
         assert len(calls) == 2  # the flag proceeds as a normal D4 rewrite
         assert s3["cells_refused"] == 0 and s3["cells_with_data"] == 1
-        assert read_granule_ids(leaf)["granule_ids"] == [_rec(1)["s3"]]
+        # The canonical id space (espg-ruled 2026-08-17): the sibling records
+        # the driver-stripped bare id, not the resolved href.
+        assert read_granule_ids(leaf)["granule_ids"] == ["granule1.h5"]
         # Ruled (9)(a): a run with nothing refused writes no manifest.
         assert s3["refusal_manifest_path"] is None
 

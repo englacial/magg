@@ -1348,12 +1348,28 @@ class TestGediTemplate:
         assert grid["sharded"] is True
         assert cfg.output["store_layout"] == "hive"
         assert cfg.output["pyramid"] is False
-        assert "streaming" not in cfg.aggregation  # pooled; composability none
         flux = cfg.aggregation["variables"]["rx_flux"]
         assert flux["params"]["delta"] == 8192
         assert "operating_point" in flux["attrs"]  # clip provenance
         assert flux["attrs"]["gain_name"]
         assert len(cfg.data_source["groups"]) == 8
+
+    def test_measured_envelope(self, cfg):
+        # Measured right-sizing (issue #460), pinned so the envelope cannot
+        # drift back to the pre-measurement guesses. Optimized probe run
+        # 5d081b68 (4/4 green, identical output to the serial baseline run
+        # 8344cde5): 4096-disk tier at workers=4 / buffer 8 runs 300 s/shard
+        # at 60% memory (container HWM 2,472 MB) for a quarter the cost.
+        assert cfg.data_source["shard_workers"] == 4
+        assert "granule_workers" not in cfg.data_source  # canonical key only
+        # An absent index block resolves to inline since issue #170; the GEDI
+        # baseline is explicitly pinned hierarchical (issue #460).
+        assert cfg.data_source["index"] == {"backend": "hierarchical"}
+        # 50-82 M rows/shard pre-clip: spill, not pooled (1.6-2.5 GB /tmp,
+        # single-block regime).
+        assert cfg.aggregation["streaming"] == {"mode": "spill", "buffer_granules": 8}
+        # Spill needs the -disk twin at every tier.
+        assert cfg.worker == {"memory": 4096, "extra_disk": True}
 
     def test_filters_are_validity_gates_only(self, cfg):
         # espg ruling 2026-08-17 (refs #425 / issue #422): the template filters

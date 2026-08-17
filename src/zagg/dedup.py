@@ -37,7 +37,7 @@ import logging
 
 from zagg.hive import read_commit, read_manifest, shard_leaf_path
 from zagg.store import open_store
-from zagg.telemetry import granules_sha256, read_sidecar
+from zagg.telemetry import canonical_granule_ids, granules_sha256, read_sidecar
 
 logger = logging.getLogger(__name__)
 
@@ -58,18 +58,19 @@ def shard_status(
 ) -> dict:
     """Dedup status of ONE (shard, window) leaf; see :func:`has_run`.
 
-    ``granule_ids`` is the shard's CURRENT catalog snapshot in the same id
-    space the sidecars record (resolved granule URLs on the aggregation
-    path, STAC item ids/datetimes for raster — cf.
-    :func:`zagg.telemetry.granules_sha256`); ``None`` skips the catalog
-    check (identity match alone then gates the hit).
+    ``granule_ids`` is the shard's CURRENT catalog snapshot — resolved granule
+    URLs (in any href form) on the aggregation path, STAC item ids/datetimes
+    for raster; both sides reduce to the canonical bare granule id before the
+    compare (:func:`zagg.telemetry.canonical_granule_id`). ``None`` skips the
+    catalog check (identity match alone then gates the hit).
 
     .. warning::
-       The catalog check is an EXACT ``granules_sha256`` comparison, so
-       ``granule_ids`` must be the same id space the writer recorded — a
-       caller that supplies a different space (bare short-names vs resolved
-       URLs, sorted vs dispatch order) makes EVERY stamped shard report
-       ``stale`` on ``catalog_match`` rather than a genuine catalog change.
+       The catalog check is an EXACT ``granules_sha256`` comparison. Since the
+       D19 hash epoch the href FORM no longer counts (an ``s3://`` href, an
+       ``https://`` href and a bare catalog id of one granule compare equal),
+       but a caller supplying genuinely different names — product short-names,
+       say — still makes EVERY stamped shard report ``stale`` on
+       ``catalog_match`` rather than a genuine catalog change.
        A ``"catalog grown/changed"`` stale carries both
        ``granules_sha256_recorded`` and ``granules_sha256_current`` so a
        mis-spaced caller can see the mismatch is systematic (every shard
@@ -130,8 +131,8 @@ def has_run(
         The prospective run's config; its ``semantic_hash`` is the identity
         compared against each sidecar.
     shards : mapping or iterable
-        ``{shard_key: granule_ids}`` (current catalog snapshot per shard —
-        the same id space the sidecars record) or a bare iterable of shard
+        ``{shard_key: granule_ids}`` (current catalog snapshot per shard, in
+        any href form — see :func:`shard_status`) or a bare iterable of shard
         keys (catalog check skipped).
     window : str, optional
         Window label for windowed stores (one status per (shard, window)).
@@ -228,6 +229,39 @@ def _sibling_ids(leaf_path, recorded, spec, store_kwargs):
     return ids
 
 
+def _warn_on_collapsed_recorded_ids(rec_ids, canonical) -> None:
+    """Say so when canonicalization collapsed DISTINCT recorded ids.
+
+    The canonical form is a basename (:func:`zagg.telemetry.canonical_granule_id`,
+    espg-ruled 2026-08-17), so two recorded hrefs differing only in prefix
+    become one id. The diff in :func:`classify_leaf_identity` is over SETS, so
+    for such a leaf the contraction guard loses its per-granule resolution
+    *inside* the collapsed group: dropping one member of a collided pair leaves
+    the set unchanged, and the leaf reads ``id-multiset-drift`` and REWRITES
+    where the pre-epoch href-space diff refused and named the dropped href.
+
+    Resolving that either way is a ruling on the ruled predicate itself
+    (``recorded − planned ≠ ∅``) rather than an implementation choice: after
+    collapse a recorded duplicate and two distinct collapsed granules are
+    byte-identical data, so a multiset diff would recover the refusal here at
+    the price of refusing the duplicate-drift case that
+    ``test_duplicate_drift_with_equal_sets_rewrites`` pins as a rewrite. Left
+    standing for espg (PR #420 review finding (2)) — but never silent.
+    """
+    groups: dict[str, set[str]] = {}
+    for original, canon in zip(rec_ids, canonical):
+        groups.setdefault(canon, set()).add(str(original))
+    collided = sorted(c for c, originals in groups.items() if len(originals) > 1)
+    if collided:
+        logger.warning(
+            f"canonicalization collapsed distinct recorded granule ids onto "
+            f"{collided} — the contraction guard cannot resolve a drop WITHIN a "
+            f"collapsed group on this leaf (it would read as id-multiset-drift "
+            f"and rewrite); ids that collide only in basename are outside what "
+            f"the canonical identity ruling can distinguish (issue #415)"
+        )
+
+
 def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorded_ids=None) -> dict:
     """Classify one planned unit against its leaf's recorded identity (#388).
 
@@ -270,7 +304,12 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorde
     from the ordinary rewrites (the phase-2 run stats, the phase-4 operator
     docs), because the guard cannot protect any leaf written before this
     release — no leaf written before issue #388 has the granule-id sibling
-    that records its input set.
+    that records its input set. The canonical-identity epoch opened one more
+    seam on that same side: two recorded hrefs differing only in prefix
+    collapse to ONE canonical id, and this set diff then cannot see a drop
+    *within* that group — the leaf rewrites where the pre-epoch diff refused.
+    Never silent (:func:`_warn_on_collapsed_recorded_ids`), and left standing
+    as a question on the predicate rather than resolved here.
 
     Parameters
     ----------
@@ -280,10 +319,12 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorde
     semantic_hash : str or None
         The run's semantic-core hash (D19). ``None`` never skips.
     planned_ids : iterable of str, or None
-        The unit's planned granule ids, in the id space the sidecars record
-        (resolved granule URLs on the aggregation path, STAC item
-        ids/datetimes for raster — cf. :func:`zagg.telemetry.granules_sha256`,
-        and the id-space warning on :func:`shard_status`). ``None`` means the
+        The unit's planned granule ids — resolved granule URLs (or paired-asset
+        entries) on the aggregation path, STAC item ids/datetimes for raster.
+        Any href form is accepted: both sides are reduced to the canonical
+        driver-stripped bare id (:func:`zagg.telemetry.canonical_granule_id`)
+        before anything is compared, so the driver a run reads with cannot move
+        the verdict. ``None`` means the
         planned set is UNKNOWN and never refuses (``unknown-planned``); the
         empty list means the unit genuinely plans no inputs, which against a
         non-empty recorded set is a full contraction and does refuse.
@@ -310,7 +351,18 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorde
         # name every recorded id as dropped and refuse the loudest way there is.
         # Ambiguity degrades to rewrite; ``[]`` below stays a real contraction.
         return {"action": "rewrite", "classification": "unknown-planned", "missing": []}
-    planned = [str(g) for g in planned_ids]
+    # Both sides of every comparison below run in the CANONICAL id space
+    # (:func:`zagg.telemetry.canonical_granule_id`, espg-ruled 2026-08-17): the
+    # driver-stripped bare id. Without it a driver switch — pure packaging in
+    # the D19 core — renames every planned id, and the diff would report the
+    # whole recorded set as dropped and the whole planned set as added for a
+    # rerun over exactly the same granules. Canonicalizing the RECORDED side
+    # too is what lets a pre-epoch leaf (full hrefs on its sibling) diff
+    # cleanly against a post-epoch plan. Such a leaf still REWRITES once — its
+    # stored digest is in the href space, so ``hashes_match`` below is False by
+    # construction and ``equal`` is unreachable — but it rewrites as
+    # drift/expansion rather than refusing as a spurious contraction.
+    planned = canonical_granule_ids(planned_ids) or []
     rec_hash = recorded.get("granules_sha256")
     semantic_match = semantic_hash is not None and recorded.get("semantic_hash") == semantic_hash
     hashes_match = rec_hash is not None and rec_hash == granules_sha256(planned)
@@ -342,7 +394,9 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorde
         # ordinary rewrites and say so in the operator docs (see the class
         # docstring's one-sided-conservatism note).
         return {"action": "rewrite", "classification": "unrecorded-ids", "missing": []}
-    recorded_set = {str(g) for g in rec_ids}
+    recorded_canonical = canonical_granule_ids(rec_ids) or []
+    _warn_on_collapsed_recorded_ids(rec_ids, recorded_canonical)
+    recorded_set = set(recorded_canonical)
     missing = sorted(recorded_set - set(planned))
     if missing:
         added = set(planned) - recorded_set
