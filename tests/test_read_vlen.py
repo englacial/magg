@@ -121,11 +121,15 @@ def _l1b_arrays(group="BEAM0000"):
 
 def _l2a_arrays(group="BEAM0000"):
     # Shot 103 has NO sibling row: the join must drop it, never borrow a row.
+    # The DEM sits within 200 m of every matched shot's window midpoint
+    # (98 / 49 / 78.5), so the template's geolocation-validity gate (issue
+    # #464) keeps all matched shots unless a test poisons it deliberately.
     return {
         f"/{group}/shot_number": np.array([101, 102, 104], dtype=np.uint64),
         f"/{group}/quality_flag": np.array([1, 0, 1], dtype=np.uint8),
         f"/{group}/sensitivity": np.array([0.95, 0.99, 0.50], dtype=np.float32),
         f"/{group}/rx_assess/rx_clipbin_count": np.array([0, 0, 0], dtype=np.uint16),
+        f"/{group}/digital_elevation_model": np.array([60.0, 30.0, 40.0], dtype=np.float32),
     }
 
 
@@ -1028,16 +1032,24 @@ class TestGediTemplate:
 
     def test_filters_are_validity_gates_only(self, cfg):
         # espg ruling 2026-08-17 (refs #425 / issue #422): the template filters
-        # on geolocation validity and saturation ONLY. quality_flag and
-        # sensitivity are L2A GROUND-RETRIEVAL fitness gates — quality_flag
-        # contains a sensitivity test internally, so the AND is brutally tight
-        # (1.61% quality-pass, 0 of 434 in-shard shots surviving the joint
-        # stack on a real SERC granule), and zagg's ratified clip policy is
-        # already the signal criterion. Pinned so they cannot drift back in.
-        datasets = [f["dataset"] for f in cfg.data_source["filters"]]
+        # on VALIDITY only — geolocation (degrade + the issue #464 DEM gate)
+        # and saturation. quality_flag and sensitivity are L2A GROUND-RETRIEVAL
+        # fitness gates — quality_flag contains a sensitivity test internally,
+        # so the AND is brutally tight (1.61% quality-pass, 0 of 434 in-shard
+        # shots surviving the joint stack on a real SERC granule), and zagg's
+        # ratified clip policy is already the signal criterion. Pinned so they
+        # cannot drift back in.
+        datasets = [f["dataset"] for f in cfg.data_source["filters"] if "dataset" in f]
         assert datasets == [
             "/{group}/geolocation/degrade",
             "/{group}/rx_assess/rx_clipbin_count",
+        ]
+        # The DEM-referenced geolocation-validity gate (issue #464): the
+        # window-MIDPOINT form (espg ruling 2026-08-17 — not elev_lowestmode,
+        # which would entangle retrieval quality), pinned verbatim.
+        expressions = [f["expression"] for f in cfg.data_source["filters"] if "expression" in f]
+        assert expressions == [
+            "abs((elevation_bin0 + elevation_lastbin)/2 - digital_elevation_model) <= 200"
         ]
 
     def test_template_reads_and_aggregates_the_fixture(self, cfg):
@@ -1168,8 +1180,13 @@ class TestOwnerMapReuse:
         # (companion count, filter levels), unlike the pinned harness above.
         ds = dict(default_config("gedi01b_waveform_healpix_hive").data_source)
         shot_vars = ds["levels"][ds["coordinates"]["level"]]["variables"]
-        # The count the finding is scaled by: six re-derivations, not one.
-        assert len(shot_vars) == 6
+        # The count the finding is scaled by: six re-derivations, not one. The
+        # asset-sourced DEM (issue #464) rides the same held gather map, so it
+        # adds a consumer without adding a derivation.
+        plain = {k: v for k, v in shot_vars.items() if isinstance(v, str)}
+        asset = {k: v for k, v in shot_vars.items() if isinstance(v, dict)}
+        assert len(plain) == 6
+        assert list(asset) == ["digital_elevation_model"]
         assert [f["level"] for f in ds["filters"] if "level" in f] == ["shots"]
 
     def test_a_genuinely_different_link_still_derives_its_own(self, monkeypatch):
