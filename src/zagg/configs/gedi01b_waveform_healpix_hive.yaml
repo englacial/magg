@@ -121,8 +121,11 @@ data_source:
 aggregation:
   # o9 shards are NOT light at GEDI density: the first successful run (run
   # 8344cde5, issue #460) read 50-82 M rows/shard pre-clip (21-33 M kept) --
-  # the pooled-mode assumption here reasoned about post-clip density and was
-  # wrong four failure rounds running (#448/#449/#452/#460). Spill wrote
+  # the pooled-mode assumption here reasoned about post-clip density and
+  # undersized the envelope. The other GEDI failure rounds had unrelated
+  # causes (issue #449 DAAC credentials, issue #452 read-plan striding, issue
+  # #460 inline cache-line residency -- the index.backend: hierarchical pin
+  # above is what unblocked that one, not this streaming block). Spill wrote
   # 1.6-2.5 GB /tmp per shard with spill_blocks_closed: 0 (exact single-block
   # regime, pooled-identical results). Pairs with worker.extra_disk below.
   streaming:
