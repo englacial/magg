@@ -179,6 +179,19 @@ places the panel.
    print(bench_metrics.select_densest_shard(sm))   # -> (shard_key, n_granules)
    ```
 
+   > **The committed maps span two granule-record schemas.** The five
+   > `sm_healpix_*.json` maps were last rebuilt after issue #246, so their
+   > granule records carry `time_start`/`time_end` (and their `metadata` a
+   > `granules_assigned` count) — they drive the windowed fan-out
+   > (`runner._windowed_units`) directly. The two `sm_rect_*.json` maps are
+   > still on the pre-#246 `{id, s3, https}` record shape, so windowing over
+   > them falls back to `bounds.temporal` (or raises the "this shardmap
+   > predates it" remedy when that is unset). They are not stale on purpose:
+   > rebuilding them needs the exact-S2 `spherely` backend, which is a
+   > non-PyPI fork, so they refresh whenever they are next re-pinned in an
+   > environment that has it. Both shapes are read correctly; only the
+   > windowing capability differs.
+
 3. **`targets.json`** — add the shard map (once per grid+order) and the target:
 
    ```json
