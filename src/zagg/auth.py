@@ -145,6 +145,17 @@ def get_gesdisc_s3_credentials() -> dict:
     return get_daac_s3_credentials("GES_DISC")
 
 
+def get_lpdaac_s3_credentials() -> dict:
+    """Return temporary S3 credentials for LP DAAC (GEDI and friends).
+
+    LP DAAC hosts the GEDI cloud products (GEDI01_B / GEDI02_A) in
+    ``lp-prod-protected``. DAAC S3 credentials are per-DAAC, so the NSIDC
+    default cannot read that bucket -- a GEDI config must select this
+    provider (issue #449).
+    """
+    return get_daac_s3_credentials("LPDAAC")
+
+
 registry.register_credential_provider(
     "nsidc",
     get_nsidc_s3_credentials,
@@ -154,6 +165,11 @@ registry.register_credential_provider(
     "gesdisc",
     get_gesdisc_s3_credentials,
     description="Earthdata temporary S3 credentials for GES DISC (MERRA-2 reanalysis)",
+)
+registry.register_credential_provider(
+    "lpdaac",
+    get_lpdaac_s3_credentials,
+    description="Earthdata temporary S3 credentials for LP DAAC (GEDI cloud products)",
 )
 
 #: The credential-provider registry (``zagg.registry.CREDENTIAL_PROVIDERS``).

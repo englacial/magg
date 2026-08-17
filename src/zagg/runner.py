@@ -2650,7 +2650,8 @@ def _resolve_source_credentials(config) -> dict:
     """S3 read credentials for the source datasets, provider-selected.
 
     ``data_source.credentials_provider`` names a credential-provider registry
-    entry (built-ins ``nsidc``/``gesdisc``; plugins may register others,
+    entry (built-ins ``nsidc``/``gesdisc``/``lpdaac``; plugins may register
+    others,
     including non-NASA S3-compatible sources -- providers run
     orchestrator-side, so the built-ins-only Lambda rule does not apply).
     Absent, the historical spatial default (NSIDC) stands, via the module
