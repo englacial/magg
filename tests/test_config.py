@@ -2710,3 +2710,45 @@ class TestNanAmbiguousReductionWarning:
         cfg = default_config("atl06")  # h_min/h_max: min/max, float32, NaN default
         validate_config(cfg)  # must NOT raise
         assert "h_min" in caplog.text and "h_max" in caplog.text
+
+
+class TestTimeEncoding:
+    """``output.time_encoding`` — the spec §8 declaration (issue #443)."""
+
+    def _raster_cfg(self, encoding=None):
+        output = {"grid": {"type": "healpix", "parent_order": 10, "child_order": 16}}
+        if encoding is not None:
+            output["time_encoding"] = encoding
+        return load_config_from_dict(
+            {
+                "data_source": {
+                    "reader": "raster",
+                    "bands": {"red": {"asset": "red", "dtype": "uint16"}},
+                },
+                "output": output,
+            }
+        )
+
+    def test_absent_and_both_values_validate(self):
+        for encoding in (None, "microseconds", "toc"):
+            validate_config(self._raster_cfg(encoding))
+
+    def test_unknown_value_rejected(self):
+        with pytest.raises(ValueError, match="output.time_encoding must be one of"):
+            validate_config(self._raster_cfg("datetime64"))
+
+    def test_toc_rejected_on_a_non_raster_pipeline(self):
+        cfg = default_config("atl06")
+        cfg.output["time_encoding"] = "toc"
+        with pytest.raises(ValueError, match="applies to raster"):
+            validate_config(cfg)
+
+    def test_default_still_validates_on_a_non_raster_pipeline(self):
+        cfg = default_config("atl06")
+        cfg.output["time_encoding"] = "microseconds"
+        validate_config(cfg)
+
+    def test_packaged_sentinel2_config_declares_toc(self):
+        cfg = default_config("sentinel2_l2a")
+        validate_config(cfg)
+        assert cfg.output["time_encoding"] == "toc"

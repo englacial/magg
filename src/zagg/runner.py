@@ -799,6 +799,7 @@ class RasterStrategy:
             write_raster_slab,
         )
         from zagg.telemetry import build_record, raster_granule_ids, write_sidecar
+        from zagg.time_axis import time_encoding
 
         catalog_path = catalog or config.catalog
         if not catalog_path:
@@ -823,7 +824,9 @@ class RasterStrategy:
 
         grid = from_config(config)
         _check_signature(grid, catalog_data)
-        time_index, times_us = raster_time_index(catalog_data["granules"])
+        time_index, times_us = raster_time_index(
+            catalog_data["granules"], encoding=time_encoding(config)
+        )
         if not time_index:
             raise ValueError("catalog carries no raster granule entries (no assets/datetime)")
 

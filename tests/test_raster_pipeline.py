@@ -21,6 +21,7 @@ from zagg.processing.raster import (
     _shard_cell_range,
     _shard_workers,
     _write_buffer,
+    emit_raster_leaf_template,
     emit_raster_template,
     new_stage_stats,
     process_raster_shard,
@@ -31,13 +32,20 @@ from zagg.processing.raster import (
     write_raster_coords,
     write_raster_slab,
 )
+from zagg.time_axis import decode_time_axis, read_time_axis, time_axis_attrs
 
 T0 = "2026-07-13T16:02:20+00:00"
 T0B = "2026-07-13T16:02:24+00:00"  # same datatake, adjacent tile: seconds later
 T1 = "2026-07-18T16:02:20+00:00"
 
 
-def _raster_config(bands=None, nodata=0, grid=None):
+def _raster_config(bands=None, nodata=0, grid=None, time_encoding=None):
+    output = {
+        "grid": grid or {"type": "healpix", "parent_order": 10, "child_order": 16},
+        "store": "memory://",
+    }
+    if time_encoding:
+        output["time_encoding"] = time_encoding
     return load_config_from_dict(
         {
             "data_source": {
@@ -55,18 +63,19 @@ def _raster_config(bands=None, nodata=0, grid=None):
                 },
                 "nodata": nodata,
             },
-            "output": {
-                "grid": grid or {"type": "healpix", "parent_order": 10, "child_order": 16},
-                "store": "memory://",
-            },
+            "output": output,
         }
     )
 
 
-def _entry(gid, assets, dt, time_key=None):
+def _entry(gid, assets, dt, time_key=None, time_start=None, time_end=None):
     e = {"id": gid, "s3": None, "https": None, "assets": assets, "datetime": dt}
     if time_key:
         e["time_key"] = time_key
+    if time_start:
+        e["time_start"] = time_start
+    if time_end:
+        e["time_end"] = time_end
     return e
 
 
@@ -322,6 +331,104 @@ class TestRasterTimeIndex:
     def test_missing_datetime_raises(self):
         with pytest.raises(ValueError, match="no datetime"):
             raster_time_index([[{"id": "bad", "assets": {"red": "x"}}]])
+
+
+class TestTocTimeIndex:
+    """The §8 toc encoding of the acquisition-group axis (issue #443)."""
+
+    def _granules(self):
+        return [
+            [
+                _entry("a", {"red": "x"}, T0, time_key="dt-1"),
+                _entry("b", {"red": "y"}, T0B, time_key="dt-1"),
+                _entry("c", {"red": "z"}, T1, time_key="dt-2"),
+            ]
+        ]
+
+    def test_group_span_becomes_a_range_word(self):
+        index, words = raster_time_index(self._granules(), encoding="toc")
+        # Row assignment is the encoding-independent part: same order, same
+        # index, so a leaf's slab rows cannot drift with the encoding.
+        assert index == raster_time_index(self._granules())[0] == {"dt-1": 0, "dt-2": 1}
+        assert words.dtype == np.uint64 and words.shape == (2,)
+        lo, hi = decode_time_axis(words, time_axis_attrs("toc"))
+        # dt-1 spans T0..T0B (4 s apart) — a conservative range containing both.
+        assert lo[0] <= np.datetime64(T0[:-6], "ns") and hi[0] > np.datetime64(T0B[:-6], "ns")
+        # dt-2 is a single item: an exact instant, not widened into a range.
+        assert lo[1] == hi[1] == np.datetime64(T1[:-6], "ns")
+
+    def test_stac_start_end_datetime_widens_the_envelope(self):
+        granules = [
+            [
+                _entry(
+                    "a",
+                    {"red": "x"},
+                    T0,
+                    time_key="dt-1",
+                    time_start="2026-07-13T16:02:18+00:00",
+                    time_end="2026-07-13T16:02:29+00:00",
+                )
+            ]
+        ]
+        _index, words = raster_time_index(granules, encoding="toc")
+        lo, hi = decode_time_axis(words, time_axis_attrs("toc"))
+        assert lo[0] <= np.datetime64("2026-07-13T16:02:18", "ns")
+        assert hi[0] > np.datetime64("2026-07-13T16:02:29", "ns")
+
+    def test_legacy_encoding_ignores_the_span(self):
+        # A pre-§8 axis is the earliest ITEM datetime, spans or not — the
+        # legacy values must not move when a catalog gains start/end columns.
+        granules = [
+            [
+                _entry(
+                    "a",
+                    {"red": "x"},
+                    T0,
+                    time_key="dt-1",
+                    time_start="2026-07-13T16:02:18+00:00",
+                    time_end="2026-07-13T16:02:29+00:00",
+                )
+            ]
+        ]
+        _index, times = raster_time_index(granules)
+        assert times.dtype == np.int64 and times[0] == np.int64(1_783_958_540_000_000)
+
+    def test_empty_toc_axis(self):
+        index, words = raster_time_index([[]], encoding="toc")
+        assert index == {} and words.dtype == np.uint64 and words.size == 0
+
+    def test_template_declares_and_round_trips(self, tmp_path):
+        cfg, grid, _shard = _healpix_setup(tmp_path, time_encoding="toc")
+        _index, words = raster_time_index(self._granules(), encoding="toc")
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, words)
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        assert tarr.dtype == np.uint64
+        assert "units" not in tarr.attrs and "calendar" not in tarr.attrs
+        assert dict(tarr.attrs)["temporal"]["spec"] == "zagg-toc/1"
+        np.testing.assert_array_equal(tarr[:], words)
+        # And the read path decodes the store without being told the encoding.
+        lo, hi = read_time_axis(store, grid.group_path)
+        assert lo.shape == (2,) and (hi >= lo).all()
+
+    def test_leaf_template_declares_toc(self, tmp_path):
+        cfg, grid, shard = _healpix_setup(tmp_path, time_encoding="toc")
+        _index, words = raster_time_index(self._granules(), encoding="toc")
+        store = MemoryStore()
+        emit_raster_leaf_template(store, grid, cfg, shard, words)
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        assert tarr.dtype == np.uint64
+        np.testing.assert_array_equal(tarr[:], words)
+
+    def test_legacy_store_still_reads(self, tmp_path):
+        # Schema evolution: a store written before §8 decodes through the same
+        # reader, no declaration and no refusal.
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, np.array([1_000_000, 2_000_000], dtype=np.int64))
+        lo, hi = read_time_axis(store, grid.group_path)
+        np.testing.assert_array_equal(lo, hi)
+        assert lo[0] == np.datetime64("1970-01-01T00:00:01", "ns")
 
 
 class _FakeGrid:
@@ -629,7 +736,7 @@ class TestOwnership:
             np.testing.assert_array_equal(streamed[t]["red"], golden[t]["red"])
 
 
-def _healpix_setup(tmp_path):
+def _healpix_setup(tmp_path, time_encoding=None):
     """Order-10 shard over the synthetic raster; order-16 cells (~97 m)."""
     from mortie import clip2order, geo2mort
 
@@ -640,6 +747,7 @@ def _healpix_setup(tmp_path):
     cfg = _raster_config(
         bands={"red": {"asset": "red", "dtype": "uint16", "scale": 0.0001, "offset": -0.1}},
         grid={"type": "healpix", "parent_order": 10, "child_order": 16},
+        time_encoding=time_encoding,
     )
     grid = HealpixGrid(10, 16, config=cfg)
     return cfg, grid, shard
