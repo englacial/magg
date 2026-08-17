@@ -210,6 +210,15 @@ def test_pinned_shardmap_no_drift(sm_key):
 
 OFFLINE_PINS = [k for k, v in MANIFEST["shardmaps"].items() if v.get("catalog_parquet")]
 
+#: The metadata keys the byte comparison below excuses, pinned HERE rather than
+#: imported from the driver. The driver's ``EXCUSED_META`` has a second job --
+#: labelling ``--check`` output -- so someone quieting a noisy check by
+#: appending a key to it would silently widen this acceptance test's blind spot,
+#: with nothing failing. That is precisely the relaxation issue #444's
+#: "byte-identically" exists to prevent, so widening it has to be a deliberate
+#: edit here too.
+EXCUSED_META = ("build_wall_s", "mortie_order")
+
 
 # ``tools/`` is not an installed package, so it goes on the path ONCE here --
 # matching the ``bench_metrics`` pattern above -- rather than on every
@@ -270,10 +279,15 @@ def test_offline_pin_reproduces_committed_map(sm_key, tmp_path):
     sm_meta = MANIFEST["shardmaps"][sm_key]
     assert (key, n) == (sm_meta["shard_key"], sm_meta["n_granules"])
 
+    # The driver may not widen this test's exemption on its own (see EXCUSED_META).
+    assert tuple(driver.EXCUSED_META) == EXCUSED_META, (
+        "the driver's excused-metadata set moved -- restate it here deliberately"
+    )
+
     written = tmp_path / "rebuilt.json"
     mapped.to_json(str(written))
-    assert _without_volatile(written.read_text(), driver.EXCUSED_META) == _without_volatile(
-        (BENCH / sm_meta["path"]).read_text(), driver.EXCUSED_META
+    assert _without_volatile(written.read_text(), EXCUSED_META) == _without_volatile(
+        (BENCH / sm_meta["path"]).read_text(), EXCUSED_META
     )
 
     from zagg.config import load_config
