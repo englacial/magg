@@ -1153,3 +1153,105 @@ class TestTemporalMergeLaws:
         np.testing.assert_array_equal(out_d, d)
         np.testing.assert_array_equal(out_t, t)
         assert out_t is not t
+
+
+class TestBatchedCompanionFolds:
+    """Cross-cell fold batching (issue #476): identical bytes, one FFI crossing."""
+
+    @staticmethod
+    def _cells(deltas=(4, 512, 32), seed=476):
+        # Varied sizes and deltas so the batch spans singleton-only partitions
+        # (n <= delta) AND compressed multi-member ones, on both channels.
+        rng = np.random.default_rng(seed)
+        cells = []
+        for j, delta in enumerate(deltas):
+            n = 30 + 40 * j
+            cells.append(
+                (
+                    rng.standard_normal(n),
+                    _point_words(n, seed=seed + j),
+                    _toc_words(n),
+                    delta,
+                )
+            )
+        return cells
+
+    def test_batched_matches_unbatched_byte_for_byte(self):
+        from zagg.stats.tdigest import batched_companion_folds
+
+        cells = self._cells()
+        plain = [build_tdigest(v, delta=d, locations=lo, temporal=t) for v, lo, t, d in cells]
+        with batched_companion_folds():
+            batched = [build_tdigest(v, delta=d, locations=lo, temporal=t) for v, lo, t, d in cells]
+        for (pd_, pl, pt), (bd, bl, bt) in zip(plain, batched, strict=True):
+            np.testing.assert_array_equal(pd_, bd)
+            np.testing.assert_array_equal(pl, bl)
+            np.testing.assert_array_equal(pt, bt)
+
+    def test_one_reduce_crossing_per_channel(self, monkeypatch):
+        import mortie
+
+        from zagg.stats.tdigest import batched_companion_folds
+
+        counts = {"tocs_reduce": 0, "validate_morton": 0}
+        orig_reduce, orig_validate = mortie.tocs_reduce, mortie.validate_morton
+        monkeypatch.setattr(
+            mortie,
+            "tocs_reduce",
+            lambda *a: (
+                counts.__setitem__("tocs_reduce", counts["tocs_reduce"] + 1) or orig_reduce(*a)
+            ),
+        )
+        monkeypatch.setattr(
+            mortie,
+            "validate_morton",
+            lambda *a: (
+                counts.__setitem__("validate_morton", counts["validate_morton"] + 1)
+                or orig_validate(*a)
+            ),
+        )
+        with batched_companion_folds():
+            for v, lo, t, d in self._cells():
+                build_tdigest(v, delta=d, locations=lo, temporal=t)
+            assert counts == {"tocs_reduce": 0, "validate_morton": 0}, (
+                "folds must defer until the context exits"
+            )
+        assert counts["tocs_reduce"] == 1
+        assert counts["validate_morton"] == 1
+
+    def test_nested_context_is_a_passthrough(self):
+        from zagg.stats.tdigest import batched_companion_folds
+
+        v, lo, t, d = self._cells()[1]
+        plain_d, plain_l, plain_t = build_tdigest(v, delta=d, locations=lo, temporal=t)
+        with batched_companion_folds():
+            with batched_companion_folds():
+                bd, bl, bt = build_tdigest(v, delta=d, locations=lo, temporal=t)
+        np.testing.assert_array_equal(plain_d, bd)
+        np.testing.assert_array_equal(plain_l, bl)
+        np.testing.assert_array_equal(plain_t, bt)
+
+    def test_exception_skips_the_flush(self, monkeypatch):
+        import mortie
+
+        from zagg.stats.tdigest import batched_companion_folds
+
+        calls = []
+        orig = mortie.tocs_reduce
+        monkeypatch.setattr(mortie, "tocs_reduce", lambda *a: calls.append(1) or orig(*a))
+        with pytest.raises(RuntimeError, match="boom"):
+            with batched_companion_folds():
+                v, lo, t, d = self._cells()[0]
+                build_tdigest(v, delta=d, temporal=t)
+                raise RuntimeError("boom")
+        assert calls == [], "a failed loop must not fold its abandoned placeholders"
+
+    def test_batch_deactivates_after_exit(self):
+        # The context always resets, so a later unbatched call folds for real.
+        from zagg.stats.tdigest import batched_companion_folds
+
+        with batched_companion_folds():
+            pass
+        v, lo, t, d = self._cells()[2]
+        _, _, times = build_tdigest(v, delta=d, locations=lo, temporal=t)
+        assert times.dtype == np.uint64 and len(times) > 0
