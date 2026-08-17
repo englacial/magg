@@ -238,13 +238,18 @@ class TestObservationWords:
         offsets = [0.0, 1.5, 86400.25]
         start, end = mortie.toc2time(self._words(offsets))
         assert np.array_equal(start, end)  # a timestamp's two bounds coincide
-        expected = np.datetime64(self.EPOCH, "ns").astype("int64") + np.rint(
-            np.asarray(offsets) * 1e9
-        ).astype("int64")
-        assert np.array_equal(
-            mortie.to_datetime64(start).astype("int64"),
-            expected,
+        # Literal instants, NOT a re-derivation of the encode's own arithmetic:
+        # re-deriving pins the round trip only where the formula is already
+        # right, which is how the leap-shift bug stayed green (issue #410 review).
+        expected = np.array(
+            [
+                "2018-01-01T00:00:00.000000000",
+                "2018-01-01T00:00:01.500000000",
+                "2018-01-02T00:00:00.250000000",
+            ],
+            dtype="datetime64[ns]",
         )
+        assert np.array_equal(mortie.to_datetime64(start), expected)
 
     def test_days_units_scale(self):
         assert int(self._words([1.0], units="days")[0]) == int(self._words([86400.0])[0])
@@ -288,6 +293,24 @@ class TestObservationWords:
         )
         decoded = mortie.to_datetime64(mortie.toc2time(self._words([offset]))[0])[0]
         assert decoded == boundary
+
+    def test_pre_2017_epoch_is_not_leap_shifted(self):
+        # Every other case here sits on the post-2017 ATLAS epoch, where a
+        # scale-vs-UTC correction is 0 and therefore invisible: deleting or
+        # sign-flipping one leaves the class green (issue #410 review). This case
+        # runs the branch — a GPS-native epoch, a 2024 observation — against the
+        # instant itself AND against the window router, so any correction
+        # reintroduced here fails by 18 s rather than passing silently.
+        import mortie
+
+        from zagg.windows import offset_to_utc
+
+        epoch, value = "1980-01-06T00:00:00", 1.4e9
+        decoded = mortie.to_datetime64(mortie.toc2time(self._words([value], epoch=epoch))[0])[0]
+        assert decoded == np.datetime64("2024-05-17T16:53:02", "ns")
+        assert decoded == np.datetime64(
+            offset_to_utc(value, epoch=epoch, scale="gps").replace(tzinfo=None), "ns"
+        )
 
     def test_post_ceiling_time_refused(self):
         # ~2142 is the grammar's ceiling (1850 + 2^63 ns); past it the cast
