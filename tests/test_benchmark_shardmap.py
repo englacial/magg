@@ -280,6 +280,38 @@ def test_repin_updates_only_the_pin_literals_in_targets():
     assert len(changed) == 2, changed
 
 
+def test_repin_targets_write_back_is_anchored_on_the_key():
+    """The entry is located by KEY, not by any occurrence of its name.
+
+    An entry name also appears as a ``"nested_in"`` VALUE (``healpix_o10_88s``
+    names ``healpix_o9_88s`` that way today). Today's manifest writes the parent
+    first, so an unanchored search happens to land right; it stops doing so the
+    moment a child precedes its parent, which the nested-pin design invites (an
+    o11 nested in an o10). Here the child comes first and carries an inner
+    object, so the unanchored form splices that object instead — silently, since
+    it too has the two literals to restate.
+    """
+    driver = _driver()
+    text = json.dumps(
+        {
+            "shardmaps": {
+                "child": {
+                    "nested_in": "parent",
+                    "provisional": {"shard_key": 1, "n_granules": 2},
+                    "shard_key": 3,
+                    "n_granules": 4,
+                },
+                "parent": {"shard_key": 5, "n_granules": 6},
+            }
+        },
+        indent=2,
+    )
+    maps = json.loads(driver.update_targets(text, "parent", 4242, 7))["shardmaps"]
+
+    assert maps["parent"] == {"shard_key": 4242, "n_granules": 7}
+    assert maps["child"] == json.loads(text)["shardmaps"]["child"]
+
+
 def test_repin_refuses_an_unknown_shardmap(capsys):
     driver = _driver()
     with pytest.raises(SystemExit):

@@ -159,11 +159,17 @@ def update_targets(text: str, sm_key: str, key: int, n: int) -> str:
     Surgical rather than a load/dump round trip: the manifest is hand-formatted
     (compact inline ``worker`` objects), so re-serializing would churn lines
     this re-pin does not touch. The entry's prose ``note`` is left alone.
+
+    The entry is located on ``"<key>":`` WITH the colon, which only a JSON key
+    can be followed by: a bare ``"<key>"`` also matches a ``"nested_in"``
+    *value* (``healpix_o10_88s`` names ``healpix_o9_88s`` that way), so the
+    unanchored form would rewrite the wrong entry whenever a child happened to
+    be written before its parent.
     """
     decoder = json.JSONDecoder()
     maps_at = text.index("{", text.index('"shardmaps"'))
     _, maps_end = decoder.raw_decode(text, maps_at)
-    entry_at = text.index("{", text.index(f'"{sm_key}"', maps_at, maps_end))
+    entry_at = text.index("{", text.index(f'"{sm_key}":', maps_at, maps_end))
     _, entry_end = decoder.raw_decode(text, entry_at)
     entry = text[entry_at:entry_end]
     for field, value in (("shard_key", key), ("n_granules", n)):
