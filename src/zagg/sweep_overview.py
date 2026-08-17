@@ -261,6 +261,15 @@ def fold_digests(cell_digests: list, *, delta: int, dtype="float32", locations=N
     separately would describe a different partition than the payload's. A
     located empty accumulation folds to a pair of empty payloads, keeping the
     sibling row-aligned with the digest at zero rows.
+
+    Every pair is length-checked HERE rather than at the call sites, because
+    this function is the documented seam the two must come from together: the
+    k-way merge validates the pairing itself, but the single-contributor arm
+    below bypasses the merge — and it is the majority case at the finest
+    overview level, where an output cell usually has exactly one populated
+    contributor. A ``b""`` sibling row decodes to a length-0 vector with no
+    complaint, so without this check that arm would encode a populated payload
+    against an empty channel: §1.1's row-alignment MUST, broken and written.
     """
     from zagg.stats.tdigest import merge_tdigests_kway
 
@@ -272,6 +281,12 @@ def fold_digests(cell_digests: list, *, delta: int, dtype="float32", locations=N
             return encode_digest(digests[0], dtype)
         return encode_digest(merge_tdigests_kway(digests, delta=int(delta)), dtype)
     pairs = [(d, w) for d, w in zip(cell_digests, locations, strict=True) if len(d)]
+    for d, w in pairs:
+        if len(w) != len(d):
+            raise ValueError(
+                f"located sibling has {len(w)} words for a {len(d)}-centroid digest — "
+                f"the channel must be row-aligned with its payload (spec §1.1)"
+            )
     if not pairs:
         return b"", b""
     digests = [d for d, _ in pairs]

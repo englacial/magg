@@ -410,6 +410,31 @@ class TestFoldDigests:
         backward = fold_digests(list(reversed(digests)), delta=64)
         assert forward == backward  # the issue #279 order-independent law
 
+    def test_a_short_located_sibling_is_refused_on_the_single_arm(self):
+        # The single-contributor arm bypasses the k-way merge, and therefore its
+        # pairing guard — a ``b""`` sibling row decodes to a length-0 vector, so
+        # without the check here a populated payload would be written against an
+        # empty channel (spec §1.1's row-alignment MUST).
+        d = self._digest(np.arange(10.0))
+        with pytest.raises(ValueError, match="row-aligned with its payload"):
+            fold_digests([d], delta=64, locations=[np.array([], dtype=np.uint64)])
+
+    def test_a_short_located_sibling_is_refused_on_the_merge_arm(self):
+        from conftest import point_words
+
+        d = self._digest(np.arange(10.0))
+        words = point_words(10, seed=7)
+        with pytest.raises(ValueError, match="row-aligned with its payload"):
+            fold_digests([d, d], delta=64, locations=[words[:3], words])
+
+    def test_the_aligned_pair_folds(self):
+        from conftest import point_words
+
+        d = self._digest(np.arange(10.0))
+        payload, sib = fold_digests([d], delta=64, locations=[point_words(len(d), seed=7)])
+        n_rows = decode_digest(payload, "float32").shape[0]
+        assert decode_digest(sib, "uint64", ()).shape == (n_rows,)
+
 
 class TestOverviewFoldDelta:
     """Issue #424: the split leaf-δ / overview-δ fold budget."""
