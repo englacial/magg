@@ -28,6 +28,7 @@ from zagg.sweep_overview import (
     OVERVIEW_ATTR,
     PYRAMID_SPEC,
     ROLE_ATTR,
+    check_located_match,
     combine_dense,
     declare_pyramid,
     decode_digest,
@@ -1190,6 +1191,100 @@ class TestLocatedOverviewFold:
         g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
         assert "h_tdigest_locations" not in g
         assert "locations" not in dict(g["h_tdigest"].attrs)["ragged"]
+
+
+class TestLocatedDeclarationGate:
+    """The §9 declaration is checked at retrofit time AND at fold time.
+
+    §9.2 imports §8.4: companions compose only on matching ``{shape, grammar}``
+    and a writer joining ones that differ MUST refuse. The pair of checks is
+    the §2.0 ``weights`` precedent (issue #424): a disagreement caught by
+    ``_field_drift`` is the retrofit refusing, and one missed there is every
+    leaf refusing at fold time.
+    """
+
+    def _leaf_group(self, root, mode="r+"):
+        store = open_store(shard_leaf_path(str(root), morton_word("-311")))
+        return zarr.open_group(store, path=str(CELL_ORDER), mode=mode, zarr_format=3)
+
+    def _drift(self, root):
+        from zagg.sweep_overview import _field_drift
+
+        return _field_drift(
+            self._leaf_group(root, mode="r"), "h_tdigest", LOCATED_FIELDS_DECL["h_tdigest"]
+        )
+
+    def test_the_written_sibling_passes_the_gate(self, tmp_path):
+        _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        assert self._drift(tmp_path) is None
+
+    def test_an_equivalent_dtype_spelling_is_not_drift(self, tmp_path):
+        # ``"<u8"`` IS uint64; a raw string compare would report spurious drift.
+        _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        sib = self._leaf_group(tmp_path)["h_tdigest_locations"]
+        block = dict(sib.attrs["ragged"])
+        block["element"] = {**block["element"], "dtype": "<u8"}
+        sib.attrs["ragged"] = block
+        assert self._drift(tmp_path) is None
+
+    def test_a_sibling_element_shape_is_drift(self, tmp_path):
+        # The fold decodes the words as a FLAT vector, so an inner shape would
+        # be silently reinterpreted rather than refused.
+        _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        sib = self._leaf_group(tmp_path)["h_tdigest_locations"]
+        block = dict(sib.attrs["ragged"])
+        block["element"] = {**block["element"], "shape": [-1, 2]}
+        sib.attrs["ragged"] = block
+        assert "element shape" in self._drift(tmp_path)
+
+    def test_an_unimplemented_shape_raises_out_of_the_gate(self, tmp_path):
+        # Not drift but UNREADABLE — the posture ``_field_drift``'s docstring
+        # already reserves for a store this zagg cannot decode.
+        _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        sib = self._leaf_group(tmp_path)["h_tdigest_locations"]
+        sib.attrs["located"] = {**dict(sib.attrs["located"]), "shape": "per-cell"}
+        with pytest.raises(ValueError, match="is not implemented"):
+            self._drift(tmp_path)
+
+    def test_an_absent_declaration_is_not_drift(self, tmp_path):
+        # §9's absent-key rule: every located store written before the
+        # declaration stays conformant, no byte rewritten.
+        _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        sib = self._leaf_group(tmp_path)["h_tdigest_locations"]
+        del sib.attrs["located"]
+        assert self._drift(tmp_path) is None
+        assert check_located_match(dict(sib.attrs), "h_tdigest") is None
+
+    def test_the_leaf_fold_refuses_an_unimplemented_shape(self, tmp_path):
+        # The fold-time counterpart: the leaf is skipped LOUDLY, exactly as a
+        # mismatched §2.0 weights declaration skips it (issue #424).
+        _write_manifest(tmp_path, orders=(1,), fields=LOCATED_FIELDS_DECL)
+        _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0]})
+        sib = self._leaf_group(tmp_path)["h_tdigest_locations"]
+        sib.attrs["located"] = {**dict(sib.attrs["located"]), "grammar": "not-mortie/9"}
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["failed"] == 1
+        assert result["families"]["overview"]["written"] == 0
+
+    def test_the_cascade_refuses_an_unimplemented_shape(self, tmp_path):
+        # Same check on the fold-of-folds path, which reads the OVERVIEW's own
+        # sibling. ``_cascade_node`` wraps this call in its per-child guard, so
+        # the raise becomes a loud skip there (``failed`` + ``unreadable``).
+        from zagg.sweep_overview import _fold_child
+
+        _write_manifest(tmp_path, orders=(1,), fields=LOCATED_FIELDS_DECL)
+        _make_located_leaf(tmp_path, "-311", {0: [1.0, 2.0], 5: [9.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        store = open_store(f"{tmp_path}/-3/1/all.zarr")
+        fine = zarr.open_group(store, path="3", mode="r+", zarr_format=3)
+        assert _fold_child(fine, LOCATED_FIELDS_DECL, 4, 4, "fine") is not None
+        fine["h_tdigest_locations"].attrs["located"] = {
+            "spec": "zagg-located/1",
+            "shape": "per-cell",
+            "grammar": "mortie-morton/1",
+        }
+        with pytest.raises(ValueError, match="is not implemented"):
+            _fold_child(fine, LOCATED_FIELDS_DECL, 4, 4, "fine")
 
 
 class TestOverviewWriter:
