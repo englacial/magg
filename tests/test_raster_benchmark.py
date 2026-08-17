@@ -71,7 +71,13 @@ def test_s2_neon_o9_tracks_the_shipped_sentinel2_config():
     assert b["grid"].pop("parent_order") == 9
     assert s["grid"].pop("parent_order") == 11
     assert b == s
+    # pyramid is dropped from the dict comparison above, so pin both sides of it
+    # explicitly: the shipped config growing an overview declaration (the issue
+    # #382 grammar) would otherwise turn the family on for the product while the
+    # leg keeps measuring it off, at an unchanged semantic hash -- output.pyramid
+    # is not in semantic_core, so the D19 assertion cannot see it either.
     assert bench.output["pyramid"] is False
+    assert "pyramid" not in shipped.output
 
 
 def test_pinned_s2_catalog_carries_raster_entries():
