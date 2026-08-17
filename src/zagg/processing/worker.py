@@ -65,6 +65,61 @@ _EXEMPLAR_CHARS = 300
 _TRACEBACK_LIMIT = 5
 
 
+#: Error codes / message tokens that mean "the read was DENIED", not "the data
+#: was bad" (issue #449). Matched case-insensitively against the exception text
+#: and, for botocore-shaped errors, against ``response["Error"]["Code"]``.
+#: Deliberately specific: a bare ``403`` would match a granule name.
+_AUTH_ERROR_TOKENS = (
+    "accessdenied",
+    "access denied",
+    "invalidaccesskeyid",
+    "signaturedoesnotmatch",
+    "expiredtoken",
+    "expired token",
+    "expired credentials",
+    "invalidtoken",
+    "tokenrefreshrequired",
+    "403 forbidden",
+    "http 403",
+    "status 403",
+    "unauthorized",
+)
+
+
+def is_auth_failure(exc: BaseException) -> bool:
+    """Whether a granule/group read failure is credentials-shaped (issue #449).
+
+    Three signatures, cheapest first:
+
+    * a **botocore** ``ClientError`` — duck-typed on its ``response`` mapping so
+      no botocore import is needed here — carrying HTTP 403 or a denial code;
+    * the **empty-body** signature: a 403'd byte-range read hands the HDF5
+      reader ``None`` where bytes were expected, which surfaces as
+      ``TypeError: memoryview: a bytes-like object is required, not 'NoneType'``
+      (the GEDI first-fleet-run shape — the reader never sees the status code);
+    * any exception whose text carries one of :data:`_AUTH_ERROR_TOKENS`.
+
+    Classification only: the caller decides what to do with it. The point is
+    that a shard whose every read was denied must not report the data-shaped
+    "No data after filtering" — that misdiagnosis cost issue #449 a fleet
+    round trip.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        meta = response.get("ResponseMetadata")
+        if isinstance(meta, dict) and meta.get("HTTPStatusCode") in (401, 403):
+            return True
+        error = response.get("Error")
+        if isinstance(error, dict):
+            code = str(error.get("Code", "")).lower()
+            if code in ("403", "401") or any(t in code for t in _AUTH_ERROR_TOKENS):
+                return True
+    text = str(exc).lower()
+    if isinstance(exc, TypeError) and "memoryview" in text and "nonetype" in text:
+        return True
+    return any(token in text for token in _AUTH_ERROR_TOKENS)
+
+
 def _entry_url(entry) -> str:
     """Primary URL of a granule entry (issue #425).
 
@@ -356,12 +411,20 @@ def process_shard(
     _exemplar_lock = threading.Lock()
     read_error_exemplars: list = []
     traced_messages: set = set()
+    # Auth-shaped failures, counted separately (issue #449): a denied read is a
+    # CONFIGURATION fault, not a data fault, and the two want opposite
+    # responses -- rerunning a shard whose credentials are wrong for the DAAC
+    # just burns another invoke. See :func:`is_auth_failure`.
+    auth_errors = 0
 
     def _record_read_error(what: str, exc: Exception) -> None:
         """Warn + exemplar one read failure. ``what`` is the log phrase (and so
         the scope): ``reading track <group>`` or ``processing file <url>``."""
+        nonlocal auth_errors
         msg = f"{type(exc).__name__}: {exc}"[:_EXEMPLAR_CHARS]
         with _exemplar_lock:
+            if is_auth_failure(exc):
+                auth_errors += 1
             if msg not in read_error_exemplars and len(read_error_exemplars) < _EXEMPLAR_LIMIT:
                 read_error_exemplars.append(msg)
             trace = msg not in traced_messages and len(traced_messages) < _TRACEBACK_LIMIT
@@ -606,6 +669,10 @@ def process_shard(
         metadata["read_errors"] = read_errors
     if granule_errors:
         metadata["granule_errors"] = granule_errors
+    if auth_errors:
+        # Counted even when the shard still produced data (a partially-denied
+        # read is a partially-wrong product), so the run summary can see it.
+        metadata["auth_errors"] = auth_errors
     if read_errors or granule_errors:
         # Bounded diagnosis payload (issue #341): messages only, no tracebacks
         # on the wire — full tracebacks were logged above. Success-path
@@ -644,13 +711,31 @@ def process_shard(
                 for n, scope in ((read_errors, "group"), (granule_errors, "granule"))
                 if n
             )
-            logger.warning(f"  No data after filtering for shard {label} and {raised} - skipping")
-            # Carry the exemplars in the error text too (issue #341): this
-            # string is what surfaces in the status object / run summary, so
-            # it must be a one-glance diagnosis, not just a count.
-            metadata["error"] = (
-                f"No data after filtering ({raised}; e.g. {' | '.join(read_error_exemplars)})"
-            )
+            exemplars = " | ".join(read_error_exemplars)
+            if auth_errors:
+                # Its own failure CLASS (issue #449): the GEDI template shipped
+                # without a credentials_provider, so NSIDC creds hit LP DAAC's
+                # lp-prod-protected, every 403 came back as an empty body, and
+                # the shard reported the data-shaped "No data after filtering"
+                # with a memoryview TypeError as the example. The fault is the
+                # config, not the data, and the message must say so.
+                logger.error(
+                    f"  Access denied reading source granules for shard {label} "
+                    f"({auth_errors} auth-shaped failures of {raised}) - skipping"
+                )
+                metadata["error"] = (
+                    f"Access denied reading source granules ({auth_errors} auth-shaped "
+                    f"failures; {raised}): check data_source.credentials_provider names "
+                    f"the DAAC hosting this product; e.g. {exemplars}"
+                )
+            else:
+                logger.warning(
+                    f"  No data after filtering for shard {label} and {raised} - skipping"
+                )
+                # Carry the exemplars in the error text too (issue #341): this
+                # string is what surfaces in the status object / run summary, so
+                # it must be a one-glance diagnosis, not just a count.
+                metadata["error"] = f"No data after filtering ({raised}; e.g. {exemplars})"
         else:
             logger.info(f"  No data after filtering for shard {label} - skipping")
             metadata["error"] = "No data after filtering"
