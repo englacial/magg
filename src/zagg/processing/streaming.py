@@ -70,6 +70,19 @@ _TDIGEST_SPILL_FUNCTIONS = (*_TDIGEST_FUNCTIONS, _TDIGEST_WHERE_FUNCTION)
 _COMPOSITION_FUNCTION = "zagg.stats.composition.pack_composition"
 
 
+def _positive_int(value) -> bool:
+    """True for a positive int — and ``bool`` is deliberately not one.
+
+    ``bool`` subclasses ``int``, so a bare ``isinstance(v, int)`` accepts
+    ``buffer_granules: true`` / ``block_bytes: true`` (PyYAML also resolves
+    ``yes``/``on`` to booleans) and the worker then runs with a threshold of
+    **1** — a 1-byte block closes on every flush, the maximally degraded fold
+    regime, from a knob name that reads enough like a flag to be a plausible
+    operator typo.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
 def get_streaming(config: PipelineConfig) -> dict | None:
     """Return the ``aggregation.streaming`` block, or ``None`` (pooled path).
 
@@ -110,7 +123,7 @@ def get_streaming(config: PipelineConfig) -> dict | None:
     # and up to buffer_granules granules of post-filter rows sit in RAM before
     # the first flush. 20 drops that term ~60% on the CA o9 fat shards.
     buffer_granules = block.get("buffer_granules", 20)
-    if not isinstance(buffer_granules, int) or buffer_granules < 1:
+    if not _positive_int(buffer_granules):
         raise ValueError(
             f"aggregation.streaming.buffer_granules must be a positive int "
             f"(got {buffer_granules!r})"
@@ -120,7 +133,7 @@ def get_streaming(config: PipelineConfig) -> dict | None:
         raise ValueError(f"aggregation.streaming.mode must be 'merge' or 'spill' (got {mode!r})")
     block_bytes = block.get("block_bytes")
     if block_bytes is not None:
-        if not isinstance(block_bytes, int) or block_bytes < 1:
+        if not _positive_int(block_bytes):
             raise ValueError(
                 f"aggregation.streaming.block_bytes must be a positive int (got {block_bytes!r})"
             )
