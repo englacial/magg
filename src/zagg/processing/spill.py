@@ -586,8 +586,15 @@ class SpillAggregator:
         else:
             self._n_partitions = 1
         if block_bytes is not None:
+            # An explicit threshold skips _default_block_bytes' 45%-of-free-/tmp
+            # cap, so the guard has to reserve what the run actually holds: under
+            # overlap a CLOSING block is resident beside the FILLING one
+            # (_close_block), i.e. 2x. Without the doubling any value between
+            # ~50% and 100% of free /tmp passes here and then ENOSPCs mid-shard —
+            # the failure check_tmp_headroom exists to pre-empt (issue #474).
             self.block_bytes = int(block_bytes)
-            check_tmp_headroom(max(_MIN_SPILL_BYTES, self.block_bytes), self.tmp_dir)
+            resident = self.block_bytes * (2 if overlap else 1)
+            check_tmp_headroom(max(_MIN_SPILL_BYTES, resident), self.tmp_dir)
         else:
             check_tmp_headroom(_MIN_SPILL_BYTES, self.tmp_dir)
             self.block_bytes = _default_block_bytes(self._n_partitions, self.tmp_dir)
