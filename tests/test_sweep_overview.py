@@ -451,6 +451,29 @@ class TestFoldDigests:
         n_rows = decode_digest(payload, "float32").shape[0]
         assert decode_digest(sib, "uint64", ()).shape == (n_rows,)
 
+    @pytest.mark.parametrize("n_contributors", [0, 1, 3])
+    def test_slot_order_is_the_table_not_the_callers_dict(self, n_contributors):
+        # Every arm must return (payload, locations, temporal) in
+        # COMPANION_CHANNELS order, because the k-way merge fixes ITS order by
+        # that table. An arm following the caller's insertion order instead
+        # would hand back a toc word in the locations slot, and since the two
+        # grammars are mutually accepting nothing downstream would raise.
+        from conftest import point_words, toc_words
+
+        digests = [self._digest(np.arange(i, i + 10.0)) for i in range(n_contributors)]
+        locs = [point_words(len(d), seed=7 + i) for i, d in enumerate(digests)]
+        times = [toc_words(len(d)) for d in digests]
+        forward = fold_digests(digests, delta=64, channels={"locations": locs, "temporal": times})
+        reverse = fold_digests(digests, delta=64, channels={"temporal": times, "locations": locs})
+        assert len(forward) == 3
+        assert forward == reverse
+
+    def test_an_unknown_channel_is_refused_not_dropped(self):
+        # Silently dropping it would return fewer slots than the caller zips.
+        d = self._digest(np.arange(10.0))
+        with pytest.raises(ValueError, match="unknown companion channel"):
+            fold_digests([d], delta=64, channels={"altitude": [np.zeros(len(d), np.uint64)]})
+
 
 class TestOverviewFoldDelta:
     """Issue #424: the split leaf-δ / overview-δ fold budget."""
