@@ -320,7 +320,10 @@ def classify_leaf_identity(recorded, *, semantic_hash, planned_ids, load_recorde
     # whole recorded set as dropped and the whole planned set as added for a
     # rerun over exactly the same granules. Canonicalizing the RECORDED side
     # too is what lets a pre-epoch leaf (full hrefs on its sibling) diff
-    # cleanly against a post-epoch plan instead of reading as a contraction.
+    # cleanly against a post-epoch plan. Such a leaf still REWRITES once — its
+    # stored digest is in the href space, so ``hashes_match`` below is False by
+    # construction and ``equal`` is unreachable — but it rewrites as
+    # drift/expansion rather than refusing as a spurious contraction.
     planned = canonical_granule_ids(planned_ids) or []
     rec_hash = recorded.get("granules_sha256")
     semantic_match = semantic_hash is not None and recorded.get("semantic_hash") == semantic_hash

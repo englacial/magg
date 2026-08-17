@@ -986,13 +986,25 @@ both halves hold, so changing it still needs `--overwrite`
 `sharded` itself *is* covered since the epoch, see
 [the migration note](#migration-the-d19-hash-epoch) item 2).
 
-The **driver-dependence** caveat is gone. The recorded id space used to be the
-resolved href, so flipping `data_source.driver` between runs read as a full
-mixed contraction and refused per leaf. Since the epoch both sides are reduced
-to the canonical driver-stripped bare granule id (item 5 of the migration
-note), so a driver switch over unchanged granules reads `equal` — including
-against leaves whose recorded list predates the epoch, since the *recorded*
-side is canonicalized on read too.
+The **driver-dependence** caveat is gone, in two different strengths either
+side of the epoch. The recorded id space used to be the resolved href, so
+flipping `data_source.driver` between runs read as a full mixed contraction and
+refused per leaf. Since the epoch both sides are reduced to the canonical
+driver-stripped bare granule id (item 5 of the migration note), so:
+
+* against a leaf written **at or after** the epoch, a driver switch over
+  unchanged granules reads `equal` and skips — its recorded
+  `granules_sha256` is already in the canonical space, so the hash fast path
+  matches and no sibling is read;
+* against a **pre-epoch** leaf it does not skip, and cannot: the fast path
+  compares the *stored* digest, which was taken over resolved hrefs, so it
+  mismatches by construction and the leaf is rewritten once (expected at an
+  epoch — the note's "every pre-epoch `granules_sha256` invalidated" headline
+  is this). What canonicalizing the *recorded* side buys is the direction of
+  that rewrite: the sibling's hrefs reduce to the same bare ids as the plan, so
+  the leaf reads `id-multiset-drift`/`expansion` and rewrites, instead of
+  **refusing as a spurious contraction**. A driver switch over a pre-epoch
+  store therefore no longer needs `--allow-contraction` to get past the guard.
 
 ### The refusal manifest
 

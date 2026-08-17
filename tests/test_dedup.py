@@ -6,6 +6,7 @@ absent leaves are plain misses.
 """
 
 import copy
+import hashlib
 import pathlib
 
 import numpy as np
@@ -372,6 +373,43 @@ class TestClassifyLeafIdentity:
         got = self._classify(planned)
         assert got == {"action": "skip", "classification": "equal", "missing": []}
         assert self.loads == 0  # the hash fast path, not the diff, decides
+
+    @pytest.mark.parametrize(
+        "planned",
+        [
+            ["g1.h5", "g2.h5", "g3.h5"],  # the post-epoch plan, canonical
+            IDS,  # ...and the pre-epoch spelling: same verdict, same reason
+        ],
+    )
+    def test_a_pre_epoch_leaf_rewrites_rather_than_refusing(self, planned):
+        # The PRE-epoch half of the driver-switch story, which no other pin
+        # covers: a leaf written before the epoch recorded its `granules_sha256`
+        # over RESOLVED HREFS, so the canonical-space fast path mismatches by
+        # construction and `equal` is unreachable no matter how unchanged the
+        # granules are -- the "every pre-epoch granules_sha256 invalidated"
+        # headline of the migration note, and why such a leaf rewrites once.
+        # What canonicalizing the RECORDED side buys is the DIRECTION of that
+        # rewrite: the sibling's hrefs reduce to the same bare ids as the plan,
+        # so the leaf reads `id-multiset-drift` and rewrites instead of REFUSING
+        # as a spurious contraction -- which is what a driver switch over a
+        # pre-epoch store did before, and what would otherwise need
+        # `--allow-contraction` to get past.
+        href_space = hashlib.sha256("\n".join(sorted(self.IDS)).encode()).hexdigest()
+        assert href_space != granules_sha256(self.IDS)  # the epoch, in one line
+        self.loads = 0
+
+        def _load():
+            self.loads += 1
+            return sorted(self.IDS)  # the sibling is href-space too
+
+        got = classify_leaf_identity(
+            {"semantic_hash": self.SEM, "granules_sha256": href_space},
+            semantic_hash=self.SEM,
+            planned_ids=planned,
+            load_recorded_ids=_load,
+        )
+        assert got == {"action": "rewrite", "classification": "id-multiset-drift", "missing": []}
+        assert self.loads == 1  # the fast path cannot decide it: one sibling GET
 
 
 class TestLeafRecordedIds:
