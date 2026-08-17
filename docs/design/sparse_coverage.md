@@ -769,10 +769,13 @@ neither gap and is safe now.
   PR): each selects how bytes are fetched or moved, never what is computed;
   each fails loudly rather than silently; and `source_region` sat in the
   same dict literal as the already-excluded `anonymous`, so the D19 line ran
-  through the middle of one decision. The live demonstration is dated: two
-  GEDI flux builds of one shard on 2026-08-17 produced identical `total_obs`
-  and `cells_with_data` in the exact single-block spill regime and still
-  hashed apart on worker/streaming machinery alone. (e) The epoch also
+  through the middle of one decision. The live demonstration is dated and
+  covers the fan-out widths only: two GEDI flux builds of one shard on
+  2026-08-17 produced identical `total_obs` and `cells_with_data` in the exact
+  single-block spill regime and still hashed apart on `read_workers` and the
+  two `*_workers` spellings. `write_buffer` and `source_region` are
+  raster-only and a flux build is the point path, so those two rest on the
+  arguments rather than on the measurement. (e) The epoch also
   canonicalized the OTHER half of the identity pair, the catalog hash below
   (espg-ruled 2026-08-17: *"we want the granule to trigger the hash, not how
   that granule is fetched"*) — see that clause. Operator

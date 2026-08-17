@@ -776,10 +776,13 @@ the skip gate compares.
    region is a connection error, an over-large buffer is an OOM), so nothing
    depended on the digest to catch them. The operator consequence matches item
    3: **retuning machinery over unchanged data no longer rehashes.** The live
-   demonstration is dated — two GEDI flux builds of the same shard on
-   2026-08-17 produced identical `total_obs` and `cells_with_data` in the exact
-   single-block spill regime and still hashed apart, purely on
-   worker/streaming/index machinery.
+   demonstration is dated, and it covers the **fan-out widths only** — two GEDI
+   flux builds of the same shard on 2026-08-17 produced identical `total_obs`
+   and `cells_with_data` in the exact single-block spill regime and still hashed
+   apart on `read_workers` and the two `*_workers` spellings of item 1. It
+   cannot cover the other two: `write_buffer` and `source_region` are read only
+   on the raster path, and a GEDI flux build is the point path, so their
+   exclusion rests on the arguments above rather than on this measurement.
 5. **Granule identity is now the driver-stripped bare granule id.** This one
    moves the *other* digest — `granules_sha256`, the **catalog** identity half
    recorded in every D20 sidecar, and the id list in its `granules.json`

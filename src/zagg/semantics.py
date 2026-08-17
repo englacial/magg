@@ -157,10 +157,14 @@ from zagg.time_axis import DEFAULT_TIME_ENCODING
 #:   direction — a too-small pool is slower, a wrong region is a connection
 #:   error, an over-large buffer is an OOM — so nothing depended on the digest
 #:   to catch them, while hashing them silently splits one product in two.
-#:   The live demonstration is dated: two GEDI flux builds of the same shard on
-#:   2026-08-17 produced identical ``total_obs`` and ``cells_with_data`` in the
-#:   exact single-block spill regime and still hashed apart, purely on
-#:   worker/streaming machinery.
+#:   The live demonstration is dated, and it covers the **fan-out widths only**:
+#:   two GEDI flux builds of the same shard on 2026-08-17 produced identical
+#:   ``total_obs`` and ``cells_with_data`` in the exact single-block spill
+#:   regime and still hashed apart on ``read_workers`` and the two ``*_workers``
+#:   spellings above. It cannot demonstrate the other two — ``write_buffer``
+#:   and ``source_region`` are read only on the RASTER path, and a GEDI flux
+#:   build is the point path — so their exclusion rests on the arguments above,
+#:   which stand without a measurement.
 #: * *A machinery migration must never rehash unchanged data* — retuning a pool
 #:   width or a buffer bound over an existing store would otherwise refuse
 #:   every leaf as ``semantic-mismatch`` and rewrite it to produce the same

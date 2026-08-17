@@ -211,10 +211,15 @@ class TestCanonicalization:
         # to close it: retuning a pool width, a buffer bound, or a source region
         # over an EXISTING store must be one product. Otherwise every leaf reads
         # `semantic-mismatch` and the store rewrites itself to produce the same
-        # bytes -- which is exactly what espg measured on 2026-08-17, when two
-        # GEDI flux builds of shard 5347294481781620745 produced identical
-        # total_obs (23,353,274) and cells_with_data (27,727) in the exact
-        # single-block spill regime and still hashed apart.
+        # bytes -- which is what espg measured on 2026-08-17 for the FAN-OUT
+        # WIDTHS, when two GEDI flux builds of shard 5347294481781620745
+        # produced identical total_obs (23,353,274) and cells_with_data (27,727)
+        # in the exact single-block spill regime and still hashed apart on
+        # read_workers and the two *_workers spellings. The measurement stops
+        # there: write_buffer and source_region are read only on the raster path
+        # and a flux build is the point path, so those two are excluded on the
+        # argument (mechanism, loud failure, one dict literal with `anonymous`)
+        # rather than on the anecdote -- which is why this pins all three.
         base = semantic_hash(_cfg())
         assert semantic_hash(_cfg(**{f"data_source__{key}": before})) == base
         assert semantic_hash(_cfg(**{f"data_source__{key}": after})) == base
