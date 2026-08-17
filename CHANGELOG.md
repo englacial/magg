@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     is measurably identical at the production order pairs (the
     `bench/neon_order_sweep.py` invariant, verified at 555,867 granules); at
     coarse grids the new default is a documented conservative superset, never a
-    subset. Explicit `mortie_order=` pins are unchanged.
+    subset. The order an explicit `mortie_order=` pin resolves to is unchanged
+    (it is still honored literally and still validated against `parent_order`).
   - Unindexed builds cover from the catalog's WKB column and intersect before
     materializing granule records. At clone scale (555,867 granules) the
     unpinned default — the case the bullet above changes — goes 1,075 s -> 39 s
