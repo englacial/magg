@@ -97,12 +97,15 @@ class TestStreamingConfig:
         with pytest.raises(ValueError, match="buffer_granules, mode and block_bytes"):
             get_streaming(_config(streaming={key: "arena"}))
 
-    @pytest.mark.parametrize("bad", [0, -1, "50", 2.5])
+    # True/False are the bool arm: bool subclasses int, so a YAML `true` (or
+    # `yes`/`on`, which PyYAML also resolves to booleans) would otherwise
+    # validate and run as 1 — a 1-byte block closes on every flush.
+    @pytest.mark.parametrize("bad", [0, -1, "50", 2.5, True, False])
     def test_bad_buffer_raises(self, bad):
         with pytest.raises(ValueError, match="buffer_granules"):
             get_streaming(_config(streaming={"buffer_granules": bad}))
 
-    @pytest.mark.parametrize("bad", [0, -1, "1048576", 2.5])
+    @pytest.mark.parametrize("bad", [0, -1, "1048576", 2.5, True, False])
     def test_bad_block_bytes_raises(self, bad):
         with pytest.raises(ValueError, match="block_bytes"):
             get_streaming(_config(streaming={"mode": "spill", "block_bytes": bad}))
