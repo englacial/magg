@@ -2874,6 +2874,34 @@ def _identity_counts(metas) -> dict:
     }
 
 
+def _warn_partial_auth_denials(metas) -> int:
+    """WARN once when shards that PRODUCED data also hit denied reads (#449).
+
+    A shard whose every read was denied says so itself — the worker's own
+    ``Access denied reading source granules`` error reaches the summary through
+    ``cells_error``. The silent case is the PARTIAL one: some granules read,
+    some 403'd, so the shard returns data, no error, and a leaf that is missing
+    exactly the granules the credentials could not reach. Nothing in the
+    summary would have shown it, which is the same misdiagnosis-costs-a-rerun
+    shape issue #449 exists to remove (espg ruling, 2026-08-17), so one WARNING
+    names the shard count and the provider check.
+
+    Returns the number of such shards (0 when silent).
+    """
+    metas = [m for m in metas if isinstance(m, dict)]
+    hits = [m for m in metas if int(m.get("auth_errors") or 0) and int(m.get("total_obs") or 0)]
+    if not hits:
+        return 0
+    denied = sum(int(m["auth_errors"]) for m in hits)
+    logger.warning(
+        f"  {len(hits)} shard(s) wrote data despite DENIED source reads "
+        f"({denied} auth-shaped read failures): those leaves are PARTIAL — check "
+        f"data_source.credentials_provider names the DAAC hosting this product, "
+        f"then rerun the affected shards (issue #449)"
+    )
+    return len(hits)
+
+
 def _write_refusals(store_path, metas, identity, run_id, semantic_hash, store_kwargs) -> str | None:
     """The run's store-root refusal manifest, or ``None`` (issue #388).
 
@@ -3258,6 +3286,8 @@ def _run_local(
     refusal_manifest_path = _write_refusals(
         store_path, report.results, identity, run_id, run_semantic_hash, store_kwargs
     )
+    # Partially-denied leaves (issue #449) — see _warn_partial_auth_denials.
+    _warn_partial_auth_denials(report.results)
 
     summary = {
         "total_cells": len(cells),
@@ -4074,6 +4104,9 @@ def _run_lambda(
         container_stats = _container_telemetry_summary(
             [r.get("body") or {} for r in report.results]
         )
+
+        # Partially-denied leaves (issue #449) — see _warn_partial_auth_denials.
+        _warn_partial_auth_denials([r.get("body") or {} for r in report.results])
 
         # Per-phase worker breakdown (issue #100 phase 2), only when --profile fed
         # the workers a "profile" event so they emitted body["phase_timings"]. Roll
