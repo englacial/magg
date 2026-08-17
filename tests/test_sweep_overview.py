@@ -1113,12 +1113,48 @@ class TestLocatedOverviewFold:
         words = decode_digest(bytes(g["h_tdigest_locations"][:][0]), "uint64", ())
         assert words.dtype == np.uint64
         assert words.shape == (payload.shape[0],), "the sibling stays row-aligned (§1.1)"
+        # Every word against ITS OWN members, partitioned by the digest's weights
+        # -- the same per-centroid check ``test_overview_words_contain_their_
+        # contributors`` makes, so a fold that got every word but the zeroth
+        # wrong cannot pass (review finding).
         members = np.concatenate([truth[0], truth[1]])
-        assert _contains_all(int(np.uint64(words[0])), members[:1])
+        bounds = np.concatenate([[0], np.cumsum(payload[:, 1]).astype(np.int64)])
+        for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+            assert _contains_all(int(np.uint64(words[i])), members[lo:hi])
         # Every stored word contains at least itself and is a real morton word.
         from mortie import validate_morton
 
         validate_morton(words)
+
+    def test_overview_words_sit_at_heterogeneous_orders(self, tmp_path):
+        # §9.1's normative property, and the one this phase newly creates: "A
+        # fold coarsens only as far as its contributors force, so one overview
+        # array's words routinely carry different orders", and a reader "MUST
+        # NOT assume a uniform order per array, per level, or per store". At
+        # delta=64 a 3-observation cell merges nothing, so its centroids keep
+        # their order-29 POINT words while cell 1's single observation folded
+        # with nothing else also stays a point word -- to get a MERGED (coarse
+        # area) word beside them the cell needs more observations than delta
+        # allows to stay singletons.
+        from mortie import is_point, orders_of
+
+        _write_manifest(tmp_path, orders=(1,), fields=LOCATED_FIELDS_DECL)
+        _make_located_leaf(tmp_path, "-311", {0: list(np.arange(400.0)), 1: [7.0]})
+        run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        payload = decode_digest(bytes(g["h_tdigest"][:][0]), "float32")
+        words = decode_digest(bytes(g["h_tdigest_locations"][:][0]), "uint64", ())
+        orders = np.asarray(orders_of(words))
+        singletons = payload[:, 1] == 1.0
+        assert singletons.any() and (~singletons).any(), "need both merged and unmerged centroids"
+        assert len(set(orders.tolist())) > 1, "§9.1: one array, heterogeneous orders"
+        # The unmerged centroids keep their order-29 POINT words; the merged ones
+        # are area words at strictly coarser orders -- kind and order both
+        # decoded from the word, never from the level (§9.1, mortie §1/§4).
+        points = np.asarray(is_point(words))
+        assert points[singletons].all() and not points[~singletons].any()
+        assert set(orders[singletons].tolist()) == {29}
+        assert orders[~singletons].max() < 29
 
     def test_overview_words_contain_their_contributors(self, tmp_path):
         # §9.1's whole claim: a merged centroid's word is a cell containing
