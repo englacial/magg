@@ -305,7 +305,33 @@ def _pairwise_variables(delta=256):
     return variables
 
 
-def _config(streaming=None, variables=None, chunk_precompute=None):
+def _companion_variables(delta=256):
+    """Like :func:`_base_variables` but carrying both companion channels: the
+    located morton words (issue #87) and the per-centroid toc words (§8.3)."""
+    variables = _base_variables(delta=delta)
+    variables["h_tdigest"].update({"location": "leaf_id", "temporal": "per-centroid"})
+    return variables
+
+
+#: The clock ``temporal: per-centroid`` derives its words from (spec §8.3).
+_TIME_SOURCE = {
+    "time_source": {
+        "field": "delta_time",
+        "epoch": "2018-01-01T00:00:00",
+        "scale": "gps",
+        "units": "seconds",
+    }
+}
+
+
+def _with_clock(dfs, step=3.0):
+    """Give each fake granule the per-observation clock column, in read order."""
+    for j, df in enumerate(dfs):
+        df["delta_time"] = 1.0e6 * (j + 1) + step * np.arange(len(df), dtype=np.float64)
+    return dfs
+
+
+def _config(streaming=None, variables=None, chunk_precompute=None, output=None):
     agg = {"variables": variables or _base_variables()}
     if streaming is not None:
         agg["streaming"] = streaming
@@ -324,6 +350,7 @@ def _config(streaming=None, variables=None, chunk_precompute=None):
             "shard_workers": 1,
         },
         aggregation=agg,
+        **({"output": output} if output is not None else {}),
     )
 
 
@@ -437,9 +464,15 @@ def _assert_ragged_identical(ragged_p, ragged_s):
         assert idx_p == idx_s
         for a, b in zip(pay_p, pay_s, strict=True):
             np.testing.assert_array_equal(a, b)
+        # Every channel slot, not just the first: a companion-carrying field can
+        # deliver locations AND times (spec §8.3), and a temporal-only field
+        # carries an explicit None location slot.
         assert len(locs_p) == len(locs_s)
-        if locs_p:
-            for a, b in zip(locs_p[0], locs_s[0], strict=True):
+        for chan_p, chan_s in zip(locs_p, locs_s, strict=True):
+            if chan_p is None or chan_s is None:
+                assert chan_p is None and chan_s is None
+                continue
+            for a, b in zip(chan_p, chan_s, strict=True):
                 np.testing.assert_array_equal(a, b)
 
 
@@ -674,6 +707,33 @@ class TestSpillWorkerSingleBlock:
         )
         pd.testing.assert_frame_equal(df_p, df_s)
         _assert_ragged_identical(ragged_p, ragged_s)
+
+    def test_companion_channels_byte_identical_to_pooled(self, monkeypatch):
+        # ``_chunk_outputs_exact`` is the one spill arm that reaches
+        # ``_aggregate_chunk_cells`` with a companion-carrying field, so it
+        # inherits both issue #476 hoists (the per-chunk toc encode and the
+        # batched folds) over read-back columns rather than read-path ones.
+        # Both channels must land byte-for-byte on the pooled route's.
+        key = _shard_key()
+        results = []
+        for streaming in (None, {"buffer_granules": 2, "mode": "spill"}):
+            cfg = _config(
+                streaming=streaming, variables=_companion_variables(), output=_TIME_SOURCE
+            )
+            grid = _grid(cfg)
+            dfs = _with_clock(_granule_dfs(grid, key, _CELL_LISTS, seed=7))
+            results.append(_run(monkeypatch, cfg, grid, key, dfs, profile=streaming is not None))
+        (df_p, ragged_p, meta_p), (df_s, ragged_s, meta_s) = results
+        # Single-block regime -> the read-back (exact) arm, not the merged one.
+        assert meta_s["phase_timings"]["spill_bytes"] > 0
+        assert meta_s["phase_timings"]["spill_blocks_closed"] == 0
+        # (payloads, cell indices, locations, times) — the channels must be there
+        # for the comparison to mean anything.
+        assert len(ragged_p["h_tdigest"]) == 4
+        assert any(len(w) for w in ragged_p["h_tdigest"][3])
+        _assert_carrier_identical(df_p, df_s)
+        _assert_ragged_identical(ragged_p, ragged_s)
+        assert meta_p["cells_with_data"] == meta_s["cells_with_data"]
 
     def test_k_gt_1_chunks_byte_identical_to_pooled(self, monkeypatch):
         # K=4 partitions: each chunk's outputs come from its own partition.

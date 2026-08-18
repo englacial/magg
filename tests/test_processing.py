@@ -2036,7 +2036,7 @@ class TestTemporalCompanionProduction:
             },
         )
 
-    def _cell(self, n=200):
+    def _cell(self, n=200, spread=1e-4):
         from conftest import point_words
 
         rng = np.random.default_rng(410)
@@ -2044,7 +2044,9 @@ class TestTemporalCompanionProduction:
         return {
             "h_li": h,
             "delta_time": 3.0 * np.arange(n, dtype=np.float64),
-            "leaf_id": point_words(n, seed=7),
+            # The default jitter keeps every point in one cell; a wider spread
+            # populates several, for the multi-chunk shapes below.
+            "leaf_id": point_words(n, seed=7, spread=spread),
         }
 
     def test_the_config_validates(self):
@@ -2168,16 +2170,23 @@ class TestTemporalCompanionProduction:
 
     # -- the per-chunk toc encode hoist (issue #476) -------------------------
 
-    def _grouped(self, n=60):
+    def _grouped(self, n=60, spread=1e-4):
         from zagg.processing.aggregate import _group_columns
 
         cfg = self._cfg()
         grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
-        cell = self._cell(n)
+        cell = self._cell(n, spread=spread)
         cells = grid.cells_of(cell["leaf_id"])
         children = np.unique(cells)
         cols, cell_to_slice = _group_columns(dict(cell), cells)
         return cfg, children, cols, cell_to_slice
+
+    def _unoccupied(self, n=6):
+        """Cell ids of the same grid holding none of the shard's rows."""
+        from conftest import point_words
+
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=self._cfg())
+        return np.unique(grid.cells_of(point_words(n, seed=99, lat0=-30.0, lon0=200.0)))
 
     def test_chunk_encode_matches_the_per_cell_encode(self):
         # The hoisted one-pass encode is element-wise, so each cell's slice must
@@ -2281,22 +2290,58 @@ class TestTemporalCompanionProduction:
 
     def test_all_empty_chunk_needs_no_clock(self):
         # Parity with the per-cell route, where an empty cell never reaches the
-        # encode: a chunk with no populated cells must not demand a clock.
+        # encode: a chunk with no populated cells must not demand a clock. The
+        # shape the multi-chunk path actually produces — shard-level columns and
+        # cell_to_slice, a chunk whose children are all unoccupied — is where the
+        # ``present`` filter is doing the work.
         from zagg.processing.aggregate import _aggregate_chunk_cells
 
-        cfg, children, cols, cell_to_slice = self._grouped()
+        cfg, _, cols, cell_to_slice = self._grouped()
         del cfg.output["time_source"]
-        empty_cols = {col: arr[:0] for col, arr in cols.items()}
-        stats, payloads, idx, channels, cwd = _aggregate_chunk_cells(
-            children,
-            empty_cols,
-            {},
+        empty_chunk = self._unoccupied()
+        assert cell_to_slice and not set(map(int, empty_chunk)) & set(cell_to_slice)
+        _, payloads, idx, _, cwd = _aggregate_chunk_cells(
+            empty_chunk,
+            cols,
+            cell_to_slice,
             {},
             cfg,
             ["h_tdigest", "observed"],
             get_agg_fields(cfg),
         )
-        assert cwd == 0 and payloads["h_tdigest"] == []
+        assert cwd == 0 and payloads["h_tdigest"] == [] and idx["h_tdigest"] == []
+
+    def test_partial_chunks_split_the_shard_columns(self):
+        # chunks_per_shard > 1 is how the worker actually calls this: shard-level
+        # col_arrays/cell_to_slice with per-chunk children covering only part of
+        # the populated cells (plus unoccupied ones). Each chunk's payloads and
+        # both channels must stay byte-equal to the per-cell route — the encode's
+        # ``present`` filter and its slice accounting are all that stand between.
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, children, cols, cell_to_slice = self._grouped(240, spread=0.5)
+        assert len(cell_to_slice) > 3, "need several populated cells for a partial chunk"
+        agg_fields = get_agg_fields(cfg)
+        half = len(children) // 2
+        chunks = [
+            np.concatenate([children[:half], self._unoccupied(2)]),
+            children[half:],
+        ]
+        seen = 0
+        for chunk in chunks:
+            _, payloads, idx, channels, cwd = _aggregate_chunk_cells(
+                chunk, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], agg_fields
+            )
+            assert cwd == sum(int(c) in cell_to_slice for c in chunk)
+            seen += cwd
+            for j, i in enumerate(idx["h_tdigest"]):
+                start, end = cell_to_slice[int(chunk[i])]
+                cell = {col: arr[start:end] for col, arr in cols.items()}
+                digest, locs, times = calculate_cell_statistics(cell, config=cfg)["h_tdigest"]
+                np.testing.assert_array_equal(payloads["h_tdigest"][j], digest)
+                np.testing.assert_array_equal(channels["h_tdigest"]["locations"][j], locs)
+                np.testing.assert_array_equal(channels["h_tdigest"]["times"][j], times)
+        assert seen == len(cell_to_slice), "every populated cell lands in exactly one chunk"
 
 
 class TestRaggedChunkCompanion:
