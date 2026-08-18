@@ -40,6 +40,33 @@ def _temporal_fields(agg_fields: dict) -> dict[str, str]:
     }
 
 
+def _checked_toc_source(columns, config) -> dict:
+    """The validated clock declaration for a temporal companion (spec §8.3, #410).
+
+    The refusal seam both encode routes share: a declared companion with no
+    ``output.time_source`` block is the §8.3 no-clock error (config validation is
+    the front door, but a config built without it must still fail loudly rather
+    than write an empty companion), and a declared clock whose column was not
+    read names itself. ``columns`` only needs membership + iteration, so either
+    a per-cell namespace or the pooled column dict can be checked without
+    gathering anything.
+    """
+    from zagg.time_axis import TOC_NO_CLOCK_ERROR, toc_source
+
+    source = toc_source(config)
+    if source is None:
+        # Defense in depth: validate_config refuses this at submission with the
+        # same single-sourced message (issue #472).
+        raise ValueError(TOC_NO_CLOCK_ERROR)
+    if source["field"] not in columns:
+        raise ValueError(
+            f"output.time_source.field {source['field']!r} is not in the cell data "
+            f"(available: {sorted(columns)}); a temporal companion needs the declared "
+            f"time column read at base rate"
+        )
+    return source
+
+
 def _toc_word_column(cell_data: dict, config) -> np.ndarray:
     """Encode this cell's observation times as toc words (spec §8.3, #410).
 
@@ -47,27 +74,87 @@ def _toc_word_column(cell_data: dict, config) -> np.ndarray:
     through :func:`zagg.time_axis.observation_words`. Both companion shapes read
     the result — a ``per-centroid`` field as the reducer's ``temporal=`` channel,
     a ``per-cell`` field as its ``source`` column — so one store can never carry
-    two clocks.
+    two clocks. The chunk path encodes through :func:`_chunk_toc_words` instead
+    (one pass per chunk, issue #476); this per-cell route remains for direct
+    :func:`calculate_cell_statistics` callers.
     """
-    from zagg.time_axis import TOC_NO_CLOCK_ERROR, observation_words, toc_source
+    from zagg.time_axis import observation_words
 
-    source = toc_source(config)
-    if source is None:
-        # Defense in depth: validate_config refuses this at submission with the
-        # same single-sourced message (issue #472).
-        raise ValueError(TOC_NO_CLOCK_ERROR)
-    if source["field"] not in cell_data:
-        raise ValueError(
-            f"output.time_source.field {source['field']!r} is not in the cell data "
-            f"(available: {sorted(cell_data)}); a temporal companion needs the declared "
-            f"time column read at base rate"
-        )
+    source = _checked_toc_source(cell_data, config)
     return observation_words(
         cell_data[source["field"]],
         epoch=source["epoch"],
         scale=source["scale"],
         units=source["units"],
     )
+
+
+def _chunk_toc_words(
+    col_arrays: dict[str, np.ndarray],
+    cell_to_slice: dict[int, tuple[int, int]],
+    children: np.ndarray,
+    config,
+    pooled: dict[str, np.ndarray] | None = None,
+) -> dict[int, np.ndarray]:
+    """Encode one chunk's toc words in ONE pass and split them per cell (#476).
+
+    Per-chunk hoist of :func:`_toc_word_column`: gather the declared
+    ``output.time_source`` column over the chunk's populated cells, encode it
+    through one :func:`zagg.time_axis.observation_words` call, and slice the
+    result back per cell. The encode is element-wise, so each cell's words are
+    byte-identical to the per-cell encode this replaces — only the call count
+    collapses (issue #476 measured 28,515 per-cell encodes at 0.21 ms against
+    one pooled pass over the same rows).
+
+    ``pooled`` is :func:`_pool_chunk_columns`' output for the same ``children``,
+    when the caller already has it: both walk ``children`` in order and take the
+    same ``cell_to_slice`` slices, so the pooled clock column IS this gather and
+    reusing it skips a second index build and column copy per chunk (review
+    finding, PR #478). Without it the index is built here — the direct-call route
+    (tests, any caller without the pooled dict).
+
+    Returns ``{cell_key: words}`` for exactly the chunk's populated cells. A
+    chunk with no populated cells returns ``{}`` before touching the clock
+    declaration — matching the per-cell path, where an empty cell never reaches
+    the encode — while any populated cell runs the §8.3 refusal checks
+    (:func:`_checked_toc_source`) exactly as the per-cell route did.
+    """
+    present: list[tuple[int, int, int]] = []
+    for child in children:
+        key = int(child)
+        sl = cell_to_slice.get(key)
+        if sl is not None:
+            present.append((key, *sl))
+    if not present:
+        return {}
+    from zagg.time_axis import observation_words
+
+    source = _checked_toc_source(col_arrays, config)
+    n_rows = sum(end - start for _, start, end in present)
+    if pooled is not None:
+        gathered = pooled[source["field"]]
+        if len(gathered) != n_rows:
+            raise ValueError(
+                f"pooled chunk columns hold {len(gathered)} rows but this chunk's cells "
+                f"span {n_rows}; the pooled columns must be _pool_chunk_columns' output "
+                "for the same children"
+            )
+    elif len(present) == 1:
+        _, start, end = present[0]
+        gathered = col_arrays[source["field"]][start:end]
+    else:
+        idx = np.concatenate([np.arange(start, end) for _, start, end in present])
+        gathered = col_arrays[source["field"]][idx]
+    words = observation_words(
+        gathered, epoch=source["epoch"], scale=source["scale"], units=source["units"]
+    )
+    out: dict[int, np.ndarray] = {}
+    pos = 0
+    for key, start, end in present:
+        n = end - start
+        out[key] = words[pos : pos + n]
+        pos += n
+    return out
 
 
 def _rss_mb() -> float:
@@ -476,12 +563,14 @@ def calculate_cell_statistics(
         0,
     )
     # The derived toc word column (spec §8.2/§8.3, issue #410): one word per
-    # observation, encoded here rather than in the read path so every route into
-    # the aggregation (pooled, spill read-back, per-chunk precompute) gets it
-    # from ONE conversion, and so the total encode work is exactly one pass over
-    # the shard's rows. Materialized only when a field declares a companion, so
+    # observation, from ONE conversion point whichever route reaches the
+    # aggregation. The chunk path (``_aggregate_chunk_cells`` — pooled and spill
+    # read-back alike) pre-encodes it once per chunk (``_chunk_toc_words``,
+    # issue #476) and injects it at ``cell_data`` construction, so this per-cell
+    # encode — and its dict copy — only runs for direct callers whose namespace
+    # lacks the column. Materialized only when a field declares a companion, so
     # a config written before #410 takes the code path it always did.
-    if n_obs and _temporal_fields(agg_fields):
+    if n_obs and TOC_WORD_COLUMN not in cell_data and _temporal_fields(agg_fields):
         cell_data = {**cell_data, TOC_WORD_COLUMN: _toc_word_column(cell_data, config)}
     if n_obs == 0:
         # Empty cell: every agg field gets its sentinel EXCEPT a field whose
@@ -593,6 +682,12 @@ def calculate_cell_statistics(
             payload = _coerce_ragged_value(payload, sig)
             out = []
             for label, channel in zip(channels, words, strict=True):
+                # Must not copy: under ``batched_companion_folds`` (issue #476) the
+                # reducer hands back a contiguous uint64 placeholder the batch fills
+                # in place at the flush, so this normalization has to be identity —
+                # which it is for the contiguous uint64 vectors the build_tdigest
+                # family returns. A copy here would strand the flush on an orphan
+                # (see ``_CompanionBatch``).
                 channel = np.ascontiguousarray(np.asarray(channel))
                 if channel.dtype != np.uint64:
                     # A silent uint64 cast would wrap negative/float garbage into
@@ -815,6 +910,7 @@ def _aggregate_chunk_cells(
     config: PipelineConfig,
     data_vars,
     agg_fields: dict,
+    chunk_pooled: dict | None = None,
 ):
     """Compute per-cell stats for one chunk's ``children`` (default numpy path).
 
@@ -835,6 +931,10 @@ def _aggregate_chunk_cells(
     (issue #87) and ``times`` (spec §8.3, issue #410), each index-aligned with
     that field's payloads. A field declaring no companion has no entry, so a
     config written before either channel produces the same empty mapping.
+
+    ``chunk_pooled`` is the caller's :func:`_pool_chunk_columns` output for these
+    same ``children`` (both worker call sites build it for the chunk precompute
+    anyway); it lets the toc hoist reuse that gather instead of rebuilding it.
     """
     children = np.asarray(children)
     n_cells = len(children)
@@ -871,54 +971,82 @@ def _aggregate_chunk_cells(
 
     _empty: dict[str, np.ndarray] = {col: arr[:0] for col, arr in col_arrays.items()}
 
+    # Per-chunk toc encode (issue #476): when a field declares a temporal
+    # companion, encode the whole chunk's words in one pass and hand each
+    # populated cell its slice at namespace construction — the per-cell encode
+    # (and its dict copy) in ``calculate_cell_statistics`` then never runs on
+    # this path. Both callers (the worker's pooled loop and the spill
+    # read-back, which is per chunk by construction) get the hoist here, so
+    # chunk boundaries are respected at any chunks_per_shard.
+    cell_toc = (
+        _chunk_toc_words(col_arrays, cell_to_slice, children, config, pooled=chunk_pooled)
+        if _temporal_fields(agg_fields)
+        else None
+    )
+
+    # Batch the per-centroid companion folds across the loop (issue #476): each
+    # ``build_tdigest`` inside defers its ``tocs_reduce``/``common_ancestor``
+    # partition and the context exit runs ONE fold per channel over the whole
+    # chunk, filling the collected vectors in place — byte-identically, before
+    # anything reads them (the ragged writer runs after this returns). Armed only
+    # when a field actually declares a companion channel, so a config predating
+    # issue #87/#410 never sees the ContextVar and an arbitrary config-resolved
+    # reducer can only meet a placeholder on the configs that ask for one.
+    from contextlib import nullcontext
+
+    from zagg.stats.tdigest import batched_companion_folds
+
     cells_with_data = 0
-    for i, child_morton in enumerate(children):
-        child_key = int(child_morton)
-        if child_key in cell_to_slice:
-            start, end = cell_to_slice[child_key]
-            cell_data: dict[str, np.ndarray] = {
-                col: arr[start:end] for col, arr in col_arrays.items()
-            }
-            cells_with_data += 1
-        else:
-            cell_data = _empty
-        # Inject the chunk-level scalars into this cell's namespace (no-op when
-        # empty, so non-precompute configs are unchanged).
-        cell_namespace: dict[str, Any] = (
-            {**cell_data, **chunk_scalars} if chunk_scalars else cell_data
-        )
-        stats = calculate_cell_statistics(
-            cell_namespace, value_col="h_li", sigma_col="s_li", config=config
-        )
-        for key, value in stats.items():
-            if key in ragged_payloads:
-                # Ragged field: collect non-empty payloads with their chunk-local
-                # cell index. Empty cells (``_empty_cell_value`` -> []) are skipped.
-                # A companion-carrying field delivers ``(payload, *channel words)``
-                # in the kernel's fixed order; the words are collected
-                # index-aligned with the payloads.
-                if isinstance(value, tuple):
-                    payload, *words = value
-                else:
-                    payload, words = np.asarray(value), []
-                if payload.size == 0:
-                    continue
-                # Fail fast if the value's arity disagrees with the declared
-                # signature (empty cells are exempt, having been skipped above) —
-                # a silent mismatch would surface much later as a length error in
-                # the ragged writer, or as a companion silently dropped.
-                channels = ragged_channels.get(key, {})
-                if len(channels) != len(words):
-                    raise ValueError(
-                        f"ragged field {key!r}: the reducer returned {len(words)} companion "
-                        f"channel(s) but the declared signature has {len(channels)} "
-                        f"({sorted(channels) or 'none'})"
-                    )
-                ragged_payloads[key].append(payload)
-                ragged_cell_indices[key].append(i)
-                for channel, word_vector in zip(channels.values(), words, strict=True):
-                    channel.append(word_vector)
+    with batched_companion_folds() if ragged_channels else nullcontext():
+        for i, child_morton in enumerate(children):
+            child_key = int(child_morton)
+            if child_key in cell_to_slice:
+                start, end = cell_to_slice[child_key]
+                cell_data: dict[str, np.ndarray] = {
+                    col: arr[start:end] for col, arr in col_arrays.items()
+                }
+                if cell_toc is not None:
+                    cell_data[TOC_WORD_COLUMN] = cell_toc[child_key]
+                cells_with_data += 1
             else:
-                stats_arrays[key][i] = value
+                cell_data = _empty
+            # Inject the chunk-level scalars into this cell's namespace (no-op when
+            # empty, so non-precompute configs are unchanged).
+            cell_namespace: dict[str, Any] = (
+                {**cell_data, **chunk_scalars} if chunk_scalars else cell_data
+            )
+            stats = calculate_cell_statistics(
+                cell_namespace, value_col="h_li", sigma_col="s_li", config=config
+            )
+            for key, value in stats.items():
+                if key in ragged_payloads:
+                    # Ragged field: collect non-empty payloads with their chunk-local
+                    # cell index. Empty cells (``_empty_cell_value`` -> []) are skipped.
+                    # A companion-carrying field delivers ``(payload, *channel words)``
+                    # in the kernel's fixed order; the words are collected
+                    # index-aligned with the payloads.
+                    if isinstance(value, tuple):
+                        payload, *words = value
+                    else:
+                        payload, words = np.asarray(value), []
+                    if payload.size == 0:
+                        continue
+                    # Fail fast if the value's arity disagrees with the declared
+                    # signature (empty cells are exempt, having been skipped above) —
+                    # a silent mismatch would surface much later as a length error in
+                    # the ragged writer, or as a companion silently dropped.
+                    channels = ragged_channels.get(key, {})
+                    if len(channels) != len(words):
+                        raise ValueError(
+                            f"ragged field {key!r}: the reducer returned {len(words)} "
+                            f"companion channel(s) but the declared signature has "
+                            f"{len(channels)} ({sorted(channels) or 'none'})"
+                        )
+                    ragged_payloads[key].append(payload)
+                    ragged_cell_indices[key].append(i)
+                    for channel, word_vector in zip(channels.values(), words, strict=True):
+                        channel.append(word_vector)
+                else:
+                    stats_arrays[key][i] = value
 
     return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_channels, cells_with_data
