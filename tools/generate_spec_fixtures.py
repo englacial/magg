@@ -83,6 +83,12 @@ conformance tests assert decoded values, never object bytes.
   — the aggregation kernel that will produce them is #410's next PR — so the
   expectations stay input-derived. ``kitchen_sink/``, committed before §9
   and not regenerated, is the absent-``located`` ⇒ §2.2 pin.
+  ``temporal/`` is ALSO the only fixture carrying a **root ``coverage.moc``**
+  (issue #480): the §10 ``zagg-coverage-toc/1`` section, written here by the
+  production sweep writer (``MocFamily``'s leaf read + finisher). The other
+  six declare no temporal field, so a sweep of one produces no section —
+  leaving them without a root coverage object IS §10's absence rule, and
+  keeps those trees byte-identical.
 
 STALE BY DESIGN: ``minimal/`` and ``kitchen_sink/`` were committed before
 issue #382 and their ``morton_hive.json`` still carries the pre-#382
@@ -1161,6 +1167,39 @@ def build_temporal(out: Path) -> None:
         processing.process_shard = original
     assert meta.get("error") is None, meta
 
+    # The §10 root coverage sidecar, through the PRODUCTION writer: the MOC
+    # family's own leaf read plus its finisher, which is exactly what a sweep
+    # runs. This is the only fixture that gets a root coverage.moc — every
+    # other fixture store declares no temporal field, so a sweep of one would
+    # produce no section at all, and writing a bare carrier there would churn
+    # four committed trees for nothing (§10's absence rule, pinned as byte
+    # identity by the conformance suite).
+    from mortie import toc_reduce
+
+    from zagg.coverage_toc import coverage_toc, coverage_toc_digest
+    from zagg.sweep import MocFamily
+
+    family = MocFamily()
+    contribution, _written_at = family.read_leaf(root, SHARD_KEY, None, "morton-hive/1", {})
+    family.finish(root, [{"payload": contribution}], 4, {})
+    envelope = hive.read_root_coverage(root)
+    root_digest, root_words = coverage_toc_digest(envelope)
+    # The shard envelope word is DERIVED from the generator's inputs — the
+    # join over every per-centroid word it handed the writer — so a writer
+    # that folds the wrong thing fails here instead of certifying itself. The
+    # digest rows are the writer's committed output read back (pinned the way
+    # column/'s group values are); the claims that matter over them — weight
+    # conservation and per-centroid containment — are derived, from the cell
+    # plan's own observation counts and the instants recorded per cell.
+    shard_word = int(
+        toc_reduce(
+            np.concatenate(
+                [cell["h_tdigest"][2] for cells in by_chunk.values() for cell in cells.values()]
+            ).astype(np.uint64)
+        )
+    )
+    assert coverage_toc(envelope) == {SHARD_KEY: shard_word}, coverage_toc(envelope)
+
     leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
     expected = {
         "shard": SHARD_KEY,
@@ -1173,6 +1212,21 @@ def build_temporal(out: Path) -> None:
         "chunks_per_shard": grid.chunks_per_shard,
         "empty_chunk": EMPTY_CHUNK,
         "delta": DELTA,
+        # The §10 root coverage temporal section: the tier-1 word (derived),
+        # the tier-2 digest (the writer's, read back) and the weight total the
+        # cell plan says it must carry.
+        "root_coverage": {
+            "object": "coverage.moc",
+            "spec": "zagg-coverage-toc/1",
+            "fields": ["h_tdigest"],
+            "shards": {SHARD_KEY: str(shard_word)},
+            "obs_total": sum(c["count"] for c in expected_cells),
+            "digest": {
+                "delta": envelope["temporal"]["digest"]["delta"],
+                "centroids": [[float(m), float(w)] for m, w in root_digest],
+                "times": [str(int(w)) for w in root_words],
+            },
+        },
         # The declarations the conformance tests assert against the committed
         # attrs — each on the array that HOLDS the words (§8/§9), and the
         # payload's binding, which is a sibling key of the ragged block.
@@ -1194,7 +1248,10 @@ def build_temporal(out: Path) -> None:
         "content_hashes": _o11_hashes(str(out / leaf_rel)),
     }
     (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
-    print(f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells, both toc variants")
+    print(
+        f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells, both toc "
+        f"variants, root coverage.moc with {len(root_digest)} digest centroids"
+    )
 
 
 def main() -> None:

@@ -1,0 +1,41 @@
+{
+ "spec": "morton-moc/1",
+ "encoding": "ranges",
+ "order": 4,
+ "source": "sweep",
+ "generated_at": "2026-08-18T07:02:07+00:00",
+ "ranges": [
+  [
+   "11213",
+   "11213"
+  ]
+ ],
+ "temporal": {
+  "spec": "zagg-coverage-toc/1",
+  "source": "sweep",
+  "generated_at": "2026-08-18T07:02:07+00:00",
+  "fields": [
+   "h_tdigest"
+  ],
+  "shards": {
+   "11213": "10689250968998768172"
+  },
+  "digest": {
+   "delta": 64,
+   "weights": "counts",
+   "value": "toc-ns",
+   "element": {
+    "dtype": "float32",
+    "shape": [
+     -1,
+     2
+    ]
+   },
+   "encoding": "base64",
+   "centroids": 35,
+   "weight_total": 346.0,
+   "payload": "2VeUXgAAgD/ZV5ReAACAP9lXlF4AAIA/2VeUXgAAgD/ZV5ReAACAP9lXlF4AAABA2VeUXgAAAEDZV5ReAAAAQNlXlF4AAABA2VeUXgAAQEDZV5ReAABAQNlXlF4AAEBA2VeUXgAAQEDZV5ReAABAQNlXlF4AAEBA2VeUXgAAQEDZV5ReAABAQNlXlF4AAKBA2leUXgAAgEDbV5ReAAAAQNtXlF4AAOBA21eUXgAAQEHbV5ReAACIQdtXlF4AAKhB21eUXgAAyEHbV5ReAADYQdtXlF4AAOhB3FeUXgAA4EDcV5ReAAAgQdxXlF4AAIBB3FeUXgAAoEHcV5ReAADAQdxXlF4AANBB3FeUXgAA4EHcV5ReAADoQQ==",
+   "times": "gHTT0R/ZV5SA0qOEIdlXlIAK8alT2VeUgGjB3FTZV5SAxpGPVtlXlJLsK0oi2VeUlOwrSiXZV5So7CtKTdlXlKnsK0pQ2VeUluwrSijZV5SY7CtKLNlXlJrsK0ow2VeUnOwrSjTZV5Se7CtKONlXlKDsK0o82VeUouwrSkHZV5Sl7CtKRdlXlBjtK0pJ2VeUG+0rSjDaV5Rc7StKttpXlGHtK0q42leUau0rSsLaV5R17StK09pXlITtK0rr2leUlu0rSgjbV5So7StKK9tXlL3tK0pR21eULO4rSk/cV5Qo7itKQdxXlCHuK0or3FeUFe4rSg/cV5QH7itK7dtXlPftK0rJ21eU5O0rSqLbV5TR7StKedtXlA=="
+  }
+ }
+}
