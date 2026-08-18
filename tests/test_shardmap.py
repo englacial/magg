@@ -2679,8 +2679,11 @@ class TestBasenameCollisions:
     def test_an_entry_with_nothing_to_canonicalize_is_skipped(self):
         # Raster entries carry no href and may carry no id (their identity is
         # the acquisition datetime); nothing to name is nothing to collide.
+        # The two entries must DIFFER in their distinguishing fields, else the
+        # skip branch could be deleted and this would still pass -- they would
+        # dedup rather than collide (issue #468 review finding (3)).
         shardmap._refuse_basename_collisions(
-            [7], [[{"id": None, "s3": None, "https": None}, {"id": None, "datetime": "2025-06-01"}]]
+            [7], [[{"id": None, "s3": None, "https": None}, {"id": "", "s3": None, "https": None}]]
         )
 
     def _colliding_fine_map(self, catalog, fine_grid):
@@ -2778,9 +2781,12 @@ class TestBasenameCollisions:
         # (issue #468 review finding (3)).
         from zagg.telemetry import canonical_granule_id
 
-        assert canonical_granule_id("/") == ""
+        assert canonical_granule_id("/") == "" and canonical_granule_id("//") == ""
+        # BOTH must canonicalize to "" and differ in their distinguishing
+        # fields: with an ``is None`` guard they share the "" bucket and this
+        # raises, which is what makes the test fail against the unfixed code.
         shardmap._refuse_basename_collisions(
-            [7], [[{"id": "/", "s3": None, "https": None}, {"id": "/", "s3": "s3://b/x/"}]]
+            [7], [[{"id": "/", "s3": None, "https": None}, {"id": "//", "s3": None, "https": None}]]
         )
 
     def test_more_than_three_collisions_are_counted_and_truncated(self):
@@ -2799,3 +2805,25 @@ class TestBasenameCollisions:
         assert message.rstrip().endswith("...")
         # Three groups shown, the fourth only counted.
         assert "'G2.h5'" in message and "'G3.h5'" not in message
+
+    def test_a_collision_with_no_href_is_named_by_what_separates_it(self):
+        # The label fallback chain reached the id before the datetime, so a
+        # raster pair printed as ['SCENE', 'SCENE'] -- the same string twice,
+        # naming nothing -- under a message that asserted a prefix cause the
+        # raster path does not have (issue #468 review finding (2)).
+        a = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-01T00:00:00Z"}
+        b = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-02T00:00:00Z"}
+        with pytest.raises(ValueError) as excinfo:
+            shardmap._refuse_basename_collisions([7], [[a, b]])
+        message = str(excinfo.value)
+        assert "SCENE @ 2025-06-01T00:00:00Z" in message
+        assert "SCENE @ 2025-06-02T00:00:00Z" in message
+        # The prefix cause is offered as the usual case, not asserted as the only one.
+        assert "Usually one basename under two key prefixes" in message
+
+    def test_an_href_collision_is_still_named_by_its_hrefs(self):
+        a = {"id": "G.h5", "s3": "s3://b/p1/G.h5", "https": "https://h/p1/G.h5"}
+        b = {"id": "G.h5", "s3": "s3://b/p2/G.h5", "https": "https://h/p2/G.h5"}
+        with pytest.raises(ValueError) as excinfo:
+            shardmap._refuse_basename_collisions([7], [[a, b]])
+        assert "['s3://b/p1/G.h5', 's3://b/p2/G.h5']" in str(excinfo.value)
