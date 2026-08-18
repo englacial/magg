@@ -126,6 +126,33 @@ class TestAggValidatesConfig:
         with pytest.raises(ValueError, match="No catalog"):
             agg(atl06_config)
 
+    # The next two pin the seam at ``agg`` rather than inside SpatialStrategy:
+    # each drives a non-spatial kind and asserts the *validator's* message, not
+    # the strategy's own first refusal. Move the call down into
+    # SpatialStrategy.run and temporal raises its "requires events=" error /
+    # raster its "No catalog specified" instead, and both fail.
+
+    def test_temporal_config_validated_at_the_same_seam(self):
+        cfg = _temporal_config()
+        del cfg.aggregation["variables"]["max_t2m"]["temporal_reducer"]
+        with pytest.raises(ValueError, match="missing required key.*temporal_reducer"):
+            agg(cfg)
+
+    def test_raster_config_validated_at_the_same_seam(self):
+        from zagg.config import load_config_from_dict
+
+        cfg = load_config_from_dict(
+            {
+                "data_source": {"reader": "raster", "bands": {"red": {"asset": "red"}}},
+                "output": {
+                    "grid": {"type": "healpix", "parent_order": 10, "child_order": 16},
+                    "store": "memory://",
+                },
+            }
+        )
+        with pytest.raises(ValueError, match="requires a string 'dtype'"):
+            agg(cfg)
+
 
 class TestDryRun:
     def test_dry_run_returns_summary(self, atl06_config, catalog_file):
