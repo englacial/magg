@@ -1598,6 +1598,22 @@ product is never sharded, §8/#247):
   `"per-cell"` shape's fold law is the grammar's join over a cell group rather
   than the field's own reducer, so it exists at native resolution only.
 
+  It is also the fixture set's only store with a **root `coverage.moc`**, and
+  so §10's golden: the object was written by the production sweep writer (the
+  MOC family's leaf read plus its finisher) and carries the
+  `zagg-coverage-toc/1` section — the shard's tier-1 envelope word and the
+  tier-2 root time-digest in the native ragged `(k, 2)` + word-sibling form.
+  `temporal.expected.json`'s `root_coverage` block records the tier-1 word
+  **derived from the generator's inputs** (the join over every per-centroid
+  word it fed the writer, so the writer is pinned rather than self-certified),
+  the decoded digest rows read back — the same exception `column/`'s group
+  values are — and `obs_total`, the cell plan's own observation count, which
+  §10.3's weight rule says the digest's total weight MUST equal. The other six
+  fixtures have **no root coverage object at all**: none of them declares a
+  temporal field, so a sweep of one produces no section, and their committed
+  trees are byte-identical to their pre-§10 selves — which is exactly §10's
+  absence rule, pinned as bytes.
+
 `minimal/` and `kitchen_sink/` pin the layout edge cases a reader must
 handle (`column/`'s leaf is `minimal/`'s, so it pins them again): inner chunk
 ordinal 2 is **empty** (absent from the shard index — the §1.5 sentinel, and
