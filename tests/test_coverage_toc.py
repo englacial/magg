@@ -369,6 +369,29 @@ class TestOnCommittedStores:
         again = run_sweep(root, leaves, families=["moc"], record=False)
         assert again["families"]["moc"]["root_moc_written"] is False
 
+    def test_a_truncated_companion_is_refused(self, tmp_path):
+        """§1.1 row alignment, at ARRAY level (issue #452's failure shape).
+
+        A companion with fewer rows than its payload aligns row for row over
+        its own length, so the per-cell check never fires — the leaf would
+        join a prefix of its cells and be published as whole.
+        """
+        import zarr
+
+        from zagg.coverage_toc import read_leaf_temporal
+        from zagg.grids.morton import morton_word
+        from zagg.hive import shard_leaf_path
+
+        root = self._copy(tmp_path, "temporal")
+        manifest = json.loads((Path(root) / "morton_hive.json").read_text())
+        fields = temporal_fields(manifest)
+        leaf = shard_leaf_path(root, int(morton_word("11213")))
+        group = zarr.open_group(leaf, path=str(manifest["cell_order"]), mode="a", zarr_format=3)
+        rows = group["h_tdigest_times"].shape[0]
+        group["h_tdigest_times"].resize((rows - 1,))
+        with pytest.raises(ValueError, match="row-aligned"):
+            read_leaf_temporal(leaf, int(manifest["cell_order"]), fields)
+
     def test_refresh_drops_only_the_shard_whose_leaf_failed(self, tmp_path, monkeypatch):
         import zagg.coverage_toc as toc_module
 
