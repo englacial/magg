@@ -9,11 +9,14 @@ bootstrap discovery (``{store_root}/coverage.moc``):
    store's temporal-carrying fields). This is the spatiotemporal pruning
    tier: "which shards hold data DURING my window" resolves from metadata,
    before any leaf is opened;
-2. **the optional root time-digest** — a t-digest over acquisition times
-   whose weights are observation counts, with the §8.3 per-centroid toc
-   envelopes as its companion, in the store's NATIVE ragged ``(k, 2)`` +
-   word-sibling form (base64 of the §1.4 element bytes), so a reader needs
-   no grammar it does not already implement for the leaves.
+2. **the optional root time-digest** — a t-digest whose weights are
+   observation counts and whose value axis is the §8.3 per-centroid toc
+   envelopes' MIDPOINTS (:func:`_centroid_times`), with those same envelopes
+   as its companion, in the store's NATIVE ragged ``(k, 2)`` + word-sibling
+   form (base64 of the §1.4 element bytes), so a reader needs no grammar it
+   does not already implement for the leaves. Its total weight is exact; the
+   placement of that weight is only as time-resolved as the leaf digest's own
+   centroid partition, which is a partition of VALUE (§10.3).
 
 Absence composes: a store with no temporal channel writes no section, and
 every accessor here returns ``None`` for it. That is never a refusal — the

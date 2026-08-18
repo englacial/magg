@@ -1805,6 +1805,32 @@ class TestRootCoverageTemporalSection:
         for t in internal:
             assert bool(np.asarray(toc_overlaps(np.array([word]), int(t), int(t) + 1))[0])
 
+    def test_the_value_axis_is_the_envelope_midpoint(self):
+        """§10.3: column 0 is derived from the words, not from the observations.
+
+        Each contributing centroid enters the fold at the midpoint of its own
+        §8.3 envelope, so a weight-1 centroid — whose word is a timestamp and
+        whose ``toc2time`` envelope is a point — carries that EXACT instant,
+        and every other mean is a convex combination of midpoints and so lies
+        inside its own centroid's word. Both hold to the float32 quantum the
+        section documents, which is why the words, never the means, are the
+        exact temporal claim.
+        """
+        from mortie import toc2time
+
+        payload, words = coverage_toc_digest(self._envelope())
+        start, end = (np.asarray(b, dtype=np.float64) for b in toc2time(np.asarray(words)))
+        means = payload[:, 0].astype(np.float64)
+        # The one exact arm: weight-1 rows sit on their word's instant.
+        single = payload[:, 1] == 1
+        assert single.any()
+        assert (start[single] == end[single]).all()
+        np.testing.assert_array_equal(payload[single, 0], start[single].astype(np.float32))
+        # Everything else: inside its own envelope, up to float32 rounding
+        # (~2^-24 relative — roughly ten minutes at present-day magnitudes).
+        quantum = np.abs(means) * 2.0**-23
+        assert ((means >= start - quantum) & (means <= end + quantum)).all()
+
     def test_the_root_words_reduce_to_the_shard_word(self):
         # The tier-2 companion and the tier-1 map are two views of the same
         # join: reducing the digest's per-centroid envelopes reproduces the
