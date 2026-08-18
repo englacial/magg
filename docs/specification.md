@@ -944,9 +944,10 @@ staged sweep's finisher.
   the payload's §1.2 `locations` binding, exactly as a leaf does — with the
   words at the **heterogeneous orders** §9.1 makes normative.
 - **A temporal ragged field composes the same way, and its entry carries
-  `temporal`.** A `temporal:` declaration (§8.3) does not exclude a field
-  from the pyramid either: zagg's digest pyramids keep the companion
-  `"per-centroid"` at every level, symmetric with the located channel — the
+  `temporal`.** A **`"per-centroid"`** `temporal:` declaration (§8.3) does
+  not exclude a field from the pyramid either: zagg's digest pyramids keep
+  the companion `"per-centroid"` at every level, symmetric with the located
+  channel — the
   temporal k-way merge reduces the `{field}_times` words over the same
   centroid partition the digest merge produces (espg-ruled 2026-08-17,
   amending [ruling 3 on
@@ -963,7 +964,11 @@ staged sweep's finisher.
   sibling array and the fold has nowhere to write its words. An overview
   level of a temporal field therefore carries the `{field}_times` sibling,
   its §8.3 `temporal` declaration, and the payload's §8.3 `times` binding,
-  exactly as a leaf does.
+  exactly as a leaf does. The §8.2 dense `"per-cell"` shape is the
+  exception: a field declaring it is classed `none` whatever its reducer
+  (`zagg.semantics.field_composability`), that shape's fold law being the
+  word grammar's join over a cell group rather than the field's own reducer,
+  so it exists at native resolution only.
 - **`all_time`** — whether the `all.zarr` all-time fold is materialized at
   the declared orders (windowed stores only; a `schedule: none` store's
   single fold is already all-time).
