@@ -1856,8 +1856,11 @@ class TestRootCoverageTemporalSection:
         "name", ["minimal", "kitchen_sink", "column", "flux", "raster_toc", "pyramid"]
     )
     def test_non_temporal_fixtures_carry_no_root_coverage_object(self, name):
-        # §10's absence rule, pinned as bytes: none of these stores declares a
-        # temporal field, so none of them has a section — or an object to put
-        # one in — and their committed trees are unchanged by §10.
+        # §10's absence rule, pinned as bytes — WITH its precondition, which
+        # is what makes the missing object evidence of the rule rather than
+        # of the generator simply never having been pointed at these trees.
+        from zagg.coverage_toc import temporal_fields
+
+        manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
+        assert temporal_fields(manifest) == {}
         assert not (SPEC_DATA / name / "coverage.moc").exists()
-        assert coverage_toc(None) is None
