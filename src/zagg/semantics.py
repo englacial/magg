@@ -216,9 +216,9 @@ DATA_SOURCE_PACKAGING_KEYS = (
 #: exactness half), ``tests/test_spill_crossblock.py``, and
 #: ``tests/test_streaming.py``'s pooled-parity pins. The D19 record stated
 #: this acceptance property twice while the code hashed the block as spelled;
-#: the ruling lands the code on the record's side before any long-lived store
-#: carries a streaming-declared digest, so the epoch moves nothing that
-#: outlives it.
+#: the ruling lands the code on the record's side before any **long-lived**
+#: store carries a streaming-declared digest (the deployed stores age out on
+#: a 30-day cycle), so the epoch moves nothing that outlives it.
 AGGREGATION_PACKAGING_KEYS = ("handoff", "streaming")
 
 #: Per-variable aggregation keys that are packaging (issue #424):
