@@ -47,6 +47,7 @@ from zagg.config import (
     get_store_path,
     get_sweep,
     get_windowing,
+    validate_config,
 )
 from zagg.dispatch import (
     BENIGN_ERRORS,
@@ -339,6 +340,15 @@ def agg(
         Summary with keys: ``total_cells``, ``cells_with_data``,
         ``cells_error``, ``total_obs``, ``wall_time_s``, ``store_path``.
     """
+    # The single validation choke point (issue #485): every submission path —
+    # Run.from_config's v1 facade, zagg.notebook.run's wrapper, and direct agg
+    # callers on any backend or pipeline kind — cross-validates here, so a
+    # PipelineConfig mutated after load_config's own call (the issue #472
+    # graft) is refused before any catalog read, store touch, or invoke.
+    # validate_config branches on pipeline kind itself, so the temporal and
+    # raster paths get their own (smaller) checks rather than a false refusal.
+    validate_config(config)
+
     # Pipeline kind picks the strategy (issue #12, Phase 5). The strategy seam
     # is dispatch-level: the spatial path is the existing code, moved verbatim
     # into SpatialStrategy so its behavior/output stays byte-identical; the

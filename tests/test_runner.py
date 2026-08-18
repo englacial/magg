@@ -1,6 +1,8 @@
 """Tests for the runner module (Python API)."""
 
+import copy
 import json
+import re
 import warnings
 from datetime import datetime, timezone
 
@@ -72,6 +74,45 @@ class TestRunValidation:
     def test_lambda_requires_s3_store(self, atl06_config, catalog_file):
         with pytest.raises(ValueError, match="s3://"):
             agg(atl06_config, catalog=catalog_file, store="./local.zarr", backend="lambda")
+
+
+class TestAggValidatesConfig:
+    """``agg`` is the single ``validate_config`` choke point (issue #485).
+
+    ``Run.from_config`` closed the facade seam (issue #472); a mutated
+    ``PipelineConfig`` handed to ``agg`` directly — the local backend and the
+    raster/temporal branches the facade's v1 gates refuse — still reached the
+    workers unvalidated. The refusal must land before catalog/store
+    resolution, so these tests pass neither.
+    """
+
+    def _graft(self):
+        # The issue #472 shape: temporal variables grafted onto a validated
+        # base after default_config's own validation already ran.
+        base = default_config("atl03_tdigest_healpix_hive", validate=False)
+        located = default_config("atl03_tdigest_located_healpix", validate=False)
+        base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
+        return base
+
+    def test_grafted_config_refused_before_catalog_resolution(self):
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            agg(self._graft())  # no catalog, no store: validation must win
+
+    def test_notebook_run_shares_the_choke_point(self):
+        from zagg.notebook import run as notebook_run
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            notebook_run(self._graft())
+
+    def test_valid_config_reaches_catalog_resolution(self, atl06_config):
+        # Positive control: a conformant config passes validation and fails on
+        # the *next* check (TestRunValidation's missing-catalog refusal), so
+        # the new call refuses nothing that ran before.
+        with pytest.raises(ValueError, match="No catalog"):
+            agg(atl06_config)
 
 
 class TestDryRun:
