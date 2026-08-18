@@ -2770,3 +2770,32 @@ class TestBasenameCollisions:
         # One granule out, not two: the prefixes -- and with them the collision
         # -- were discarded upstream of the check, not by it.
         assert {g["id"] for g in entries} == {"Gdup"}
+
+    def test_an_id_that_canonicalizes_to_empty_is_skipped(self):
+        # ``canonical_granule_id("/")`` strips the separator down to "", which
+        # is falsy but not None -- an ``is None`` guard let it through as a
+        # live bucket key and would report ``''`` as the collapsed granule id
+        # (issue #468 review finding (3)).
+        from zagg.telemetry import canonical_granule_id
+
+        assert canonical_granule_id("/") == ""
+        shardmap._refuse_basename_collisions(
+            [7], [[{"id": "/", "s3": None, "https": None}, {"id": "/", "s3": "s3://b/x/"}]]
+        )
+
+    def test_more_than_three_collisions_are_counted_and_truncated(self):
+        # The operator-facing message shows the first three groups and says so;
+        # a badly mis-scoped catalog hits this branch, not the single-pair one
+        # (issue #468 review finding (4)).
+        entries = [
+            {"id": f"G{n}.h5", "s3": f"s3://b/{p}/G{n}.h5", "https": None}
+            for n in range(4)
+            for p in ("p1", "p2")
+        ]
+        with pytest.raises(ValueError) as excinfo:
+            shardmap._refuse_basename_collisions([7], [entries])
+        message = str(excinfo.value)
+        assert "4 per-shard granule identity collision(s)" in message
+        assert message.rstrip().endswith("...")
+        # Three groups shown, the fourth only counted.
+        assert "'G2.h5'" in message and "'G3.h5'" not in message
