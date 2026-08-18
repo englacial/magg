@@ -274,7 +274,12 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     import obstore
     from obstore.exceptions import NotFoundError
 
-    from zagg.coverage_toc import build_temporal_section, read_leaf_temporal, temporal_fields
+    from zagg.coverage_toc import (
+        build_temporal_section,
+        read_leaf_temporal,
+        temporal_cell_order,
+        temporal_fields,
+    )
     from zagg.grids.morton import morton_words_from_decimals
     from zagg.store import open_store
 
@@ -287,7 +292,13 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     # this walk is whole-store by construction, its root time-digest is the
     # authoritative one (spec §10's whole-coverage rule).
     toc_fields = temporal_fields(manifest)
-    cell_order = int(manifest.get("cell_order") or 0)
+    cell_order = temporal_cell_order(manifest)
+    if toc_fields and cell_order is None:
+        logger.warning(
+            f"refresh: {store_root} declares temporal fields but carries no cell_order — "
+            f"rebuilding no §10 section rather than guessing a group"
+        )
+        toc_fields = {}
     contributions: dict[str, list] = {}
     toc_failed: set[str] = set()
     store = open_object_store(store_root, **store_kwargs)

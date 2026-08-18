@@ -423,6 +423,31 @@ class TestOnCommittedStores:
         # only the one it could read whole (§10.2's unknown-not-empty rule).
         assert set(envelope["temporal"]["shards"]) == {"11213"}
 
+    def test_a_manifest_without_a_cell_order_publishes_no_section(self, tmp_path, caplog):
+        """A required key missing is a broken manifest, not group ``"0"``.
+
+        Defaulting either asks for a group that does not exist — logged as an
+        ordinary missing contribution, which hides the real problem — or, on a
+        store whose cell order really is 0, reads the wrong group.
+        """
+        from zagg.grids.morton import morton_word
+        from zagg.sweep import run_sweep
+
+        root = self._copy(tmp_path, "temporal")
+        path = Path(root) / "morton_hive.json"
+        manifest = json.loads(path.read_text())
+        del manifest["cell_order"]
+        path.write_text(json.dumps(manifest, indent=1))
+        (Path(root) / "coverage.moc").unlink()
+        with caplog.at_level("WARNING"):
+            summary = run_sweep(
+                root, [(int(morton_word("11213")), None)], families=["moc"], record=False
+            )
+            assert "temporal_shards" not in summary["families"]["moc"]
+            assert "temporal" not in read_root_coverage(root)
+            assert refresh_root_coverage(root).get("temporal") is None
+        assert caplog.text.count("cell_order") >= 2
+
     def test_refresh_never_deletes_the_section_when_every_leaf_fails(self, tmp_path, monkeypatch):
         """The escape hatch must not be the thing that destroys the section.
 

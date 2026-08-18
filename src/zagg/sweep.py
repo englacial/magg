@@ -216,14 +216,21 @@ class MocFamily(SweepFamily):
         candidate), which is always safe, while a shard listed with a partial
         word is not.
         """
-        from zagg.coverage_toc import read_leaf_temporal, temporal_fields
+        from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
 
         if self._temporal_fields is None:
             from zagg.hive import read_manifest
 
             manifest = read_manifest(store_root, **store_kwargs) or {}
             self._temporal_fields = temporal_fields(manifest)
-            self._cell_order = int(manifest.get("cell_order") or 0)
+            cell_order = temporal_cell_order(manifest)
+            if self._temporal_fields and cell_order is None:
+                logger.warning(
+                    f"sweep[moc]: {store_root} declares temporal fields but carries no "
+                    f"cell_order — publishing no §10 section rather than guessing a group"
+                )
+                self._temporal_fields = {}
+            self._cell_order = cell_order or 0
         if not self._temporal_fields or decimal in self._temporal_failed:
             return
         try:
