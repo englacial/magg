@@ -966,28 +966,27 @@ class SpillAggregator:
 
         Covers every column the fold resolves out of the block: a field's
         ``source`` and ``location``, a stratum's ``where``, and a composition
-        field's ``conf_*`` params (the hand-written ones — five per field — and
-        the ones whose failure mode is worst; see :func:`_unresolvable_names`).
-        A column the block never carried would surface as a bare
-        ``KeyError`` raised on the overlap reducer thread, which
-        :meth:`_join_reducer` re-wraps as :class:`SpillReduceError` with the real
-        cause reachable only via ``__cause__`` — a materially worse diagnostic
-        than ``calculate_cell_statistics``'s named ``ValueError`` for the same
-        config error, and one that only appears on shards big enough to close a
-        block. Checked once per block against the block schema, off the per-cell
-        loop. An empty block (nothing appended, so no schema) has nothing to
-        fold and nothing to check.
+        field's ``conf_*`` params (see :func:`_unresolvable_names`). A column the
+        block never carried would otherwise surface as a bare ``KeyError`` on the
+        overlap reducer thread, which :meth:`_join_reducer` re-wraps as
+        :class:`SpillReduceError` with the real cause reachable only via
+        ``__cause__`` — materially worse than ``calculate_cell_statistics``'s
+        named ``ValueError`` for the same config error, and visible only on
+        shards big enough to close a block. Checked once per block against the
+        block schema, off the per-cell loop; an empty block has nothing to check.
         """
         available = sorted(name for name, _ in schema or [])
         if not available:
             return
-        if self._needs_toc:
-            # The derived toc word column is not spilled — ``_fold_block``
-            # encodes it into the namespace per partition — but it IS resolvable
-            # there, as on the pooled path, so a ``where`` reading it is not a
-            # missing column. An absent CLOCK column is named by
-            # ``_toc_word_column`` itself, with the pooled path's message.
-            available = sorted([*available, TOC_WORD_COLUMN])
+        # The derived toc word column is not spilled — ``_fold_block`` encodes it
+        # per cell — but it IS resolvable there, as on the pooled path, so a
+        # ``where`` reading it is not a missing column. It stays OUT of
+        # ``available``, which is the block's true contents: the source/location
+        # messages must not advertise ``toc_word``, and a ``location: toc_word``
+        # must still raise here rather than reach ``mortie.common_ancestor``. An
+        # absent CLOCK column is named by ``_toc_word_column``, with the pooled
+        # path's message.
+        resolvable = sorted([*available, TOC_WORD_COLUMN]) if self._needs_toc else available
         for name, f in self._digest_fields.items():
             if f.source not in available:
                 raise ValueError(
@@ -1000,7 +999,7 @@ class SpillAggregator:
                     f"column is not in the spilled block (available: {available}); "
                     f"per-observation mortons require a HEALPix grid"
                 )
-            missing = _unresolvable_names(f.where, available)
+            missing = _unresolvable_names(f.where, resolvable)
             if missing:
                 raise ValueError(
                     f"ragged field {name!r} declares where: {f.where!r}, which names "
@@ -1019,7 +1018,7 @@ class SpillAggregator:
             # _resolve_param as a literal string and dies inside
             # np.column_stack naming neither the field nor the column.
             for pname, pval in params.items():
-                missing = _unresolvable_names(pval, available) if pname.startswith("conf_") else ()
+                missing = _unresolvable_names(pval, resolvable) if pname.startswith("conf_") else ()
                 if missing:
                     raise ValueError(
                         f"field {name!r} param {pname}: {pval!r} names {list(missing)}, "
