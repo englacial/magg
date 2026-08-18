@@ -133,6 +133,17 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
             continue
         dtype = meta.get("dtype") or "float32"
         raw_words, raw_payload = sibling[:], payload[:]
+        if len(raw_words) != len(raw_payload):
+            # A SHORT companion aligns row for row over its own length, so the
+            # per-cell check below never fires: the leaf would publish a word
+            # joined over a PREFIX of its cells and be listed as complete. This
+            # is the truncated-array shape the read path refuses everywhere
+            # else (issue #452); refuse it here too, per shard (§10.2).
+            raise ValueError(
+                f"{meta['sibling']} has {len(raw_words)} rows for a "
+                f"{len(raw_payload)}-row {name} payload — the companion must be "
+                f"row-aligned with its digest (spec §1.1)"
+            )
         for i, row in enumerate(raw_words):
             if row is None or not len(row):
                 continue
