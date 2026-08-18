@@ -924,6 +924,9 @@ def process_shard(
                 config,
                 data_vars,
                 agg_fields,
+                # Already gathered for the precompute above — the toc hoist reuses
+                # it instead of rebuilding the same index (review finding, PR #478).
+                chunk_pooled=chunk_pooled,
             )
         cells_with_data += cwd
         # Strict-AOI per-cell mask (issue #101): expand the shard's manifest payload
