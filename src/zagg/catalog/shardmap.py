@@ -223,7 +223,12 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
         by_canonical: dict = {}
         for entry in entries:
             canonical, distinguishing = _recorded_identity(entry)
-            if canonical is None:
+            if not canonical:
+                # Empty as well as absent: an id of ``"/"`` canonicalizes to
+                # ``""``, and ``canonical_granule_id`` refuses to mint an
+                # identity from an empty name precisely so nothing gets a
+                # silently-wrong one -- reporting ``''`` as the collapsed id
+                # would be exactly that.
                 continue
             by_canonical.setdefault(canonical, {})[distinguishing] = (
                 entry.get("s3") or entry.get("https") or entry.get("id") or entry.get("datetime")
