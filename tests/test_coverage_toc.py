@@ -423,6 +423,49 @@ class TestOnCommittedStores:
         # only the one it could read whole (§10.2's unknown-not-empty rule).
         assert set(envelope["temporal"]["shards"]) == {"11213"}
 
+    def test_refresh_never_deletes_the_section_when_every_leaf_fails(self, tmp_path, monkeypatch):
+        """The escape hatch must not be the thing that destroys the section.
+
+        Fail-open per leaf is fail-DESTRUCTIVE in aggregate: refresh PUTs its
+        envelope outright, so an all-failed walk would publish a root object
+        with the ``temporal`` key gone — during exactly the incident an
+        operator reached for refresh to repair.
+        """
+        import zagg.coverage_toc as toc_module
+
+        root = self._copy(tmp_path, "temporal")
+        standing = json.loads((Path(root) / "coverage.moc").read_text())["temporal"]
+
+        def reader(*args, **kwargs):
+            raise OSError("credentials expired mid-walk")
+
+        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        envelope = refresh_root_coverage(root)
+        assert envelope["ranges"]  # the spatial refresh still succeeded
+        assert envelope["temporal"] == standing
+        assert coverage_toc(envelope) == coverage_toc({"temporal": standing})
+
+    def test_refresh_composes_a_partial_rebuild_with_the_standing_section(
+        self, tmp_path, monkeypatch
+    ):
+        import zagg.coverage_toc as toc_module
+
+        root = self._copy(tmp_path, "temporal")
+        self._clone_shard(root)
+        refresh_root_coverage(root)  # both shards land in the standing section
+        real = toc_module.read_leaf_temporal
+
+        def reader(leaf, *args, **kwargs):
+            if "11214" in leaf:
+                raise OSError("truncated companion")
+            return real(leaf, *args, **kwargs)
+
+        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        envelope = refresh_root_coverage(root)
+        # The shard the walk could not read keeps the word the last whole walk
+        # published: a partial rebuild composes, it does not overwrite.
+        assert set(envelope["temporal"]["shards"]) == {"11213", "11214"}
+
     def test_a_second_pass_over_a_multi_shard_store_writes_nothing(self, tmp_path):
         """Sweep idempotence where the seam actually bites (§10.4).
 
