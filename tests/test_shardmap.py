@@ -2740,3 +2740,33 @@ class TestBasenameCollisions:
     def test_one_acquisition_listed_twice_is_still_not_a_collision(self):
         a = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-01T00:00:00Z"}
         shardmap._refuse_basename_collisions([7], [[a, dict(a)]])
+
+    def test_refine_rebuilds_hrefs_from_the_catalog_so_it_cannot_collide(
+        self, catalog, fine_grid, coarse_grid
+    ):
+        # The refine arm looks each entry up in the catalog by id and rebuilds
+        # the entry from THAT record, so a source map's per-entry hrefs never
+        # reach the new map: a collided pair arrives as one identical entry and
+        # the check has nothing left to see. Pinning it because it bounds what
+        # the guard can promise -- only ``build`` and coarsen can surface an
+        # href collision (issue #468 review finding (2)).
+        sm = ShardMap.build(
+            _catalog([_item("Gdup", -76.62, -76.57)]), coarse_grid, backend="mortie"
+        )
+        cat = _catalog([_item("Gdup", -76.62, -76.57)])
+        collided = [
+            {"id": "Gdup", "s3": f"s3://b/{p}/Gdup.h5", "https": f"https://h/{p}/Gdup.h5"}
+            for p in ("p1", "p2")
+        ]
+        source = ShardMap(
+            sm.grid_signature,
+            list(sm.shard_keys),
+            [collided] + [list(g) for g in sm.granules[1:]],
+            dict(sm.metadata),
+        )
+        refined = source.reproject(fine_grid, catalog=cat)
+        entries = [g for shard in refined.granules for g in shard]
+        assert all(g["s3"] == "s3://b/Gdup.h5" for g in entries), "hrefs come from the catalog"
+        # One granule out, not two: the prefixes -- and with them the collision
+        # -- were discarded upstream of the check, not by it.
+        assert {g["id"] for g in entries} == {"Gdup"}
