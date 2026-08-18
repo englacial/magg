@@ -793,10 +793,17 @@ neither gap and is safe now.
   record already stated twice while `semantic_core` still hashed the
   block as spelled. The exclusion holds **on condition of the
   law-equivalence contract**: every streaming mode MUST produce output
-  within the documented approximation law of the pooled path — exact for
-  the single-block regime and the summation reducers, the
-  kway/`np.isclose` class across merge flushes and block closes — and a
-  mode that cannot maintain that law may not join the streaming block.
+  within the documented approximation law of the pooled path. Three law
+  classes are admitted, and a mode that cannot maintain the class its
+  channels fall in may not join the streaming block: (1) **exact** — the
+  single-block regime and the summation reducers; (2) the
+  **kway/`np.isclose`** class — the payload channel across merge flushes
+  and block closes; (3) the **channel-specific documented bounds** for
+  the companion channels, conservative rather than close — a located
+  companion word folds toward the contributors' common ancestor, so its
+  pin is an ancestor-or-equal hull bound (§9.1), and the packed
+  composition word keeps presence (`lane > 0`) exactly with counts within
+  one lane quantization (`tol = 1 + n / 255.0`) of pooled.
   The contract, not the digest, is what makes one shared identity across
   all streaming regimes honest; its enforcement is the cross-block suites
   (`tests/test_spill_crossblock.py`, being extended to the temporal

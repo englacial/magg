@@ -202,9 +202,14 @@ DATA_SOURCE_PACKAGING_KEYS = (
 #: streaming regime shares one product identity, with bytes bounded by the
 #: **law-equivalence contract** (``docs/design/sparse_coverage.md``, D19):
 #: each streaming mode MUST land within the documented approximation law of
-#: the pooled path — exact for the single-block regime and the summation
-#: reducers, the kway/``np.isclose`` class across merge flushes and block
-#: closes — and a mode that cannot maintain that law may not join the block.
+#: the pooled path, in one of three classes — exact (the single-block regime
+#: and the summation reducers), the kway/``np.isclose`` class (the payload
+#: channel across merge flushes and block closes), and the channel-specific
+#: documented bounds for the companion channels (a located word folds to the
+#: contributors' common ancestor, pinned as an ancestor-or-equal hull; the
+#: packed composition word keeps presence exactly and counts within one lane
+#: quantization) — and a mode that cannot maintain the class its channels
+#: fall in may not join the block.
 #: Enforcement is ``tests/test_spill_crossblock.py``. The D19 record stated
 #: this acceptance property twice while the code hashed the block as spelled;
 #: the ruling lands the code on the record's side before any long-lived store
