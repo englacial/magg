@@ -2206,7 +2206,7 @@ already carry:
 | tier | key | what | answers |
 |---|---|---|---|
 | 1 | `shards` | one toc word per populated shard — the join over that shard's sibling words | *which* shards hold data during a window |
-| 2 | `digest` | a weighted t-digest over acquisition times, with per-centroid toc envelopes as its companion | *how much* data falls in a window |
+| 2 | `digest` | a weighted t-digest over acquisition times — mass placed at the per-centroid toc envelope midpoints that are also its companion | *how much* data falls in a window |
 
 Neither tier is new information and neither is truth: like the spatial ranges
 beside them they are a **regenerable accelerator** over the leaf arrays (§8.3,
@@ -2344,11 +2344,28 @@ does not already implement for the leaves:
   broken).
 - **Column 0 is an instant on §8's internal nanosecond scale** (`value:
   "toc-ns"`), directly comparable with `toc2time` output and needing no unit
-  conversion. It is `float32`, so it carries ~2^-24 **relative** precision —
-  near present-day magnitudes that is a quantum of roughly ten minutes. This
-  is deliberate: the digest is a density instrument at campaign scale, and the
-  **companion word beside each centroid is the exact temporal claim**. A
-  reader needing exactness MUST use the words, never the means.
+  conversion. It is **derived from the companion words, not measured from the
+  observations**: each contributing centroid enters the fold at the MIDPOINT
+  of its own §8.3 word's `toc2time` envelope, and a merged centroid's mean is
+  the weight-weighted mean of those midpoints. Two consequences a reader MUST
+  plan for:
+  - a **weight-1 centroid is exact**. Its word is a timestamp under §8.3's
+    kind-keyed semantics, `toc2time` returns `(t, t)`, and the midpoint is
+    that instant. This is the one exact arm of the value axis.
+  - every other mean is a **convex combination of envelope midpoints**, so it
+    lies inside that centroid's own word but at no particular observation.
+    The partition is the one the **value** distribution produced (zagg re-keys
+    each §8.3 companion's existing digest onto its words), so a centroid's
+    members are grouped by payload value, not by time: a heavy centroid whose
+    members straddle a campaign gap places all of its mass at a point inside
+    that gap, where the store may hold no data at all.
+
+  Column 0 is also `float32`, carrying ~2^-24 **relative** precision — near
+  present-day magnitudes a quantum of roughly ten minutes, enough that both
+  statements above hold only up to that rounding. It is the smaller half of
+  the same approximation, and deliberate: the **companion word beside each
+  centroid is the exact temporal claim**, and a reader needing exactness MUST
+  use the words, never the means.
 - **Column 1 is a weight under the §2.0 `"counts"` declaration** (`weights`,
   restated in the block): observation counts, so `sum(weights)` — recorded as
   `weight_total` — is the total number of temporal observations the listed
@@ -2370,8 +2387,18 @@ companion MUST come from one call and MUST NOT be folded in separate passes.
 
 Density over a window is then the existing algebra: a CDF difference over the
 payload, with the companion words available to bound (and, near a window edge,
-to correct) which centroids may legitimately contribute. Gaps between campaign
-clusters stay visible because k centroids carry k envelopes.
+to correct) which centroids may legitimately contribute. Total weight is
+**exact** — the fold conserves it, so `weight_total` is the observation count
+however coarse the value axis is — while the placement of that weight along
+the axis is only as time-resolved as the centroid partition above.
+
+Gaps between campaign clusters stay visible in the **envelope words**: `k`
+centroids carry `k` words, and a gap between two clusters shows as the
+absence of any word covering it. That is a claim about the `times` buffer,
+not about column 0 — the means can and do land inside a gap when a single
+centroid's members straddle one. A reader answering "is there data in this
+window at all" MUST read the words; the CDF answers "roughly how much",
+resolved to the partition, and nothing finer.
 
 ### 10.4 Composition
 
