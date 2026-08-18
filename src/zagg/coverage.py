@@ -254,13 +254,14 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     ``.zarr`` off the shard-order depth is checked for the D11 ``role`` attr and
     skipped when it carries one (never classified by position) — as is a
     ``{stem}.pyramid.zarr`` column (issue #383), the one derived family that
-    lives at the leaf's OWN node. A temporal-declaring store (spec §10, issue
-    #480) also has its ``zagg-coverage-toc/1`` section rebuilt from this same
-    walk — fail-open per SHARD, so an unreadable companion costs the section
-    that shard and never the refresh; and a walk that lost any shard COMPOSES
-    its rebuild with the standing section (§10.4) instead of replacing it, so
-    the escape hatch can never be the thing that deletes the section. A
-    supersedes it). A successful refresh also re-arms the
+    lives at the leaf's OWN node. A
+    supersedes it). A temporal-declaring store (spec §10, issue #480) also has
+    its ``zagg-coverage-toc/1`` section rebuilt from this same walk —
+    fail-open per SHARD, so an unreadable companion costs the section that
+    shard and never the refresh; and a walk that lost any shard COMPOSES its
+    rebuild with the standing section (§10.4) instead of replacing it, so the
+    escape hatch can never be the thing that deletes the section. A successful
+    refresh also re-arms the
     :func:`warn_if_stale` once-per-episode latch for this store. Returns the
     envelope written, or ``None`` — deleting any existing root object — when
     no stamped leaf exists (absence is truthful, a stale cache is not, and
