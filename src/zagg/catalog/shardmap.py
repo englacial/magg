@@ -162,8 +162,11 @@ def _granule_entry(rec: dict) -> dict:
     return entry
 
 
-def _recorded_identity(entry: dict):
+def _recorded_identity(entry: dict, canonicalize=None) -> tuple:
     """What a shard entry will be RECORDED as, and what actually names it.
+
+    ``canonicalize`` lets a caller in a hot loop hoist the
+    :func:`zagg.telemetry.canonical_granule_id` import out of the per-entry path.
 
     Returns ``(canonical, distinguishing)``: the canonical granule id the leaf's
     D20 sidecar will carry for this entry (:func:`zagg.telemetry.canonical_granule_id`
@@ -187,17 +190,34 @@ def _recorded_identity(entry: dict):
     record's granule identity is the **primary alone**, which is the invariant
     :func:`zagg.telemetry.canonical_granule_id` records.
     """
-    from zagg.telemetry import canonical_granule_id
+    if canonicalize is None:
+        from zagg.telemetry import canonical_granule_id as canonicalize
 
     href = entry.get("s3") or entry.get("https")
     named = href or entry.get("id") or entry.get("datetime")
-    canonical = canonical_granule_id(named) if named else None
+    canonical = canonicalize(named) if named else None
     return canonical, (
         entry.get("id"),
         entry.get("s3"),
         entry.get("https"),
         entry.get("datetime"),
     )
+
+
+def _collision_label(entry: dict) -> str:
+    """How to name one colliding entry so the operator can tell the pair apart.
+
+    The href when there is one — the prefix is what differs, and it is what the
+    remedy acts on. A raster entry has none, and both members of such a pair
+    carry the SAME id (that is the collapse), so naming them by id twice says
+    nothing; the acquisition datetime is what separates them.
+    """
+    href = entry.get("s3") or entry.get("https")
+    if href:
+        return str(href)
+    if entry.get("id") and entry.get("datetime"):
+        return f"{entry['id']} @ {entry['datetime']}"
+    return str(entry.get("id") or entry.get("datetime"))
 
 
 def _refuse_basename_collisions(shard_keys, granules) -> None:
@@ -219,10 +239,14 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
     children legitimately arrives more than once.
     """
     collisions = []
+    # Imported once rather than per entry: this runs over every granule of every
+    # shard, 555,867 of them at clone scale.
+    from zagg.telemetry import canonical_granule_id
+
     for key, entries in zip(shard_keys, granules):
         by_canonical: dict = {}
         for entry in entries:
-            canonical, distinguishing = _recorded_identity(entry)
+            canonical, distinguishing = _recorded_identity(entry, canonical_granule_id)
             if not canonical:
                 # Empty as well as absent: an id of ``"/"`` canonicalizes to
                 # ``""``, and ``canonical_granule_id`` refuses to mint an
@@ -230,26 +254,24 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
                 # silently-wrong one -- reporting ``''`` as the collapsed id
                 # would be exactly that.
                 continue
-            by_canonical.setdefault(canonical, {})[distinguishing] = (
-                entry.get("s3") or entry.get("https") or entry.get("id") or entry.get("datetime")
-            )
-        collisions += [
-            (key, canonical, sorted(str(h) for h in named.values()))
-            for canonical, named in sorted(by_canonical.items())
+            by_canonical.setdefault(canonical, {})[distinguishing] = _collision_label(entry)
+        collisions += sorted(
+            (key, canonical, sorted(named.values()))
+            for canonical, named in by_canonical.items()
             if len(named) > 1
-        ]
+        )
     if not collisions:
         return
     shown = "; ".join(
-        f"shard {k} {canonical!r} <- {hrefs}" for k, canonical, hrefs in collisions[:3]
+        f"shard {k} {canonical!r} <- {named}" for k, canonical, named in collisions[:3]
     )
     raise ValueError(
         f"ShardMap: {len(collisions)} per-shard granule identity collision(s) — granules "
-        f"assigned to one shard share a basename across different prefixes, so they "
-        f"collapse onto a single recorded granule id and the shard's catalog identity "
-        f"names fewer granules than it reads (issue #468). Re-scope the catalog query so "
-        f"each granule appears once, or de-collide the basenames: "
-        f"{shown}{' ...' if len(collisions) > 3 else ''}"
+        f"assigned to one shard record as ONE granule id, so the shard's catalog identity "
+        f"names fewer granules than it reads (issue #468). Usually one basename under two "
+        f"key prefixes, in which case re-scope the catalog query so each granule appears "
+        f"once, or de-collide the basenames; the entries below are named by whatever "
+        f"separates them: {shown}{' ...' if len(collisions) > 3 else ''}"
     )
 
 
