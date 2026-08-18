@@ -944,10 +944,28 @@ staged sweep's finisher.
   nowhere to write its words. An overview level of a located field therefore
   carries the `{field}_locations` sibling, its §9 `located` declaration, and
   the payload's §1.2 `locations` binding, exactly as a leaf does — with the
-  words at the **heterogeneous orders** §9.1 makes normative. A **temporal**
-  companion (§8.3) is a different case and stays `class: "none"`: §8.4's
-  shape-coarsening reduction is not wired through the fold sites, so those
-  fields exist at native resolution only.
+  words at the **heterogeneous orders** §9.1 makes normative.
+- **A temporal ragged field composes the same way, and its entry carries
+  `temporal`.** A `temporal:` declaration (§8.3) does not exclude a field
+  from the pyramid either: zagg's digest pyramids keep the companion
+  `"per-centroid"` at every level, symmetric with the located channel — the
+  temporal k-way merge reduces the `{field}_times` words over the same
+  centroid partition the digest merge produces (espg-ruled 2026-08-17,
+  amending [ruling 3 on
+  issue #410](https://github.com/englacial/zagg/issues/410#issuecomment-5310502887);
+  §8.4 records the amendment and keeps its per-cell reduction licensed but
+  unused by this writer), so a temporal digest field folds through every
+  level and the class is `approximate` like any other digest field. Its
+  entry carries `temporal` — the companion **shape** (`"per-centroid"`),
+  which is all a level above the leaf can act on, the leaf's ingest column
+  never being re-read by any fold — keyed **only when set**, so a field
+  without the companion has an unchanged entry. The key is load-bearing
+  exactly as `location` is: the overview writer reconstructs a level's
+  arrays from this entry alone, so without it the overview template emits no
+  sibling array and the fold has nowhere to write its words. An overview
+  level of a temporal field therefore carries the `{field}_times` sibling,
+  its §8.3 `temporal` declaration, and the payload's §8.3 `times` binding,
+  exactly as a leaf does.
 - **`all_time`** — whether the `all.zarr` all-time fold is materialized at
   the declared orders (windowed stores only; a `schedule: none` store's
   single fold is already all-time).
