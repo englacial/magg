@@ -667,6 +667,14 @@ The example above is `zagg.hive.build_root_coverage` output for the shards
 `root_coverage_words`; the test suite parses it straight out of this file so
 the reference example can never drift from the implementation.
 
+A temporal-declaring store adds one more key here: `temporal`, the
+`zagg-coverage-toc/1` section (per-shard toc envelope words plus an optional
+root time-digest) whose grammar is normative in
+[`specification.md`](specification.md) §10 — one metadata GET then answers
+"which shards hold data DURING my window" before any leaf is opened. A store
+with no temporal channel carries no such key and its root object is
+byte-identical to a pre-#480 one; absence is never a refusal.
+
 A range is an inclusive run of same-order cells within one base cell,
 consecutive in digit-tail rank; endpoints are decimal **strings** (packed
 u64 words exceed 2^53 and raw JSON numbers get mangled by float-based
