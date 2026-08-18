@@ -210,7 +210,9 @@ DATA_SOURCE_PACKAGING_KEYS = (
 #: packed composition word keeps presence exactly and counts within one lane
 #: quantization) — and a mode that cannot maintain the class its channels
 #: fall in may not join the block.
-#: Enforcement is ``tests/test_spill_crossblock.py``. The D19 record stated
+#: Enforcement is ``tests/test_spill.py::TestSpillWorkerSingleBlock`` (the
+#: exactness half), ``tests/test_spill_crossblock.py``, and
+#: ``tests/test_streaming.py``'s pooled-parity pins. The D19 record stated
 #: this acceptance property twice while the code hashed the block as spelled;
 #: the ruling lands the code on the record's side before any long-lived store
 #: carries a streaming-declared digest, so the epoch moves nothing that

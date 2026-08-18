@@ -805,9 +805,11 @@ neither gap and is safe now.
   composition word keeps presence (`lane > 0`) exactly with counts within
   one lane quantization (`tol = 1 + n / 255.0`) of pooled.
   The contract, not the digest, is what makes one shared identity across
-  all streaming regimes honest; its enforcement is the cross-block suites
-  (`tests/test_spill_crossblock.py`, being extended to the temporal
-  channel by #477) and `tests/test_streaming.py`'s pooled-parity pins.
+  all streaming regimes honest; its enforcement is the single-block
+  exactness pins (`tests/test_spill.py::TestSpillWorkerSingleBlock`), the
+  cross-block suites (`tests/test_spill_crossblock.py`, being extended to
+  the temporal channel by issue #477), and `tests/test_streaming.py`'s
+  pooled-parity pins.
   Store compatibility was priced at decision time: no long-lived store
   carries a streaming-declared digest (the deployed stores age out on a
   30-day cycle), so the epoch moves nothing that outlives it — and the
