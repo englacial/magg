@@ -254,7 +254,10 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     ``.zarr`` off the shard-order depth is checked for the D11 ``role`` attr and
     skipped when it carries one (never classified by position) — as is a
     ``{stem}.pyramid.zarr`` column (issue #383), the one derived family that
-    lives at the leaf's OWN node. A
+    lives at the leaf's OWN node. A temporal-declaring store (spec §10, issue
+    #480) also has its ``zagg-coverage-toc/1`` section rebuilt from this same
+    walk — fail-open per leaf, so an unreadable companion costs the section a
+    shard, never the refresh. A
     supersedes it). A successful refresh also re-arms the
     :func:`warn_if_stale` once-per-episode latch for this store. Returns the
     envelope written, or ``None`` — deleting any existing root object — when
@@ -269,6 +272,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     import obstore
     from obstore.exceptions import NotFoundError
 
+    from zagg.coverage_toc import build_temporal_section, read_leaf_temporal, temporal_fields
     from zagg.grids.morton import morton_words_from_decimals
     from zagg.store import open_store
 
@@ -276,6 +280,13 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     if manifest is None:
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")
     order = int(manifest["shard_order"])
+    # The §10 temporal section (issue #480) is rebuilt from the SAME walk, so
+    # the escape hatch regenerates it rather than deleting it — and, because
+    # this walk is whole-store by construction, its root time-digest is the
+    # authoritative one (spec §10's whole-coverage rule).
+    toc_fields = temporal_fields(manifest)
+    cell_order = int(manifest.get("cell_order") or 0)
+    contributions: dict[str, list] = {}
     store = open_object_store(store_root, **store_kwargs)
     root = store_root.rstrip("/")
     # Decimals accumulate through the walk and parse once at the end (issue
@@ -352,6 +363,16 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                     )
                     continue
                 decimals.append(decimal)
+                if toc_fields:
+                    try:
+                        got = read_leaf_temporal(
+                            f"{root}/{rel}", cell_order, toc_fields, **store_kwargs
+                        )
+                    except Exception as e:  # fail-open: the section is a cache
+                        logger.warning(f"refresh: no temporal contribution from {rel} ({e})")
+                        got = None
+                    if got is not None:
+                        contributions.setdefault(decimal, []).append(got)
                 # D15: windowed stamps carry the leaf's actual time range;
                 # the rebuilt root summary re-derives the union from this
                 # walk's stamps (truth), superseding any cached value.
@@ -374,6 +395,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
         order,
         source="refresh",
         time_range=union_time_range(*time_ranges),
+        temporal=build_temporal_section(contributions, toc_fields, source="refresh"),
     )
     obstore.put(store, ROOT_COVERAGE_NAME, json.dumps(envelope, indent=1).encode())
     return envelope
