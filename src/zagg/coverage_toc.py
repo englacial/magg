@@ -130,6 +130,17 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
     the leaf's temporal observation count. ``None`` when the leaf holds no
     temporal row at all (an unpopulated or pre-companion leaf), which is
     absence, not failure.
+
+    **Cost.** One leaf-sized read per declared field — ``payload[:]`` plus its
+    sibling — and a per-cell decode before the merge, the same shape as the
+    overview family's own leaf read (:func:`zagg.sweep_overview._fold_node`,
+    which reads ``arr[:]`` per field and accumulates per-cell centroid lists
+    the same way). What it returns is bounded regardless: the k-way merge here
+    compresses the whole leaf to ~``ROOT_TOC_DELTA`` centroids, so the caller
+    accumulating leaves (:func:`build_temporal_section`) holds
+    ``n_leaves × ~δ`` rows, not ``n_leaves × n_cells × k``. For a
+    2,726-shard store that is ~1.4 MB of centroids plus ~1.4 MB of companion
+    words, which is why the root fold needs no chunk batching of its own.
     """
     import zarr
     from mortie import toc_reduce
