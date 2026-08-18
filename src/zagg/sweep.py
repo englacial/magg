@@ -192,17 +192,29 @@ class MocFamily(SweepFamily):
         #: ``{shard decimal: [(word, digest, times), ...]}`` — one entry per
         #: window leaf this run visited (issue #480).
         self._temporal: dict[str, list] = {}
+        #: Shards whose temporal read failed: dropped from the map entirely,
+        #: never published from the window leaves that did read (issue #480).
+        self._temporal_failed: set[str] = set()
         #: Resolved once, on the first leaf read; ``None`` until then.
         self._temporal_fields: dict | None = None
         self._cell_order = 0
 
     def _accumulate_temporal(self, store_root, decimal, leaf, store_kwargs) -> None:
-        """Read one leaf's §10 temporal contribution; fail-open (D9).
+        """Read one leaf's §10 temporal contribution; fail-open per SHARD (D9).
 
         A store declaring no temporal field short-circuits after one manifest
         read. An unreadable companion is logged and skipped rather than
         failing the leaf: the temporal section is a regenerable accelerator,
         and the spatial rollup this walk exists for must not die on it.
+
+        The fail-open is shard-scoped, not leaf-scoped. A windowed shard has
+        several leaves behind ONE map entry, and §10.2 promises that a LISTED
+        shard's word conservatively contains every instant in it — a word
+        joined over whichever windows happened to read is not that. So one
+        failed window drops its whole shard from the map, permanently for this
+        run; a shard absent from ``shards`` reads as *unknown* (still a
+        candidate), which is always safe, while a shard listed with a partial
+        word is not.
         """
         from zagg.coverage_toc import read_leaf_temporal, temporal_fields
 
@@ -212,12 +224,17 @@ class MocFamily(SweepFamily):
             manifest = read_manifest(store_root, **store_kwargs) or {}
             self._temporal_fields = temporal_fields(manifest)
             self._cell_order = int(manifest.get("cell_order") or 0)
-        if not self._temporal_fields:
+        if not self._temporal_fields or decimal in self._temporal_failed:
             return
         try:
             got = read_leaf_temporal(leaf, self._cell_order, self._temporal_fields, **store_kwargs)
         except Exception as e:
-            logger.warning(f"sweep[moc]: no temporal contribution from leaf {leaf} ({e})")
+            logger.warning(
+                f"sweep[moc]: dropping shard {decimal} from the temporal section — "
+                f"leaf {leaf} did not read ({e})"
+            )
+            self._temporal_failed.add(decimal)
+            self._temporal.pop(decimal, None)
             return
         if got is not None:
             self._temporal.setdefault(decimal, []).append(got)

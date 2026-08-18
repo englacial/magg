@@ -2302,6 +2302,16 @@ from `shards` is one whose temporal contribution has not been rolled up yet
 (or one carrying no companion at all), and MUST be treated as *unknown*, i.e.
 a candidate, never as *empty*.
 
+That escape hatch is the *only* one: containment is a claim about a **listed**
+shard, so a producer whose read of any input behind a shard's word FAILED —
+one window leaf of several, one unreadable companion — MUST omit that shard
+from `shards` rather than publish the word it managed to join over the rest.
+Dropping the shard costs a reader one candidate it must open; publishing a
+partial word costs it data it will never look for. A field a leaf simply does
+not carry (one added to the store after that leaf was written) is absence, not
+failure: it holds no observations, so the word over the remaining fields is
+still whole.
+
 > **Open question, flagged not decided** ([#480](https://github.com/englacial/zagg/issues/480)):
 > whether a multi-field store should additionally publish **per-field** maps
 > instead of (or beside) this union. The union is the default because coverage
