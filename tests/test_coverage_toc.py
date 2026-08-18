@@ -27,7 +27,7 @@ from zagg.coverage_toc import (
     coverage_toc_digest,
     load_temporal_coverage,
     merge_temporal_sections,
-    section_covers,
+    section_unchanged,
     shards_overlapping,
     temporal_fields,
 )
@@ -193,13 +193,32 @@ class TestComposition:
         assert merge_temporal_sections({}, good) == good
         assert merge_temporal_sections({"shards": {"1": "2"}}, good) == good
 
-    def test_section_covers(self):
+    def test_section_unchanged(self):
         a = build_temporal_section({"11211": [_leaf(1)], "11212": [_leaf(2)]}, ["h_tdigest"])
-        assert section_covers(a, None)
-        assert section_covers(a, a)
-        assert not section_covers(None, a)
-        assert not section_covers({"spec": "zagg-coverage-toc/2"}, a)
-        assert not section_covers(build_temporal_section({"11211": [_leaf(1)]}, ["h_tdigest"]), a)
+        assert section_unchanged(a, None)
+        assert section_unchanged(a, a)
+        assert not section_unchanged(None, a)
+        assert not section_unchanged(build_temporal_section({"11211": [_leaf(1)]}, ["h_tdigest"]), a)
+        # A standing section this revision cannot read is preserved verbatim
+        # by the merge, so composing over it changes nothing either — the
+        # skip test must not churn the object on a mixed-version store.
+        assert section_unchanged({"spec": "zagg-coverage-toc/2"}, a)
+
+    def test_a_partial_producer_converges_instead_of_re_putting_forever(self):
+        """The composed digest, not the built one, is what the skip test sees.
+
+        A producer that walked one shard of a two-shard store always builds a
+        digest, and §10.4 always drops it at the seam. Comparing the built
+        section against the standing one therefore never converges; comparing
+        the MERGE against it does, on the very next pass.
+        """
+        first = build_temporal_section({"11211": [_leaf(1)]}, ["h_tdigest"])
+        second = build_temporal_section({"11212": [_leaf(2)]}, ["h_tdigest"])
+        standing = merge_temporal_sections(first, second)
+        assert "digest" not in standing  # neither producer covered the store
+        assert second.get("digest") is not None  # ... yet the producer built one
+        assert section_unchanged(standing, second)
+        assert section_unchanged(standing, first)
 
 
 class TestAbsence:
@@ -270,6 +289,23 @@ class TestOnCommittedStores:
         shutil.copytree(SPEC_DATA / name, dst)
         return str(dst)
 
+    def _clone_shard(self, root, src="11213", dst="11214"):
+        """Give ``root`` a second shard, cloned from its committed leaf.
+
+        The §7 ``temporal/`` fixture ships ONE shard, which is exactly the
+        shape that hides the composition seam: a single-shard producer is
+        always whole-covering, so its digest survives the merge and the skip
+        test converges by accident.
+        """
+        from zagg.grids.morton import morton_word
+        from zagg.hive import shard_leaf_path
+
+        src_leaf = Path(shard_leaf_path(root, int(morton_word(src))))
+        dst_leaf = Path(shard_leaf_path(root, int(morton_word(dst))))
+        dst_leaf.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src_leaf, dst_leaf)
+        return [(int(morton_word(src)), None)], [(int(morton_word(dst)), None)]
+
     def test_refresh_rebuilds_the_section_from_its_own_walk(self, tmp_path):
         root = self._copy(tmp_path, "temporal")
         committed = json.loads((SPEC_DATA / "temporal" / "coverage.moc").read_text())
@@ -299,6 +335,30 @@ class TestOnCommittedStores:
         # Idempotence: a second pass over an unchanged tree writes nothing.
         again = run_sweep(root, leaves, families=["moc"], record=False)
         assert again["families"]["moc"]["root_moc_written"] is False
+
+    def test_a_second_pass_over_a_multi_shard_store_writes_nothing(self, tmp_path):
+        """Sweep idempotence where the seam actually bites (§10.4).
+
+        Two shards, two incremental sweeps: neither producer covers the store,
+        so the composed section carries no digest while every pass keeps
+        building one. The skip test has to converge on what was WRITTEN, or
+        the fleet re-PUTs a byte-identical root object forever.
+        """
+        from zagg.sweep import run_sweep
+
+        root = self._copy(tmp_path, "temporal")
+        (Path(root) / "coverage.moc").unlink()
+        a, b = self._clone_shard(root)
+        for leaves in (a, b):
+            summary = run_sweep(root, leaves, families=["moc"], record=False)
+            assert summary["families"]["moc"]["root_moc_written"] is True
+        written = read_root_coverage(root)
+        assert set(written["temporal"]["shards"]) == {"11213", "11214"}
+        assert "digest" not in written["temporal"]
+        for leaves in (b, a):
+            again = run_sweep(root, leaves, families=["moc"], record=False)
+            assert again["families"]["moc"]["root_moc_written"] is False
+        assert read_root_coverage(root)["temporal"] == written["temporal"]
 
     def test_a_non_temporal_store_writes_byte_identical_bytes(self, tmp_path):
         """The §10 absence promise, as bytes.

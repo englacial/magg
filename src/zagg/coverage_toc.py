@@ -289,23 +289,36 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
     return merged
 
 
-def section_covers(existing, incoming) -> bool:
-    """Whether ``existing`` already carries everything ``incoming`` would add.
+def section_unchanged(existing, incoming) -> bool:
+    """Whether composing ``incoming`` into ``existing`` would change nothing.
 
     The temporal half of the MOC family's skip-if-current test: an unchanged
-    re-sweep of a temporal store must write no root object either. Compared
-    on CONTENT (the shard words and whether a digest is present), never on
-    the whole section — ``generated_at`` churns per pass by construction.
+    re-sweep of a temporal store must write no root object either. The test is
+    on what would actually be **written** — :func:`merge_temporal_sections`'s
+    own output — compared against the standing section on CONTENT (the shard
+    words, the digest block, the field list), never on the whole section:
+    ``source`` and ``generated_at`` churn per pass by construction.
+
+    Testing the merge rather than the inputs is what makes it converge. A
+    producer that walked only part of the store always builds a digest, and
+    §10.4 always drops that digest at the seam; a test asking "does the
+    standing section already carry everything this one holds" therefore
+    answers *no* forever on any store with more than one shard, and every
+    incremental sweep re-PUTs a byte-identical object.
     """
-    if incoming is None:
-        return True
-    a = _usable(existing)
-    if a is None:
-        return False
-    have = {d: int(w) for d, w in (a.get("shards") or {}).items()}
-    if any(have.get(d) != int(w) for d, w in (incoming.get("shards") or {}).items()):
-        return False
-    return not (incoming.get("digest") is not None and a.get("digest") is None)
+    merged = merge_temporal_sections(existing, incoming)
+    return _content(merged) == _content(existing if isinstance(existing, dict) else None)
+
+
+def _content(section) -> tuple | None:
+    """The part of a section a no-op pass must reproduce exactly."""
+    if section is None:
+        return None
+    return (
+        {d: str(w) for d, w in (section.get("shards") or {}).items()},
+        section.get("digest"),
+        sorted(section.get("fields") or []),
+    )
 
 
 def _usable(section) -> dict | None:
@@ -422,7 +435,7 @@ __all__ = [
     "load_temporal_coverage",
     "merge_temporal_sections",
     "read_leaf_temporal",
-    "section_covers",
+    "section_unchanged",
     "shards_overlapping",
     "temporal_fields",
 ]

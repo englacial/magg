@@ -253,13 +253,17 @@ class MocFamily(SweepFamily):
         Unions with the existing root object (the sweep may cover only the
         dirty subtrees — untouched bases must keep their listing), via the
         same :func:`zagg.hive.write_root_coverage` transport the runner uses.
-        No PUT when the existing root already lists every folded word and
-        covers the folded time range — AND already carries this run's §10
-        temporal words — so an unchanged tree re-sweep is a no-op here too.
+        No PUT when the existing root already lists every folded word,
+        covers the folded time range, and would be UNCHANGED by composing
+        this run's §10 temporal section into it
+        (:func:`zagg.coverage_toc.section_unchanged` — the test is on the
+        merge's output rather than on the raw section, because §10.4 drops a
+        partial producer's digest at the seam), so an unchanged tree re-sweep
+        is a no-op here too, on a multi-shard store as much as a one-shard one.
         """
         import numpy as np
 
-        from zagg.coverage_toc import TEMPORAL_KEY, build_temporal_section, section_covers
+        from zagg.coverage_toc import TEMPORAL_KEY, build_temporal_section, section_unchanged
         from zagg.hive import (
             build_root_coverage,
             read_root_coverage,
@@ -286,7 +290,7 @@ class MocFamily(SweepFamily):
                     union_time_range(existing.get("time_range"), time_range)
                     == existing.get("time_range")
                 )
-                covered = covered and section_covers(existing.get(TEMPORAL_KEY), section)
+                covered = covered and section_unchanged(existing.get(TEMPORAL_KEY), section)
                 if covered:
                     return {"root_moc_written": False}
             except (KeyError, TypeError, ValueError):
