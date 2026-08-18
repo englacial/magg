@@ -144,13 +144,24 @@ def _point_leafs(grid, cell, n, rng):
 
 
 def _granule_dfs(
-    grid, shard_key, cell_idx_lists, obs_per_cell=60, seed=0, conf=False, nan_cells=(), times=False
+    grid,
+    shard_key,
+    cell_idx_lists,
+    obs_per_cell=60,
+    seed=0,
+    conf=False,
+    nan_cells=(),
+    times=False,
+    nan_frac=0.0,
 ):
     """One DataFrame per granule; real order-29 point leafs per chosen cell.
 
     ``conf=True`` adds the five ``signal_conf_*`` columns (ATL03's ``-1..4``
     range) for composition tests. Cells in ``nan_cells`` get all-NaN heights
-    (an empty digest but a nonzero count). ``times=True`` adds the
+    (an empty digest but a nonzero count); ``nan_frac`` instead NaNs a scattered
+    ~fraction of every OTHER cell's rows, leaving each cell partially finite —
+    the case where a payload/companion misalignment over the reducer's
+    ``[finite]`` mask is observable. ``times=True`` adds the
     ``delta_time`` clock column ``_TIME_SOURCE`` declares — one granule per
     DAY, rows a millisecond apart within it, so every granule (and therefore
     every forced block) covers a disjoint instant range: a cross-block fold
@@ -166,6 +177,8 @@ def _granule_dfs(
             vals = rng.normal(0.0, 10.0, obs_per_cell).astype(np.float32)
             if ci in nan_cells:
                 vals[:] = np.nan
+            elif nan_frac:
+                vals[rng.random(obs_per_cell) < nan_frac] = np.nan
             h.append(vals)
             leaf.append(_point_leafs(grid, int(children[ci]), obs_per_cell, rng))
         cols = {"h_ph": np.concatenate(h), "leaf_id": np.concatenate(leaf)}
@@ -250,12 +263,18 @@ def _contributor_times(dfs, grid, cell, mask_fn=None):
     clock, which is the ONE conversion both paths use — so this is the raw
     instant set the fold's per-centroid envelopes must account for, not a
     re-derivation of them.
+
+    Restricted to rows with a FINITE ``h_ph``: ``build_tdigest`` drops non-finite
+    values along with the companion rows that go with them, so a non-finite row's
+    instant is never stored, and including it here would compare the output
+    against an observation no path ever kept.
     """
     from zagg.time_axis import observation_words
 
     out = []
     for df in dfs:
         keep = np.asarray(grid.cells_of(df["leaf_id"].values)) == cell
+        keep = keep & np.isfinite(df["h_ph"].values)
         if mask_fn is not None:
             keep = keep & mask_fn(df)
         out.append(
@@ -271,13 +290,18 @@ def _assert_envelope_conservation(times, contributors):
 
     Membership per centroid is not observable from the output (as with
     locations), so pin the two statements that are — both EXACT at any fold
-    depth, because the §8.2 join is a semilattice and a fold partitions the
-    members:
+    depth over the rows the reducer keeps, because the §8.2 join is a semilattice
+    and a fold partitions the members:
 
     (a) the join over the stored per-centroid words equals the join over the raw
     observation words — no instant dropped by a block close, none invented; and
     (b) every stored word's ``[start, end)`` lies inside that whole envelope,
     which is what a reader's §8.3 containment claim rests on.
+
+    "Every observation" means every FINITE-valued one: ``build_tdigest`` drops
+    non-finite values and their companion rows, so ``contributors`` must come
+    from :func:`_contributor_times`, which masks the same way. Both claims are
+    upper bounds — a caller wanting a floor pins the weight-1 rows too.
     """
     import mortie
 
@@ -672,6 +696,44 @@ class TestTemporalMultiBlock:
             instants = _contributor_times(dfs, grid, cell)
             np.testing.assert_array_equal(np.sort(words), np.sort(instants))
             keys = values.astype(np.float32)
+            assert len(np.unique(keys)) == len(keys)
+            value_to_word = dict(zip(keys.tolist(), instants.tolist(), strict=True))
+            for centroid, word in zip(digest, words, strict=True):
+                assert value_to_word[float(centroid[0])] == int(word)
+
+    def test_partially_nan_cells_keep_the_channel_row_aligned(self, monkeypatch):
+        # build_tdigest drops non-finite VALUES and the companion rows that go
+        # with them. A whole-NaN cell cannot catch a [finite]-mask misalignment
+        # between payload and companion — nothing survives to align — but a
+        # PARTIALLY NaN one can: the surviving instants must be exactly the
+        # finite rows', paired with the finite rows' own values.
+        key = _shard_key()
+        cfg = _config(_variables(temporal=True, delta=512), streaming=_SPILL)
+        grid = _grid(cfg)
+        dfs = _granule_dfs(
+            grid, key, _CELL_LISTS, obs_per_cell=20, seed=26, times=True, nan_frac=0.4
+        )
+        _force_tiny_blocks(monkeypatch)
+        df_out, ragged, meta = _run(monkeypatch, cfg, grid, key, list(dfs))
+        assert meta["phase_timings"]["spill_blocks_closed"] == len(_CELL_LISTS)
+        children = np.asarray(grid.children(key), dtype=np.uint64)
+        vals, idx, _, times = _channels_of(ragged["h_tdigest"])
+        assert len(vals) > 0
+        for cell_i, digest, words in zip(idx, vals, times, strict=True):
+            cell = int(children[cell_i])
+            values, _ = _contributor_rows(dfs, grid, cell)
+            finite = np.isfinite(values)
+            assert finite.any() and not finite.all(), "the cell is not partially NaN"
+            # The count is over every row; the digest only over the finite ones.
+            assert int(df_out["count"].values[cell_i]) == len(values)
+            assert words.shape == (len(digest),)
+            assert len(digest) == int(finite.sum())
+            # δ=512 over ≤60 rows: nothing merges, so each centroid is one finite
+            # observation and its word is that row's exact instant.
+            assert (digest[:, 1] == 1.0).all()
+            instants = _contributor_times(dfs, grid, cell)
+            np.testing.assert_array_equal(np.sort(words), np.sort(instants))
+            keys = values[finite]
             assert len(np.unique(keys)) == len(keys)
             value_to_word = dict(zip(keys.tolist(), instants.tolist(), strict=True))
             for centroid, word in zip(digest, words, strict=True):
