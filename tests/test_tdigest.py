@@ -1285,6 +1285,29 @@ class TestBatchedCompanionFolds:
                 assert np.ascontiguousarray(np.asarray(channel)) is channel
                 assert not channel.any(), "a deferred placeholder must read as reserved 0"
 
+    def test_row_cap_folds_mid_loop_byte_for_byte(self, monkeypatch):
+        # The cap bounds the words the batch pins; the folds are segment-local,
+        # so cutting the batch mid-loop must not move a byte — and the flush it
+        # triggers has to run for real (batch deactivated), not re-defer.
+        import mortie
+
+        import zagg.stats.tdigest as td_mod
+        from zagg.stats.tdigest import batched_companion_folds
+
+        cells = self._cells()
+        plain = [build_tdigest(v, delta=d, locations=lo, temporal=t) for v, lo, t, d in cells]
+        crossings = []
+        orig = mortie.tocs_reduce
+        monkeypatch.setattr(mortie, "tocs_reduce", lambda *a: crossings.append(1) or orig(*a))
+        monkeypatch.setattr(td_mod, "_BATCH_ROW_CAP", 40)
+        with batched_companion_folds():
+            batched = [build_tdigest(v, delta=d, locations=lo, temporal=t) for v, lo, t, d in cells]
+        assert len(crossings) > 1, "a tiny cap must fold more than once"
+        for (pd_, pl, pt), (bd, bl, bt) in zip(plain, batched, strict=True):
+            np.testing.assert_array_equal(pd_, bd)
+            np.testing.assert_array_equal(pl, bl)
+            np.testing.assert_array_equal(pt, bt)
+
     def test_batch_deactivates_after_exit(self):
         # The context always resets, so a later unbatched call folds for real.
         from zagg.stats.tdigest import batched_companion_folds

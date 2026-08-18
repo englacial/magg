@@ -97,6 +97,11 @@ _ChannelFold = Callable[[np.ndarray, np.ndarray, int], np.ndarray]
 #: One deferred fold: member words, offset-adjusted starts, placeholder, declared n.
 _Deferred = tuple[np.ndarray, np.ndarray, np.ndarray, int]
 
+#: Deferred member rows per channel before the batch folds mid-loop, bounding the
+#: words it pins to ~8 MB per channel (issue #476 review finding). The folds are
+#: segment-local, so the cut point cannot change an output word.
+_BATCH_ROW_CAP = 1_000_000
+
 __all__ = [
     "build_tdigest",
     "build_tdigest_pairwise",
@@ -195,7 +200,9 @@ class _CompanionBatch:
     its own member slice — and ``_compress`` always emits starts partitioning
     ``[0, n)`` from 0, so the concatenation is itself a valid ``(words,
     starts, n)`` fold input and the batched result is byte-for-byte the
-    per-call results, sliced back apart.
+    per-call results, sliced back apart.  The same segment-locality bounds the
+    memory: a channel that reaches ``_BATCH_ROW_CAP`` deferred rows folds mid-loop
+    (:meth:`flush_detached`) instead of holding the whole chunk's words.
 
     Correctness requires deferred outputs to be **write-only and un-copied
     until the flush**, which holds for the one activation site
@@ -242,7 +249,29 @@ class _CompanionBatch:
         # partition on the single-entry arm.
         self._pending.setdefault(fold, []).append((words[:n], starts + rows, out, n))
         self._rows[fold] = rows + n
+        # Bound the held member words (review finding, PR #478): the batch pins a
+        # copy of every deferral's words until its flush, which at 1.5 M obs is
+        # ~12 MB per channel for a whole chunk. Folding mid-loop at the cap is
+        # byte-identical — the folds are segment-local, so where the batch is cut
+        # cannot move an output word — and keeps essentially the whole FFI win
+        # (one crossing per _BATCH_ROW_CAP rows rather than one per cell-field).
+        if self._rows[fold] >= _BATCH_ROW_CAP:
+            self.flush_detached()
         return out
+
+    def flush_detached(self) -> None:
+        """Flush from *inside* the context: deactivate the batch, then fold.
+
+        ``flush`` calls the real folds, which re-enter :func:`_centroid_ancestors`
+        / :func:`_centroid_envelopes` — with the batch still installed they would
+        defer straight back into it (and recurse). Deactivating first is exactly
+        what :func:`batched_companion_folds` does at exit.
+        """
+        token = _FOLD_BATCH.set(None)
+        try:
+            self.flush()
+        finally:
+            _FOLD_BATCH.reset(token)
 
     def flush(self) -> None:
         """Run each channel's fold once over its concatenated deferrals."""
