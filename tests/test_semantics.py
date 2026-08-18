@@ -103,6 +103,27 @@ class TestCanonicalization:
         cfg.worker = {"memory": 8192, "extra_disk": True}
         assert semantic_hash(cfg) == base
 
+    def test_streaming_block_is_packaging_in_every_spelling(self):
+        # espg-ruled 2026-08-17 (the PR #475 D19 question, option (b)): the
+        # whole aggregation.streaming block is packaging, on condition of the
+        # law-equivalence contract (docs/design/sparse_coverage.md, D19) —
+        # every streaming regime lands within the documented approximation
+        # law of the pooled path, so all spellings share one identity. The
+        # design record stated this twice while the code hashed the block as
+        # spelled; this pin is the drift-proofing.
+        base = semantic_hash(_cfg())
+        spellings = [
+            {},
+            {"mode": "spill"},
+            {"mode": "merge", "buffer_granules": 7},
+            {"mode": "spill", "block_bytes": 1 << 26},
+            {"buffer_granules": 20},
+        ]
+        for block in spellings:
+            cfg = _cfg(aggregation__streaming=block)
+            assert semantic_hash(cfg) == base
+            assert "streaming" not in semantic_core(cfg)["aggregation"]
+
     def test_emit_cell_ids_is_packaging(self):
         # The issue #304 D16 transition hatch. It DOES add a `cell_ids` array
         # to every leaf, so it met the epoch's leaf-shaping criterion and was
