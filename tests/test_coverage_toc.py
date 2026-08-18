@@ -241,6 +241,19 @@ class TestAbsence:
         assert coverage_toc_digest(envelope) is None
         assert shards_overlapping(envelope, 0, 10**18) is None
 
+    def test_a_block_whose_buffers_disagree_with_k_is_refused(self):
+        """§10.3's MUST-check, on all three of the block's shape claims."""
+        section = build_temporal_section(_contributions([1, 2]), ["h_tdigest"])
+        block = section["digest"]
+        for bad in (
+            {"centroids": block["centroids"] + 1},
+            {"centroids": None},
+            {"times": build_temporal_section(_contributions([3]), ["h"])["digest"]["times"]},
+        ):
+            envelope = {"temporal": {**section, "digest": {**block, **bad}}}
+            with pytest.raises(ValueError, match="row-aligned"):
+                coverage_toc_digest(envelope)
+
     def test_a_section_without_a_digest_still_prunes(self):
         section = build_temporal_section(_contributions([1, 2]), ["h_tdigest"])
         section.pop("digest")
