@@ -11,7 +11,9 @@ Included (the semantic core):
 
 - the ``aggregation`` block — functions, params, dtypes, fills, ragged kinds,
   declared coordinates, ``chunk_precompute`` — minus the ``handoff`` carrier
-  choice (arrow vs pandas is a worker-internal transport);
+  choice (arrow vs pandas is a worker-internal transport) and the whole
+  ``streaming`` block (every streaming regime shares one identity under the
+  law-equivalence contract — see the exclusions below);
 - the ``data_source`` **semantics** — which groups/variables/coordinates are
   read and how observations are filtered (``filters``/``quality_filter``,
   photon ``base_level``/``levels``, raster ``bands``/``nodata``/
@@ -556,8 +558,8 @@ def semantic_core(config: PipelineConfig) -> dict:
     """The output-defining subset of ``config`` (D19), as a plain dict.
 
     Deterministic given the config's semantics: two configs differing only in
-    packaging knobs (orders, chunking, worker size, read machinery, carrier)
-    map to the same core. ``None``-valued keys are pruned recursively so a
+    packaging knobs (orders, chunking, worker size, read machinery, carrier,
+    the ``aggregation.streaming`` block) map to the same core. ``None``-valued keys are pruned recursively so a
     YAML explicit-null hashes identically to an absent key (§8.3). The returned
     structure is JSON-serializable plain data (the YAML loader guarantees it).
     """
