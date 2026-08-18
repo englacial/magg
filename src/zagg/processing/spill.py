@@ -1052,6 +1052,7 @@ class SpillAggregator:
             self.config,
             self._data_vars,
             agg_fields,
+            chunk_pooled=chunk_pooled,
         )
 
     def _load_partition(self, key: int) -> None:

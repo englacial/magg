@@ -96,6 +96,7 @@ def _chunk_toc_words(
     cell_to_slice: dict[int, tuple[int, int]],
     children: np.ndarray,
     config,
+    pooled: dict[str, np.ndarray] | None = None,
 ) -> dict[int, np.ndarray]:
     """Encode one chunk's toc words in ONE pass and split them per cell (#476).
 
@@ -106,6 +107,13 @@ def _chunk_toc_words(
     byte-identical to the per-cell encode this replaces — only the call count
     collapses (issue #476 measured 28,515 per-cell encodes at 0.21 ms against
     one pooled pass over the same rows).
+
+    ``pooled`` is :func:`_pool_chunk_columns`' output for the same ``children``,
+    when the caller already has it: both walk ``children`` in order and take the
+    same ``cell_to_slice`` slices, so the pooled clock column IS this gather and
+    reusing it skips a second index build and column copy per chunk (review
+    finding, PR #478). Without it the index is built here — the direct-call route
+    (tests, any caller without the pooled dict).
 
     Returns ``{cell_key: words}`` for exactly the chunk's populated cells. A
     chunk with no populated cells returns ``{}`` before touching the clock
@@ -124,13 +132,21 @@ def _chunk_toc_words(
     from zagg.time_axis import observation_words
 
     source = _checked_toc_source(col_arrays, config)
-    col = col_arrays[source["field"]]
-    if len(present) == 1:
+    n_rows = sum(end - start for _, start, end in present)
+    if pooled is not None:
+        gathered = pooled[source["field"]]
+        if len(gathered) != n_rows:
+            raise ValueError(
+                f"pooled chunk columns hold {len(gathered)} rows but this chunk's cells "
+                f"span {n_rows}; the pooled columns must be _pool_chunk_columns' output "
+                "for the same children"
+            )
+    elif len(present) == 1:
         _, start, end = present[0]
-        gathered = col[start:end]
+        gathered = col_arrays[source["field"]][start:end]
     else:
         idx = np.concatenate([np.arange(start, end) for _, start, end in present])
-        gathered = col[idx]
+        gathered = col_arrays[source["field"]][idx]
     words = observation_words(
         gathered, epoch=source["epoch"], scale=source["scale"], units=source["units"]
     )
@@ -896,6 +912,7 @@ def _aggregate_chunk_cells(
     config: PipelineConfig,
     data_vars,
     agg_fields: dict,
+    chunk_pooled: dict | None = None,
 ):
     """Compute per-cell stats for one chunk's ``children`` (default numpy path).
 
@@ -916,6 +933,10 @@ def _aggregate_chunk_cells(
     (issue #87) and ``times`` (spec §8.3, issue #410), each index-aligned with
     that field's payloads. A field declaring no companion has no entry, so a
     config written before either channel produces the same empty mapping.
+
+    ``chunk_pooled`` is the caller's :func:`_pool_chunk_columns` output for these
+    same ``children`` (both worker call sites build it for the chunk precompute
+    anyway); it lets the toc hoist reuse that gather instead of rebuilding it.
     """
     children = np.asarray(children)
     n_cells = len(children)
@@ -960,7 +981,7 @@ def _aggregate_chunk_cells(
     # read-back, which is per chunk by construction) get the hoist here, so
     # chunk boundaries are respected at any chunks_per_shard.
     cell_toc = (
-        _chunk_toc_words(col_arrays, cell_to_slice, children, config)
+        _chunk_toc_words(col_arrays, cell_to_slice, children, config, pooled=chunk_pooled)
         if _temporal_fields(agg_fields)
         else None
     )

@@ -2191,6 +2191,24 @@ class TestTemporalCompanionProduction:
             per_cell = _toc_word_column({col: arr[start:end] for col, arr in cols.items()}, cfg)
             np.testing.assert_array_equal(by_cell[key], per_cell)
 
+    def test_the_pooled_gather_is_the_same_gather(self):
+        # Both callers pool the chunk's columns for the precompute one statement
+        # earlier, walking the same children in the same order — so reusing that
+        # column instead of rebuilding the index must not move a byte, while a
+        # pooled dict built for other children is refused rather than trusted.
+        from zagg.processing.aggregate import _chunk_toc_words, _pool_chunk_columns
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        pooled = _pool_chunk_columns(cols, cell_to_slice, children)
+        built = _chunk_toc_words(cols, cell_to_slice, children, cfg)
+        reused = _chunk_toc_words(cols, cell_to_slice, children, cfg, pooled=pooled)
+        assert set(built) == set(reused) == set(cell_to_slice)
+        for key in built:
+            np.testing.assert_array_equal(built[key], reused[key])
+        stale = {name: arr[:-1] for name, arr in pooled.items()}
+        with pytest.raises(ValueError, match="pooled chunk columns hold"):
+            _chunk_toc_words(cols, cell_to_slice, children, cfg, pooled=stale)
+
     def test_chunk_path_never_encodes_per_cell(self, monkeypatch):
         # The chunk path injects the pre-encoded column, so the per-cell encode
         # (and its dict copy) must not run — while the emitted words stay
