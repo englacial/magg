@@ -174,11 +174,24 @@ class TestComposition:
         assert merge_temporal_sections(None, standing) == standing
         assert merge_temporal_sections(None, None) is None
 
-    def test_an_unknown_revision_is_ignored_not_merged(self):
+    def test_an_unknown_revision_on_the_standing_side_is_preserved(self):
+        """§10.4: readers add revisions, they never drop them.
+
+        The merge is the WRITE composer — a ``None`` return deletes the key —
+        so an unreadable standing section must survive both a producer with
+        nothing to say and one carrying this revision's section. Otherwise the
+        older zagg in a mixed fleet is the one that wins.
+        """
         good = build_temporal_section(_contributions([1]), ["h_tdigest"])
         future = {**good, "spec": "zagg-coverage-toc/2", "shards": {"99999": "1"}}
-        assert merge_temporal_sections(future, good) == good
+        assert merge_temporal_sections(future, None) == future
+        assert merge_temporal_sections(future, good) == future
+        # Incoming side: this revision cannot read it, so it contributes
+        # nothing and the standing section stands.
         assert merge_temporal_sections(good, future) == good
+        # Unmarked debris claims no revision and does not wedge the key shut.
+        assert merge_temporal_sections({}, good) == good
+        assert merge_temporal_sections({"shards": {"1": "2"}}, good) == good
 
     def test_section_covers(self):
         a = build_temporal_section({"11211": [_leaf(1)], "11212": [_leaf(2)]}, ["h_tdigest"])

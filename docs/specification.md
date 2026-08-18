@@ -2377,6 +2377,17 @@ that seam as follows:
   look. Conversely a producer that overwrites the carrier wholesale (an
   unparsable or incompatible existing root — the D9 regenerable-cache rule)
   discards the stale section with it.
+- **An existing section at an unknown revision is preserved verbatim, and
+  never downgraded.** The strict `spec` gate above makes such a section read
+  as absent, but composition is a *write*, and dropping the key is not the
+  same as ignoring it: a producer MUST copy an unreadable standing section
+  through unchanged, both when it has no section of its own and when the
+  section it holds is at an older revision. This is the page's standing
+  succession rule (readers add revisions, they never drop them) applied at
+  the one seam a mixed-version fleet actually meets — without it the oldest
+  producer in the fleet wins. An unmarked carrier (a `temporal` value with no
+  `spec` string at all) claims no revision and is debris a producer MAY
+  replace.
 
 Conformance for an external reader is §7's `temporal/` fixture: its root
 `coverage.moc` carries this section, and the fixture's `temporal.expected.json`

@@ -243,16 +243,30 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
     observation counts, and merging two digests over overlapping shard sets
     would double-count them. It is REPLACED instead, and only by a producer
     that covered every shard the merged map lists; a partial producer drops
-    it and leaves tier 1 standing (§10). An unknown-spec section on either
-    side is ignored rather than merged — the same strict gate the enclosing
-    envelope uses.
+    it and leaves tier 1 standing (§10).
+
+    An unknown-spec section on the INCOMING side contributes nothing — the
+    same strict gate the enclosing envelope uses. On the EXISTING side it is
+    kept **verbatim** instead: this function is the write composer, and a
+    ``None`` return deletes the key. A section at a revision this zagg cannot
+    read was written by a producer that knew more than this one, so it is
+    neither dropped by a producer with no contribution nor downgraded by one
+    carrying a ``zagg-coverage-toc/1`` section — the page's standing rule that
+    readers add revisions and never drop them (§10.4).
     """
     from mortie import toc_merge
 
     a, b = _usable(existing), _usable(incoming)
     if b is None:
-        return dict(a) if a is not None else None
+        return dict(a) if a is not None else _preserved(existing)
     if a is None:
+        newer = _preserved(existing)
+        if newer is not None:
+            logger.warning(
+                f"coverage[toc]: keeping the standing {newer.get('spec')!r} section — "
+                f"{TEMPORAL_COVERAGE_SPEC} does not read it and MUST NOT downgrade it"
+            )
+            return newer
         return dict(b)
     shards = {d: int(w) for d, w in (a.get("shards") or {}).items()}
     for d, w in (b.get("shards") or {}).items():
@@ -301,6 +315,23 @@ def _usable(section) -> dict | None:
             logger.debug("coverage[toc]: ignoring a section with an unknown spec")
         return None
     return section
+
+
+def _preserved(section) -> dict | None:
+    """A standing section carrying a spec MARKER this revision does not implement.
+
+    Distinguished from plain malformation: a marked section is some future
+    revision's, and §10.4 keeps it verbatim rather than clobber it. An
+    unmarked carrier (no ``spec``, or a non-string one) claims no revision,
+    so it is debris a producer may legitimately replace — otherwise one bad
+    write would wedge the key shut forever.
+    """
+    if not isinstance(section, dict):
+        return None
+    spec = section.get("spec")
+    if isinstance(spec, str) and spec and spec != TEMPORAL_COVERAGE_SPEC:
+        return dict(section)
+    return None
 
 
 # ---------------------------------------------------------------------------
