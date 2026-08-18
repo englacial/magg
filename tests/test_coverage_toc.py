@@ -261,6 +261,39 @@ class TestAbsence:
         assert fields["h_tdigest"]["sibling"] == "h_tdigest_times"
 
 
+class TestPartialReadsDropTheShard:
+    """§10.2 — a LISTED shard's word contains every instant in that shard.
+
+    A word joined over whichever window leaves happened to read does not, so
+    a failed read costs the shard its map entry. Absent reads as *unknown*
+    (still a candidate); listed-but-partial reads as a promise the section
+    cannot keep.
+    """
+
+    def test_a_failed_window_leaf_drops_its_whole_shard(self, monkeypatch):
+        import zagg.coverage_toc as toc_module
+        from zagg.sweep import MocFamily
+
+        def reader(leaf, *args, **kwargs):
+            if leaf.endswith("_2020.zarr"):
+                raise OSError("truncated companion")
+            return _leaf(1)
+
+        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        family = MocFamily()
+        family._temporal_fields = {"h_tdigest": {"sibling": "h_tdigest_times"}}
+        family._accumulate_temporal("root", "11213", "root/11213_2019.zarr", {})
+        assert "11213" in family._temporal
+        family._accumulate_temporal("root", "11213", "root/11213_2020.zarr", {})
+        assert "11213" not in family._temporal
+        # A later window that DOES read cannot resurrect a half-read shard.
+        family._accumulate_temporal("root", "11213", "root/11213_2021.zarr", {})
+        assert "11213" not in family._temporal
+        # ... and the failure is scoped to its own shard.
+        family._accumulate_temporal("root", "11214", "root/11214_2019.zarr", {})
+        assert "11214" in family._temporal
+
+
 class TestPruning:
     """§10.2 — the tier-1 predicate, conservative by the grammar's own law."""
 
@@ -335,6 +368,24 @@ class TestOnCommittedStores:
         # Idempotence: a second pass over an unchanged tree writes nothing.
         again = run_sweep(root, leaves, families=["moc"], record=False)
         assert again["families"]["moc"]["root_moc_written"] is False
+
+    def test_refresh_drops_only_the_shard_whose_leaf_failed(self, tmp_path, monkeypatch):
+        import zagg.coverage_toc as toc_module
+
+        root = self._copy(tmp_path, "temporal")
+        self._clone_shard(root)
+        real = toc_module.read_leaf_temporal
+
+        def reader(leaf, *args, **kwargs):
+            if "11214" in leaf:
+                raise OSError("truncated companion")
+            return real(leaf, *args, **kwargs)
+
+        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        envelope = refresh_root_coverage(root)
+        # The spatial walk still lists both shards; the temporal map lists
+        # only the one it could read whole (§10.2's unknown-not-empty rule).
+        assert set(envelope["temporal"]["shards"]) == {"11213"}
 
     def test_a_second_pass_over_a_multi_shard_store_writes_nothing(self, tmp_path):
         """Sweep idempotence where the seam actually bites (§10.4).

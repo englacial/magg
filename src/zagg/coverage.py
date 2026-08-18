@@ -287,6 +287,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     toc_fields = temporal_fields(manifest)
     cell_order = int(manifest.get("cell_order") or 0)
     contributions: dict[str, list] = {}
+    toc_failed: set[str] = set()
     store = open_object_store(store_root, **store_kwargs)
     root = store_root.rstrip("/")
     # Decimals accumulate through the walk and parse once at the end (issue
@@ -363,13 +364,23 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                     )
                     continue
                 decimals.append(decimal)
-                if toc_fields:
+                if toc_fields and decimal not in toc_failed:
                     try:
                         got = read_leaf_temporal(
                             f"{root}/{rel}", cell_order, toc_fields, **store_kwargs
                         )
                     except Exception as e:  # fail-open: the section is a cache
-                        logger.warning(f"refresh: no temporal contribution from {rel} ({e})")
+                        # Shard-scoped, not leaf-scoped: §10.2's word must
+                        # contain EVERY instant in a listed shard, which a
+                        # word joined over the window leaves that happened to
+                        # read cannot promise. Drop the shard — absent means
+                        # "unknown", which stays a candidate.
+                        logger.warning(
+                            f"refresh: dropping shard {decimal} from the temporal section "
+                            f"— leaf {rel} did not read ({e})"
+                        )
+                        toc_failed.add(decimal)
+                        contributions.pop(decimal, None)
                         got = None
                     if got is not None:
                         contributions.setdefault(decimal, []).append(got)
