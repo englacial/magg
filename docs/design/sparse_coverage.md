@@ -729,8 +729,10 @@ neither gap and is safe now.
   it — no store carries a hash yet). Excluded as packaging: cell order (a
   resolution axis — D24), parent/shard order, `chunk_inner`/`sharded`
   (`sharded` amended below — the D19 hash epoch),
-  worker size, streaming mode (merge-vs-spill lands `np.isclose` and
-  shares one store, with the actual mode recorded per-run), and read
+  worker size, the whole `aggregation.streaming` block (mode AND its
+  sizing knobs, `buffer_granules`/`block_bytes` — merge-vs-spill lands
+  `np.isclose` and shares one store, with the actual mode recorded
+  per-run; see the law-equivalence contract below), and read
   knobs — hashing the whole template would have made o8 and o9 runs
   different products and blocked mixed-order processing.
   **Amended by the D19 hash epoch** (espg-ruled on-thread 2026-08-07 as
@@ -781,6 +783,31 @@ neither gap and is safe now.
   that granule is fetched"*) — see that clause. Operator
   consequences — every pre-epoch hash invalidated, and the three migration
   paths — are in `docs/hive_layout.md`, "Migration: the D19 hash epoch".
+
+  **Amended again — the streaming exclusion and its law-equivalence
+  contract** (the PR #475 D19 question, resolved 2026-08-17 as option (b);
+  the decision record is on that PR's thread; issue #474): the whole
+  `aggregation.streaming` block — `mode`, `buffer_granules`,
+  `block_bytes` — is excluded from the core as packaging
+  (`AGGREGATION_PACKAGING_KEYS`), landing the code on the side this
+  record already stated twice while `semantic_core` still hashed the
+  block as spelled. The exclusion holds **on condition of the
+  law-equivalence contract**: every streaming mode MUST produce output
+  within the documented approximation law of the pooled path — exact for
+  the single-block regime and the summation reducers, the
+  kway/`np.isclose` class across merge flushes and block closes — and a
+  mode that cannot maintain that law may not join the streaming block.
+  The contract, not the digest, is what makes one shared identity across
+  all streaming regimes honest; its enforcement is the cross-block suites
+  (`tests/test_spill_crossblock.py`, being extended to the temporal
+  channel by #477) and `tests/test_streaming.py`'s pooled-parity pins.
+  Store compatibility was priced at decision time: no long-lived store
+  carries a streaming-declared digest (the deployed stores age out on a
+  30-day cycle), so the epoch moves nothing that outlives it — and the
+  fat-shard rescue that motivated the knob (issue #474) stays deployable
+  on an existing store, where the as-spelled hash would have tripped the
+  frozen-key refusal.
+
   The hash is a
   **frozen manifest key** (reusing a name with different aggregation
   semantics refuses up front, like any frozen-key mismatch) and is
@@ -1189,7 +1216,9 @@ registry — CI coverage should be auditable against this list:
   members (cf. D24).
 - **Semantic-hash canonicalization** (D19): syntactic edits (whitespace,
   key order, comments) never change the hash; packaging-knob edits
-  (orders, chunking, worker size, streaming mode) never change the hash;
+  (orders, chunking, worker size, the `aggregation.streaming` block in
+  every spelling — the law-equivalence contract above is the exclusion's
+  condition) never change the hash;
   any semantic edit does; and, post-epoch (#415), a leaf-shaping `output`
   edit does while an explicit default hashes as absence. Name-grammar
   validation (base-component exclusion, URL-safe charset).

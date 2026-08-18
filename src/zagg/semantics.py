@@ -59,7 +59,10 @@ it declares is verified by READING the artifact instead — see
 :data:`OUTPUT_LEAF_SHAPING_KEYS`), ``emit_cell_ids`` (the issue #304 D16
 transition hatch — leaf-shaping, but scheduled for removal, so hashing it
 would strand stores whose digest no legal config reproduces; see
-:data:`GRID_LEAF_SHAPING_KEYS`), worker sizing, streaming mode, read knobs,
+:data:`GRID_LEAF_SHAPING_KEYS`), worker sizing, the whole
+``aggregation.streaming`` block (mode AND its sizing knobs, under the
+law-equivalence contract — espg-ruled 2026-08-17 on the PR #475 D19 question;
+see :data:`AGGREGATION_PACKAGING_KEYS`), read knobs,
 the credential mechanism and the byte-movement knobs
 (``credentials_provider``/``anonymous``/``source_region``/``read_workers``/
 ``write_buffer`` select how source bytes are fetched or moved, never what is
@@ -193,8 +196,21 @@ DATA_SOURCE_PACKAGING_KEYS = (
 )
 
 #: ``aggregation`` keys that are packaging: the per-cell carrier choice
-#: (issue #132) transports identical values either way.
-AGGREGATION_PACKAGING_KEYS = ("handoff",)
+#: (issue #132) transports identical values either way, and the whole
+#: ``streaming`` block — mode, ``buffer_granules``, ``block_bytes`` —
+#: **espg-ruled 2026-08-17** (the PR #475 D19 question, option (b)): every
+#: streaming regime shares one product identity, with bytes bounded by the
+#: **law-equivalence contract** (``docs/design/sparse_coverage.md``, D19):
+#: each streaming mode MUST land within the documented approximation law of
+#: the pooled path — exact for the single-block regime and the summation
+#: reducers, the kway/``np.isclose`` class across merge flushes and block
+#: closes — and a mode that cannot maintain that law may not join the block.
+#: Enforcement is ``tests/test_spill_crossblock.py``. The D19 record stated
+#: this acceptance property twice while the code hashed the block as spelled;
+#: the ruling lands the code on the record's side before any long-lived store
+#: carries a streaming-declared digest, so the epoch moves nothing that
+#: outlives it.
+AGGREGATION_PACKAGING_KEYS = ("handoff", "streaming")
 
 #: Per-variable aggregation keys that are packaging (issue #424):
 #: ``overview_delta`` shapes the pyramid/overview fold budget only — the
