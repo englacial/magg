@@ -2236,6 +2236,31 @@ class TestTemporalCompanionProduction:
             np.testing.assert_array_equal(channels["h_tdigest"]["times"][j], times)
             assert stats["observed"][i] == calculate_cell_statistics(cell, config=cfg)["observed"]
 
+    def test_the_batch_is_armed_only_for_companion_configs(self, monkeypatch):
+        # No declared channel, no deferral machinery: a config predating issue
+        # #87/#410 must never see the ContextVar, so an arbitrary reducer can
+        # only meet a placeholder on the configs that ask for one.
+        import zagg.stats.tdigest as td_mod
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        calls: list[int] = []
+        orig = td_mod.batched_companion_folds
+        monkeypatch.setattr(td_mod, "batched_companion_folds", lambda: calls.append(1) or orig())
+        cfg, children, cols, cell_to_slice = self._grouped()
+        _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], get_agg_fields(cfg)
+        )
+        assert calls == [1]
+        plain = self._cfg()
+        del plain.aggregation["variables"]["h_tdigest"]["location"]
+        del plain.aggregation["variables"]["h_tdigest"]["temporal"]
+        del plain.aggregation["variables"]["observed"]
+        calls.clear()
+        _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, plain, ["h_tdigest"], get_agg_fields(plain)
+        )
+        assert calls == []
+
     def test_no_clock_refused_on_the_chunk_path(self):
         # §8.3's refusal stays reachable after the hoist: a populated chunk with
         # a declared companion but no clock fails exactly as the per-cell route.

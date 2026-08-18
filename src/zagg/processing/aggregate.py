@@ -990,11 +990,16 @@ def _aggregate_chunk_cells(
     # ``build_tdigest`` inside defers its ``tocs_reduce``/``common_ancestor``
     # partition and the context exit runs ONE fold per channel over the whole
     # chunk, filling the collected vectors in place — byte-identically, before
-    # anything reads them (the ragged writer runs after this returns).
+    # anything reads them (the ragged writer runs after this returns). Armed only
+    # when a field actually declares a companion channel, so a config predating
+    # issue #87/#410 never sees the ContextVar and an arbitrary config-resolved
+    # reducer can only meet a placeholder on the configs that ask for one.
+    from contextlib import nullcontext
+
     from zagg.stats.tdigest import batched_companion_folds
 
     cells_with_data = 0
-    with batched_companion_folds():
+    with batched_companion_folds() if ragged_channels else nullcontext():
         for i, child_morton in enumerate(children):
             child_key = int(child_morton)
             if child_key in cell_to_slice:
