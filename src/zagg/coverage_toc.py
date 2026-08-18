@@ -397,6 +397,12 @@ def coverage_toc_digest(envelope):
     ``payload`` is the §2.1 ``(k, 2)`` float32 centroid array whose value
     column is an instant on the §8 internal-ns scale and whose weight column
     is an observation count; ``words`` is its row-aligned §8.3 companion.
+
+    §10.3's MUST-check is on all THREE: the two buffers against each other and
+    both against the block's declared ``centroids``. A ``k`` that agrees with
+    neither is a broken block, not a decorative field — and a reference
+    accessor that skipped the check would leave the external reader
+    (moczarr) implementing one zagg does not.
     """
     section = load_temporal_coverage(envelope)
     block = (section or {}).get("digest")
@@ -406,10 +412,11 @@ def coverage_toc_digest(envelope):
 
     payload = decode_digest(base64.b64decode(block["payload"]), "float32", (2,))
     words = decode_digest(base64.b64decode(block["times"]), "uint64", ())
-    if len(payload) != len(words):
+    if len(payload) != len(words) or block.get("centroids") != len(payload):
         raise ValueError(
-            f"root time-digest has {len(payload)} centroids and {len(words)} companion "
-            f"words — the companion must be row-aligned with its digest (spec §1.1)"
+            f"root time-digest declares {block.get('centroids')!r} centroids and decodes "
+            f"{len(payload)} of them with {len(words)} companion words — the companion "
+            f"must be row-aligned with its digest at the declared k (spec §1.1, §10.3)"
         )
     return payload, words
 
