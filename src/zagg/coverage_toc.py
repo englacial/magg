@@ -250,12 +250,10 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
     from mortie import toc_merge
 
     a, b = _usable(existing), _usable(incoming)
-    if a is None and b is None:
-        return None
-    if a is None:
-        return dict(b)  # type: ignore[arg-type]
     if b is None:
-        return dict(a)
+        return dict(a) if a is not None else None
+    if a is None:
+        return dict(b)
     shards = {d: int(w) for d, w in (a.get("shards") or {}).items()}
     for d, w in (b.get("shards") or {}).items():
         prior = shards.get(d)
