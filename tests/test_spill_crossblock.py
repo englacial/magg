@@ -639,9 +639,16 @@ class TestTemporalMultiBlock:
         for cell_i, digest, words in zip(idx, vals, times, strict=True):
             assert words.dtype == np.uint64
             assert words.shape == (len(digest),)
-            _assert_envelope_conservation(
-                words, _contributor_times(dfs, grid, int(children[cell_i]))
-            )
+            contributors = _contributor_times(dfs, grid, int(children[cell_i]))
+            _assert_envelope_conservation(words, contributors)
+            # Both claims above are UPPER bounds — a fold that widened every
+            # centroid to the whole-cell envelope would satisfy them. The floor
+            # is the weight-1 rows: a centroid holding a single observation must
+            # still carry that observation's exact instant, never a range.
+            singles = words[digest[:, 1] == 1.0]
+            assert len(singles) > 0, "no weight-1 centroid survived the fold"
+            assert not mortie.toc_is_range(singles).any(), "a weight-1 word widened to a range"
+            assert np.isin(singles, contributors).all(), "a weight-1 word is no contributor's"
             merged |= bool(mortie.toc_is_range(words).any())
         # δ=16 over 300 observations per cell: compression is real, so at least
         # one stored word must be a RANGE — otherwise conservation above would be
