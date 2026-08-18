@@ -198,7 +198,9 @@ class TestComposition:
         assert section_unchanged(a, None)
         assert section_unchanged(a, a)
         assert not section_unchanged(None, a)
-        assert not section_unchanged(build_temporal_section({"11211": [_leaf(1)]}, ["h_tdigest"]), a)
+        assert not section_unchanged(
+            build_temporal_section({"11211": [_leaf(1)]}, ["h_tdigest"]), a
+        )
         # A standing section this revision cannot read is preserved verbatim
         # by the merge, so composing over it changes nothing either — the
         # skip test must not churn the object on a mixed-version store.
@@ -422,6 +424,59 @@ class TestOnCommittedStores:
         # The spatial walk still lists both shards; the temporal map lists
         # only the one it could read whole (§10.2's unknown-not-empty rule).
         assert set(envelope["temporal"]["shards"]) == {"11213"}
+
+    def test_the_shard_word_unions_across_every_temporal_field(self, tmp_path):
+        """§10.2's headline rule: coverage is "any data", not "data in field X".
+
+        The committed fixture declares ONE temporal field, so the union is
+        invisible on it. A second field is grafted onto a copy of the leaf —
+        the same payload rows under a companion whose words sit in a different
+        campaign — and the shard word must be the join across both.
+        """
+        import zarr
+        from mortie import time2toc
+
+        from zagg.coverage_toc import read_leaf_temporal
+        from zagg.grids.morton import morton_word
+        from zagg.hive import shard_leaf_path
+
+        root = self._copy(tmp_path, "temporal")
+        manifest = json.loads((Path(root) / "morton_hive.json").read_text())
+        order = int(manifest["cell_order"])
+        leaf = shard_leaf_path(root, int(morton_word("11213")))
+        group = zarr.open_group(leaf, path=str(order), mode="a", zarr_format=3)
+        payload, sibling = group["h_tdigest"], group["h_tdigest_times"]
+        # A companion of the same per-row width, so §1.1 alignment holds, but
+        # carrying instants a whole campaign away from the committed ones.
+        far = np.empty(sibling.shape[0], dtype=object)
+        for i, row in enumerate(sibling[:]):
+            width = 0 if row is None else len(row) // 8
+            far[i] = np.array(
+                [int(time2toc(BASE_NS + 20_000 * DAY_NS + j * DAY_NS)) for j in range(width)],
+                dtype="<u8",
+            ).tobytes()
+        for name, values in (("g_tdigest", payload[:]), ("g_tdigest_times", far)):
+            group.create_array(
+                name,
+                shape=payload.shape,
+                chunks=payload.chunks,
+                dtype=payload.metadata.data_type,
+                overwrite=True,
+            )[:] = values
+
+        fields = temporal_fields(manifest)
+        second = {"g_tdigest": {**fields["h_tdigest"], "sibling": "g_tdigest_times"}}
+        one = read_leaf_temporal(leaf, order, fields)
+        other = read_leaf_temporal(leaf, order, second)
+        both = read_leaf_temporal(leaf, order, {**fields, **second})
+        assert both[0] == int(toc_reduce(np.array([one[0], other[0]], dtype=np.uint64)))
+        assert both[0] not in (one[0], other[0])  # neither field alone covers it
+        section = build_temporal_section({"11213": [both]}, ["g_tdigest", "h_tdigest"])
+        assert int(section["shards"]["11213"]) == both[0]
+        # §10.3's once-per-field counting rule, seen from the weight side.
+        assert section["digest"]["weight_total"] == pytest.approx(
+            float(one[1][:, 1].sum()) + float(other[1][:, 1].sum())
+        )
 
     def test_a_manifest_without_a_cell_order_publishes_no_section(self, tmp_path, caplog):
         """A required key missing is a broken manifest, not group ``"0"``.
