@@ -2712,12 +2712,13 @@ class TestBasenameCollisions:
         with pytest.raises(ValueError, match="identity collision"):
             sm_fine.reproject(coarse_grid)
 
-    def test_coarsen_does_not_silently_drop_one_of_a_collided_pair(
-        self, catalog, fine_grid, coarse_grid
-    ):
+    def test_coarsen_names_both_members_of_the_collided_pair(self, catalog, fine_grid, coarse_grid):
         # The pre-#468 dedup keyed on the id alone, so the second granule
-        # overwrote the first and the collapse was unobservable. Assert the
-        # merge keeps both -- that is what leaves the check something to refuse.
+        # overwrote the first and the collapse was unobservable. Both hrefs
+        # reaching the message is the observable consequence of the merge
+        # keeping both; the keeping itself is pinned directly by
+        # test_the_union_keeps_both_members_of_a_collided_pair over in
+        # tests/test_sweep.py, on the one union the guard does not raise on.
         sm_fine = self._colliding_fine_map(catalog, fine_grid)
         try:
             sm_fine.reproject(coarse_grid)

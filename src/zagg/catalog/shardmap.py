@@ -162,33 +162,20 @@ def _granule_entry(rec: dict) -> dict:
     return entry
 
 
-def _recorded_identity(entry: dict, canonicalize=None) -> tuple:
-    """What a shard entry will be RECORDED as, and what actually names it.
+def _recorded_identity(entry: dict, canonicalize=None) -> tuple[str | None, tuple]:
+    """``(canonical, distinguishing)`` for one shard entry.
 
-    ``canonicalize`` lets a caller in a hot loop hoist the
-    :func:`zagg.telemetry.canonical_granule_id` import out of the per-entry path.
+    ``canonical`` is the granule id the leaf's D20 sidecar will carry — the
+    basename of the href the runner resolves (:func:`zagg.telemetry.canonical_granule_id`),
+    falling back to the id, then the datetime, for the raster entries that carry
+    no href. ``None`` when there is nothing to canonicalize.
 
-    Returns ``(canonical, distinguishing)``: the canonical granule id the leaf's
-    D20 sidecar will carry for this entry (:func:`zagg.telemetry.canonical_granule_id`
-    of the href the runner resolves — ``zagg.runner._resolve_urls`` picks ``s3``
-    or ``https`` by ``data_source.driver``, and the two spellings of one granule
-    agree on the basename by construction), paired with everything that
-    distinguishes one granule from another here. ``(None, ...)`` for an entry
-    with nothing to canonicalize.
+    ``distinguishing`` is what separates one granule from another. ``datetime``
+    counts because :func:`zagg.telemetry.raster_granule_ids` records two
+    acquisitions sharing an item id as one id; the sibling ``assets`` do not,
+    because a record's identity is the primary alone (issue #425).
 
-    Keyed on the href rather than on ``entry["id"]`` because the href is what the
-    recorded identity is actually derived from; for every catalog zagg reads the
-    two agree (that agreement is *why* ``rec["id"]`` equals the basename — see
-    :func:`zagg.telemetry.canonical_granule_id`), so on real catalogs the choice
-    is not observable. Raster entries carry no href, and their identity is the
-    STAC item id or the acquisition datetime (:func:`zagg.telemetry.raster_granule_ids`)
-    — which is why ``datetime`` distinguishes too: two acquisitions sharing an item
-    id record as one id there, so leaving it out let exactly the collapse this
-    guards against pass as one granule listed twice.
-
-    The sibling ``assets`` (issue #425) are deliberately not distinguishing: a
-    record's granule identity is the **primary alone**, which is the invariant
-    :func:`zagg.telemetry.canonical_granule_id` records.
+    ``canonicalize`` lets a hot loop hoist the import out of the per-entry path.
     """
     if canonicalize is None:
         from zagg.telemetry import canonical_granule_id as canonicalize
@@ -205,12 +192,11 @@ def _recorded_identity(entry: dict, canonicalize=None) -> tuple:
 
 
 def _collision_label(entry: dict) -> str:
-    """How to name one colliding entry so the operator can tell the pair apart.
+    """Name one colliding entry by what tells it apart from its partner.
 
-    The href when there is one — the prefix is what differs, and it is what the
-    remedy acts on. A raster entry has none, and both members of such a pair
-    carry the SAME id (that is the collapse), so naming them by id twice says
-    nothing; the acquisition datetime is what separates them.
+    The href when there is one — the prefix is what differs and what the remedy
+    acts on. A raster pair has no href and both members carry the same id (that
+    IS the collapse), so the datetime is the only thing left that separates them.
     """
     href = entry.get("s3") or entry.get("https")
     if href:
@@ -223,22 +209,18 @@ def _collision_label(entry: dict) -> str:
 def _refuse_basename_collisions(shard_keys, granules) -> None:
     """Refuse a map whose recorded granule identity is not per-shard unique (#468).
 
-    Post-#420 a granule's recorded identity is its driver-stripped basename, so
-    two granules of one shard differing only in href prefix collapse onto ONE
-    recorded id — the leaf then reads a genuine contraction as duplicate drift
-    and rewrites. PR #420 question (6) priced that and ruled it acceptable
-    ([option (a)](https://github.com/englacial/zagg/pull/420#issuecomment-5317015792))
-    **because** every catalog zagg reads names granules globally uniquely. This
-    enforces that "because" where the invariant is owned — at construction —
-    instead of guarding its violation at the leaf gate, which is what makes the
-    leaf-side predicate variants (question (6) options (b)/(c)) unnecessary.
+    Two granules of one shard whose recorded ids collapse onto one make the
+    shard's catalog identity name fewer granules than it reads. PR #420 question
+    (6) ruled the leaf-gate consequence acceptable *because* every catalog zagg
+    reads names granules globally uniquely; this enforces that "because" where
+    the invariant is owned rather than assuming it.
 
     Entries agreeing on every distinguishing field (:func:`_recorded_identity`)
-    are one granule listed twice and pass: :meth:`ShardMap.reproject`'s coarsen
-    unions the granule lists of sibling shards, where a granule spanning several
-    children legitimately arrives more than once.
+    are one granule listed twice and pass — coarsen unions sibling shards, where
+    a granule spanning several children legitimately arrives more than once.
     """
-    collisions = []
+    n_collisions = 0
+    shown: list = []
     # Imported once rather than per entry: this runs over every granule of every
     # shard, 555,867 of them at clone scale.
     from zagg.telemetry import canonical_granule_id
@@ -247,31 +229,29 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
         by_canonical: dict = {}
         for entry in entries:
             canonical, distinguishing = _recorded_identity(entry, canonical_granule_id)
+            # Empty as well as absent: an id of ``"/"`` canonicalizes to ``""``,
+            # and reporting ``''`` as the collapsed id is exactly the
+            # silently-wrong identity ``canonical_granule_id`` refuses to mint.
             if not canonical:
-                # Empty as well as absent: an id of ``"/"`` canonicalizes to
-                # ``""``, and ``canonical_granule_id`` refuses to mint an
-                # identity from an empty name precisely so nothing gets a
-                # silently-wrong one -- reporting ``''`` as the collapsed id
-                # would be exactly that.
                 continue
             by_canonical.setdefault(canonical, {})[distinguishing] = _collision_label(entry)
-        collisions += sorted(
-            (key, canonical, sorted(named.values()))
-            for canonical, named in by_canonical.items()
-            if len(named) > 1
-        )
-    if not collisions:
+        # Filtered before sorting -- on every catalog zagg reads the filter
+        # discards all of them, so sorting first is a per-shard sort of nothing.
+        # Only the first few groups are retained: the message prints three, and a
+        # wholly mis-scoped catalog has one group per granule.
+        found = sorted((c, sorted(n.values())) for c, n in by_canonical.items() if len(n) > 1)
+        n_collisions += len(found)
+        shown += [(key, c, named) for c, named in found[: max(0, 4 - len(shown))]]
+    if not n_collisions:
         return
-    shown = "; ".join(
-        f"shard {k} {canonical!r} <- {named}" for k, canonical, named in collisions[:3]
-    )
+    listed = "; ".join(f"shard {k} {c!r} <- {named}" for k, c, named in shown[:3])
     raise ValueError(
-        f"ShardMap: {len(collisions)} per-shard granule identity collision(s) — granules "
+        f"ShardMap: {n_collisions} per-shard granule identity collision(s) — granules "
         f"assigned to one shard record as ONE granule id, so the shard's catalog identity "
         f"names fewer granules than it reads (issue #468). Usually one basename under two "
         f"key prefixes, in which case re-scope the catalog query so each granule appears "
         f"once, or de-collide the basenames; the entries below are named by whatever "
-        f"separates them: {shown}{' ...' if len(collisions) > 3 else ''}"
+        f"separates them: {listed}{' ...' if n_collisions > 3 else ''}"
     )
 
 
