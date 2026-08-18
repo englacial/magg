@@ -11,7 +11,9 @@ Included (the semantic core):
 
 - the ``aggregation`` block — functions, params, dtypes, fills, ragged kinds,
   declared coordinates, ``chunk_precompute`` — minus the ``handoff`` carrier
-  choice (arrow vs pandas is a worker-internal transport);
+  choice (arrow vs pandas is a worker-internal transport) and the whole
+  ``streaming`` block (every streaming regime shares one identity under the
+  law-equivalence contract — see the exclusions below);
 - the ``data_source`` **semantics** — which groups/variables/coordinates are
   read and how observations are filtered (``filters``/``quality_filter``,
   photon ``base_level``/``levels``, raster ``bands``/``nodata``/
@@ -59,7 +61,10 @@ it declares is verified by READING the artifact instead — see
 :data:`OUTPUT_LEAF_SHAPING_KEYS`), ``emit_cell_ids`` (the issue #304 D16
 transition hatch — leaf-shaping, but scheduled for removal, so hashing it
 would strand stores whose digest no legal config reproduces; see
-:data:`GRID_LEAF_SHAPING_KEYS`), worker sizing, streaming mode, read knobs,
+:data:`GRID_LEAF_SHAPING_KEYS`), worker sizing, the whole
+``aggregation.streaming`` block (mode AND its sizing knobs, under the
+law-equivalence contract — espg-ruled 2026-08-17 on the PR #475 D19 question;
+see :data:`AGGREGATION_PACKAGING_KEYS`), read knobs,
 the credential mechanism and the byte-movement knobs
 (``credentials_provider``/``anonymous``/``source_region``/``read_workers``/
 ``write_buffer`` select how source bytes are fetched or moved, never what is
@@ -193,8 +198,28 @@ DATA_SOURCE_PACKAGING_KEYS = (
 )
 
 #: ``aggregation`` keys that are packaging: the per-cell carrier choice
-#: (issue #132) transports identical values either way.
-AGGREGATION_PACKAGING_KEYS = ("handoff",)
+#: (issue #132) transports identical values either way, and the whole
+#: ``streaming`` block — mode, ``buffer_granules``, ``block_bytes`` —
+#: **espg-ruled 2026-08-17** (the PR #475 D19 question, option (b)): every
+#: streaming regime shares one product identity, with bytes bounded by the
+#: **law-equivalence contract** (``docs/design/sparse_coverage.md``, D19):
+#: each streaming mode MUST land within the documented approximation law of
+#: the pooled path, in one of three classes — exact (the single-block regime
+#: and the summation reducers), the kway/``np.isclose`` class (the payload
+#: channel across merge flushes and block closes), and the channel-specific
+#: documented bounds for the companion channels (a located word folds to the
+#: contributors' common ancestor, pinned as an ancestor-or-equal hull; the
+#: packed composition word keeps presence exactly and counts within one lane
+#: quantization) — and a mode that cannot maintain the class its channels
+#: fall in may not join the block.
+#: Enforcement is ``tests/test_spill.py::TestSpillWorkerSingleBlock`` (the
+#: exactness half), ``tests/test_spill_crossblock.py``, and
+#: ``tests/test_streaming.py``'s pooled-parity pins. The D19 record stated
+#: this acceptance property twice while the code hashed the block as spelled;
+#: the ruling lands the code on the record's side before any **long-lived**
+#: store carries a streaming-declared digest (the deployed stores age out on
+#: a 30-day cycle), so the epoch moves nothing that outlives it.
+AGGREGATION_PACKAGING_KEYS = ("handoff", "streaming")
 
 #: Per-variable aggregation keys that are packaging (issue #424):
 #: ``overview_delta`` shapes the pyramid/overview fold budget only — the
@@ -533,8 +558,8 @@ def semantic_core(config: PipelineConfig) -> dict:
     """The output-defining subset of ``config`` (D19), as a plain dict.
 
     Deterministic given the config's semantics: two configs differing only in
-    packaging knobs (orders, chunking, worker size, read machinery, carrier)
-    map to the same core. ``None``-valued keys are pruned recursively so a
+    packaging knobs (orders, chunking, worker size, read machinery, carrier,
+    the ``aggregation.streaming`` block) map to the same core. ``None``-valued keys are pruned recursively so a
     YAML explicit-null hashes identically to an absent key (§8.3). The returned
     structure is JSON-serializable plain data (the YAML loader guarantees it).
     """
