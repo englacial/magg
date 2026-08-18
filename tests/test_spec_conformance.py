@@ -17,6 +17,7 @@ generator's INPUTS (the arrays handed to the writers), so writer, reader,
 and spec text are pinned against each other through the committed bytes.
 """
 
+import base64
 import hashlib
 import json
 import struct
@@ -28,6 +29,7 @@ import zarr
 from numcodecs import Zstd
 from zarr.storage import LocalStore
 
+from zagg.coverage_toc import coverage_toc, coverage_toc_digest
 from zagg.readers.tdigest_tensor import read_cell, read_locations
 from zagg.stats.composition import counts_from_composition, unpack_composition
 
@@ -1703,3 +1705,133 @@ class TestLocatedDeclaration:
         for bad in ({"spec": "zagg-located/2"}, {"shape": "per-cell"}, {"grammar": "geohash/1"}):
             with pytest.raises(ValueError):
                 located_declaration({"located": {**block, **bad}})
+
+
+class TestRootCoverageTemporalSection:
+    """§10 — the ``zagg-coverage-toc/1`` section, on the committed sidecar.
+
+    ``temporal/`` is the only fixture with a root coverage object at all:
+    every other fixture store declares no temporal field, so a sweep of one
+    produces no section. Their *lack* of the object is §10's absence rule
+    pinned as bytes, asserted below.
+    """
+
+    def _envelope(self):
+        return json.loads((SPEC_DATA / "temporal" / "coverage.moc").read_text())
+
+    def test_the_carrier_still_reads_as_a_plain_root_moc(self):
+        # §10 adds ONE key to the `morton-moc/1` carrier; a reader that knows
+        # nothing about §10 must decode the object exactly as before.
+        from zagg.coverage import load_coverage
+        from zagg.grids.morton import morton_word
+        from zagg.hive import root_coverage_words
+
+        envelope = self._envelope()
+        assert envelope["spec"] == "morton-moc/1"
+        assert envelope["encoding"] == "ranges"
+        assert envelope["ranges"] == [[_expected("temporal")["shard"]] * 2]
+        assert load_coverage(str(SPEC_DATA / "temporal")) == envelope
+        assert set(root_coverage_words(envelope)) == {
+            int(morton_word(_expected("temporal")["shard"]))
+        }
+
+    def test_section_grammar(self):
+        exp = _expected("temporal")["root_coverage"]
+        section = self._envelope()["temporal"]
+        assert section["spec"] == exp["spec"] == "zagg-coverage-toc/1"
+        assert section["source"] == "sweep"
+        assert section["fields"] == exp["fields"]
+        # Words are DECIMAL STRINGS: a uint64 exceeds 2^53 and a float-based
+        # JSON parser would mangle a raw number, exactly as for the ranges.
+        assert section["shards"] == exp["shards"]
+        assert all(isinstance(w, str) for w in section["shards"].values())
+        digest = section["digest"]
+        assert digest["element"] == {"dtype": "float32", "shape": [-1, 2]}
+        assert (digest["encoding"], digest["weights"], digest["value"]) == (
+            "base64",
+            "counts",
+            "toc-ns",
+        )
+        assert digest["delta"] == exp["digest"]["delta"]
+
+    def test_digest_decodes_through_the_native_grammars(self):
+        """§10.3: the payload is §2.1 bytes and the sibling is §8.3 words.
+
+        Decoded here with the SPEC-TEXT recipe (base64, then the §1.4 raw
+        little-endian buffer at the declared dtype) — no zagg decoder — so the
+        "zero new grammar" claim is what is being asserted.
+        """
+        exp = _expected("temporal")["root_coverage"]["digest"]
+        block = self._envelope()["temporal"]["digest"]
+        payload = np.frombuffer(
+            base64.b64decode(block["payload"]), dtype=np.dtype("float32").newbyteorder("<")
+        ).reshape(-1, 2)
+        words = np.frombuffer(
+            base64.b64decode(block["times"]), dtype=np.dtype("uint64").newbyteorder("<")
+        )
+        assert len(payload) == len(words) == block["centroids"]
+        np.testing.assert_array_equal(payload, np.array(exp["centroids"], dtype=np.float32))
+        np.testing.assert_array_equal(words, np.array(exp["times"], dtype=np.uint64))
+        # §2.1: rows ascend by mean, and every weight is a positive count.
+        assert (np.diff(payload[:, 0]) >= 0).all()
+        assert (payload[:, 1] > 0).all()
+
+    def test_weight_conservation(self):
+        """§10.3: `sum(weights)` is the store's temporal observation count."""
+        exp = _expected("temporal")
+        block = self._envelope()["temporal"]["digest"]
+        payload, _words = coverage_toc_digest(self._envelope())
+        total = exp["root_coverage"]["obs_total"]
+        assert total == sum(cell["count"] for cell in exp["cells"])
+        assert float(payload[:, 1].sum()) == block["weight_total"] == float(total)
+
+    def test_shard_word_conservatively_contains_every_instant(self):
+        """§10.2's whole claim, on committed bytes.
+
+        Every observation instant in the shard falls inside that shard's one
+        envelope word, and the grammar's own overlap predicate says so for
+        each instant without any decoding by the caller.
+        """
+        from mortie import from_datetime64, to_datetime64, toc2time, toc_overlaps
+
+        exp = _expected("temporal")
+        word = coverage_toc(self._envelope())[exp["shard"]]
+        lo, hi = (int(np.asarray(to_datetime64(b)).astype("int64")) for b in toc2time(word))
+        instants = np.array(
+            [int(t) for cell in exp["cells"] for t in cell["obs_span_ns"]], dtype="int64"
+        )
+        assert (lo <= instants).all() and (instants < hi).all()
+        internal = np.asarray(from_datetime64(instants.astype("datetime64[ns]")), dtype=np.uint64)
+        for t in internal:
+            assert bool(np.asarray(toc_overlaps(np.array([word]), int(t), int(t) + 1))[0])
+
+    def test_the_root_words_reduce_to_the_shard_word(self):
+        # The tier-2 companion and the tier-1 map are two views of the same
+        # join: reducing the digest's per-centroid envelopes reproduces the
+        # shard's envelope word exactly (mortie's semilattice, spec §8.4).
+        from mortie import toc_reduce
+
+        exp = _expected("temporal")
+        _payload, words = coverage_toc_digest(self._envelope())
+        assert int(toc_reduce(words)) == coverage_toc(self._envelope())[exp["shard"]]
+
+    def test_the_shard_word_is_the_join_of_the_committed_leaf_words(self):
+        # Derived from the LEAF bytes, not from the sidecar: a writer that
+        # folded the wrong thing fails here instead of agreeing with itself.
+        from mortie import toc_reduce
+
+        exp = _expected("temporal")
+        leaf = np.concatenate(
+            [np.array(cell["h_tdigest_times"], dtype=np.uint64) for cell in exp["cells"]]
+        )
+        assert int(toc_reduce(leaf)) == coverage_toc(self._envelope())[exp["shard"]]
+
+    @pytest.mark.parametrize(
+        "name", ["minimal", "kitchen_sink", "column", "flux", "raster_toc", "pyramid"]
+    )
+    def test_non_temporal_fixtures_carry_no_root_coverage_object(self, name):
+        # §10's absence rule, pinned as bytes: none of these stores declares a
+        # temporal field, so none of them has a section — or an object to put
+        # one in — and their committed trees are unchanged by §10.
+        assert not (SPEC_DATA / name / "coverage.moc").exists()
+        assert coverage_toc(None) is None
