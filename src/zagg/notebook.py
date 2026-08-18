@@ -20,7 +20,13 @@ from __future__ import annotations
 import html
 import logging
 
-from zagg.config import PipelineConfig, get_pipeline_type, get_store_layout, get_windowing
+from zagg.config import (
+    PipelineConfig,
+    get_pipeline_type,
+    get_store_layout,
+    get_windowing,
+    validate_config,
+)
 from zagg.dispatch import BENIGN_ERRORS, LAMBDA_ARCH, max_cost_usd
 
 logger = logging.getLogger(__name__)
@@ -284,6 +290,15 @@ def run(config: PipelineConfig, **kwargs) -> RunView:
     unsized tqdm (or the logging fallback).
     """
     from zagg import runner
+
+    # Refuse before the preview, not just before the invoke (issue #485).
+    # ``agg`` stays the choke point for the dispatch itself; this call is the
+    # wrapper's ordering guarantee -- ``max_cost_preview`` below reads the
+    # shardmap (a local read or an S3 GET), so without it a bad config would
+    # surface as a catalog error first, masking the real refusal. Same shape
+    # as the facade's own pre-resolution call in ``client.Run.from_config``;
+    # ``validate_config`` is pure, so the second call inside ``agg`` is free.
+    validate_config(config)
 
     total = None
     if kwargs.get("events") is not None:

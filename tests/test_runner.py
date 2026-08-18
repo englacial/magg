@@ -107,6 +107,18 @@ class TestAggValidatesConfig:
         with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
             notebook_run(self._graft())
 
+    def test_notebook_run_refuses_before_the_cost_preview(self, tmp_path):
+        # The wrapper's own ordering (issue #485): with a catalog= the run
+        # would preview first, and max_cost_preview loads the shardmap — so
+        # without notebook.run's pre-preview call this raises FileNotFoundError
+        # and the config refusal never surfaces.
+        from zagg.notebook import run as notebook_run
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        missing = str(tmp_path / "no_such_shardmap.json")
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            notebook_run(self._graft(), catalog=missing)
+
     def test_valid_config_reaches_catalog_resolution(self, atl06_config):
         # Positive control: a conformant config passes validation and fails on
         # the *next* check (TestRunValidation's missing-catalog refusal), so
