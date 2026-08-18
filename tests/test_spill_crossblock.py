@@ -23,6 +23,7 @@ from zagg.processing.spill import SpillAggregator
 from zagg.processing.streaming import validate_spill_fold, validate_streaming
 from zagg.stats.composition import counts_from_composition, unpack_composition
 from zagg.stats.tdigest import quantile_from_tdigest
+from zagg.time_axis import TOC_WORD_COLUMN
 
 _CREDS = {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"}
 
@@ -1066,6 +1067,22 @@ class TestFoldColumnDiagnostics:
         cols = {"h_ph": np.ones(1, np.float32), "delta_time": np.ones(1, np.float64)}
         agg = self._agg_with_block(variables, cols)
         agg._fold_block(agg._block)  # no raise
+        agg.close()
+
+    def test_location_may_not_name_the_derived_word_column(self):
+        # ... but toc_word is resolvable, not spilled: it must stay out of the
+        # source/location membership checks. Widening the one `available` list
+        # for every check let a `location: toc_word` slip past this named raise
+        # into mortie.common_ancestor, and made the message advertise a column
+        # the block never carried.
+        variables = _variables(located=True, temporal=True)
+        variables["h_tdigest"]["location"] = TOC_WORD_COLUMN
+        cols = {"h_ph": np.ones(1, np.float32), "delta_time": np.ones(1, np.float64)}
+        agg = self._agg_with_block(variables, cols)
+        with pytest.raises(ValueError, match="h_tdigest.*location: 'toc_word'.*spilled block") as e:
+            agg._fold_block(agg._block)
+        listed = str(e.value).split("available: ", 1)[1]
+        assert TOC_WORD_COLUMN not in listed, f"the message advertises a column never spilled: {e}"
         agg.close()
 
     def test_expression_over_spilled_columns_passes(self):
