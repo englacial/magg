@@ -178,7 +178,10 @@ def _recorded_identity(entry: dict):
     two agree (that agreement is *why* ``rec["id"]`` equals the basename — see
     :func:`zagg.telemetry.canonical_granule_id`), so on real catalogs the choice
     is not observable. Raster entries carry no href, and their identity is the
-    STAC item id or the acquisition datetime (:func:`zagg.telemetry.raster_granule_ids`).
+    STAC item id or the acquisition datetime (:func:`zagg.telemetry.raster_granule_ids`)
+    — which is why ``datetime`` distinguishes too: two acquisitions sharing an item
+    id record as one id there, so leaving it out let exactly the collapse this
+    guards against pass as one granule listed twice.
 
     The sibling ``assets`` (issue #425) are deliberately not distinguishing: a
     record's granule identity is the **primary alone**, which is the invariant
@@ -189,7 +192,12 @@ def _recorded_identity(entry: dict):
     href = entry.get("s3") or entry.get("https")
     named = href or entry.get("id") or entry.get("datetime")
     canonical = canonical_granule_id(named) if named else None
-    return canonical, (entry.get("id"), entry.get("s3"), entry.get("https"))
+    return canonical, (
+        entry.get("id"),
+        entry.get("s3"),
+        entry.get("https"),
+        entry.get("datetime"),
+    )
 
 
 def _refuse_basename_collisions(shard_keys, granules) -> None:
@@ -205,10 +213,10 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
     instead of guarding its violation at the leaf gate, which is what makes the
     leaf-side predicate variants (question (6) options (b)/(c)) unnecessary.
 
-    Entries agreeing on ``(id, s3, https)`` are one granule listed twice and
-    pass: :meth:`ShardMap.reproject`'s coarsen unions the granule lists of
-    sibling shards, where a granule spanning several children legitimately
-    arrives more than once.
+    Entries agreeing on every distinguishing field (:func:`_recorded_identity`)
+    are one granule listed twice and pass: :meth:`ShardMap.reproject`'s coarsen
+    unions the granule lists of sibling shards, where a granule spanning several
+    children legitimately arrives more than once.
     """
     collisions = []
     for key, entries in zip(shard_keys, granules):
@@ -218,7 +226,7 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
             if canonical is None:
                 continue
             by_canonical.setdefault(canonical, {})[distinguishing] = (
-                entry.get("s3") or entry.get("https") or entry.get("id")
+                entry.get("s3") or entry.get("https") or entry.get("id") or entry.get("datetime")
             )
         collisions += [
             (key, canonical, sorted(str(h) for h in named.values()))

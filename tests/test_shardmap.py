@@ -2722,3 +2722,21 @@ class TestBasenameCollisions:
             assert "s3://b/p1/Gdup.h5" in str(e) and "s3://b/p2/Gdup.h5" in str(e)
         else:
             pytest.fail("coarsen must refuse the collided pair")
+
+    def test_two_acquisitions_sharing_an_item_id_collide(self):
+        # A raster entry carries no href, and its recorded identity is the item
+        # id or the acquisition datetime (``raster_granule_ids``). Two
+        # acquisitions sharing an item id record as ONE id, so the datetime is
+        # what distinguishes them -- without it this pair read as one granule
+        # listed twice and slipped through (issue #468 review finding (1)).
+        from zagg.telemetry import raster_granule_ids
+
+        a = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-01T00:00:00Z"}
+        b = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-02T00:00:00Z"}
+        assert raster_granule_ids([a, b]) == ["SCENE", "SCENE"], "the collapse must be real"
+        with pytest.raises(ValueError, match="identity collision"):
+            shardmap._refuse_basename_collisions([7], [[a, b]])
+
+    def test_one_acquisition_listed_twice_is_still_not_a_collision(self):
+        a = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-01T00:00:00Z"}
+        shardmap._refuse_basename_collisions([7], [[a, dict(a)]])
