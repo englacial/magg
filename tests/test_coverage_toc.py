@@ -1,0 +1,316 @@
+"""The root coverage sidecar's temporal section — spec §10, issue #480.
+
+Three things are asserted here that the §7 conformance suite cannot: the
+order-independence of the root fold, the composition rules the GET-union-PUT
+seam applies, and the byte-identity of a NON-temporal store's root object —
+the promise that a store with no temporal channel is untouched by this
+revision. The committed ``temporal/`` fixture is the real-store end of it;
+``minimal/`` is the absence end.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+import numpy as np
+import pytest
+from mortie import span2toc, time2toc, toc_merge, toc_overlaps, toc_reduce
+
+from zagg.coverage import refresh_root_coverage
+from zagg.coverage_toc import (
+    ROOT_TOC_DELTA,
+    TEMPORAL_COVERAGE_SPEC,
+    build_temporal_section,
+    coverage_toc,
+    coverage_toc_digest,
+    load_temporal_coverage,
+    merge_temporal_sections,
+    section_covers,
+    shards_overlapping,
+    temporal_fields,
+)
+from zagg.hive import build_root_coverage, read_root_coverage, write_root_coverage
+
+SPEC_DATA = Path(__file__).parent / "data" / "spec"
+#: A day on the toc scale, in internal ns — enough to keep the synthetic
+#: leaves below in visibly distinct campaign clusters.
+DAY_NS = 86_400 * 10**9
+#: An arbitrary but realistic base instant on the §8 internal-ns scale.
+BASE_NS = 5_344_000_000_000_000_000
+
+
+def _leaf(seed: int, n: int = 12):
+    """A synthetic per-leaf contribution: ``(word, digest, times)``.
+
+    Shaped exactly like :func:`zagg.coverage_toc.read_leaf_temporal`'s return
+    — a valid ``(k, 2)`` digest sorted by mean, its row-aligned toc words, and
+    the join over them.
+    """
+    rng = np.random.default_rng(seed)
+    starts = np.sort(BASE_NS + seed * 40 * DAY_NS + rng.integers(0, 30 * DAY_NS, n)).astype(
+        np.uint64
+    )
+    # Both variants, deliberately: a single-instant centroid keeps its exact
+    # timestamp word, a spanning one gets a conservative range.
+    words = np.array(
+        [
+            int(time2toc(int(t))) if i % 3 == 0 else int(span2toc(int(t), int(t) + 3600 * 10**9))
+            for i, t in enumerate(starts)
+        ],
+        dtype=np.uint64,
+    )
+    digest = np.empty((n, 2), dtype=np.float32)
+    digest[:, 0] = starts.astype(np.float64)
+    digest[:, 1] = rng.integers(1, 20, n).astype(np.float64)
+    order = np.lexsort((words, digest[:, 0]))
+    return int(toc_reduce(words)), digest[order], words[order]
+
+
+def _contributions(seeds):
+    return {f"1121{i}": [_leaf(s)] for i, s in enumerate(seeds)}
+
+
+class TestSectionGrammar:
+    """§10.1 — what a built section carries, and what it refuses to carry."""
+
+    def test_required_keys_and_string_words(self):
+        section = build_temporal_section(_contributions([1, 2, 3]), ["h_tdigest"])
+        assert section["spec"] == TEMPORAL_COVERAGE_SPEC
+        assert set(section) == {"spec", "source", "generated_at", "fields", "shards", "digest"}
+        assert section["fields"] == ["h_tdigest"]
+        assert all(isinstance(w, str) and w.isdigit() for w in section["shards"].values())
+        assert section["digest"]["delta"] == ROOT_TOC_DELTA
+        assert section["digest"]["element"] == {"dtype": "float32", "shape": [-1, 2]}
+
+    def test_an_empty_walk_builds_no_section(self):
+        assert build_temporal_section({}, []) is None
+        assert build_temporal_section({}, ["h_tdigest"]) is None
+
+    def test_several_window_leaves_reduce_to_one_shard_word(self):
+        a, b = _leaf(1), _leaf(2)
+        section = build_temporal_section({"11213": [a, b]}, ["h_tdigest"])
+        assert set(section["shards"]) == {"11213"}
+        assert int(section["shards"]["11213"]) == int(toc_merge(a[0], b[0]))
+
+    def test_weight_conservation(self):
+        contributions = _contributions([1, 2, 3])
+        section = build_temporal_section(contributions, ["h_tdigest"])
+        total = sum(
+            float(part[1][:, 1].sum()) for parts in contributions.values() for part in parts
+        )
+        payload, _words = coverage_toc_digest({"temporal": section})
+        assert float(payload[:, 1].sum()) == pytest.approx(total)
+        assert section["digest"]["weight_total"] == pytest.approx(total)
+
+    def test_the_root_words_reduce_to_the_join_of_every_shard_word(self):
+        section = build_temporal_section(_contributions([1, 2, 3]), ["h_tdigest"])
+        _payload, words = coverage_toc_digest({"temporal": section})
+        assert int(toc_reduce(words)) == int(
+            toc_reduce(np.array([int(w) for w in section["shards"].values()], dtype=np.uint64))
+        )
+
+
+class TestOrderIndependence:
+    """§10.3 — the fold is ONE k-way merge, so leaf order cannot matter."""
+
+    def test_permuting_the_leaves_reproduces_the_section(self):
+        contributions = _contributions([4, 7, 11, 13, 17])
+        forward = build_temporal_section(contributions, ["h_tdigest"])
+        keys = list(contributions)
+        orders = [list(reversed(keys)), [keys[i] for i in (2, 0, 4, 1, 3)]]
+        for order in orders:
+            other = build_temporal_section({k: contributions[k] for k in order}, ["h_tdigest"])
+            assert other["shards"] == forward["shards"]
+            # Byte-for-byte: both the digest and its companion words, which is
+            # what "permutation-independent in every channel" means.
+            assert other["digest"]["payload"] == forward["digest"]["payload"]
+            assert other["digest"]["times"] == forward["digest"]["times"]
+
+    def test_the_fold_compresses(self):
+        # δ is provenance, not a promise about k (§10.3) — the k1 budget is
+        # scale-free, not a hard cap — but the fold must actually compress:
+        # a root digest the size of its inputs would be no summary at all.
+        contributions = _contributions(range(1, 12))
+        rows = sum(len(part[1]) for parts in contributions.values() for part in parts)
+        section = build_temporal_section(contributions, ["h_tdigest"])
+        assert 0 < section["digest"]["centroids"] < rows
+        assert section["digest"]["delta"] == ROOT_TOC_DELTA
+
+
+class TestComposition:
+    """§10.4 — how two sections meet at the GET-union-PUT seam."""
+
+    def test_tier_one_unions_elementwise(self):
+        a = build_temporal_section({"11211": [_leaf(1)], "11212": [_leaf(2)]}, ["h_tdigest"])
+        b = build_temporal_section({"11212": [_leaf(3)], "11213": [_leaf(4)]}, ["h_tdigest"])
+        merged = merge_temporal_sections(a, b)
+        assert set(merged["shards"]) == {"11211", "11212", "11213"}
+        assert int(merged["shards"]["11212"]) == int(
+            toc_merge(int(a["shards"]["11212"]), int(b["shards"]["11212"]))
+        )
+        # The join is idempotent: re-merging changes nothing.
+        assert merge_temporal_sections(merged, merged)["shards"] == merged["shards"]
+
+    def test_a_partial_producer_drops_the_digest(self):
+        whole = build_temporal_section({"11211": [_leaf(1)], "11212": [_leaf(2)]}, ["h_tdigest"])
+        partial = build_temporal_section({"11213": [_leaf(3)]}, ["h_tdigest"])
+        merged = merge_temporal_sections(whole, partial)
+        # Neither side's map covers the union, so neither digest can vouch for
+        # the store — tier 1 stands, tier 2 goes.
+        assert set(merged["shards"]) == {"11211", "11212", "11213"}
+        assert "digest" not in merged
+
+    def test_a_whole_covering_producer_replaces_the_digest(self):
+        old = build_temporal_section({"11211": [_leaf(1)]}, ["h_tdigest"])
+        new = build_temporal_section({"11211": [_leaf(9)]}, ["h_tdigest"])
+        merged = merge_temporal_sections(old, new)
+        assert merged["digest"]["payload"] == new["digest"]["payload"]
+
+    def test_a_producer_with_no_section_leaves_the_standing_one_alone(self):
+        standing = build_temporal_section(_contributions([1, 2]), ["h_tdigest"])
+        assert merge_temporal_sections(standing, None) == standing
+        assert merge_temporal_sections(None, standing) == standing
+        assert merge_temporal_sections(None, None) is None
+
+    def test_an_unknown_revision_is_ignored_not_merged(self):
+        good = build_temporal_section(_contributions([1]), ["h_tdigest"])
+        future = {**good, "spec": "zagg-coverage-toc/2", "shards": {"99999": "1"}}
+        assert merge_temporal_sections(future, good) == good
+        assert merge_temporal_sections(good, future) == good
+
+    def test_section_covers(self):
+        a = build_temporal_section({"11211": [_leaf(1)], "11212": [_leaf(2)]}, ["h_tdigest"])
+        assert section_covers(a, None)
+        assert section_covers(a, a)
+        assert not section_covers(None, a)
+        assert not section_covers({"spec": "zagg-coverage-toc/2"}, a)
+        assert not section_covers(build_temporal_section({"11211": [_leaf(1)]}, ["h_tdigest"]), a)
+
+
+class TestAbsence:
+    """§10's standing posture: absence composes, and is never a refusal."""
+
+    @pytest.mark.parametrize(
+        "envelope",
+        [
+            None,
+            {},
+            {"spec": "morton-moc/1", "encoding": "ranges"},
+            {"temporal": None},
+            {"temporal": {"spec": "zagg-coverage-toc/2"}},
+            "not a dict",
+        ],
+    )
+    def test_readers_return_none_cleanly(self, envelope):
+        assert load_temporal_coverage(envelope) is None
+        assert coverage_toc(envelope) is None
+        assert coverage_toc_digest(envelope) is None
+        assert shards_overlapping(envelope, 0, 10**18) is None
+
+    def test_a_section_without_a_digest_still_prunes(self):
+        section = build_temporal_section(_contributions([1, 2]), ["h_tdigest"])
+        section.pop("digest")
+        envelope = {"temporal": section}
+        assert coverage_toc_digest(envelope) is None
+        assert set(coverage_toc(envelope)) == set(section["shards"])
+
+    def test_a_store_declaring_no_temporal_field_has_no_fields(self):
+        manifest = json.loads((SPEC_DATA / "minimal" / "morton_hive.json").read_text())
+        assert temporal_fields(manifest) == {}
+        assert temporal_fields(None) == {}
+        assert temporal_fields({}) == {}
+
+    def test_a_temporal_store_declares_its_sibling(self):
+        manifest = json.loads((SPEC_DATA / "temporal" / "morton_hive.json").read_text())
+        fields = temporal_fields(manifest)
+        assert set(fields) == {"h_tdigest"}
+        assert fields["h_tdigest"]["sibling"] == "h_tdigest_times"
+
+
+class TestPruning:
+    """§10.2 — the tier-1 predicate, conservative by the grammar's own law."""
+
+    def test_windows_select_the_right_shards(self):
+        contributions = _contributions([1, 5])
+        section = build_temporal_section(contributions, ["h_tdigest"])
+        envelope = {"temporal": section}
+        for shard, parts in contributions.items():
+            word = np.array([parts[0][0]], dtype=np.uint64)
+            lo = int(np.asarray(parts[0][1][:, 0]).min()) - DAY_NS
+            hi = int(np.asarray(parts[0][1][:, 0]).max()) + DAY_NS
+            assert bool(np.asarray(toc_overlaps(word, lo, hi))[0])
+            assert shard in shards_overlapping(envelope, lo, hi)
+
+    def test_a_window_past_every_shard_selects_none(self):
+        section = build_temporal_section(_contributions([1, 5]), ["h_tdigest"])
+        far = BASE_NS + 10_000 * DAY_NS
+        assert shards_overlapping({"temporal": section}, far, far + DAY_NS) == []
+
+
+class TestOnCommittedStores:
+    """End to end, on the §7 fixtures: the writer, and the absence pin."""
+
+    def _copy(self, tmp_path, name):
+        dst = tmp_path / name
+        shutil.copytree(SPEC_DATA / name, dst)
+        return str(dst)
+
+    def test_refresh_rebuilds_the_section_from_its_own_walk(self, tmp_path):
+        root = self._copy(tmp_path, "temporal")
+        committed = json.loads((SPEC_DATA / "temporal" / "coverage.moc").read_text())
+        envelope = refresh_root_coverage(root)
+        assert envelope["temporal"]["source"] == "refresh"
+        # Same walk, same words: only the carrier's provenance differs.
+        assert envelope["temporal"]["shards"] == committed["temporal"]["shards"]
+        assert (
+            envelope["temporal"]["digest"]["payload"] == committed["temporal"]["digest"]["payload"]
+        )
+
+    def test_a_sweep_writes_the_section_the_fixture_committed(self, tmp_path):
+        from zagg.grids.morton import morton_word
+        from zagg.sweep import run_sweep
+
+        root = self._copy(tmp_path, "temporal")
+        (Path(root) / "coverage.moc").unlink()
+        leaves = [(int(morton_word("11213")), None)]
+        summary = run_sweep(root, leaves, families=["moc"], record=False)
+        assert summary["families"]["moc"]["temporal_shards"] == 1
+        committed = json.loads((SPEC_DATA / "temporal" / "coverage.moc").read_text())
+        written = read_root_coverage(root)
+        assert written["temporal"]["shards"] == committed["temporal"]["shards"]
+        assert (
+            written["temporal"]["digest"]["payload"] == committed["temporal"]["digest"]["payload"]
+        )
+        # Idempotence: a second pass over an unchanged tree writes nothing.
+        again = run_sweep(root, leaves, families=["moc"], record=False)
+        assert again["families"]["moc"]["root_moc_written"] is False
+
+    def test_a_non_temporal_store_writes_byte_identical_bytes(self, tmp_path):
+        """The §10 absence promise, as bytes.
+
+        A store declaring no temporal field must produce EXACTLY the root
+        object a pre-#480 zagg produced: no key added, no key reordered.
+        """
+        from zagg.grids.morton import morton_word
+        from zagg.sweep import run_sweep
+
+        root = self._copy(tmp_path, "minimal")
+        summary = run_sweep(
+            root, [(int(morton_word("11213")), None)], families=["moc"], record=False
+        )
+        assert "temporal_shards" not in summary["families"]["moc"]
+        raw = (Path(root) / "coverage.moc").read_bytes()
+        envelope = json.loads(raw)
+        assert "temporal" not in envelope
+        assert coverage_toc(envelope) is None
+        # The reference: the same carrier built with the §10 parameter omitted
+        # entirely — the pre-#480 call — serialized the pre-#480 way. Equal
+        # bytes is the whole promise.
+        reference = build_root_coverage([morton_word("11213")], 4, source="sweep")
+        reference["generated_at"] = envelope["generated_at"]
+        assert json.dumps(reference, indent=1).encode() == raw
+        # And a re-write through the GET-union-PUT seam stays temporal-free.
+        assert "temporal" not in write_root_coverage(root, reference)
+        assert "temporal" not in json.loads((Path(root) / "coverage.moc").read_bytes())
