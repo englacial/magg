@@ -373,17 +373,21 @@ class _DigestField(NamedTuple):
     temporal: bool
 
 
-#: Emission key per companion-channel reducer kwarg, in the kernel's fixed
-#: return order ``(digest, locations, temporal)`` — the same channels in the
-#: same order ``sweep_overview.COMPANION_CHANNELS`` folds overviews by. The keys
-#: are ``_aggregate_chunk_cells``'s (``times``, not ``temporal``, for the §8.3
-#: sibling), which is the contract ``chunk_outputs`` returns under.
-_CHANNEL_EMIT = {"locations": "locations", "temporal": "times"}
+#: A digest field's companion channels in the kernel's FIXED return order
+#: ``(digest, locations, temporal)`` — the same channels in the same order
+#: ``sweep_overview.COMPANION_CHANNELS`` folds overviews by. Per entry: the
+#: declaring :class:`_DigestField` attribute, the reducer kwarg, and the
+#: ``chunk_outputs`` emission key (``_aggregate_chunk_cells``'s — ``times``, not
+#: ``temporal``, for the §8.3 sibling). The ONLY place that order lives: every
+#: fold site zips against this tuple, so none can drift on a dict's insertion
+#: order (``strict=True`` checks a zip's length, never its order, and the two
+#: word grammars accept each other's values, so a swap would be silent).
+_CHANNELS = (("location", "locations", "locations"), ("temporal", "temporal", "times"))
 
 
-def _channels(f: _DigestField) -> tuple[str, ...]:
-    """Reducer kwargs for the companion channels ``f`` declares, in kernel order."""
-    return ("locations",) * bool(f.location) + ("temporal",) * bool(f.temporal)
+def _channels(f: _DigestField) -> tuple[tuple[str, str], ...]:
+    """``(reducer kwarg, emission key)`` per channel ``f`` declares, in kernel order."""
+    return tuple((kwarg, emit) for attr, kwarg, emit in _CHANNELS if getattr(f, attr))
 
 
 def _resolve_param(param, cell_data: dict[str, np.ndarray]):
@@ -525,22 +529,19 @@ class SpillAggregator:
       when the config sets it, else :func:`_default_block_bytes`): each closing block is reduced
       partition-by-partition into running mergeable state (counts by
       summation, tdigests via ``merge_tdigests``/``merge_tdigests_kway`` —
-      including ``build_tdigest_where`` strata and companion-carrying fields,
-      whose per-block builds fold under the located/temporal overloads (issues
-      #370/#410) — and composition words via ``merge_composition_kway``),
-      collapsing merge rounds from N/buffer to ~spill/threshold. A
-      config with any reducer outside the ``validate_spill_fold`` surface
-      raises :class:`SpillOverflowError` at the first crossing instead of
-      silently approximating.
+      including ``build_tdigest_where`` strata and, under the :data:`_CHANNELS`
+      overloads, companion-carrying fields — and composition words via
+      ``merge_composition_kway``), collapsing merge rounds from N/buffer to
+      ~spill/threshold. A config with any reducer outside the
+      ``validate_spill_fold`` surface raises :class:`SpillOverflowError` at the
+      first crossing instead of silently approximating.
 
     ``chunk_outputs`` returns the 5-tuple ``_aggregate_chunk_cells`` contract
     (``stats_arrays, ragged_payloads, ragged_cell_indices, ragged_channels,
-    cells_with_data``) — one element more than StreamingAggregator, since
-    spill serves companion-carrying fields. Both §8 channels ride BOTH regimes
+    cells_with_data``) — one element more than StreamingAggregator, since spill
+    serves companion-carrying fields. Both :data:`_CHANNELS` ride BOTH regimes
     (issue #477): single-block through the pooled machinery unchanged,
-    multi-block through the per-channel fold state below — so a field may
-    declare ``location:`` and ``temporal: per-centroid`` together, each folded
-    in the same merge as the payload it describes.
+    multi-block through the per-channel fold state below.
     """
 
     def __init__(
@@ -648,15 +649,13 @@ class SpillAggregator:
         self._counts: dict[int, int] = {}
         self._digests: dict[str, dict[int, np.ndarray]] = {n: {} for n in self._digest_fields}
         # Companion-channel running state (issues #370/#410), per field and per
-        # DECLARED channel: the per-cell uint64 word vector row-aligned with the
-        # running digest — ``locations`` (the spilled per-observation morton
-        # column, issue #87) and ``temporal`` (the derived per-observation toc
-        # words, spec §8.3). The per-block build returns ``(digest, *words)`` and
-        # the fold laws carry every declared channel through the SAME
-        # merge_tdigests / merge_tdigests_kway call, so a field declaring both
-        # never has one channel folded against a partition the other did not see.
+        # DECLARED channel (:data:`_CHANNELS`): the per-cell uint64 word vector
+        # row-aligned with the running digest. Every channel rides the SAME
+        # merge_tdigests / merge_tdigests_kway call as its payload, so a field
+        # declaring both never has one folded against a partition the other
+        # did not see.
         self._digest_words: dict[str, dict[str, dict[int, np.ndarray]]] = {
-            n: {kw: {} for kw in _channels(f)} for n, f in self._digest_fields.items()
+            n: {kw: {} for kw, _ in _channels(f)} for n, f in self._digest_fields.items()
         }
         # Whether any field needs the derived toc word column at fold time.
         self._needs_toc = any(f.temporal for f in self._digest_fields.values())
@@ -693,11 +692,10 @@ class SpillAggregator:
         self._digest_parts: dict[str, dict[int, list[np.ndarray]]] = {
             n: {} for n, f in self._digest_fields.items() if not f.pairwise
         }
-        # Companion words stashed alongside (issues #370/#410), index-aligned
-        # with ``_digest_parts`` so the finalize k-way collapse folds every
-        # declared channel in the same order-independent pass.
+        # Companion words stashed alongside, index-aligned with ``_digest_parts``
+        # so the finalize k-way collapse folds every channel in the same pass.
         self._digest_word_parts: dict[str, dict[str, dict[int, list[np.ndarray]]]] = {
-            n: {kw: {} for kw in _channels(f)}
+            n: {kw: {} for kw, _ in _channels(f)}
             for n, f in self._digest_fields.items()
             if not f.pairwise
         }
@@ -880,17 +878,16 @@ class SpillAggregator:
         whether a ``where`` param happens to be present, so the fold can never
         substitute a reducer the config did not declare. A ``temporal:
         per-centroid`` field (spec §8.3) additionally rides the derived toc word
-        column, encoded per cell below (as the pooled path does) and passed as
-        the build's ``temporal=`` channel — and then, per the field's fold law: **k-way**
-        fields stash the block digest (+ every declared channel's words) for one
+        column, encoded per cell below as the pooled path does and passed as the
+        build's ``temporal=`` channel. Then, per the field's fold law: **k-way**
+        fields stash the block digest (+ every declared channel's words) for the
         order-independent collapse at finalize (:meth:`_finalize_kway`);
         **pairwise** fields merge it into the running digest here, the companion
-        overloads carrying the channels. Composition fields pack a per-block ``(word,
-        n_signal)`` pair (``pack_composition_n`` — the same predicate and
-        bytes as the pooled reducer) and stash it for the same finalize
-        collapse (``merge_composition_kway``). Either way it is one build round
-        per block instead of per buffer — the ~6x merge-CPU collapse the design targets
-        (issue #279).
+        overloads carrying the channels. Composition fields stash a per-block
+        ``pack_composition_n`` ``(word, n_signal)`` pair — the same predicate and
+        bytes as the pooled reducer — for the same finalize collapse
+        (``merge_composition_kway``). Either way it is one build round per block
+        instead of per buffer (the ~6x merge-CPU collapse of issue #279).
         """
         from zagg.processing.aggregate import _group_columns, _toc_word_column
 
@@ -920,9 +917,10 @@ class SpillAggregator:
                     cell_data[TOC_WORD_COLUMN] = _toc_word_column(cell_data, self.config)
                 for name, f in self._digest_fields.items():
                     values = cell_data[f.source]
+                    declared = _channels(f)  # every zip below is against THIS tuple
                     chans = {
                         kw: cell_data[f.location if kw == "locations" else TOC_WORD_COLUMN]
-                        for kw in _channels(f)
+                        for kw, _ in declared
                     }
                     if f.stratum:
                         where = _resolve_param(f.where, cell_data)
@@ -931,28 +929,28 @@ class SpillAggregator:
                         built = build_tdigest(values, delta=f.delta, **chans)
                     # ``(digest, *words)`` with any channel declared, the bare
                     # digest without — the kernel's arity contract.
-                    fresh, *words = built if chans else (built,)
+                    fresh, *words = built if declared else (built,)
                     if not f.pairwise:
                         self._digest_parts[name].setdefault(cell, []).append(fresh)
                         parts = self._digest_word_parts[name]
-                        for kw, vec in zip(chans, words, strict=True):
+                        for (kw, _), vec in zip(declared, words, strict=True):
                             parts[kw].setdefault(cell, []).append(vec)
                         continue
                     running = self._digest_words[name]
                     held = self._digests[name].get(cell)
                     if held is None:
                         self._digests[name][cell] = fresh
-                        for kw, vec in zip(chans, words, strict=True):
+                        for (kw, _), vec in zip(declared, words, strict=True):
                             running[kw][cell] = vec
-                    elif chans:
+                    elif declared:
                         # Both channels ride ONE merge (kwargs ``{kw}1``/``{kw}2``),
                         # so the words describe the digest this call produced.
                         pairs = {}
-                        for kw, vec in zip(chans, words, strict=True):
+                        for (kw, _), vec in zip(declared, words, strict=True):
                             pairs[f"{kw}1"], pairs[f"{kw}2"] = running[kw][cell], vec
                         merged, *merged_words = merge_tdigests(held, fresh, delta=f.delta, **pairs)
                         self._digests[name][cell] = merged
-                        for kw, vec in zip(chans, merged_words, strict=True):
+                        for (kw, _), vec in zip(declared, merged_words, strict=True):
                             running[kw][cell] = vec
                     else:
                         self._digests[name][cell] = merge_tdigests(held, fresh, delta=f.delta)
@@ -1037,10 +1035,10 @@ class SpillAggregator:
         associative), so the result does not depend on block reduce order — the
         property #280 relies on to parallelize the reducer. A companion-carrying
         field's word parts collapse in the SAME pass (the ``merge_tdigests_kway``
-        channel overloads), keeping every channel row-aligned with the payload —
-        and the channels are order-independent too, since the merge breaks
-        ``(mean, weight)`` ties on the words themselves, location tertiary and
-        toc quaternary (issues #370/#410). Composition parts collapse the same way
+        channel overloads, in :data:`_CHANNELS` order), keeping every channel
+        row-aligned with the payload — and order-independent too, since the merge
+        breaks ``(mean, weight)`` ties on the words themselves, location tertiary
+        and toc quaternary. Composition parts collapse the same way
         (``merge_composition_kway`` over the block ``(word, n_signal)`` pairs:
         one weighted lane mean, quantized once), so a reducer parallelized
         under #280 inherits the property on all three channels rather than
@@ -1050,16 +1048,17 @@ class SpillAggregator:
             f = self._digest_fields[name]
             dest = self._digests[name]
             word_parts = self._digest_word_parts[name]
-            if word_parts:
+            declared = _channels(f)  # ``_CHANNELS`` order, as in _fold_block
+            if declared:
                 dest_words = self._digest_words[name]
                 for cell, parts in cell_parts.items():
                     folded = merge_tdigests_kway(
                         parts,
                         delta=f.delta,
-                        **{kw: by_cell[cell] for kw, by_cell in word_parts.items()},
+                        **{kw: word_parts[kw][cell] for kw, _ in declared},
                     )
                     dest[cell] = folded[0]
-                    for kw, vec in zip(word_parts, folded[1:], strict=True):
+                    for (kw, _), vec in zip(declared, folded[1:], strict=True):
                         dest_words[kw][cell] = vec
                 for by_cell in word_parts.values():
                     by_cell.clear()
@@ -1187,10 +1186,10 @@ class SpillAggregator:
         ragged_cell_indices: dict[str, list[int]] = {n: [] for n in self._digest_fields}
         # Companion-carrying fields only: keyed presence tells the worker which
         # sibling slots to deliver, mirroring _aggregate_chunk_cells — the same
-        # emission keys (``locations``, ``times``) in the same order, so a folded
-        # chunk and a pooled one are indistinguishable to the writer.
+        # :data:`_CHANNELS` emission keys in the same order, so a folded chunk
+        # and a pooled one are indistinguishable to the writer.
         ragged_channels: dict[str, dict[str, list]] = {
-            n: {_CHANNEL_EMIT[kw]: [] for kw in _channels(f)}
+            n: {emit: [] for _, emit in _channels(f)}
             for n, f in self._digest_fields.items()
             if _channels(f)
         }
@@ -1215,8 +1214,9 @@ class SpillAggregator:
                     ragged_payloads[name].append(digest)
                     ragged_cell_indices[name].append(i)
                     if name in ragged_channels:
-                        for kw, by_cell in self._digest_words[name].items():
-                            ragged_channels[name][_CHANNEL_EMIT[kw]].append(by_cell[cell])
+                        running = self._digest_words[name]
+                        for kw, emit in _channels(self._digest_fields[name]):
+                            ragged_channels[name][emit].append(running[kw][cell])
         return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_channels, cells_with_data
 
     def close(self) -> None:
