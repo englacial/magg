@@ -1111,12 +1111,14 @@ re-invoking the idempotent leaf, never a sweep-side fold from raw cells.
   declared later never rewrites a leaf). Each group holds the `morton`
   coordinate (the node's order-`r` descendant words, ascending) and one
   array per **composable** field (§4.5 classes; `none` fields are absent),
-  plus — for a field whose §4.5 entry carries `location` — that field's
-  `{field}_locations` sibling, row-aligned with its payload and carrying the
-  §9 declaration, exactly as an overview level does. The pair is written
-  together or not at all: the words are exact only *given* the centroid
-  partition the payload describes (§9.1), so a group holding a populated
-  payload against an empty sibling is non-conformant, not merely short.
+  plus **every channel sibling** that field's §4.5 entry declares — the
+  `{field}_locations` sibling for a `location` entry (carrying the §9
+  declaration), the `{field}_times` sibling for a `temporal` entry (carrying
+  the §8.3 declaration) — each row-aligned with its payload, exactly as an
+  overview level does. Each pair is written together or not at all: the
+  words are exact only *given* the centroid partition the payload describes
+  (§9.1, §8.3), so a group holding a populated payload against an empty
+  sibling is non-conformant, not merely short.
   A group's arrays are **single-chunk and unsharded** — `chunk_shape` equals
   `shape` (`4^(r - node)` cells), no `sharding_indexed` codec — whatever the
   leaf's own `chunk_inner`/sharding: a column group is small by construction,
