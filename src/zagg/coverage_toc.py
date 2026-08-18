@@ -275,6 +275,13 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
     that covered every shard the merged map lists; a partial producer drops
     it and leaves tier 1 standing (§10).
 
+    ``fields`` unions with tier 1, because it is the provenance of the SHARD
+    MAP and the map is the thing that unions. It is deliberately not narrowed
+    to the surviving digest's own fields: doing so would describe the map with
+    a list that no longer covers it. §10.1 says so, and makes the list an
+    upper bound for the once-per-field weight rule rather than an exact
+    description of the installed digest.
+
     An unknown-spec section on the INCOMING side contributes nothing — the
     same strict gate the enclosing envelope uses. On the EXISTING side it is
     kept **verbatim** instead: this function is the write composer, and a

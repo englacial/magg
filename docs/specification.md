@@ -2264,8 +2264,13 @@ new section here; keys are never repurposed in place.
   and the carrier's may differ, because a producer with no temporal
   contribution rewrites the ranges and leaves the section standing (§10.4).
 - **`fields`** (required) — the sorted payload field names whose §8.3
-  companions the words were derived from. Informative for tier 1 (the words
-  are already unioned), load-bearing for tier 2 (see the weight rule below).
+  companions the **`shards` map** was derived from. It is the map's
+  provenance, and it composes as a **union** across producers (§10.4): after a
+  merge it names every field any contributing producer read, which is not
+  necessarily the set the installed `digest` was built over. A reader MUST
+  therefore treat it as an upper bound when applying the once-per-field weight
+  rule of §10.3, not as a per-digest field list. Informative for tier 1 (the
+  words are already unioned across fields by construction).
 - **`shards`** (required) — tier 1, below.
 - **`digest`** (optional) — tier 2, below.
 
@@ -2350,7 +2355,9 @@ does not already implement for the leaves:
   fields contributed, under §2.1's float32 representability bound. Where
   `fields` names more than one field, an observation that contributes to
   several of them is counted **once per field**; this is the same open
-  question §10.2 flags, seen from the weight side.
+  question §10.2 flags, seen from the weight side. `fields` bounds that set
+  from above rather than naming it exactly (§10.1): a digest installed by one
+  producer sits beside a field list unioned over all of them.
 - **`delta`** records the compression budget the fold used (64 in zagg's
   writer). It is provenance, not a promise about `k`.
 

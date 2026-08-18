@@ -328,6 +328,10 @@ class MocFamily(SweepFamily):
         )
         out = {"root_moc_written": True}
         if section is not None:
+            # THIS pass's contribution, not the store's total. The section
+            # composes with the standing one at the seam (§10.4), so the map
+            # that landed lists at least these shards and usually more; the
+            # run summary reports what the run did.
             out["temporal_shards"] = len(section["shards"])
         return out
 
