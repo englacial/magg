@@ -80,6 +80,25 @@ def temporal_fields(manifest: dict | None) -> dict[str, dict]:
     return out
 
 
+def temporal_cell_order(manifest: dict | None) -> int | None:
+    """The manifest's ``cell_order`` — the leaf group the arrays live under.
+
+    ``None`` when the key is absent or unparsable, and a caller MUST read that
+    as "this store publishes no temporal coverage" rather than substitute a
+    default. ``cell_order`` is a required manifest key, and a silent ``0``
+    either asks for a group that does not exist — surfacing as an ordinary
+    "no temporal contribution" log line, which hides the manifest problem —
+    or, on a store whose cell order really IS 0, reads the wrong group and
+    publishes words for it.
+    """
+    if not isinstance(manifest, dict):
+        return None
+    try:
+        return int(manifest["cell_order"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _centroid_times(words: np.ndarray) -> np.ndarray:
     """Representative instants (internal ns, float64) for toc words.
 
@@ -455,5 +474,6 @@ __all__ = [
     "read_leaf_temporal",
     "section_unchanged",
     "shards_overlapping",
+    "temporal_cell_order",
     "temporal_fields",
 ]
