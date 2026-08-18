@@ -89,8 +89,8 @@ class TestAggValidatesConfig:
     def _graft(self):
         # The issue #472 shape: temporal variables grafted onto a validated
         # base after default_config's own validation already ran.
-        base = default_config("atl03_tdigest_healpix_hive", validate=False)
-        located = default_config("atl03_tdigest_located_healpix", validate=False)
+        base = default_config("atl03_tdigest_healpix_hive")
+        located = default_config("atl03_tdigest_located_healpix")
         base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
         return base
 
