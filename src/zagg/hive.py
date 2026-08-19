@@ -1079,16 +1079,28 @@ def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict
     section leaves an existing one standing. Two stores with no temporal
     channel at all still write byte-identical bytes to a pre-#480 zagg.
 
-    THIS SEAM IS WHY NO CALLER HAS TO REFRESH (spec §10.5, issue #487). The
-    tier-1 join only ever GROWS an envelope, and growing is conservative in
-    the direction §10.2 needs, so every observation added through here lands
-    inside its shard's word by construction — the containment claim stays
-    true across any number of producers in any order, with no coordination.
-    Only a whole-store walk (:func:`zagg.coverage.refresh_root_coverage`)
-    TIGHTENS, and only it may narrow a word or replace the digest; a pass
-    that adds no observations may preserve the section untouched, which is
-    exactly what the staged sweep does
-    (:func:`zagg.sweep_stages.run_finisher`).
+    THE UNION ARM IS WHY NO CALLER HAS TO REFRESH (spec §10.5, issue #487).
+    On that arm the tier-1 join only ever GROWS an envelope, and growing is
+    conservative in the direction §10.2 needs, so every observation added
+    through it lands inside its shard's word by construction — the
+    containment claim stays true across any number of producers in any order,
+    with no coordination. Only a whole-store walk
+    (:func:`zagg.coverage.refresh_root_coverage`) TIGHTENS, and a pass that
+    adds no observations may preserve the section untouched, which is exactly
+    what the staged sweep does (:func:`zagg.sweep_stages.run_finisher`).
+
+    THE OVERWRITE ARM ABOVE IS THE CARVE-OUT, and callers passing a section
+    have to know it: `carried` is False there, so nothing is joined and the
+    caller's own section is installed VERBATIM. A run-scoped caller —
+    :meth:`zagg.sweep.MocFamily.finish`, which builds its section from the
+    leaves this run visited — therefore publishes a word NARROWER than the
+    standing one for any shard whose other window leaves it did not visit,
+    and replaces the digest with its own. §10.5 names that arm's cost: a
+    narrowed word prunes a shard that does hold data in the window, a MISSED
+    candidate rather than a wasted open. It is bounded by D9 (the carrier is
+    a regenerable cache — the arm only runs when the standing carrier was
+    already unusable, and one refresh walk restores precision), but it is not
+    the join's guarantee, and nothing here re-derives it.
     """
     import obstore
 
