@@ -22,8 +22,10 @@ acquisition group. Two encodings are defined:
 The point of the second one is honesty: a Sentinel-2 datatake is a
 ~seconds-long acquisition whose adjacent MGRS tiles are sensed seconds
 apart, which ``datetime64`` cannot represent and a toc range can. Word
-semantics — bit layout, sort order, merge law — are mortie's
-(``mortie.toc``), never restated here; this module owns zagg's half: the
+semantics — bit layout, sort order, merge law — are mortie's (the flat
+``mortie.time2toc`` / ``mortie.toc2time`` / ``mortie.toc_*`` kernels;
+``mortie.toc`` is the ``Toc`` constructor as of mortie 0.9.10, not a
+module), never restated here; this module owns zagg's half: the
 declaration grammar, the acquisition-group mapping, and the decode.
 """
 
@@ -326,7 +328,7 @@ def observation_words(values, *, epoch, scale: str, units: str) -> np.ndarray:
     convention, not something this encode can bridge.
     """
     import mortie
-    from mortie.toc import TOC_MAX_NS
+    from mortie import TOC_MAX_NS
 
     from zagg.windows import UNIT_SECONDS, parse_utc
 
