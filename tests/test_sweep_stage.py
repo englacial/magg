@@ -355,6 +355,25 @@ def _stage_store(root, leaves=LEAVES, skip_columns=(), write_moc=True, fields=FI
     return manifest
 
 
+def _standing_section(decimals):
+    """A real §10 section over ``decimals``, built by the shipped builder.
+
+    The staged sweep never writes one (it adds no observations, #487), so a
+    test of the PRESERVE arm has to install the walk's output itself.
+    """
+    from conftest import TOC_BASE
+    from mortie import time2toc
+
+    from zagg.coverage_toc import build_temporal_section
+
+    contributions = {}
+    for i, dec in enumerate(decimals):
+        t = int(np.datetime64(TOC_BASE, "ns").astype("int64")) + i * 10**12
+        words = np.asarray([int(time2toc(t))], dtype=np.uint64)
+        contributions[dec] = [(int(words[0]), np.asarray([[t, 3.0]], dtype=np.float32), words)]
+    return build_temporal_section(contributions, ["h_tdigest"], source="refresh")
+
+
 def _by_shard(leaves=LEAVES):
     return {d: {None} for d in leaves}
 
@@ -1067,6 +1086,40 @@ class TestFinisher:
         calls = []
         out, _, _ = self._run(tmp_path / "s", m, released=lambda: calls.append(1) or True)
         assert out["lease_released"] and calls == [1]
+
+    def test_a_temporal_store_with_no_root_section_is_nudged(self, tmp_path, caplog):
+        """Issue #488. The finisher PRESERVES the §10 section (it adds no
+        observations, #487), so a section missing HERE was dropped by a
+        producer that predates §10.4 — the one gap the succession rule cannot
+        close, and the reason this is a nudge rather than a rebuild."""
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
+        with caplog.at_level("WARNING"):
+            out, _, _ = self._run(tmp_path / "s", m)
+        assert out["toc_section_missing"] is True
+        assert "refresh_root_coverage" in caplog.text
+
+    def test_a_store_with_no_temporal_channel_is_not_nudged(self, tmp_path, caplog):
+        m = _stage_store(tmp_path / "s")  # FIELDS: no `temporal:` declaration
+        with caplog.at_level("WARNING"):
+            out, _, _ = self._run(tmp_path / "s", m)
+        assert out["toc_section_missing"] is False
+        assert "refresh_root_coverage" not in caplog.text
+
+    def test_the_finisher_leaves_a_standing_section_alone(self, tmp_path, caplog):
+        """The preserve arm, on the same store: once the walk has written the
+        section, the staged sweep composes across it (#487) and stops nudging."""
+        from zagg.hive import read_root_coverage
+
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
+        env = build_root_coverage([morton_word(d) for d in LEAVES], 3, source="refresh")
+        env["temporal"] = _standing_section(LEAVES)
+        write_root_coverage(str(tmp_path / "s"), env)
+        with caplog.at_level("WARNING"):
+            out, _, _ = self._run(tmp_path / "s", m)
+        assert out["toc_section_missing"] is False
+        assert "refresh_root_coverage" not in caplog.text
+        after = read_root_coverage(str(tmp_path / "s"))["temporal"]
+        assert after["shards"] == env["temporal"]["shards"]
 
     def test_finisher_is_idempotent(self, tmp_path):
         m = _stage_store(tmp_path / "s")

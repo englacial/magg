@@ -340,6 +340,51 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
     return merged
 
 
+def warn_if_section_missing(store_root: str, envelope, manifest) -> bool:
+    """Warn when a temporal-declaring store's root carries no §10 section.
+
+    The belt for the one gap the §10.4 succession rule cannot close (issue
+    #488): the rule binds producers that know it, and a pre-#481 producer —
+    an old laptop, a stale worker — rebuilds the root envelope from the keys
+    it knows and drops the section it never learned to copy. Severity is
+    bounded by D9 (the section is a regenerable accelerator: a reader that
+    loses it falls back to opening every candidate, slow and correct), so
+    this is a logged nudge naming :func:`zagg.coverage.refresh_root_coverage`
+    as the remedy — deliberately NOT a locking scheme, the #208 no-lock
+    ruling stands. Returns whether it warned.
+
+    Detection is DECLARATION-driven, like every other reach for the temporal
+    channel here (:func:`temporal_fields`): a store whose manifest declares
+    §8.3 ``"per-centroid"`` companions should have a section, and one that
+    declares none never should. That makes the check free — no leaf is
+    opened — at the cost of also firing on a temporal-declaring store whose
+    leaves genuinely hold no temporal row yet (freshly templated, or leaves
+    written before the declaration was added). The remedy named is right for
+    that store too: the walk rebuilds what is there, and writes no section
+    when the answer is honestly nothing.
+
+    A standing section at a revision this zagg cannot read is NOT missing —
+    §10.4 preserves it verbatim, and warning about it would invite an
+    operator to run a walk that downgrades nothing but says the same thing
+    again. Only an absent key, or an unmarked carrier (debris), warns.
+    """
+    from zagg.hive import ROOT_COVERAGE_NAME
+
+    if not temporal_fields(manifest):
+        return False
+    section = envelope.get(TEMPORAL_KEY) if isinstance(envelope, dict) else None
+    if _usable(section) is not None or _preserved(section) is not None:
+        return False
+    logger.warning(
+        f"coverage[toc]: {store_root} declares temporal fields but its root "
+        f"{ROOT_COVERAGE_NAME} carries no {TEMPORAL_COVERAGE_SPEC} section — a producer "
+        f"that predates spec §10.4 may have dropped it, and `when=` pruning degrades to "
+        f"opening every candidate until it is rebuilt; run "
+        f"zagg.coverage.refresh_root_coverage({store_root!r}) to restore it"
+    )
+    return True
+
+
 def section_unchanged(existing, incoming) -> bool:
     """Whether composing ``incoming`` into ``existing`` would change nothing.
 
@@ -497,4 +542,5 @@ __all__ = [
     "shards_overlapping",
     "temporal_cell_order",
     "temporal_fields",
+    "warn_if_section_missing",
 ]
