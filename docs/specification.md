@@ -2480,16 +2480,29 @@ below states what it costs.
   holds. A reader opens that candidate and finds nothing in the window: a
   wasted open, never missed data — the same asymmetry a window edge's quantum
   already has (§10.2).
-- **Only a whole-store walk tightens**, and only a whole-store walk refreshes
-  tier 2. Tightening is what re-derives a shard's word from what its leaves
-  hold *now* instead of joining it with what they held before, and tier 2's
-  whole-coverage rule (§10.4) already denies the digest to any partial
-  producer. **On the union arm a producer MUST NOT publish a narrowed word**
-  for a shard unless it derived that word from every leaf of the shard: the
-  join is how a partial producer stays safe, and reaching past it to narrow a
-  word is the one way to lose a candidate. The join itself satisfies this
-  rule by construction, so the MUST-NOT binds a producer that composes the
-  section by some other means.
+- **Only a whole-store walk tightens.** Tightening is what re-derives a
+  shard's word from what its leaves hold *now* instead of joining it with what
+  they held before, and only a producer that read every leaf of a shard can do
+  that without narrowing the word below the shard's true extent. zagg's one
+  whole-store producer is the refresh walk
+  (`zagg.coverage.refresh_root_coverage`). **On the union arm a producer MUST
+  NOT publish a narrowed word** for a shard unless it derived that word from
+  every leaf of the shard: the join is how a partial producer stays safe, and
+  reaching past it to narrow a word is the one way to lose a candidate. The
+  join itself satisfies this rule by construction, so the MUST-NOT binds a
+  producer that composes the section by some other means.
+- **Tier 2 is a weaker rule, and it is not the walk's alone.** §10.4 replaces
+  the digest with whichever side's map covers the **merged map**, newest side
+  first. That is a test on the two maps meeting at the seam, not on the store:
+  a run-scoped producer whose own map happens to cover the merged one — a
+  fresh store's first sweep, where the standing map is empty, or any later run
+  that touched every shard the standing map lists — does install its digest,
+  and legitimately so, because it covered everything the composed map claims.
+  What §10.4 buys is that the digest covers every shard the **map lists**;
+  what the whole-store walk alone adds is that the map lists every shard the
+  **store** holds. A reader MUST NOT read the second from the first — §10.2's
+  escape hatch means an unlisted shard is *unknown*, so a digest can be whole
+  over the map and still describe less than the store.
 - **A pass that adds no observations MAY leave the section untouched.** It
   cannot falsify a claim it never widened, so preserving is always sound; what
   it forgoes is only the tightening. This is what makes §10.4's "a producer
