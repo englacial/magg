@@ -1107,6 +1107,14 @@ class TestFinisher:
         assert out["toc_section_missing"] is False
         assert "refresh_root_coverage" not in caplog.text
 
+    def test_an_empty_work_set_still_reports_the_nudge_key(self, tmp_path):
+        """The stage record's shape must not depend on the work set: a
+        consumer indexing ``summary["finisher"]["toc_section_missing"]`` gets
+        a bool on every run, not a KeyError on the one that found no work."""
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
+        out = run_finisher(str(tmp_path / "s"), m, {}, {}, run_id="A")
+        assert out["root_moc"] is False and out["toc_section_missing"] is False
+
     def test_the_finisher_leaves_a_standing_section_alone(self, tmp_path, caplog):
         """The preserve arm, on the same store: once the walk has written the
         section, the staged sweep composes across it (#487) and stops nudging."""

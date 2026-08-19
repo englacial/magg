@@ -277,7 +277,10 @@ def run_finisher(
        here was dropped by someone else. The written payload is checked by
        :func:`zagg.coverage_toc.warn_if_section_missing` — a
        temporal-declaring store whose root carries no section gets a logged
-       nudge at ``toc_section_missing`` (issue #488), never a refusal;
+       nudge at ``toc_section_missing`` (issue #488), never a refusal. That
+       key is ALWAYS in the returned dict, like every other one: a run with
+       an empty work set writes no root object and reports ``False``, so the
+       stage record's shape does not depend on the work set;
     2. the manifest RMW nesting per-entry actuals inside the level entries
        of ``pyramid.overviews`` (#381 point (7); readers MUST tolerate the
        added key). The leaf entry records the ``leaf-column`` law
@@ -317,6 +320,7 @@ def run_finisher(
     store_kwargs = dict(store_kwargs or {})
     out = {
         "root_moc": False,
+        "toc_section_missing": False,
         "manifest_updated": False,
         "objects_touched": 0,
         "touch_failures": 0,
