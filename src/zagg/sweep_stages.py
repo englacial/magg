@@ -272,9 +272,12 @@ def run_finisher(
        This stage adds no observations, so it PRESERVES the spec §10
        temporal section rather than refreshing it (issue #487: the staged
        sweep preserves, the walk tightens — see
-       :func:`zagg.coverage.refresh_root_coverage`); preserving is what
-       makes the belt below meaningful, since a section that is missing
-       here was dropped by someone else. The written payload is checked by
+       :func:`zagg.coverage.refresh_root_coverage`). Preserving holds on
+       :func:`zagg.hive.write_root_coverage`'s UNION arm; an unparsable or
+       incompatible standing root is OVERWRITTEN there by design (D9
+       regenerable cache) and the stale section goes with the stale ranges,
+       so on that arm this very call is the dropper — which is why the
+       belt below names no cause. The written payload is checked by
        :func:`zagg.coverage_toc.warn_if_section_missing` — a
        temporal-declaring store whose root carries no section gets a logged
        nudge at ``toc_section_missing`` (issue #488), never a refusal. That

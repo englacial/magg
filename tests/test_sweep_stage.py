@@ -1131,6 +1131,25 @@ class TestFinisher:
         after = read_root_coverage(str(tmp_path / "s"))["temporal"]
         assert after["shards"] == env["temporal"]["shards"]
 
+    def test_an_incompatible_standing_root_drops_the_section_and_nudges(self, tmp_path, caplog):
+        """The overwrite arm: `write_root_coverage` discards an incompatible
+        standing envelope (D9 regenerable cache) and the section goes with the
+        ranges, so the finisher's own write is the dropper here. The nudge
+        still fires — correctly, since the remedy is the same walk — and it is
+        the reason the message blames no one."""
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS, write_moc=False)
+        env = build_root_coverage([morton_word(d) for d in LEAVES], 3, source="refresh")
+        env["temporal"] = _standing_section(LEAVES)
+        env["encoding"] = "bitmap"  # the leaf sidecar's encoding at the root
+        # PUT outright: routing an incompatible envelope through the writer
+        # would only reproduce the overwrite one call early.
+        (tmp_path / "s" / "coverage.moc").write_text(json.dumps(env, indent=1))
+        with caplog.at_level("WARNING"):
+            out, _, _ = self._run(tmp_path / "s", m)
+        assert "incompatible envelope; overwriting" in caplog.text
+        assert out["toc_section_missing"] is True
+        assert "refresh_root_coverage" in caplog.text
+
     def test_finisher_is_idempotent(self, tmp_path):
         m = _stage_store(tmp_path / "s")
         _, first, _ = self._run(tmp_path / "s", m)
