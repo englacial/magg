@@ -333,11 +333,13 @@ class TestMissingSectionWarning:
     def test_an_unreadable_future_revision_is_not_missing(self, caplog):
         """§10.4 preserves it verbatim, so nothing was dropped and a walk would
         only say the same thing again — warning here would invite a pointless
-        rebuild."""
+        rebuild. Silent at DEBUG too: the arm that HONORS the section must not
+        also emit :func:`_usable`'s "ignoring a section with an unknown spec",
+        which is the opposite claim (true at the merge seam, not at this one)."""
         env = self._envelope({"spec": "zagg-coverage-toc/2", "shards": {}})
-        with caplog.at_level("WARNING"):
+        with caplog.at_level("DEBUG"):
             assert warn_if_section_missing("s3://b/s", env, self._manifest("temporal")) is False
-        assert "refresh_root_coverage" not in caplog.text
+        assert caplog.text == ""
 
     @pytest.mark.parametrize("debris", [None, {}, {"shards": {}}, "not a dict"])
     def test_an_unmarked_carrier_is_debris_and_warns(self, debris, caplog):

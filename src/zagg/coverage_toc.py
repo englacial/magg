@@ -389,7 +389,11 @@ def warn_if_section_missing(store_root: str, envelope, manifest) -> bool:
     if not temporal_fields(manifest):
         return False
     section = envelope.get(TEMPORAL_KEY) if isinstance(envelope, dict) else None
-    if _usable(section) is not None or _preserved(section) is not None:
+    # Marked-revision first, in the order the docstring reads them: :func:`_usable`
+    # logs "ignoring a section with an unknown spec" — true at the merge seam it
+    # was written for, the opposite of what this seat decides — so the arm that
+    # HONORS a future revision must short-circuit before it is consulted.
+    if _preserved(section) is not None or _usable(section) is not None:
         return False
     logger.warning(
         f"coverage[toc]: {store_root} declares temporal fields but its root "
