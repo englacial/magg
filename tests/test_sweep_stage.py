@@ -361,16 +361,19 @@ def _standing_section(decimals):
     The staged sweep never writes one (it adds no observations, #487), so a
     test of the PRESERVE arm has to install the walk's output itself.
     """
-    from conftest import TOC_BASE
-    from mortie import time2toc
+    from conftest import TOC_BASE, toc_words
 
     from zagg.coverage_toc import build_temporal_section
 
     contributions = {}
     for i, dec in enumerate(decimals):
-        t = int(np.datetime64(TOC_BASE, "ns").astype("int64")) + i * 10**12
-        words = np.asarray([int(time2toc(t))], dtype=np.uint64)
-        contributions[dec] = [(int(words[0]), np.asarray([[t, 3.0]], dtype=np.float32), words)]
+        # One instant per shard, off the same base `_located_leaf_slabs` uses,
+        # packed by the shared fixture helper rather than a second hand-rolled
+        # copy of it.
+        when = np.datetime64(TOC_BASE, "ns") + np.timedelta64(1000 * i, "s")
+        words = toc_words(1, base=str(when))
+        value = float(when.astype("int64"))
+        contributions[dec] = [(int(words[0]), np.asarray([[value, 3.0]], dtype=np.float32), words)]
     return build_temporal_section(contributions, ["h_tdigest"], source="refresh")
 
 
