@@ -1088,10 +1088,12 @@ class TestFinisher:
         assert out["lease_released"] and calls == [1]
 
     def test_a_temporal_store_with_no_root_section_is_nudged(self, tmp_path, caplog):
-        """Issue #488. The finisher PRESERVES the §10 section (it adds no
-        observations, #487), so a section missing HERE was dropped by a
-        producer that predates §10.4 — the one gap the succession rule cannot
-        close, and the reason this is a nudge rather than a rebuild."""
+        """Issue #488. This store is the case the nudge cannot diagnose and
+        does not try to: the finisher PRESERVES the §10 section (it adds no
+        observations, #487) and no walk has run here, so the section was
+        never built — nobody dropped it. The message names both causes and
+        the one remedy that fixes either, which is why it is a nudge rather
+        than a rebuild."""
         m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
         with caplog.at_level("WARNING"):
             out, _, _ = self._run(tmp_path / "s", m)

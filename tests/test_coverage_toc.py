@@ -279,12 +279,15 @@ class TestAbsence:
 
 
 class TestMissingSectionWarning:
-    """Issue #488 — the belt for a producer that predates §10.4's succession rule.
+    """Issue #488 — the belt for a root that carries no §10 section.
 
-    A pre-#481 producer rebuilds the root envelope from the keys it knows and
-    drops the section it never learned to copy. The check is a logged nudge,
-    not a refusal: the section is a D9 regenerable accelerator, and losing it
-    only degrades ``when=`` pruning to opening every candidate.
+    Two causes reach the same state and the check cannot tell them apart: a
+    pre-#481 producer rebuilt the root envelope from the keys it knows and
+    dropped the section it never learned to copy, or no walk has built one
+    yet (only the walk writes a section). So the message asserts neither and
+    names both. It is a logged nudge, not a refusal: the section is a D9
+    regenerable accelerator, and losing it only degrades ``when=`` pruning to
+    opening every candidate.
     """
 
     def _manifest(self, name):
@@ -296,13 +299,18 @@ class TestMissingSectionWarning:
             env["temporal"] = section
         return env
 
-    def test_a_temporal_store_whose_root_lost_the_section_warns(self, caplog):
+    def test_a_temporal_store_whose_root_carries_no_section_warns(self, caplog):
         manifest = self._manifest("temporal")
         with caplog.at_level("WARNING"):
             assert warn_if_section_missing("s3://b/store", self._envelope(), manifest) is True
         # The remedy has to be IN the line: a warning that only says the
         # section is gone leaves the operator with nothing to run.
         assert "refresh_root_coverage" in caplog.text and "s3://b/store" in caplog.text
+        # ...and the line must not pick a cause it cannot know: an absent
+        # section is equally "never built" and "dropped", so both are named
+        # and the operator is not sent chasing a stale worker that may not
+        # exist.
+        assert "no walk has built one yet" in caplog.text and "dropped it" in caplog.text
 
     def test_a_store_declaring_no_temporal_field_never_warns(self, caplog):
         """The common case. A section it never had is not a section it lost."""

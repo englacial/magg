@@ -353,6 +353,22 @@ def warn_if_section_missing(store_root: str, envelope, manifest) -> bool:
     as the remedy — deliberately NOT a locking scheme, the #208 no-lock
     ruling stands. Returns whether it warned.
 
+    An absent section is an OBSERVATION, and the message says only that.
+    Two causes produce it and this seat cannot tell them apart: a producer
+    dropped it, or no walk has ever built one — only the walk writes a
+    section (:meth:`zagg.sweep.MocFamily.finish` and
+    :func:`zagg.coverage.refresh_root_coverage` are its two writers; the
+    runner's ingest and :func:`zagg.sweep_stages.run_finisher` both write
+    section-less root envelopes). In the default pipeline the walk does
+    precede the staged finisher — ``runner.py`` runs
+    :func:`zagg.sweep.sweep_after_run` over
+    :data:`zagg.sweep.DEFAULT_FAMILIES` (``moc`` among them) BEFORE
+    :func:`zagg.sweep_stages.stage_sweep_after_run` in the same post-run
+    hook — so a section missing at the finisher is genuinely anomalous
+    there. It is NOT anomalous for a store swept with ``--stages``
+    standalone, or one whose fail-open families sweep failed, and the same
+    remedy fixes every one of them.
+
     Detection is DECLARATION-driven, like every other reach for the temporal
     channel here (:func:`temporal_fields`): a store whose manifest declares
     §8.3 ``"per-centroid"`` companions should have a section, and one that
@@ -377,10 +393,10 @@ def warn_if_section_missing(store_root: str, envelope, manifest) -> bool:
         return False
     logger.warning(
         f"coverage[toc]: {store_root} declares temporal fields but its root "
-        f"{ROOT_COVERAGE_NAME} carries no {TEMPORAL_COVERAGE_SPEC} section — a producer "
-        f"that predates spec §10.4 may have dropped it, and `when=` pruning degrades to "
-        f"opening every candidate until it is rebuilt; run "
-        f"zagg.coverage.refresh_root_coverage({store_root!r}) to restore it"
+        f"{ROOT_COVERAGE_NAME} carries no {TEMPORAL_COVERAGE_SPEC} section — no walk has "
+        f"built one yet, or a producer dropped it; either way `when=` pruning degrades to "
+        f"opening every candidate until it is built, so run "
+        f"zagg.coverage.refresh_root_coverage({store_root!r})"
     )
     return True
 
