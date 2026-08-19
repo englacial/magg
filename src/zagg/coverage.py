@@ -279,7 +279,12 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     windows of one shard are one covered shard (the MOC is spatial — the
     builder de-duplicates words), and a malformed window label on a STAMPED
     leaf is skipped with a warning, like the foreign-order carve-out —
-    unstamped malformed debris stays silent, as ordinary debris does.
+    unstamped malformed debris stays silent, as ordinary debris does. That
+    skip also banks its shard as a TEMPORAL loss: only the label is
+    malformed, so the id before the first ``_`` still names a shard whose
+    other windows read fine, and publishing their join alone would narrow
+    the shard's word below §10.2's containment (the two carve-outs below it
+    name DIFFERENT shard ids, so neither can do that).
     """
     import obstore
     from obstore.exceptions import NotFoundError
@@ -361,6 +366,18 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                         f"window label (frozen grammar, mortie#62) — it will NOT be "
                         f"listed in {ROOT_COVERAGE_NAME}"
                     )
+                    if toc_fields:
+                        # Only the LABEL is malformed: the id up to the first
+                        # `_` is still readable, and a sibling window of that
+                        # same shard reads fine and would be published alone.
+                        # §10.2's word must cover every leaf of a LISTED shard,
+                        # so bank the loss exactly as the read failure below
+                        # does — otherwise the walk narrows the shard's word to
+                        # the leaves it happened to parse, which costs a reader
+                        # a MISSED candidate rather than a wasted open (§10.5).
+                        lost = name.removesuffix(".zarr").split("_", 1)[0]
+                        toc_failed.add(lost)
+                        contributions.pop(lost, None)
                     continue
                 if not _is_decimal_id(decimal):
                     # Same posture, one grammar down: the name split succeeded

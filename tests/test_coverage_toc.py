@@ -638,6 +638,40 @@ class TestOnCommittedStores:
         # published: a partial rebuild composes, it does not overwrite.
         assert set(envelope["temporal"]["shards"]) == {"11213", "11214"}
 
+    def test_a_malformed_window_label_costs_its_shard_not_its_extent(self, tmp_path):
+        """A skipped SIBLING window must not narrow the shard's published word.
+
+        The walk's malformed-label carve-out drops a stamped leaf whose window
+        label breaks the frozen grammar — but only the LABEL is malformed, so
+        the id before the first ``_`` names a shard whose other windows read
+        fine. Publishing their join alone would be a word derived from some of
+        the shard's leaves, exactly the narrowing §10.2 forbids and §10.5 names
+        as the one loss that costs a MISSED candidate.
+        """
+        root = self._copy(tmp_path, "temporal")
+        standing = json.loads((Path(root) / "coverage.moc").read_text())
+        # Widen the standing word as a sibling window's data would have, and
+        # keep an instant that ONLY the widened word covers.
+        far_at = BASE_NS + 4000 * DAY_NS
+        far = int(np.asarray(time2toc(np.asarray([far_at], dtype=np.int64)))[0])
+        narrow = int(standing["temporal"]["shards"]["11213"])
+        wide = int(toc_merge(narrow, far))
+        standing["temporal"]["shards"]["11213"] = str(wide)
+        (Path(root) / "coverage.moc").write_text(json.dumps(standing, indent=1))
+        leaf_dir = Path(root) / "1" / "1" / "2" / "1" / "3"
+        shutil.copytree(leaf_dir / "11213.zarr", leaf_dir / "11213_bad$label.zarr")
+
+        envelope = refresh_root_coverage(root)
+        assert int(envelope["temporal"]["shards"]["11213"]) == wide
+        # The window only the widened word covers is still a candidate — the
+        # skipped sibling cost the shard PRECISION, never its containment. Had
+        # the walk published the join over the leaves it parsed, this query
+        # would prune a shard that holds data in the window: a MISSED
+        # candidate, the one §10.5 loss a reader cannot detect.
+        lo, hi = far_at, far_at + DAY_NS
+        assert bool(np.asarray(toc_overlaps(np.array([wide], dtype=np.uint64), lo, hi))[0])
+        assert not bool(np.asarray(toc_overlaps(np.array([narrow], dtype=np.uint64), lo, hi))[0])
+
     def test_a_second_pass_over_a_multi_shard_store_writes_nothing(self, tmp_path):
         """Sweep idempotence where the seam actually bites (§10.4).
 
