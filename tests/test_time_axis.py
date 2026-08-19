@@ -9,7 +9,7 @@ pre-§8 store still reads through.
 
 import numpy as np
 import pytest
-from mortie.toc import Q_END_NS, Q_START_NS
+from mortie import Q_END_NS, Q_START_NS
 
 from zagg.time_axis import (
     LEGACY_TIME_ATTRS,
@@ -340,7 +340,7 @@ class TestObservationWords:
         # mortie refuses at TOC_MAX_NS = 2^63 - 2^32 (its quantum-aligned span
         # ceiling), so a 2^63 - 1 bound here lets the last 4.29 s through and the
         # caller gets mortie's message instead of this one (issue #410 review).
-        from mortie.toc import TOC_MAX_NS
+        from mortie import TOC_MAX_NS
 
         from zagg.time_axis import _internal_ns
 
