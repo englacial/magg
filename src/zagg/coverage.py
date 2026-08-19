@@ -254,13 +254,22 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     ``.zarr`` off the shard-order depth is checked for the D11 ``role`` attr and
     skipped when it carries one (never classified by position) — as is a
     ``{stem}.pyramid.zarr`` column (issue #383), the one derived family that
-    lives at the leaf's OWN node. A
-    supersedes it). A temporal-declaring store (spec §10, issue #480) also has
+    lives at the leaf's OWN node. A temporal-declaring store (spec §10, issue #480) also has
     its ``zagg-coverage-toc/1`` section rebuilt from this same walk —
     fail-open per SHARD, so an unreadable companion costs the section that
     shard and never the refresh; and a walk that lost any shard COMPOSES its
     rebuild with the standing section (§10.4) instead of replacing it, so the
-    escape hatch can never be the thing that deletes the section. A successful
+    escape hatch can never be the thing that deletes the section. THIS WALK IS
+    THE SECTION'S ONLY TIGHTENER, and its only tier-2 refresher (spec §10.5,
+    issue #487): every other producer composes through
+    :func:`zagg.hive.write_root_coverage`'s join, which only ever GROWS an
+    envelope, so their claims stay true without ever getting narrower. Nothing
+    NEEDS this call for correctness — an un-refreshed section is over-wide at
+    worst, costing a wasted candidate open and never a missed one — which is
+    what lets a no-observation pass preserve the section instead
+    (:func:`zagg.sweep_stages.run_finisher`); refresh buys PRECISION, and
+    repairs a section a pre-§10.4 producer dropped
+    (:func:`zagg.coverage_toc.warn_if_section_missing` names it for that). A successful
     refresh also re-arms the
     :func:`warn_if_stale` once-per-episode latch for this store. Returns the
     envelope written, or ``None`` — deleting any existing root object — when

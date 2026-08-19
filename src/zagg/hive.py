@@ -1078,6 +1078,17 @@ def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict
     rather than unioned (weights are counts), and a producer carrying no
     section leaves an existing one standing. Two stores with no temporal
     channel at all still write byte-identical bytes to a pre-#480 zagg.
+
+    THIS SEAM IS WHY NO CALLER HAS TO REFRESH (spec §10.5, issue #487). The
+    tier-1 join only ever GROWS an envelope, and growing is conservative in
+    the direction §10.2 needs, so every observation added through here lands
+    inside its shard's word by construction — the containment claim stays
+    true across any number of producers in any order, with no coordination.
+    Only a whole-store walk (:func:`zagg.coverage.refresh_root_coverage`)
+    TIGHTENS, and only it may narrow a word or replace the digest; a pass
+    that adds no observations may preserve the section untouched, which is
+    exactly what the staged sweep does
+    (:func:`zagg.sweep_stages.run_finisher`).
     """
     import obstore
 

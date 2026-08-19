@@ -2458,6 +2458,45 @@ that seam as follows:
   `spec` string at all) claims no revision and is debris a producer MAY
   replace.
 
+### 10.5 Refresh contract — the walk is the only tightener
+
+**Contract.** The section is **always safe, eventually precise**: every claim
+it makes is true the moment it is written and *stays* true with no refresh at
+all, and a refresh only makes it **tighter**. Producers therefore need no
+coordination, and a reader never has to ask how recently the section was
+rebuilt in order to trust it.
+
+- **Adding observations keeps the claims true automatically.** Every
+  observation-adding producer composes its words through the §10.4 seam, and
+  tier 1's join only ever *grows* an envelope. Growing is conservative in the
+  direction §10.2 requires — the word must contain every instant in the shard
+  — so an appended observation lands inside that shard's word by
+  construction, whichever producer wrote it and in whatever order.
+- **Removing observations leaves a word over-wide, never wrong.** A rewrite
+  that drops data leaves the shard claiming a window wider than the shard now
+  holds. A reader opens that candidate and finds nothing in the window: a
+  wasted open, never missed data — the same asymmetry a window edge's quantum
+  already has (§10.2).
+- **Only a whole-store walk tightens**, and only a whole-store walk refreshes
+  tier 2. Tightening is what re-derives a shard's word from what its leaves
+  hold *now* instead of joining it with what they held before, and tier 2's
+  whole-coverage rule (§10.4) already denies the digest to any partial
+  producer. A producer MUST NOT publish a **narrowed** word for a shard unless
+  it derived that word from every leaf of the shard.
+- **A pass that adds no observations MAY leave the section untouched.** It
+  cannot falsify a claim it never widened, so preserving is always sound; what
+  it forgoes is only the tightening. This is what makes §10.4's "a producer
+  with no temporal contribution leaves an existing section standing" a
+  permanent posture rather than a transitional one.
+
+The one loss this contract does not prevent is a producer that **drops** the
+section instead of preserving it — a writer predating §10.4 that rebuilds the
+root carrier from the keys it knows. The succession rule forbids it but cannot
+bind code that shipped before the rule existed, so the loss is *bounded*
+rather than prevented: the section is a regenerable accelerator (D9), a reader
+that finds it absent falls back to opening every candidate — slow, and still
+correct — and one walk restores it.
+
 Conformance for an external reader is §7's `temporal/` fixture: its root
 `coverage.moc` carries this section, and the fixture's `temporal.expected.json`
 records the shard word and the decoded digest so the containment and weight
