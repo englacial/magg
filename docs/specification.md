@@ -2458,6 +2458,13 @@ that seam as follows:
   `spec` string at all) claims no revision and is debris a producer MAY
   replace.
 
+Conformance for an external reader is §7's `temporal/` fixture: its root
+`coverage.moc` carries this section, and the fixture's `temporal.expected.json`
+records the shard word and the decoded digest so the containment and weight
+claims above (§10.2, §10.3) are pinned on committed bytes. §10.5 below is a
+contract on producer *behaviour*, and no fixture of committed bytes can pin
+one: its conformance is the prose.
+
 ### 10.5 Refresh contract — the walk is the only tightener
 
 **Contract.** Across §10.4's **union** arm the section is **always safe,
@@ -2531,8 +2538,3 @@ store publishes no temporal coverage" (§10), so a reader falls back to opening
 every candidate — slow, and still correct. Both are bounded by the section
 being a regenerable accelerator (D9) whose truth is in the leaves, and one
 whole-store walk repairs either.
-
-Conformance for an external reader is §7's `temporal/` fixture: its root
-`coverage.moc` carries this section, and the fixture's `temporal.expected.json`
-records the shard word and the decoded digest so the containment and weight
-claims above are pinned on committed bytes.
