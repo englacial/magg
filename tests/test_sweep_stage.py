@@ -1131,6 +1131,17 @@ class TestFinisher:
         after = read_root_coverage(str(tmp_path / "s"))["temporal"]
         assert after["shards"] == env["temporal"]["shards"]
 
+    def test_the_nudge_reads_the_store_manifest_not_the_caller_copy(self, tmp_path, caplog):
+        """The caller's `manifest` was read at admission; the declaration can
+        have moved since. A temporal channel added mid-run is still nudged."""
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
+        stale = json.loads(json.dumps(m))
+        stale["pyramid"]["overview"]["fields"] = FIELDS  # no `temporal:` at admission
+        with caplog.at_level("WARNING"):
+            out = run_finisher(str(tmp_path / "s"), stale, _by_shard(), {}, run_id="A")
+        assert out["toc_section_missing"] is True
+        assert "refresh_root_coverage" in caplog.text
+
     def test_an_incompatible_standing_root_drops_the_section_and_nudges(self, tmp_path, caplog):
         """The overwrite arm: `write_root_coverage` discards an incompatible
         standing envelope (D9 regenerable cache) and the section goes with the

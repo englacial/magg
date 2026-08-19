@@ -283,7 +283,9 @@ def run_finisher(
        nudge at ``toc_section_missing`` (issue #488), never a refusal. That
        key is ALWAYS in the returned dict, like every other one: a run with
        an empty work set writes no root object and reports ``False``, so the
-       stage record's shape does not depend on the work set;
+       stage record's shape does not depend on the work set. The check runs
+       against step 2's RE-READ manifest, not the caller's admission-time
+       copy, so it judges the declaration the store carries now;
     2. the manifest RMW nesting per-entry actuals inside the level entries
        of ``pyramid.overviews`` (#381 point (7); readers MUST tolerate the
        added key). The leaf entry records the ``leaf-column`` law
@@ -330,16 +332,24 @@ def run_finisher(
         "lease_released": False,
     }
     shard_order = int(manifest["shard_order"])
+    written = None
     if by_shard:
         envelope = build_root_coverage(
             [morton_word(d) for d in by_shard], shard_order, source="sweep"
         )
         written = write_root_coverage(store_root, envelope, **store_kwargs)
         out["root_moc"] = True
-        out["toc_section_missing"] = warn_if_section_missing(store_root, written, manifest)
     fresh = read_manifest(store_root, **store_kwargs)
     if fresh is None:
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — cannot record actuals")
+    if written is not None:
+        # Against `fresh`, never the caller's `manifest`: the declaration the
+        # check reads is the STORE's, and `manifest` was read at admission —
+        # before the lease, the stages, and however long the fan-out took. A
+        # temporal channel added mid-run would otherwise go un-nudged, and one
+        # removed mid-run nudged for a channel the store no longer has. The
+        # write above has to precede the re-read; the check does not.
+        out["toc_section_missing"] = warn_if_section_missing(store_root, written, fresh)
     now = _utcnow()
     changed = False
     for entry in (fresh.get("pyramid") or {}).get("overviews") or []:
