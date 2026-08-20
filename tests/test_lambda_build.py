@@ -258,6 +258,100 @@ class TestTemplateEnvironment:
         assert len(ext_matches) == 1
         assert sorted(ext_matches[0]["Action"]) == actions
 
+    def test_source_coop_upload_role_is_gated_scoped_and_deterministic(self):
+        # Issue #495: the Source Cooperative Option 3 grant needs an upload role
+        # whose ARN exists BEFORE they can name it in their bucket policy (AWS
+        # rejects a policy naming a principal that does not exist). Pin the
+        # three properties that make the role safe to ship in a shared account:
+        #   * it is opt-in -- an empty SourceCoopPublisherPrincipal (the
+        #     default) creates nothing, so self-hosted standups are unchanged;
+        #   * the ARN is deterministic (explicit RoleName), which is what was
+        #     promised to Source Cooperative in advance;
+        #   * the trust principal is a parameterized identity ARN, never the
+        #     account :root (sts:AssumeRole is outside PowerUserAccess's
+        #     NotAction list, so :root would let any power user assume it).
+        tpl = self._load_template()
+        params = tpl["Parameters"]
+        assert params["SourceCoopPublisherPrincipal"]["Default"] == ""
+        assert params["SourceCoopUploadRoleName"]["Default"] == "source-coop-upload"
+        assert tpl["Conditions"]["ShouldCreateSourceCoopRole"] == {
+            "Not": [{"Equals": [{"Ref": "SourceCoopPublisherPrincipal"}, ""]}]
+        }
+
+        role = tpl["Resources"]["SourceCoopUploadRole"]
+        assert role["Type"] == "AWS::IAM::Role"
+        assert role["Condition"] == "ShouldCreateSourceCoopRole"
+        props = role["Properties"]
+        assert props["RoleName"] == {"Ref": "SourceCoopUploadRoleName"}
+        (trust,) = props["AssumeRolePolicyDocument"]["Statement"]
+        assert trust["Action"] == "sts:AssumeRole"
+        assert trust["Principal"] == {"AWS": {"Ref": "SourceCoopPublisherPrincipal"}}
+
+        (policy,) = props["Policies"]
+        objects, bucket = policy["PolicyDocument"]["Statement"]
+        assert objects["Resource"] == "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/*"
+        # Multipart actions are load-bearing at ~131 MB/shard: obstore uploads
+        # multipart constantly, and an aborted upload must be cleanable.
+        assert sorted(objects["Action"]) == [
+            "s3:AbortMultipartUpload",
+            "s3:DeleteObject",
+            "s3:GetObject",
+            "s3:ListMultipartUploadParts",
+            "s3:PutObject",
+            "s3:PutObjectAcl",
+        ]
+        assert bucket["Action"] == "s3:ListBucket"
+        assert bucket["Resource"] == "arn:aws:s3:::us-west-2.opendata.source.coop"
+        assert bucket["Condition"] == {"StringLike": {"s3:prefix": "englacial/*"}}
+
+        out = tpl["Outputs"]["SourceCoopUploadRoleArn"]
+        assert out["Condition"] == "ShouldCreateSourceCoopRole"
+        assert out["Value"] == {"GetAtt": "SourceCoopUploadRole.Arn"}
+
+    def test_execution_role_gains_no_source_coop_access(self):
+        # Issue #495 keeps the #26 fail-closed posture: the fleet's execution
+        # role gets NO standing write access to source.coop. The dispatcher
+        # assumes SourceCoopUploadRole and injects short-lived credentials
+        # through the existing output_credentials path instead. Checked in BOTH
+        # copies of the role (inline ExecutionRole here, admin-created
+        # execution_role.yaml).
+        import json
+
+        import yaml
+
+        class _CfnLoader(yaml.SafeLoader):
+            pass
+
+        def _cfn_multi(loader, tag_suffix, node):
+            if isinstance(node, yaml.ScalarNode):
+                return {tag_suffix: loader.construct_scalar(node)}
+            if isinstance(node, yaml.SequenceNode):
+                return {tag_suffix: loader.construct_sequence(node)}
+            return {tag_suffix: loader.construct_mapping(node)}
+
+        _CfnLoader.add_multi_constructor("!", _cfn_multi)
+        role_tpl = REPO_ROOT / "deployment" / "aws" / "execution_role.yaml"
+        external = yaml.load(role_tpl.read_text(), Loader=_CfnLoader)
+        roles = {
+            "template.yaml": self._load_template()["Resources"]["ExecutionRole"],
+            "execution_role.yaml": external["Resources"]["ExecutionRole"],
+        }
+        for name, role in roles.items():
+            assert "source.coop" not in json.dumps(role), (
+                f"{name}'s ExecutionRole now names source.coop -- issue #495 "
+                "grants that access through an assumed role, not standing "
+                "permissions on the worker role (issue #26)"
+            )
+
+    def test_standup_does_not_stamp_the_source_coop_role(self):
+        # The role is opt-in via SourceCoopPublisherPrincipal, and stand_up.sh
+        # (the one in-repo standup path) does not pass it -- so a plain standup
+        # creates no named IAM role and needs no extra IAM capability beyond
+        # what it already requests. Applying the role is an operator action on
+        # the englacial account, not something a standup does implicitly.
+        standup = (REPO_ROOT / "deployment" / "aws" / "stand_up.sh").read_text()
+        assert "SourceCoopPublisherPrincipal" not in standup
+
     def test_metric_filters_publish_recycle_error_split(self):
         # issue #175: under RecycleMaxInvocations=1 every async invocation
         # self-exits, so Lambda's raw Errors metric is pure noise. The
