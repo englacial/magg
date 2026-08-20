@@ -177,7 +177,15 @@ Parameters:
     Description: >-
       ARN allowed to assume the Source Cooperative upload role (issue #495).
       Empty (the default) creates no role, so every existing standup is
-      unchanged; set it to the dispatching identity's ARN to stamp the role.
+      unchanged; set it to the dispatching identity's IAM role ARN to stamp
+      the role. Under SSO that is
+      arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_<permission-set>_<hash>
+      — NOT the arn:aws:sts::<account>:assumed-role/... session ARN that
+      `aws sts get-caller-identity` prints, which CloudFormation rejects with
+      "Invalid principal in policy" and rolls the stack update back. A knob
+      rather than a literal in this git-tracked template because that SSO hash
+      suffix is regenerated whenever the permission set is reprovisioned, so a
+      hardcoded ARN silently rots.
       The dispatcher assumes it and injects short-lived credentials through the
       existing output_credentials path, so the Lambda execution role gains no
       standing write access and keeps its fail-closed posture (issue #26).
