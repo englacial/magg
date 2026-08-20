@@ -171,6 +171,31 @@ Parameters:
       and its -extract twin are independent of this list and stay the
       no-config default.
 
+  SourceCoopPublisherPrincipal:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN allowed to assume the Source Cooperative upload role (issue #495).
+      Empty (the default) creates no role, so every existing standup is
+      unchanged; set it to the dispatching identity's ARN to stamp the role.
+      The dispatcher assumes it and injects short-lived credentials through the
+      existing output_credentials path, so the Lambda execution role gains no
+      standing write access and keeps its fail-closed posture (issue #26).
+      Deliberately an identity ARN, not the account :root: sts:AssumeRole is
+      outside PowerUserAccess's NotAction list, so :root would let any power
+      user in a shared account assume the role.
+
+  SourceCoopUploadRoleName:
+    Type: String
+    Default: source-coop-upload
+    Description: >-
+      Name of the Source Cooperative upload role (issue #495). Explicit rather
+      than CloudFormation-generated so the ARN is deterministic and can be sent
+      to Source Cooperative before this stack update lands — an S3 bucket policy
+      cannot name a principal that does not exist yet ("Invalid principal in
+      policy"), so the role must be created first. A named IAM role needs
+      CAPABILITY_NAMED_IAM, which stand_up.sh already passes.
+
 Mappings:
   # /tmp for the -disk variants is memory + 2048 MB (issue #235 thread
   # decision); 10240 for the 8192 variant is exactly Lambda's
@@ -185,6 +210,7 @@ Conditions:
   ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
   ShouldCreateRole: !Equals [!Ref CreateExecutionRole, "true"]
   ShouldCreateMetricFilters: !Equals [!Ref CreateLogMetricFilters, "true"]
+  ShouldCreateSourceCoopRole: !Not [!Equals [!Ref SourceCoopPublisherPrincipal, ""]]
 
 Resources:
   OutputBucket:
@@ -235,6 +261,51 @@ Resources:
                   - s3:PutObject
                   - s3:DeleteObject
                 Resource: arn:aws:s3:::sliderule-public-cors/*
+
+  # In-region writes to Source Cooperative (issue #495). Their Option 3 grant
+  # adds this role's ARN to the bucket policy on us-west-2.opendata.source.coop,
+  # after which the fleet writes natively instead of through the
+  # data.source.coop proxy — the CA campaign paid $31.22 of egress for
+  # 346.85 GiB, more than the $29.00 of Lambda compute for the same run.
+  # Scoped org-wide to englacial/* (zagg now, ismip7 later) rather than to one
+  # product prefix. The bucket ARNs are literal for the same reason the
+  # sliderule-public-cors grant above is: they are fixed external facts, not
+  # operator knobs. Multipart actions matter — at ~131 MB/shard the writes are
+  # multipart constantly, and an aborted upload must be cleanable.
+  SourceCoopUploadRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateSourceCoopRole
+    Properties:
+      RoleName: !Ref SourceCoopUploadRoleName
+      Description: >-
+        Writes englacial/* on us-west-2.opendata.source.coop in-region (issue #495).
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref SourceCoopPublisherPrincipal
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: source-coop-write
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: arn:aws:s3:::us-west-2.opendata.source.coop/englacial/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: arn:aws:s3:::us-west-2.opendata.source.coop
+                Condition:
+                  StringLike:
+                    s3:prefix: englacial/*
 
   DepsLayer:
     Type: AWS::Lambda::LayerVersion
@@ -651,6 +722,10 @@ Outputs:
   OutputBucket:
     Description: Bucket where results are written.
     Value: !Ref OutputBucketName
+  SourceCoopUploadRoleArn:
+    Condition: ShouldCreateSourceCoopRole
+    Description: "ARN of the Source Cooperative upload role (issue #495)."
+    Value: !GetAtt SourceCoopUploadRole.Arn
   'Fn::ForEach::WorkerVariantArns':
     - WorkerMemory
     - !Ref WorkerMemorySizes
