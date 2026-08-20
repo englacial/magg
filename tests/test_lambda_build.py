@@ -357,12 +357,19 @@ class TestTemplateEnvironment:
 
     def test_standup_does_not_stamp_the_source_coop_role(self):
         # The role is opt-in via SourceCoopPublisherPrincipal, and stand_up.sh
-        # (the one in-repo standup path) does not pass it -- so a plain standup
-        # creates no named IAM role and needs no extra IAM capability beyond
-        # what it already requests. Applying the role is an operator action on
-        # the englacial account, not something a standup does implicitly.
+        # (the one in-repo standup path) does not pass it -- so a plain
+        # stand_up.sh creates no named IAM role. Applying the role is an
+        # operator action on the englacial account, not something a standup
+        # does implicitly. RoleName on SourceCoopUploadRole is nonetheless the
+        # first named-IAM property in the template (ExecutionRole lets
+        # CloudFormation generate its name), so pin the capability stand_up.sh
+        # passes: tightening it back to CAPABILITY_IAM would fail only against
+        # live AWS. The claim is scoped to this path -- an operator deploying
+        # via the console or a bare `aws cloudformation deploy` supplies the
+        # capability themselves.
         standup = (REPO_ROOT / "deployment" / "aws" / "stand_up.sh").read_text()
         assert "SourceCoopPublisherPrincipal" not in standup
+        assert "CAPABILITY_NAMED_IAM" in standup
 
     def test_metric_filters_publish_recycle_error_split(self):
         # issue #175: under RecycleMaxInvocations=1 every async invocation
