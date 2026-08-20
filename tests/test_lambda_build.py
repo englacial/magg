@@ -291,7 +291,10 @@ class TestTemplateEnvironment:
         objects, bucket = policy["PolicyDocument"]["Statement"]
         assert objects["Resource"] == "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/*"
         # Multipart actions are load-bearing at ~131 MB/shard: obstore uploads
-        # multipart constantly, and an aborted upload must be cleanable.
+        # multipart constantly. AbortMultipartUpload covers obstore's
+        # in-process failure path (it needs the UploadId it already holds);
+        # finding uploads leaked by a worker killed at the 900 s ceiling needs
+        # ListBucketMultipartUploads on the bucket ARN, asserted below.
         assert sorted(objects["Action"]) == [
             "s3:AbortMultipartUpload",
             "s3:DeleteObject",
@@ -300,7 +303,7 @@ class TestTemplateEnvironment:
             "s3:PutObject",
             "s3:PutObjectAcl",
         ]
-        assert bucket["Action"] == "s3:ListBucket"
+        assert bucket["Action"] == ["s3:ListBucket", "s3:ListBucketMultipartUploads"]
         assert bucket["Resource"] == "arn:aws:s3:::us-west-2.opendata.source.coop"
         # ListBucket is unconditional on purpose (review fold): S3 returns
         # 404 on a GET for a missing key only when the caller has
