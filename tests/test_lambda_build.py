@@ -349,11 +349,24 @@ class TestTemplateEnvironment:
             "execution_role.yaml": external["Resources"]["ExecutionRole"],
         }
         for name, role in roles.items():
-            assert "source.coop" not in json.dumps(role), (
-                f"{name}'s ExecutionRole now names source.coop -- issue #495 "
-                "grants that access through an assumed role, not standing "
-                "permissions on the worker role (issue #26)"
+            # The grep is sound only because the role's permissions are fully
+            # described inline, so pin that too: an attached managed policy
+            # (ManagedPolicyArns) could carry bucket write access with none of
+            # these spellings in the resource body. Needles cover the bucket's
+            # dotted host form, the hyphenated form a policy/role name would
+            # use, and the bare bucket-name stem.
+            blob = json.dumps(role)
+            assert "ManagedPolicyArns" not in blob, (
+                f"{name}'s ExecutionRole attaches a managed policy -- its "
+                "permissions are no longer fully described inline, so this "
+                "guard can no longer see what it grants (issue #26)"
             )
+            for needle in ("source.coop", "source-coop", "opendata"):
+                assert needle not in blob, (
+                    f"{name}'s ExecutionRole now names {needle} -- issue #495 "
+                    "grants that access through an assumed role, not standing "
+                    "permissions on the worker role (issue #26)"
+                )
 
     def test_standup_does_not_stamp_the_source_coop_role(self):
         # The role is opt-in via SourceCoopPublisherPrincipal, and stand_up.sh
