@@ -271,7 +271,14 @@ Resources:
   # product prefix. The bucket ARNs are literal for the same reason the
   # sliderule-public-cors grant above is: they are fixed external facts, not
   # operator knobs. Multipart actions matter — at ~131 MB/shard the writes are
-  # multipart constantly, and an aborted upload must be cleanable.
+  # multipart constantly — but be precise about what they buy:
+  # AbortMultipartUpload only aborts an upload whose UploadId the caller
+  # already holds, i.e. obstore's in-process cleanup when a put fails inside a
+  # live worker. Discovering uploads that leaked needs
+  # ListBucketMultipartUploads on the bucket ARN, granted below. Neither
+  # rescues a worker killed at the 900 s ceiling: it never reaches obstore's
+  # abort, so its parts survive, invisible to ListObjects and billed to Source
+  # Cooperative, until a lifecycle rule on their side reaps them.
   SourceCoopUploadRole:
     Type: AWS::IAM::Role
     Condition: ShouldCreateSourceCoopRole
@@ -315,7 +322,9 @@ Resources:
               # and the cross-account path is gated again by Source
               # Cooperative's own bucket policy.
               - Effect: Allow
-                Action: s3:ListBucket
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
                 Resource: arn:aws:s3:::us-west-2.opendata.source.coop
 
   DepsLayer:
