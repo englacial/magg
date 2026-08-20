@@ -302,7 +302,16 @@ class TestTemplateEnvironment:
         ]
         assert bucket["Action"] == "s3:ListBucket"
         assert bucket["Resource"] == "arn:aws:s3:::us-west-2.opendata.source.coop"
-        assert bucket["Condition"] == {"StringLike": {"s3:prefix": "englacial/*"}}
+        # ListBucket is unconditional on purpose (review fold): S3 returns
+        # 404 on a GET for a missing key only when the caller has
+        # s3:ListBucket on the bucket, and a GetObject evaluation carries no
+        # s3:prefix context key -- so an s3:prefix condition would make every
+        # absent object 403, which zagg's 404-only absence checks do not
+        # catch.
+        assert "Condition" not in bucket, (
+            "an s3:prefix condition on ListBucket makes absent objects 403 "
+            "instead of 404, and zagg's absence checks catch 404 only"
+        )
 
         out = tpl["Outputs"]["SourceCoopUploadRoleArn"]
         assert out["Condition"] == "ShouldCreateSourceCoopRole"

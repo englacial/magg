@@ -300,12 +300,23 @@ Resources:
                   - s3:AbortMultipartUpload
                   - s3:ListMultipartUploadParts
                 Resource: arn:aws:s3:::us-west-2.opendata.source.coop/englacial/*
+              # Unconditional by intent -- do NOT re-add an s3:prefix
+              # condition here. S3 answers a GET on a missing key with 404
+              # NoSuchKey only when the caller holds s3:ListBucket on the
+              # bucket; otherwise it answers 403 AccessDenied. A GetObject
+              # request carries no s3:prefix context key, so a StringLike on
+              # that key never matches during a GET evaluation and every
+              # absent object would come back 403. zagg's "is it written
+              # yet?" checks (hive manifests, sweep leases, the fan-out
+              # result poll) catch 404 only, so a 403 turns "not there yet"
+              # into a hard error mid-campaign, after the compute. The
+              # containment given up is near nil: obstore builds the store
+              # with prefix= from the output path and cannot list outside it,
+              # and the cross-account path is gated again by Source
+              # Cooperative's own bucket policy.
               - Effect: Allow
                 Action: s3:ListBucket
                 Resource: arn:aws:s3:::us-west-2.opendata.source.coop
-                Condition:
-                  StringLike:
-                    s3:prefix: englacial/*
 
   DepsLayer:
     Type: AWS::Lambda::LayerVersion
