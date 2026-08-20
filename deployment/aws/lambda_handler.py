@@ -232,6 +232,7 @@ import os
 import resource
 import threading
 import time
+import uuid
 from typing import Any, Dict, Optional
 
 from zarr import open_group
@@ -537,6 +538,54 @@ def _output_store_kwargs(event: Dict[str, Any]) -> Dict[str, Any]:
     if creds.get("endpointUrl"):
         kwargs["endpoint_url"] = creds["endpointUrl"]
     return kwargs
+
+
+def _probe_output_write(event: Dict[str, Any]) -> Optional[str]:
+    """PUT-then-DELETE a zero-byte object to prove WRITE permission (issue #495).
+
+    The ping's read-only manifest check proves the output credentials can REACH
+    the store; it cannot prove they can write to it. Credentials that read but
+    do not write are exactly how a fresh cross-account grant fails -- and Source
+    Cooperative's in-region path vends no credentials of its own (our IAM role
+    writes through THEIR bucket policy), so there is no interactive step where a
+    human would notice a misconfigured grant. Without this probe the first real
+    write is ``ensure_manifest`` in ``mode="setup"``, invoked
+    ``InvocationType="Event"`` whose 500 the dispatcher never sees, and
+    per-shard status writes are deliberately fail-open (issue #327): the denial
+    would surface only after every worker had read and aggregated its shard
+    (~$29-58 of compute on a CA-sized run).
+
+    Probes a sibling ``<store_path>.probe/`` prefix rather than the store root,
+    mirroring the ``.status`` channel (issue #151): a DELETE that is itself
+    denied would otherwise strand a stray key inside a published dataset. The
+    key carries a uuid, so concurrent runs -- into different stores or the same
+    one -- cannot collide on it. The prefix rides the same credentials, endpoint
+    and external-target canned ACL as the real writes (issue #495), so a bucket
+    that rejects the ACL fails here too. Two requests per run.
+
+    Returns the probed URI, or ``None`` for a non-``s3://`` store (a local store
+    has nothing to prove, and probing it would create the directory).
+    """
+    store_path = event.get("store_path") or ""
+    if not store_path.startswith("s3://"):
+        return None
+
+    import obstore
+
+    from zagg.store import open_object_store
+
+    prefix = f"{store_path.rstrip('/')}.probe"
+    key = f"{uuid.uuid4().hex}.probe"
+    store = open_object_store(prefix, **_output_store_kwargs(event))
+    obstore.put(store, key, b"")
+    try:
+        obstore.delete(store, key)
+    except Exception:
+        # The PUT is the load-bearing half -- write permission is proven. A
+        # delete that fails leaves one zero-byte object OUTSIDE the store root:
+        # worth a warning, not a refused run.
+        logger.warning(f"Write probe could not delete {prefix}/{key}", exc_info=True)
+    return f"{prefix}/{key}"
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -937,7 +986,7 @@ def _handle_finalize(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Hive pre-fan-out preflight (issue #252) — writes nothing.
+    """Hive pre-fan-out preflight (issue #252).
 
     Answering 200 at all is the versioning half of the guard: a function that
     predates the issue #252 hive lifecycle doesn't know ``mode="ping"``,
@@ -954,6 +1003,13 @@ def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
     once the async setup write lands (issue #252 hybrid). Kept while flat
     exists (issue #251): once flat is removed, a stale function simply
     errors and the ping can be dropped.
+
+    The third half is the WRITE probe (issue #495): reachability is not
+    permission, so :func:`_probe_output_write` PUT-then-DELETEs a zero-byte
+    object under a sibling ``.probe`` prefix -- still before any worker is
+    dispatched. Its failure is reported with ``"check": "write_probe"`` so the
+    dispatcher names the right remedy, and it is deliberately NOT fail-open:
+    the point is to refuse the run while refusing is still free.
     """
     logger.info(f"Ping mode: hive preflight for {event.get('store_path')}")
     try:
@@ -975,13 +1031,32 @@ def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
                     overwrite=event.get("overwrite", False),
                     **_output_store_kwargs(event),
                 )
-        return {
-            "statusCode": 200,
-            "body": json.dumps({"ok": True, "mode": "ping", "zagg_version": zagg.__version__}),
-        }
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "ping"})}
+
+    try:
+        probed = _probe_output_write(event)
+    except Exception as e:
+        # Tagged distinctly from the read-side refusal above: the dispatcher
+        # turns "check": "write_probe" into a grant remedy instead of the
+        # "clear the store root" one, which would be actively misleading here.
+        logger.exception(e)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e), "mode": "ping", "check": "write_probe"}),
+        }
+    return {
+        "statusCode": 200,
+        "body": json.dumps(
+            {
+                "ok": True,
+                "mode": "ping",
+                "zagg_version": zagg.__version__,
+                "write_probe": probed is not None,
+            }
+        ),
+    }
 
 
 def _handle_coverage(event: Dict[str, Any]) -> Dict[str, Any]:

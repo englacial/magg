@@ -1755,8 +1755,90 @@ class TestPingMode:
         body = json.loads(resp["body"])
         assert body["mode"] == "ping"
         assert body["zagg_version"] == zagg.__version__
-        # Read-only: the preflight never writes the manifest (or anything).
+        # Read-only against the store itself: the preflight never writes the
+        # manifest. The issue #495 write probe is s3-only, so a local store is
+        # never probed -- the body says so.
         assert not os.path.exists(os.path.join(event["store_path"], hive.MANIFEST_NAME))
+        assert body["write_probe"] is False
+
+    def test_ping_probes_write_permission_on_s3_stores(self, handler_mod, monkeypatch):
+        # Issue #495: reachability is not permission. The probe PUTs a
+        # zero-byte object and DELETEs it again, under a sibling .probe prefix
+        # (never the store root -- a denied DELETE would strand a key inside a
+        # published dataset) and with the run's own output credentials.
+        calls = self._patch_probe(handler_mod, monkeypatch)
+        event = {
+            "mode": "ping",
+            "store_path": "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr",
+            "output_credentials": {"accessKeyId": "ASIA", "secretAccessKey": "s"},
+        }
+        resp = handler_mod._handle_ping(event)
+        assert resp["statusCode"] == 200, resp["body"]
+        assert json.loads(resp["body"])["write_probe"] is True
+        assert calls["prefix"] == "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr.probe"
+        assert calls["store_kwargs"]["credentials"] == event["output_credentials"]
+        assert calls["put"] == [(calls["key"], b"")]
+        assert calls["deleted"] == [calls["key"]]
+
+    def test_ping_probe_keys_are_unique_per_run(self, handler_mod, monkeypatch):
+        # Concurrent runs must not collide on a shared probe key.
+        event = {"mode": "ping", "store_path": "s3://bucket/out.zarr"}
+        first = self._patch_probe(handler_mod, monkeypatch)
+        handler_mod._handle_ping(event)
+        second = self._patch_probe(handler_mod, monkeypatch)
+        handler_mod._handle_ping(event)
+        assert first["key"] != second["key"]
+
+    def test_ping_write_denied_is_500_tagged_write_probe(self, handler_mod, monkeypatch):
+        # The failure this whole phase exists for: a grant that reads but does
+        # not write must refuse the run BEFORE the fan-out, and must be
+        # distinguishable from the store-contents refusal so the dispatcher can
+        # name the right remedy.
+        self._patch_probe(handler_mod, monkeypatch, put_error=PermissionError("Access Denied"))
+        resp = handler_mod._handle_ping({"mode": "ping", "store_path": "s3://bucket/out.zarr"})
+        assert resp["statusCode"] == 500
+        body = json.loads(resp["body"])
+        assert body["check"] == "write_probe"
+        assert "Access Denied" in body["error"]
+
+    def test_ping_probe_delete_failure_does_not_fail_the_run(self, handler_mod, monkeypatch):
+        # The PUT is the load-bearing half: write permission is proven. A
+        # failed cleanup strands one zero-byte object outside the store root --
+        # a warning, not a refused run.
+        self._patch_probe(handler_mod, monkeypatch, delete_error=RuntimeError("no delete"))
+        resp = handler_mod._handle_ping({"mode": "ping", "store_path": "s3://bucket/out.zarr"})
+        assert resp["statusCode"] == 200, resp["body"]
+        assert json.loads(resp["body"])["write_probe"] is True
+
+    @staticmethod
+    def _patch_probe(handler_mod, monkeypatch, put_error=None, delete_error=None):
+        """Capture the probe's obstore traffic without touching S3."""
+        import obstore
+
+        import zagg.store as zagg_store
+
+        calls: dict = {"put": [], "deleted": []}
+
+        def _open(prefix, **kwargs):
+            calls["prefix"] = prefix
+            calls["store_kwargs"] = kwargs
+            return MagicMock(name="probe_store")
+
+        def _put(store, key, payload):
+            calls["key"] = key
+            if put_error is not None:
+                raise put_error
+            calls["put"].append((key, payload))
+
+        def _delete(store, key):
+            if delete_error is not None:
+                raise delete_error
+            calls["deleted"].append(key)
+
+        monkeypatch.setattr(zagg_store, "open_object_store", _open)
+        monkeypatch.setattr(obstore, "put", _put)
+        monkeypatch.setattr(obstore, "delete", _delete)
+        return calls
 
     def test_ping_matching_existing_store_resumes(self, handler_mod, tmp_path):
         cfg = TestProcessHive._hive_config_dict()
