@@ -116,6 +116,92 @@ class TestOpenS3Store:
         assert "credential_provider" not in kwargs
 
 
+class TestBucketOwnerAcl:
+    """Issue #495: writes to a target we do not own must hand ownership to the
+    bucket owner. S3 object ownership follows the WRITING account, so a
+    cross-account PUT without ``x-amz-acl: bucket-owner-full-control`` leaves
+    objects the bucket owner cannot manage -- Source Cooperative's in-region
+    upload grant requires the canned ACL for exactly that reason. obstore has no
+    ACL config key, so it rides as a default request header."""
+
+    HEADER = {"x-amz-acl": "bucket-owner-full-control"}
+    CREDS = {"accessKeyId": "ASIA", "secretAccessKey": "secret", "sessionToken": "tok"}
+
+    def test_external_target_sets_canned_acl(self, mock_s3):
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr", credentials=self.CREDS
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == self.HEADER
+
+    def test_side_channel_objects_get_the_header_too(self, mock_s3):
+        # Status envelopes, hive manifests, stats sidecars and the temporal
+        # tabular object are real writes to the same external store, so the
+        # raw-obstore route must carry the ACL as well.
+        s3_cls, _ = mock_s3
+        open_object_store(
+            "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr.status/run1",
+            credentials=self.CREDS,
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == self.HEADER
+
+    def test_in_account_write_sends_no_acl_header(self, mock_s3):
+        # Ambient execution-role writes go to our own bucket: nothing to hand
+        # over, and no client_options are introduced at all.
+        s3_cls, _ = mock_s3
+        open_store("s3://our-bucket/out.zarr")
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+        open_object_store("s3://our-bucket/out.zarr.status/run1")
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+
+    def test_anonymous_read_sends_no_acl_header(self, mock_s3):
+        s3_cls, _ = mock_s3
+        open_store("s3://public-bucket/demo.zarr", read_only=True, skip_signature=True)
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+
+    def test_custom_endpoint_sends_no_acl_header(self, mock_s3):
+        # Canned ACLs are an AWS-S3 concept; the S3-compatible stores behind
+        # endpoint_url (R2, MinIO) do not implement them.
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://bucket/foo.zarr",
+            credentials=self.CREDS,
+            endpoint_url="https://acct.r2.cloudflarestorage.com",
+        )
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+
+    def test_caller_client_options_are_preserved(self, mock_s3):
+        # Additive merge: unrelated client options survive, and a caller who
+        # sets x-amz-acl explicitly wins over the default.
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://external/foo.zarr",
+            credentials=self.CREDS,
+            client_options={
+                "timeout": "30s",
+                "default_headers": {"x-amz-acl": "private", "x-custom": "1"},
+            },
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["timeout"] == "30s"
+        assert kwargs["client_options"]["default_headers"] == {
+            "x-amz-acl": "private",
+            "x-custom": "1",
+        }
+
+    def test_caller_client_options_are_not_mutated(self, mock_s3):
+        s3_cls, _ = mock_s3
+        options = {"default_headers": {"x-custom": "1"}}
+        open_store("s3://external/foo.zarr", credentials=self.CREDS, client_options=options)
+        assert options == {"default_headers": {"x-custom": "1"}}
+
+
 class TestS3RetryConfig:
     """Issue #186: S3 stores get a paced retry policy by default. obstore's
     default (10 retries, 100 ms init backoff, uniform jitter) exhausts its whole

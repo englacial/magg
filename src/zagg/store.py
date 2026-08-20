@@ -52,6 +52,26 @@ _S3_READONLY_RETRY_CONFIG = {
 }
 
 
+# Cross-account object ownership on external writes (issue #495). S3 object
+# ownership follows the WRITING account, so under the ``ObjectWriter`` setting a
+# cross-account PUT without this canned ACL creates objects the BUCKET owner can
+# neither manage nor delete. Source Cooperative's in-region upload path (their
+# "Option 3" grant) requires it for exactly that reason -- it is what retires the
+# ``data.source.coop`` proxy hop, and with it the egress the CA campaign paid.
+# The value is correct in all three Object Ownership modes: ``BucketOwnerEnforced``
+# ignores ACLs, but AWS explicitly carves out this one canned value instead of
+# failing the request, so it is sent unconditionally rather than gated on the
+# target's configuration.
+#
+# obstore exposes no ACL config key (``aws_acl``/``acl``/``x-amz-acl`` all raise
+# ``UnknownConfigurationKeyError``), so it rides as a default request header --
+# verified end-to-end against a real ACL-enabled bucket: it survives SigV4
+# signing and AWS accepts the PUT. S3 interprets ``x-amz-acl`` only on
+# object-creating requests, so a GET/LIST issued by the same store carries the
+# header inertly.
+_BUCKET_OWNER_ACL = "bucket-owner-full-control"
+
+
 def open_store(
     path: str,
     read_only: bool = False,
@@ -83,6 +103,13 @@ def open_store(
         :data:`_S3_READONLY_RETRY_CONFIG` when ``read_only=True``; and
         ``skip_signature=True`` for anonymous reads of public buckets (no
         AWS credentials needed, e.g. binder).
+
+    Notes
+    -----
+    Explicit ``credentials`` without an ``endpoint_url`` mark a write target we
+    do not own, and the store then sends
+    ``x-amz-acl: bucket-owner-full-control`` on every request so the bucket
+    owner owns what it writes (issue #495; see :data:`_BUCKET_OWNER_ACL`).
 
     Returns
     -------
@@ -137,6 +164,12 @@ def open_object_store(
     extra ``kwargs``) are cached per process and reused across calls (issue #287)
     -- this is the sidecar manifest-fetch hot path. Every other call builds a
     fresh store, unchanged.
+
+    Side-channel objects are real writes to the output store (status envelopes,
+    hive manifests, stats sidecars, the temporal tabular object), so the
+    external-target canned ACL applies here exactly as it does to
+    :func:`open_store` -- both routes share :func:`_s3_object_store`
+    (issue #495).
     """
     if path.startswith("s3://"):
         if credentials is None and endpoint_url is None and not kwargs:
@@ -222,6 +255,15 @@ def _s3_object_store(
                 opts["session_token"] = credentials["sessionToken"]
         if endpoint_url:
             opts["endpoint"] = endpoint_url
+        elif credentials:
+            # Explicit credentials against the AWS endpoint == a target this
+            # account does not own (issue #495): the ambient execution role
+            # covers every in-account store, so injected credentials exist
+            # precisely to write somewhere else. A custom ``endpoint_url`` is
+            # excluded deliberately -- canned ACLs are an AWS-S3 concept and the
+            # S3-compatible stores behind that knob (R2, MinIO) do not implement
+            # them, so the header would be noise at best there.
+            kwargs["client_options"] = _with_bucket_owner_acl(kwargs.get("client_options"))
         s3 = S3Store(**opts, **kwargs)
     elif kwargs.get("skip_signature"):
         # Anonymous read of a public bucket: no credential provider —
@@ -242,6 +284,20 @@ def _s3_object_store(
             **kwargs,
         )
     return s3
+
+
+def _with_bucket_owner_acl(client_options):
+    """Merge the issue #495 canned ACL into obstore ``client_options``.
+
+    Additive rather than replacing: any other client option survives, and an
+    ``x-amz-acl`` the caller set explicitly wins -- the header is a default for
+    external targets, not an override of a caller who knows better.
+    """
+    options = dict(client_options or {})
+    headers = dict(options.get("default_headers") or {})
+    headers.setdefault("x-amz-acl", _BUCKET_OWNER_ACL)
+    options["default_headers"] = headers
+    return options
 
 
 def parse_s3_path(path: str) -> tuple[str, str]:

@@ -1955,6 +1955,42 @@ class TestProcessEventModeGate:
         assert "store_path" in json.loads(resp["body"])["error"]
 
 
+class TestOutputStoreAcl:
+    """Issue #495: the external-target canned ACL must actually reach the store
+    the worker opens from an event, and must NOT appear on in-account writes."""
+
+    @staticmethod
+    def _s3_kwargs(handler_mod, monkeypatch, event):
+        s3_cls = MagicMock(name="S3Store")
+        monkeypatch.setattr("obstore.store.S3Store", s3_cls)
+        monkeypatch.setattr("zarr.storage.ObjectStore", MagicMock(name="ObjectStore"))
+        monkeypatch.setattr("obstore.auth.boto3.Boto3CredentialProvider", MagicMock())
+        from zagg.store import open_store
+
+        open_store(event["store_path"], **handler_mod._output_store_kwargs(event))
+        _, kwargs = s3_cls.call_args
+        return kwargs
+
+    def test_output_credentials_event_sets_the_canned_acl(self, handler_mod, monkeypatch):
+        event = {
+            "store_path": "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr",
+            "output_credentials": {
+                "accessKeyId": "ASIA",
+                "secretAccessKey": "secret",
+                "sessionToken": "tok",
+            },
+        }
+        kwargs = self._s3_kwargs(handler_mod, monkeypatch, event)
+        assert kwargs["client_options"]["default_headers"] == {
+            "x-amz-acl": "bucket-owner-full-control"
+        }
+
+    def test_execution_role_event_sends_no_acl(self, handler_mod, monkeypatch):
+        event = {"store_path": "s3://our-bucket/out.zarr"}
+        kwargs = self._s3_kwargs(handler_mod, monkeypatch, event)
+        assert "client_options" not in kwargs
+
+
 class TestProcessEventMode:
     def _patch(self, handler_mod, monkeypatch):
         """Stub the S3 readers + tabular writer; run the real process_event."""

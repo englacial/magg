@@ -157,6 +157,16 @@ source.coop uses the standard AWS S3 endpoint with injected STS credentials —
 names (e.g. `us-west-2.opendata.source.coop`) and custom endpoints use
 path-style addressing automatically.
 
+Supplying `output_credentials` **without** an `endpointUrl` is what marks the
+target as one this account does not own, and every request to it then carries
+`x-amz-acl: bucket-owner-full-control` (issue #495). S3 object ownership follows
+the *writing* account, so without that canned ACL a cross-account PUT under the
+`ObjectWriter` setting leaves objects the bucket owner cannot manage or delete —
+Source Cooperative's in-region upload path requires it. It is derived, not
+configured: there is no ACL knob to set, and in-account (execution-role) writes
+never send the header. Custom-endpoint targets (R2, MinIO) are excluded, since
+canned ACLs are an AWS-S3 concept those stores do not implement.
+
 ## Deployment
 
 ### Recommended: CloudFormation standup
