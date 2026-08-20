@@ -5250,6 +5250,16 @@ def _invoke_lambda_ping(
       seconds. Same last-writer caveat the manifest write itself has always
       had.
 
+    - **Read-only grant:** the handler PUT-then-DELETEs a zero-byte probe
+      object under a sibling ``.probe`` prefix (issue #495), so output
+      credentials that can READ the store but not write it -- the shape a
+      fresh cross-account bucket policy fails in, and the one Source
+      Cooperative's in-region path has no interactive step to catch -- refuse
+      here instead of after every worker has aggregated its shard. The
+      response tags this failure ``"check": "write_probe"`` so the remedy
+      below points at the grant, not at the store's contents. A function that
+      predates #495 simply omits the tag and the older message applies.
+
     The raster lambda path reuses this ping (issue #264) ahead of its sync
     template-writing setup invoke: a raster config carries no hive layout, so
     only the stale-deployment half applies (the handler's manifest precheck
@@ -5284,6 +5294,19 @@ def _invoke_lambda_ping(
             body = json.loads(result.get("body") or "{}")
         except (TypeError, ValueError):
             body = {}
+        if body.get("check") == "write_probe":
+            # The store is reachable and compatible; the credentials just
+            # cannot write to it (issue #495). Naming the store's contents
+            # here — the message below — would send the operator to clear a
+            # store root that is not the problem.
+            raise RuntimeError(
+                f"Lambda ping could not WRITE to {store_path}: "
+                f"{body.get('error')!r} — the output credentials can reach the "
+                f"store but a zero-byte probe PUT was denied; fix the grant "
+                f"(bucket policy or assumed role) before dispatching this run, "
+                f"or the fan-out will aggregate every shard and then fail at "
+                f"write time"
+            )
         if body.get("mode") == "ping":
             # The deployed function KNOWS ping — this is validate_manifest
             # refusing the store, not a stale deployment.

@@ -2739,6 +2739,25 @@ class TestInvokeLambdaPingEvent:
                 parent_order=6,
             )
 
+    def test_write_probe_refusal_names_the_grant_not_the_store(self, cfg):
+        # Issue #495: a read-only-but-valid grant fails the ping's write probe.
+        # The 500 carries check="write_probe", and the dispatcher must NOT
+        # reuse the store-contents remedy -- clearing a store root that is not
+        # the problem is the wrong instruction, and the run has to stop before
+        # the fan-out spends compute it will fail to write.
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(RuntimeError, match="could not WRITE") as excinfo:
+            self._invoke(
+                _wire_client(
+                    {"error": "Access Denied", "mode": "ping", "check": "write_probe"},
+                    status_code=500,
+                ),
+                asdict(cfg),
+                parent_order=6,
+            )
+        assert "clear the store root" not in str(excinfo.value)
+        assert "grant" in str(excinfo.value)
+
     def test_validate_refusal_fails_fast(self, cfg):
         # The handler's read-only validate_manifest refusal (frozen-key
         # mismatch, D2) surfaces pre-fan-out with the store remedy, not
