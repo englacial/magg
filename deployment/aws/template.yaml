@@ -736,7 +736,7 @@ Outputs:
     Description: ARN of the deployed Lambda function.
     Value: !GetAtt ProcessFn.Arn
   ExtractFunctionArn:
-    Description: ARN of the dedicated extraction Lambda function (issue #148).
+    Description: "ARN of the dedicated extraction Lambda function (issue #148)."
     Value: !GetAtt ExtractFn.Arn
   FunctionName:
     Description: Name of the deployed Lambda function.
