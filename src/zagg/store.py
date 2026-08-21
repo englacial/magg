@@ -65,10 +65,18 @@ _S3_READONLY_RETRY_CONFIG = {
 #
 # obstore exposes no ACL config key (``aws_acl``/``acl``/``x-amz-acl`` all raise
 # ``UnknownConfigurationKeyError``), so it rides as a default request header --
-# verified end-to-end against a real ACL-enabled bucket: it survives SigV4
-# signing and AWS accepts the PUT. S3 interprets ``x-amz-acl`` only on
-# object-creating requests, so a GET/LIST issued by the same store carries the
-# header inertly.
+# verified end-to-end against a real ACL-enabled bucket, and traced per-request
+# against a local endpoint. obstore applies ``default_headers`` on the reqwest
+# client, i.e. AFTER object_store signs, so the header rides OUTSIDE the
+# signature: ``x-amz-acl`` never appears in ``SignedHeaders``, and AWS accepts it
+# because S3 ignores unsigned non-required ``x-amz-*`` on header-auth requests --
+# it would NOT survive a presigned-URL path, which rejects unsigned ``x-amz-*``.
+# The header rides ``CreateMultipartUpload`` (``POST ?uploads``) as well as a
+# single-shot ``PUT``, and that is the load-bearing half: the create request is
+# what sets a multipart object's ACL (``UploadPart``/``CompleteMultipartUpload``
+# ignore it), and at ~131 MB/shard multipart is the normal write path. S3
+# interprets ``x-amz-acl`` only on object-creating requests, so a GET/LIST issued
+# by the same store carries the header inertly.
 _BUCKET_OWNER_ACL = "bucket-owner-full-control"
 
 
