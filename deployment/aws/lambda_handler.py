@@ -555,13 +555,28 @@ def _probe_output_write(event: Dict[str, Any]) -> Optional[str]:
     would surface only after every worker had read and aggregated its shard
     (~$29-58 of compute on a CA-sized run).
 
-    Probes a sibling ``<store_path>.probe/`` prefix rather than the store root,
-    mirroring the ``.status`` channel (issue #151): a DELETE that is itself
-    denied would otherwise strand a stray key inside a published dataset. The
-    key carries a uuid, so concurrent runs -- into different stores or the same
-    one -- cannot collide on it. The prefix rides the same credentials, endpoint
-    and external-target canned ACL as the real writes (issue #495), so a bucket
-    that rejects the ACL fails here too. Two requests per run.
+    Probes the run's OWN async-result sibling -- ``<store_path>.status/`` (issue
+    #151, ``zagg.client_transport.run_status_prefix``) -- as
+    ``probe-<uuid>``, rather than the store root or a prefix of its own. Two
+    properties, in order:
+
+    * **Never inside the store root.** ``docs/specification.md`` §5.2 makes the
+      leaf hash set discovery-based, so a stranded probe object under a leaf is
+      a KEY-SET difference, not just untidy: a verifier would report an intact
+      leaf as tampered. A denied DELETE must not be able to do that.
+    * **Never a NEW grant surface.** The probe is fail-closed, so whatever
+      prefix it writes becomes a precondition for the run to start. ``.status``
+      is one the run already requires writable (the async invoke/poll transport
+      writes every per-shard status object there), so a grant scoped to
+      ``<store>.status/*`` + ``<store>/*`` passes the probe exactly when the
+      run's real writes would succeed -- no fourth prefix for an operator to
+      enumerate, and no false refusal of a correctly scoped grant.
+
+    The key carries a uuid, so concurrent runs -- into different stores or the
+    same one -- cannot collide on it, nor with the transport's ``run-<run_id>``
+    objects. The prefix rides the same credentials, endpoint and external-target
+    canned ACL as the real writes (issue #495), so a bucket that rejects the ACL
+    fails here too. Two requests, added to the ping, for ``s3://`` stores only.
 
     Returns the probed URI, or ``None`` for a non-``s3://`` store (a local store
     has nothing to prove, and probing it would create the directory).
@@ -574,16 +589,16 @@ def _probe_output_write(event: Dict[str, Any]) -> Optional[str]:
 
     from zagg.store import open_object_store
 
-    prefix = f"{store_path.rstrip('/')}.probe"
-    key = f"{uuid.uuid4().hex}.probe"
+    prefix = f"{store_path.rstrip('/')}.status"
+    key = f"probe-{uuid.uuid4().hex}"
     store = open_object_store(prefix, **_output_store_kwargs(event))
     obstore.put(store, key, b"")
     try:
         obstore.delete(store, key)
     except Exception:
         # The PUT is the load-bearing half -- write permission is proven. A
-        # delete that fails leaves one zero-byte object OUTSIDE the store root:
-        # worth a warning, not a refused run.
+        # delete that fails leaves one zero-byte object OUTSIDE the store root
+        # (so no leaf hash is perturbed): worth a warning, not a refused run.
         logger.warning(f"Write probe could not delete {prefix}/{key}", exc_info=True)
     return f"{prefix}/{key}"
 
@@ -1006,8 +1021,9 @@ def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
 
     The third half is the WRITE probe (issue #495): reachability is not
     permission, so :func:`_probe_output_write` PUT-then-DELETEs a zero-byte
-    object under a sibling ``.probe`` prefix -- still before any worker is
-    dispatched. Its failure is reported with ``"check": "write_probe"`` so the
+    object under the run's own ``<store>.status/`` sibling -- still before any
+    worker is dispatched, and under a prefix the async transport already
+    requires writable, so it adds no grant surface of its own. Its failure is reported with ``"check": "write_probe"`` so the
     dispatcher names the right remedy, and it is deliberately NOT fail-open:
     the point is to refuse the run while refusing is still free.
     """

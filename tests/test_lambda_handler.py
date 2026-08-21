@@ -1763,9 +1763,13 @@ class TestPingMode:
 
     def test_ping_probes_write_permission_on_s3_stores(self, handler_mod, monkeypatch):
         # Issue #495: reachability is not permission. The probe PUTs a
-        # zero-byte object and DELETEs it again, under a sibling .probe prefix
-        # (never the store root -- a denied DELETE would strand a key inside a
-        # published dataset) and with the run's own output credentials.
+        # zero-byte object and DELETEs it again, under the run's own .status
+        # sibling (never the store root -- a denied DELETE would strand a key
+        # inside a published dataset, and spec 5.2 makes that a KEY-SET
+        # difference that reports an intact leaf as tampered) and with the
+        # run's own output credentials. .status specifically, not a .probe
+        # prefix of its own: the async transport already requires it writable,
+        # so a fail-closed probe there adds no new grant surface.
         calls = self._patch_probe(handler_mod, monkeypatch)
         event = {
             "mode": "ping",
@@ -1775,7 +1779,8 @@ class TestPingMode:
         resp = handler_mod._handle_ping(event)
         assert resp["statusCode"] == 200, resp["body"]
         assert json.loads(resp["body"])["write_probe"] is True
-        assert calls["prefix"] == "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr.probe"
+        assert calls["prefix"] == "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr.status"
+        assert calls["key"].startswith("probe-")
         assert calls["store_kwargs"]["credentials"] == event["output_credentials"]
         assert calls["put"] == [(calls["key"], b"")]
         assert calls["deleted"] == [calls["key"]]
@@ -1803,8 +1808,9 @@ class TestPingMode:
 
     def test_ping_probe_delete_failure_does_not_fail_the_run(self, handler_mod, monkeypatch):
         # The PUT is the load-bearing half: write permission is proven. A
-        # failed cleanup strands one zero-byte object outside the store root --
-        # a warning, not a refused run.
+        # failed cleanup strands one zero-byte object outside the store root
+        # (under .status, so no leaf hash is perturbed) -- a warning, not a
+        # refused run.
         self._patch_probe(handler_mod, monkeypatch, delete_error=RuntimeError("no delete"))
         resp = handler_mod._handle_ping({"mode": "ping", "store_path": "s3://bucket/out.zarr"})
         assert resp["statusCode"] == 200, resp["body"]
