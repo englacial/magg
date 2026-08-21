@@ -365,12 +365,21 @@ class TestTouchS3:
         # It must reach the COPY, not just the call-site guard -- the seam
         # carries a second check, and a policy-blind seam would silently make
         # `always` a no-op on exactly the destination it was set for.
+        from zagg.store import _BUCKET_OWNER_ACL
+
         client = self._client(monkeypatch)
         pub = lifecycle.touch_current_unit(
             self._leaf(self.PUBLISHED), store_kwargs=self._kw(), policy="always"
         )
         assert client.copy_object.call_args_list, "always must reach the copy seam"
         assert pub["touched"] > 0 and "skipped_paths" not in pub
+        # The copy must CARRY the bucket-owner ACL. `always` is the only route
+        # that reaches _copy_acl with a published bucket, and under the ambient
+        # execution role the bucket arm of _external_target is the only arm that
+        # can fire -- so this pins the `bucket` argument that keeps an `always`
+        # run from silently stripping ownership on every object it self-copies
+        # to Source Cooperative (review finding on PR #496).
+        assert {c.kwargs["ACL"] for c in client.copy_object.call_args_list} == {_BUCKET_OWNER_ACL}
 
         # _CLIENTS is process-wide and the autouse reset runs once per test, so
         # a second install inside one test needs the cache cleared or the first
@@ -414,6 +423,24 @@ class TestTouchS3:
         assert target.stat().st_mtime == 1
         assert counts["touched"] == 0 and counts["failed"] == 0
         assert counts["skipped_paths"] > 0
+
+    def test_not_applicable_log_names_the_policy_not_the_inference(self, tmp_path, caplog):
+        # The line an operator reads at 3 a.m. A policy skip is not a
+        # publication skip: under `never` on a LOCAL store there is no bucket at
+        # all, and the old wording reported an empty published-bucket list and
+        # pointed at a predicate that was never consulted (review finding on
+        # PR #496).
+        import logging
+
+        root = tmp_path / "store" / "-5" / "1" / LEAF
+        root.mkdir(parents=True)
+        (root / "zarr.json").write_text("{}")
+        with caplog.at_level(logging.INFO, logger="zagg.lifecycle"):
+            lifecycle.touch_current_unit(str(root), policy="never")
+        line = next(r.message for r in caplog.records if "not applicable" in r.message)
+        assert "policy='never'" in line
+        assert "bucket(s)" not in line  # no bucket to name on a local path
+        assert "_touch_applies" in line
 
     def test_published_skip_is_keyed_on_the_bucket_not_the_credentials(self, monkeypatch):
         # The guard is `bucket in _PUBLISHED_BUCKETS`, never

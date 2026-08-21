@@ -196,10 +196,12 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None, policy="auto") ->
     "failed": m}`` and never raises — an unexpected error (client build, LIST
     fault) counts one failure and abandons the remainder (best-effort).
 
-    A path on a PUBLISHED bucket is NOT APPLICABLE rather than failed (issue
-    #495 phase 4, :func:`_skip_published`): it is counted under a
+    A path the touch does not apply to under ``policy`` — a published bucket
+    under ``auto`` (issue #495 phase 4), any path at all under ``never`` (issue
+    #501) — is NOT APPLICABLE rather than failed (:func:`_touch_applies`): it is
+    counted under a
     ``"skipped_paths"`` key, added only when non-zero, and never touches
-    ``"failed"`` — so a published run cannot be read as an error in the run
+    ``"failed"`` — so a skipped run cannot be read as an error in the run
     parquet or the status objects. That key counts INPUT PATHS, not objects,
     unlike its two siblings: a tree path is one skip here but would have been
     one ``"touched"`` per listed key, so the three are not summable (review
@@ -243,12 +245,17 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None, policy="auto") ->
         counts["skipped_paths"] = skipped
         # This fires once per (shard, window) unit — thousands of times on an
         # all-skip run — so it IDENTIFIES rather than explains: the rationale
-        # lives in _skip_published and docs/hive_layout.md, where a reader can
-        # afford it, and the bucket is what the operator needs at 3 a.m. to
-        # tell the published target from something new in _PUBLISHED_BUCKETS.
+        # lives in _touch_applies and docs/hive_layout.md, where a reader can
+        # afford it. It names the POLICY, not the inference: a skip is now
+        # either the issue #495 phase 4 published-bucket call or the operator's
+        # own `output.touch` (issue #501), and under `never` there may be no
+        # bucket at all (a local store) — so the bucket list appears only when
+        # non-empty, and when it does it is what the operator needs at 3 a.m.
+        # to tell the published target from something new.
+        where = f" on bucket(s) {sorted(skipped_buckets)}" if skipped_buckets else ""
         logger.info(
-            f"lifecycle touch not applicable for {skipped} path(s) on published bucket(s) "
-            f"{sorted(skipped_buckets)} — see zagg.lifecycle._skip_published (issue #495 phase 4)"
+            f"lifecycle touch not applicable for {skipped} path(s) under "
+            f"policy={policy!r}{where} — see zagg.lifecycle._touch_applies (issue #501)"
         )
     return counts
 
@@ -341,16 +348,18 @@ def _copy_acl(store_kwargs, bucket) -> str | None:
     value both come from :mod:`zagg.store`, the seam every store write already
     goes through, so this raw-boto3 path cannot drift from it.
 
-    ``bucket`` is the DESTINATION being touched. Since phase 4 it cannot change
-    this function's answer — :func:`_skip_published` returns before ``_copy_acl``
-    is ever called for a bucket in the published set, so only the credentials
-    arm of the predicate can still fire here, and the store kwargs alone would
-    do. It is kept deliberately, as the belt-and-braces :func:`_skip_published`
-    anticipates: the day "not ours" and "not expiring" diverge, the touch grows
-    its own set and starts copying to a bucket that still needs the canned ACL,
-    and this argument is what makes that a one-line change rather than a
-    silent ownership strip. It is resolved per path rather than once per call
-    because one footprint's paths need not share a bucket.
+    ``bucket`` is the DESTINATION being touched, and since issue #501 the
+    BUCKET arm of ``_external_target`` is LIVE here — do not delete this
+    argument. Under ``output.touch: always`` (:func:`_touch_applies`) a
+    published bucket reaches this function, and under the ambient execution
+    role — no injected credentials — the bucket arm is the ONLY arm that can
+    fire. Dropping the argument would therefore strip
+    ``bucket-owner-full-control`` from every object an ``always`` run
+    self-copies to Source Cooperative: the exact fail-open, invisible ownership
+    strip the phase-4 grant round added this ACL to prevent. Pinned by
+    ``test_policy_always_touches_the_published_destination_too``. It is resolved
+    per path rather than once per call because one footprint's paths need not
+    share a bucket.
     """
     from .store import _BUCKET_OWNER_ACL, _external_target
 
