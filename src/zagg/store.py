@@ -58,6 +58,9 @@ _S3_READONLY_RETRY_CONFIG = {
 # neither manage nor delete. Source Cooperative's in-region upload path (their
 # "Option 3" grant) requires it for exactly that reason -- it is what retires the
 # ``data.source.coop`` proxy hop, and with it the egress the CA campaign paid.
+# Since phase 3 the fleet reaches that bucket with the AMBIENT execution role,
+# so the trigger is the destination bucket (:data:`_PUBLISHED_BUCKETS`) as well
+# as injected credentials -- see :func:`_external_target`.
 # The value is correct in all three Object Ownership modes: ``BucketOwnerEnforced``
 # ignores ACLs, but AWS explicitly carves out this one canned value instead of
 # failing the request, so it is sent unconditionally rather than gated on the
@@ -84,9 +87,30 @@ _S3_READONLY_RETRY_CONFIG = {
 # does not: it knows, so it is gated (see ``_s3_object_store``).
 _BUCKET_OWNER_ACL = "bucket-owner-full-control"
 
+# Buckets this account writes to but does not OWN, reached with the ambient
+# execution role (issue #495). Since phase 3 the fleet publishes to Source
+# Cooperative as itself -- no injected credentials -- so "did the caller pass
+# credentials?" no longer separates our buckets from theirs, and keying the
+# canned ACL on that alone would silently publish owner-less objects. The
+# destination is the thing that decides, so the destination is what the
+# predicate reads. A fixed external fact, of the same class as the literal
+# bucket ARNs in ``deployment/aws/template.yaml``: this is the bucket named in
+# Source Cooperative's grant, and it changes only when that grant does.
+#
+# Deliberately NOT "every AWS-endpoint write": the header requires
+# ``s3:PutObjectAcl`` on the target, which zagg holds on this bucket alone --
+# sending it everywhere would 403 every self-hoster's own output bucket and
+# ``sliderule-public-cors``, whose bucket policy is not ours to change.
+_PUBLISHED_BUCKETS = frozenset({"us-west-2.opendata.source.coop"})
 
-def _external_target(credentials, endpoint_url) -> bool:
+
+def _external_target(credentials, endpoint_url, bucket=None) -> bool:
     """Whether these store kwargs describe a target this account does not own.
+
+    True on either route to a not-ours destination: explicit write credentials
+    against the AWS endpoint (the un-negotiated targets injection still exists
+    for), or an ambient write to a bucket in :data:`_PUBLISHED_BUCKETS`. A
+    custom ``endpoint_url`` excludes both, unchanged.
 
     The issue #495 predicate, in one place because it has a second caller
     outside this module: ``zagg.lifecycle``'s skip-run touch re-creates objects
@@ -95,7 +119,9 @@ def _external_target(credentials, endpoint_url) -> bool:
     :data:`_BUCKET_OWNER_ACL` on exactly this condition, or it strips the
     ownership an earlier PUT handed over.
     """
-    return bool(credentials) and not endpoint_url
+    if endpoint_url:
+        return False
+    return bool(credentials) or bucket in _PUBLISHED_BUCKETS
 
 
 def open_store(
@@ -132,12 +158,14 @@ def open_store(
 
     Notes
     -----
-    Explicit ``credentials`` without an ``endpoint_url`` mark a write target we
-    do not own, and the store then sends
-    ``x-amz-acl: bucket-owner-full-control`` on every request so the bucket
-    owner owns what it writes (issue #495; see :data:`_BUCKET_OWNER_ACL`).
-    ``read_only=True`` suppresses it: a read opened with explicit credentials is
-    the issue #223 consumer-INPUT channel (somebody else's input bucket, as
+    A write target this account does not own makes the store send
+    ``x-amz-acl: bucket-owner-full-control`` on every request, so the bucket
+    owner owns what it writes (issue #495; see :data:`_BUCKET_OWNER_ACL`). Two
+    shapes qualify: explicit ``credentials`` without an ``endpoint_url``, and an
+    ambient write to a bucket in :data:`_PUBLISHED_BUCKETS` (Source Cooperative,
+    which the execution role now reaches directly). ``read_only=True``
+    suppresses it: a read opened with explicit credentials is the issue #223
+    consumer-INPUT channel (somebody else's input bucket, as
     ``temporal.open_dataset`` opens it), not a write target of ours.
 
     Returns
@@ -197,7 +225,9 @@ def open_object_store(
     Side-channel objects are real writes to the output store (status envelopes,
     hive manifests, stats sidecars, the temporal tabular object), so the
     external-target canned ACL applies here exactly as it does to
-    :func:`open_store` -- both routes share :func:`_s3_object_store`
+    :func:`open_store` -- both routes share :func:`_s3_object_store`, so an
+    ambient write to a published bucket carries the header here too, cached
+    store included (the cache is keyed by path, and the path is what decides)
     (issue #495). Known exception: this route has no ``read_only`` concept, so a
     credentialed READER built through it sends the header too -- notably
     ``temporal.open_dataset``'s NetCDF branch, a pure GET of a consumer-input
@@ -285,6 +315,32 @@ def _s3_object_store(
     # future mutation of one store's config must not edit a shared global.
     kwargs["retry_config"] = copy.deepcopy(kwargs["retry_config"])
 
+    if (
+        _external_target(credentials, endpoint_url, bucket)
+        and not read_only
+        and not kwargs.get("skip_signature")
+    ):
+        # A WRITE target this account does not own (issue #495), reached either
+        # way: injected credentials against the AWS endpoint (the ambient
+        # execution role covers every in-account store, so injected write
+        # credentials exist precisely to write somewhere else), or an ambient
+        # write to a published bucket -- which is how the fleet reaches Source
+        # Cooperative since phase 3, and is why this gate reads the BUCKET and
+        # not just the credential shape.
+        #
+        # ``read_only`` is the other shape of injected credentials -- the issue
+        # #223 consumer-INPUT channel reading somebody else's bucket -- and is
+        # excluded, as is ``skip_signature`` (an anonymous public read). A
+        # custom ``endpoint_url`` is excluded deliberately, and that exclusion
+        # covers TWO shapes: the S3-compatible stores behind that knob (R2,
+        # MinIO) do not implement canned ACLs at all, so the header would be
+        # noise at best there; and an endpoint-routed AWS target (the retired
+        # ``data.source.coop`` proxy hop was reached exactly that way) is
+        # excluded with them. Retiring that hop -- and the egress it paid -- is
+        # what this header buys, so the exclusion costs nothing under the
+        # no-egress rule.
+        kwargs["client_options"] = _with_bucket_owner_acl(kwargs.get("client_options"))
+
     if credentials or endpoint_url:
         opts = {
             "bucket": bucket,
@@ -301,22 +357,6 @@ def _s3_object_store(
                 opts["session_token"] = credentials["sessionToken"]
         if endpoint_url:
             opts["endpoint"] = endpoint_url
-        elif _external_target(credentials, endpoint_url) and not read_only:
-            # Explicit credentials against the AWS endpoint == a WRITE target
-            # this account does not own (issue #495): the ambient execution role
-            # covers every in-account store, so injected write credentials exist
-            # precisely to write somewhere else. ``read_only`` is the other
-            # shape of injected credentials -- the issue #223 consumer-INPUT
-            # channel reading somebody else's bucket -- and is excluded, so this
-            # branch means what it says. A custom ``endpoint_url`` is
-            # excluded deliberately, and that exclusion covers TWO shapes: the
-            # S3-compatible stores behind that knob (R2, MinIO) do not implement
-            # canned ACLs at all, so the header would be noise at best there;
-            # and an endpoint-routed AWS target (the retired ``data.source.coop``
-            # proxy hop was reached exactly that way) is excluded with them.
-            # Retiring that hop -- and the egress it paid -- is what this header
-            # buys, so the exclusion costs nothing under the no-egress rule.
-            kwargs["client_options"] = _with_bucket_owner_acl(kwargs.get("client_options"))
         s3 = S3Store(**opts, **kwargs)
     elif kwargs.get("skip_signature"):
         # Anonymous read of a public bucket: no credential provider —

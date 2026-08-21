@@ -245,33 +245,52 @@ class TestTemplateEnvironment:
             "Statement"
         ]
 
-        objects = [
-            s
-            for s in stmts
-            if s.get("Resource") == "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/*"
-        ]
+        published = "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*"
+        objects = [s for s in stmts if s.get("Resource") == published]
         assert len(objects) == 1, "the execution role must reach zagg's published prefix"
         # DeleteObject is deliberate: store overwrite and manifest cleanup need
         # it, and the bucket is versioned, so a delete leaves a marker rather
-        # than destroying bytes.
+        # than destroying bytes. PutObjectAcl is load-bearing: every write to
+        # this bucket carries x-amz-acl: bucket-owner-full-control, and S3
+        # evaluates that against s3:PutObjectAcl on PutObject AND on
+        # CreateMultipartUpload -- without it the first published PUT 403s.
+        # The multipart pair covers the failure path PutObject does not:
+        # obstore's own abort (it holds the UploadId) would otherwise 403 and
+        # leak parts billed to Source Cooperative.
         assert sorted(objects[0]["Action"]) == [
+            "s3:AbortMultipartUpload",
             "s3:DeleteObject",
             "s3:GetObject",
+            "s3:ListMultipartUploadParts",
             "s3:PutObject",
+            "s3:PutObjectAcl",
         ]
-        # Scoped to englacial/zagg/*, not englacial/*: englacial is a personal
-        # org today, so sibling repos stay out of the fleet's reach until a
-        # communal org exists.
+        # Scoped to englacial/zagg/demo/*, not englacial/zagg/* or englacial/*
+        # (espg, 2026-08-20): the fleet publishes demo stores, while
+        # englacial/zagg/lambda/* and englacial/zagg/benchmarks/* belong to the
+        # CI release role under issue #497.
         assert not any(
-            s.get("Resource") == "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/*"
+            s.get("Resource")
+            in (
+                "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/*",
+                "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/*",
+            )
             for s in stmts
         )
+        # PutObjectAcl is granted on the published prefix ONLY: the canned ACL
+        # is not sent to buckets we own, and sliderule-public-cors' bucket
+        # policy is not ours to change, so granting it there would be
+        # unexplained privilege.
+        acl_grants = [s for s in stmts if "s3:PutObjectAcl" in (s.get("Action") or [])]
+        assert [s["Resource"] for s in acl_grants] == [published]
 
         bucket = [
             s for s in stmts if s.get("Resource") == "arn:aws:s3:::us-west-2.opendata.source.coop"
         ]
         assert len(bucket) == 1
-        assert bucket[0]["Action"] == "s3:ListBucket"
+        # ListBucketMultipartUploads is what makes a leaked upload discoverable
+        # at all -- ListObjects never shows in-progress parts.
+        assert sorted(bucket[0]["Action"]) == ["s3:ListBucket", "s3:ListBucketMultipartUploads"]
         # Unconditional on purpose (PR #496 review): S3 answers 404 for an
         # absent key only when the caller holds s3:ListBucket on the bucket,
         # and a GetObject evaluation carries no s3:prefix context key -- so an

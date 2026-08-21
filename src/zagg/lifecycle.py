@@ -37,8 +37,9 @@ properties. Exactly what that costs, and what this module does about it:
 - **ACL**: NOT preserved — ``CopyObject`` grants the destination the
   requester's default private ACL unless ``x-amz-acl``/``x-amz-grant-*``
   rides the request. SOLVED for the case that matters: on an external
-  target (explicit credentials, no endpoint — ``zagg.store``'s issue #495
-  predicate, imported so the two cannot drift) the copy carries
+  target (injected credentials against AWS, or an ambient write to a
+  published bucket — ``zagg.store``'s issue #495 predicate, imported with
+  the destination bucket so the two cannot drift) the copy carries
   ``x-amz-acl: bucket-owner-full-control``, so a touch cannot claw back
   ownership the writing PUT handed to the bucket owner. Still a caveat for
   the in-account case: a public-read-BY-ACL bucket would have the touched
@@ -179,16 +180,17 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
     fault) counts one failure and abandons the remainder (best-effort).
     """
     counts = {"touched": 0, "failed": 0}
-    acl = _copy_acl(store_kwargs)
     try:
         for tree in trees:
             if _is_s3(tree):
+                acl = _copy_acl(store_kwargs, _split_s3(tree)[0])
                 _touch_s3_tree(_client(store_kwargs), tree, counts, acl)
             else:
                 _touch_local_tree(tree, counts)
         for obj in objects:
             if _is_s3(obj):
                 bucket, key = _split_s3(obj)
+                acl = _copy_acl(store_kwargs, bucket)
                 _touch_s3_object(_client(store_kwargs), bucket, key, counts, acl=acl)
             else:
                 _touch_local_object(obj, counts)
@@ -228,7 +230,7 @@ def _client(store_kwargs):
         return _CLIENTS[key]
 
 
-def _copy_acl(store_kwargs) -> str | None:
+def _copy_acl(store_kwargs, bucket) -> str | None:
     """Canned ACL the self-copy must carry, or ``None`` (issue #495).
 
     ``CopyObject`` CREATES an object, so on a cross-account target it re-creates
@@ -237,11 +239,17 @@ def _copy_acl(store_kwargs) -> str | None:
     bucket owner, and doing it silently (the touch is fail-open). Predicate and
     value both come from :mod:`zagg.store`, the seam every store write already
     goes through, so this raw-boto3 path cannot drift from it.
+
+    ``bucket`` is the DESTINATION being touched, and is load-bearing: the fleet
+    publishes to Source Cooperative with the ambient execution role, so the
+    store kwargs alone no longer say whether the target is ours (review finding
+    on PR #496). It is resolved per path rather than once per call because one
+    footprint's paths need not share a bucket.
     """
     from .store import _BUCKET_OWNER_ACL, _external_target
 
     store_kwargs = store_kwargs or {}
-    if _external_target(store_kwargs.get("credentials"), store_kwargs.get("endpoint_url")):
+    if _external_target(store_kwargs.get("credentials"), store_kwargs.get("endpoint_url"), bucket):
         return _BUCKET_OWNER_ACL
     return None
 

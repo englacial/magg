@@ -147,9 +147,32 @@ class TestBucketOwnerAcl:
         _, kwargs = s3_cls.call_args
         assert kwargs["client_options"]["default_headers"] == self.HEADER
 
+    def test_ambient_write_to_a_published_bucket_sends_the_header(self, mock_s3):
+        # Phase 3 (issue #495) made publishing AMBIENT: the execution role
+        # reaches source.coop with no injected credentials. Keying the ACL on
+        # "did the caller pass credentials?" would therefore stop sending it on
+        # exactly the path it exists for, and the fleet would publish objects
+        # Source Cooperative cannot manage -- silently, since the PUT succeeds.
+        # The destination decides instead (review finding on PR #496).
+        s3_cls, _ = mock_s3
+        open_store("s3://us-west-2.opendata.source.coop/englacial/zagg/demo/d.zarr")
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == self.HEADER
+        # ...and through the raw-obstore route too (status envelopes, hive
+        # manifests, stats sidecars), including its ambient per-process cache.
+        open_object_store(
+            "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/d.zarr.status/run1"
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == self.HEADER
+
     def test_in_account_write_sends_no_acl_header(self, mock_s3):
-        # Ambient execution-role writes go to our own bucket: nothing to hand
-        # over, and no client_options are introduced at all.
+        # Ambient writes to a bucket we OWN: nothing to hand over, and no
+        # client_options are introduced at all. Scoped to ownership, not to
+        # ambience -- the header requires s3:PutObjectAcl on the target, which
+        # the execution role holds on the published prefix only, so sending it
+        # to every AWS endpoint would 403 self-hosters' own output buckets and
+        # sliderule-public-cors (whose bucket policy is not ours to change).
         s3_cls, _ = mock_s3
         open_store("s3://our-bucket/out.zarr")
         _, kwargs = s3_cls.call_args
@@ -157,10 +180,21 @@ class TestBucketOwnerAcl:
         open_object_store("s3://our-bucket/out.zarr.status/run1")
         _, kwargs = s3_cls.call_args
         assert "client_options" not in kwargs
+        open_store("s3://sliderule-public-cors/zagg-examples/d.zarr")
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
 
     def test_anonymous_read_sends_no_acl_header(self, mock_s3):
         s3_cls, _ = mock_s3
         open_store("s3://public-bucket/demo.zarr", read_only=True, skip_signature=True)
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+
+    def test_read_only_published_store_sends_no_acl_header(self, mock_s3):
+        # The read_only exclusion is unchanged by the destination-keyed
+        # predicate: reading the published store back is not a write.
+        s3_cls, _ = mock_s3
+        open_store("s3://us-west-2.opendata.source.coop/englacial/zagg/demo/d.zarr", read_only=True)
         _, kwargs = s3_cls.call_args
         assert "client_options" not in kwargs
 
@@ -172,6 +206,15 @@ class TestBucketOwnerAcl:
             "s3://bucket/foo.zarr",
             credentials=self.CREDS,
             endpoint_url="https://acct.r2.cloudflarestorage.com",
+        )
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+        # ...and the exclusion still wins over the destination, which is what
+        # keeps the retired data.source.coop proxy hop (an endpoint-routed AWS
+        # target) out of the header path.
+        open_store(
+            "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/d.zarr",
+            endpoint_url="https://data.source.coop",
         )
         _, kwargs = s3_cls.call_args
         assert "client_options" not in kwargs
