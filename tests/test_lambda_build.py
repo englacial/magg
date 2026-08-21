@@ -280,12 +280,20 @@ class TestTemplateEnvironment:
         # quietly taken the slow route (issue #502).
         role = self._load_template()["Resources"]["ExecutionRole"]["Properties"]
         stmts = role["Policies"][0]["PolicyDocument"]["Statement"]
-        bucket = [s for s in stmts if s.get("Resource") == "arn:aws:s3:::sliderule-public-cors"]
+        # Resource and Action both go through the normalizing helpers: the
+        # grant is IAM-identical whether either is written as a scalar or a
+        # one-element list, so neither shape should fail this spuriously --
+        # matching on the raw Resource would report the grant MISSING when it
+        # is present and correct. The list-of-one also keeps the bare-bucket
+        # ARN pinned (not .../*, and not a superset).
+        bucket = [
+            s for s in stmts if _statement_resources(s) == ["arn:aws:s3:::sliderule-public-cors"]
+        ]
         assert len(bucket) == 1, "the execution role must list sliderule-public-cors"
-        # Normalized through the helper: the grant is IAM-identical whether it
-        # is written as a scalar or a one-element list, so neither shape should
-        # fail this spuriously.
         assert _statement_actions(bucket[0]) == ["s3:ListBucket"]
+        # An explicit Deny here would pass every other assertion in this test
+        # while overriding the bucket policy's public ListBucket grant.
+        assert bucket[0]["Effect"] == "Allow"
         # Unconditional on purpose, same reasoning as the source.coop grant: a
         # GetObject evaluation carries no s3:prefix context key, so a condition
         # on it never matches during a GET and every absent object 403s anyway.
