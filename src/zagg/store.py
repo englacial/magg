@@ -179,9 +179,13 @@ def open_store(
 
     The permission requirement rides along: any ACL-carrying PUT needs
     ``s3:PutObjectAcl`` on the target, so overriding to a different canned value
-    carries the same requirement rather than a lesser one. Passing ``None`` as
-    the value strips the header instead of setting one -- the only way through
-    this path to send no ACL at all.
+    carries the same requirement rather than a lesser one. On those external
+    targets -- and only there, since the gate in :func:`_s3_object_store` is the
+    one thing that routes ``client_options`` through
+    :func:`_with_bucket_owner_acl` -- passing ``None`` as the value strips the
+    header instead of setting one. Anywhere else (our own buckets,
+    ``read_only=True``, ``skip_signature=True``, any ``endpoint_url``) no ACL is
+    sent to begin with, and a ``None`` reaches obstore raw, which rejects it.
 
     Injected ``credentials`` are never REFRESHED (issue #500, folded from #498).
     ``output_credentials`` are resolved once at dispatch and embedded in every
