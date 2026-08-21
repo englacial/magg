@@ -76,7 +76,12 @@ _S3_READONLY_RETRY_CONFIG = {
 # what sets a multipart object's ACL (``UploadPart``/``CompleteMultipartUpload``
 # ignore it), and at ~131 MB/shard multipart is the normal write path. S3
 # interprets ``x-amz-acl`` only on object-creating requests, so a GET/LIST issued
-# by the same store carries the header inertly.
+# by the same store carries the header inertly. That inertness is what makes the
+# one route that cannot tell reads from writes safe: ``open_object_store`` has no
+# read-only concept, so its credentialed callers -- including
+# ``temporal.open_dataset``'s NetCDF branch, a pure GET of a consumer INPUT
+# bucket (issue #223) -- still send the header. ``open_store(read_only=True)``
+# does not: it knows, so it is gated (see ``_s3_object_store``).
 _BUCKET_OWNER_ACL = "bucket-owner-full-control"
 
 
@@ -118,6 +123,9 @@ def open_store(
     do not own, and the store then sends
     ``x-amz-acl: bucket-owner-full-control`` on every request so the bucket
     owner owns what it writes (issue #495; see :data:`_BUCKET_OWNER_ACL`).
+    ``read_only=True`` suppresses it: a read opened with explicit credentials is
+    the issue #223 consumer-INPUT channel (somebody else's input bucket, as
+    ``temporal.open_dataset`` opens it), not a write target of ours.
 
     Returns
     -------
@@ -177,7 +185,12 @@ def open_object_store(
     hive manifests, stats sidecars, the temporal tabular object), so the
     external-target canned ACL applies here exactly as it does to
     :func:`open_store` -- both routes share :func:`_s3_object_store`
-    (issue #495).
+    (issue #495). Known exception: this route has no ``read_only`` concept, so a
+    credentialed READER built through it sends the header too -- notably
+    ``temporal.open_dataset``'s NetCDF branch, a pure GET of a consumer-input
+    bucket (issue #223). It is inert there (S3 interprets ``x-amz-acl`` only on
+    object-creating requests); ``open_store(read_only=True)``, which can tell,
+    suppresses it.
     """
     if path.startswith("s3://"):
         if credentials is None and endpoint_url is None and not kwargs:
@@ -223,7 +236,13 @@ def _open_s3_store(
         # on the constant). Set here so _s3_object_store's write-policy
         # default doesn't kick in; an explicit caller retry_config still wins.
         kwargs["retry_config"] = _S3_READONLY_RETRY_CONFIG
-    s3 = _s3_object_store(path, credentials=credentials, endpoint_url=endpoint_url, **kwargs)
+    s3 = _s3_object_store(
+        path,
+        credentials=credentials,
+        endpoint_url=endpoint_url,
+        read_only=read_only,
+        **kwargs,
+    )
     return ObjectStore(store=s3, read_only=read_only)
 
 
@@ -231,9 +250,15 @@ def _s3_object_store(
     path: str,
     credentials: dict | None = None,
     endpoint_url: str | None = None,
+    read_only: bool = False,
     **kwargs,
 ):
-    """Build the raw obstore ``S3Store`` for ``path`` (credential rules above)."""
+    """Build the raw obstore ``S3Store`` for ``path`` (credential rules above).
+
+    ``read_only`` is consumed here, never forwarded to ``S3Store`` (obstore has
+    no such option): it only gates the issue #495 canned ACL, since a read
+    opened with explicit credentials is an input we do not write.
+    """
     from obstore.store import S3Store
 
     bucket, prefix = parse_s3_path(path)
@@ -263,11 +288,14 @@ def _s3_object_store(
                 opts["session_token"] = credentials["sessionToken"]
         if endpoint_url:
             opts["endpoint"] = endpoint_url
-        elif credentials:
-            # Explicit credentials against the AWS endpoint == a target this
-            # account does not own (issue #495): the ambient execution role
-            # covers every in-account store, so injected credentials exist
-            # precisely to write somewhere else. A custom ``endpoint_url`` is
+        elif credentials and not read_only:
+            # Explicit credentials against the AWS endpoint == a WRITE target
+            # this account does not own (issue #495): the ambient execution role
+            # covers every in-account store, so injected write credentials exist
+            # precisely to write somewhere else. ``read_only`` is the other
+            # shape of injected credentials -- the issue #223 consumer-INPUT
+            # channel reading somebody else's bucket -- and is excluded, so this
+            # branch means what it says. A custom ``endpoint_url`` is
             # excluded deliberately, and that exclusion covers TWO shapes: the
             # S3-compatible stores behind that knob (R2, MinIO) do not implement
             # canned ACLs at all, so the header would be noise at best there;
