@@ -157,14 +157,26 @@ The non-secret `endpoint_url` / `region` may also be set in the config's
 names (e.g. `us-west-2.opendata.source.coop`) and custom endpoints use
 path-style addressing automatically.
 
-Supplying `output_credentials` **without** an `endpointUrl` is what marks the
-target as one this account does not own, and every request to it then carries
-`x-amz-acl: bucket-owner-full-control` (issue #495). S3 object ownership follows
-the *writing* account, so without that canned ACL a cross-account PUT under the
-`ObjectWriter` setting leaves objects the bucket owner cannot manage or delete —
-Source Cooperative's in-region upload path requires it. It is derived, not
-configured: there is no ACL knob to set, and in-account (execution-role) writes
-never send the header. Any target reached through an `endpointUrl` is excluded —
+A write target this account does not own carries
+`x-amz-acl: bucket-owner-full-control` on every request (issue #495). S3 object
+ownership follows the *writing* account, so without that canned ACL a
+cross-account PUT under the `ObjectWriter` setting leaves objects the bucket
+owner cannot manage or delete — Source Cooperative's in-region upload path
+requires it. Two shapes qualify, and the second is the one phase 3 added:
+
+- `output_credentials` **without** an `endpointUrl` — an un-negotiated target;
+- an **ambient** (execution-role) write to a bucket zagg publishes to but does
+  not own. Today that is `us-west-2.opendata.source.coop`, the one entry in
+  `zagg.store._PUBLISHED_BUCKETS`. Since the fleet now reaches it with the
+  execution role and no injected credentials, keying the header on credentials
+  alone would publish owner-less objects silently.
+
+It is derived, not configured: there is no ACL knob to set. Writes to buckets we
+*do* own — the output bucket, `sliderule-public-cors` — still send no header;
+that is deliberate, since the header requires `s3:PutObjectAcl` on the target
+and the execution role holds it only on the published prefix (see
+`deployment/aws/template.yaml`). Any target reached through an `endpointUrl` is
+excluded —
 both the S3-compatible stores behind that knob (R2, MinIO), which do not
 implement canned ACLs at all, and an endpoint-routed *AWS* target such as the
 retired `data.source.coop` proxy hop, which this native-write path exists to

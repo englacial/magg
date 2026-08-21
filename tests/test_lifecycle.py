@@ -304,6 +304,23 @@ class TestTouchS3:
         assert calls
         assert {c.kwargs["ACL"] for c in calls} == {_BUCKET_OWNER_ACL}
 
+    def test_ambient_published_target_copies_carry_the_acl(self, monkeypatch):
+        # The fleet publishes to Source Cooperative with the AMBIENT execution
+        # role since phase 3, so a credentials-only predicate would let the
+        # skip-run self-copy strip the ownership on exactly the published path
+        # it exists to protect. The DESTINATION bucket decides (review finding
+        # on PR #496).
+        from zagg.store import _BUCKET_OWNER_ACL
+
+        client = self._client(monkeypatch)
+        lifecycle.touch_current_unit(
+            f"s3://us-west-2.opendata.source.coop/englacial/zagg/demo/store/-5/1/{LEAF}",
+            store_kwargs={"region": "us-west-2", "credentials": None, "endpoint_url": None},
+        )
+        calls = client.copy_object.call_args_list
+        assert calls
+        assert {c.kwargs["ACL"] for c in calls} == {_BUCKET_OWNER_ACL}
+
     def test_in_account_copies_carry_no_acl(self, monkeypatch):
         # Ambient execution-role touch of our own bucket: nothing to hand over,
         # and an ACL would be a change the touch has no business making.

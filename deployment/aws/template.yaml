@@ -74,6 +74,7 @@ Parameters:
       replaced. A parameter, not a literal: zagg-backend-test is a second stack
       from this same template and a fixed name would collide. Mirrors how
       benchmark_cicd.yaml parameterizes ReleaseRoleName / BenchmarkInvokeRoleName.
+
       A named IAM role needs CAPABILITY_NAMED_IAM, which stand_up.sh passes.
 
   MemorySize:
@@ -242,19 +243,45 @@ Resources:
               # the staging grant above, pointed at Source Cooperative. This
               # retires the data.source.coop proxy hop and the egress it paid
               # ($31.22 for 346.85 GiB on the CA campaign, more than the run's
-              # $29.00 of compute). Scoped to englacial/zagg/* rather than
-              # englacial/*: englacial is a personal org today, so the narrow
-              # prefix keeps sibling repos out of the fleet's reach until a
-              # communal org exists. DeleteObject is deliberate — store
-              # overwrite and manifest cleanup need it, and the bucket is
-              # versioned, so a delete leaves a marker rather than destroying
-              # bytes.
+              # $29.00 of compute). Scoped to englacial/zagg/demo/* (espg,
+              # 2026-08-20): englacial is a personal org today, and the fleet
+              # publishes demo stores only — englacial/zagg/lambda/* and
+              # englacial/zagg/benchmarks/* belong to the CI release role
+              # (issue #497). Source Cooperative granted englacial/* to both
+              # ARNs, so tightening or widening later is a reviewed change to
+              # this file rather than another email to them. DeleteObject is
+              # deliberate — store overwrite and manifest cleanup need it, and
+              # the bucket is versioned, so a delete leaves a marker rather
+              # than destroying bytes.
+              #
+              # PutObjectAcl is load-bearing, not incidental: every write to
+              # this bucket carries x-amz-acl: bucket-owner-full-control
+              # (zagg.store._PUBLISHED_BUCKETS), which S3 evaluates against
+              # s3:PutObjectAcl on both PutObject and CreateMultipartUpload —
+              # without it the first published PUT is AccessDenied. It is
+              # granted HERE ONLY: the header is not sent to our own output
+              # bucket or to sliderule-public-cors, whose bucket policy is not
+              # ours to change, so granting it there would be unexplained
+              # privilege.
+              #
+              # The multipart actions cover the FAILURE path, which PutObject
+              # does not: obstore aborts its own in-flight upload (it holds the
+              # UploadId), and without AbortMultipartUpload that cleanup 403s,
+              # leaving parts invisible to ListObjects and billed to Source
+              # Cooperative — a failed abort can also mask the error the worker
+              # reports. ListBucketMultipartUploads (bucket statement below) is
+              # what makes leaked uploads discoverable at all. Neither rescues
+              # a worker killed at the 900 s ceiling: its parts survive until
+              # Source Cooperative's lifecycle rule reaps them.
               - Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:PutObject
+                  - s3:PutObjectAcl
                   - s3:DeleteObject
-                Resource: arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/*
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*
               # Unconditional by intent -- do NOT add an s3:prefix condition.
               # S3 answers a GET on a missing key with 404 NoSuchKey only when
               # the caller holds s3:ListBucket on the bucket; otherwise it
@@ -265,7 +292,9 @@ Resources:
               # sweep leases, the fan-out result poll) catch 404 only, turning
               # "not there yet" into a hard error mid-campaign.
               - Effect: Allow
-                Action: s3:ListBucket
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
                 Resource: arn:aws:s3:::us-west-2.opendata.source.coop
 
   DepsLayer:
