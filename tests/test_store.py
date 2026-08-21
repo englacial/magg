@@ -246,6 +246,29 @@ class TestBucketOwnerAcl:
         _, kwargs = s3_cls.call_args
         assert kwargs["client_options"]["default_headers"] == {"x-custom": "1"}
 
+    def test_a_real_obstore_store_accepts_and_normalizes_the_header(self):
+        # Deliberately UNMOCKED (no network: construction only). Every other
+        # test here mocks S3Store, so they pin what zagg passes and never what
+        # obstore accepts -- client_options/default_headers validate only at
+        # real construction (a typo raises ValueError: Invalid key), so an
+        # obstore rename would leave this class green while the fleet wrote
+        # owner-less objects into someone else's bucket. Note the bytes:
+        # obstore normalizes header values.
+        from zagg.store import _s3_object_store
+
+        s3 = _s3_object_store("s3://external/foo.zarr", credentials=self.CREDS)
+        assert s3.client_options["default_headers"]["x-amz-acl"] == b"bucket-owner-full-control"
+
+    def test_a_real_obstore_read_only_store_carries_no_header(self):
+        # The issue #223 consumer-input shape, unmocked: no client_options at
+        # all reach obstore, so nothing rides the GET.
+        from zagg.store import _s3_object_store
+
+        s3 = _s3_object_store(
+            "s3://someones-input/mask.zarr", credentials=self.CREDS, read_only=True
+        )
+        assert s3.client_options is None
+
     def test_caller_client_options_are_not_mutated(self, mock_s3):
         s3_cls, _ = mock_s3
         options = {"default_headers": {"x-custom": "1"}}
