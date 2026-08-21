@@ -3403,6 +3403,22 @@ class TestTouchPolicy:
         cfg.output.pop("touch", None)
         _validate_store_layout_keys(cfg)
 
+    def test_unvalidated_typo_warns_before_falling_through_to_auto(self, caplog):
+        # validate_config catches a typo at submission, but the worker's own
+        # funnel (load_config_from_dict) does not validate -- so a hand-built
+        # invoke event carrying `touch: "nevr"` reaches here. Fall-through to
+        # `auto` is deliberate (fail-open), but it must be GREPPABLE rather
+        # than silent (review finding on PR #496).
+        import logging
+
+        from zagg.config import default_config, get_touch_policy
+
+        cfg = default_config()
+        cfg.output["touch"] = "nevr"
+        with caplog.at_level(logging.WARNING, logger="zagg.config"):
+            assert get_touch_policy(cfg) == "nevr"  # fall-through is `auto` in _touch_applies
+        assert any("'nevr'" in r.message and "'auto'" in r.message for r in caplog.records)
+
 
 class TestPackagedConfigsAreDispatchable:
     """Every packaged config must survive the strict JSON the Lambda dispatch

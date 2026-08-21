@@ -3204,8 +3204,24 @@ def get_touch_policy(config: PipelineConfig) -> str:
         where version churn outweighs the protection.
 
     An override layered ON TOP of the inference, not a replacement.
+
+    An unrecognized value falls through to ``auto`` (:func:`zagg.lifecycle.
+    _touch_applies`) but WARNS first: :func:`validate_config` rejects a typo at
+    submission, but the worker's own funnel — :func:`load_config_from_dict` on
+    a hand-built invoke event — does not validate, so ``touch: "nevr"`` would
+    otherwise touch an archival destination against the operator's stated
+    intent with nothing in the log. One greppable line instead (review finding
+    on PR #496).
     """
-    return config.output.get("touch", "auto")
+    touch = config.output.get("touch", "auto")
+    if touch not in TOUCH_POLICIES:
+        logger.warning(
+            f"output.touch={touch!r} is not one of "
+            f"{', '.join(repr(t) for t in TOUCH_POLICIES)} — falling through to 'auto' "
+            "(the issue #495 phase 4 inference); this config was not validated at "
+            "submission (issue #501)"
+        )
+    return touch
 
 
 def get_store_layout(config: PipelineConfig) -> str:
