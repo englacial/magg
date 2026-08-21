@@ -46,6 +46,7 @@ from zagg.config import (
     get_store_layout,
     get_store_path,
     get_sweep,
+    get_touch_policy,
     get_windowing,
 )
 from zagg.dispatch import (
@@ -1146,7 +1147,9 @@ class RasterStrategy:
             if identity["cells_current"]:
                 from zagg.lifecycle import touch_store_root
 
-                root_touch = touch_store_root(store_path, store_kwargs=store_kwargs)
+                root_touch = touch_store_root(
+                    store_path, store_kwargs=store_kwargs, policy=get_touch_policy(config)
+                )
                 identity["objects_touched"] += root_touch["touched"]
                 identity["touch_failures"] += root_touch["failed"]
                 _add_skipped_paths(identity, root_touch)
@@ -3318,7 +3321,9 @@ def _run_local(
     if store_layout == "hive" and identity["cells_current"]:
         from zagg.lifecycle import touch_store_root
 
-        root_touch = touch_store_root(store_path, store_kwargs=store_kwargs)
+        root_touch = touch_store_root(
+            store_path, store_kwargs=store_kwargs, policy=get_touch_policy(config)
+        )
         identity["objects_touched"] += root_touch["touched"]
         identity["touch_failures"] += root_touch["failed"]
         _add_skipped_paths(identity, root_touch)

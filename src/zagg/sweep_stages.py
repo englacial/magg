@@ -259,6 +259,7 @@ def run_finisher(
     run_id: str,
     store_kwargs: dict | None = None,
     release=None,
+    touch_policy: str = "auto",
 ) -> dict:
     """The designated finisher-worker (espg ruling): root singletons, once.
 
@@ -349,8 +350,16 @@ def run_finisher(
             json.dumps(fresh, indent=1).encode(),
         )
         out["manifest_updated"] = True
+    # ``touch_policy`` is the issue #501 declaration (``output.touch``). The
+    # sweep entry points carry no config — a sweep is driven by the store's own
+    # manifest — so a caller that has one passes it; the default is ``auto``,
+    # the issue #495 phase 4 inference, which is correct for every destination
+    # the sweep reaches today (it touches exactly this one root object).
     touch = touch_unit_footprint(
-        [], [f"{str(store_root).rstrip('/')}/{AGGREGATION_CORE_NAME}"], store_kwargs=store_kwargs
+        [],
+        [f"{str(store_root).rstrip('/')}/{AGGREGATION_CORE_NAME}"],
+        store_kwargs=store_kwargs,
+        policy=touch_policy,
     )
     out["objects_touched"] = touch["touched"]
     out["touch_failures"] = touch["failed"]

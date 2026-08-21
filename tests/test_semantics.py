@@ -92,6 +92,16 @@ class TestCanonicalization:
             _cfg(output__consolidate_metadata=True),
             _cfg(output__coverage_moc=False),
             _cfg(output__sweep=False),
+            # issue #501: output.touch declares a LIFECYCLE policy for the
+            # destination -- when to refresh LastModified on a skip run. It
+            # cannot change a byte of any leaf, so it must never move the
+            # hash. This holds by CONSTRUCTION, not by an exclusion: `output`
+            # is allowlist-shaped (OUTPUT_LEAF_SHAPING_KEYS + output.grid), so
+            # a new key is out unless someone adds it. That is exactly why it
+            # needs a regression guard -- the property is currently true only
+            # because nobody added it to the allowlist.
+            _cfg(output__touch="never"),
+            _cfg(output__touch="always"),
             _cfg(aggregation__handoff="pandas"),
             _cfg(data_source__reader="xarray"),
             _cfg(data_source__driver="https"),

@@ -1515,6 +1515,7 @@ def process_and_write_hive(
                 # so the touch never resurrects the column-drift ambiguity).
                 # Fail-open both here and inside: a failed touch logs and
                 # counts, never fails or un-skips the unit.
+                from zagg.config import get_touch_policy
                 from zagg.lifecycle import touch_current_unit
 
                 try:
@@ -1523,6 +1524,7 @@ def process_and_write_hive(
                         column_path=column_path if column_declared else None,
                         sidecar_spec=sidecar_spec,
                         store_kwargs=store_kwargs,
+                        policy=get_touch_policy(config),
                     )
                 except Exception as e:
                     logger.warning(

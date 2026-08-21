@@ -1241,6 +1241,16 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
     store_layout = config.output.get("store_layout")
     if store_layout is not None and store_layout not in ("flat", "hive"):
         raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
+    # Lifecycle-touch policy (issue #501): validated at load so a typo fails at
+    # submission rather than silently resolving to the default deep inside a
+    # worker's skip path, where the wrong answer is either version churn on a
+    # published store or a collaborator's data expiring.
+    touch = config.output.get("touch")
+    if touch is not None and touch not in TOUCH_POLICIES:
+        raise ValueError(
+            f"output.touch must be one of {', '.join(repr(t) for t in TOUCH_POLICIES)} "
+            f"(got {touch!r})"
+        )
     # D19 product name (issue #299): validated at load so a bad name fails
     # before any store I/O. The grammar lives in hive.py (one source).
     name = config.output.get("product_name")
@@ -3167,6 +3177,35 @@ def get_store_path(config: PipelineConfig) -> str | None:
     str or None
     """
     return config.output.get("store")
+
+
+#: Legal ``output.touch`` values (issue #501). ``auto`` is the issue #495
+#: phase 4 inference; the other two are the operator's override of it.
+TOUCH_POLICIES = ("auto", "always", "never")
+
+
+def get_touch_policy(config: PipelineConfig) -> str:
+    """Return the skip-run lifecycle-touch policy (issue #501).
+
+    The touch (issue #388) defeats a bucket EXPIRATION rule, so whether to run
+    it is a property of the destination — one we cannot read cross-account
+    (``s3:GetLifecycleConfiguration`` is bucket-owner only) and that no bucket
+    name reliably encodes. The operator knows, so it is declarable:
+
+    ``auto`` (default)
+        The issue #495 phase 4 inference, verbatim: touch unless the
+        destination is in :data:`zagg.store._PUBLISHED_BUCKETS`. A pure no-op
+        for every config that predates this knob.
+    ``always``
+        Touch regardless of destination — an un-negotiated external target
+        whose expiry rule we know about but whose name says nothing.
+    ``never``
+        Never touch, local paths included — an archival destination, or one
+        where version churn outweighs the protection.
+
+    An override layered ON TOP of the inference, not a replacement.
+    """
+    return config.output.get("touch", "auto")
 
 
 def get_store_layout(config: PipelineConfig) -> str:

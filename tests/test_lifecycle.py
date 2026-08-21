@@ -330,6 +330,91 @@ class TestTouchS3:
         # one per listed key -- the keys are not summable, hence the name.
         assert counts["skipped_paths"] == 4
 
+    PUBLISHED = "us-west-2.opendata.source.coop"
+
+    def _leaf(self, bucket):
+        return f"s3://{bucket}/englacial/zagg/demo/store/-5/1/{LEAF}"
+
+    def _kw(self):
+        return {"region": "us-west-2", "credentials": None, "endpoint_url": None}
+
+    def test_policy_auto_matches_the_inference_on_both_destinations(self, monkeypatch):
+        # issue #501: `auto` IS issue #495 phase 4, verbatim -- the default, so
+        # every config that predates the knob is byte-identical.
+        client = self._client(monkeypatch)
+        pub = lifecycle.touch_current_unit(
+            self._leaf(self.PUBLISHED), store_kwargs=self._kw(), policy="auto"
+        )
+        assert client.copy_object.call_args_list == []
+        assert pub["skipped_paths"] > 0 and pub["failed"] == 0
+
+        # _CLIENTS is process-wide and the autouse reset runs once per test, so
+        # a second install inside one test needs the cache cleared or the first
+        # client is handed back and the new mock records nothing.
+        lifecycle._CLIENTS.clear()
+        client = self._client(monkeypatch)
+        ours = lifecycle.touch_current_unit(
+            self._leaf(self.BUCKET), store_kwargs=self._kw(), policy="auto"
+        )
+        assert client.copy_object.call_args_list
+        assert ours["touched"] > 0 and "skipped_paths" not in ours
+
+    def test_policy_always_touches_the_published_destination_too(self, monkeypatch):
+        # The override the inference cannot express: an un-negotiated external
+        # target whose expiry rule we know about but whose name says nothing.
+        # It must reach the COPY, not just the call-site guard -- the seam
+        # carries a second check, and a policy-blind seam would silently make
+        # `always` a no-op on exactly the destination it was set for.
+        client = self._client(monkeypatch)
+        pub = lifecycle.touch_current_unit(
+            self._leaf(self.PUBLISHED), store_kwargs=self._kw(), policy="always"
+        )
+        assert client.copy_object.call_args_list, "always must reach the copy seam"
+        assert pub["touched"] > 0 and "skipped_paths" not in pub
+
+        # _CLIENTS is process-wide and the autouse reset runs once per test, so
+        # a second install inside one test needs the cache cleared or the first
+        # client is handed back and the new mock records nothing.
+        lifecycle._CLIENTS.clear()
+        client = self._client(monkeypatch)
+        ours = lifecycle.touch_current_unit(
+            self._leaf(self.BUCKET), store_kwargs=self._kw(), policy="always"
+        )
+        assert client.copy_object.call_args_list
+        assert ours["touched"] > 0
+
+    def test_policy_never_touches_neither_destination(self, monkeypatch):
+        client = self._client(monkeypatch)
+        pub = lifecycle.touch_current_unit(
+            self._leaf(self.PUBLISHED), store_kwargs=self._kw(), policy="never"
+        )
+        assert client.copy_object.call_args_list == []
+        assert pub["skipped_paths"] > 0 and pub["failed"] == 0
+
+        # _CLIENTS is process-wide and the autouse reset runs once per test, so
+        # a second install inside one test needs the cache cleared or the first
+        # client is handed back and the new mock records nothing.
+        lifecycle._CLIENTS.clear()
+        client = self._client(monkeypatch)
+        ours = lifecycle.touch_current_unit(
+            self._leaf(self.BUCKET), store_kwargs=self._kw(), policy="never"
+        )
+        assert client.copy_object.call_args_list == []
+        assert ours["skipped_paths"] > 0 and ours["failed"] == 0 and ours["touched"] == 0
+
+    def test_policy_never_covers_local_paths_too(self, tmp_path):
+        # "never touch" is a statement about the RUN, not about S3. A local
+        # store under `never` must not have its mtimes rewritten either.
+        root = tmp_path / "store" / "-5" / "1" / LEAF
+        root.mkdir(parents=True)
+        target = root / "zarr.json"
+        target.write_text("{}")
+        os.utime(target, (1, 1))
+        counts = lifecycle.touch_current_unit(str(root), policy="never")
+        assert target.stat().st_mtime == 1
+        assert counts["touched"] == 0 and counts["failed"] == 0
+        assert counts["skipped_paths"] > 0
+
     def test_published_skip_is_keyed_on_the_bucket_not_the_credentials(self, monkeypatch):
         # The guard is `bucket in _PUBLISHED_BUCKETS`, never
         # `_external_target(...)`. The two differ, and the difference is
