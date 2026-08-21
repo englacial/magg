@@ -1341,6 +1341,32 @@ class TestChainingAndCli:
         # Scoped to base '1': the untouched '-2' base was not invoked.
         assert not (tmp_path / "s" / "-2" / "all.zarr").exists()
 
+    def test_stage_sweep_after_run_honours_the_never_touch_policy(self, tmp_path):
+        # Issue #501 through the ONE sweep caller that holds a config. The
+        # finisher's step 3 self-copies `aggregation.yaml`; on an archival
+        # destination an operator who declared `never` must not get one new
+        # full-size root-core version per staged sweep. Delete the
+        # `touch_policy=` kwarg anywhere along
+        # stage_sweep_after_run -> run_stage_sweep -> run_finisher and this
+        # fails (review finding on PR #496).
+        from zagg.sweep_stages import stage_sweep_after_run
+
+        _stage_store(tmp_path / "s")
+        (tmp_path / "s" / "aggregation.yaml").write_text("dataset: TEST\n")
+
+        never = stage_sweep_after_run(
+            str(tmp_path / "s"), [(morton_word("1111"), None)], touch_policy="never"
+        )
+        assert never["finisher"]["objects_touched"] == 0
+        assert never["finisher"]["touch_skipped_paths"] == 1
+
+        # The default is `auto` -- the issue #495 phase 4 inference -- so the
+        # CLI entry point, which has no config to read a policy from, is
+        # unchanged: a local core is still touched.
+        auto = stage_sweep_after_run(str(tmp_path / "s"), [(morton_word("1111"), None)])
+        assert auto["finisher"]["objects_touched"] == 1
+        assert "touch_skipped_paths" not in auto["finisher"]
+
     def test_stage_sweep_after_run_is_fail_open(self, tmp_path):
         from zagg.sweep_lease import acquire_lease
         from zagg.sweep_stages import stage_sweep_after_run
