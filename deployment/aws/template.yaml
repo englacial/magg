@@ -74,8 +74,12 @@ Parameters:
       replaced. A parameter, not a literal: zagg-backend-test is a second stack
       from this same template and a fixed name would collide. Mirrors how
       benchmark_cicd.yaml parameterizes ReleaseRoleName / BenchmarkInvokeRoleName.
-
       A named IAM role needs CAPABILITY_NAMED_IAM, which stand_up.sh passes.
+
+      Setting or changing this on a DEPLOYED stack REPLACES the role (create,
+      re-point the five Role: references, delete the old during cleanup), which
+      invalidates credentials held by warm sandboxes mid-shard: run that update
+      with an idle fleet. See docs/deployment/standup.md.
 
   MemorySize:
     Type: Number

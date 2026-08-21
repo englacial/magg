@@ -92,6 +92,19 @@ to hand-assemble zips or wire up the IAM role yourself.
   identity** -- Source Cooperative names this ARN in their bucket policy -- so a
   second stack in the same account must override `EXECUTION_ROLE_NAME` to avoid
   a collision.
+
+  **Run the first update after [issue #495](https://github.com/englacial/zagg/issues/495)
+  with an idle fleet.** Adding `RoleName` to an already-deployed *unnamed* role
+  is a **replacement**, not an in-place edit: CloudFormation creates the new
+  role, re-points the five `Role:` references, then **deletes the old one**
+  during cleanup. A warm Lambda sandbox holds credentials vended from the old
+  role, so that delete invalidates them and any 900 s worker still mid-shard
+  starts getting `AccessDenied`. IAM/Lambda propagation is not instant either
+  -- `UpdateFunctionConfiguration` against a freshly created role can fail with
+  *The role defined for the function cannot be assumed by Lambda* until IAM
+  catches up; CloudFormation retries, but a rollback there leaves five
+  functions to re-point by hand. The same applies to any later change of
+  `EXECUTION_ROLE_NAME` on a live stack.
 - **`OutputBucket`** -- created only when `CreateOutputBucket=true`; otherwise the
   bucket named by `OutputBucketName` must already exist and be writable by the
   role.
