@@ -174,6 +174,14 @@ class TestLambdaHandlerSyntax:
         compile(invoker.read_text(), str(invoker), "exec")
 
 
+def _resources(statement):
+    """A policy statement's Resource entries, whether scalar or list."""
+    resource = statement.get("Resource")
+    if isinstance(resource, str):
+        return [resource]
+    return [r for r in (resource or []) if isinstance(r, str)]
+
+
 class TestTemplateEnvironment:
     """The CloudFormation template must wire the glibc allocator tunables (#143).
 
@@ -246,9 +254,17 @@ class TestTemplateEnvironment:
             "Statement"
         ]
 
-        published = "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*"
+        # Two prefixes on one statement (espg, 2026-08-20): demo/* is what the
+        # fleet publishes; index/* is the sidecar index cache (issue #160)
+        # migrating off sliderule-public-cors, which is being retired because a
+        # NASA account cannot host public data (issue #499). The destination
+        # grant has to exist BEFORE that migration, which is why it lands here.
+        published = [
+            "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*",
+            "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/index/*",
+        ]
         objects = [s for s in stmts if s.get("Resource") == published]
-        assert len(objects) == 1, "the execution role must reach zagg's published prefix"
+        assert len(objects) == 1, "the execution role must reach zagg's published prefixes"
         # DeleteObject is deliberate: store overwrite and manifest cleanup need
         # it, and the bucket is versioned, so a delete leaves a marker rather
         # than destroying bytes. PutObjectAcl is load-bearing: every write to
@@ -285,13 +301,23 @@ class TestTemplateEnvironment:
         acl_grants = [s for s in stmts if "s3:PutObjectAcl" in (s.get("Action") or [])]
         assert [s["Resource"] for s in acl_grants] == [published]
 
+        # Nothing outside demo/ and index/ -- lambda/* and benchmarks/* belong
+        # to the CI release role under issue #497, not to the fleet.
+        reachable = {r for s in stmts for r in _resources(s) if "source.coop/" in r}
+        assert reachable == set(published)
+
         bucket = [
             s for s in stmts if s.get("Resource") == "arn:aws:s3:::us-west-2.opendata.source.coop"
         ]
         assert len(bucket) == 1
-        # ListBucketMultipartUploads is what makes a leaked upload discoverable
-        # at all -- ListObjects never shows in-progress parts.
-        assert sorted(bucket[0]["Action"]) == ["s3:ListBucket", "s3:ListBucketMultipartUploads"]
+        # s3:ListBucket ONLY. ListBucketMultipartUploads was dropped (espg,
+        # 2026-08-20): it lists in-progress uploads bucket-wide and s3:prefix
+        # cannot constrain it, so Source Cooperative's data-upload docs omit it
+        # and their bucket policy does not grant it -- holding it here would be
+        # denied cross-account anyway. Leaked parts age out on their 7-day
+        # lifecycle rule; obstore's own abort (AbortMultipartUpload, granted on
+        # the objects above) covers the failure path we can actually clean up.
+        assert bucket[0]["Action"] == "s3:ListBucket"
         # Unconditional on purpose (PR #496 review): S3 answers 404 for an
         # absent key only when the caller holds s3:ListBucket on the bucket,
         # and a GetObject evaluation carries no s3:prefix context key -- so an
