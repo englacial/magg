@@ -87,22 +87,23 @@ to hand-assemble zips or wire up the IAM role yourself.
   statement: `Get/Put/DeleteObject` **and** `ListBucket` on the output bucket;
   `Get/Put/DeleteObject` on the public `sliderule-public-cors` bucket
   (whole-bucket, by intent -- PR #176; that bucket is being retired, issue
-  #499); and, on Source Cooperative, `Get/Put/PutObjectAcl/DeleteObject` plus
-  the multipart pair on the published object prefix `englacial/zagg/demo/*`,
-  with plain `ListBucket`
-  granted on the **bucket** rather than the prefix, unconditioned on purpose,
-  because S3 answers a GET for an absent key with 404 only when the caller
-  holds bucket-level `ListBucket`, and zagg's absence checks catch 404 only.
+  #499, and its sidecar-cache successor is **not** the Source Cooperative
+  prefix below -- a different bucket under a different org, post-MVP and not
+  yet chosen); and, on Source Cooperative, `Get/Put/PutObjectAcl/DeleteObject`
+  plus the multipart pair on the published object prefix
+  `englacial/zagg/demo/*`, with plain `ListBucket` granted on the **bucket**
+  rather than the prefix, unconditioned on purpose, because S3 answers a GET
+  for an absent key with 404 only when the caller holds bucket-level
+  `ListBucket`, and zagg's absence checks catch 404 only.
   `ListBucketMultipartUploads` is deliberately absent: it is bucket-wide and
   cannot be prefix-constrained, so Source Cooperative does not grant it and
   uploads leaked by a killed worker age out on their 7-day lifecycle rule
-  instead. Standing the stack
-  up therefore needs `iam:CreateRole`: in an IAM-constrained account (e.g. an
-  AWS SSO power-user), have an admin run the standup rather than mint a role
-  separately. The name is explicit and stable because it is zagg's **published
-  identity** -- Source Cooperative names this ARN in their bucket policy -- so a
-  second stack in the same account must override `EXECUTION_ROLE_NAME` to avoid
-  a collision.
+  instead. Standing the stack up therefore needs `iam:CreateRole`: in an
+  IAM-constrained account (e.g. an AWS SSO power-user), have an admin run the
+  standup rather than mint a role separately. The name is explicit and stable
+  because it is zagg's **published identity** -- Source Cooperative names this
+  ARN in their bucket policy -- so a second stack in the same account must
+  override `EXECUTION_ROLE_NAME` to avoid a collision.
 
   **Run the first update after [issue #495](https://github.com/englacial/zagg/issues/495)
   with an idle fleet.** Adding `RoleName` to an already-deployed *unnamed* role
