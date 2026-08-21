@@ -1062,11 +1062,12 @@ counters and worker logs, not in a durable object.
 
 ### The lifecycle touch
 
-A skipped unit still resets the purge clock: every object in its footprint
-gets a fresh `LastModified` (lifecycle rules act per object) — the leaf
-`.zarr` tree (stamp, arrays, in-leaf `coverage.moc`), the stats sidecar, its
-granule-id sibling and the sub-map sibling, and the declared column tree plus
-its own sidecar.
+A skipped unit still resets the purge clock (except on a **published**
+bucket — see below): every object in its footprint gets a fresh
+`LastModified` (lifecycle rules act per object) — the leaf `.zarr` tree
+(stamp, arrays, in-leaf `coverage.moc`), the stats sidecar, its granule-id
+sibling and the sub-map sibling, and the declared column tree plus its own
+sidecar.
 Local stores use `os.utime`; S3 uses a server-side self-copy (`CopyObject`
 onto itself, `MetadataDirective: REPLACE`) that preserves content, the ETag
 of non-multipart objects, and the object's storage class. A local run's
@@ -1081,13 +1082,34 @@ and degrades to today's behavior — it never fails the unit and never
 un-skips it. Watch the counters: `objects_touched` / `touch_failures` ride
 the run summary, and the CLI warns explicitly when touches failed, because
 those objects **did not** get their purge clock reset (the run still exits
-0). S3 caveats, documented rather than solved: a versioned bucket mints a
-new object version per touch; an object already transitioned to
+0).
+
+**A published store is not touched at all.** A path on a bucket in
+`zagg.store._PUBLISHED_BUCKETS` — Source Cooperative's
+`us-west-2.opendata.source.coop` today — is **not applicable** rather than
+touched or failed. The touch exists to defeat an expiration rule and an
+archival published bucket has none; worse, that bucket is **versioned**, so
+the self-copy does not refresh a timestamp in place — it writes a new
+full-size version and demotes the old one to noncurrent, where it keeps
+consuming storage. A single full-skip run over the CA store would add
+roughly **332 GB** of noncurrent versions, invisible to `ListObjectsV2`, on
+a bucket AWS pays for as an Open Data sponsor. So a published store reports
+`objects_touched: 0` with **no failures**, plus a `touch_skipped_paths`
+count naming how many footprint *paths* (not objects) were skipped — that
+key is present only when something was skipped, and is what tells a
+published run apart from a touch that never ran. The guard keys on the
+published set specifically, **not** on "external target": an
+injected-credential collaborator bucket has unknown lifecycle configuration
+and must still be touched, or the touch's whole purpose fails there.
+
+S3 caveats, documented rather than solved: an object already transitioned to
 `GLACIER`/`DEEP_ARCHIVE` cannot be self-copied (counts as failed); ACLs are
 not preserved (moot under `BucketOwnerEnforced`, the modern default, but a
 public-read-**by-ACL** bucket would see touched objects go private); under
 SSE-KMS the copy re-encrypts with the bucket-default key and needs
-`kms:Decrypt` + `kms:GenerateDataKey`.
+`kms:Decrypt` + `kms:GenerateDataKey`. Versioning is no longer on this list:
+a versioned bucket mints a new object version per touch, and that is the
+*reason for the published skip* above rather than a cost accepted.
 
 **Known gaps** — plan lifecycle rules around them, they are not promised
 away: the [design §7](design/sparse_coverage.md) sweep's **ancestor-node
