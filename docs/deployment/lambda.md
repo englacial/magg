@@ -131,7 +131,7 @@ from zagg import load_config, agg
 
 results = agg(
     config, catalog="catalog.json", backend="lambda",
-    store="s3://us-west-2.opendata.source.coop/org/dataset.zarr",
+    store="s3://a-collaborators-private-bucket/shared/dataset.zarr",
     output_credentials={  # runtime-only; never store in config/YAML
         "accessKeyId": "ASIA...",
         "secretAccessKey": "...",
@@ -147,7 +147,7 @@ secrets out of shell history):
 
 ```bash
 python -m zagg --config atl06.yaml --catalog catalog.json --backend lambda \
-  --store s3://us-west-2.opendata.source.coop/org/dataset.zarr \
+  --store s3://a-collaborators-private-bucket/shared/dataset.zarr \
   --output-creds /path/to/output-creds.json
 ```
 

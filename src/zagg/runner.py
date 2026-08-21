@@ -212,10 +212,12 @@ def agg(
     output_credentials : dict, optional
         Explicit credentials for writing the output store (camelCase
         ``accessKeyId``/``secretAccessKey``/``sessionToken``). Omit to use
-        the ambient credential chain / execution role (writes to in-account
-        buckets, unchanged behavior). Supply to write an external or
-        S3-compatible target (e.g. source.coop). Runtime-only -- never read
-        from config.
+        the ambient credential chain / execution role, which reaches the
+        in-account buckets, ``sliderule-public-cors``, AND zagg's published
+        prefix on Source Cooperative (issue #495). Supply only for a target we
+        have not negotiated a bucket policy with -- a collaborator's private
+        bucket, or an S3-compatible store like R2/MinIO. Runtime-only -- never
+        read from config.
     output_endpoint_url : str, optional
         Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
         Overrides ``output.endpoint_url`` in the config.

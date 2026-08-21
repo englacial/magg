@@ -17,12 +17,12 @@ Event payload (default / process mode):
         "sessionToken": str
     },
     "output_credentials": {     # OPTIONAL -- creds for writing the output store;
-        "accessKeyId": str,     #   omit to use the execution role (in-account).
-        "secretAccessKey": str, #   Supply to write an external/S3-compatible
-        "sessionToken": str,    #   target (e.g. source.coop). sessionToken,
-        "endpointUrl": str,     #   endpointUrl, and region are optional.
-        "region": str
-    },
+        "accessKeyId": str,     #   omit to use the execution role, which reaches
+        "secretAccessKey": str, #   the in-account bucket, sliderule-public-cors,
+        "sessionToken": str,    #   AND source.coop (issue #495). Supply only for
+        "endpointUrl": str,     #   an UN-NEGOTIATED target: a collaborator's
+        "region": str           #   private bucket, or R2/MinIO. sessionToken,
+    },                          #   endpointUrl, and region are optional.
     "config": dict (optional, pipeline config as dict),
     "aoi_payload": list (optional, issue #101) -- this shard's strict-AOI mask
         payload (a compact MOC for HEALPix / in-AOI cell ids for rectilinear).
