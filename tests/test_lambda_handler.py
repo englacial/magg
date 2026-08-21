@@ -1783,12 +1783,42 @@ class TestPingMode:
         assert json.loads(resp["body"])["write_probe"] is True
         assert calls["prefix"] == "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr.status"
         assert calls["key"].startswith("probe-")
+        # The docstring's canned-ACL claim, pinned by proxy at this seam: the
+        # ACL-bearing branch in zagg.store is exactly "credentials present and
+        # endpoint_url absent" (src/zagg/store.py), and _open stubs
+        # open_object_store wholesale, so the argument SHAPE is all that stands
+        # between the docstring and reality. A refactor routing the probe
+        # through a constructor that skips the ACL would change it.
         assert calls["store_kwargs"]["credentials"] == event["output_credentials"]
+        assert calls["store_kwargs"]["region"]
+        assert "endpoint_url" not in calls["store_kwargs"]
         assert calls["put"] == [(calls["key"], b"")]
         assert calls["deleted"] == [calls["key"]]
         # The round trip's outcome rides back out in the body, not only into
         # the function's log group (issue #495 fold).
         assert json.loads(resp["body"])["probe_delete"] is True
+
+    def test_ping_bad_credentials_on_non_hive_is_not_a_grant_failure(
+        self, handler_mod, monkeypatch
+    ):
+        # A malformed output_credentials block is an EVENT typo, not a denied
+        # grant. It is first touched by _output_store_kwargs, which the read
+        # half calls only on the hive branch -- so on a raster/flat ping (issue
+        # #264) the ValueError used to escape through the probe and get tagged
+        # write_probe, sending the operator to rewrite a bucket policy. The
+        # kwargs are now resolved in the read-side try, so the tag stays off.
+        self._patch_probe(handler_mod, monkeypatch)
+        resp = handler_mod._handle_ping(
+            {
+                "mode": "ping",
+                "store_path": "s3://bucket/out.zarr",
+                "output_credentials": {"accessKeyId": "ASIA"},  # no secretAccessKey
+            }
+        )
+        assert resp["statusCode"] == 500
+        body = json.loads(resp["body"])
+        assert "output_credentials missing keys" in body["error"]
+        assert "check" not in body
 
     def test_ping_probe_keys_are_unique_per_run(self, handler_mod, monkeypatch):
         # Concurrent runs must not collide on a shared probe key.
@@ -1872,7 +1902,13 @@ class TestPingMode:
         other["output"]["grid"]["parent_order"] = 5
         resp = handler_mod._handle_ping(self._event(tmp_path, other))
         assert resp["statusCode"] == 500
-        assert "does not match this run" in json.loads(resp["body"])["error"]
+        body = json.loads(resp["body"])
+        assert "does not match this run" in body["error"]
+        # The read-side refusal must NOT carry the write-probe tag: the
+        # dispatcher branches on `check` FIRST, so a handler change that tagged
+        # every 500 write_probe would send every store-contents refusal to the
+        # grant remedy (issue #495).
+        assert "check" not in body
 
     def test_ping_routes_from_lambda_handler(self, handler_mod):
         # The dispatch seam: mode="ping" answers 200 with no store touched —
