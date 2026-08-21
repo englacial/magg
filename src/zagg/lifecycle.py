@@ -47,13 +47,16 @@ properties. Exactly what that costs, and what this module does about it:
   (``InvalidObjectState``) and counts as failed;
 - **ACL**: NOT preserved — ``CopyObject`` grants the destination the
   requester's default private ACL unless ``x-amz-acl``/``x-amz-grant-*``
-  rides the request. SOLVED for the case that matters: on an external
-  target (injected credentials against AWS, or an ambient write to a
-  published bucket — ``zagg.store``'s issue #495 predicate, imported with
-  the destination bucket so the two cannot drift) the copy carries
+  rides the request. SOLVED for the case that matters: on an
+  INJECTED-CREDENTIAL external target the copy carries
   ``x-amz-acl: bucket-owner-full-control``, so a touch cannot claw back
-  ownership the writing PUT handed to the bucket owner. Still a caveat for
-  the in-account case: a public-read-BY-ACL bucket would have the touched
+  ownership the writing PUT handed to the bucket owner. ``zagg.store``'s
+  issue #495 predicate has a second arm — an ambient write to a published
+  bucket — that is UNREACHABLE from here since phase 4: the touch skips
+  those paths before any copy. The predicate is still imported whole, and
+  still resolved against the destination bucket, only so this raw-boto3
+  path cannot drift from the store seam's. Still a caveat for the
+  in-account case: a public-read-BY-ACL bucket would have the touched
   objects made private (a no-op on ``BucketOwnerEnforced``, the default
   since 2023);
 - **SSE-KMS**: a self-copy re-encrypts under the BUCKET DEFAULT key, not
@@ -305,11 +308,16 @@ def _copy_acl(store_kwargs, bucket) -> str | None:
     value both come from :mod:`zagg.store`, the seam every store write already
     goes through, so this raw-boto3 path cannot drift from it.
 
-    ``bucket`` is the DESTINATION being touched, and is load-bearing: the fleet
-    publishes to Source Cooperative with the ambient execution role, so the
-    store kwargs alone no longer say whether the target is ours (review finding
-    on PR #496). It is resolved per path rather than once per call because one
-    footprint's paths need not share a bucket.
+    ``bucket`` is the DESTINATION being touched. Since phase 4 it cannot change
+    this function's answer — :func:`_skip_published` returns before ``_copy_acl``
+    is ever called for a bucket in the published set, so only the credentials
+    arm of the predicate can still fire here, and the store kwargs alone would
+    do. It is kept deliberately, as the belt-and-braces :func:`_skip_published`
+    anticipates: the day "not ours" and "not expiring" diverge, the touch grows
+    its own set and starts copying to a bucket that still needs the canned ACL,
+    and this argument is what makes that a one-line change rather than a
+    silent ownership strip. It is resolved per path rather than once per call
+    because one footprint's paths need not share a bucket.
     """
     from .store import _BUCKET_OWNER_ACL, _external_target
 
