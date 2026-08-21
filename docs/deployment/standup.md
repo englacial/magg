@@ -83,9 +83,16 @@ to hand-assemble zips or wire up the IAM role yourself.
 - **`DepsLayer`** -- the dependency layer version (`<FunctionName>-deps`).
 - **`ExecutionRole`** -- always created by the stack, named by
   `ExecutionRoleName` (default `zagg-lambda-execution`). It trusts
-  `lambda.amazonaws.com` and grants CloudWatch Logs plus `Get/Put/DeleteObject`
-  + `ListBucket` on the output bucket, the public `sliderule-public-cors`
-  bucket, and zagg's published prefix on Source Cooperative. Standing the stack
+  `lambda.amazonaws.com` and grants CloudWatch Logs plus, statement by
+  statement: `Get/Put/DeleteObject` **and** `ListBucket` on the output bucket;
+  `Get/Put/DeleteObject` on the public `sliderule-public-cors` bucket
+  (whole-bucket, by intent -- PR #176); and, on Source Cooperative,
+  `Get/Put/PutObjectAcl/DeleteObject` plus the multipart pair on the published
+  object prefix `englacial/zagg/demo/*`, with `ListBucket` +
+  `ListBucketMultipartUploads` granted on the **bucket** rather than the prefix
+  -- unconditioned on purpose, because S3 answers a GET for an absent key with
+  404 only when the caller holds bucket-level `ListBucket`, and zagg's absence
+  checks catch 404 only. Standing the stack
   up therefore needs `iam:CreateRole`: in an IAM-constrained account (e.g. an
   AWS SSO power-user), have an admin run the standup rather than mint a role
   separately. The name is explicit and stable because it is zagg's **published
