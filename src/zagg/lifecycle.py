@@ -191,22 +191,26 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
     fault) counts one failure and abandons the remainder (best-effort).
 
     A path on a PUBLISHED bucket is NOT APPLICABLE rather than failed (issue
-    #495 phase 4, :func:`_skip_published`): it is counted under a ``"skipped"``
-    key, added only when non-zero, and never touches ``"failed"`` — so a
-    published run reports ``touched_objects: 0, touch_failed: 0`` and cannot be
-    read as an error in the run parquet or the status objects. The key is
-    omitted when zero to leave every existing caller's dict byte-identical,
-    mirroring how the unit records omit ``touched_objects`` entirely when no
-    touch ran.
+    #495 phase 4, :func:`_skip_published`): it is counted under a
+    ``"skipped_paths"`` key, added only when non-zero, and never touches
+    ``"failed"`` — so a published run cannot be read as an error in the run
+    parquet or the status objects. That key counts INPUT PATHS, not objects,
+    unlike its two siblings: a tree path is one skip here but would have been
+    one ``"touched"`` per listed key, so the three are not summable (review
+    finding on PR #496). It is omitted when zero to leave every existing
+    caller's dict byte-identical; the callers that record it are named in
+    :func:`zagg.runner._identity_counts`.
     """
     counts = {"touched": 0, "failed": 0}
     skipped = 0
+    skipped_buckets: set = set()
     try:
         for tree in trees:
             if _is_s3(tree):
                 bucket = _split_s3(tree)[0]
                 if _skip_published(bucket):
                     skipped += 1
+                    skipped_buckets.add(bucket)
                     continue
                 _touch_s3_tree(_client(store_kwargs), tree, counts, _copy_acl(store_kwargs, bucket))
             else:
@@ -216,6 +220,7 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
                 bucket, key = _split_s3(obj)
                 if _skip_published(bucket):
                     skipped += 1
+                    skipped_buckets.add(bucket)
                     continue
                 acl = _copy_acl(store_kwargs, bucket)
                 _touch_s3_object(_client(store_kwargs), bucket, key, counts, acl=acl)
@@ -225,11 +230,15 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
         counts["failed"] += 1
         logger.warning(f"lifecycle touch aborted mid-footprint (fail-open, issue #388): {e}")
     if skipped:
-        counts["skipped"] = skipped
+        counts["skipped_paths"] = skipped
+        # This fires once per (shard, window) unit — thousands of times on an
+        # all-skip run — so it IDENTIFIES rather than explains: the rationale
+        # lives in _skip_published and docs/hive_layout.md, where a reader can
+        # afford it, and the bucket is what the operator needs at 3 a.m. to
+        # tell the published target from something new in _PUBLISHED_BUCKETS.
         logger.info(
-            f"lifecycle touch not applicable for {skipped} published path(s) — an archival "
-            "published bucket has no expiration rule to defeat, and it is versioned, so a "
-            "self-copy would only mint noncurrent versions (issue #495 phase 4)"
+            f"lifecycle touch not applicable for {skipped} path(s) on published bucket(s) "
+            f"{sorted(skipped_buckets)} — see zagg.lifecycle._skip_published (issue #495 phase 4)"
         )
     return counts
 
@@ -365,6 +374,22 @@ def _touch_s3_tree(s3, path, counts, acl=None) -> None:
 
 
 def _touch_s3_object(s3, bucket, key, counts, storage_class=None, acl=None) -> None:
+    if _skip_published(bucket):
+        # Belt and braces (issue #495 phase 4, review finding). The counting
+        # guard lives in touch_unit_footprint — the only route here today —
+        # but this is the one function that issues CopyObject, so putting the
+        # invariant HERE makes it unbypassable by a future entry point rather
+        # than a property of two ``if``s in one loop body. Blast radius if it
+        # ever leaked: ~332 GB of noncurrent versions per full-skip run,
+        # invisible to ListObjectsV2, on a bucket AWS sponsors. It counts
+        # NOTHING — the path-based accounting above already counted this
+        # path, and counting again would double it — and it is unreachable in
+        # practice, so a hit means a new caller skipped the seam: WARNING.
+        logger.warning(
+            f"lifecycle touch reached the copy seam for published s3://{bucket}/{key} — "
+            "refused (issue #495 phase 4); a caller bypassed touch_unit_footprint's guard"
+        )
+        return
     try:
         if storage_class is None:
             # A named object has no LIST entry: one HEAD buys its class (and
