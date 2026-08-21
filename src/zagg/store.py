@@ -85,6 +85,19 @@ _S3_READONLY_RETRY_CONFIG = {
 _BUCKET_OWNER_ACL = "bucket-owner-full-control"
 
 
+def _external_target(credentials, endpoint_url) -> bool:
+    """Whether these store kwargs describe a target this account does not own.
+
+    The issue #495 predicate, in one place because it has a second caller
+    outside this module: ``zagg.lifecycle``'s skip-run touch re-creates objects
+    with a boto3 ``CopyObject`` -- an object-CREATING request that never passes
+    through :func:`_s3_object_store` -- and must apply
+    :data:`_BUCKET_OWNER_ACL` on exactly this condition, or it strips the
+    ownership an earlier PUT handed over.
+    """
+    return bool(credentials) and not endpoint_url
+
+
 def open_store(
     path: str,
     read_only: bool = False,
@@ -288,7 +301,7 @@ def _s3_object_store(
                 opts["session_token"] = credentials["sessionToken"]
         if endpoint_url:
             opts["endpoint"] = endpoint_url
-        elif credentials and not read_only:
+        elif _external_target(credentials, endpoint_url) and not read_only:
             # Explicit credentials against the AWS endpoint == a WRITE target
             # this account does not own (issue #495): the ambient execution role
             # covers every in-account store, so injected write credentials exist
