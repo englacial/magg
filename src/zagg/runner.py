@@ -3379,7 +3379,12 @@ def _run_local(
             if config.output.get("sweep") == "stages":
                 from zagg.sweep_stages import stage_sweep_after_run
 
-                stage_sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
+                stage_sweep_after_run(
+                    store_path,
+                    leaves,
+                    store_kwargs=store_kwargs,
+                    touch_policy=get_touch_policy(config),
+                )
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )

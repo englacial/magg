@@ -350,11 +350,12 @@ def run_finisher(
             json.dumps(fresh, indent=1).encode(),
         )
         out["manifest_updated"] = True
-    # ``touch_policy`` is the issue #501 declaration (``output.touch``). The
-    # sweep entry points carry no config — a sweep is driven by the store's own
-    # manifest — so a caller that has one passes it; the default is ``auto``,
-    # the issue #495 phase 4 inference, which is correct for every destination
-    # the sweep reaches today (it touches exactly this one root object).
+    # ``touch_policy`` is the issue #501 declaration (``output.touch``), threaded
+    # in from whichever caller holds the config: the post-run chaining path does
+    # (``runner`` reads ``config`` on the line it decides to chain from), the
+    # ``python -m zagg.sweep --stages`` CLI does not — a sweep invoked there is
+    # driven by the store's own manifest, which carries no policy. Hence the
+    # ``auto`` default: the issue #495 phase 4 inference, unchanged for the CLI.
     touch = touch_unit_footprint(
         [],
         [f"{str(store_root).rstrip('/')}/{AGGREGATION_CORE_NAME}"],
@@ -389,6 +390,7 @@ def run_stage_sweep(
     record: bool = True,
     run_id: str | None = None,
     lease_ttl_s: int | None = None,
+    touch_policy: str = "auto",
 ) -> dict:
     """One admitted staged sweep, end to end: lease -> stages -> finisher.
 
@@ -417,6 +419,12 @@ def run_stage_sweep(
     (``sweep_stats_{ts}_stages.json``) with the lease intent/completion, the
     per-stage rows, the per-level actuals, and the finisher counts
     (``objects_touched``/``touch_failures`` — the PR #397 shape).
+
+    ``touch_policy`` is the caller's ``output.touch`` declaration (issue #501),
+    forwarded to the finisher's ``aggregation.yaml`` touch — the one object a
+    staged sweep refreshes. ``auto`` (the default) is the issue #495 phase 4
+    inference, so the CLI entry point, which has no config to read it from, is
+    unchanged.
     """
     import uuid
     from datetime import datetime, timezone
@@ -523,6 +531,7 @@ def run_stage_sweep(
             run_id=run_id,
             store_kwargs=store_kwargs,
             release=lambda: release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs),
+            touch_policy=touch_policy,
         )
         summary["lease"]["released"] = bool(summary["finisher"].get("lease_released"))
     except BaseException as e:
@@ -571,7 +580,9 @@ def _write_stage_record(store_root: str, summary: dict, store_kwargs: dict) -> s
     return key
 
 
-def stage_sweep_after_run(store_root: str, leaves, *, store_kwargs: dict | None = None):
+def stage_sweep_after_run(
+    store_root: str, leaves, *, store_kwargs: dict | None = None, touch_policy: str = "auto"
+):
     """Post-fleet chaining: the ``output.sweep: "stages"`` opt-in, fail-open.
 
     The dispatcher fires the staged sweep immediately after the fleet lands,
@@ -583,6 +594,11 @@ def stage_sweep_after_run(store_root: str, leaves, *, store_kwargs: dict | None 
     ``python -m zagg.sweep --stages`` pass, never a wrong answer. Local
     backend only for now (D8: the Lambda dispatcher never writes; the
     worker-transport forward is the recorded open question (b)).
+
+    ``touch_policy`` is the run's ``output.touch`` (issue #501): the dispatcher
+    reads the config to decide to chain at all, so it also passes the policy
+    that governs the finisher's touch — an operator who declared ``never`` on an
+    archival destination must not get one new root-core version per staged sweep.
     """
     from zagg.grids.morton import morton_decimal
 
@@ -590,7 +606,9 @@ def stage_sweep_after_run(store_root: str, leaves, *, store_kwargs: dict | None 
         scope = sorted({morton_decimal(int(k)) for k, _w in (tuple(r) for r in leaves)})
         if not scope:
             return None
-        summary = run_stage_sweep(store_root, leaves, scope=scope, store_kwargs=store_kwargs)
+        summary = run_stage_sweep(
+            store_root, leaves, scope=scope, store_kwargs=store_kwargs, touch_policy=touch_policy
+        )
         logger.info(
             f"Post-run staged sweep: {[(s['dispatch_order'], s['written']) for s in summary['stages']]}"
         )
