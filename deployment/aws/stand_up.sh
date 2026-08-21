@@ -54,13 +54,31 @@ done
 # The command runs in the foreground, so its stdout/stderr stream straight to you.
 run() { echo "+ $(printf '%q ' "$@")"; "$@"; }
 
+DEFAULT_STACK_NAME="zagg-backend"
+DEFAULT_EXECUTION_ROLE_NAME="zagg-lambda-execution"
+
 ARCH="${ARCH:-arm64}"                                # arm64 | x86_64
-STACK_NAME="${STACK_NAME:-zagg-backend}"
+STACK_NAME="${STACK_NAME:-$DEFAULT_STACK_NAME}"
 FUNCTION_NAME="${FUNCTION_NAME:-process-shard}"      # e.g. process-shard-test for a test stack
 REGION="${REGION:-us-west-2}"
 OUTPUT_BUCKET="${OUTPUT_BUCKET:?Set OUTPUT_BUCKET to the bucket where results go}"
 CREATE_BUCKET="${CREATE_BUCKET:-false}"              # true => the stack creates OUTPUT_BUCKET
-EXECUTION_ROLE_NAME="${EXECUTION_ROLE_NAME:-zagg-lambda-execution}"  # published identity (issue #495)
+EXECUTION_ROLE_NAME="${EXECUTION_ROLE_NAME:-$DEFAULT_EXECUTION_ROLE_NAME}"  # published identity (issue #495)
+
+# IAM role names are ACCOUNT-scoped, so a second stack that keeps the default
+# role name asks CloudFormation to create a role the first stack already owns:
+# EntityAlreadyExists, then ROLLBACK. That failure is live-AWS-only and lands
+# minutes in, which is the class this script exists to pre-empt (review finding
+# on PR #496) -- the CREATE_ROLE pair the named role replaced carried a guard
+# for the same mistake. Being explicit is what satisfies it: name the role.
+if [ "$STACK_NAME" != "$DEFAULT_STACK_NAME" ] && \
+   [ "$EXECUTION_ROLE_NAME" = "$DEFAULT_EXECUTION_ROLE_NAME" ]; then
+    echo "ERROR: STACK_NAME='$STACK_NAME' is a second stack, but EXECUTION_ROLE_NAME is"
+    echo "       still the default '$DEFAULT_EXECUTION_ROLE_NAME', which the '$DEFAULT_STACK_NAME'"
+    echo "       stack already owns -- CREATE would fail with EntityAlreadyExists."
+    echo "       Pass a distinct name, e.g. EXECUTION_ROLE_NAME=${DEFAULT_EXECUTION_ROLE_NAME}-test"
+    exit 2
+fi
 STAGING_BUCKET="${STAGING_BUCKET:-}"                 # required only outside the mirror region
 
 # Distribution source (issue #25; source.coop mirror retired in issue #174).
