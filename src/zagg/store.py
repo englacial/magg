@@ -271,10 +271,13 @@ def open_object_store(
     The rest of the injected-credential contract is shared with
     :func:`open_store` and documented there (issue #500): an ``x-amz-acl`` the
     caller sets in ``client_options["default_headers"]`` wins over the canned
-    default, and ``None`` strips the header outright; any ACL-carrying PUT needs
-    ``s3:PutObjectAcl`` on the target; and injected ``credentials`` are resolved
-    once at dispatch and never refreshed, so a long run fails at write time in
-    the tail rather than up front.
+    default, and on an external target ``None`` strips the header; any
+    ACL-carrying PUT needs ``s3:PutObjectAcl`` on the target; and injected
+    ``credentials`` are resolved once at dispatch and never refreshed, so a long
+    run fails at write time in the tail rather than up front. The sentinel is
+    scoped, and the dominant call here is on the other side of that scope: an
+    ambient write to our own output store is not an external target, so no ACL
+    is sent to begin with and a ``None`` value would be rejected by obstore.
     """
     if path.startswith("s3://"):
         if credentials is None and endpoint_url is None and not kwargs:
