@@ -269,6 +269,29 @@ class TestTemplateEnvironment:
         assert len(matches) == 1
         assert sorted(matches[0]["Action"]) == ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"]
 
+    def test_execution_role_lists_the_public_cors_bucket(self):
+        # Bucket-level ListBucket is what makes S3 answer 404 NoSuchKey rather
+        # than 403 AccessDenied on an absent key. The sidecar read path catches
+        # the 404 ONLY -- obstore's NotFoundError subclasses FileNotFoundError,
+        # and that ``return None`` is what selects on_miss=fallback -- so
+        # without this grant a missing sidecar hard-errors where it should have
+        # quietly taken the slow route (issue #502).
+        role = self._load_template()["Resources"]["ExecutionRole"]["Properties"]
+        stmts = role["Policies"][0]["PolicyDocument"]["Statement"]
+        bucket = [s for s in stmts if s.get("Resource") == "arn:aws:s3:::sliderule-public-cors"]
+        assert len(bucket) == 1, "the execution role must list sliderule-public-cors"
+        # Normalized through the helper: the grant is IAM-identical whether it
+        # is written as a scalar or a one-element list, so neither shape should
+        # fail this spuriously.
+        assert _statement_actions(bucket[0]) == ["s3:ListBucket"]
+        # Unconditional on purpose, same reasoning as the source.coop grant: a
+        # GetObject evaluation carries no s3:prefix context key, so a condition
+        # on it never matches during a GET and every absent object 403s anyway.
+        assert "Condition" not in bucket[0], (
+            "an s3:prefix condition on ListBucket makes absent objects 403 "
+            "instead of 404, which defeats on_miss=fallback on the sidecar path"
+        )
+
     def test_execution_role_is_the_published_identity(self):
         # Issue #495 (revised): the fleet publishes to Source Cooperative as
         # ITSELF -- no assumable role, no injected credentials, no one-hour
