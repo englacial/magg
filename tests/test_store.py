@@ -212,6 +212,19 @@ class TestBucketOwnerAcl:
             "x-custom": "1",
         }
 
+    def test_caller_can_strip_the_header_with_an_explicit_none(self, mock_s3):
+        # The escape hatch for an external AWS target that must send no ACL:
+        # neither obstore-legal value expresses absence (None is rejected, ""
+        # is a live empty header S3 rejects), so a None value means REMOVE.
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://external/foo.zarr",
+            credentials=self.CREDS,
+            client_options={"default_headers": {"x-amz-acl": None, "x-custom": "1"}},
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == {"x-custom": "1"}
+
     def test_caller_client_options_are_not_mutated(self, mock_s3):
         s3_cls, _ = mock_s3
         options = {"default_headers": {"x-custom": "1"}}

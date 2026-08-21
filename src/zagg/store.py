@@ -268,9 +268,13 @@ def _s3_object_store(
             # account does not own (issue #495): the ambient execution role
             # covers every in-account store, so injected credentials exist
             # precisely to write somewhere else. A custom ``endpoint_url`` is
-            # excluded deliberately -- canned ACLs are an AWS-S3 concept and the
+            # excluded deliberately, and that exclusion covers TWO shapes: the
             # S3-compatible stores behind that knob (R2, MinIO) do not implement
-            # them, so the header would be noise at best there.
+            # canned ACLs at all, so the header would be noise at best there;
+            # and an endpoint-routed AWS target (the retired ``data.source.coop``
+            # proxy hop was reached exactly that way) is excluded with them.
+            # Retiring that hop -- and the egress it paid -- is what this header
+            # buys, so the exclusion costs nothing under the no-egress rule.
             kwargs["client_options"] = _with_bucket_owner_acl(kwargs.get("client_options"))
         s3 = S3Store(**opts, **kwargs)
     elif kwargs.get("skip_signature"):
@@ -305,10 +309,19 @@ def _with_bucket_owner_acl(client_options):
     lowercases them itself) and is what makes that precedence real: a
     mixed-case ``X-Amz-Acl`` would slip past the ``setdefault`` and then lose
     to our key inside obstore, where last insertion wins.
+
+    Passing ``{"x-amz-acl": None}`` in ``default_headers`` REMOVES the header
+    instead of setting one -- the escape hatch for a future external AWS target
+    that must send no ACL at all. It exists because neither obstore-legal value
+    can express absence (obstore rejects a ``None`` header value, and ``""`` is
+    a live empty ``x-amz-acl`` S3 rejects), and it keeps the derivation itself
+    knob-free: no config surface, no per-run flag.
     """
     options = dict(client_options or {})
     headers = {str(k).lower(): v for k, v in (options.get("default_headers") or {}).items()}
     headers.setdefault("x-amz-acl", _BUCKET_OWNER_ACL)
+    if headers["x-amz-acl"] is None:
+        del headers["x-amz-acl"]
     options["default_headers"] = headers
     return options
 
