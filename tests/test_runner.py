@@ -1600,6 +1600,100 @@ class TestIdentityCountsNotApplicableRollup:
         assert "touch_skipped_paths" not in clean
 
 
+class TestDeclaredTouchPolicyReachesTheRootTouch:
+    """Issue #501 END TO END through the local runner's store-root touch.
+
+    Every lifecycle test calls ``touch_store_root`` directly, so without this
+    the ``policy=get_touch_policy(config)`` kwarg at the ``_run_local`` root
+    seam could be deleted with the suite green — and an operator who declared
+    ``output.touch: never`` on an archival destination would still get the D6
+    manifest and the aggregation core self-copied on every all-skip run
+    (review finding on PR #496).
+    """
+
+    def _run(self, monkeypatch, atl06_config, tmp_path, *, touch):
+        import zagg.grids as grids_mod
+        import zagg.hive as hive_mod
+        from zagg import runner
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
+        # Every unit is CURRENT: the run writes nothing, which is exactly when
+        # the root objects would otherwise age out from under fresh leaves.
+        monkeypatch.setattr(
+            hive_mod,
+            "process_and_write_hive",
+            lambda shard_key, *a, **k: {
+                "shard_key": shard_key,
+                "current": True,
+                "identity": "equal",
+                "touched_objects": 0,
+                "touch_failed": 0,
+                "error": None,
+            },
+        )
+        atl06_config.output["store_layout"] = "hive"
+        atl06_config.output["coverage_moc"] = False
+        atl06_config.output.setdefault("sweep", False)
+        if touch is not None:
+            atl06_config.output["touch"] = touch
+        return runner._run_local(
+            atl06_config,
+            _run_catalog(),
+            str(tmp_path / "store"),
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+
+    def test_never_leaves_the_root_objects_alone(self, monkeypatch, atl06_config, tmp_path):
+        summary = self._run(monkeypatch, atl06_config, tmp_path, touch="never")
+        assert summary["cells_current"] == 4  # premise: the root touch seam ran
+        assert summary["objects_touched"] == 0 and summary["touch_failures"] == 0
+        # Not applicable, recorded — three root paths, none of them touched.
+        assert summary["touch_skipped_paths"] == 3
+
+    def test_the_staged_sweep_chaining_carries_the_policy(
+        self, monkeypatch, atl06_config, tmp_path
+    ):
+        # The staged sweep's finisher self-copies the root aggregation core, so
+        # the ONE sweep caller that holds a config must hand it the policy —
+        # otherwise `never` on an archival destination still pays one full-size
+        # root-core version per staged sweep (review finding on PR #496).
+        import zagg.sweep as sweep_mod
+        import zagg.sweep_stages as stages_mod
+
+        monkeypatch.setattr(sweep_mod, "leaves_from_stats_records", lambda *a, **k: [(1, None)])
+        monkeypatch.setattr(sweep_mod, "sweep_after_run", lambda *a, **k: None)
+        seen = {}
+        monkeypatch.setattr(
+            stages_mod,
+            "stage_sweep_after_run",
+            lambda *a, **k: seen.update(k),
+        )
+        atl06_config.output["sweep"] = "stages"
+        self._run(monkeypatch, atl06_config, tmp_path, touch="never")
+        assert seen["touch_policy"] == "never"
+
+    def test_absent_still_touches_the_root(self, monkeypatch, atl06_config, tmp_path):
+        # `auto` is the default and the issue #495 phase 4 inference: a local
+        # store is not published, so the root objects that exist are touched
+        # and the conditional not-applicable key stays absent.
+        summary = self._run(monkeypatch, atl06_config, tmp_path, touch=None)
+        assert summary["cells_current"] == 4
+        assert summary["objects_touched"] > 0 and summary["touch_failures"] == 0
+        assert "touch_skipped_paths" not in summary
+
+
 class TestSummaryKeysByteIdentical:
     """The dispatch refactor (#63) must leave the run-summary dict keys -- and
     the data/error counting -- byte-identical for both backends.
