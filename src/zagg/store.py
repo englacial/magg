@@ -300,9 +300,14 @@ def _with_bucket_owner_acl(client_options):
     Additive rather than replacing: any other client option survives, and an
     ``x-amz-acl`` the caller set explicitly wins -- the header is a default for
     external targets, not an override of a caller who knows better.
+
+    Caller header keys are lowercased first, which is lossless (obstore
+    lowercases them itself) and is what makes that precedence real: a
+    mixed-case ``X-Amz-Acl`` would slip past the ``setdefault`` and then lose
+    to our key inside obstore, where last insertion wins.
     """
     options = dict(client_options or {})
-    headers = dict(options.get("default_headers") or {})
+    headers = {str(k).lower(): v for k, v in (options.get("default_headers") or {}).items()}
     headers.setdefault("x-amz-acl", _BUCKET_OWNER_ACL)
     options["default_headers"] = headers
     return options
