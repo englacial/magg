@@ -354,6 +354,11 @@ def run_finisher(
     )
     out["objects_touched"] = touch["touched"]
     out["touch_failures"] = touch["failed"]
+    # A published target is not applicable rather than touched or failed
+    # (issue #495 phase 4); absent when zero, so an unpublished sweep record
+    # keeps exactly the key set it had.
+    if touch.get("skipped_paths"):
+        out["touch_skipped_paths"] = touch["skipped_paths"]
     if release is not None:
         out["lease_released"] = bool(release())
     return out

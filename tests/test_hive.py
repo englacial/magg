@@ -1152,6 +1152,34 @@ class TestLeafSkipIfCurrent:
         assert set(after) == set(before)
         assert all(mtime > aged_ns for mtime in after.values())
         assert meta["touched_objects"] == len(after) and meta["touch_failed"] == 0
+        # A touch that RAN carries no not-applicable key: the issue #495
+        # phase-4 field is conditional, so an unpublished record is
+        # byte-identical to what it was before that phase.
+        assert "touch_skipped_paths" not in meta
+
+    def test_a_published_skip_is_recorded_not_silently_zero(self, monkeypatch, cfg, tmp_path):
+        # Issue #495 phase 4 (review finding on PR #496). The touch is NOT
+        # APPLICABLE on a published bucket, but touched_objects: 0 /
+        # touch_failed: 0 is byte-identical to a touch that never ran -- so
+        # the not-applicable path count has to reach the durable record, or
+        # an operator auditing a published campaign cannot tell the two
+        # apart. The touch itself is pinned in tests/test_lifecycle.py; this
+        # pins the seam that WRITES the record.
+        import zagg.lifecycle as lifecycle_mod
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        self._arm_boom(monkeypatch)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "touch_current_unit",
+            lambda *_a, **_k: {"touched": 0, "failed": 0, "skipped_paths": 4},
+        )
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert meta["current"] is True
+        assert meta["touched_objects"] == 0 and meta["touch_failed"] == 0
+        assert meta["touch_skipped_paths"] == 4
 
     def test_gate_is_off_by_default(self, monkeypatch, cfg, tmp_path):
         # Byte-identical default: without skip_if_current the seam rewrites

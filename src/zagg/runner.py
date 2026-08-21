@@ -1149,6 +1149,7 @@ class RasterStrategy:
                 root_touch = touch_store_root(store_path, store_kwargs=store_kwargs)
                 identity["objects_touched"] += root_touch["touched"]
                 identity["touch_failures"] += root_touch["failed"]
+                _add_skipped_paths(identity, root_touch)
         # Store-root refusal manifest (issue #388) — see _write_refusals.
         refusal_manifest_path = _write_refusals(
             store_path, ok_metas, identity, run_id, run_semantic_hash, store_kwargs
@@ -2875,15 +2876,40 @@ def _identity_counts(metas) -> dict:
       here, never folded into ``cells_error``). The local paths ADD the
       once-per-run ``touch_store_root`` counts to these after the fact — the
       root objects belong to no unit, so they cannot come from ``metas``.
+    - ``touch_skipped_paths`` — PATHS (not objects) the touch found NOT
+      APPLICABLE because they live on a published bucket (issue #495 phase 4,
+      ``zagg.lifecycle._skip_published``). CONDITIONAL: present only when
+      non-zero, so a run that touches nothing published carries exactly the
+      key set it did before. Without it a published run records
+      ``objects_touched: 0, touch_failures: 0`` — byte-identical to a touch
+      that never ran, which is the ambiguity the skip must not inherit.
     """
     metas = [m for m in metas if isinstance(m, dict)]
-    return {
+    counts = {
         "cells_current": sum(1 for m in metas if m.get("current")),
         "cells_refused": sum(1 for m in metas if m.get("refused")),
         "cells_unrecorded": sum(1 for m in metas if m.get("identity") == "unrecorded-ids"),
         "objects_touched": sum(int(m.get("touched_objects") or 0) for m in metas),
         "touch_failures": sum(int(m.get("touch_failed") or 0) for m in metas),
     }
+    skipped = sum(int(m.get("touch_skipped_paths") or 0) for m in metas)
+    if skipped:
+        counts["touch_skipped_paths"] = skipped
+    return counts
+
+
+def _add_skipped_paths(identity: dict, touch: dict) -> None:
+    """Roll a store-root touch's not-applicable PATH count into ``identity``.
+
+    The root objects belong to no unit, so they never reach
+    :func:`_identity_counts` through ``metas``. Conditional on both sides —
+    the key appears only once something was actually skipped (issue #495
+    phase 4).
+    """
+    if touch.get("skipped_paths"):
+        identity["touch_skipped_paths"] = (
+            identity.get("touch_skipped_paths", 0) + touch["skipped_paths"]
+        )
 
 
 def _warn_partial_auth_denials(metas) -> int:
@@ -3295,6 +3321,7 @@ def _run_local(
         root_touch = touch_store_root(store_path, store_kwargs=store_kwargs)
         identity["objects_touched"] += root_touch["touched"]
         identity["touch_failures"] += root_touch["failed"]
+        _add_skipped_paths(identity, root_touch)
     refusal_manifest_path = _write_refusals(
         store_path, report.results, identity, run_id, run_semantic_hash, store_kwargs
     )

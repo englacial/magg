@@ -1475,6 +1475,31 @@ class TestRasterHiveWorker:
         assert set(after) == set(before)
         assert all(mtime > aged_ns for mtime in after.values())
         assert skipped["touched_objects"] == len(after) and skipped["touch_failed"] == 0
+        # Conditional key (issue #495 phase 4): a touch that RAN carries no
+        # not-applicable count, so this record is what it was before.
+        assert "touch_skipped_paths" not in skipped
+
+    def test_a_published_skip_is_recorded_not_silently_zero(self, tmp_path, monkeypatch):
+        # Mirror of the aggregation seam (issue #495 phase 4, review finding
+        # on PR #496): touched_objects: 0 / touch_failed: 0 cannot be told
+        # from a touch that never ran -- the comment at the bottom of
+        # zagg/processing/raster.py names that exact ambiguity -- so the
+        # not-applicable PATH count is recorded too.
+        import zagg.lifecycle as lifecycle_mod
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "touch_current_unit",
+            lambda *_a, **_k: {"touched": 0, "failed": 0, "skipped_paths": 3},
+        )
+        skipped = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert skipped["current"] is True
+        assert skipped["touched_objects"] == 0 and skipped["touch_failed"] == 0
+        assert skipped["touch_skipped_paths"] == 3
 
     def test_contraction_refuses_without_the_flag(self, tmp_path, monkeypatch):
         import zagg.processing.raster as raster_mod
