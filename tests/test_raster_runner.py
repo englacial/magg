@@ -1334,6 +1334,13 @@ class TestRasterHiveLambdaBackend:
         monkeypatch.setattr(
             hive, "open_object_store", lambda path, **kw: real_open_object(_translate(path))
         )
+        # The ping's write probe (issue #495) resolves open_object_store from
+        # zagg.store at call time, so the remap has to cover that binding too --
+        # otherwise the probe builds a REAL S3 store for s3://bucket/... and the
+        # preflight fails on credentials instead of exercising the handler.
+        monkeypatch.setattr(
+            store_mod, "open_object_store", lambda path, **kw: real_open_object(_translate(path))
+        )
         # The handler binds open_store at its own import; patch that binding too.
         monkeypatch.setattr(
             handler_mod, "open_store", lambda path, **kw: real_open_store(_translate(path))
