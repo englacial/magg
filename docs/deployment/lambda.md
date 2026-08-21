@@ -164,8 +164,13 @@ the *writing* account, so without that canned ACL a cross-account PUT under the
 `ObjectWriter` setting leaves objects the bucket owner cannot manage or delete —
 Source Cooperative's in-region upload path requires it. It is derived, not
 configured: there is no ACL knob to set, and in-account (execution-role) writes
-never send the header. Custom-endpoint targets (R2, MinIO) are excluded, since
-canned ACLs are an AWS-S3 concept those stores do not implement.
+never send the header. Any target reached through an `endpointUrl` is excluded —
+both the S3-compatible stores behind that knob (R2, MinIO), which do not
+implement canned ACLs at all, and an endpoint-routed *AWS* target such as the
+retired `data.source.coop` proxy hop, which this native-write path exists to
+replace. A caller that must send no ACL at all can pass
+`client_options={"default_headers": {"x-amz-acl": None}}`, which strips the
+header; nothing in the Lambda config surface does.
 
 ## Deployment
 
