@@ -69,8 +69,8 @@ EXECUTION_ROLE_NAME="${EXECUTION_ROLE_NAME:-$DEFAULT_EXECUTION_ROLE_NAME}"  # pu
 # role name asks CloudFormation to create a role the first stack already owns:
 # EntityAlreadyExists, then ROLLBACK. That failure is live-AWS-only and lands
 # minutes in, which is the class this script exists to pre-empt (review finding
-# on PR #496) -- the CREATE_ROLE pair the named role replaced carried a guard
-# for the same mistake. Being explicit is what satisfies it: name the role.
+# on PR #496) -- the bring-your-own-role pair the named role replaced carried a
+# guard for the same mistake. Being explicit is what satisfies it: name the role.
 if [ "$STACK_NAME" != "$DEFAULT_STACK_NAME" ] && \
    [ "$EXECUTION_ROLE_NAME" = "$DEFAULT_EXECUTION_ROLE_NAME" ]; then
     echo "ERROR: STACK_NAME='$STACK_NAME' is a second stack, but EXECUTION_ROLE_NAME is"

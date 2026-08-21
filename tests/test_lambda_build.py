@@ -7,6 +7,7 @@ These tests verify that:
 """
 
 import inspect
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -365,8 +366,40 @@ class TestTemplateEnvironment:
                         roles.append(resource["Properties"]["Role"])
             elif val.get("Type") == "AWS::Lambda::Function":
                 roles.append(val["Properties"]["Role"])
-        assert roles, "no Lambda functions found in the template"
+        # Count, not just `all(...)`: a vacuous all() holds on a SUBSET, so
+        # deleting a whole worker variant would leave this green. Five is what
+        # the template yields -- base, -extract, and the three Fn::ForEach
+        # blocks -- and five is the number of Role: sites the comment names.
+        assert len(roles) == 5, roles
         assert all(r == {"GetAtt": "ExecutionRole.Arn"} for r in roles), roles
+
+    def test_execution_role_permissions_are_fully_inline(self):
+        # Salvaged from the deleted test_execution_role_gains_no_source_coop_access
+        # (review finding): every assertion in this file reads the role's
+        # inline Policies, and that reasoning is sound ONLY while the role has
+        # no attached managed policy -- one could carry bucket access none of
+        # these tests can see.
+        role = self._load_template()["Resources"]["ExecutionRole"]
+        assert "ManagedPolicyArns" not in json.dumps(role), (
+            "the ExecutionRole attaches a managed policy -- its permissions are "
+            "no longer fully described inline, so the assertions in this file "
+            "can no longer see everything it grants"
+        )
+
+    def test_the_second_stack_command_overrides_the_role_name(self):
+        # IAM role names are ACCOUNT-scoped, so the one in-repo command that
+        # stands up a second stack must pass EXECUTION_ROLE_NAME or CREATE
+        # fails with EntityAlreadyExists (review finding). stand_up.sh refuses
+        # the combination up front; this pins that the documented command does
+        # not hit that refusal.
+        doc = (REPO_ROOT / "docs" / "deployment" / "benchmark-cicd.md").read_text()
+        block = doc.split("## 8. The `process-shard-test` stack", 1)[1]
+        block = block.split("```bash", 1)[1].split("```", 1)[0]
+        assert "STACK_NAME=zagg-backend-test" in block
+        assert "EXECUTION_ROLE_NAME=zagg-lambda-execution-test" in block
+        standup = (REPO_ROOT / "deployment" / "aws" / "stand_up.sh").read_text()
+        assert 'DEFAULT_EXECUTION_ROLE_NAME="zagg-lambda-execution"' in standup
+        assert '[ "$STACK_NAME" != "$DEFAULT_STACK_NAME" ]' in standup
 
     def test_metric_filters_publish_recycle_error_split(self):
         # issue #175: under RecycleMaxInvocations=1 every async invocation
