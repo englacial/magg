@@ -393,10 +393,16 @@ churn.
 OUTPUT_BUCKET=sliderule-public \
 STACK_NAME=zagg-backend-test \
 FUNCTION_NAME=process-shard-test \
+EXECUTION_ROLE_NAME=zagg-lambda-execution-test \
   ./deployment/aws/stand_up.sh
 ```
 
 (`stand_up.sh` passes `FUNCTION_NAME` to the template's `FunctionName` parameter.)
+`EXECUTION_ROLE_NAME` is **required** here: IAM role names are account-scoped
+and the production stack already owns the default `zagg-lambda-execution`
+([issue #495](https://github.com/englacial/zagg/issues/495)), so without the
+override CloudFormation fails with `EntityAlreadyExists` and rolls back.
+`stand_up.sh` refuses up front rather than letting that happen against live AWS.
 Subsequent PR deploys only `update-function-code`, so the stack is stood up once.
 **Verify:** `aws lambda get-function --function-name process-shard-test` returns
 the function.
