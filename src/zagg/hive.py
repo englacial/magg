@@ -1531,6 +1531,13 @@ def process_and_write_hive(
                     counts = {"touched": 0, "failed": 1}
                 unit_meta["touched_objects"] = counts["touched"]
                 unit_meta["touch_failed"] = counts["failed"]
+                # A published target is NOT APPLICABLE, not failed (issue #495
+                # phase 4) — but the pair above records that as 0/0, which is
+                # byte-identical to a touch that never ran. Recorded so the
+                # run parquet and the .status objects say it out loud; absent
+                # when zero, so every non-published record stays as it was.
+                if counts.get("skipped_paths"):
+                    unit_meta["touch_skipped_paths"] = counts["skipped_paths"]
             return unit_meta
 
     box: dict = {}

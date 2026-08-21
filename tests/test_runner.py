@@ -1556,6 +1556,50 @@ class TestClampedDataSource:
         assert _clamped_data_source({"granule_workers": 4}, 1) == {"granule_workers": 1}
 
 
+class TestIdentityCountsNotApplicableRollup:
+    """The issue #495 phase-4 not-applicable count reaches the run summary.
+
+    A published store's touch is skipped, and ``objects_touched: 0`` /
+    ``touch_failures: 0`` is byte-identical to a touch that never ran -- so
+    the skip has to be visible in the durable record, not only in a
+    CloudWatch INFO line (review finding on PR #496).
+    """
+
+    def test_skipped_paths_roll_up_from_the_unit_records(self):
+        from zagg.runner import _identity_counts
+
+        metas = [
+            {"current": True, "touched_objects": 0, "touch_failed": 0, "touch_skipped_paths": 4},
+            {"current": True, "touched_objects": 0, "touch_failed": 0, "touch_skipped_paths": 4},
+        ]
+        counts = _identity_counts(metas)
+        assert counts["objects_touched"] == 0 and counts["touch_failures"] == 0
+        assert counts["touch_skipped_paths"] == 8
+
+    def test_the_key_is_absent_when_nothing_was_skipped(self):
+        # Conditional by design: a run that touches nothing published keeps
+        # exactly the key set it had before phase 4 (pinned as a SET by
+        # TestSummaryKeysByteIdentical._IDENTITY_KEYS below).
+        from zagg.runner import _identity_counts
+
+        counts = _identity_counts([{"current": True, "touched_objects": 6, "touch_failed": 0}])
+        assert counts["objects_touched"] == 6
+        assert "touch_skipped_paths" not in counts
+
+    def test_the_store_root_touch_adds_to_the_same_key(self):
+        # The root objects belong to no unit, so they never arrive through
+        # ``metas`` -- the local paths add them after the fact.
+        from zagg.runner import _add_skipped_paths, _identity_counts
+
+        identity = _identity_counts([{"current": True, "touch_skipped_paths": 4}])
+        _add_skipped_paths(identity, {"touched": 0, "failed": 0, "skipped_paths": 3})
+        assert identity["touch_skipped_paths"] == 7
+        # ...and adds nothing when the root touch actually ran.
+        clean = _identity_counts([{"current": True, "touched_objects": 6, "touch_failed": 0}])
+        _add_skipped_paths(clean, {"touched": 3, "failed": 0})
+        assert "touch_skipped_paths" not in clean
+
+
 class TestSummaryKeysByteIdentical:
     """The dispatch refactor (#63) must leave the run-summary dict keys -- and
     the data/error counting -- byte-identical for both backends.

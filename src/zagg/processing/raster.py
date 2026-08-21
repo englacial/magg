@@ -1360,6 +1360,13 @@ def process_and_write_raster_hive(
                     counts = {"touched": 0, "failed": 1}
                 out["touched_objects"] = counts["touched"]
                 out["touch_failed"] = counts["failed"]
+                # Not-applicable paths (issue #495 phase 4) — same posture as
+                # the aggregation seam: the pair above records a published
+                # skip as 0/0, indistinguishable from a touch that never ran
+                # (the exact ambiguity the comment at the bottom of this
+                # module names). Absent when zero.
+                if counts.get("skipped_paths"):
+                    out["touch_skipped_paths"] = counts["skipped_paths"]
             return out
     # The leaf's own time axis, from the dispatched subset. Every group key in
     # the subset is in this index by construction, so the worker never trips
