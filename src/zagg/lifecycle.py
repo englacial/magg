@@ -17,6 +17,17 @@ across the unit's WHOLE footprint (lifecycle rules act per object):
   artifact agree (``column-drift`` never reaches the touch), so the caller
   simply passes the column path on the declared arm and ``None`` otherwise.
 
+**Not applicable to a PUBLISHED bucket** (issue #495 phase 4). The touch
+exists to defeat an expiration rule; an archival published bucket has none, so
+there is nothing to defeat — and on a VERSIONED bucket the self-copy is
+actively harmful, for the reason the ``versioned`` bullet below already names:
+it writes a new FULL-SIZE version and demotes the old one to noncurrent, where
+it keeps consuming storage. Source Cooperative's bucket is versioned, so one
+full-skip run over the CA store would add ~332 GB of noncurrent versions and
+double the footprint — invisibly, since ``ListObjectsV2`` reports only current
+versions — on a bucket where AWS pays the bill as an Open Data sponsor. See
+:func:`_skip_published`.
+
 Mechanism: local stores get ``os.utime``; S3 gets a server-side self-copy
 (``CopyObject`` onto itself with ``MetadataDirective="REPLACE"`` — S3
 rejects an identity copy without it; already a ``boto3`` dependency, and
@@ -178,18 +189,34 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
     ``endpoint_url``) and keys the S3 client. Returns ``{"touched": n,
     "failed": m}`` and never raises — an unexpected error (client build, LIST
     fault) counts one failure and abandons the remainder (best-effort).
+
+    A path on a PUBLISHED bucket is NOT APPLICABLE rather than failed (issue
+    #495 phase 4, :func:`_skip_published`): it is counted under a ``"skipped"``
+    key, added only when non-zero, and never touches ``"failed"`` — so a
+    published run reports ``touched_objects: 0, touch_failed: 0`` and cannot be
+    read as an error in the run parquet or the status objects. The key is
+    omitted when zero to leave every existing caller's dict byte-identical,
+    mirroring how the unit records omit ``touched_objects`` entirely when no
+    touch ran.
     """
     counts = {"touched": 0, "failed": 0}
+    skipped = 0
     try:
         for tree in trees:
             if _is_s3(tree):
-                acl = _copy_acl(store_kwargs, _split_s3(tree)[0])
-                _touch_s3_tree(_client(store_kwargs), tree, counts, acl)
+                bucket = _split_s3(tree)[0]
+                if _skip_published(bucket):
+                    skipped += 1
+                    continue
+                _touch_s3_tree(_client(store_kwargs), tree, counts, _copy_acl(store_kwargs, bucket))
             else:
                 _touch_local_tree(tree, counts)
         for obj in objects:
             if _is_s3(obj):
                 bucket, key = _split_s3(obj)
+                if _skip_published(bucket):
+                    skipped += 1
+                    continue
                 acl = _copy_acl(store_kwargs, bucket)
                 _touch_s3_object(_client(store_kwargs), bucket, key, counts, acl=acl)
             else:
@@ -197,6 +224,13 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
     except Exception as e:
         counts["failed"] += 1
         logger.warning(f"lifecycle touch aborted mid-footprint (fail-open, issue #388): {e}")
+    if skipped:
+        counts["skipped"] = skipped
+        logger.info(
+            f"lifecycle touch not applicable for {skipped} published path(s) — an archival "
+            "published bucket has no expiration rule to defeat, and it is versioned, so a "
+            "self-copy would only mint noncurrent versions (issue #495 phase 4)"
+        )
     return counts
 
 
@@ -228,6 +262,28 @@ def _client(store_kwargs):
         if key not in _CLIENTS:
             _CLIENTS[key] = _s3_client(store_kwargs)
         return _CLIENTS[key]
+
+
+def _skip_published(bucket) -> bool:
+    """Whether ``bucket`` is a published target the touch must leave alone.
+
+    Guarded on membership in :data:`zagg.store._PUBLISHED_BUCKETS`, NOT on
+    ``_external_target(...)``, and the difference is load-bearing:
+    ``_external_target`` is also true for injected-credential targets, whose
+    lifecycle and versioning configuration we do not know. Skipping the touch
+    on one of those could let a collaborator's data expire — the exact failure
+    the touch exists to prevent. Only the published set is known not to expire.
+
+    Note the set is doing DOUBLE DUTY here. It enumerates buckets that are both
+    (a) not ours, which is what the canned ACL keys on, and (b) not expiring,
+    which is what this skip keys on. Those two properties coincide today rather
+    than being the same thing; if they ever diverge — a published bucket that
+    does expire, or a non-owned bucket that does not — the touch needs its own
+    set and this predicate must stop borrowing that one.
+    """
+    from .store import _PUBLISHED_BUCKETS
+
+    return bucket in _PUBLISHED_BUCKETS
 
 
 def _copy_acl(store_kwargs, bucket) -> str | None:

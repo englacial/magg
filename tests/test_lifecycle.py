@@ -304,22 +304,48 @@ class TestTouchS3:
         assert calls
         assert {c.kwargs["ACL"] for c in calls} == {_BUCKET_OWNER_ACL}
 
-    def test_ambient_published_target_copies_carry_the_acl(self, monkeypatch):
-        # The fleet publishes to Source Cooperative with the AMBIENT execution
-        # role since phase 3, so a credentials-only predicate would let the
-        # skip-run self-copy strip the ownership on exactly the published path
-        # it exists to protect. The DESTINATION bucket decides (review finding
-        # on PR #496).
-        from zagg.store import _BUCKET_OWNER_ACL
-
+    def test_published_target_is_not_touched_at_all(self, monkeypatch):
+        # Issue #495 phase 4. The touch exists to defeat an expiration rule;
+        # an archival published bucket has none, and it IS versioned, so a
+        # self-copy would not refresh a timestamp in place -- it writes a new
+        # full-size version and demotes the old one to noncurrent, where it
+        # keeps consuming storage on a bucket AWS pays for as an Open Data
+        # sponsor. One full-skip run over the CA store would add ~332 GB that
+        # ListObjectsV2 does not even show. So: no LIST, no HEAD, no copy.
         client = self._client(monkeypatch)
-        lifecycle.touch_current_unit(
+        counts = lifecycle.touch_current_unit(
             f"s3://us-west-2.opendata.source.coop/englacial/zagg/demo/store/-5/1/{LEAF}",
             store_kwargs={"region": "us-west-2", "credentials": None, "endpoint_url": None},
         )
-        calls = client.copy_object.call_args_list
-        assert calls
-        assert {c.kwargs["ACL"] for c in calls} == {_BUCKET_OWNER_ACL}
+        assert client.copy_object.call_args_list == []
+        assert client.head_object.call_args_list == []
+        assert client.get_paginator.call_args_list == []
+        # Not applicable, NOT failed: a published run must not read as an error
+        # in the run parquet or the status objects.
+        assert counts["failed"] == 0
+        assert counts["touched"] == 0
+        assert counts["skipped"] > 0
+
+    def test_published_skip_is_keyed_on_the_bucket_not_the_credentials(self, monkeypatch):
+        # The guard is `bucket in _PUBLISHED_BUCKETS`, never
+        # `_external_target(...)`. The two differ, and the difference is
+        # load-bearing: _external_target is also true for injected-credential
+        # targets, whose lifecycle and versioning config we do not know.
+        # Skipping those could let a collaborator's data EXPIRE -- the exact
+        # failure the touch exists to prevent. Only the published set is known
+        # not to expire.
+        from zagg.store import _external_target
+
+        creds = {"accessKeyId": "ASIA", "secretAccessKey": "s"}
+        assert _external_target(creds, None, self.BUCKET), "premise: external but not published"
+        client = self._client(monkeypatch)
+        counts = lifecycle.touch_current_unit(
+            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
+            store_kwargs={"region": "us-west-2", "credentials": creds, "endpoint_url": None},
+        )
+        assert client.copy_object.call_args_list, "an un-negotiated target must still be touched"
+        assert counts["touched"] > 0
+        assert "skipped" not in counts
 
     def test_in_account_copies_carry_no_acl(self, monkeypatch):
         # Ambient execution-role touch of our own bucket: nothing to hand over,
