@@ -440,8 +440,9 @@ class Run:
         ----------
         config : PipelineConfig, dict, or str
             A loaded :class:`~zagg.config.PipelineConfig`, a plain config
-            dict, or a path to a YAML config file. Dicts and paths are
-            validated on load.
+            dict, or a path to a YAML config file. **Every** shape is
+            cross-validated here (issue #472), including an already-built
+            ``PipelineConfig`` that was mutated after ``default_config``.
         shardmap : dict or str, optional
             A loaded ShardMap manifest dict or a path to its JSON. Falls back
             to the config's ``catalog:`` key. The map's grid signature must
@@ -479,7 +480,6 @@ class Run:
             config = load_config(config)
         elif isinstance(config, dict):
             config = load_config_from_dict(config)
-            validate_config(config)
 
         # v1 scope gate: the spatial point path only. The other pipelines
         # already run through agg()/zagg.notebook.run; refusing here beats a
@@ -501,6 +501,17 @@ class Run:
                 "configs fan out (shard, window) units — use zagg.runner.agg / "
                 "zagg.notebook.run until the v2 transport (issue #327)"
             )
+
+        # Cross-validate EVERY input shape, not just the dict/path ones (issue
+        # #472): a ``PipelineConfig`` from ``default_config`` validates once, at
+        # build time, so a notebook that then grafts another template's
+        # ``aggregation.variables`` onto it (the 02_write graft) dispatched a
+        # config nothing had re-checked — and the error surfaced one invoke per
+        # shard later, fleet-side. Runs after the scope gates above so an
+        # out-of-scope pipeline still gets its "use agg" pointer rather than a
+        # config error for a facade it was never going to run through, and
+        # before the shard map / store resolution so nothing touches AWS first.
+        validate_config(config)
 
         if isinstance(shardmap, dict):
             catalog_data = shardmap

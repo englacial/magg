@@ -48,6 +48,7 @@ from zagg.config import (
     get_sweep,
     get_touch_policy,
     get_windowing,
+    validate_config,
 )
 from zagg.dispatch import (
     BENIGN_ERRORS,
@@ -342,6 +343,20 @@ def agg(
         Summary with keys: ``total_cells``, ``cells_with_data``,
         ``cells_error``, ``total_obs``, ``wall_time_s``, ``store_path``.
     """
+    # The validation choke point for this entry (issue #485): direct agg
+    # callers on any backend or pipeline kind, plus zagg.notebook.run, whose
+    # dispatch bottoms out here — so a PipelineConfig mutated after
+    # load_config's own call (the issue #472 graft) is refused before agg
+    # reads a catalog, touches a store, or invokes. Two sibling seams call
+    # validate_config themselves rather than routing through this one, and
+    # both must stay: client.Run.from_config dispatches via Run/StatusPoller,
+    # never through agg (client.py, same error text), and notebook.run repeats
+    # the call above its max_cost_preview branch, which reads the shardmap
+    # before reaching agg. validate_config branches on pipeline kind itself,
+    # so the temporal and raster paths get their own (smaller) checks rather
+    # than a false refusal.
+    validate_config(config)
+
     # Pipeline kind picks the strategy (issue #12, Phase 5). The strategy seam
     # is dispatch-level: the spatial path is the existing code, moved verbatim
     # into SpatialStrategy so its behavior/output stays byte-identical; the

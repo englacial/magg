@@ -51,15 +51,13 @@ def _checked_toc_source(columns, config) -> dict:
     a per-cell namespace or the pooled column dict can be checked without
     gathering anything.
     """
-    from zagg.time_axis import toc_source
+    from zagg.time_axis import TOC_NO_CLOCK_ERROR, toc_source
 
     source = toc_source(config)
     if source is None:
-        raise ValueError(
-            "a field declares a temporal companion but the store has no per-observation "
-            "clock — declare output.time_source {field, epoch, scale, units} (spec §8.3, "
-            "issue #410)"
-        )
+        # Defense in depth: validate_config refuses this at submission with the
+        # same single-sourced message (issue #472).
+        raise ValueError(TOC_NO_CLOCK_ERROR)
     if source["field"] not in columns:
         raise ValueError(
             f"output.time_source.field {source['field']!r} is not in the cell data "

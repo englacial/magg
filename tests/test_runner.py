@@ -1,6 +1,8 @@
 """Tests for the runner module (Python API)."""
 
+import copy
 import json
+import re
 import warnings
 from datetime import datetime, timezone
 
@@ -72,6 +74,84 @@ class TestRunValidation:
     def test_lambda_requires_s3_store(self, atl06_config, catalog_file):
         with pytest.raises(ValueError, match="s3://"):
             agg(atl06_config, catalog=catalog_file, store="./local.zarr", backend="lambda")
+
+
+class TestAggValidatesConfig:
+    """``agg`` is the single ``validate_config`` choke point (issue #485).
+
+    ``Run.from_config`` closed the facade seam (issue #472); a mutated
+    ``PipelineConfig`` handed to ``agg`` directly — the local backend and the
+    raster/temporal branches the facade's v1 gates refuse — still reached the
+    workers unvalidated. The refusal must land before catalog/store
+    resolution, so these tests pass neither.
+    """
+
+    def _graft(self):
+        # The issue #472 shape: temporal variables grafted onto a validated
+        # base after default_config's own validation already ran.
+        base = default_config("atl03_tdigest_healpix_hive")
+        located = default_config("atl03_tdigest_located_healpix")
+        base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
+        return base
+
+    def test_grafted_config_refused_before_catalog_resolution(self):
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            agg(self._graft())  # no catalog, no store: validation must win
+
+    def test_notebook_run_shares_the_choke_point(self):
+        from zagg.notebook import run as notebook_run
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            notebook_run(self._graft())
+
+    def test_notebook_run_refuses_before_the_cost_preview(self, tmp_path):
+        # The wrapper's own ordering (issue #485): with a catalog= the run
+        # would preview first, and max_cost_preview loads the shardmap — so
+        # without notebook.run's pre-preview call this raises FileNotFoundError
+        # and the config refusal never surfaces.
+        from zagg.notebook import run as notebook_run
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        missing = str(tmp_path / "no_such_shardmap.json")
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            notebook_run(self._graft(), catalog=missing)
+
+    def test_valid_config_reaches_catalog_resolution(self, atl06_config):
+        # Positive control: a conformant config passes validation and fails on
+        # the *next* check (TestRunValidation's missing-catalog refusal), so
+        # the new call refuses nothing that ran before.
+        with pytest.raises(ValueError, match="No catalog"):
+            agg(atl06_config)
+
+    # The next two pin the seam at ``agg`` rather than inside SpatialStrategy:
+    # each drives a non-spatial kind and asserts the *validator's* message, not
+    # the strategy's own first refusal. Move the call down into
+    # SpatialStrategy.run and temporal raises its "requires events=" error /
+    # raster its "No catalog specified" instead, and both fail.
+
+    def test_temporal_config_validated_at_the_same_seam(self):
+        cfg = _temporal_config()
+        del cfg.aggregation["variables"]["max_t2m"]["temporal_reducer"]
+        with pytest.raises(ValueError, match="missing required key.*temporal_reducer"):
+            agg(cfg)
+
+    def test_raster_config_validated_at_the_same_seam(self):
+        from zagg.config import load_config_from_dict
+
+        cfg = load_config_from_dict(
+            {
+                "data_source": {"reader": "raster", "bands": {"red": {"asset": "red"}}},
+                "output": {
+                    "grid": {"type": "healpix", "parent_order": 10, "child_order": 16},
+                    "store": "memory://",
+                },
+            }
+        )
+        with pytest.raises(ValueError, match="requires a string 'dtype'"):
+            agg(cfg)
 
 
 class TestDryRun:
