@@ -154,7 +154,8 @@ def open_store(
         paced :data:`_S3_RETRY_CONFIG` policy (issue #186), or the shorter
         :data:`_S3_READONLY_RETRY_CONFIG` when ``read_only=True``; and
         ``skip_signature=True`` for anonymous reads of public buckets (no
-        AWS credentials needed, e.g. binder).
+        AWS credentials needed, e.g. binder); and ``client_options``, whose
+        ``default_headers`` is where the canned-ACL override lives (see Notes).
 
     Notes
     -----
