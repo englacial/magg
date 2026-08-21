@@ -269,7 +269,24 @@ def run_finisher(
 
     1. the root ``coverage.moc`` refresh (GET-union-PUT, ``source:
        "sweep"``) — sequenced HERE, before any later scoped fan-out reads
-       it: the #380 read-side obligation the partition machinery deferred;
+       it: the #380 read-side obligation the partition machinery deferred.
+       This stage adds no observations, so it PRESERVES the spec §10
+       temporal section rather than refreshing it (issue #487: the staged
+       sweep preserves, the walk tightens — see
+       :func:`zagg.coverage.refresh_root_coverage`). Preserving holds on
+       :func:`zagg.hive.write_root_coverage`'s UNION arm; an unparsable or
+       incompatible standing root is OVERWRITTEN there by design (D9
+       regenerable cache) and the stale section goes with the stale ranges,
+       so on that arm this very call is the dropper — which is why the
+       belt below names no cause. The written payload is checked by
+       :func:`zagg.coverage_toc.warn_if_section_missing` — a
+       temporal-declaring store whose root carries no section gets a logged
+       nudge at ``toc_section_missing`` (issue #488), never a refusal. That
+       key is ALWAYS in the returned dict, like every other one: a run with
+       an empty work set writes no root object and reports ``False``, so the
+       stage record's shape does not depend on the work set. The check runs
+       against step 2's RE-READ manifest, not the caller's admission-time
+       copy, so it judges the declaration the store carries now;
     2. the manifest RMW nesting per-entry actuals inside the level entries
        of ``pyramid.overviews`` (#381 point (7); readers MUST tolerate the
        added key). The leaf entry records the ``leaf-column`` law
@@ -293,6 +310,7 @@ def run_finisher(
     """
     import obstore
 
+    from zagg.coverage_toc import warn_if_section_missing
     from zagg.grids.morton import morton_word
     from zagg.hive import (
         AGGREGATION_CORE_NAME,
@@ -308,21 +326,31 @@ def run_finisher(
     store_kwargs = dict(store_kwargs or {})
     out = {
         "root_moc": False,
+        "toc_section_missing": False,
         "manifest_updated": False,
         "objects_touched": 0,
         "touch_failures": 0,
         "lease_released": False,
     }
     shard_order = int(manifest["shard_order"])
+    written = None
     if by_shard:
         envelope = build_root_coverage(
             [morton_word(d) for d in by_shard], shard_order, source="sweep"
         )
-        write_root_coverage(store_root, envelope, **store_kwargs)
+        written = write_root_coverage(store_root, envelope, **store_kwargs)
         out["root_moc"] = True
     fresh = read_manifest(store_root, **store_kwargs)
     if fresh is None:
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — cannot record actuals")
+    if written is not None:
+        # Against `fresh`, never the caller's `manifest`: the declaration the
+        # check reads is the STORE's, and `manifest` was read at admission —
+        # before the lease, the stages, and however long the fan-out took. A
+        # temporal channel added mid-run would otherwise go un-nudged, and one
+        # removed mid-run nudged for a channel the store no longer has. The
+        # write above has to precede the re-read; the check does not.
+        out["toc_section_missing"] = warn_if_section_missing(store_root, written, fresh)
     now = _utcnow()
     changed = False
     for entry in (fresh.get("pyramid") or {}).get("overviews") or []:

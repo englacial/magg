@@ -340,6 +340,71 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
     return merged
 
 
+def warn_if_section_missing(store_root: str, envelope, manifest) -> bool:
+    """Warn when a temporal-declaring store's root carries no §10 section.
+
+    The belt for the one gap the §10.4 succession rule cannot close (issue
+    #488): the rule binds producers that know it, and a pre-#481 producer —
+    an old laptop, a stale worker — rebuilds the root envelope from the keys
+    it knows and drops the section it never learned to copy. Severity is
+    bounded by D9 (the section is a regenerable accelerator: a reader that
+    loses it falls back to opening every candidate, slow and correct), so
+    this is a logged nudge naming :func:`zagg.coverage.refresh_root_coverage`
+    as the remedy — deliberately NOT a locking scheme, the #208 no-lock
+    ruling stands. Returns whether it warned.
+
+    An absent section is an OBSERVATION, and the message says only that.
+    Two causes produce it and this seat cannot tell them apart: a producer
+    dropped it, or no walk has ever built one — only the walk writes a
+    section (:meth:`zagg.sweep.MocFamily.finish` and
+    :func:`zagg.coverage.refresh_root_coverage` are its two writers; the
+    runner's ingest and :func:`zagg.sweep_stages.run_finisher` both write
+    section-less root envelopes). In the default pipeline the walk does
+    precede the staged finisher — ``runner.py`` runs
+    :func:`zagg.sweep.sweep_after_run` over
+    :data:`zagg.sweep.DEFAULT_FAMILIES` (``moc`` among them) BEFORE
+    :func:`zagg.sweep_stages.stage_sweep_after_run` in the same post-run
+    hook — so a section missing at the finisher is genuinely anomalous
+    there. It is NOT anomalous for a store swept with ``--stages``
+    standalone, or one whose fail-open families sweep failed, and the same
+    remedy fixes every one of them.
+
+    Detection is DECLARATION-driven, like every other reach for the temporal
+    channel here (:func:`temporal_fields`): a store whose manifest declares
+    §8.3 ``"per-centroid"`` companions should have a section, and one that
+    declares none never should. That makes the check free — no leaf is
+    opened — at the cost of also firing on a temporal-declaring store whose
+    leaves genuinely hold no temporal row yet (freshly templated, or leaves
+    written before the declaration was added). The remedy named is right for
+    that store too: the walk rebuilds what is there, and writes no section
+    when the answer is honestly nothing.
+
+    A standing section at a revision this zagg cannot read is NOT missing —
+    §10.4 preserves it verbatim, and warning about it would invite an
+    operator to run a walk that downgrades nothing but says the same thing
+    again. Only an absent key, or an unmarked carrier (debris), warns.
+    """
+    from zagg.hive import ROOT_COVERAGE_NAME
+
+    if not temporal_fields(manifest):
+        return False
+    section = envelope.get(TEMPORAL_KEY) if isinstance(envelope, dict) else None
+    # Marked-revision first, in the order the docstring reads them: :func:`_usable`
+    # logs "ignoring a section with an unknown spec" — true at the merge seam it
+    # was written for, the opposite of what this seat decides — so the arm that
+    # HONORS a future revision must short-circuit before it is consulted.
+    if _preserved(section) is not None or _usable(section) is not None:
+        return False
+    logger.warning(
+        f"coverage[toc]: {store_root} declares temporal fields but its root "
+        f"{ROOT_COVERAGE_NAME} carries no {TEMPORAL_COVERAGE_SPEC} section — no walk has "
+        f"built one yet, or a producer dropped it; either way `when=` pruning degrades to "
+        f"opening every candidate until it is built, so run "
+        f"zagg.coverage.refresh_root_coverage({store_root!r})"
+    )
+    return True
+
+
 def section_unchanged(existing, incoming) -> bool:
     """Whether composing ``incoming`` into ``existing`` would change nothing.
 
@@ -497,4 +562,5 @@ __all__ = [
     "shards_overlapping",
     "temporal_cell_order",
     "temporal_fields",
+    "warn_if_section_missing",
 ]

@@ -355,6 +355,28 @@ def _stage_store(root, leaves=LEAVES, skip_columns=(), write_moc=True, fields=FI
     return manifest
 
 
+def _standing_section(decimals):
+    """A real §10 section over ``decimals``, built by the shipped builder.
+
+    The staged sweep never writes one (it adds no observations, #487), so a
+    test of the PRESERVE arm has to install the walk's output itself.
+    """
+    from conftest import TOC_BASE, toc_words
+
+    from zagg.coverage_toc import build_temporal_section
+
+    contributions = {}
+    for i, dec in enumerate(decimals):
+        # One instant per shard, off the same base `_located_leaf_slabs` uses,
+        # packed by the shared fixture helper rather than a second hand-rolled
+        # copy of it.
+        when = np.datetime64(TOC_BASE, "ns") + np.timedelta64(1000 * i, "s")
+        words = toc_words(1, base=str(when))
+        value = float(when.astype("int64"))
+        contributions[dec] = [(int(words[0]), np.asarray([[value, 3.0]], dtype=np.float32), words)]
+    return build_temporal_section(contributions, ["h_tdigest"], source="refresh")
+
+
 def _by_shard(leaves=LEAVES):
     return {d: {None} for d in leaves}
 
@@ -1067,6 +1089,80 @@ class TestFinisher:
         calls = []
         out, _, _ = self._run(tmp_path / "s", m, released=lambda: calls.append(1) or True)
         assert out["lease_released"] and calls == [1]
+
+    def test_a_temporal_store_with_no_root_section_is_nudged(self, tmp_path, caplog):
+        """Issue #488. This store is the case the nudge cannot diagnose and
+        does not try to: the finisher PRESERVES the §10 section (it adds no
+        observations, #487) and no walk has run here, so the section was
+        never built — nobody dropped it. The message names both causes and
+        the one remedy that fixes either, which is why it is a nudge rather
+        than a rebuild."""
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
+        with caplog.at_level("WARNING"):
+            out, _, _ = self._run(tmp_path / "s", m)
+        assert out["toc_section_missing"] is True
+        assert "refresh_root_coverage" in caplog.text
+
+    def test_a_store_with_no_temporal_channel_is_not_nudged(self, tmp_path, caplog):
+        m = _stage_store(tmp_path / "s")  # FIELDS: no `temporal:` declaration
+        with caplog.at_level("WARNING"):
+            out, _, _ = self._run(tmp_path / "s", m)
+        assert out["toc_section_missing"] is False
+        assert "refresh_root_coverage" not in caplog.text
+
+    def test_an_empty_work_set_still_reports_the_nudge_key(self, tmp_path):
+        """The stage record's shape must not depend on the work set: a
+        consumer indexing ``summary["finisher"]["toc_section_missing"]`` gets
+        a bool on every run, not a KeyError on the one that found no work."""
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
+        out = run_finisher(str(tmp_path / "s"), m, {}, {}, run_id="A")
+        assert out["root_moc"] is False and out["toc_section_missing"] is False
+
+    def test_the_finisher_leaves_a_standing_section_alone(self, tmp_path, caplog):
+        """The preserve arm, on the same store: once the walk has written the
+        section, the staged sweep composes across it (#487) and stops nudging."""
+        from zagg.hive import read_root_coverage
+
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
+        env = build_root_coverage([morton_word(d) for d in LEAVES], 3, source="refresh")
+        env["temporal"] = _standing_section(LEAVES)
+        write_root_coverage(str(tmp_path / "s"), env)
+        with caplog.at_level("WARNING"):
+            out, _, _ = self._run(tmp_path / "s", m)
+        assert out["toc_section_missing"] is False
+        assert "refresh_root_coverage" not in caplog.text
+        after = read_root_coverage(str(tmp_path / "s"))["temporal"]
+        assert after["shards"] == env["temporal"]["shards"]
+
+    def test_the_nudge_reads_the_store_manifest_not_the_caller_copy(self, tmp_path, caplog):
+        """The caller's `manifest` was read at admission; the declaration can
+        have moved since. A temporal channel added mid-run is still nudged."""
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
+        stale = json.loads(json.dumps(m))
+        stale["pyramid"]["overview"]["fields"] = FIELDS  # no `temporal:` at admission
+        with caplog.at_level("WARNING"):
+            out = run_finisher(str(tmp_path / "s"), stale, _by_shard(), {}, run_id="A")
+        assert out["toc_section_missing"] is True
+        assert "refresh_root_coverage" in caplog.text
+
+    def test_an_incompatible_standing_root_drops_the_section_and_nudges(self, tmp_path, caplog):
+        """The overwrite arm: `write_root_coverage` discards an incompatible
+        standing envelope (D9 regenerable cache) and the section goes with the
+        ranges, so the finisher's own write is the dropper here. The nudge
+        still fires — correctly, since the remedy is the same walk — and it is
+        the reason the message blames no one."""
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS, write_moc=False)
+        env = build_root_coverage([morton_word(d) for d in LEAVES], 3, source="refresh")
+        env["temporal"] = _standing_section(LEAVES)
+        env["encoding"] = "bitmap"  # the leaf sidecar's encoding at the root
+        # PUT outright: routing an incompatible envelope through the writer
+        # would only reproduce the overwrite one call early.
+        (tmp_path / "s" / "coverage.moc").write_text(json.dumps(env, indent=1))
+        with caplog.at_level("WARNING"):
+            out, _, _ = self._run(tmp_path / "s", m)
+        assert "incompatible envelope; overwriting" in caplog.text
+        assert out["toc_section_missing"] is True
+        assert "refresh_root_coverage" in caplog.text
 
     def test_finisher_is_idempotent(self, tmp_path):
         m = _stage_store(tmp_path / "s")

@@ -254,23 +254,39 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     ``.zarr`` off the shard-order depth is checked for the D11 ``role`` attr and
     skipped when it carries one (never classified by position) — as is a
     ``{stem}.pyramid.zarr`` column (issue #383), the one derived family that
-    lives at the leaf's OWN node. A
-    supersedes it). A temporal-declaring store (spec §10, issue #480) also has
-    its ``zagg-coverage-toc/1`` section rebuilt from this same walk —
-    fail-open per SHARD, so an unreadable companion costs the section that
-    shard and never the refresh; and a walk that lost any shard COMPOSES its
-    rebuild with the standing section (§10.4) instead of replacing it, so the
-    escape hatch can never be the thing that deletes the section. A successful
-    refresh also re-arms the
-    :func:`warn_if_stale` once-per-episode latch for this store. Returns the
-    envelope written, or ``None`` — deleting any existing root object — when
-    no stamped leaf exists (absence is truthful, a stale cache is not, and
-    the ranges envelope has no empty form). Windowed leaves (issue #246)
-    classify as data via the frozen first-``_`` name split; several stamped
-    windows of one shard are one covered shard (the MOC is spatial — the
-    builder de-duplicates words), and a malformed window label on a STAMPED
-    leaf is skipped with a warning, like the foreign-order carve-out —
-    unstamped malformed debris stays silent, as ordinary debris does.
+    lives at the leaf's OWN node. A temporal-declaring store (spec §10,
+    issue #480) also has its ``zagg-coverage-toc/1`` section rebuilt from
+    this same walk — fail-open per SHARD, so an unreadable companion costs
+    the section that shard and never the refresh; and a walk that lost any
+    shard COMPOSES its rebuild with the standing section (§10.4) instead of
+    replacing it, so the escape hatch can never be the thing that deletes
+    the section. THIS WALK IS THE SECTION'S ONLY TIGHTENER (spec §10.5,
+    issue #487): every other producer composes through the UNION arm of
+    :func:`zagg.hive.write_root_coverage`, whose join only ever GROWS an
+    envelope, so their claims stay true without ever getting narrower. It is
+    NOT the only tier-2 refresher — §10.4 installs whichever side's map
+    covers the MERGED map, which a run-scoped sweep's map often does — but it
+    is the only producer whose map is guaranteed to list the whole store.
+    Nothing NEEDS this call for correctness — an un-refreshed section is
+    over-wide at worst, costing a wasted candidate open and never a missed
+    one — which is what lets a no-observation pass preserve the section
+    instead (:func:`zagg.sweep_stages.run_finisher`); refresh buys PRECISION,
+    and repairs a section a pre-§10.4 producer dropped —
+    :func:`zagg.coverage_toc.warn_if_section_missing` names it for that. A
+    successful refresh also re-arms the :func:`warn_if_stale` once-per-episode
+    latch for this store. Returns the envelope written, or ``None`` — deleting
+    any existing root object — when no stamped leaf exists (absence is
+    truthful, a stale cache is not, and the ranges envelope has no empty
+    form). Windowed leaves (issue #246) classify as data via the frozen
+    first-``_`` name split; several stamped windows of one shard are one
+    covered shard (the MOC is spatial — the builder de-duplicates words), and
+    a malformed window label on a STAMPED leaf is skipped with a warning, like
+    the foreign-order carve-out — unstamped malformed debris stays silent, as
+    ordinary debris does. That skip also banks its shard as a TEMPORAL loss:
+    only the label is malformed, so the id before the first ``_`` still names
+    a shard whose other windows read fine, and publishing their join alone
+    would narrow the shard's word below §10.2's containment (the two
+    carve-outs below it name DIFFERENT shard ids, so neither can do that).
     """
     import obstore
     from obstore.exceptions import NotFoundError
@@ -352,6 +368,18 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                         f"window label (frozen grammar, mortie#62) — it will NOT be "
                         f"listed in {ROOT_COVERAGE_NAME}"
                     )
+                    if toc_fields:
+                        # Only the LABEL is malformed: the id up to the first
+                        # `_` is still readable, and a sibling window of that
+                        # same shard reads fine and would be published alone.
+                        # §10.2's word must cover every leaf of a LISTED shard,
+                        # so bank the loss exactly as the read failure below
+                        # does — otherwise the walk narrows the shard's word to
+                        # the leaves it happened to parse, which costs a reader
+                        # a MISSED candidate rather than a wasted open (§10.5).
+                        lost = name.removesuffix(".zarr").split("_", 1)[0]
+                        toc_failed.add(lost)
+                        contributions.pop(lost, None)
                     continue
                 if not _is_decimal_id(decimal):
                     # Same posture, one grammar down: the name split succeeded

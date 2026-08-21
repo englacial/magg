@@ -2461,4 +2461,80 @@ that seam as follows:
 Conformance for an external reader is §7's `temporal/` fixture: its root
 `coverage.moc` carries this section, and the fixture's `temporal.expected.json`
 records the shard word and the decoded digest so the containment and weight
-claims above are pinned on committed bytes.
+claims above (§10.2, §10.3) are pinned on committed bytes. §10.5 below is a
+contract on producer *behaviour*, and no fixture of committed bytes can pin
+one: its conformance is the prose.
+
+### 10.5 Refresh contract — the walk is the only tightener
+
+**Contract.** Across §10.4's **union** arm the section is **always safe,
+eventually precise**: every claim it makes is true the moment it is written
+and *stays* true with no refresh at all, and a refresh only makes it
+**tighter**. Producers therefore need no coordination on that arm, and a
+reader never has to ask how recently the section was rebuilt in order to
+trust it. §10.4's **overwrite** arm is the carve-out, and the last bullet
+below states what it costs.
+
+- **Adding observations keeps the claims true automatically.** An
+  observation-adding producer that composes through §10.4's union arm joins
+  its words with the standing ones, and tier 1's join only ever *grows* an
+  envelope. Growing is conservative in the direction §10.2 requires — the
+  word must contain every instant in the shard — so an appended observation
+  lands inside that shard's word by construction, whichever producer wrote it
+  and in whatever order.
+- **Removing observations leaves a word over-wide, never wrong.** A rewrite
+  that drops data leaves the shard claiming a window wider than the shard now
+  holds. A reader opens that candidate and finds nothing in the window: a
+  wasted open, never missed data — the same asymmetry a window edge's quantum
+  already has (§10.2).
+- **Only a whole-store walk tightens.** Tightening is what re-derives a
+  shard's word from what its leaves hold *now* instead of joining it with what
+  they held before, and only a producer that read every leaf of a shard can do
+  that without narrowing the word below the shard's true extent. zagg's one
+  whole-store producer is the refresh walk
+  (`zagg.coverage.refresh_root_coverage`). **On the union arm a producer MUST
+  NOT publish a narrowed word** for a shard unless it derived that word from
+  every leaf of the shard: the join is how a partial producer stays safe, and
+  reaching past it to narrow a word is the one way to lose a candidate. The
+  join itself satisfies this rule by construction, so the MUST-NOT binds a
+  producer that composes the section by some other means.
+- **Tier 2 is a weaker rule, and it is not the walk's alone.** §10.4 replaces
+  the digest with whichever side's map covers the **merged map**, newest side
+  first. That is a test on the two maps meeting at the seam, not on the store:
+  a run-scoped producer whose own map happens to cover the merged one — a
+  fresh store's first sweep, where the standing map is empty, or any later run
+  that touched every shard the standing map lists — does install its digest,
+  and legitimately so, because it covered everything the composed map claims.
+  What §10.4 buys is that the digest covers every shard the **map lists**;
+  what the whole-store walk alone adds is that the map lists every shard the
+  **store** holds. A reader MUST NOT read the second from the first — §10.2's
+  escape hatch means an unlisted shard is *unknown*, so a digest can be whole
+  over the map and still describe less than the store.
+- **A pass that adds no observations MAY leave the section untouched.** It
+  cannot falsify a claim it never widened, so preserving is always sound; what
+  it forgoes is only the tightening. This is what makes §10.4's "a producer
+  with no temporal contribution leaves an existing section standing" a
+  permanent posture rather than a transitional one.
+- **The overwrite arm installs the incoming section verbatim.** §10.4's
+  wholesale overwrite — an unparsable or incompatible standing carrier, the D9
+  regenerable-cache rule — discards the standing section along with the stale
+  ranges, so there is no standing word left to join against and the producer's
+  own section is installed as written. A run-scoped producer that reaches that
+  arm therefore publishes words derived from the leaves *it* visited, which
+  for a shard whose other leaves it did not visit is **narrower** than the
+  word that was standing. This arm is a carve-out from the MUST-NOT above, not
+  a violation of it, and it is the one arm on which the section can lose a
+  candidate rather than merely fail to prune one.
+
+Two losses this contract bounds rather than prevents, worse one first. A
+producer that publishes a **narrowed** word — the overwrite arm above — leaves
+a `toc_overlaps` query pruning a shard that does hold data in the window: a
+missed candidate, not a wasted open, and the one §10 failure a reader has no
+way to notice. A producer that **drops** the section instead of preserving it
+— a writer predating §10.4 that rebuilds the root carrier from the keys it
+knows — is the milder one: the succession rule forbids it but cannot bind code
+that shipped before the rule existed, and an absent section reads as "this
+store publishes no temporal coverage" (§10), so a reader falls back to opening
+every candidate — slow, and still correct. Both are bounded by the section
+being a regenerable accelerator (D9) whose truth is in the leaves, and one
+whole-store walk repairs either.

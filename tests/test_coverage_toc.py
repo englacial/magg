@@ -30,8 +30,10 @@ from zagg.coverage_toc import (
     section_unchanged,
     shards_overlapping,
     temporal_fields,
+    warn_if_section_missing,
 )
-from zagg.hive import build_root_coverage, read_root_coverage, write_root_coverage
+from zagg.grids.morton import morton_word
+from zagg.hive import _decimal_order, build_root_coverage, read_root_coverage, write_root_coverage
 
 SPEC_DATA = Path(__file__).parent / "data" / "spec"
 #: A day on the toc scale, in internal ns — enough to keep the synthetic
@@ -274,6 +276,96 @@ class TestAbsence:
         fields = temporal_fields(manifest)
         assert set(fields) == {"h_tdigest"}
         assert fields["h_tdigest"]["sibling"] == "h_tdigest_times"
+
+
+class TestMissingSectionWarning:
+    """Issue #488 — the belt for a root that carries no §10 section.
+
+    Two causes reach the same state and the check cannot tell them apart: a
+    pre-#481 producer rebuilt the root envelope from the keys it knows and
+    dropped the section it never learned to copy, or no walk has built one
+    yet (only the walk writes a section). So the message asserts neither and
+    names both. It is a logged nudge, not a refusal: the section is a D9
+    regenerable accelerator, and losing it only degrades ``when=`` pruning to
+    opening every candidate.
+    """
+
+    def _manifest(self, name):
+        return json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
+
+    def _envelope(self, section=...):
+        env = build_root_coverage([morton_word("11213")], _decimal_order("11213"), source="sweep")
+        if section is not ...:
+            env["temporal"] = section
+        return env
+
+    def test_a_temporal_store_whose_root_carries_no_section_warns(self, caplog):
+        manifest = self._manifest("temporal")
+        with caplog.at_level("WARNING"):
+            assert warn_if_section_missing("s3://b/store", self._envelope(), manifest) is True
+        # The remedy has to be IN the line: a warning that only says the
+        # section is gone leaves the operator with nothing to run.
+        assert "refresh_root_coverage" in caplog.text and "s3://b/store" in caplog.text
+        # ...and the line must not pick a cause it cannot know: an absent
+        # section is equally "never built" and "dropped", so both are named
+        # and the operator is not sent chasing a stale worker that may not
+        # exist.
+        assert "no walk has built one yet" in caplog.text and "dropped it" in caplog.text
+
+    def test_a_store_declaring_no_temporal_field_never_warns(self, caplog):
+        """The common case. A section it never had is not a section it lost."""
+        with caplog.at_level("WARNING"):
+            assert (
+                warn_if_section_missing("s3://b/s", self._envelope(), self._manifest("minimal"))
+                is False
+            )
+            assert warn_if_section_missing("s3://b/s", self._envelope(), None) is False
+        assert caplog.text == ""
+
+    def test_a_section_that_is_present_never_warns(self, caplog):
+        section = build_temporal_section(_contributions([1, 2]), ["h_tdigest"])
+        with caplog.at_level("WARNING"):
+            got = warn_if_section_missing(
+                "s3://b/s", self._envelope(section), self._manifest("temporal")
+            )
+        assert got is False and caplog.text == ""
+
+    def test_an_unreadable_future_revision_is_not_missing(self, caplog):
+        """§10.4 preserves it verbatim, so nothing was dropped and a walk would
+        only say the same thing again — warning here would invite a pointless
+        rebuild. Silent at DEBUG too: the arm that HONORS the section must not
+        also emit :func:`_usable`'s "ignoring a section with an unknown spec",
+        which is the opposite claim (true at the merge seam, not at this one)."""
+        env = self._envelope({"spec": "zagg-coverage-toc/2", "shards": {}})
+        with caplog.at_level("DEBUG"):
+            assert warn_if_section_missing("s3://b/s", env, self._manifest("temporal")) is False
+        assert caplog.text == ""
+
+    @pytest.mark.parametrize("debris", [None, {}, {"shards": {}}, "not a dict"])
+    def test_an_unmarked_carrier_is_debris_and_warns(self, debris, caplog):
+        """An unmarked value claims no revision (:func:`_preserved`'s rule), so
+        it is exactly as missing as an absent key."""
+        with caplog.at_level("WARNING"):
+            got = warn_if_section_missing(
+                "s3://b/s", self._envelope(debris), self._manifest("temporal")
+            )
+        assert got is True and "refresh_root_coverage" in caplog.text
+
+    def test_a_refreshed_store_stops_warning(self, tmp_path):
+        """End to end on the committed fixture: strip the section, confirm the
+        warning fires, run the remedy the message names, confirm it stops."""
+        root = str(tmp_path / "temporal")
+        shutil.copytree(SPEC_DATA / "temporal", root)
+        manifest = json.loads((Path(root) / "morton_hive.json").read_text())
+        envelope = read_root_coverage(root)
+        assert envelope.pop("temporal")  # the fixture really does carry one
+        # PUT outright, which is what the pre-§10.4 producer does: routing this
+        # back through write_root_coverage would compose the standing section
+        # BACK IN — the succession rule working, which is not the shape here.
+        (Path(root) / "coverage.moc").write_text(json.dumps(envelope, indent=1))
+        assert warn_if_section_missing(root, read_root_coverage(root), manifest) is True
+        refresh_root_coverage(root)
+        assert warn_if_section_missing(root, read_root_coverage(root), manifest) is False
 
 
 class TestPartialReadsDropTheShard:
@@ -545,6 +637,40 @@ class TestOnCommittedStores:
         # The shard the walk could not read keeps the word the last whole walk
         # published: a partial rebuild composes, it does not overwrite.
         assert set(envelope["temporal"]["shards"]) == {"11213", "11214"}
+
+    def test_a_malformed_window_label_costs_its_shard_not_its_extent(self, tmp_path):
+        """A skipped SIBLING window must not narrow the shard's published word.
+
+        The walk's malformed-label carve-out drops a stamped leaf whose window
+        label breaks the frozen grammar — but only the LABEL is malformed, so
+        the id before the first ``_`` names a shard whose other windows read
+        fine. Publishing their join alone would be a word derived from some of
+        the shard's leaves, exactly the narrowing §10.2 forbids and §10.5 names
+        as the one loss that costs a MISSED candidate.
+        """
+        root = self._copy(tmp_path, "temporal")
+        standing = json.loads((Path(root) / "coverage.moc").read_text())
+        # Widen the standing word as a sibling window's data would have, and
+        # keep an instant that ONLY the widened word covers.
+        far_at = BASE_NS + 4000 * DAY_NS
+        far = int(np.asarray(time2toc(np.asarray([far_at], dtype=np.int64)))[0])
+        narrow = int(standing["temporal"]["shards"]["11213"])
+        wide = int(toc_merge(narrow, far))
+        standing["temporal"]["shards"]["11213"] = str(wide)
+        (Path(root) / "coverage.moc").write_text(json.dumps(standing, indent=1))
+        leaf_dir = Path(root) / "1" / "1" / "2" / "1" / "3"
+        shutil.copytree(leaf_dir / "11213.zarr", leaf_dir / "11213_bad$label.zarr")
+
+        envelope = refresh_root_coverage(root)
+        assert int(envelope["temporal"]["shards"]["11213"]) == wide
+        # The window only the widened word covers is still a candidate — the
+        # skipped sibling cost the shard PRECISION, never its containment. Had
+        # the walk published the join over the leaves it parsed, this query
+        # would prune a shard that holds data in the window: a MISSED
+        # candidate, the one §10.5 loss a reader cannot detect.
+        lo, hi = far_at, far_at + DAY_NS
+        assert bool(np.asarray(toc_overlaps(np.array([wide], dtype=np.uint64), lo, hi))[0])
+        assert not bool(np.asarray(toc_overlaps(np.array([narrow], dtype=np.uint64), lo, hi))[0])
 
     def test_a_second_pass_over_a_multi_shard_store_writes_nothing(self, tmp_path):
         """Sweep idempotence where the seam actually bites (§10.4).
