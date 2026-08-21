@@ -247,20 +247,12 @@ Resources:
               # the staging grant above, pointed at Source Cooperative. This
               # retires the data.source.coop proxy hop and the egress it paid
               # ($31.22 for 346.85 GiB on the CA campaign, more than the run's
-              # $29.00 of compute). Two prefixes, both narrow (espg,
-              # 2026-08-20) — englacial is a personal org today:
-              #   demo/*  — the stores the fleet publishes.
-              #   index/* — the sidecar index cache (issue #160), which lives
-              #     on sliderule-public-cors today. That bucket is being
-              #     retired (issue #499): it sits in a NASA account, which
-              #     cannot host public data, so its public access is closed
-              #     and it can no longer serve its purpose. The cache is its
-              #     one live dependency, and this grant has to exist BEFORE
-              #     the migration can run, which is why it lands here rather
-              #     than in #499.
-              # englacial/zagg/lambda/* and englacial/zagg/benchmarks/* stay
-              # out: they belong to the CI release role (issue #497). Source
-              # Cooperative granted englacial/* to both ARNs, so tightening or
+              # $29.00 of compute). Scoped to englacial/zagg/demo/* (espg,
+              # 2026-08-20): englacial is a personal org today, and the fleet
+              # publishes demo stores only — englacial/zagg/lambda/* and
+              # englacial/zagg/benchmarks/* belong to the CI release role
+              # (issue #497). Source Cooperative granted englacial/* to both
+              # ARNs, so tightening or
               # widening later is a reviewed change to this file rather than
               # another email to them. DeleteObject is deliberate — store
               # overwrite and manifest cleanup need it, and the bucket is
@@ -299,9 +291,7 @@ Resources:
                   - s3:DeleteObject
                   - s3:AbortMultipartUpload
                   - s3:ListMultipartUploadParts
-                Resource:
-                  - arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*
-                  - arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/index/*
+                Resource: arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*
               # Unconditional by intent -- do NOT add an s3:prefix condition.
               # S3 answers a GET on a missing key with 404 NoSuchKey only when
               # the caller holds s3:ListBucket on the bucket; otherwise it

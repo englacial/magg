@@ -254,17 +254,9 @@ class TestTemplateEnvironment:
             "Statement"
         ]
 
-        # Two prefixes on one statement (espg, 2026-08-20): demo/* is what the
-        # fleet publishes; index/* is the sidecar index cache (issue #160)
-        # migrating off sliderule-public-cors, which is being retired because a
-        # NASA account cannot host public data (issue #499). The destination
-        # grant has to exist BEFORE that migration, which is why it lands here.
-        published = [
-            "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*",
-            "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/index/*",
-        ]
+        published = "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*"
         objects = [s for s in stmts if s.get("Resource") == published]
-        assert len(objects) == 1, "the execution role must reach zagg's published prefixes"
+        assert len(objects) == 1, "the execution role must reach zagg's published prefix"
         # DeleteObject is deliberate: store overwrite and manifest cleanup need
         # it, and the bucket is versioned, so a delete leaves a marker rather
         # than destroying bytes. PutObjectAcl is load-bearing: every write to
@@ -301,10 +293,12 @@ class TestTemplateEnvironment:
         acl_grants = [s for s in stmts if "s3:PutObjectAcl" in (s.get("Action") or [])]
         assert [s["Resource"] for s in acl_grants] == [published]
 
-        # Nothing outside demo/ and index/ -- lambda/* and benchmarks/* belong
-        # to the CI release role under issue #497, not to the fleet.
+        # Nothing outside demo/ -- lambda/* and benchmarks/* belong to the CI
+        # release role under issue #497, not to the fleet, and the sidecar
+        # index cache is NOT moving here (espg, 2026-08-20: a different bucket
+        # under a different org, post-MVP).
         reachable = {r for s in stmts for r in _resources(s) if "source.coop/" in r}
-        assert reachable == set(published)
+        assert reachable == {published}
 
         bucket = [
             s for s in stmts if s.get("Resource") == "arn:aws:s3:::us-west-2.opendata.source.coop"
