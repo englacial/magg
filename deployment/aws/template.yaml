@@ -252,12 +252,11 @@ Resources:
               # publishes demo stores only — englacial/zagg/lambda/* and
               # englacial/zagg/benchmarks/* belong to the CI release role
               # (issue #497). Source Cooperative granted englacial/* to both
-              # ARNs, so tightening or
-              # widening later is a reviewed change to this file rather than
-              # another email to them. DeleteObject is deliberate — store
-              # overwrite and manifest cleanup need it, and the bucket is
-              # versioned, so a delete leaves a marker rather than destroying
-              # bytes.
+              # ARNs, so tightening or widening later is a reviewed change to
+              # this file rather than another email to them. DeleteObject is
+              # deliberate — store overwrite and manifest cleanup need it, and
+              # the bucket is versioned, so a delete leaves a marker rather
+              # than destroying bytes.
               #
               # PutObjectAcl is load-bearing, not incidental: every write to
               # this bucket carries x-amz-acl: bucket-owner-full-control
@@ -274,15 +273,19 @@ Resources:
               # UploadId), and without AbortMultipartUpload that cleanup 403s,
               # leaving parts invisible to ListObjects and billed to Source
               # Cooperative — a failed abort can also mask the error the worker
-              # reports. That is the WHOLE of the remedy: uploads leaked by a
-              # worker killed at the 900 s ceiling never reach obstore's abort,
-              # and they are not discoverable from here. Listing them would
-              # need s3:ListBucketMultipartUploads, which is bucket-wide
-              # (s3:prefix cannot constrain it) — which is why Source
-              # Cooperative's data-upload docs omit it and their bucket policy
-              # does not grant it, so holding it on our side would be denied
-              # cross-account anyway (espg, 2026-08-20). Leaked parts age out
-              # on their 7-day lifecycle rule instead.
+              # reports. ListMultipartUploadParts stays as belt-and-braces:
+              # object_store keeps its part list in memory and issues no
+              # ListParts today, but the action is object-scoped and
+              # prefix-constrainable, so it stays grantable cross-account if
+              # that ever changes. The multipart pair is the whole of the
+              # remedy: uploads leaked by a worker killed at the 900 s ceiling
+              # never reach obstore's abort, and they are not discoverable from
+              # here. Listing them would need s3:ListBucketMultipartUploads,
+              # which is bucket-wide (s3:prefix cannot constrain it) — which is
+              # why Source Cooperative's data-upload docs omit it and their
+              # bucket policy does not grant it, so holding it on our side
+              # would be denied cross-account anyway (espg, 2026-08-20). Leaked
+              # parts age out on their 7-day lifecycle rule instead.
               - Effect: Allow
                 Action:
                   - s3:GetObject
