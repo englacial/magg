@@ -174,12 +174,39 @@ class TestLambdaHandlerSyntax:
         compile(invoker.read_text(), str(invoker), "exec")
 
 
-def _resources(statement):
-    """A policy statement's Resource entries, whether scalar or list."""
+def _statement_resources(statement):
+    """A policy statement's Resource ARNs -- scalar or list, ``!Sub`` flattened.
+
+    Flattening the one-key intrinsic matters: several of the role's statements
+    build their ARN with ``!Sub``, which the loader below parses to
+    ``{"Sub": "arn:..."}``. Skipping those would let a parameterized ARN --
+    ``!Sub "arn:aws:s3:::${PublishBucket}/englacial/zagg/index/*"`` -- slip
+    past the "nothing outside demo/" guard the helper exists to feed.
+    """
     resource = statement.get("Resource")
-    if isinstance(resource, str):
-        return [resource]
-    return [r for r in (resource or []) if isinstance(r, str)]
+    entries = resource if isinstance(resource, list) else [resource]
+    arns = []
+    for entry in entries:
+        if isinstance(entry, str):
+            arns.append(entry)
+        elif isinstance(entry, dict) and len(entry) == 1:
+            (body,) = entry.values()
+            if isinstance(body, str):
+                arns.append(body)
+    return arns
+
+
+def _statement_actions(statement):
+    """A policy statement's Action entries, whether scalar or list.
+
+    Normalizing first is load-bearing: ``"s3:Foo" in statement["Action"]`` is a
+    substring test rather than a membership test when Action is a scalar
+    string, and this template carries both shapes.
+    """
+    action = statement.get("Action")
+    if isinstance(action, list):
+        return action
+    return [action] if action is not None else []
 
 
 class TestTemplateEnvironment:
@@ -290,14 +317,14 @@ class TestTemplateEnvironment:
         # is not sent to buckets we own, and sliderule-public-cors' bucket
         # policy is not ours to change, so granting it there would be
         # unexplained privilege.
-        acl_grants = [s for s in stmts if "s3:PutObjectAcl" in (s.get("Action") or [])]
+        acl_grants = [s for s in stmts if "s3:PutObjectAcl" in _statement_actions(s)]
         assert [s["Resource"] for s in acl_grants] == [published]
 
         # Nothing outside demo/ -- lambda/* and benchmarks/* belong to the CI
         # release role under issue #497, not to the fleet, and the sidecar
         # index cache is NOT moving here (espg, 2026-08-20: a different bucket
         # under a different org, post-MVP).
-        reachable = {r for s in stmts for r in _resources(s) if "source.coop/" in r}
+        reachable = {r for s in stmts for r in _statement_resources(s) if "source.coop/" in r}
         assert reachable == {published}
 
         bucket = [
@@ -311,7 +338,10 @@ class TestTemplateEnvironment:
         # denied cross-account anyway. Leaked parts age out on their 7-day
         # lifecycle rule; obstore's own abort (AbortMultipartUpload, granted on
         # the objects above) covers the failure path we can actually clean up.
-        assert bucket[0]["Action"] == "s3:ListBucket"
+        # Normalized through the helper on purpose: the point is the ABSENCE of
+        # ListBucketMultipartUploads, so rewriting the grant as the
+        # IAM-identical one-element list must not fail this spuriously.
+        assert _statement_actions(bucket[0]) == ["s3:ListBucket"]
         # Unconditional on purpose (PR #496 review): S3 answers 404 for an
         # absent key only when the caller holds s3:ListBucket on the bucket,
         # and a GetObject evaluation carries no s3:prefix context key -- so an
