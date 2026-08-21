@@ -172,6 +172,57 @@ replace. A caller that must send no ACL at all can pass
 `client_options={"default_headers": {"x-amz-acl": None}}`, which strips the
 header; nothing in the Lambda config surface does.
 
+### Write probe {#write-probe}
+
+Reachability is not permission, so the pre-fan-out ping
+([issue #495](https://github.com/englacial/zagg/issues/495)) does not stop at
+the read-only store check: it PUT-then-DELETEs one zero-byte object before any
+worker is dispatched. **Two requests, added to the ping, and only for `s3://`
+stores** (a local store has nothing to prove). It is not hive-specific — every
+`s3://` ping runs it, the raster path included.
+
+Why it exists: credentials that can read the store but not write it are exactly
+how a fresh cross-account grant fails, and Source Cooperative's in-region path
+vends no credentials of its own (our IAM role writes through *their* bucket
+policy), so no interactive step would catch a misconfigured grant. Without the
+probe the first real write is the fire-and-forget `mode="setup"` invoke whose
+failure nobody sees, and the denial surfaces only after every worker has read
+and aggregated its shard.
+
+**Grant requirement.** The probe writes `<store>.status/probe-<uuid>` — the
+run's async-result sibling, *not* the store root and *not* a prefix of its own.
+That prefix is one the run already needs writable (the async invoke/poll
+transport writes every per-shard status object under it), so a grant covering
+`<store>/*` + `<store>.status/*` passes the probe exactly when the run's real
+writes would succeed. Nothing new to enumerate. Keeping the probe out of the
+store root is deliberate: `docs/specification.md` §5.2 makes the leaf hash set
+discovery-based, so a probe object stranded inside a leaf by a denied DELETE
+would be a *key-set difference* and a verifier would report an intact leaf as
+tampered.
+
+**What it covers, and what it does not.** The PUT proves `s3:PutObject`, and one
+small PUT is representative of the multipart path
+(`CreateMultipartUpload`/`UploadPart`/`CompleteMultipartUpload` are all
+authorized by `s3:PutObject`). It cannot exercise `s3:AbortMultipartUpload` or
+`s3:ListMultipartUploadParts`, which the grant carries deliberately for
+aborted/retried uploads — a grant missing those still passes.
+
+**Outcomes.** A failed PUT is **fail-closed**: the ping returns 500 tagged
+`"check": "write_probe"` and the dispatcher refuses the run, naming the failing
+request (a denied grant being the likely cause) rather than sending you to clear
+a store root that is not the problem. A failed DELETE is **fail-open** — write
+permission is proven, which is what the preflight gates on — but it is reported
+(`probe_delete: false` plus `probe_key` in the 200 body) and the dispatcher logs
+a warning naming the stranded object and the likely missing `s3:DeleteObject`.
+Do not ignore it: `s3:DeleteObject` is not optional for zagg's real writes
+(store overwrite, manifest cleanup), so that run is likely to fail later, and
+each run leaves one zero-byte object behind under a prefix nothing sweeps.
+
+> Not to be confused with the manual `s3://BUCKET/PREFIX/.probe` check in
+> [`benchmark-cicd.md`](benchmark-cicd.md) — that one is a human-run
+> `aws s3 cp` *inside* the prefix, cleaned up by hand in the same command. The
+> automated probe deliberately never writes inside the store root.
+
 ## Deployment
 
 ### Recommended: CloudFormation standup

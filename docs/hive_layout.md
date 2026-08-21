@@ -220,13 +220,12 @@ Otherwise never touched during a run (D6); the read-only frozen-key precheck
 incompatible existing store refuses up front on reruns (two concurrent first
 writes into a fresh root now collide within seconds of init, not at the
 losing run's finalize). That precheck is a *read*, so the same preflight also
-PUT-then-DELETEs a zero-byte probe object under a sibling `<store>.probe/`
-prefix ([issue #495](https://github.com/englacial/zagg/issues/495)):
-credentials that can read the store but not write it — the way a fresh
-cross-account grant fails — would otherwise sail through the ping, past the
-fire-and-forget setup invoke whose failure nobody sees, and surface only after
-every worker had aggregated its shard. Two requests per run, and the refusal
-names the grant rather than the store's contents.
+runs a **write probe** ([issue
+#495](https://github.com/englacial/zagg/issues/495)); it is not hive-specific
+(it runs on every `s3://` ping, raster included), so it is documented with the
+other operator-facing credential material in
+[`docs/deployment/lambda.md`](deployment/lambda.md#write-probe).
+
 With the manifest, every shard
 path is computable arithmetically with zero requests:
 
