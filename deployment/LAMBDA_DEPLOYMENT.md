@@ -28,10 +28,10 @@ x86_64 / py3.12 is available for local/testing parity.
   names the ARN in their bucket policy, so a second stack in the same account
   must override `EXECUTION_ROLE_NAME`. It reaches three destinations: the
   `OutputBucketName` bucket you pass to `stand_up.sh`, the public
-  `sliderule-public-cors` bucket (whole-bucket, by intent — PR #176), and
-  zagg's published prefix on Source Cooperative
-  (`us-west-2.opendata.source.coop/englacial/zagg/demo/*`, plus bucket-level
-  `ListBucket`). (The dependency layer is named `<FunctionName>-deps`, default
+  `sliderule-public-cors` bucket (whole-bucket, by intent — PR #176; being
+  retired, issue #499), and zagg's published prefixes on Source Cooperative
+  (`us-west-2.opendata.source.coop/englacial/zagg/demo/*` and
+  `.../englacial/zagg/index/*`, plus bucket-level `ListBucket`). (The dependency layer is named `<FunctionName>-deps`, default
   `process-shard-deps`. The legacy `deploy.sh` in-place updater still defaults
   `ZAGG_S3_BUCKET=xagg` for its >50MB staging copies; that is the updater's
   staging bucket, not the output bucket.)

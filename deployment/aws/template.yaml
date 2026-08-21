@@ -247,16 +247,25 @@ Resources:
               # the staging grant above, pointed at Source Cooperative. This
               # retires the data.source.coop proxy hop and the egress it paid
               # ($31.22 for 346.85 GiB on the CA campaign, more than the run's
-              # $29.00 of compute). Scoped to englacial/zagg/demo/* (espg,
-              # 2026-08-20): englacial is a personal org today, and the fleet
-              # publishes demo stores only — englacial/zagg/lambda/* and
-              # englacial/zagg/benchmarks/* belong to the CI release role
-              # (issue #497). Source Cooperative granted englacial/* to both
-              # ARNs, so tightening or widening later is a reviewed change to
-              # this file rather than another email to them. DeleteObject is
-              # deliberate — store overwrite and manifest cleanup need it, and
-              # the bucket is versioned, so a delete leaves a marker rather
-              # than destroying bytes.
+              # $29.00 of compute). Two prefixes, both narrow (espg,
+              # 2026-08-20) — englacial is a personal org today:
+              #   demo/*  — the stores the fleet publishes.
+              #   index/* — the sidecar index cache (issue #160), which lives
+              #     on sliderule-public-cors today. That bucket is being
+              #     retired (issue #499): it sits in a NASA account, which
+              #     cannot host public data, so its public access is closed
+              #     and it can no longer serve its purpose. The cache is its
+              #     one live dependency, and this grant has to exist BEFORE
+              #     the migration can run, which is why it lands here rather
+              #     than in #499.
+              # englacial/zagg/lambda/* and englacial/zagg/benchmarks/* stay
+              # out: they belong to the CI release role (issue #497). Source
+              # Cooperative granted englacial/* to both ARNs, so tightening or
+              # widening later is a reviewed change to this file rather than
+              # another email to them. DeleteObject is deliberate — store
+              # overwrite and manifest cleanup need it, and the bucket is
+              # versioned, so a delete leaves a marker rather than destroying
+              # bytes.
               #
               # PutObjectAcl is load-bearing, not incidental: every write to
               # this bucket carries x-amz-acl: bucket-owner-full-control
@@ -273,10 +282,15 @@ Resources:
               # UploadId), and without AbortMultipartUpload that cleanup 403s,
               # leaving parts invisible to ListObjects and billed to Source
               # Cooperative — a failed abort can also mask the error the worker
-              # reports. ListBucketMultipartUploads (bucket statement below) is
-              # what makes leaked uploads discoverable at all. Neither rescues
-              # a worker killed at the 900 s ceiling: its parts survive until
-              # Source Cooperative's lifecycle rule reaps them.
+              # reports. That is the WHOLE of the remedy: uploads leaked by a
+              # worker killed at the 900 s ceiling never reach obstore's abort,
+              # and they are not discoverable from here. Listing them would
+              # need s3:ListBucketMultipartUploads, which is bucket-wide
+              # (s3:prefix cannot constrain it) — which is why Source
+              # Cooperative's data-upload docs omit it and their bucket policy
+              # does not grant it, so holding it on our side would be denied
+              # cross-account anyway (espg, 2026-08-20). Leaked parts age out
+              # on their 7-day lifecycle rule instead.
               - Effect: Allow
                 Action:
                   - s3:GetObject
@@ -285,7 +299,9 @@ Resources:
                   - s3:DeleteObject
                   - s3:AbortMultipartUpload
                   - s3:ListMultipartUploadParts
-                Resource: arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*
+                Resource:
+                  - arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*
+                  - arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/index/*
               # Unconditional by intent -- do NOT add an s3:prefix condition.
               # S3 answers a GET on a missing key with 404 NoSuchKey only when
               # the caller holds s3:ListBucket on the bucket; otherwise it
@@ -296,9 +312,7 @@ Resources:
               # sweep leases, the fan-out result poll) catch 404 only, turning
               # "not there yet" into a hard error mid-campaign.
               - Effect: Allow
-                Action:
-                  - s3:ListBucket
-                  - s3:ListBucketMultipartUploads
+                Action: s3:ListBucket
                 Resource: arn:aws:s3:::us-west-2.opendata.source.coop
 
   DepsLayer:

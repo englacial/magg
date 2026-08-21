@@ -86,13 +86,18 @@ to hand-assemble zips or wire up the IAM role yourself.
   `lambda.amazonaws.com` and grants CloudWatch Logs plus, statement by
   statement: `Get/Put/DeleteObject` **and** `ListBucket` on the output bucket;
   `Get/Put/DeleteObject` on the public `sliderule-public-cors` bucket
-  (whole-bucket, by intent -- PR #176); and, on Source Cooperative,
-  `Get/Put/PutObjectAcl/DeleteObject` plus the multipart pair on the published
-  object prefix `englacial/zagg/demo/*`, with `ListBucket` +
-  `ListBucketMultipartUploads` granted on the **bucket** rather than the prefix
-  -- unconditioned on purpose, because S3 answers a GET for an absent key with
-  404 only when the caller holds bucket-level `ListBucket`, and zagg's absence
-  checks catch 404 only. Standing the stack
+  (whole-bucket, by intent -- PR #176; that bucket is being retired, issue
+  #499); and, on Source Cooperative, `Get/Put/PutObjectAcl/DeleteObject` plus
+  the multipart pair on two object prefixes -- `englacial/zagg/demo/*` (what
+  the fleet publishes) and `englacial/zagg/index/*` (the sidecar index cache of
+  issue #160, moving off `sliderule-public-cors`) -- with plain `ListBucket`
+  granted on the **bucket** rather than the prefix, unconditioned on purpose,
+  because S3 answers a GET for an absent key with 404 only when the caller
+  holds bucket-level `ListBucket`, and zagg's absence checks catch 404 only.
+  `ListBucketMultipartUploads` is deliberately absent: it is bucket-wide and
+  cannot be prefix-constrained, so Source Cooperative does not grant it and
+  uploads leaked by a killed worker age out on their 7-day lifecycle rule
+  instead. Standing the stack
   up therefore needs `iam:CreateRole`: in an IAM-constrained account (e.g. an
   AWS SSO power-user), have an admin run the standup rather than mint a role
   separately. The name is explicit and stable because it is zagg's **published
