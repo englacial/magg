@@ -324,7 +324,11 @@ class TestTouchS3:
         # in the run parquet or the status objects.
         assert counts["failed"] == 0
         assert counts["touched"] == 0
-        assert counts["skipped"] > 0
+        # PATHS, not objects (review finding on PR #496): the four inputs are
+        # the leaf tree plus the three named siblings. A successful touch of
+        # the same footprint reports touched: 6, because the tree contributes
+        # one per listed key -- the keys are not summable, hence the name.
+        assert counts["skipped_paths"] == 4
 
     def test_published_skip_is_keyed_on_the_bucket_not_the_credentials(self, monkeypatch):
         # The guard is `bucket in _PUBLISHED_BUCKETS`, never
@@ -345,7 +349,24 @@ class TestTouchS3:
         )
         assert client.copy_object.call_args_list, "an un-negotiated target must still be touched"
         assert counts["touched"] > 0
-        assert "skipped" not in counts
+        assert "skipped_paths" not in counts
+
+    def test_the_copy_seam_itself_refuses_a_published_bucket(self, monkeypatch):
+        # Belt and braces (review finding on PR #496): the counting guard is
+        # in touch_unit_footprint, but the invariant belongs to the one
+        # function that issues CopyObject, so no future entry point can
+        # bypass it. Unreachable through the public surface today -- this
+        # calls the private seam directly, which is the point.
+        client = self._client(monkeypatch)
+        counts = {"touched": 0, "failed": 0}
+        lifecycle._touch_s3_object(
+            client, "us-west-2.opendata.source.coop", "englacial/zagg/demo/store/x.json", counts
+        )
+        assert client.copy_object.call_args_list == []
+        assert client.head_object.call_args_list == []
+        # Counts NOTHING: the path-based accounting lives at the call site,
+        # and counting here as well would double it.
+        assert counts == {"touched": 0, "failed": 0}
 
     def test_in_account_copies_carry_no_acl(self, monkeypatch):
         # Ambient execution-role touch of our own bucket: nothing to hand over,
