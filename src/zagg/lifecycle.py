@@ -36,9 +36,14 @@ properties. Exactly what that costs, and what this module does about it:
   (``InvalidObjectState``) and counts as failed;
 - **ACL**: NOT preserved — ``CopyObject`` grants the destination the
   requester's default private ACL unless ``x-amz-acl``/``x-amz-grant-*``
-  rides the request. A no-op on a ``BucketOwnerEnforced`` bucket (the
-  default since 2023), but a public-read-BY-ACL bucket would have the
-  touched objects made private. Documented, not solved;
+  rides the request. SOLVED for the case that matters: on an external
+  target (explicit credentials, no endpoint — ``zagg.store``'s issue #495
+  predicate, imported so the two cannot drift) the copy carries
+  ``x-amz-acl: bucket-owner-full-control``, so a touch cannot claw back
+  ownership the writing PUT handed to the bucket owner. Still a caveat for
+  the in-account case: a public-read-BY-ACL bucket would have the touched
+  objects made private (a no-op on ``BucketOwnerEnforced``, the default
+  since 2023);
 - **SSE-KMS**: a self-copy re-encrypts under the BUCKET DEFAULT key, not
   the source object's key, and needs ``kms:Decrypt`` +
   ``kms:GenerateDataKey``. Fails loudly into ``failed`` when the role lacks
@@ -174,16 +179,17 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
     fault) counts one failure and abandons the remainder (best-effort).
     """
     counts = {"touched": 0, "failed": 0}
+    acl = _copy_acl(store_kwargs)
     try:
         for tree in trees:
             if _is_s3(tree):
-                _touch_s3_tree(_client(store_kwargs), tree, counts)
+                _touch_s3_tree(_client(store_kwargs), tree, counts, acl)
             else:
                 _touch_local_tree(tree, counts)
         for obj in objects:
             if _is_s3(obj):
                 bucket, key = _split_s3(obj)
-                _touch_s3_object(_client(store_kwargs), bucket, key, counts)
+                _touch_s3_object(_client(store_kwargs), bucket, key, counts, acl=acl)
             else:
                 _touch_local_object(obj, counts)
     except Exception as e:
@@ -220,6 +226,24 @@ def _client(store_kwargs):
         if key not in _CLIENTS:
             _CLIENTS[key] = _s3_client(store_kwargs)
         return _CLIENTS[key]
+
+
+def _copy_acl(store_kwargs) -> str | None:
+    """Canned ACL the self-copy must carry, or ``None`` (issue #495).
+
+    ``CopyObject`` CREATES an object, so on a cross-account target it re-creates
+    every touched object owned by THIS account under the requester's default
+    private ACL -- stripping the ownership the writing store handed to the
+    bucket owner, and doing it silently (the touch is fail-open). Predicate and
+    value both come from :mod:`zagg.store`, the seam every store write already
+    goes through, so this raw-boto3 path cannot drift from it.
+    """
+    from .store import _BUCKET_OWNER_ACL, _external_target
+
+    store_kwargs = store_kwargs or {}
+    if _external_target(store_kwargs.get("credentials"), store_kwargs.get("endpoint_url")):
+        return _BUCKET_OWNER_ACL
+    return None
 
 
 def _s3_client(store_kwargs: dict):
@@ -266,30 +290,36 @@ def _touch_local_object(path, counts) -> None:
         logger.warning(f"lifecycle touch failed for {path} (fail-open): {e}")
 
 
-def _touch_s3_tree(s3, path, counts) -> None:
+def _touch_s3_tree(s3, path, counts, acl=None) -> None:
     bucket, key = _split_s3(path)
     prefix = key.rstrip("/") + "/"
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for entry in page.get("Contents") or []:
             # The LIST already carries the class; echoing it back is what
             # keeps the self-copy from demoting the object to STANDARD.
-            _touch_s3_object(s3, bucket, entry["Key"], counts, entry.get("StorageClass"))
+            _touch_s3_object(s3, bucket, entry["Key"], counts, entry.get("StorageClass"), acl)
 
 
-def _touch_s3_object(s3, bucket, key, counts, storage_class=None) -> None:
+def _touch_s3_object(s3, bucket, key, counts, storage_class=None, acl=None) -> None:
     try:
         if storage_class is None:
             # A named object has no LIST entry: one HEAD buys its class (and
             # detects absence a request earlier than the copy would).
             storage_class = s3.head_object(Bucket=bucket, Key=key).get("StorageClass")
-        s3.copy_object(
-            Bucket=bucket,
-            Key=key,
-            CopySource={"Bucket": bucket, "Key": key},
-            MetadataDirective="REPLACE",
+        params = {
+            "Bucket": bucket,
+            "Key": key,
+            "CopySource": {"Bucket": bucket, "Key": key},
+            "MetadataDirective": "REPLACE",
             # S3 omits StorageClass for STANDARD in both LIST and HEAD.
-            StorageClass=storage_class or "STANDARD",
-        )
+            "StorageClass": storage_class or "STANDARD",
+        }
+        if acl:
+            # The re-created object keeps the bucket owner's ownership
+            # (issue #495); omitted in-account, where there is nothing to hand
+            # over and an ACL would be a change the touch has no business making.
+            params["ACL"] = acl
+        s3.copy_object(**params)
         counts["touched"] += 1
     except Exception as e:
         code = ""

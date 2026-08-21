@@ -284,6 +284,61 @@ class TestTouchS3:
         assert client.head_object.call_count == 3  # named objects only
         assert counts == {"touched": 5, "failed": 0}
 
+    def test_external_target_copies_carry_the_bucket_owner_acl(self, monkeypatch):
+        # CopyObject CREATES the object, so on a cross-account target a touch
+        # without x-amz-acl re-creates it owned by US, stripping the ownership
+        # the writing PUT handed over (issue #495 review finding). Same
+        # predicate and value as the store seam, which the touch bypasses.
+        from zagg.store import _BUCKET_OWNER_ACL
+
+        client = self._client(monkeypatch)
+        lifecycle.touch_current_unit(
+            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
+            store_kwargs={
+                "region": "us-west-2",
+                "credentials": {"accessKeyId": "ASIA", "secretAccessKey": "s"},
+                "endpoint_url": None,
+            },
+        )
+        calls = client.copy_object.call_args_list
+        assert calls
+        assert {c.kwargs["ACL"] for c in calls} == {_BUCKET_OWNER_ACL}
+
+    def test_in_account_copies_carry_no_acl(self, monkeypatch):
+        # Ambient execution-role touch of our own bucket: nothing to hand over,
+        # and an ACL would be a change the touch has no business making.
+        client = self._client(monkeypatch)
+        lifecycle.touch_current_unit(
+            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
+            store_kwargs={"region": "us-west-2", "credentials": None, "endpoint_url": None},
+        )
+        calls = client.copy_object.call_args_list
+        assert calls
+        assert all("ACL" not in c.kwargs for c in calls)
+
+    def test_custom_endpoint_copies_carry_no_acl(self, monkeypatch):
+        # Excluded exactly as in the store seam: canned ACLs are an AWS-S3
+        # concept the stores behind endpoint_url do not implement.
+        client = self._client(monkeypatch)
+        lifecycle.touch_current_unit(
+            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
+            store_kwargs={
+                "credentials": {"accessKeyId": "ASIA", "secretAccessKey": "s"},
+                "endpoint_url": "https://acct.r2.cloudflarestorage.com",
+            },
+        )
+        assert all("ACL" not in c.kwargs for c in client.copy_object.call_args_list)
+
+    def test_a_failing_copy_on_an_external_target_stays_fail_open(self, monkeypatch):
+        # The ACL rides a best-effort request: a rejection still only counts.
+        err = ClientError({"Error": {"Code": "AccessDenied"}}, "CopyObject")
+        self._client(monkeypatch, copy_error=err)
+        counts = lifecycle.touch_current_unit(
+            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
+            store_kwargs={"credentials": {"accessKeyId": "ASIA", "secretAccessKey": "s"}},
+        )
+        assert counts == {"touched": 0, "failed": 6}
+
     def test_absent_sibling_is_neither_touched_nor_failed(self, monkeypatch):
         # copy of a missing key (e.g. no sub-map was ever written) NoSuchKey-s;
         # absence is not a failure.
