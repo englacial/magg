@@ -265,12 +265,12 @@ def open_object_store(
     suppresses it.
 
     The rest of the injected-credential contract is shared with
-    :func:`open_store` and documented there (issue #500): the canned ACL is a
-    ``setdefault`` default, so a caller-supplied ``client_options={
-    "default_headers": {"x-amz-acl": ...}}`` wins (``None`` strips the header);
-    any ACL-carrying PUT needs ``s3:PutObjectAcl`` on the target; and injected
-    ``credentials`` are resolved once at dispatch and never refreshed, so a long
-    run fails at write time in the tail rather than up front.
+    :func:`open_store` and documented there (issue #500): an ``x-amz-acl`` the
+    caller sets in ``client_options["default_headers"]`` wins over the canned
+    default, and ``None`` strips the header outright; any ACL-carrying PUT needs
+    ``s3:PutObjectAcl`` on the target; and injected ``credentials`` are resolved
+    once at dispatch and never refreshed, so a long run fails at write time in
+    the tail rather than up front.
     """
     if path.startswith("s3://"):
         if credentials is None and endpoint_url is None and not kwargs:
