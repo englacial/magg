@@ -3,9 +3,8 @@
 > **Status: maintainer notes — partially out of date (audited against the code
 > 2026-06-15, see [#34](https://github.com/englacial/zagg/issues/34)).** The
 > canonical, rendered deploy docs live in the docs site:
-> [Standing Up the Backend](../docs/deployment/standup.md) (preferred path),
-> [AWS Lambda](../docs/deployment/lambda.md), and
-> [Execution Role](../docs/deployment/execution-role.md). This file keeps the
+> [Standing Up the Backend](../docs/deployment/standup.md) (preferred path)
+> and [AWS Lambda](../docs/deployment/lambda.md). This file keeps the
 > build/layer internals and the size/cost rationale; several figures below
 > (layer/function sizes, the role/bucket names, the layer contents) are
 > historical and were not all re-measured — trust the scripts
