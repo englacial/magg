@@ -223,166 +223,131 @@ class TestTemplateEnvironment:
         # The shared execution role gets Get/Put/Delete on the whole public
         # sliderule-public-cors bucket -- deliberate scope (espg, PR #176):
         # virtual-index write-back + sidecar reads (zagg-index/*, issue #160)
-        # AND worker-written output zarr stores (e.g. zagg-examples/*) -- in
-        # BOTH copies of the role (inline ExecutionRole here, admin-created
-        # execution_role.yaml).
+        # AND worker-written output zarr stores (e.g. zagg-examples/*). This is
+        # the STAGING half of the identity model in issue #495; the published
+        # half is asserted in the next test.
         arn = "arn:aws:s3:::sliderule-public-cors/*"
-        actions = ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"]
-
-        def _index_statements(role_props):
-            stmts = role_props["Policies"][0]["PolicyDocument"]["Statement"]
-            return [s for s in stmts if s.get("Resource") == arn]
-
-        tpl_role = self._load_template()["Resources"]["ExecutionRole"]["Properties"]
-        matches = _index_statements(tpl_role)
+        role = self._load_template()["Resources"]["ExecutionRole"]["Properties"]
+        stmts = role["Policies"][0]["PolicyDocument"]["Statement"]
+        matches = [s for s in stmts if s.get("Resource") == arn]
         assert len(matches) == 1
-        assert sorted(matches[0]["Action"]) == actions
+        assert sorted(matches[0]["Action"]) == ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"]
 
-        import yaml
-
-        class _CfnLoader(yaml.SafeLoader):
-            pass
-
-        def _cfn_multi(loader, tag_suffix, node):
-            if isinstance(node, yaml.ScalarNode):
-                return {tag_suffix: loader.construct_scalar(node)}
-            if isinstance(node, yaml.SequenceNode):
-                return {tag_suffix: loader.construct_sequence(node)}
-            return {tag_suffix: loader.construct_mapping(node)}
-
-        _CfnLoader.add_multi_constructor("!", _cfn_multi)
-        role_tpl = REPO_ROOT / "deployment" / "aws" / "execution_role.yaml"
-        ext = yaml.load(role_tpl.read_text(), Loader=_CfnLoader)
-        ext_role = ext["Resources"]["ExecutionRole"]["Properties"]
-        ext_matches = _index_statements(ext_role)
-        assert len(ext_matches) == 1
-        assert sorted(ext_matches[0]["Action"]) == actions
-
-    def test_source_coop_upload_role_is_gated_scoped_and_deterministic(self):
-        # Issue #495: the Source Cooperative Option 3 grant needs an upload role
-        # whose ARN exists BEFORE they can name it in their bucket policy (AWS
-        # rejects a policy naming a principal that does not exist). Pin the
-        # three properties that make the role safe to ship in a shared account:
-        #   * it is opt-in -- an empty SourceCoopPublisherPrincipal (the
-        #     default) creates nothing, so self-hosted standups are unchanged;
-        #   * the ARN is deterministic (explicit RoleName), which is what was
-        #     promised to Source Cooperative in advance;
-        #   * the trust principal is a parameterized identity ARN, never the
-        #     account :root (sts:AssumeRole is outside PowerUserAccess's
-        #     NotAction list, so :root would let any power user assume it).
+    def test_execution_role_is_the_published_identity(self):
+        # Issue #495 (revised): the fleet publishes to Source Cooperative as
+        # ITSELF -- no assumable role, no injected credentials, no one-hour
+        # role-chaining ceiling. zagg's data model is communal (one datacube,
+        # appended by many), and staging vs published is a difference in store
+        # MATURITY, not identity, so this is the same policy shape as the
+        # sliderule-public-cors grant above pointed at a durable destination.
         tpl = self._load_template()
-        params = tpl["Parameters"]
-        assert params["SourceCoopPublisherPrincipal"]["Default"] == ""
-        assert params["SourceCoopUploadRoleName"]["Default"] == "source-coop-upload"
-        assert tpl["Conditions"]["ShouldCreateSourceCoopRole"] == {
-            "Not": [{"Equals": [{"Ref": "SourceCoopPublisherPrincipal"}, ""]}]
-        }
+        stmts = tpl["Resources"]["ExecutionRole"]["Properties"]["Policies"][0]["PolicyDocument"][
+            "Statement"
+        ]
 
-        role = tpl["Resources"]["SourceCoopUploadRole"]
-        assert role["Type"] == "AWS::IAM::Role"
-        assert role["Condition"] == "ShouldCreateSourceCoopRole"
-        props = role["Properties"]
-        assert props["RoleName"] == {"Ref": "SourceCoopUploadRoleName"}
-        (trust,) = props["AssumeRolePolicyDocument"]["Statement"]
-        assert trust["Action"] == "sts:AssumeRole"
-        assert trust["Principal"] == {"AWS": {"Ref": "SourceCoopPublisherPrincipal"}}
-
-        (policy,) = props["Policies"]
-        objects, bucket = policy["PolicyDocument"]["Statement"]
-        assert objects["Resource"] == "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/*"
-        # Multipart actions are load-bearing at ~131 MB/shard: obstore uploads
-        # multipart constantly. AbortMultipartUpload covers obstore's
-        # in-process failure path (it needs the UploadId it already holds);
-        # finding uploads leaked by a worker killed at the 900 s ceiling needs
-        # ListBucketMultipartUploads on the bucket ARN, asserted below.
-        assert sorted(objects["Action"]) == [
-            "s3:AbortMultipartUpload",
+        objects = [
+            s
+            for s in stmts
+            if s.get("Resource") == "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/*"
+        ]
+        assert len(objects) == 1, "the execution role must reach zagg's published prefix"
+        # DeleteObject is deliberate: store overwrite and manifest cleanup need
+        # it, and the bucket is versioned, so a delete leaves a marker rather
+        # than destroying bytes.
+        assert sorted(objects[0]["Action"]) == [
             "s3:DeleteObject",
             "s3:GetObject",
-            "s3:ListMultipartUploadParts",
             "s3:PutObject",
-            "s3:PutObjectAcl",
         ]
-        assert bucket["Action"] == ["s3:ListBucket", "s3:ListBucketMultipartUploads"]
-        assert bucket["Resource"] == "arn:aws:s3:::us-west-2.opendata.source.coop"
-        # ListBucket is unconditional on purpose (review fold): S3 returns
-        # 404 on a GET for a missing key only when the caller has
-        # s3:ListBucket on the bucket, and a GetObject evaluation carries no
-        # s3:prefix context key -- so an s3:prefix condition would make every
-        # absent object 403, which zagg's 404-only absence checks do not
-        # catch.
-        assert "Condition" not in bucket, (
+        # Scoped to englacial/zagg/*, not englacial/*: englacial is a personal
+        # org today, so sibling repos stay out of the fleet's reach until a
+        # communal org exists.
+        assert not any(
+            s.get("Resource") == "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/*"
+            for s in stmts
+        )
+
+        bucket = [
+            s for s in stmts if s.get("Resource") == "arn:aws:s3:::us-west-2.opendata.source.coop"
+        ]
+        assert len(bucket) == 1
+        assert bucket[0]["Action"] == "s3:ListBucket"
+        # Unconditional on purpose (PR #496 review): S3 answers 404 for an
+        # absent key only when the caller holds s3:ListBucket on the bucket,
+        # and a GetObject evaluation carries no s3:prefix context key -- so an
+        # s3:prefix condition would make every absent object 403, which zagg's
+        # 404-only absence checks do not catch.
+        assert "Condition" not in bucket[0], (
             "an s3:prefix condition on ListBucket makes absent objects 403 "
             "instead of 404, and zagg's absence checks catch 404 only"
         )
 
-        out = tpl["Outputs"]["SourceCoopUploadRoleArn"]
-        assert out["Condition"] == "ShouldCreateSourceCoopRole"
-        assert out["Value"] == {"GetAtt": "SourceCoopUploadRole.Arn"}
+        # No assumable upload role survives from the first cut of phase 3.
+        assert not any("SourceCoop" in name for name in tpl["Resources"])
+        assert not any("SourceCoop" in name for name in tpl["Parameters"])
 
-    def test_execution_role_gains_no_source_coop_access(self):
-        # Issue #495 keeps the #26 fail-closed posture: the fleet's execution
-        # role gets NO standing write access to source.coop. The dispatcher
-        # assumes SourceCoopUploadRole and injects short-lived credentials
-        # through the existing output_credentials path instead. Checked in BOTH
-        # copies of the role (inline ExecutionRole here, admin-created
-        # execution_role.yaml).
-        import json
-
-        import yaml
-
-        class _CfnLoader(yaml.SafeLoader):
-            pass
-
-        def _cfn_multi(loader, tag_suffix, node):
-            if isinstance(node, yaml.ScalarNode):
-                return {tag_suffix: loader.construct_scalar(node)}
-            if isinstance(node, yaml.SequenceNode):
-                return {tag_suffix: loader.construct_sequence(node)}
-            return {tag_suffix: loader.construct_mapping(node)}
-
-        _CfnLoader.add_multi_constructor("!", _cfn_multi)
-        role_tpl = REPO_ROOT / "deployment" / "aws" / "execution_role.yaml"
-        external = yaml.load(role_tpl.read_text(), Loader=_CfnLoader)
-        roles = {
-            "template.yaml": self._load_template()["Resources"]["ExecutionRole"],
-            "execution_role.yaml": external["Resources"]["ExecutionRole"],
-        }
-        for name, role in roles.items():
-            # The grep is sound only because the role's permissions are fully
-            # described inline, so pin that too: an attached managed policy
-            # (ManagedPolicyArns) could carry bucket write access with none of
-            # these spellings in the resource body. Needles cover the bucket's
-            # dotted host form, the hyphenated form a policy/role name would
-            # use, and the bare bucket-name stem.
-            blob = json.dumps(role)
-            assert "ManagedPolicyArns" not in blob, (
-                f"{name}'s ExecutionRole attaches a managed policy -- its "
-                "permissions are no longer fully described inline, so this "
-                "guard can no longer see what it grants (issue #26)"
-            )
-            for needle in ("source.coop", "source-coop", "opendata"):
-                assert needle not in blob, (
-                    f"{name}'s ExecutionRole now names {needle} -- issue #495 "
-                    "grants that access through an assumed role, not standing "
-                    "permissions on the worker role (issue #26)"
-                )
-
-    def test_standup_does_not_stamp_the_source_coop_role(self):
-        # The role is opt-in via SourceCoopPublisherPrincipal, and stand_up.sh
-        # (the one in-repo standup path) does not pass it -- so a plain
-        # stand_up.sh creates no named IAM role. Applying the role is an
-        # operator action on the englacial account, not something a standup
-        # does implicitly. RoleName on SourceCoopUploadRole is nonetheless the
-        # first named-IAM property in the template (ExecutionRole lets
-        # CloudFormation generate its name), so pin the capability stand_up.sh
-        # passes: tightening it back to CAPABILITY_IAM would fail only against
-        # live AWS. The claim is scoped to this path -- an operator deploying
-        # via the console or a bare `aws cloudformation deploy` supplies the
-        # capability themselves.
+    def test_execution_role_name_is_a_stable_parameter(self):
+        # The ARN becomes a cross-organization contract once Source Cooperative
+        # names it in their bucket policy, so the role cannot keep a
+        # CloudFormation-generated name. It must stay a PARAMETER, though:
+        # zagg-backend-test is a second stack from this same template and a
+        # hardcoded name would collide on CREATE.
+        tpl = self._load_template()
+        assert tpl["Parameters"]["ExecutionRoleName"]["Default"] == "zagg-lambda-execution"
+        role = tpl["Resources"]["ExecutionRole"]
+        assert role["Properties"]["RoleName"] == {"Ref": "ExecutionRoleName"}
         standup = (REPO_ROOT / "deployment" / "aws" / "stand_up.sh").read_text()
-        assert "SourceCoopPublisherPrincipal" not in standup
+        # A named IAM role needs CAPABILITY_NAMED_IAM; tightening that back to
+        # CAPABILITY_IAM would fail only against live AWS.
         assert "CAPABILITY_NAMED_IAM" in standup
+        # ...and the name must be reachable from the standup path, or a second
+        # stack in the same account cannot avoid the collision.
+        assert 'ExecutionRoleName="$EXECUTION_ROLE_NAME"' in standup
+
+    def test_execution_role_backdoor_is_gone(self):
+        # espg's ruling (issue #495): CreateExecutionRole/ExecutionRoleArn was
+        # a hatch for users without iam:CreateRole, it never worked, and
+        # nothing used it. The supported posture is "an admin stands up the
+        # template". Removal has to be complete -- a surviving !If or a stale
+        # env var in stand_up.sh would silently reintroduce an unnamed role,
+        # and an unnamed role breaks publishing on Source Cooperative's side.
+        tpl = self._load_template()
+        assert "CreateExecutionRole" not in tpl["Parameters"]
+        assert "ExecutionRoleArn" not in tpl["Parameters"]
+        assert "ShouldCreateRole" not in tpl["Conditions"]
+        assert "Condition" not in tpl["Resources"]["ExecutionRole"]
+        assert tpl["Outputs"]["RoleArn"]["Value"] == {"GetAtt": "ExecutionRole.Arn"}
+
+        raw = (REPO_ROOT / "deployment" / "aws" / "template.yaml").read_text()
+        for token in ("ShouldCreateRole", "ExecutionRoleArn", "CreateExecutionRole"):
+            assert token not in raw, f"{token} survives in template.yaml"
+        standup = (REPO_ROOT / "deployment" / "aws" / "stand_up.sh").read_text()
+        for token in ("CREATE_ROLE", "ROLE_ARN", "CreateExecutionRole", "ExecutionRoleArn"):
+            assert token not in standup, f"{token} survives in stand_up.sh"
+        for stale in (
+            REPO_ROOT / "deployment" / "aws" / "execution_role.yaml",
+            REPO_ROOT / "deployment" / "aws" / "EXECUTION_ROLE.md",
+            REPO_ROOT / "docs" / "deployment" / "execution-role.md",
+        ):
+            assert not stale.exists(), f"{stale.name} documents a path that no longer exists"
+        # A nav entry pointing at a deleted page breaks the docs build.
+        assert "execution-role.md" not in (REPO_ROOT / "mkdocs.yml").read_text()
+
+    def test_every_function_uses_the_stack_role_directly(self):
+        # The five !If [ShouldCreateRole, ...] sites are gone; each function
+        # (base, -extract, and the Fn::ForEach worker variants) must reference
+        # the role resource, not a parameter that no longer exists.
+        tpl = self._load_template()
+        roles = []
+        for key, val in tpl["Resources"].items():
+            if key.startswith("Fn::ForEach::"):
+                for resource in val[2].values():
+                    if resource.get("Type") == "AWS::Lambda::Function":
+                        roles.append(resource["Properties"]["Role"])
+            elif val.get("Type") == "AWS::Lambda::Function":
+                roles.append(val["Properties"]["Role"])
+        assert roles, "no Lambda functions found in the template"
+        assert all(r == {"GetAtt": "ExecutionRole.Arn"} for r in roles), roles
 
     def test_metric_filters_publish_recycle_error_split(self):
         # issue #175: under RecycleMaxInvocations=1 every async invocation

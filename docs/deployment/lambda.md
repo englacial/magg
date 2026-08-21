@@ -118,12 +118,13 @@ This approach avoids rate limiting from 1,872 simultaneous NASA logins and elimi
 
 ### Output Credentials (external write targets)
 
-By default the function writes the output store with its **execution role**
-against the in-account bucket; omit `output_credentials` entirely to keep this
-behavior. To write an **external or S3-compatible target** (another account, or
-e.g. source.coop) without changing the execution role, supply
-`output_credentials` in the event — symmetric to how `s3_credentials` injects
-read credentials:
+By default the function writes the output store with its **execution role**,
+which reaches the in-account output bucket, `sliderule-public-cors`, and zagg's
+published prefix on Source Cooperative (issue #495) — omit `output_credentials`
+entirely for all three. Injection is for targets we have **not** negotiated a
+bucket policy with: a collaborator's private bucket, or an S3-compatible store
+like R2/MinIO. Supply `output_credentials` in the event — symmetric to how
+`s3_credentials` injects read credentials:
 
 ```python
 from zagg import load_config, agg
@@ -152,7 +153,6 @@ python -m zagg --config atl06.yaml --catalog catalog.json --backend lambda \
 
 The non-secret `endpoint_url` / `region` may also be set in the config's
 `output:` section (overridable at runtime); **credentials are runtime-only**.
-source.coop uses the standard AWS S3 endpoint with injected STS credentials —
 `endpointUrl` is only needed for non-AWS S3-compatible stores. Dotted bucket
 names (e.g. `us-west-2.opendata.source.coop`) and custom endpoints use
 path-style addressing automatically.
@@ -237,11 +237,9 @@ OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
 
 See **[Standing Up the Backend](standup.md)** for the full walkthrough: what the
 script does, the parameter/environment-variable reference, cross-region staging,
-and teardown. By default (`CreateExecutionRole=true`) the stack creates the IAM
-execution role for you; the only exception is an account whose deploy identity
-*cannot* create IAM roles (e.g. an AWS SSO "power user" set) — see
-[Execution Role](execution-role.md) for that IAM-constrained, legacy/unverified
-path.
+and teardown. The stack always creates the IAM execution role, so the identity
+running the standup needs `iam:CreateRole` — in an account whose deploy identity
+cannot (e.g. an AWS SSO "power user" set), have an admin run the standup itself.
 
 ### Worker-size variants {#worker-size-variants}
 

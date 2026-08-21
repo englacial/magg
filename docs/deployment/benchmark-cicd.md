@@ -65,7 +65,7 @@ All three GitHub-OIDC roles — **benchmark-invoke** (this section), **test-depl
 and **release** (section 9) — plus the public **`sliderule-public-cors`** bucket
 (section 10) are provisioned by one template, `deployment/aws/benchmark_cicd.yaml`,
 kept in its own stack so it rolls back / tears down cleanly (the SlideRule
-CFN-first convention; mirrors `execution_role.yaml`). It references the existing
+CFN-first convention). It references the existing
 OIDC provider from section 1 by account ID, so nothing here recreates it.
 
 ```bash
