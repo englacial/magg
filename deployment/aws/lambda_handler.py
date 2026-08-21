@@ -540,7 +540,9 @@ def _output_store_kwargs(event: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
-def _probe_output_write(event: Dict[str, Any]) -> Optional[Tuple[str, bool]]:
+def _probe_output_write(
+    event: Dict[str, Any], store_kwargs: Dict[str, Any]
+) -> Optional[Tuple[str, bool]]:
     """PUT-then-DELETE a zero-byte object to prove ``s3:PutObject`` (issue #495).
 
     The ping's read-only manifest check proves the output credentials can REACH
@@ -587,6 +589,14 @@ def _probe_output_write(event: Dict[str, Any]) -> Optional[Tuple[str, bool]]:
     deliberately for aborted/retried uploads. A grant missing those still
     passes here.
 
+    ``store_kwargs`` is resolved by the CALLER (``_output_store_kwargs``, in
+    ``_handle_ping``'s read-side ``try``) rather than here: a malformed
+    ``output_credentials`` block raises ``ValueError`` and must not be reported
+    as a denied grant. That is genuinely reachable -- the read half calls
+    ``_output_store_kwargs`` only on the hive branch, so on a raster or flat
+    ping (issue #264) the event's credentials shape is first touched right
+    here.
+
     Returns ``(probed URI, delete succeeded)``, or ``None`` for a non-``s3://``
     store (a local store has nothing to prove, and probing it would create the
     directory). The DELETE outcome rides back out so it can reach the
@@ -604,7 +614,7 @@ def _probe_output_write(event: Dict[str, Any]) -> Optional[Tuple[str, bool]]:
 
     prefix = f"{store_path.rstrip('/')}.status"
     key = f"probe-{uuid.uuid4().hex}"
-    store = open_object_store(prefix, **_output_store_kwargs(event))
+    store = open_object_store(prefix, **store_kwargs)
     obstore.put(store, key, b"")
     deleted = True
     try:
@@ -1039,7 +1049,9 @@ def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
     object under the run's own ``<store>.status/`` sibling -- still before any
     worker is dispatched, and under a prefix the async transport already
     requires writable, so it adds no grant surface of its own. Its failure is reported with ``"check": "write_probe"`` so the
-    dispatcher names the right remedy, and it is deliberately NOT fail-open:
+    dispatcher names the right remedy -- narrowly, since the store kwargs are
+    resolved in the read-side ``try`` above, so only the request itself can
+    carry that tag -- and it is deliberately NOT fail-open:
     the point is to refuse the run while refusing is still free. The DELETE
     half stays fail-open but is REPORTED (``probe_delete``/``probe_key`` in the
     200 body), so a Put-but-no-Delete grant reaches the operator as a warning
@@ -1049,6 +1061,12 @@ def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         import zagg
 
+        # Resolved HERE, inside the read-side try, and handed to the probe
+        # below: a malformed output_credentials block is an event typo, not a
+        # denied grant, and must keep the read-side tag. The hive branch is the
+        # only other caller, so on a raster/flat ping (issue #264) this line is
+        # the first thing to touch the credentials shape at all.
+        store_kwargs = _output_store_kwargs(event)
         if "config" in event:
             config = load_config_from_dict(event["config"])
             if get_store_layout(config) == "hive":
@@ -1063,14 +1081,14 @@ def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
                         grid, dataset=event.get("dataset"), windowing=get_windowing(config)
                     ),
                     overwrite=event.get("overwrite", False),
-                    **_output_store_kwargs(event),
+                    **store_kwargs,
                 )
     except Exception as e:
         logger.exception(e)
         return {"statusCode": 500, "body": json.dumps({"error": str(e), "mode": "ping"})}
 
     try:
-        probed = _probe_output_write(event)
+        probed = _probe_output_write(event, store_kwargs)
     except Exception as e:
         # Tagged distinctly from the read-side refusal above: the dispatcher
         # turns "check": "write_probe" into a grant remedy instead of the

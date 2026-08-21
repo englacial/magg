@@ -5251,14 +5251,18 @@ def _invoke_lambda_ping(
       had.
 
     - **Read-only grant:** the handler PUT-then-DELETEs a zero-byte probe
-      object under a sibling ``.probe`` prefix (issue #495), so output
-      credentials that can READ the store but not write it -- the shape a
-      fresh cross-account bucket policy fails in, and the one Source
-      Cooperative's in-region path has no interactive step to catch -- refuse
-      here instead of after every worker has aggregated its shard. The
-      response tags this failure ``"check": "write_probe"`` so the remedy
-      below points at the grant, not at the store's contents. A function that
-      predates #495 simply omits the tag and the older message applies.
+      object under the run's own ``<store>.status/`` sibling (issue #495 --
+      the prefix the async transport already requires writable, so the probe
+      adds no grant surface), so output credentials that can READ the store
+      but not write it -- the shape a fresh cross-account bucket policy fails
+      in, and the one Source Cooperative's in-region path has no interactive
+      step to catch -- refuse here instead of after every worker has
+      aggregated its shard. The response tags this failure
+      ``"check": "write_probe"`` so the remedy below points at the failing
+      REQUEST (grant being the likely cause) rather than at the store's
+      contents. A function that predates #495 simply omits the tag and the
+      older message applies. A DELETE that fails is fail-open but reported
+      (``probe_delete``) and warned about here.
 
     The raster lambda path reuses this ping (issue #264) ahead of its sync
     template-writing setup invoke: a raster config carries no hive layout, so
@@ -5295,17 +5299,19 @@ def _invoke_lambda_ping(
         except (TypeError, ValueError):
             body = {}
         if body.get("check") == "write_probe":
-            # The store is reachable and compatible; the credentials just
-            # cannot write to it (issue #495). Naming the store's contents
-            # here — the message below — would send the operator to clear a
-            # store root that is not the problem.
+            # The store is reachable and compatible; the zero-byte probe PUT
+            # did not land (issue #495). Naming the store's contents here — the
+            # message below — would send the operator to clear a store root
+            # that is not the problem. The cause is stated as LIKELY, not
+            # determined: the tag says which request failed, not why, and the
+            # echoed error carries "Access Denied" when that is what happened.
             raise RuntimeError(
                 f"Lambda ping could not WRITE to {store_path}: "
                 f"{body.get('error')!r} — the output credentials can reach the "
-                f"store but a zero-byte probe PUT was denied; fix the grant "
-                f"(bucket policy or assumed role) before dispatching this run, "
-                f"or the fan-out will aggregate every shard and then fail at "
-                f"write time"
+                f"store but a zero-byte probe PUT failed, most likely a denied "
+                f"grant (bucket policy or assumed role); resolve it before "
+                f"dispatching this run, or the fan-out will aggregate every "
+                f"shard and then fail at write time"
             )
         if body.get("mode") == "ping":
             # The deployed function KNOWS ping — this is validate_manifest
