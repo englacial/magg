@@ -1978,6 +1978,37 @@ class TestRasterLocalRerun:
         assert s2["objects_touched"] > 0 and s2["touch_failures"] == 0
         assert all(os.stat(path).st_mtime_ns > 10_000 * 10**9 for path in roots)
 
+    def test_declared_never_leaves_the_whole_store_alone(self, tmp_path, manifest):
+        # Issue #501 END TO END through the raster local dispatcher: the
+        # operator's `output.touch` must govern BOTH touch seams a skip run
+        # fires -- the unit footprint (processing/raster.py) and the store root
+        # (RasterStrategy). Delete either `policy=get_touch_policy(config)`
+        # kwarg and this fails (review finding on PR #496).
+        import os
+
+        from zagg import hive
+
+        cfg, sm_path, _shard, _data = manifest
+        cfg.output["store_layout"] = "hive"
+        agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        store = cfg.output["store"]
+        for dirpath, _dirs, files in os.walk(store):
+            for name in files:
+                os.utime(os.path.join(dirpath, name), (10_000, 10_000))
+        aged_ns = 10_000 * 10**9
+
+        cfg.output["touch"] = "never"
+        s2 = agg(cfg, catalog=sm_path, backend="local", max_workers=2)
+        assert s2["cells_current"] == 1  # premise: both touch seams were reached
+        assert s2["objects_touched"] == 0 and s2["touch_failures"] == 0
+        # Unit footprint AND the three root paths, all not applicable.
+        assert s2["touch_skipped_paths"] > 0
+        stale = [
+            os.path.join(store, hive.MANIFEST_NAME),
+            os.path.join(store, hive.AGGREGATION_CORE_NAME),
+        ]
+        assert all(os.stat(path).st_mtime_ns == aged_ns for path in stale)
+
     def test_overwrite_disables_the_skip(self, tmp_path, manifest):
         cfg, sm_path, _shard, _data = manifest
         cfg.output["store_layout"] = "hive"

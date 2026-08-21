@@ -1479,6 +1479,31 @@ class TestRasterHiveWorker:
         # not-applicable count, so this record is what it was before.
         assert "touch_skipped_paths" not in skipped
 
+    def test_declared_touch_policy_reaches_the_skip_seam(self, tmp_path, monkeypatch):
+        # Issue #501 END TO END through the raster seam: the config's
+        # `output.touch` must govern the touch, not just the lifecycle unit
+        # tests that call touch_current_unit directly. Delete the
+        # `policy=get_touch_policy(config)` kwarg in process_and_write_raster_hive
+        # and this fails (review finding on PR #496).
+        import zagg.processing.raster as raster_mod
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        aged_ns = self._age(root)
+
+        def boom(*_a, **_k):
+            raise AssertionError("sampling ran on a current unit")
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", boom)
+        cfg.output["touch"] = "never"
+        skipped = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert skipped["current"] is True
+        assert skipped["touched_objects"] == 0 and skipped["touch_failed"] == 0
+        assert skipped["touch_skipped_paths"] > 0
+        assert all(mtime == aged_ns for mtime in self._tree(root).values())
+
     def test_a_published_skip_is_recorded_not_silently_zero(self, tmp_path, monkeypatch):
         # Mirror of the aggregation seam (issue #495 phase 4, review finding
         # on PR #496): touched_objects: 0 / touch_failed: 0 cannot be told
