@@ -195,6 +195,23 @@ class TestBucketOwnerAcl:
             "x-custom": "1",
         }
 
+    def test_caller_mixed_case_acl_header_still_wins(self, mock_s3):
+        # obstore lowercases header keys, so a raw setdefault cannot see
+        # ``X-Amz-Acl`` and the collision resolves inside obstore in OUR
+        # favour -- a caller who deliberately asked for ``private`` would be
+        # silently overridden (review finding). Lowercasing the merge fixes it.
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://external/foo.zarr",
+            credentials=self.CREDS,
+            client_options={"default_headers": {"X-Amz-Acl": "private", "X-Custom": "1"}},
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == {
+            "x-amz-acl": "private",
+            "x-custom": "1",
+        }
+
     def test_caller_client_options_are_not_mutated(self, mock_s3):
         s3_cls, _ = mock_s3
         options = {"default_headers": {"x-custom": "1"}}
