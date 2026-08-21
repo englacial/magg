@@ -168,6 +168,34 @@ def open_store(
     consumer-INPUT channel (somebody else's input bucket, as
     ``temporal.open_dataset`` opens it), not a write target of ours.
 
+    That header is a DEFAULT, not a fixture (issue #500). It is merged with
+    ``setdefault``, so a caller-supplied value WINS -- honoured as passed,
+    neither merged with ours nor overwritten (key case is irrelevant; see
+    :func:`_with_bucket_owner_acl`)::
+
+        open_store(path, credentials=creds,
+                   client_options={"default_headers": {"x-amz-acl": "private"}})
+
+    The permission requirement rides along: any ACL-carrying PUT needs
+    ``s3:PutObjectAcl`` on the target, so overriding to a different canned value
+    carries the same requirement rather than a lesser one. Passing ``None`` as
+    the value strips the header instead of setting one -- the only way through
+    this path to send no ACL at all.
+
+    Injected ``credentials`` are never REFRESHED (issue #500, folded from #498).
+    ``output_credentials`` are resolved once at dispatch and embedded in every
+    worker's invoke payload, so a worker inherits the dispatcher's clock rather
+    than starting its own: a run that outlasts its credential lifetime fails in
+    the tail, at write time, after the compute is already paid for, and
+    concentrated on the slowest shards. The ceiling depends on how the
+    credentials were obtained -- ``sts:AssumeRole`` from an already-assumed role
+    (SSO included) is role chaining, which AWS hard-caps at one hour and which
+    ``MaxSessionDuration`` cannot raise, while ``AssumeRoleWithWebIdentity`` is
+    not chaining and honours ``MaxSessionDuration`` up to 12 hours. This does
+    NOT affect the fleet's published writes, which go out under the ambient
+    execution role that Lambda rotates transparently; the limitation is specific
+    to the injected-credential escape hatch (issue #26).
+
     Returns
     -------
     Store
@@ -234,6 +262,14 @@ def open_object_store(
     bucket (issue #223). It is inert there (S3 interprets ``x-amz-acl`` only on
     object-creating requests); ``open_store(read_only=True)``, which can tell,
     suppresses it.
+
+    The rest of the injected-credential contract is shared with
+    :func:`open_store` and documented there (issue #500): the canned ACL is a
+    ``setdefault`` default, so a caller-supplied ``client_options={
+    "default_headers": {"x-amz-acl": ...}}`` wins (``None`` strips the header);
+    any ACL-carrying PUT needs ``s3:PutObjectAcl`` on the target; and injected
+    ``credentials`` are resolved once at dispatch and never refreshed, so a long
+    run fails at write time in the tail rather than up front.
     """
     if path.startswith("s3://"):
         if credentials is None and endpoint_url is None and not kwargs:
