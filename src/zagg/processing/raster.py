@@ -1347,11 +1347,15 @@ def process_and_write_raster_hive(
                 # sub-map siblings (the raster seam writes no column).
                 # Fail-open: a failed touch logs and counts, never fails or
                 # un-skips the unit.
+                from zagg.config import get_touch_policy
                 from zagg.lifecycle import touch_current_unit
 
                 try:
                     counts = touch_current_unit(
-                        leaf_path, sidecar_spec=sidecar_spec, store_kwargs=store_kwargs
+                        leaf_path,
+                        sidecar_spec=sidecar_spec,
+                        store_kwargs=store_kwargs,
+                        policy=get_touch_policy(config),
                     )
                 except Exception as e:
                     logger.warning(

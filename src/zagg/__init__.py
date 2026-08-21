@@ -22,6 +22,7 @@ from .config import (
     get_driver,
     get_layout,
     get_store_path,
+    get_touch_policy,
     load_config,
 )
 from .grids import HealpixGrid, OutputGrid
@@ -64,6 +65,7 @@ __all__ = [
     "get_edl_token",
     "get_nsidc_s3_credentials",
     "get_store_path",
+    "get_touch_policy",
     "load_config",
     "open_store",
     "parse_s3_path",

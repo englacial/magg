@@ -122,6 +122,7 @@ def touch_current_unit(
     column_path=None,
     sidecar_spec=None,
     store_kwargs=None,
+    policy="auto",
 ) -> dict:
     """The issue #388 skip-path touch for ONE ``(shard, window)`` unit.
 
@@ -158,10 +159,10 @@ def touch_current_unit(
     except Exception as e:
         logger.warning(f"lifecycle touch skipped — footprint unresolved (fail-open): {e}")
         return {"touched": 0, "failed": 1}
-    return touch_unit_footprint(trees, objects, store_kwargs=store_kwargs)
+    return touch_unit_footprint(trees, objects, store_kwargs=store_kwargs, policy=policy)
 
 
-def touch_store_root(store_root, *, store_kwargs=None) -> dict:
+def touch_store_root(store_root, *, store_kwargs=None, policy="auto") -> dict:
     """Touch the store-ROOT objects no unit footprint covers (issue #388).
 
     A run whose every unit skipped writes nothing at the root either:
@@ -181,10 +182,12 @@ def touch_store_root(store_root, *, store_kwargs=None) -> dict:
     except Exception as e:
         logger.warning(f"store-root touch skipped — names unresolved (fail-open): {e}")
         return {"touched": 0, "failed": 1}
-    return touch_unit_footprint([], [f"{root}/{name}" for name in names], store_kwargs=store_kwargs)
+    return touch_unit_footprint(
+        [], [f"{root}/{name}" for name in names], store_kwargs=store_kwargs, policy=policy
+    )
 
 
-def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
+def touch_unit_footprint(trees, objects, *, store_kwargs=None, policy="auto") -> dict:
     """Touch every object under each of ``trees`` + each single ``objects`` path.
 
     Paths are either local filesystem paths or ``s3://`` URLs; ``store_kwargs``
@@ -209,24 +212,28 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
     skipped_buckets: set = set()
     try:
         for tree in trees:
-            if _is_s3(tree):
-                bucket = _split_s3(tree)[0]
-                if _skip_published(bucket):
-                    skipped += 1
+            bucket = _split_s3(tree)[0] if _is_s3(tree) else None
+            if not _touch_applies(bucket, policy):
+                skipped += 1
+                if bucket is not None:
                     skipped_buckets.add(bucket)
-                    continue
-                _touch_s3_tree(_client(store_kwargs), tree, counts, _copy_acl(store_kwargs, bucket))
+                continue
+            if _is_s3(tree):
+                _touch_s3_tree(
+                    _client(store_kwargs), tree, counts, _copy_acl(store_kwargs, bucket), policy
+                )
             else:
                 _touch_local_tree(tree, counts)
         for obj in objects:
-            if _is_s3(obj):
-                bucket, key = _split_s3(obj)
-                if _skip_published(bucket):
-                    skipped += 1
+            bucket, key = _split_s3(obj) if _is_s3(obj) else (None, None)
+            if not _touch_applies(bucket, policy):
+                skipped += 1
+                if bucket is not None:
                     skipped_buckets.add(bucket)
-                    continue
+                continue
+            if _is_s3(obj):
                 acl = _copy_acl(store_kwargs, bucket)
-                _touch_s3_object(_client(store_kwargs), bucket, key, counts, acl=acl)
+                _touch_s3_object(_client(store_kwargs), bucket, key, counts, acl=acl, policy=policy)
             else:
                 _touch_local_object(obj, counts)
     except Exception as e:
@@ -296,6 +303,32 @@ def _skip_published(bucket) -> bool:
     from .store import _PUBLISHED_BUCKETS
 
     return bucket in _PUBLISHED_BUCKETS
+
+
+def _touch_applies(bucket, policy="auto") -> bool:
+    """Whether the touch applies to this path under ``policy`` (issue #501).
+
+    The operator's ``output.touch`` declaration layered ON TOP of the issue
+    #495 phase 4 inference, which it overrides rather than replaces:
+
+    ``auto``
+        Fall through to :func:`_skip_published` — the phase 4 behaviour
+        verbatim, and the default, so every config predating the knob is
+        byte-identical.
+    ``always``
+        Applies everywhere, published buckets included. For an un-negotiated
+        external target with an expiry rule the bucket name does not encode.
+    ``never``
+        Applies nowhere — LOCAL paths included, since "never touch" is a
+        statement about the run, not about S3.
+
+    ``bucket`` is None for a local path, which only ``never`` acts on.
+    """
+    if policy == "never":
+        return False
+    if policy == "always":
+        return True
+    return not (bucket is not None and _skip_published(bucket))
 
 
 def _copy_acl(store_kwargs, bucket) -> str | None:
@@ -371,18 +404,20 @@ def _touch_local_object(path, counts) -> None:
         logger.warning(f"lifecycle touch failed for {path} (fail-open): {e}")
 
 
-def _touch_s3_tree(s3, path, counts, acl=None) -> None:
+def _touch_s3_tree(s3, path, counts, acl=None, policy="auto") -> None:
     bucket, key = _split_s3(path)
     prefix = key.rstrip("/") + "/"
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for entry in page.get("Contents") or []:
             # The LIST already carries the class; echoing it back is what
             # keeps the self-copy from demoting the object to STANDARD.
-            _touch_s3_object(s3, bucket, entry["Key"], counts, entry.get("StorageClass"), acl)
+            _touch_s3_object(
+                s3, bucket, entry["Key"], counts, entry.get("StorageClass"), acl, policy
+            )
 
 
-def _touch_s3_object(s3, bucket, key, counts, storage_class=None, acl=None) -> None:
-    if _skip_published(bucket):
+def _touch_s3_object(s3, bucket, key, counts, storage_class=None, acl=None, policy="auto") -> None:
+    if not _touch_applies(bucket, policy):
         # Belt and braces (issue #495 phase 4, review finding). The counting
         # guard lives in touch_unit_footprint — the only route here today —
         # but this is the one function that issues CopyObject, so putting the
@@ -394,8 +429,9 @@ def _touch_s3_object(s3, bucket, key, counts, storage_class=None, acl=None) -> N
         # path, and counting again would double it — and it is unreachable in
         # practice, so a hit means a new caller skipped the seam: WARNING.
         logger.warning(
-            f"lifecycle touch reached the copy seam for published s3://{bucket}/{key} — "
-            "refused (issue #495 phase 4); a caller bypassed touch_unit_footprint's guard"
+            f"lifecycle touch reached the copy seam for s3://{bucket}/{key} under "
+            f"policy={policy!r} — refused (issue #495 phase 4, issue #501); a caller "
+            "bypassed touch_unit_footprint's guard"
         )
         return
     try:

@@ -3365,6 +3365,45 @@ class TestNonFiniteFloatsAreRefusedAtValidation:
         _validate_json_floats(load_config_from_dict(d))  # must not raise
 
 
+class TestTouchPolicy:
+    """``output.touch`` (issue #501): declare the lifecycle-touch behaviour
+    instead of inferring it from the bucket name."""
+
+    def test_defaults_to_auto(self):
+        from zagg.config import default_config, get_touch_policy
+
+        assert get_touch_policy(default_config()) == "auto"
+
+    def test_reads_the_declared_value(self):
+        from zagg.config import default_config, get_touch_policy
+
+        cfg = default_config()
+        for value in ("auto", "always", "never"):
+            cfg.output["touch"] = value
+            assert get_touch_policy(cfg) == value
+
+    def test_rejects_anything_outside_the_three_values(self):
+        # Validated at LOAD so a typo fails at submission rather than
+        # resolving to the default deep inside a worker's skip path, where the
+        # wrong answer is either version churn on a published store or a
+        # collaborator's data expiring.
+        import pytest
+
+        from zagg.config import _validate_store_layout_keys, default_config
+
+        cfg = default_config()
+        cfg.output["touch"] = "sometimes"
+        with pytest.raises(ValueError, match="output.touch must be one of"):
+            _validate_store_layout_keys(cfg)
+
+    def test_absent_is_legal(self):
+        from zagg.config import _validate_store_layout_keys, default_config
+
+        cfg = default_config()
+        cfg.output.pop("touch", None)
+        _validate_store_layout_keys(cfg)
+
+
 class TestPackagedConfigsAreDispatchable:
     """Every packaged config must survive the strict JSON the Lambda dispatch
     payload is built with (issue #448).
