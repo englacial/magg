@@ -123,6 +123,16 @@ to hand-assemble zips or wire up the IAM role yourself.
 > have not negotiated a bucket policy with -- a collaborator's private bucket,
 > R2/MinIO -- see
 > [AWS Lambda](lambda.md#output-credentials-external-write-targets).
+>
+> **Publish into a subdirectory of the granted prefix, never at the prefix
+> root.** A run's status objects are a string-concatenated *sibling* of the
+> store, not a child: a store at
+> `s3://us-west-2.opendata.source.coop/englacial/zagg/demo/foo.zarr` puts them
+> under `.../demo/foo.zarr.status/`, inside the grant, but a store written at
+> the prefix root (`.../englacial/zagg/demo`) puts them at
+> `.../englacial/zagg/demo.status/`, outside it. The
+> [write probe](lambda.md#write-probe) makes that fail closed before fan-out
+> rather than mid-campaign, so the policy is deliberately not widened for it.
 
 ## `stand_up.sh` environment variables
 
