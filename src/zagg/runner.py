@@ -5322,10 +5322,24 @@ def _invoke_lambda_ping(
             f"redeploy the function before dispatching this run"
         )
     try:
-        version = json.loads(result.get("body") or "{}").get("zagg_version")
+        ok_body = json.loads(result.get("body") or "{}")
     except (TypeError, ValueError):
-        version = None
-    logger.info(f"Preflight OK (function zagg version {version})")
+        ok_body = {}
+    if ok_body.get("probe_delete") is False:
+        # The probe PUT succeeded but its cleanup DELETE did not (issue #495).
+        # Deliberately not fatal — write permission, the thing this preflight
+        # gates on, is proven. But s3:DeleteObject is not optional for zagg's
+        # real writes (store overwrite and manifest cleanup), so the run is
+        # likely to fail later, and every run strands one zero-byte object
+        # under a prefix nothing sweeps. Surfaced HERE because the function's
+        # own log group is not where the dispatching operator is looking.
+        logger.warning(
+            f"Write probe could not delete {ok_body.get('probe_key')!r}: the output "
+            f"credentials can PUT but likely lack s3:DeleteObject, which zagg needs "
+            f"for store overwrite and manifest cleanup — this run may fail at write "
+            f"time, and the probe object is stranded"
+        )
+    logger.info(f"Preflight OK (function zagg version {ok_body.get('zagg_version')})")
 
 
 def _invoke_lambda_finalize(

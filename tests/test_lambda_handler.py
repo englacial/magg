@@ -1757,9 +1757,11 @@ class TestPingMode:
         assert body["zagg_version"] == zagg.__version__
         # Read-only against the store itself: the preflight never writes the
         # manifest. The issue #495 write probe is s3-only, so a local store is
-        # never probed -- the body says so.
+        # never probed -- the body says so, and reports no delete outcome to
+        # warn about.
         assert not os.path.exists(os.path.join(event["store_path"], hive.MANIFEST_NAME))
         assert body["write_probe"] is False
+        assert "probe_delete" not in body
 
     def test_ping_probes_write_permission_on_s3_stores(self, handler_mod, monkeypatch):
         # Issue #495: reachability is not permission. The probe PUTs a
@@ -1784,6 +1786,9 @@ class TestPingMode:
         assert calls["store_kwargs"]["credentials"] == event["output_credentials"]
         assert calls["put"] == [(calls["key"], b"")]
         assert calls["deleted"] == [calls["key"]]
+        # The round trip's outcome rides back out in the body, not only into
+        # the function's log group (issue #495 fold).
+        assert json.loads(resp["body"])["probe_delete"] is True
 
     def test_ping_probe_keys_are_unique_per_run(self, handler_mod, monkeypatch):
         # Concurrent runs must not collide on a shared probe key.
@@ -1811,10 +1816,17 @@ class TestPingMode:
         # failed cleanup strands one zero-byte object outside the store root
         # (under .status, so no leaf hash is perturbed) -- a warning, not a
         # refused run.
-        self._patch_probe(handler_mod, monkeypatch, delete_error=RuntimeError("no delete"))
+        calls = self._patch_probe(handler_mod, monkeypatch, delete_error=RuntimeError("no delete"))
         resp = handler_mod._handle_ping({"mode": "ping", "store_path": "s3://bucket/out.zarr"})
         assert resp["statusCode"] == 200, resp["body"]
-        assert json.loads(resp["body"])["write_probe"] is True
+        body = json.loads(resp["body"])
+        assert body["write_probe"] is True
+        # ... but the operator has to be TOLD: a Put-but-no-Delete grant would
+        # otherwise pass this preflight silently and fail later at store
+        # overwrite / manifest cleanup. The body carries the outcome AND the
+        # stranded key so the dispatcher can name both.
+        assert body["probe_delete"] is False
+        assert body["probe_key"] == f"s3://bucket/out.zarr.status/{calls['key']}"
 
     @staticmethod
     def _patch_probe(handler_mod, monkeypatch, put_error=None, delete_error=None):
