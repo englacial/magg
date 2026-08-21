@@ -176,6 +176,27 @@ class TestBucketOwnerAcl:
         _, kwargs = s3_cls.call_args
         assert "client_options" not in kwargs
 
+    def test_read_with_input_credentials_sends_no_acl_header(self, mock_s3):
+        # The issue #223 consumer-INPUT channel: explicit credentials that read
+        # somebody else's bucket (temporal.open_dataset's .zarr branch), not a
+        # write target of ours. read_only is consumed by _s3_object_store and
+        # never reaches S3Store.
+        s3_cls, _ = mock_s3
+        open_store("s3://someones-input/mask.zarr", read_only=True, credentials=self.CREDS)
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+        assert "read_only" not in kwargs
+
+    def test_object_store_reads_are_the_documented_exception(self, mock_s3):
+        # open_object_store has no read_only concept, so temporal's NetCDF
+        # branch (a pure GET of an input bucket) still carries the header. Inert
+        # -- S3 reads x-amz-acl only on object-creating requests -- and pinned
+        # here so the exception stays visible.
+        s3_cls, _ = mock_s3
+        open_object_store("s3://someones-input", credentials=self.CREDS, region="us-west-2")
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == self.HEADER
+
     def test_caller_client_options_are_preserved(self, mock_s3):
         # Additive merge: unrelated client options survive, and a caller who
         # sets x-amz-acl explicitly wins over the default.
