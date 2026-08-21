@@ -233,7 +233,7 @@ import resource
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from zarr import open_group
 from zarr.errors import GroupNotFoundError
@@ -540,8 +540,8 @@ def _output_store_kwargs(event: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
-def _probe_output_write(event: Dict[str, Any]) -> Optional[str]:
-    """PUT-then-DELETE a zero-byte object to prove WRITE permission (issue #495).
+def _probe_output_write(event: Dict[str, Any]) -> Optional[Tuple[str, bool]]:
+    """PUT-then-DELETE a zero-byte object to prove ``s3:PutObject`` (issue #495).
 
     The ping's read-only manifest check proves the output credentials can REACH
     the store; it cannot prove they can write to it. Credentials that read but
@@ -578,8 +578,21 @@ def _probe_output_write(event: Dict[str, Any]) -> Optional[str]:
     canned ACL as the real writes (issue #495), so a bucket that rejects the ACL
     fails here too. Two requests, added to the ping, for ``s3://`` stores only.
 
-    Returns the probed URI, or ``None`` for a non-``s3://`` store (a local store
-    has nothing to prove, and probing it would create the directory).
+    Coverage is ``s3:PutObject`` plus ``s3:DeleteObject``, and no more. One
+    small PUT IS representative of the multipart path -- obstore's
+    ``CreateMultipartUpload``/``UploadPart``/``CompleteMultipartUpload`` are all
+    authorized by ``s3:PutObject``, so no multipart probe is needed -- but it
+    cannot exercise ``s3:AbortMultipartUpload`` or
+    ``s3:ListMultipartUploadParts``, which the phase 1 grant carries
+    deliberately for aborted/retried uploads. A grant missing those still
+    passes here.
+
+    Returns ``(probed URI, delete succeeded)``, or ``None`` for a non-``s3://``
+    store (a local store has nothing to prove, and probing it would create the
+    directory). The DELETE outcome rides back out so it can reach the
+    dispatcher: a Put-but-no-Delete grant would otherwise pass this preflight
+    silently and fail later at store-overwrite/manifest-cleanup time -- the
+    exact "discovered after the compute" shape the probe exists to eliminate.
     """
     store_path = event.get("store_path") or ""
     if not store_path.startswith("s3://"):
@@ -593,14 +606,16 @@ def _probe_output_write(event: Dict[str, Any]) -> Optional[str]:
     key = f"probe-{uuid.uuid4().hex}"
     store = open_object_store(prefix, **_output_store_kwargs(event))
     obstore.put(store, key, b"")
+    deleted = True
     try:
         obstore.delete(store, key)
     except Exception:
+        deleted = False
         # The PUT is the load-bearing half -- write permission is proven. A
         # delete that fails leaves one zero-byte object OUTSIDE the store root
         # (so no leaf hash is perturbed): worth a warning, not a refused run.
         logger.warning(f"Write probe could not delete {prefix}/{key}", exc_info=True)
-    return f"{prefix}/{key}"
+    return f"{prefix}/{key}", deleted
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -1025,7 +1040,10 @@ def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
     worker is dispatched, and under a prefix the async transport already
     requires writable, so it adds no grant surface of its own. Its failure is reported with ``"check": "write_probe"`` so the
     dispatcher names the right remedy, and it is deliberately NOT fail-open:
-    the point is to refuse the run while refusing is still free.
+    the point is to refuse the run while refusing is still free. The DELETE
+    half stays fail-open but is REPORTED (``probe_delete``/``probe_key`` in the
+    200 body), so a Put-but-no-Delete grant reaches the operator as a warning
+    rather than as a silent pass plus a stranded object.
     """
     logger.info(f"Ping mode: hive preflight for {event.get('store_path')}")
     try:
@@ -1062,17 +1080,15 @@ def _handle_ping(event: Dict[str, Any]) -> Dict[str, Any]:
             "statusCode": 500,
             "body": json.dumps({"error": str(e), "mode": "ping", "check": "write_probe"}),
         }
-    return {
-        "statusCode": 200,
-        "body": json.dumps(
-            {
-                "ok": True,
-                "mode": "ping",
-                "zagg_version": zagg.__version__,
-                "write_probe": probed is not None,
-            }
-        ),
+    body: Dict[str, Any] = {
+        "ok": True,
+        "mode": "ping",
+        "zagg_version": zagg.__version__,
+        "write_probe": probed is not None,
     }
+    if probed is not None:
+        body["probe_key"], body["probe_delete"] = probed
+    return {"statusCode": 200, "body": json.dumps(body)}
 
 
 def _handle_coverage(event: Dict[str, Any]) -> Dict[str, Any]:

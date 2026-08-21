@@ -6,6 +6,7 @@ retry semantics (D4), and the local runner's hive write path.
 """
 
 import json
+import logging
 import os
 import time
 from dataclasses import asdict
@@ -2757,6 +2758,46 @@ class TestInvokeLambdaPingEvent:
             )
         assert "clear the store root" not in str(excinfo.value)
         assert "grant" in str(excinfo.value)
+
+    def test_probe_delete_failure_warns_the_operator(self, cfg, caplog):
+        # Issue #495 fold: the DELETE half is fail-open, but its outcome has to
+        # REACH the operator. A Put-but-no-Delete grant returns 200 with
+        # probe_delete=false; the dispatcher names the stranded key and the
+        # missing action, because s3:DeleteObject is not optional for zagg's
+        # real writes (store overwrite, manifest cleanup) and the function's own
+        # log group is not where the dispatching operator is looking.
+        cfg.output["store_layout"] = "hive"
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            self._invoke(
+                _wire_client(
+                    {
+                        "ok": True,
+                        "mode": "ping",
+                        "zagg_version": "1.2.3",
+                        "write_probe": True,
+                        "probe_delete": False,
+                        "probe_key": "s3://out/product.status/probe-abc",
+                    }
+                ),
+                asdict(cfg),
+                parent_order=6,
+            )
+        warned = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "s3://out/product.status/probe-abc" in warned
+        assert "s3:DeleteObject" in warned
+
+    def test_probe_delete_success_is_silent(self, cfg, caplog):
+        # The happy path stays quiet: no warning when the round trip completed.
+        cfg.output["store_layout"] = "hive"
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            self._invoke(
+                _wire_client(
+                    {"ok": True, "mode": "ping", "write_probe": True, "probe_delete": True}
+                ),
+                asdict(cfg),
+                parent_order=6,
+            )
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
     def test_validate_refusal_fails_fast(self, cfg):
         # The handler's read-only validate_manifest refusal (frozen-key
