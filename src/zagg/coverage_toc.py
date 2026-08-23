@@ -1037,7 +1037,12 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) 
       the standing sibling untouched), and a stale word set MUST NOT prune.
 
     A ``cover`` at an unknown revision degrades to tier 1 wholesale — exactly
-    ``cover=None`` — per §10.5's strict-gate-then-degrade rule. So does a
+    ``cover=None`` — per §10.5's strict-gate-then-degrade rule, and so does a
+    cover whose declared shard ``order`` differs from the carrier's: D1 ids
+    at two orders are not comparable, so a foreign-order sibling is debris
+    that must neither decide a shard nor contribute ids of its own (the gate
+    :func:`merge_cover_sections` applies on the write side, logged the same
+    way). So does a
     both-listed block that decodes to an EMPTY word set: the widening law
     forbids an empty cover for a shard that has data, so that block is
     malformed and the shard falls back to its tier-1 word rather than
@@ -1046,7 +1051,16 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) 
     from mortie import toc_overlaps
 
     words = coverage_toc(envelope)
-    sets = cover_words(cover) if cover is not None else None
+    section = load_cover(cover) if cover is not None else None
+    e_order = envelope.get("order") if isinstance(envelope, dict) else None
+    c_order = (section or {}).get("order")
+    if section is not None and None not in (c_order, e_order) and c_order != e_order:
+        logger.warning(
+            f"coverage[toc]: ignoring the cover at shard order {c_order!r} — the carrier is "
+            f"at order {e_order!r}; D1 ids at two orders are not comparable"
+        )
+        section = None
+    sets = cover_words(section) if section is not None else None
     if words is None and sets is None:
         return None
     words, sets = words or {}, sets or {}
