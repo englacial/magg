@@ -850,6 +850,24 @@ class TestCoverObject:
         write_cover(root, b)
         assert read_cover(root) == future
 
+    def test_no_contribution_leaves_the_standing_object_untouched(self, tmp_path):
+        # The refresh escape hatch over a store with NO temporal channel:
+        # `build_cover_section` answers None and `replace=True` must be a
+        # no-op on that arm too, not a crash and not an overwrite (§10.5).
+        root = str(tmp_path)
+        a = build_cover_section(_contributions([1]), ["h"], 4)
+        write_cover(root, a)
+        raw = (tmp_path / COVER_NAME).read_bytes()
+        assert write_cover(root, None, replace=True) == read_cover(root)
+        assert (tmp_path / COVER_NAME).read_bytes() == raw
+        assert write_cover(root, None) == read_cover(root)
+        assert (tmp_path / COVER_NAME).read_bytes() == raw
+
+    def test_no_contribution_on_an_empty_root_writes_nothing(self, tmp_path):
+        assert write_cover(str(tmp_path), None, replace=True) is None
+        assert write_cover(str(tmp_path), None) is None
+        assert not (tmp_path / COVER_NAME).exists()
+
     def test_garbage_is_overwritten(self, tmp_path):
         root = str(tmp_path)
         (tmp_path / COVER_NAME).write_text("not json {")
