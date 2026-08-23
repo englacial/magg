@@ -615,6 +615,13 @@ def merge_cover_sections(existing, incoming):
     shard on one side carries over unchanged. The unknown-revision rules are
     the §10.4 ones verbatim: an incoming unknown revision contributes
     nothing; a standing one is preserved and never downgraded.
+
+    Shard ``order`` gates the union the way the carrier's does
+    (:func:`zagg.hive.write_root_coverage`): D1 ids at two different orders
+    are not comparable, so a standing object at another order is incompatible
+    debris and the incoming side wins wholesale — the regenerable-cache
+    posture, and the behavior a re-shard needs if the sibling is to stay in
+    step with the ``coverage.moc`` that already replaces itself.
     """
     a, b = _cover_usable(existing), _cover_usable(incoming)
     if b is None:
@@ -627,6 +634,13 @@ def merge_cover_sections(existing, incoming):
                 f"{COVER_SPEC} does not read it and MUST NOT downgrade it"
             )
             return newer
+        return dict(b)
+    if a.get("order") != b.get("order"):
+        logger.warning(
+            f"coverage[toc]: standing cover is at shard order {a.get('order')!r} and the "
+            f"incoming one at {b.get('order')!r}; overwriting (regenerable cache) — "
+            f"D1 ids at two orders are not comparable"
+        )
         return dict(b)
     shards: dict[str, dict] = {}
     for decimal in sorted(set(a.get("shards") or {}) | set(b.get("shards") or {})):

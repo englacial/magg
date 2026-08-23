@@ -820,6 +820,21 @@ class TestCoverComposition:
         expect = quantize_words(np.concatenate([cover_words(fine)["11213"], words14]), 14)
         assert np.array_equal(cover_words(merged)["11213"], expect)
 
+    def test_a_standing_cover_at_another_shard_order_is_replaced(self, caplog):
+        # D1 ids at two orders are not comparable, so the seam behaves like
+        # the carrier's incompatible-envelope arm: the incoming side wins.
+        a = build_cover_section(_contributions([1, 2]), ["h"], 4)
+        b = build_cover_section({"11219": [_leaf(4)]}, ["g"], 5)
+        with caplog.at_level("WARNING"):
+            merged = merge_cover_sections(a, b)
+        assert merged == b
+        assert set(merged["shards"]) == {"11219"}
+        assert merged["fields"] == ["g"]
+        assert "not comparable" in caplog.text
+        # And the same shard order still unions, so the gate is the only change.
+        same = build_cover_section({"11219": [_leaf(4)]}, ["g"], 4)
+        assert set(merge_cover_sections(a, same)["shards"]) == {"11210", "11211", "11219"}
+
     def test_an_unknown_incoming_revision_contributes_nothing(self):
         a = build_cover_section(_contributions([1]), ["h"], 4)
         assert merge_cover_sections(a, {"spec": "zagg-coverage-toc-cover/9"}) == a
