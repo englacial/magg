@@ -771,8 +771,18 @@ class TestCoverSection:
         assert block["temporal_order"] == TEMPORAL_DAY_ORDER - 1
         assert block["count"] <= COVER_CAP
         assert "coarsened" in caplog.text
-        # Widening only: every original instant is still covered.
-        assert np.all(toc_overlaps(cover_words(section)["11213"], int(ts[0]), int(ts[-1]) + 1))
+        effective = block["temporal_order"]
+        words = cover_words(section)["11213"]
+        # Widening only, and EXACTLY: the capped block is the input cover
+        # re-quantized one order coarser, never a truncation of its word list
+        # (a whole-span overlap check would pass for a truncation too).
+        assert np.array_equal(words, quantize_words(cover, effective))
+        # Per instant, so a dropped cluster fails here.
+        assert all(np.any(toc_overlaps(words, int(t), int(t) + 1)) for t in ts[::7])
+        # §10.5's parity invariant at the shard's EFFECTIVE order — the arm
+        # `test_parity_with_the_tier_one_map` never reaches.
+        tier1 = int(toc_reduce(cover))
+        assert int(toc_reduce(words)) == int(toc_reduce(quantize_words([tier1], effective)))
 
     def test_parity_with_the_tier_one_map(self):
         contributions = _contributions([1, 5, 11])
@@ -819,6 +829,12 @@ class TestCoverComposition:
         assert block["temporal_order"] == 14
         expect = quantize_words(np.concatenate([cover_words(fine)["11213"], words14]), 14)
         assert np.array_equal(cover_words(merged)["11213"], expect)
+        # And the parity invariant survives the mixed-order requantize, at the
+        # merged shard's effective order.
+        tier1 = int(toc_reduce(np.array([_leaf(1)[0], _leaf(2)[0]], dtype=np.uint64)))
+        assert int(toc_reduce(cover_words(merged)["11213"])) == int(
+            toc_reduce(quantize_words([tier1], 14))
+        )
 
     def test_a_standing_cover_at_another_shard_order_is_replaced(self, caplog):
         # D1 ids at two orders are not comparable, so the seam behaves like
@@ -863,8 +879,9 @@ class TestCoverComposition:
         assert merged["shards"]["11213"]["temporal_order"] == 14
         expect = quantize_words(np.concatenate([words14, cover_words(fine)["11213"]]), 14)
         assert np.array_equal(cover_words(merged)["11213"], expect)
+        tier1 = int(toc_reduce(np.array([_leaf(1)[0], _leaf(2)[0]], dtype=np.uint64)))
         assert int(toc_reduce(cover_words(merged)["11213"])) == int(
-            toc_reduce(quantize_words(np.concatenate([words14, cover_words(fine)["11213"]]), 14))
+            toc_reduce(quantize_words([tier1], 14))
         )
 
     def test_a_block_above_the_objects_pin_is_refused(self):
