@@ -1026,9 +1026,12 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) 
 
     The pruning answer, on the grammar's own predicate
     (``mortie.toc_overlaps``): conservative — it never under-reports, and may
-    over-report by up to one quantum at a window edge. ``None`` when the
-    store carries no temporal section, which a caller MUST read as "no
-    temporal information", never as "no shards".
+    over-report by up to one quantum at a window edge. ``None`` only when
+    the store offers NEITHER a readable temporal section NOR a readable
+    ``cover``, which a caller MUST read as "no temporal information", never
+    as "no shards" — a section-less carrier with a standing cover still
+    answers (from the cover, under the seam rules below), because there is
+    temporal information to answer from.
 
     ``cover`` upgrades the answer to the §10.5 word SET (issue #489): pass
     the ``coverage.toc`` body (:func:`read_cover`'s return) and a shard the

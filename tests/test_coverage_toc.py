@@ -497,6 +497,23 @@ class TestCoverPruning:
         assert shards_overlapping({}, 0, 1, cover=None) is None
         assert shards_overlapping({}, 0, 1, cover={"spec": "junk"}) is None
 
+    def test_a_section_less_carrier_answers_from_the_cover(self):
+        """``None`` means no information — a standing cover IS information.
+
+        This is the state the refresh's "no ``else`` arm" leaves behind: a
+        walk with no temporal input rewrites ``coverage.moc`` without a
+        section and leaves the sibling alone. Every shard is cover-only
+        there, so every shard is a candidate (§10.5) — not ``None``, and not
+        pruned by a word set that may be arbitrarily old.
+        """
+        envelope, cover = self._two_campaign_shard()
+        section_less = {k: v for k, v in envelope.items() if k != "temporal"}
+        assert shards_overlapping(section_less, BASE_NS, BASE_NS + DAY_NS) is None
+        lo, hi = BASE_NS - DAY_NS, BASE_NS + 2 * DAY_NS
+        assert shards_overlapping(section_less, lo, hi, cover=cover) == ["11213"]
+        gap0, gap1 = BASE_NS + 400 * DAY_NS, BASE_NS + 401 * DAY_NS
+        assert shards_overlapping(section_less, gap0, gap1, cover=cover) == ["11213"]
+
 
 class TestOnCommittedStores:
     """End to end, on the §7 fixtures: the writer, and the absence pin."""
