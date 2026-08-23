@@ -2574,7 +2574,10 @@ The pinned **day order is 16**: bucket span `2^47` ns ≈ 39.1 h, the finest
 order whose span is at least one day (order 17's `2^46` ns ≈ 19.5 h is
 shorter than a day). Derived, not chosen freely: the ladder is the grammar's
 own power-of-two structure, and "≥ 1 day" is the resolution floor this
-surface promises (campaign/pass structure, not sub-orbit timing).
+surface promises (campaign/pass structure, not sub-orbit timing). Note the
+bucket span is not the *gap* promise: a surviving gap needs a whole aligned
+bucket to itself (below), so the **guaranteed gap floor is two spans**,
+`2 × 2^47` ns ≈ 78.2 h ≈ 3.26 days.
 
 Three consequences, all normative:
 
@@ -2586,10 +2589,16 @@ Three consequences, all normative:
   therefore never under-reports, and `toc_contains` never over-reports,
   exactly as in §10.2.
 - **Gaps survive at bucket resolution.** The never-bridge law holds on the
-  quantized words: a real gap spanning at least one whole aligned bucket
-  survives in the cover exactly; a gap shorter than a bucket may close.
-  "Is there data in `[t0, t1)`" answers per shard from this object alone,
-  down to that floor.
+  quantized words, with an exact criterion: **a gap survives iff it contains
+  a whole aligned bucket.** Widening lands the instants either side of a gap
+  in their own buckets, and `toc_normalize` coalesces ranges that merely
+  abut, so a gap of exactly one bucket span always closes; a gap of two
+  spans or more always survives; and a gap between one and two spans
+  survives only when it happens to straddle a bucket boundary the right
+  way — alignment, i.e. data-dependent, so a consumer MUST NOT reason on it.
+  The guaranteed floor a consumer may rely on is therefore `2 × 2^(63 − o)`
+  ns — at the pinned order 16, ≈ 78.2 h. "Is there data in `[t0, t1)`"
+  answers per shard from this object alone, down to that floor.
 - **Quantization commutes with union and with the envelope join**, which is
   what makes the per-leaf fold exact (the cover of a union of leaves is the
   normalize of the union of their covers) and the parity invariant below
