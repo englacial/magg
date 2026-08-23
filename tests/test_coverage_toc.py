@@ -377,6 +377,13 @@ class TestOnCommittedStores:
         assert (
             envelope["temporal"]["digest"]["payload"] == committed["temporal"]["digest"]["payload"]
         )
+        # The §10.5 sibling rebuilds from the same walk: same word sets, its
+        # own provenance, and the carrier's marker points at it.
+        committed_cover = json.loads((SPEC_DATA / "temporal" / COVER_NAME).read_text())
+        rebuilt = read_cover(root)
+        assert rebuilt["source"] == "refresh"
+        assert rebuilt["shards"] == committed_cover["shards"]
+        assert envelope["temporal"][COVER_KEY] == rebuilt["spec"] == COVER_SPEC
 
     def test_a_sweep_writes_the_section_the_fixture_committed(self, tmp_path):
         from zagg.grids.morton import morton_word
@@ -384,15 +391,23 @@ class TestOnCommittedStores:
 
         root = self._copy(tmp_path, "temporal")
         (Path(root) / "coverage.moc").unlink()
+        (Path(root) / COVER_NAME).unlink()
         leaves = [(int(morton_word("11213")), None)]
         summary = run_sweep(root, leaves, families=["moc"], record=False)
         assert summary["families"]["moc"]["temporal_shards"] == 1
+        assert summary["families"]["moc"]["cover_shards"] == 1
         committed = json.loads((SPEC_DATA / "temporal" / "coverage.moc").read_text())
         written = read_root_coverage(root)
         assert written["temporal"]["shards"] == committed["temporal"]["shards"]
         assert (
             written["temporal"]["digest"]["payload"] == committed["temporal"]["digest"]["payload"]
         )
+        # The §10.5 sibling lands beside it, byte-equal in content to the
+        # committed fixture's, and the section's marker names its revision.
+        committed_cover = json.loads((SPEC_DATA / "temporal" / COVER_NAME).read_text())
+        written_cover = read_cover(root)
+        assert written_cover["shards"] == committed_cover["shards"]
+        assert written["temporal"][COVER_KEY] == written_cover["spec"] == COVER_SPEC
         # Idempotence: a second pass over an unchanged tree writes nothing.
         again = run_sweep(root, leaves, families=["moc"], record=False)
         assert again["families"]["moc"]["root_moc_written"] is False
@@ -610,6 +625,8 @@ class TestOnCommittedStores:
         # And a re-write through the GET-union-PUT seam stays temporal-free.
         assert "temporal" not in write_root_coverage(root, reference)
         assert "temporal" not in json.loads((Path(root) / "coverage.moc").read_bytes())
+        # And the §10.5 sibling was never created: absence composes.
+        assert not (Path(root) / COVER_NAME).exists()
 
 
 #: One §10.5 day-order bucket, in internal ns (order 16 -> span 2^47).
@@ -1026,6 +1043,21 @@ class TestCoverObject:
         assert load_cover(None) is None
         assert load_cover({"spec": "zagg-coverage-toc-cover/9"}) is None
         assert cover_words(None) is None
+
+    def test_delete_discards_ours_and_debris_but_never_a_future_revision(self, tmp_path):
+        from zagg.coverage_toc import delete_cover
+
+        root = str(tmp_path)
+        assert delete_cover(root) is False  # absent: nothing to do
+        write_cover(root, build_cover_section(_contributions([1]), ["h"], 4))
+        assert delete_cover(root) is True
+        assert read_cover(root) is None
+        (tmp_path / COVER_NAME).write_text("not json {")
+        assert delete_cover(root) is True  # garbage is debris
+        future = {"spec": "zagg-coverage-toc-cover/9", "shards": {}}
+        (tmp_path / COVER_NAME).write_text(json.dumps(future))
+        assert delete_cover(root) is False  # succession: never deleted
+        assert read_cover(root) == future
 
 
 class TestCoverMarker:

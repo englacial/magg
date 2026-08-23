@@ -85,10 +85,12 @@ conformance tests assert decoded values, never object bytes.
   and not regenerated, is the absent-``located`` ⇒ §2.2 pin.
   ``temporal/`` is ALSO the only fixture carrying a **root ``coverage.moc``**
   (issue #480): the §10 ``zagg-coverage-toc/1`` section, written here by the
-  production sweep writer (``MocFamily``'s leaf read + finisher). The other
-  six declare no temporal field, so a sweep of one produces no section —
-  leaving them without a root coverage object IS §10's absence rule, and
-  keeps those trees byte-identical.
+  production sweep writer (``MocFamily``'s leaf read + finisher) — and, from
+  issue #489, the only one with the §10.5 ``coverage.toc`` word-set cover
+  sibling that same finisher PUTs beside it. The other six declare no
+  temporal field, so a sweep of one produces no section (and no sibling) —
+  leaving them without either root object IS §10's absence rule, and keeps
+  those trees byte-identical.
 
 STALE BY DESIGN: ``minimal/`` and ``kitchen_sink/`` were committed before
 issue #382 and their ``morton_hive.json`` still carries the pre-#382
@@ -1176,7 +1178,16 @@ def build_temporal(out: Path) -> None:
     # identity by the conformance suite).
     from mortie import toc_reduce
 
-    from zagg.coverage_toc import coverage_toc, coverage_toc_digest
+    from zagg.coverage_toc import (
+        COVER_KEY,
+        COVER_SPEC,
+        TEMPORAL_DAY_ORDER,
+        cover_words,
+        coverage_toc,
+        coverage_toc_digest,
+        quantize_words,
+        read_cover,
+    )
     from zagg.sweep import MocFamily
 
     family = MocFamily()
@@ -1199,6 +1210,23 @@ def build_temporal(out: Path) -> None:
         )
     )
     assert coverage_toc(envelope) == {SHARD_KEY: shard_word}, coverage_toc(envelope)
+
+    # The §10.5 word-set cover sibling (issue #489), through the same
+    # production writer: derived from the identical inputs — the quantized
+    # normalize over every per-centroid word handed to the writer — so the
+    # committed object is pinned against the generator, never against itself.
+    every_word = np.concatenate(
+        [cell["h_tdigest"][2] for cells in by_chunk.values() for cell in cells.values()]
+    ).astype(np.uint64)
+    expect_cover = quantize_words(every_word)
+    cover_obj = read_cover(root)
+    assert cover_obj["spec"] == COVER_SPEC == envelope["temporal"][COVER_KEY]
+    assert cover_obj["order"] == 4 and cover_obj["temporal_order"] == TEMPORAL_DAY_ORDER
+    decoded_cover = cover_words(cover_obj)
+    assert set(decoded_cover) == {SHARD_KEY}
+    assert np.array_equal(decoded_cover[SHARD_KEY], expect_cover), decoded_cover
+    # The §10.5 parity invariant, on the committed pair.
+    assert int(toc_reduce(expect_cover)) == int(toc_reduce(quantize_words([shard_word])))
 
     leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
     expected = {
@@ -1226,6 +1254,16 @@ def build_temporal(out: Path) -> None:
                 "centroids": [[float(m), float(w)] for m, w in root_digest],
                 "times": [str(int(w)) for w in root_words],
             },
+        },
+        # The §10.5 sibling: the object name, its markers, and the DERIVED
+        # word set (quantized from the same inputs as the tier-1 word above),
+        # so the conformance suite pins the committed coverage.toc without
+        # the object certifying itself.
+        "cover": {
+            "object": "coverage.toc",
+            "spec": COVER_SPEC,
+            "temporal_order": TEMPORAL_DAY_ORDER,
+            "words": [str(int(w)) for w in expect_cover],
         },
         # The declarations the conformance tests assert against the committed
         # attrs — each on the array that HOLDS the words (§8/§9), and the

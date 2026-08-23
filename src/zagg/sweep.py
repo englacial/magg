@@ -285,10 +285,28 @@ class MocFamily(SweepFamily):
         merge's output rather than on the raw section, because §10.4 drops a
         partial producer's digest at the seam), so an unchanged tree re-sweep
         is a no-op here too, on a multi-shard store as much as a one-shard one.
+
+        The §10.5 word-set cover (issue #489) rides the same pass: the
+        sibling ``coverage.toc`` is composed from the identical accumulator
+        (GET-union-PUT via :func:`zagg.coverage_toc.write_cover`, BEFORE the
+        root object that carries its presence marker), and its half of the
+        skip test (:func:`zagg.coverage_toc.cover_unchanged`) is paid only
+        once the root object already vouches for everything else — so a
+        non-temporal store's finisher never GETs the sibling at all.
         """
         import numpy as np
 
-        from zagg.coverage_toc import TEMPORAL_KEY, build_temporal_section, section_unchanged
+        from zagg.coverage_toc import (
+            COVER_KEY,
+            COVER_SPEC,
+            TEMPORAL_KEY,
+            build_cover_section,
+            build_temporal_section,
+            cover_unchanged,
+            read_cover,
+            section_unchanged,
+            write_cover,
+        )
         from zagg.hive import (
             build_root_coverage,
             read_root_coverage,
@@ -302,6 +320,14 @@ class MocFamily(SweepFamily):
         section = build_temporal_section(
             self._temporal, self._temporal_fields or {}, source="sweep"
         )
+        cover = build_cover_section(
+            self._temporal, self._temporal_fields or {}, shard_order, source="sweep"
+        )
+        if section is not None and cover is not None:
+            # The §10.1 presence marker: this producer is about to PUT (or
+            # leave standing) a sibling at its own revision. A hint, per the
+            # spec — a reader falls back when the object is gone or foreign.
+            section[COVER_KEY] = COVER_SPEC
         words = np.unique(np.concatenate([root_coverage_words(t["payload"]) for t in tops]))
         time_range = union_time_range(*(t["payload"].get("time_range") for t in tops))
         try:
@@ -316,10 +342,20 @@ class MocFamily(SweepFamily):
                     == existing.get("time_range")
                 )
                 covered = covered and section_unchanged(existing.get(TEMPORAL_KEY), section)
+                # The sibling's half of the same test — reached (and its GET
+                # paid) only once the root object vouches for everything
+                # else. `cover_unchanged` answers False on a malformed
+                # standing object, which routes to the rewrite.
+                if covered and cover is not None:
+                    covered = cover_unchanged(read_cover(store_root, **store_kwargs), cover)
                 if covered:
                     return {"root_moc_written": False}
             except (KeyError, TypeError, ValueError):
                 pass  # malformed cache cannot vouch for coverage -> rewrite
+        if cover is not None:
+            # Sibling before marker: the root object that names the cover
+            # must never land while the object it points at is still absent.
+            write_cover(store_root, cover, **store_kwargs)
         write_root_coverage(
             store_root,
             build_root_coverage(
@@ -334,6 +370,8 @@ class MocFamily(SweepFamily):
             # that landed lists at least these shards and usually more; the
             # run summary reports what the run did.
             out["temporal_shards"] = len(section["shards"])
+        if cover is not None:
+            out["cover_shards"] = len(cover["shards"])
         return out
 
 
