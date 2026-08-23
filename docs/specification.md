@@ -2266,6 +2266,7 @@ new section here; keys are never repurposed in place.
   "source": "sweep",
   "generated_at": "2026-08-17T22:59:35+00:00",
   "fields": ["h_tdigest"],
+  "cover": "zagg-coverage-toc-cover/1",
   "shards": {"11213": "10689250968998768172"},
   "digest": {
     "delta": 64,
@@ -2298,6 +2299,19 @@ new section here; keys are never repurposed in place.
   words are already unioned across fields by construction).
 - **`shards`** (required) — tier 1, below.
 - **`digest`** (optional) — tier 2, below.
+- **`cover`** (optional, added under this revision — issue
+  [#489](https://github.com/englacial/zagg/issues/489)) — the **presence
+  marker** for the word-set cover *sibling object* (§10.5): its value is
+  that object's `spec` string (`"zagg-coverage-toc-cover/1"`), telling a
+  temporal consumer one GET ahead that a `coverage.toc` stands beside this
+  root, and at which revision. It is a hint under the sidecar staleness
+  posture, never a promise: a reader MUST fall back to tier 1 (or to
+  opening leaves) when the object turns out to be absent, unreadable, or at
+  a revision it does not implement — and, conversely, MAY probe for the
+  object even without the marker (a marker-less root simply predates it).
+  Pre-marker readers ignore the key under the unknown-keys rule above,
+  which is what makes this an in-revision addition rather than a `spec`
+  bump: no meaning of any existing key changed.
 
 A reader MUST ignore keys it does not recognize; a producer MUST NOT put
 anything under `temporal` that is not defined here or by a later revision.
@@ -2446,6 +2460,11 @@ that seam as follows:
   look. Conversely a producer that overwrites the carrier wholesale (an
   unparsable or incompatible existing root — the D9 regenerable-cache rule)
   discards the stale section with it.
+- **The `cover` marker carries through the merge**: the incoming section's
+  value wins when both sides carry one, and a marker on either side alone
+  survives — the object it points at composes under §10.5's own seam, so a
+  producer that did not write the sibling must not erase the standing
+  pointer to it.
 - **An existing section at an unknown revision is preserved verbatim, and
   never downgraded.** The strict `spec` gate above makes such a section read
   as absent, but composition is a *write*, and dropping the key is not the
@@ -2462,3 +2481,156 @@ Conformance for an external reader is §7's `temporal/` fixture: its root
 `coverage.moc` carries this section, and the fixture's `temporal.expected.json`
 records the shard word and the decoded digest so the containment and weight
 claims above are pinned on committed bytes.
+
+### 10.5 The word-set cover sibling — `zagg-coverage-toc-cover/1`
+
+**Status: contract** ([issue #489](https://github.com/englacial/zagg/issues/489)).
+
+Tier 1 gives one envelope word per shard, so **gaps are invisible below shard
+granularity**: a shard observed in 2019 and again in 2025 answers every window
+in between. The cover restores the grammar's never-bridge law at sub-shard
+resolution — per shard, a **canonical multi-word set** (`mortie.toc_normalize`
+over that shard's §8.3 companion words, quantized as below) whose surviving
+decoded gaps are floors on the true gaps. It is the multi-order-MOC analog on
+the time axis: the §10.2 word is the overview, this is the index.
+
+It lives in its **own root object**, `{store_root}/coverage.toc`, beside the
+bootstrap sidecar — never inline: at the published CA store's shape it is
+~50–60 words per shard (~1.2 MB store-wide, ~300× the bootstrap object), and
+a spatial-only reader must not pay that on every bootstrap GET. Temporal
+consumers GET it on demand, discovering it through §10.1's `cover` marker.
+Like the section it refines, it is a **regenerable accelerator** over the
+leaf arrays (D9), under the same staleness posture: a shard it does not list
+is *unknown*, a candidate — never *empty*.
+
+**Contract.**
+
+```json
+{
+  "spec": "zagg-coverage-toc-cover/1",
+  "source": "sweep",
+  "generated_at": "2026-08-23T02:41:00+00:00",
+  "order": 4,
+  "temporal_order": 16,
+  "cap": 512,
+  "fields": ["h_tdigest"],
+  "element": {"dtype": "uint64", "shape": [-1]},
+  "encoding": "base64",
+  "shards": {
+    "11213": {"words": "…", "count": 3}
+  }
+}
+```
+
+- **`spec`** (required) — `"zagg-coverage-toc-cover/1"`, the object's OWN
+  marker (it is a root object, not a section, so it gates itself the way the
+  carrier envelope does). A reader MUST strict-check it, and an unknown
+  revision reads as **absent** — degrade to tier 1 or open leaves, never
+  refuse the store. A future revision is a new `spec` string; keys are never
+  repurposed in place.
+- **`source`** / **`generated_at`** (required) — as §10.1's, the object's own
+  provenance and clock.
+- **`order`** (required) — the shard order of the `shards` keys, spelled as
+  the carrier's `order` is; keys are D1 decimal shard ids at that order,
+  exactly as §10.2's are.
+- **`temporal_order`** (required) — the object's pinned quantization order,
+  below. This revision's producers write **16**.
+- **`cap`** (required) — the overflow cap the producer enforced, below. This
+  revision's producers write **512**.
+- **`fields`** (required) — provenance, with §10.1 `fields` semantics
+  verbatim: the union of payload field names whose companions any
+  contributing producer read; an upper bound, not a per-shard list.
+- **`element`** / **`encoding`** (required) — the one byte grammar, declared
+  once for every shard block: each `words` value is base64 of the words'
+  §1.4 element bytes — `count` little-endian `uint64` toc words, exactly
+  what one `zagg-ragged/1` uint64 element holds — so a reader decodes it
+  with the leaf decoder it already has.
+- **`shards`** (required) — one block per covered shard:
+  - **`words`** — the base64 word set: the canonical (`toc_normalize`-form)
+    cover of every §8.3 companion word the shard's leaves hold, unioned
+    across the store's temporal-carrying fields (§10.2's union rule),
+    quantized at the shard's effective temporal order. Sorted, duplicate-free
+    uint64, mixed timestamp/range members legal under the grammar's
+    kind-keyed semantics.
+  - **`count`** — the word count. A reader MUST refuse a block whose buffer
+    disagrees with it (§10.3's `centroids` rule, one buffer instead of two).
+  - **`temporal_order`** (optional) — present **iff** this shard coarsened
+    below the object's pinned order under the cap; absence means the pinned
+    order. Always ≤ the object's `temporal_order`.
+
+**Quantization.** Temporal order `o` partitions the toc scale (2^63 ns from
+the grammar's 1850 epoch — the span the 31-bit end code at 2^32 ns closes)
+into `2^o` **aligned buckets** of `2^(63 − o)` ns. A word enters the cover
+with its conservative decoded envelope (`toc2time`) **widened to the bucket
+grid** — start floored, end ceiled — re-encoded as a range word, and the set
+canonicalized with `toc_normalize`. Bucket bounds are exactly representable
+on the grammar's own encoding grids for every `o ≤ 31` (a bucket start is a
+multiple of 2^31 ns and its end of 2^32 ns), so the re-encoding adds no
+rounding of its own; the one exception is the scale ceiling, where the top
+bucket's end clamps to the grammar's maximum encodable end (`TOC_MAX_NS`) —
+still containing every encodable input word.
+
+The pinned **day order is 16**: bucket span `2^47` ns ≈ 39.1 h, the finest
+order whose span is at least one day (order 17's `2^46` ns ≈ 19.5 h is
+shorter than a day). Derived, not chosen freely: the ladder is the grammar's
+own power-of-two structure, and "≥ 1 day" is the resolution floor this
+surface promises (campaign/pass structure, not sub-orbit timing).
+
+Three consequences, all normative:
+
+- **Widening only.** The cover's decoded coverage **contains** the shard's
+  true observation set: quantization widens, `toc_normalize` is
+  coverage-exact, and the union across leaves and fields is a union. A
+  cover may over-claim — by strictly less than one bucket at each cluster
+  edge — and MUST NEVER false-negative. `toc_overlaps` on the words
+  therefore never under-reports, and `toc_contains` never over-reports,
+  exactly as in §10.2.
+- **Gaps survive at bucket resolution.** The never-bridge law holds on the
+  quantized words: a real gap spanning at least one whole aligned bucket
+  survives in the cover exactly; a gap shorter than a bucket may close.
+  "Is there data in `[t0, t1)`" answers per shard from this object alone,
+  down to that floor.
+- **Quantization commutes with union and with the envelope join**, which is
+  what makes the per-leaf fold exact (the cover of a union of leaves is the
+  normalize of the union of their covers) and the parity invariant below
+  well-defined.
+
+**The cap.** A shard's block holds at most `cap` words. A producer whose
+cover lands above it MUST coarsen **by order** — re-quantize at `o − 1`,
+halving the bucket count — until it fits, recording the landing order in the
+block's `temporal_order`. The same widening law (order 0 is a single bucket,
+so the loop terminates); a producer MUST NOT truncate the word list instead,
+which would silently drop coverage.
+
+**Parity invariant.** For every shard listed both here and in §10.2's map,
+the words MUST satisfy
+
+> `toc_reduce(words)` = `toc_reduce(quantize({§10.2 word}, o))`
+
+at the shard's effective order `o` — the cover's own envelope is exactly the
+quantized tier-1 envelope. This follows from the commutation above and is
+the cross-object consistency check a reader MAY apply cheaply; zagg's suite
+asserts it on every shard it writes. (Plain equality with the §10.2 word
+itself does NOT hold: that word lives on the grammar's native 2^31/2^32
+grids, the cover on the bucket grid.)
+
+**Composition.** The object is written GET-union-PUT across the same seam as
+the carrier (§10.4), composing per shard: the union of the two word sets,
+**re-quantized at the coarser of the two effective orders** (a union alone
+could interleave two orders' bucket bounds and break the parity claim), then
+re-capped — which may coarsen further, under the same widening law. A shard
+on one side carries over unchanged. The §10.4 succession rules apply
+verbatim at object level: an unknown-revision standing object is preserved
+and never downgraded (on the refresh's replace path too); an unmarked or
+unparsable one is debris a producer replaces; a producer whose read of any
+input behind a shard FAILED omits that shard (§10.2's whole-word rule); a
+producer with no temporal contribution leaves the standing object untouched.
+
+Conformance is §7's `temporal/` fixture again: it is the only fixture
+carrying a `coverage.toc`, written by the production sweep writer beside its
+`coverage.moc`, and `temporal.expected.json`'s `cover` block records the
+decoded word set — derived from the generator's inputs through the
+quantization law above, never transcribed — plus the parity claim on
+committed bytes. The other six fixtures carry no `coverage.toc` at all,
+which pins the absence rule as bytes, exactly as §10's section absence is
+pinned.

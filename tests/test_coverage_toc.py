@@ -20,16 +20,29 @@ from mortie import span2toc, time2toc, toc_merge, toc_overlaps, toc_reduce
 
 from zagg.coverage import refresh_root_coverage
 from zagg.coverage_toc import (
+    COVER_CAP,
+    COVER_KEY,
+    COVER_NAME,
+    COVER_SPEC,
     ROOT_TOC_DELTA,
     TEMPORAL_COVERAGE_SPEC,
+    TEMPORAL_DAY_ORDER,
+    build_cover_section,
     build_temporal_section,
+    cover_unchanged,
+    cover_words,
     coverage_toc,
     coverage_toc_digest,
+    load_cover,
     load_temporal_coverage,
+    merge_cover_sections,
     merge_temporal_sections,
+    quantize_words,
+    read_cover,
     section_unchanged,
     shards_overlapping,
     temporal_fields,
+    write_cover,
 )
 from zagg.hive import build_root_coverage, read_root_coverage, write_root_coverage
 
@@ -42,11 +55,11 @@ BASE_NS = 5_344_000_000_000_000_000
 
 
 def _leaf(seed: int, n: int = 12):
-    """A synthetic per-leaf contribution: ``(word, digest, times)``.
+    """A synthetic per-leaf contribution: ``(word, digest, times, cover)``.
 
     Shaped exactly like :func:`zagg.coverage_toc.read_leaf_temporal`'s return
-    — a valid ``(k, 2)`` digest sorted by mean, its row-aligned toc words, and
-    the join over them.
+    — a valid ``(k, 2)`` digest sorted by mean, its row-aligned toc words,
+    the join over them, and their §10.5 quantized cover.
     """
     rng = np.random.default_rng(seed)
     starts = np.sort(BASE_NS + seed * 40 * DAY_NS + rng.integers(0, 30 * DAY_NS, n)).astype(
@@ -65,7 +78,7 @@ def _leaf(seed: int, n: int = 12):
     digest[:, 0] = starts.astype(np.float64)
     digest[:, 1] = rng.integers(1, 20, n).astype(np.float64)
     order = np.lexsort((words, digest[:, 0]))
-    return int(toc_reduce(words)), digest[order], words[order]
+    return int(toc_reduce(words)), digest[order], words[order], quantize_words(words)
 
 
 def _contributions(seeds):
@@ -597,3 +610,281 @@ class TestOnCommittedStores:
         # And a re-write through the GET-union-PUT seam stays temporal-free.
         assert "temporal" not in write_root_coverage(root, reference)
         assert "temporal" not in json.loads((Path(root) / "coverage.moc").read_bytes())
+
+
+#: One §10.5 day-order bucket, in internal ns (order 16 -> span 2^47).
+BUCKET_NS = 1 << (63 - TEMPORAL_DAY_ORDER)
+
+
+class TestQuantization:
+    """§10.5's quantization law: widening only, gap-preserving, commuting."""
+
+    def _instants(self, n_days=49, per_day=200, seed=489):
+        rng = np.random.default_rng(seed)
+        days = np.sort(rng.choice(2_700, n_days, replace=False))
+        ts = np.concatenate(
+            [BASE_NS + int(d) * DAY_NS + rng.integers(0, 20 * 60 * 10**9, per_day) for d in days]
+        ).astype(np.uint64)
+        return days, ts
+
+    def test_the_cover_contains_every_instant(self):
+        from mortie import toc2time
+
+        _days, ts = self._instants()
+        cover = quantize_words(time2toc(ts))
+        start, end = toc2time(cover)
+        assert all(np.any((start <= t) & (t < end)) for t in ts[::97])
+
+    def test_buckets_are_aligned_at_the_pinned_order(self):
+        from mortie import toc2time
+
+        _days, ts = self._instants()
+        start, end = toc2time(quantize_words(time2toc(ts)))
+        assert np.all(np.asarray(start, np.uint64) % BUCKET_NS == 0)
+        assert np.all(np.asarray(end, np.uint64) % BUCKET_NS == 0)
+
+    def test_a_range_word_widens_to_its_buckets(self):
+        word = span2toc(BASE_NS + 10, BASE_NS + BUCKET_NS)
+        from mortie import toc2time
+
+        start, end = toc2time(quantize_words([word]))
+        assert int(start[0]) == (BASE_NS // BUCKET_NS) * BUCKET_NS
+        assert int(end[0]) - int(start[0]) >= 2 * BUCKET_NS  # widened, never shrunk
+
+    def test_the_pass_day_shape_compresses_to_the_day_clusters(self):
+        # The CA store's shard 3231242244 shape, scaled: millions of exact
+        # timestamps clustering into ~49 distinct pass-days must land at
+        # ~one word per cluster, not one per instant.
+        days, ts = self._instants()
+        cover = quantize_words(time2toc(ts))
+        assert len(cover) <= len(days)
+
+    def test_gaps_of_a_bucket_or_more_survive(self):
+        days, ts = self._instants()
+        cover = quantize_words(time2toc(ts))
+        far = [int(d) for d in range(2_700) if np.abs(days - d).min() >= 3][:60]
+        assert far
+        for d in far:
+            q0, q1 = BASE_NS + d * DAY_NS, BASE_NS + (d + 1) * DAY_NS
+            assert not np.any(toc_overlaps(cover, q0, q1))
+
+    def test_quantization_commutes_with_union(self):
+        _days, ts = self._instants()
+        words = time2toc(ts)
+        a, b = words[: len(words) // 2], words[len(words) // 2 :]
+        joint = quantize_words(words)
+        parts = quantize_words(np.concatenate([quantize_words(a), quantize_words(b)]))
+        assert np.array_equal(joint, parts)
+
+    def test_quantization_commutes_with_the_envelope_join(self):
+        _days, ts = self._instants()
+        words = time2toc(ts)
+        lhs = int(toc_reduce(quantize_words(words)))
+        rhs = int(toc_reduce(quantize_words([toc_reduce(words)])))
+        assert lhs == rhs
+
+    def test_idempotent_at_the_same_order(self):
+        _days, ts = self._instants()
+        once = quantize_words(time2toc(ts))
+        assert np.array_equal(once, quantize_words(once))
+
+    def test_the_scale_ceiling_clamps_without_losing_containment(self):
+        from mortie import TOC_MAX_NS, toc2time
+
+        word = span2toc(TOC_MAX_NS - 2 * BUCKET_NS, TOC_MAX_NS - 10**9)
+        start, end = toc2time(quantize_words([word]))
+        w_start, w_end = toc2time(np.asarray([word], np.uint64))
+        assert int(start[0]) <= int(w_start[0]) and int(w_end[0]) <= int(end[0])
+
+    def test_orders_outside_the_grammar_are_refused(self):
+        with pytest.raises(ValueError, match="temporal order"):
+            quantize_words([time2toc(BASE_NS)], 32)
+        with pytest.raises(ValueError, match="temporal order"):
+            quantize_words([time2toc(BASE_NS)], -1)
+
+    def test_empty_in_empty_out(self):
+        assert len(quantize_words(np.array([], dtype=np.uint64))) == 0
+
+
+class TestCoverSection:
+    """§10.5's object grammar, from the same contributions the section folds."""
+
+    def test_grammar_and_decode_round_trip(self):
+        contributions = _contributions([1, 2, 3])
+        section = build_cover_section(contributions, ["h_tdigest"], 4)
+        assert section["spec"] == COVER_SPEC
+        assert section["order"] == 4
+        assert section["temporal_order"] == TEMPORAL_DAY_ORDER
+        assert section["cap"] == COVER_CAP
+        assert section["element"] == {"dtype": "uint64", "shape": [-1]}
+        decoded = cover_words(section)
+        assert set(decoded) == set(contributions)
+        for decimal, parts in contributions.items():
+            expect = quantize_words(np.concatenate([p[3] for p in parts]))
+            assert np.array_equal(decoded[decimal], expect)
+
+    def test_an_empty_walk_builds_no_object(self):
+        assert build_cover_section({}, [], 4) is None
+
+    def test_window_leaves_union_into_one_shard_block(self):
+        parts = [_leaf(3), _leaf(9)]
+        section = build_cover_section({"11213": parts}, ["h"], 4)
+        expect = quantize_words(np.concatenate([p[3] for p in parts]))
+        assert np.array_equal(cover_words(section)["11213"], expect)
+
+    def test_the_cap_coarsens_by_order_and_records_it(self, caplog):
+        # 600 instants two buckets apart: 600 words at the pinned order,
+        # over the 512 cap; one coarsening step (span doubles) lands at 300.
+        ts = (BASE_NS + np.arange(600, dtype=np.uint64) * np.uint64(2 * BUCKET_NS)).astype(
+            np.uint64
+        )
+        cover = quantize_words(time2toc(ts))
+        assert len(cover) == 600
+        contributions = {"11213": [(int(toc_reduce(cover)), np.empty((0, 2)), [], cover)]}
+        with caplog.at_level("WARNING"):
+            section = build_cover_section(contributions, ["h"], 4)
+        block = section["shards"]["11213"]
+        assert block["temporal_order"] == TEMPORAL_DAY_ORDER - 1
+        assert block["count"] <= COVER_CAP
+        assert "coarsened" in caplog.text
+        # Widening only: every original instant is still covered.
+        assert np.all(toc_overlaps(cover_words(section)["11213"], int(ts[0]), int(ts[-1]) + 1))
+
+    def test_parity_with_the_tier_one_map(self):
+        contributions = _contributions([1, 5, 11])
+        section = build_temporal_section(contributions, ["h"], source="sweep")
+        cover = build_cover_section(contributions, ["h"], 4)
+        for decimal, block in cover["shards"].items():
+            order = block.get("temporal_order", TEMPORAL_DAY_ORDER)
+            words = cover_words(cover)[decimal]
+            tier1 = int(section["shards"][decimal])
+            assert int(toc_reduce(words)) == int(toc_reduce(quantize_words([tier1], order)))
+
+    def test_a_block_whose_count_disagrees_is_refused(self):
+        section = build_cover_section(_contributions([1]), ["h"], 4)
+        (decimal,) = section["shards"]
+        section["shards"][decimal]["count"] += 1
+        with pytest.raises(ValueError, match="declares"):
+            cover_words(section)
+
+
+class TestCoverComposition:
+    """§10.5's seam: per-shard union, requantize at the coarser order, re-cap."""
+
+    def test_merge_unions_per_shard_and_carries_singletons(self):
+        a = build_cover_section(_contributions([1, 2]), ["h"], 4)
+        b = build_cover_section({"11211": [_leaf(7)], "11219": [_leaf(4)]}, ["g"], 4)
+        merged = merge_cover_sections(a, b)
+        assert set(merged["shards"]) == {"11210", "11211", "11219"}
+        assert merged["fields"] == ["g", "h"]
+        union = quantize_words(np.concatenate([_leaf(2)[3], _leaf(7)[3]]))
+        assert np.array_equal(cover_words(merged)["11211"], union)
+        assert np.array_equal(cover_words(merged)["11210"], cover_words(a)["11210"])
+
+    def test_mixed_orders_requantize_at_the_coarser(self):
+        fine = build_cover_section({"11213": [_leaf(1)]}, ["h"], 4)
+        coarse = build_cover_section({"11213": [_leaf(2)]}, ["h"], 4)
+        coarse["shards"]["11213"] = dict(coarse["shards"]["11213"])
+        # Simulate a capped producer: re-encode the block at order 14.
+        words14 = quantize_words(cover_words(coarse)["11213"], 14)
+        from zagg.coverage_toc import _encode_cover_block
+
+        coarse["shards"]["11213"] = _encode_cover_block(words14, 14)
+        merged = merge_cover_sections(fine, coarse)
+        block = merged["shards"]["11213"]
+        assert block["temporal_order"] == 14
+        expect = quantize_words(np.concatenate([cover_words(fine)["11213"], words14]), 14)
+        assert np.array_equal(cover_words(merged)["11213"], expect)
+
+    def test_an_unknown_incoming_revision_contributes_nothing(self):
+        a = build_cover_section(_contributions([1]), ["h"], 4)
+        assert merge_cover_sections(a, {"spec": "zagg-coverage-toc-cover/9"}) == a
+
+    def test_an_unknown_standing_revision_is_preserved(self):
+        b = build_cover_section(_contributions([1]), ["h"], 4)
+        future = {"spec": "zagg-coverage-toc-cover/9", "shards": {}}
+        assert merge_cover_sections(future, b) == future
+        assert merge_cover_sections(future, None) == future
+
+    def test_unmarked_debris_is_replaced(self):
+        b = build_cover_section(_contributions([1]), ["h"], 4)
+        assert merge_cover_sections({"shards": "junk"}, b) == b
+
+    def test_cover_unchanged_converges(self):
+        a = build_cover_section(_contributions([1, 2]), ["h"], 4)
+        assert not cover_unchanged(None, a)
+        merged = merge_cover_sections(None, a)
+        assert cover_unchanged(merged, a)
+        b = build_cover_section({"11219": [_leaf(4)]}, ["h"], 4)
+        assert not cover_unchanged(merged, b)
+        assert cover_unchanged(merge_cover_sections(merged, b), b)
+
+
+class TestCoverObject:
+    """The sibling object's transport: GET-union-PUT, replace, preservation."""
+
+    def test_write_read_round_trip_accumulates(self, tmp_path):
+        root = str(tmp_path)
+        a = build_cover_section(_contributions([1]), ["h"], 4)
+        b = build_cover_section({"11219": [_leaf(4)]}, ["h"], 4)
+        write_cover(root, a)
+        write_cover(root, b)
+        standing = read_cover(root)
+        assert set(standing["shards"]) == {"11210", "11219"}
+        assert (tmp_path / COVER_NAME).exists()
+
+    def test_replace_discards_the_standing_object(self, tmp_path):
+        root = str(tmp_path)
+        write_cover(root, build_cover_section(_contributions([1]), ["h"], 4))
+        b = build_cover_section({"11219": [_leaf(4)]}, ["h"], 4)
+        write_cover(root, b, replace=True)
+        assert set(read_cover(root)["shards"]) == {"11219"}
+
+    def test_replace_never_downgrades_a_future_revision(self, tmp_path):
+        root = str(tmp_path)
+        future = {"spec": "zagg-coverage-toc-cover/9", "shards": {}}
+        (tmp_path / COVER_NAME).write_text(json.dumps(future))
+        b = build_cover_section(_contributions([1]), ["h"], 4)
+        write_cover(root, b, replace=True)
+        assert read_cover(root) == future
+        write_cover(root, b)
+        assert read_cover(root) == future
+
+    def test_garbage_is_overwritten(self, tmp_path):
+        root = str(tmp_path)
+        (tmp_path / COVER_NAME).write_text("not json {")
+        b = build_cover_section(_contributions([1]), ["h"], 4)
+        write_cover(root, b)
+        assert set(read_cover(root)["shards"]) == {"11210"}
+
+    def test_absent_reads_none(self, tmp_path):
+        assert read_cover(str(tmp_path)) is None
+        assert load_cover(None) is None
+        assert load_cover({"spec": "zagg-coverage-toc-cover/9"}) is None
+        assert cover_words(None) is None
+
+
+class TestCoverMarker:
+    """§10.1's `cover` key: carried through the section merge, never invented."""
+
+    def test_the_marker_survives_the_seam(self):
+        a = build_temporal_section(_contributions([1]), ["h"], source="sweep")
+        a[COVER_KEY] = COVER_SPEC
+        b = build_temporal_section(_contributions([2]), ["h"], source="sweep")
+        assert merge_temporal_sections(a, b)[COVER_KEY] == COVER_SPEC
+        assert merge_temporal_sections(b, a)[COVER_KEY] == COVER_SPEC
+        assert merge_temporal_sections(None, a)[COVER_KEY] == COVER_SPEC
+        assert merge_temporal_sections(a, None)[COVER_KEY] == COVER_SPEC
+
+    def test_no_marker_no_key(self):
+        a = build_temporal_section(_contributions([1]), ["h"], source="sweep")
+        b = build_temporal_section(_contributions([2]), ["h"], source="sweep")
+        assert COVER_KEY not in merge_temporal_sections(a, b)
+
+    def test_a_marker_change_is_a_content_change(self):
+        a = build_temporal_section(_contributions([1]), ["h"], source="sweep")
+        merged = merge_temporal_sections(None, a)
+        assert section_unchanged(merged, a)
+        marked = dict(a)
+        marked[COVER_KEY] = COVER_SPEC
+        assert not section_unchanged(merged, marked)

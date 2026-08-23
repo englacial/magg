@@ -18,6 +18,17 @@ bootstrap discovery (``{store_root}/coverage.moc``):
    placement of that weight is only as time-resolved as the leaf digest's own
    centroid partition, which is a partition of VALUE (§10.3).
 
+A third surface lives BESIDE the bootstrap object (issue #489): the
+**word-set cover sibling** ``{store_root}/coverage.toc`` — per shard, the
+``mortie.toc_normalize`` canonical cover of that shard's companion words,
+quantized to a spec-pinned temporal order (§10.5). Tier 1's one word makes
+gaps invisible below shard granularity; the cover preserves them (the
+grammar's never-bridge law) at bucket resolution, so "is there data in
+``[t0, t1)``" resolves per shard without opening a leaf. It is a sibling
+object, not a section: at CA scale it is ~300× the bootstrap object's size,
+and spatial-only readers must not pay that. ``coverage.moc``'s temporal
+section carries only a presence marker for it (:data:`COVER_KEY`).
+
 Absence composes: a store with no temporal channel writes no section, and
 every accessor here returns ``None`` for it. That is never a refusal — the
 standing absence posture of the sidecar grammars.
@@ -55,6 +66,32 @@ ROOT_TOC_DELTA = 64
 #: ``"coordinate"`` declaration is a different array grammar and contributes
 #: nothing here (see the §10 open question).
 PER_CENTROID = "per-centroid"
+
+#: The word-set cover sibling's own spec marker (§10.5, issue #489) — an
+#: OBJECT-level marker: the cover is a root sibling, not a section, so it
+#: gates itself the way the carrier envelope does.
+COVER_SPEC = "zagg-coverage-toc-cover/1"
+
+#: The sibling object's name under the store root, beside ``coverage.moc``.
+COVER_NAME = "coverage.toc"
+
+#: The presence-marker key on the §10.1 temporal section: its value is the
+#: sibling object's spec string, so a temporal consumer knows one GET ahead
+#: that (and at which revision) a cover stands beside the root. A hint under
+#: the sidecar staleness posture, never a promise.
+COVER_KEY = "cover"
+
+#: The §10.5 day order: temporal order ``o`` partitions the toc scale into
+#: ``2**o`` aligned buckets of ``2**(63 - o)`` ns. Order 16 (span 2^47 ns
+#: ≈ 39.1 h) is the FINEST order whose bucket span is at least one day —
+#: the spec-pinned quantization for the cover, chosen so bucket bounds are
+#: exactly representable on the grammar's own encoding grids (§10.5).
+TEMPORAL_DAY_ORDER = 16
+
+#: The §10.5 overflow cap: a shard's cover holds at most this many words.
+#: A cover that lands above it coarsens by order (each step halves the
+#: bucket count) until it fits — widening only, loudly recorded.
+COVER_CAP = 512
 
 
 def temporal_fields(manifest: dict | None) -> dict[str, dict]:
@@ -118,7 +155,7 @@ def _centroid_times(words: np.ndarray) -> np.ndarray:
 
 
 def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kwargs):
-    """One leaf's contribution: ``(envelope_word, digest, times)`` or ``None``.
+    """One leaf's contribution: ``(envelope_word, digest, times, cover)`` or ``None``.
 
     Reads each declared field's payload and its §8.3 sibling by NAME (never a
     member enumeration), row-aligned per §1.1. The envelope word is
@@ -127,8 +164,13 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
     The digest is one flat k-way merge over the leaf's per-cell time digests,
     each built from that cell's centroid instants (:func:`_centroid_times`)
     weighted by the payload's own centroid weights, so its total weight is
-    the leaf's temporal observation count. ``None`` when the leaf holds no
-    temporal row at all (an unpopulated or pre-companion leaf), which is
+    the leaf's temporal observation count. ``cover`` is the leaf's §10.5
+    word-set cover — :func:`quantize_words` over every sibling word the leaf
+    holds, at the pinned day order — reduced here (a few dozen words per
+    leaf) so the accumulator never holds the raw word multiset: a CA-scale
+    shard carries millions of words, and the cover of a union is the
+    normalize of the union of covers, exactly. ``None`` when the leaf holds
+    no temporal row at all (an unpopulated or pre-companion leaf), which is
     absence, not failure.
 
     **Cost.** One leaf-sized read per declared field — ``payload[:]`` plus its
@@ -202,18 +244,21 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
             times.append(np.asarray(words, dtype=np.uint64)[order])
     if not all_words:
         return None
-    word = int(toc_reduce(np.concatenate(all_words)))
+    raw = np.concatenate(all_words)
+    word = int(toc_reduce(raw))
     digest, folded = merge_tdigests_kway(digests, delta=ROOT_TOC_DELTA, temporal=times)
-    return word, digest, folded
+    return word, digest, folded, quantize_words(raw)
 
 
 def build_temporal_section(contributions: dict, fields, *, source: str = "sweep") -> dict | None:
     """The ``zagg-coverage-toc/1`` section from per-leaf contributions.
 
     ``contributions`` maps a shard's D1 decimal id to the LIST of
-    ``(word, digest, times)`` triples :func:`read_leaf_temporal` returned for
-    it — one per window leaf, so a windowed shard's several leaves reduce to
-    the one envelope word the shard-keyed map holds. Returns ``None`` for an
+    ``(word, digest, times, cover)`` tuples :func:`read_leaf_temporal`
+    returned for it — one per window leaf, so a windowed shard's several
+    leaves reduce to the one envelope word the shard-keyed map holds (the
+    ``cover`` element is :func:`build_cover_section`'s input and is ignored
+    here). Returns ``None`` for an
     empty map: a store with no temporal channel gets no section, and its root
     object stays byte-identical to a pre-#480 one.
 
@@ -235,7 +280,7 @@ def build_temporal_section(contributions: dict, fields, *, source: str = "sweep"
     for decimal in sorted(contributions):
         parts = contributions[decimal]
         shards[decimal] = int(toc_reduce(np.asarray([p[0] for p in parts], dtype=np.uint64)))
-        for _word, digest, folded in parts:
+        for _word, digest, folded, _cover in parts:
             if len(digest):
                 digests.append(np.asarray(digest, dtype=np.float32))
                 times.append(np.asarray(folded, dtype=np.uint64))
@@ -337,6 +382,12 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
         if side.get("digest") is not None and set(side.get("shards") or {}) >= listed:
             merged["digest"] = side["digest"]
             break
+    # The §10.5 presence marker carries through the seam (§10.4): the sibling
+    # object composes under its own merge, so a producer that wrote no cover
+    # must not erase the standing pointer to one.
+    marker = b.get(COVER_KEY, a.get(COVER_KEY))
+    if marker is not None:
+        merged[COVER_KEY] = marker
     return merged
 
 
@@ -369,6 +420,7 @@ def _content(section) -> tuple | None:
         {d: str(w) for d, w in (section.get("shards") or {}).items()},
         section.get("digest"),
         sorted(section.get("fields") or []),
+        section.get(COVER_KEY),
     )
 
 
@@ -396,6 +448,303 @@ def _preserved(section) -> dict | None:
     if isinstance(spec, str) and spec and spec != TEMPORAL_COVERAGE_SPEC:
         return dict(section)
     return None
+
+
+# ---------------------------------------------------------------------------
+# The word-set cover sibling — `zagg-coverage-toc-cover/1` (§10.5, issue
+# #489). A root object BESIDE the bootstrap sidecar, GET-on-demand by
+# temporal consumers only: per shard, the canonical gap-preserving cover of
+# its companion words, quantized to the pinned day order.
+# ---------------------------------------------------------------------------
+
+
+def quantize_words(words, order: int = TEMPORAL_DAY_ORDER) -> np.ndarray:
+    """The §10.5 quantization: toc words, widened to aligned order-``o`` buckets.
+
+    Temporal order ``o`` partitions the toc scale (2^63 ns from the grammar's
+    1850 epoch) into ``2**o`` aligned buckets of ``2**(63 - o)`` ns. Each
+    input word's conservative envelope (``toc2time``) is widened to the
+    bucket grid — start floored, end ceiled — re-encoded as a range word,
+    and the set canonicalized with ``toc_normalize``. Bucket bounds are
+    exactly representable on the grammar's own grids for every ``o <= 31``
+    (a bucket start is a multiple of 2^31 ns and its end of 2^32 ns), so the
+    encoding round-trip adds no rounding of its own.
+
+    **Widening only.** The output's coverage contains the input's — a cover
+    may over-claim, never false-negative — and the never-bridge law holds at
+    bucket resolution: a real gap of at least one bucket survives exactly,
+    while a sub-bucket gap may close. The one clamp is the scale ceiling:
+    the top bucket's end exceeds the grammar's maximum encodable end
+    (``mortie.TOC_MAX_NS``), so it is clamped there — still containing every
+    encodable input word, because no encoder-produced envelope reaches past
+    the ceiling either.
+
+    Quantization commutes with union and with the envelope join
+    (``toc_reduce``), which is what makes the per-leaf fold exact
+    (:func:`read_leaf_temporal`) and the §10.5 parity invariant testable.
+    Junk words carry the grammar's own posture: garbage in, garbage out,
+    deterministically.
+    """
+    from mortie import TOC_MAX_NS, span2toc, toc2time, toc_normalize
+
+    if not 0 <= int(order) <= 31:
+        raise ValueError(
+            f"temporal order {order} is outside [0, 31] — coarser than the scale, or a "
+            f"bucket finer than the grammar's 2^32 ns end grid can encode (spec §10.5)"
+        )
+    words = np.asarray(words, dtype=np.uint64)
+    if words.size == 0:
+        return words
+    k = np.uint64(63 - int(order))
+    start, end = toc2time(words)
+    start = np.atleast_1d(np.asarray(start, dtype=np.uint64))
+    end = np.atleast_1d(np.asarray(end, dtype=np.uint64))
+    lo = (start >> k) << k
+    # A timestamp decodes to (t, t); a range's decoded end is exclusive. The
+    # last covered instant is therefore max(end, start + 1) - 1, uniformly.
+    last = np.maximum(end, start + np.uint64(1)) - np.uint64(1)
+    hi = np.minimum(((last >> k) + np.uint64(1)) << k, np.uint64(TOC_MAX_NS))
+    return toc_normalize(span2toc(lo, hi - np.uint64(1)))
+
+
+def _cap_cover(cover: np.ndarray, order: int, cap: int = COVER_CAP) -> tuple[np.ndarray, int]:
+    """Coarsen a cover by order until it fits the §10.5 cap.
+
+    Each step halves the bucket count (order − 1 doubles the span), so the
+    loop terminates: order 0 is a single bucket. The same widening law as
+    the quantization itself — never a truncation of the word list, which
+    would silently drop coverage.
+    """
+    while len(cover) > cap and order > 0:
+        order -= 1
+        cover = quantize_words(cover, order)
+    return cover, order
+
+
+def build_cover_section(contributions: dict, fields, shard_order: int, *, source="sweep"):
+    """The ``zagg-coverage-toc-cover/1`` object body from per-leaf contributions.
+
+    Same ``contributions`` mapping :func:`build_temporal_section` folds —
+    this consumes the tuples' ``cover`` element: per shard, the union of its
+    window leaves' covers, requantized at the pinned day order (canonical,
+    and exact: quantization commutes with union) and coarsened to the cap.
+    ``None`` for an empty map — the standing absence rule, so a store with
+    no temporal channel gets no sibling object at all.
+
+    A shard that had to coarsen below :data:`TEMPORAL_DAY_ORDER` records the
+    order it landed at in its own block (``temporal_order``), and the
+    coarsening is logged — §10.5's "widening only, loudly recorded".
+    """
+    from zagg.hive import _utcnow
+
+    if not contributions:
+        return None
+    shards: dict[str, dict] = {}
+    for decimal in sorted(contributions):
+        cover = np.concatenate([np.asarray(p[3], dtype=np.uint64) for p in contributions[decimal]])
+        cover = quantize_words(cover, TEMPORAL_DAY_ORDER)
+        cover, order = _cap_cover(cover, TEMPORAL_DAY_ORDER)
+        if order != TEMPORAL_DAY_ORDER:
+            logger.warning(
+                f"coverage[toc]: shard {decimal} cover coarsened to temporal order {order} "
+                f"(span 2^{63 - order} ns) to fit the {COVER_CAP}-word cap (spec §10.5)"
+            )
+        shards[decimal] = _encode_cover_block(cover, order)
+    return {
+        "spec": COVER_SPEC,
+        "source": source,
+        "generated_at": _utcnow(),
+        "order": int(shard_order),
+        "temporal_order": TEMPORAL_DAY_ORDER,
+        "cap": COVER_CAP,
+        "fields": sorted(fields),
+        "element": {"dtype": "uint64", "shape": [-1]},
+        "encoding": "base64",
+        "shards": shards,
+    }
+
+
+def _encode_cover_block(cover: np.ndarray, order: int) -> dict:
+    """One shard's block: base64 of the §1.4 element bytes, plus its k.
+
+    ``count`` is the §10.5 MUST-check (the §10.3 ``centroids`` rule, one
+    buffer instead of two); ``temporal_order`` appears only when the shard
+    coarsened below the object's pinned order — absence means the pin.
+    """
+    from zagg.sweep_overview import encode_digest
+
+    block = {
+        "words": base64.b64encode(encode_digest(np.asarray(cover, np.uint64), "uint64")).decode(
+            "ascii"
+        ),
+        "count": int(len(cover)),
+    }
+    if order != TEMPORAL_DAY_ORDER:
+        block["temporal_order"] = int(order)
+    return block
+
+
+def _decode_cover_block(decimal: str, block) -> tuple[np.ndarray, int]:
+    """One shard's ``(words, temporal_order)``, MUST-checked against ``count``."""
+    from zagg.sweep_overview import decode_digest
+
+    if not isinstance(block, dict):
+        raise ValueError(f"cover shard {decimal} block is not an object (spec §10.5)")
+    words = decode_digest(base64.b64decode(block["words"]), "uint64", ())
+    if block.get("count") != len(words):
+        raise ValueError(
+            f"cover shard {decimal} declares {block.get('count')!r} words and decodes "
+            f"{len(words)} — the block must agree with its own buffer (spec §10.5)"
+        )
+    return words, int(block.get("temporal_order", TEMPORAL_DAY_ORDER))
+
+
+def merge_cover_sections(existing, incoming):
+    """Compose two cover bodies for the sibling object's GET-union-PUT.
+
+    Per shard: the union of the two word sets, requantized at the coarser of
+    the two recorded orders (union alone could interleave two orders' bucket
+    bounds, and the §10.5 parity invariant is a claim at ONE order), then
+    re-capped — which may coarsen further, under the same widening law. A
+    shard on one side carries over unchanged. The unknown-revision rules are
+    the §10.4 ones verbatim: an incoming unknown revision contributes
+    nothing; a standing one is preserved and never downgraded.
+    """
+    a, b = _cover_usable(existing), _cover_usable(incoming)
+    if b is None:
+        return dict(a) if a is not None else _cover_preserved(existing)
+    if a is None:
+        newer = _cover_preserved(existing)
+        if newer is not None:
+            logger.warning(
+                f"coverage[toc]: keeping the standing {newer.get('spec')!r} cover — "
+                f"{COVER_SPEC} does not read it and MUST NOT downgrade it"
+            )
+            return newer
+        return dict(b)
+    shards: dict[str, dict] = {}
+    for decimal in sorted(set(a.get("shards") or {}) | set(b.get("shards") or {})):
+        sides = [
+            _decode_cover_block(decimal, side["shards"][decimal])
+            for side in (a, b)
+            if decimal in (side.get("shards") or {})
+        ]
+        if len(sides) == 1:
+            ((words, order),) = sides
+        else:
+            order = min(o for _, o in sides)
+            words = quantize_words(np.concatenate([w for w, _ in sides]), order)
+        words, order = _cap_cover(words, order)
+        shards[decimal] = _encode_cover_block(words, order)
+    return {
+        "spec": COVER_SPEC,
+        "source": b.get("source", a.get("source")),
+        "generated_at": b.get("generated_at", a.get("generated_at")),
+        "order": b.get("order", a.get("order")),
+        "temporal_order": TEMPORAL_DAY_ORDER,
+        "cap": COVER_CAP,
+        "fields": sorted(set(a.get("fields") or []) | set(b.get("fields") or [])),
+        "element": {"dtype": "uint64", "shape": [-1]},
+        "encoding": "base64",
+        "shards": shards,
+    }
+
+
+def cover_unchanged(existing, incoming) -> bool:
+    """Whether composing ``incoming`` into ``existing`` would change nothing.
+
+    The sibling object's half of the MOC family's skip-if-current test,
+    built exactly as :func:`section_unchanged` is: on the MERGE's content
+    (the per-shard blocks and the field list), never on the carrier fields
+    that churn per pass.
+    """
+    merged = merge_cover_sections(existing, incoming)
+    return _cover_content(merged) == _cover_content(
+        existing if isinstance(existing, dict) else None
+    )
+
+
+def _cover_content(section) -> tuple | None:
+    if section is None:
+        return None
+    shards = {
+        d: (b.get("words"), b.get("count"), b.get("temporal_order"))
+        for d, b in (section.get("shards") or {}).items()
+        if isinstance(b, dict)
+    }
+    return (shards, sorted(section.get("fields") or []), section.get("order"))
+
+
+def _cover_usable(section) -> dict | None:
+    if not isinstance(section, dict) or section.get("spec") != COVER_SPEC:
+        if section is not None:
+            logger.debug("coverage[toc]: ignoring a cover with an unknown spec")
+        return None
+    return section
+
+
+def _cover_preserved(section) -> dict | None:
+    """A standing cover at a spec marker this revision does not implement."""
+    if not isinstance(section, dict):
+        return None
+    spec = section.get("spec")
+    if isinstance(spec, str) and spec and spec != COVER_SPEC:
+        return dict(section)
+    return None
+
+
+def write_cover(store_root: str, section: dict, *, replace: bool = False, **store_kwargs):
+    """PUT the ``coverage.toc`` sibling, composing across the standing object.
+
+    The default is the same GET-union-PUT seam ``coverage.moc`` rides
+    (incremental sweeps accumulate; concurrent runs race benignly, last
+    writer wins, D9). ``replace=True`` is the refresh escape hatch: the
+    caller's walk is authoritative and the standing object is discarded —
+    except a standing cover at an UNKNOWN revision, which §10.4's succession
+    rule preserves on both paths (a producer never downgrades what it cannot
+    read). An unparsable standing object is logged and overwritten, the
+    regenerable-cache posture. Returns what was left standing.
+    """
+    import json
+
+    import obstore
+
+    from zagg.hive import _read_json, open_object_store
+
+    store = open_object_store(store_root, **store_kwargs)
+    try:
+        existing = _read_json(store, COVER_NAME)
+    except ValueError:
+        logger.warning(
+            f"existing {COVER_NAME} at {store_root} is not JSON; overwriting "
+            f"(regenerable cache — the sweep is the authoritative rebuilder)"
+        )
+        existing = None
+    if replace:
+        preserved = _cover_preserved(existing)
+        if preserved is not None:
+            logger.warning(
+                f"coverage[toc]: keeping the standing {preserved.get('spec')!r} cover at "
+                f"{store_root} — {COVER_SPEC} does not read it and MUST NOT downgrade it"
+            )
+        merged = preserved if preserved is not None else dict(section)
+    else:
+        merged = merge_cover_sections(existing, section)
+    if merged is None:
+        return None
+    obstore.put(store, COVER_NAME, json.dumps(merged, indent=1).encode())
+    return merged
+
+
+def read_cover(store_root: str, **store_kwargs):
+    """Read the store-root ``coverage.toc``; ``None`` when absent.
+
+    Raises ``ValueError`` on garbage JSON, exactly as the carrier's reader
+    does — a corrupt cache must be loud, never a plausible partial answer.
+    """
+    from zagg.hive import _read_json, open_object_store
+
+    return _read_json(open_object_store(store_root, **store_kwargs), COVER_NAME)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +810,32 @@ def coverage_toc_digest(envelope):
     return payload, words
 
 
+def load_cover(obj) -> dict | None:
+    """A ``coverage.toc`` body at the revision this module implements, else ``None``.
+
+    The strict-gate-then-degrade rule at object level: an unknown revision, a
+    non-dict carrier, or plain absence all read as ``None`` — the cover is an
+    accelerator whose truth is in the leaves, so degraded means "fall back to
+    tier 1 (or open leaves)", never a refusal.
+    """
+    return _cover_usable(obj)
+
+
+def cover_words(obj) -> dict[str, np.ndarray] | None:
+    """The decoded per-shard word sets, ``{shard decimal: uint64 words}``.
+
+    ``None`` when ``obj`` is not a readable cover. Each block's ``count`` is
+    MUST-checked against its own buffer (§10.5) — the same rule
+    :func:`coverage_toc_digest` applies to the digest block's ``centroids``.
+    """
+    section = load_cover(obj)
+    if section is None:
+        return None
+    return {
+        d: _decode_cover_block(d, block)[0] for d, block in (section.get("shards") or {}).items()
+    }
+
+
 def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int) -> list[str] | None:
     """Shard ids whose envelope word intersects ``[q_start_ns, q_end_ns)``.
 
@@ -483,18 +858,31 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int) -> list[str] | 
 
 
 __all__ = [
+    "COVER_CAP",
+    "COVER_KEY",
+    "COVER_NAME",
+    "COVER_SPEC",
     "PER_CENTROID",
     "ROOT_TOC_DELTA",
     "TEMPORAL_COVERAGE_SPEC",
+    "TEMPORAL_DAY_ORDER",
     "TEMPORAL_KEY",
+    "build_cover_section",
     "build_temporal_section",
+    "cover_unchanged",
+    "cover_words",
     "coverage_toc",
     "coverage_toc_digest",
+    "load_cover",
     "load_temporal_coverage",
+    "merge_cover_sections",
     "merge_temporal_sections",
+    "quantize_words",
+    "read_cover",
     "read_leaf_temporal",
     "section_unchanged",
     "shards_overlapping",
     "temporal_cell_order",
     "temporal_fields",
+    "write_cover",
 ]
