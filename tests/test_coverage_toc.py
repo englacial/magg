@@ -387,11 +387,42 @@ class TestCoverPruning:
         assert ("11219" in got) == expect
 
     def test_a_shard_only_the_cover_lists_is_still_a_candidate(self):
+        """§10.5: cover-only is "unknown, a candidate, never authoritative".
+
+        The discriminating window is the GAP one — a campaign window is green
+        whether the cover-only shard is an unconditional candidate or merely
+        authoritative-and-hitting. The sibling may be arbitrarily older than
+        the carrier here (a refresh with no temporal input replaces
+        ``coverage.moc`` and leaves the standing cover alone), so its word
+        set MUST NOT prune a shard tier 1 has never listed.
+        """
         envelope, cover = self._two_campaign_shard()
-        # Simulate the seam where the sibling ran ahead of the carrier.
+        # Simulate the seam where the two maps disagree about the shard.
         del envelope["temporal"]["shards"]["11213"]
         lo, hi = BASE_NS - DAY_NS, BASE_NS + 2 * DAY_NS
         assert shards_overlapping(envelope, lo, hi, cover=cover) == ["11213"]
+        gap0, gap1 = BASE_NS + 400 * DAY_NS, BASE_NS + 401 * DAY_NS
+        # Cover-listed AND tier-1-listed, this window prunes (the test above);
+        # cover-only, the same window keeps it — that is the whole rule.
+        assert shards_overlapping(envelope, gap0, gap1, cover=cover) == ["11213"]
+
+    def test_an_empty_word_set_falls_back_to_the_tier_one_word(self):
+        """A structurally legal ``count: 0`` block never prunes a real shard.
+
+        Widening is the only cover direction (§10.5), so an empty set for a
+        shard the carrier lists cannot be a true claim — it is malformed, and
+        the shard degrades to its envelope word instead of vanishing from
+        every window.
+        """
+        from zagg.coverage_toc import _encode_cover_block
+
+        envelope, cover = self._two_campaign_shard()
+        block = _encode_cover_block(np.asarray([], np.uint64), TEMPORAL_DAY_ORDER)
+        empty = {**cover, "shards": {"11213": block}}
+        assert empty["shards"]["11213"]["count"] == 0
+        gap0, gap1 = BASE_NS + 400 * DAY_NS, BASE_NS + 401 * DAY_NS
+        assert shards_overlapping(envelope, gap0, gap1, cover=empty) == ["11213"]
+        assert shards_overlapping(envelope, gap0, gap1) == ["11213"]
 
     def test_an_unknown_revision_cover_degrades_to_tier_one(self):
         envelope, cover = self._two_campaign_shard()

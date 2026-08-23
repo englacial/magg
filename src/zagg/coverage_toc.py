@@ -1015,15 +1015,33 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) 
     the ``coverage.toc`` body (:func:`read_cover`'s return) and a shard the
     cover lists is tested against its whole word set — so a window that
     falls in a gap BETWEEN a shard's campaigns no longer selects it, which
-    is the entire point of the sibling. A shard the cover does not list
-    falls back to its tier-1 envelope word (the cover's absent-shard rule:
-    unknown stays a candidate), a shard only the cover lists is tested on
-    the cover alone (never under-report across the two maps' seam), and a
-    ``cover`` at an unknown revision degrades to tier 1 wholesale — exactly
-    ``cover=None`` — per §10.5's strict-gate-then-degrade rule. Widening is
-    the only cover direction (§10.5), so the upgraded answer is still
-    conservative against the true observations: over-report bounded by the
-    quantization bucket at a cluster edge, under-report never.
+    is the entire point of the sibling. Widening is the only cover direction
+    (§10.5), so the upgraded answer is still conservative against the true
+    observations: over-report bounded by the quantization bucket at a
+    cluster edge, under-report never.
+
+    The two maps meet at a staleness seam, and §10.5 rules it three ways by
+    which object lists the shard:
+
+    * **Both** — the cover's word set decides. The carrier's envelope word is
+      the join of that set, so the set is the strictly tighter claim, and
+      pruning a gap window here is the whole point of the sibling.
+    * **Tier 1 only** — the envelope word decides ("a shard the cover does
+      not list is unknown rather than empty": unknown stays a candidate at
+      the resolution the carrier does have).
+    * **The cover only** — an unconditional candidate. §10.5 composes such a
+      shard "under the standing staleness posture — unknown, a candidate,
+      never authoritative", because a cover-only listing is exactly the seam
+      where the sibling may be arbitrarily older than the carrier (a refresh
+      whose walk found no temporal input replaces ``coverage.moc`` and leaves
+      the standing sibling untouched), and a stale word set MUST NOT prune.
+
+    A ``cover`` at an unknown revision degrades to tier 1 wholesale — exactly
+    ``cover=None`` — per §10.5's strict-gate-then-degrade rule. So does a
+    both-listed block that decodes to an EMPTY word set: the widening law
+    forbids an empty cover for a shard that has data, so that block is
+    malformed and the shard falls back to its tier-1 word rather than
+    under-reporting.
     """
     from mortie import toc_overlaps
 
@@ -1031,10 +1049,14 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) 
     sets = cover_words(cover) if cover is not None else None
     if words is None and sets is None:
         return None
-    words = words or {}
+    words, sets = words or {}, sets or {}
     out = []
-    for key in sorted(words.keys() | (sets or {}).keys()):
-        if sets is not None and key in sets:
+    for key in sorted(words.keys() | sets.keys()):
+        if key not in words:
+            # Cover-only: the fresher carrier has never listed it. Unknown,
+            # never authoritative — a candidate for every window (§10.5).
+            hit = True
+        elif key in sets and len(sets[key]):
             hit = bool(np.any(np.atleast_1d(toc_overlaps(sets[key], q_start_ns, q_end_ns))))
         else:
             hit = bool(toc_overlaps(words[key], q_start_ns, q_end_ns))
