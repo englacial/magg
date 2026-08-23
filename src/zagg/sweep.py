@@ -189,8 +189,9 @@ class MocFamily(SweepFamily):
     name = "moc"
 
     def __init__(self):
-        #: ``{shard decimal: [(word, digest, times), ...]}`` — one entry per
-        #: window leaf this run visited (issue #480).
+        #: ``{shard decimal: [(word, digest, times, cover), ...]}`` — one
+        #: entry per window leaf this run visited (issues #480, #489; the
+        #: fourth element is the leaf's §10.5 word-set cover).
         self._temporal: dict[str, list] = {}
         #: Shards whose temporal read failed: dropped from the map entirely,
         #: never published from the window leaves that did read (issue #480).

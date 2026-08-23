@@ -177,12 +177,25 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
     sibling — and a per-cell decode before the merge, the same shape as the
     overview family's own leaf read (:func:`zagg.sweep_overview._fold_node`,
     which reads ``arr[:]`` per field and accumulates per-cell centroid lists
-    the same way). What it returns is bounded regardless: the k-way merge here
+    the same way). The §10.5 fold is now the dominant CPU term of the
+    non-I/O work, and it is unconditional — every ``moc`` sweep pays it, on
+    stores that will never publish a cover too. At the CA shard shape (2.7 M
+    words over 49 pass-days) the two reductions measure ``toc_reduce``
+    ~0.002 s against ``quantize_words`` ~0.105 s, the latter returning ~45
+    words, with a transient of a few full-length ``uint64`` temporaries
+    (~130 MB at that shape) on top of the ``raw`` concatenation that already
+    exists. Accepted: it sits beside seconds of leaf array I/O, and the
+    alternative — handing the accumulator the raw word multiset and
+    quantizing once at the root — is exactly the ``n_leaves × n_cells × k``
+    memory blowup this fold exists to avoid.
+
+    What it returns is bounded regardless: the k-way merge here
     compresses the whole leaf to ~``ROOT_TOC_DELTA`` centroids, so the caller
     accumulating leaves (:func:`build_temporal_section`) holds
     ``n_leaves × ~δ`` rows, not ``n_leaves × n_cells × k``. For a
     2,726-shard store that is ~1.4 MB of centroids plus ~1.4 MB of companion
-    words, which is why the root fold needs no chunk batching of its own.
+    words — plus a few dozen cover words per leaf — which is why the root
+    fold needs no chunk batching of its own.
     """
     import zarr
     from mortie import toc_reduce
