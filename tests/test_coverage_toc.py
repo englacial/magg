@@ -412,6 +412,34 @@ class TestOnCommittedStores:
         again = run_sweep(root, leaves, families=["moc"], record=False)
         assert again["families"]["moc"]["root_moc_written"] is False
 
+    def test_a_sweep_over_a_future_sibling_converges_instead_of_lying(self, tmp_path):
+        """§10.4's succession rule, applied to the §10.5 marker.
+
+        ``write_cover`` never replaces a standing cover at a revision it
+        cannot read, so on such a store the standing marker is the truth
+        about what the sibling carries. A ``zagg-coverage-toc-cover/1``
+        producer that downgraded the marker would advertise a revision the
+        object does not have, and would never converge: the sweep would
+        stamp ``/1``, the refresh would stamp back the object's own ``/9``,
+        and the pair would re-PUT ``coverage.moc`` on every pass.
+        """
+        from zagg.grids.morton import morton_word
+        from zagg.sweep import run_sweep
+
+        root = self._copy(tmp_path, "temporal")
+        future = "zagg-coverage-toc-cover/9"
+        (Path(root) / COVER_NAME).write_text(json.dumps({"spec": future, "shards": {}}, indent=1))
+        moc = Path(root) / "coverage.moc"
+        envelope = json.loads(moc.read_text())
+        envelope["temporal"][COVER_KEY] = future
+        moc.write_text(json.dumps(envelope, indent=1))
+        leaves = [(int(morton_word("11213")), None)]
+        for _ in range(2):
+            summary = run_sweep(root, leaves, families=["moc"], record=False)
+            assert summary["families"]["moc"]["root_moc_written"] is False
+        assert read_root_coverage(root)["temporal"][COVER_KEY] == future
+        assert read_cover(root)["spec"] == future
+
     def test_a_truncated_companion_is_refused(self, tmp_path):
         """§1.1 row alignment, at ARRAY level (issue #452's failure shape).
 
