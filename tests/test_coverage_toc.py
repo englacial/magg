@@ -895,21 +895,29 @@ class TestOnCommittedStores:
         the spec tells readers they MAY check cheaply. Asserted over the
         multi-shard incremental sweep, so the §10.4/§10.5 seams (not just a
         single-producer PUT) are inside the claim.
+
+        The passes OVERLAP deliberately: two disjoint producers only ever
+        exercise ``merge_cover_sections``' carry-over arm ("a shard on one
+        side carries over unchanged"). The third pass re-covers both shards,
+        so every block here has been through the per-shard
+        union-then-requantize arm on the production writer's own output —
+        the arm where parity could actually break.
         """
+        from zagg.coverage_toc import _object_pin
         from zagg.sweep import run_sweep
 
         root = self._copy(tmp_path, "temporal")
         (Path(root) / "coverage.moc").unlink()
         (Path(root) / COVER_NAME).unlink()
         a, b = self._clone_shard(root)
-        for leaves in (a, b):
+        for leaves in (a, b, a + b):
             run_sweep(root, leaves, families=["moc"], record=False)
         tier1 = coverage_toc(read_root_coverage(root))
         cover = read_cover(root)
         decoded = cover_words(cover)
         assert set(decoded) == set(tier1) == {"11213", "11214"}
         for shard, words in decoded.items():
-            order = cover["shards"][shard].get("temporal_order", cover["temporal_order"])
+            order = cover["shards"][shard].get("temporal_order", _object_pin(cover))
             lhs = int(toc_reduce(words))
             rhs = int(toc_reduce(quantize_words([tier1[shard]], order)))
             assert lhs == rhs, shard
