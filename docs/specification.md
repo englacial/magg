@@ -2515,7 +2515,8 @@ the time axis: the §10.2 word is the overview, this is the index.
 
 It lives in its **own root object**, `{store_root}/coverage.toc`, beside the
 bootstrap sidecar — never inline: at the published CA store's shape it is
-~50–60 words per shard (~1.2 MB store-wide, ~300× the bootstrap object), and
+~50–60 words per shard (~1.5 MB store-wide, ~15× the tier-1-carrying
+bootstrap object it sits beside, and ~300× a spatial-only pre-#480 root), and
 a spatial-only reader must not pay that on every bootstrap GET. Temporal
 consumers GET it on demand, discovering it through §10.1's `cover` marker.
 Like the section it refines, it is a **regenerable accelerator** over the

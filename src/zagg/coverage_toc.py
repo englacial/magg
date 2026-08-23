@@ -25,8 +25,9 @@ quantized to a spec-pinned temporal order (§10.5). Tier 1's one word makes
 gaps invisible below shard granularity; the cover preserves them (the
 grammar's never-bridge law) at bucket resolution, so "is there data in
 ``[t0, t1)``" resolves per shard without opening a leaf. It is a sibling
-object, not a section: at CA scale it is ~300× the bootstrap object's size,
-and spatial-only readers must not pay that. ``coverage.moc``'s temporal
+object, not a section: at CA scale it is ~1.5 MB against the ~0.1 MB
+tier-1-carrying bootstrap object it sits beside (~15×), and spatial-only
+readers must not pay that. ``coverage.moc``'s temporal
 section carries only a presence marker for it (:data:`COVER_KEY`).
 
 Absence composes: a store with no temporal channel writes no section, and
