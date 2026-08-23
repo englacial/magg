@@ -985,7 +985,10 @@ def load_cover(obj) -> dict | None:
 def cover_words(obj) -> dict[str, np.ndarray] | None:
     """The decoded per-shard word sets, ``{shard decimal: uint64 words}``.
 
-    ``None`` when ``obj`` is not a readable cover. Each block's ``count`` is
+    ``None`` when ``obj`` is not a readable cover; a readable cover holding a
+    broken BLOCK raises, which makes this the conformance surface — the
+    query path (:func:`shards_overlapping`) degrades that one shard to tier 1
+    instead. Each block's ``count`` is
     MUST-checked against its own buffer (§10.5) — the same rule
     :func:`coverage_toc_digest` applies to the digest block's ``centroids``.
     A block that omits ``temporal_order`` decodes at the OBJECT's declared
@@ -1000,6 +1003,22 @@ def cover_words(obj) -> dict[str, np.ndarray] | None:
         d: _decode_cover_block(d, block, pinned)[0]
         for d, block in (section.get("shards") or {}).items()
     }
+
+
+def _query_word_set(section, decimal: str):
+    """One shard's cover words for the QUERY path, or ``None`` if unreadable.
+
+    The tolerant twin of :func:`cover_words`' strict decode: pruning must
+    never fail on debris, so a block that breaks §10.5's rules degrades this
+    one shard to tier 1 instead of raising the whole query.
+    """
+    try:
+        return _decode_cover_block(decimal, section["shards"][decimal], _object_pin(section))[0]
+    except (KeyError, TypeError, ValueError) as e:
+        logger.debug(
+            f"coverage[toc]: cover shard {decimal} does not decode ({e}) — tier 1 decides it"
+        )
+        return None
 
 
 def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) -> list[str] | None:
@@ -1042,11 +1061,19 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) 
     at two orders are not comparable, so a foreign-order sibling is debris
     that must neither decide a shard nor contribute ids of its own (the gate
     :func:`merge_cover_sections` applies on the write side, logged the same
-    way). So does a
+    way).
+
+    Degradation is per shard below the object gate: a block that does not
+    decode — §10.5's ``count`` MUST-check, a block above the object's pin, a
+    buffer that is not a buffer — falls back to that shard's tier-1 word
+    (a candidate if tier 1 does not list it), logged at debug. So does a
     both-listed block that decodes to an EMPTY word set: the widening law
     forbids an empty cover for a shard that has data, so that block is
-    malformed and the shard falls back to its tier-1 word rather than
-    under-reporting.
+    malformed and the shard falls back rather than under-reporting. This
+    query surface never raises on a corrupt sibling — the cover is an
+    accelerator whose truth is in the leaves, and §10.5 calls a broken one
+    "debris". The strict reading of the same bytes is
+    :func:`cover_words`, which is the conformance surface and DOES raise.
     """
     from mortie import toc_overlaps
 
@@ -1060,20 +1087,22 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) 
             f"at order {e_order!r}; D1 ids at two orders are not comparable"
         )
         section = None
-    sets = cover_words(section) if section is not None else None
-    if words is None and sets is None:
+    blocks = (section or {}).get("shards") or {}
+    if words is None and section is None:
         return None
-    words, sets = words or {}, sets or {}
+    words = words or {}
     out = []
-    for key in sorted(words.keys() | sets.keys()):
+    for key in sorted(words.keys() | blocks.keys()):
         if key not in words:
             # Cover-only: the fresher carrier has never listed it. Unknown,
             # never authoritative — a candidate for every window (§10.5).
             hit = True
-        elif key in sets and len(sets[key]):
-            hit = bool(np.any(np.atleast_1d(toc_overlaps(sets[key], q_start_ns, q_end_ns))))
         else:
-            hit = bool(toc_overlaps(words[key], q_start_ns, q_end_ns))
+            cover_set = _query_word_set(section, key) if key in blocks else None
+            if cover_set is not None and len(cover_set):
+                hit = bool(np.any(np.atleast_1d(toc_overlaps(cover_set, q_start_ns, q_end_ns))))
+            else:
+                hit = bool(toc_overlaps(words[key], q_start_ns, q_end_ns))
         if hit:
             out.append(key)
     return out

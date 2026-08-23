@@ -432,6 +432,40 @@ class TestCoverPruning:
         assert shards_overlapping(envelope, gap0, gap1, cover=foreign) == ["11213"]
         assert shards_overlapping(envelope, gap0, gap1, cover=None) == ["11213"]
 
+    @pytest.mark.parametrize("damage", ["count", "above_pin", "object_pin", "not_a_block"])
+    def test_a_broken_block_degrades_that_shard_instead_of_raising(self, damage):
+        """§10.5's MUST-refuse is scoped to the BLOCK, not to the query.
+
+        The cover is an accelerator whose truth is in the leaves, so debris
+        makes a shard unknown — it does not kill the caller's prune. The
+        strict reading of the same bytes (``cover_words``) still raises;
+        that is the conformance surface, asserted below.
+        """
+        from zagg.coverage_toc import _encode_cover_block
+
+        envelope, cover = self._two_campaign_shard()
+        block = dict(cover["shards"]["11213"])
+        if damage == "count":
+            block["count"] = 99
+        elif damage == "above_pin":
+            block = _encode_cover_block(
+                cover_words(cover)["11213"], TEMPORAL_DAY_ORDER, TEMPORAL_DAY_ORDER
+            )
+            block["temporal_order"] = TEMPORAL_DAY_ORDER + 1
+        elif damage == "not_a_block":
+            block = "words"
+        broken = {**cover, "shards": {"11213": block}}
+        if damage == "object_pin":
+            broken["temporal_order"] = "sixteen"
+        gap0, gap1 = BASE_NS + 400 * DAY_NS, BASE_NS + 401 * DAY_NS
+        # Tier 1 decides this shard now, so the gap no longer prunes it.
+        assert shards_overlapping(envelope, gap0, gap1, cover=broken) == ["11213"]
+        assert shards_overlapping(envelope, gap0, gap1) == ["11213"]
+        lo, hi = BASE_NS - DAY_NS, BASE_NS + 2 * DAY_NS
+        assert shards_overlapping(envelope, lo, hi, cover=broken) == ["11213"]
+        with pytest.raises(ValueError):
+            cover_words(broken)
+
     def test_a_cover_at_another_shard_order_is_ignored_wholesale(self, caplog):
         """§10.4/§10.5's order gate, on the read side (:func:`merge_cover_sections`).
 
