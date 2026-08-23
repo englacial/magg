@@ -474,13 +474,14 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
             and isinstance(written_cover.get("spec"), str)
         ):
             section[COVER_KEY] = written_cover["spec"]
-    else:
-        # A whole-store walk that found no cover input: the stale sibling is
-        # discarded with the stale section (§10.5's wholesale-rebuild rule),
-        # not left to describe leaves this walk proved absent.
-        from zagg.coverage_toc import delete_cover
-
-        delete_cover(store_root, **store_kwargs)
+    # No `else` arm. A whole-store walk that produced no cover input has
+    # proved nothing about the leaves — `toc_fields` is empty on a manifest
+    # that merely lost its `cell_order`, and a store whose companions are not
+    # written yet reads the same way — so the standing sibling stays standing,
+    # the posture §10.5 states ("a producer with no temporal contribution
+    # leaves the standing object untouched") and the one the sweep takes on
+    # the same evidence through `write_cover(None)`. §10.5's delete licence is
+    # scoped to the arm above, where no stamped leaf remains at all.
     envelope = build_root_coverage(
         morton_words_from_decimals(decimals),
         order,
