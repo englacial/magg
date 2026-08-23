@@ -870,11 +870,17 @@ def read_cover(store_root: str, **store_kwargs):
 def delete_cover(store_root: str, **store_kwargs) -> bool:
     """Discard the sibling with an authoritative wholesale rebuild (§10.5).
 
-    The refresh escape hatch's arm for a walk that proved the store carries
-    no cover input: the stale object goes with the stale section it refined.
-    A standing object at an UNKNOWN revision survives (the §10.4 succession
-    rule — a producer never deletes what it cannot read); garbage JSON is
-    debris and goes. Returns whether an object was removed.
+    The refresh escape hatch's arm for a walk that left no stamped leaf: the
+    stale object goes with the carrier it refined. A standing object at an
+    UNKNOWN revision survives (the §10.4 succession rule — a producer never
+    deletes what it cannot read); garbage JSON is debris and goes.
+
+    An object the read found ABSENT is answered from the read: no DELETE is
+    issued, so a refresh of a non-temporal store costs one GET rather than a
+    GET and a pointless DELETE. The return is best-effort and
+    backend-dependent under a race — read and delete are two requests, and
+    S3's ``DeleteObject`` is idempotent, so an object that appears between
+    them (or vanishes) is reported by whichever request saw it.
     """
     import obstore
     from obstore.exceptions import NotFoundError
@@ -884,8 +890,11 @@ def delete_cover(store_root: str, **store_kwargs) -> bool:
     store = open_object_store(store_root, **store_kwargs)
     try:
         existing = _read_json(store, COVER_NAME)
+        garbage = False
     except ValueError:
-        existing = None  # garbage is debris — delete below
+        existing, garbage = None, True  # debris — delete below
+    if existing is None and not garbage:
+        return False  # nothing there: the read already answered
     if _cover_preserved(existing) is not None:
         logger.warning(
             f"coverage[toc]: keeping the standing {existing.get('spec')!r} cover at "
