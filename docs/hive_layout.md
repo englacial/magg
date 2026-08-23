@@ -681,6 +681,16 @@ root time-digest) whose grammar is normative in
 with no temporal channel carries no such key and its root object is
 byte-identical to a pre-#480 one; absence is never a refusal.
 
+The same store may carry one more **root sibling**, `{store_root}/coverage.toc`
+([issue #489](https://github.com/englacial/zagg/issues/489)): the §10.5
+word-set cover — per shard, a small canonical toc word SET instead of the
+section's single envelope word, so a window that falls in a gap *between* a
+shard's observation campaigns prunes that shard too. It is GET-on-demand by
+temporal consumers only (at CA scale it is ~300× the bootstrap object, which
+is why it is not inline), discovered through the section's `cover` marker,
+and carries the same regenerable-accelerator staleness posture as everything
+else on this page. Grammar: [`specification.md`](specification.md) §10.5.
+
 A range is an inclusive run of same-order cells within one base cell,
 consecutive in digit-tail rank; endpoints are decimal **strings** (packed
 u64 words exceed 2^53 and raw JSON numbers get mangled by float-based
