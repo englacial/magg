@@ -1159,11 +1159,27 @@ class TestCoverObject:
         assert load_cover({"spec": "zagg-coverage-toc-cover/9"}) is None
         assert cover_words(None) is None
 
-    def test_delete_discards_ours_and_debris_but_never_a_future_revision(self, tmp_path):
+    def test_delete_discards_ours_and_debris_but_never_a_future_revision(
+        self, tmp_path, monkeypatch
+    ):
+        import obstore
+
         from zagg.coverage_toc import delete_cover
 
+        issued: list[str] = []
+        real = obstore.delete
+
+        def counting(store, path, *args, **kwargs):
+            issued.append(path)
+            return real(store, path, *args, **kwargs)
+
+        monkeypatch.setattr(obstore, "delete", counting)
         root = str(tmp_path)
-        assert delete_cover(root) is False  # absent: nothing to do
+        # Absent: answered from the read, with no DELETE issued at all — which
+        # is also what makes the answer the same on S3, whose DeleteObject is
+        # idempotent and would report a removal that never happened.
+        assert delete_cover(root) is False
+        assert issued == []
         write_cover(root, build_cover_section(_contributions([1]), ["h"], 4))
         assert delete_cover(root) is True
         assert read_cover(root) is None
