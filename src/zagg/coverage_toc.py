@@ -1091,21 +1091,27 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) 
     if words is None and section is None:
         return None
     words = words or {}
-    out = []
+    hits, tier = {}, []
     for key in sorted(words.keys() | blocks.keys()):
         if key not in words:
             # Cover-only: the fresher carrier has never listed it. Unknown,
             # never authoritative — a candidate for every window (§10.5).
-            hit = True
+            hits[key] = True
+            continue
+        cover_set = _query_word_set(section, key) if key in blocks else None
+        if cover_set is not None and len(cover_set):
+            hits[key] = bool(np.any(np.atleast_1d(toc_overlaps(cover_set, q_start_ns, q_end_ns))))
         else:
-            cover_set = _query_word_set(section, key) if key in blocks else None
-            if cover_set is not None and len(cover_set):
-                hit = bool(np.any(np.atleast_1d(toc_overlaps(cover_set, q_start_ns, q_end_ns))))
-            else:
-                hit = bool(toc_overlaps(words[key], q_start_ns, q_end_ns))
-        if hit:
-            out.append(key)
-    return out
+            # A word each: one batched call, not one FFI hop per shard.
+            tier.append(key)
+    if tier:
+        batch = np.atleast_1d(
+            np.asarray(
+                toc_overlaps(np.asarray([words[k] for k in tier], np.uint64), q_start_ns, q_end_ns)
+            )
+        )
+        hits.update(zip(tier, (bool(h) for h in batch), strict=True))
+    return sorted(k for k, hit in hits.items() if hit)
 
 
 __all__ = [
