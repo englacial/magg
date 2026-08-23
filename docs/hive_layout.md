@@ -57,8 +57,9 @@ the same per-shard write path (see [Status](#status)).
 - **Node invariant** (D5): below the root, a node contains *only* digit
   children (`[1-4]/`) and `*.zarr` objects — zero zarr metadata above the
   leaf, no shared mutable state across workers. The root alone also carries
-  the manifest (and, in a follow-on, `coverage.moc`). `zagg.hive`
-  re-checks every computed leaf path against this invariant before writing.
+  the manifest and the coverage sidecars — `coverage.moc`, plus `coverage.toc`
+  on a temporal store. `zagg.hive` re-checks every computed leaf path against
+  this invariant before writing.
 
 ## Config
 
@@ -617,7 +618,7 @@ actual `[t_min, t_max]` written, as ISO-8601 UTC strings.
 Where the data is, declared hierarchically
 ([issue #200](https://github.com/englacial/zagg/issues/200), design §4 as
 amended by PR #206; O8/O9 resolved on the issue thread). Three tiers per
-shard plus one store-root object:
+shard plus two store-root objects:
 
 | tier | what | where | cost to read |
 |---|---|---|---|
@@ -625,6 +626,7 @@ shard plus one store-root object:
 | 1 — exact bitmap | zstd-compressed bit field over the shard subtree at `cell_order` | `{full_id}.zarr/coverage.moc` sidecar | one opt-in GET |
 | 2 — exact truth | the leaf's `morton` coordinate array | the leaf's data plane | array read; the tiers above are indexes, never truth (D9) |
 | root | shard-order ranges MOC over all completed shards | `{store_root}/coverage.moc` | one GET — the discovery bootstrap |
+| root sibling | [§10.5](specification.md) word-set cover: a per-shard toc word SET (temporal stores only) | `{store_root}/coverage.toc` | one opt-in GET, temporal consumers only, on demand |
 
 **Leaf envelope** (on the stamp, `zagg.hive.read_coverage`; strict
 `spec: morton-moc/1` gate — unknown specs read as absent):
@@ -681,6 +683,12 @@ root time-digest) whose grammar is normative in
 with no temporal channel carries no such key and its root object is
 byte-identical to a pre-#480 one; absence is never a refusal.
 
+A range is an inclusive run of same-order cells within one base cell,
+consecutive in digit-tail rank; endpoints are decimal **strings** (packed
+u64 words exceed 2^53 and raw JSON numbers get mangled by float-based
+parsers). `source` is `"dispatcher"` (end-of-run write) or `"refresh"` (the
+explicit walk rebuild); the sweep will add its own.
+
 The same store may carry one more **root sibling**, `{store_root}/coverage.toc`
 ([issue #489](https://github.com/englacial/zagg/issues/489)): the §10.5
 word-set cover — per shard, a small canonical toc word SET instead of the
@@ -688,15 +696,10 @@ section's single envelope word, so a window that falls in a gap *between* a
 shard's observation campaigns prunes that shard too. It is GET-on-demand by
 temporal consumers only (at CA scale ~1.5 MB against the ~0.1 MB
 tier-1-carrying bootstrap object it sits beside — ~15×, and ~300× a
-spatial-only pre-#480 root — which is why it is not inline), discovered through the section's `cover` marker,
-and carries the same regenerable-accelerator staleness posture as everything
-else on this page. Grammar: [`specification.md`](specification.md) §10.5.
-
-A range is an inclusive run of same-order cells within one base cell,
-consecutive in digit-tail rank; endpoints are decimal **strings** (packed
-u64 words exceed 2^53 and raw JSON numbers get mangled by float-based
-parsers). `source` is `"dispatcher"` (end-of-run write) or `"refresh"` (the
-explicit walk rebuild); the sweep will add its own.
+spatial-only pre-#480 root — which is why it is not inline), discovered
+through the section's `cover` marker, and carries the same
+regenerable-accelerator staleness posture as everything else on this page.
+Grammar: [`specification.md`](specification.md) §10.5.
 
 **Reader flow** (`zagg.coverage`): `load_coverage` → `root_coverage_and`
 against the AOI to pick candidate shards (one GET, no walk); per leaf,
