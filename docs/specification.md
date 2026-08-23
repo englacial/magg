@@ -1637,7 +1637,13 @@ product is never sharded, §8/#247):
   fixtures have **no root coverage object at all**: none of them declares a
   temporal field, so a sweep of one produces no section, and their committed
   trees are byte-identical to their pre-§10 selves — which is exactly §10's
-  absence rule, pinned as bytes.
+  absence rule, pinned as bytes. From issue #489 the same fixture also
+  carries the **§10.5 `coverage.toc` sibling**, PUT by the same production
+  finisher beside the carrier (whose section now bears the §10.1 `cover`
+  marker); `temporal.expected.json`'s `cover` block records the derived
+  word set — the §10.5 quantization of the same inputs the tier-1 word is
+  derived from — and the other six fixtures carry no `coverage.toc` either,
+  the §10.5 absence pin.
 
 `minimal/` and `kitchen_sink/` pin the layout edge cases a reader must
 handle (`column/`'s leaf is `minimal/`'s, so it pins them again): inner chunk

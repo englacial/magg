@@ -202,6 +202,14 @@
    ]
   }
  },
+ "cover": {
+  "object": "coverage.toc",
+  "spec": "zagg-coverage-toc-cover/1",
+  "temporal_order": 16,
+  "words": [
+   "10689012241831559168"
+  ]
+ },
  "declarations": {
   "observed": {
    "spec": "zagg-toc/1",

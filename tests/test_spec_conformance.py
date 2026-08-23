@@ -1859,8 +1859,70 @@ class TestRootCoverageTemporalSection:
         # §10's absence rule, pinned as bytes — WITH its precondition, which
         # is what makes the missing object evidence of the rule rather than
         # of the generator simply never having been pointed at these trees.
+        # §10.5 extends the same pin to the word-set cover sibling.
         from zagg.coverage_toc import temporal_fields
 
         manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
         assert temporal_fields(manifest) == {}
         assert not (SPEC_DATA / name / "coverage.moc").exists()
+        assert not (SPEC_DATA / name / "coverage.toc").exists()
+
+    def _cover(self):
+        return json.loads((SPEC_DATA / "temporal" / "coverage.toc").read_text())
+
+    def test_the_cover_sibling_decodes_to_the_expected_word_set(self):
+        # §10.5 on committed bytes: the object gates on its own spec marker,
+        # the carrier's section points at it, and the word set equals the
+        # expectation DERIVED from the generator's inputs (never read back).
+        from zagg.coverage_toc import COVER_KEY, cover_words, load_cover
+
+        exp = _expected("temporal")["cover"]
+        obj = self._cover()
+        section = self._envelope()["temporal"]
+        assert obj["spec"] == exp["spec"] == "zagg-coverage-toc-cover/1"
+        assert section[COVER_KEY] == obj["spec"]
+        assert obj["order"] == self._envelope()["order"]
+        assert obj["temporal_order"] == exp["temporal_order"]
+        loaded = load_cover(obj)
+        assert loaded is not None
+        words = cover_words(loaded)
+        shard = _expected("temporal")["shard"]
+        assert set(words) == {shard}
+        assert [str(int(w)) for w in words[shard]] == exp["words"]
+
+    def test_the_cover_satisfies_the_parity_invariant(self):
+        # §10.5: toc_reduce(cover words) == toc_reduce(quantize(tier-1 word))
+        # at the shard's effective order — the cross-object consistency claim.
+        from mortie import toc_reduce
+
+        from zagg.coverage_toc import TEMPORAL_DAY_ORDER, cover_words, quantize_words
+
+        obj = self._cover()
+        shard = _expected("temporal")["shard"]
+        words = cover_words(obj)[shard]
+        order = obj["shards"][shard].get("temporal_order", obj["temporal_order"])
+        assert order == TEMPORAL_DAY_ORDER
+        tier1 = coverage_toc(self._envelope())[shard]
+        assert int(toc_reduce(words)) == int(toc_reduce(quantize_words([tier1], order)))
+
+    def test_the_cover_conservatively_contains_every_member_instant(self):
+        # §10.5's widening-only law, on the same derived instants §8.3's
+        # containment is asserted from: every real member instant the
+        # generator recorded (Unix-epoch ns, converted to the §8 internal
+        # scale exactly as the other containment tests do) lies inside the
+        # committed cover.
+        from mortie import from_datetime64, toc2time
+
+        from zagg.coverage_toc import cover_words
+
+        exp = _expected("temporal")
+        words = cover_words(self._cover())[exp["shard"]]
+        start, end = toc2time(words)
+        start, end = np.atleast_1d(start), np.atleast_1d(end)
+        for cell in exp["cells"]:
+            spans = np.array(cell["centroid_spans_ns"], dtype="int64")
+            internal = np.asarray(
+                from_datetime64(spans.reshape(-1).astype("datetime64[ns]")), dtype=np.uint64
+            )
+            for t in internal:
+                assert bool(np.any((start.astype(np.uint64) <= t) & (t < end.astype(np.uint64))))

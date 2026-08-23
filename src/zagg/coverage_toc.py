@@ -857,6 +857,38 @@ def read_cover(store_root: str, **store_kwargs):
     return _read_json(open_object_store(store_root, **store_kwargs), COVER_NAME)
 
 
+def delete_cover(store_root: str, **store_kwargs) -> bool:
+    """Discard the sibling with an authoritative wholesale rebuild (§10.5).
+
+    The refresh escape hatch's arm for a walk that proved the store carries
+    no cover input: the stale object goes with the stale section it refined.
+    A standing object at an UNKNOWN revision survives (the §10.4 succession
+    rule — a producer never deletes what it cannot read); garbage JSON is
+    debris and goes. Returns whether an object was removed.
+    """
+    import obstore
+    from obstore.exceptions import NotFoundError
+
+    from zagg.hive import _read_json, open_object_store
+
+    store = open_object_store(store_root, **store_kwargs)
+    try:
+        existing = _read_json(store, COVER_NAME)
+    except ValueError:
+        existing = None  # garbage is debris — delete below
+    if _cover_preserved(existing) is not None:
+        logger.warning(
+            f"coverage[toc]: keeping the standing {existing.get('spec')!r} cover at "
+            f"{store_root} — {COVER_SPEC} does not read it and MUST NOT delete it"
+        )
+        return False
+    try:
+        obstore.delete(store, COVER_NAME)
+        return True
+    except (FileNotFoundError, NotFoundError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Reader side — the minimum zagg's own tests (and demos) need. The external
 # reader's `coverage_toc` / `when=` surface is espg/moczarr#45, decoded from
@@ -988,6 +1020,7 @@ __all__ = [
     "cover_words",
     "coverage_toc",
     "coverage_toc_digest",
+    "delete_cover",
     "load_cover",
     "load_temporal_coverage",
     "merge_cover_sections",

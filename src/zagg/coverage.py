@@ -276,10 +276,14 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     from obstore.exceptions import NotFoundError
 
     from zagg.coverage_toc import (
+        COVER_KEY,
+        build_cover_section,
         build_temporal_section,
+        read_cover,
         read_leaf_temporal,
         temporal_cell_order,
         temporal_fields,
+        write_cover,
     )
     from zagg.grids.morton import morton_words_from_decimals
     from zagg.store import open_store
@@ -291,7 +295,8 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     # The §10 temporal section (issue #480) is rebuilt from the SAME walk, so
     # the escape hatch regenerates it rather than deleting it — and, because
     # this walk is whole-store by construction, its root time-digest is the
-    # authoritative one (spec §10's whole-coverage rule).
+    # authoritative one (spec §10's whole-coverage rule). The §10.5 word-set
+    # cover sibling (issue #489) rebuilds from the same contributions.
     toc_fields = temporal_fields(manifest)
     cell_order = temporal_cell_order(manifest)
     if toc_fields and cell_order is None:
@@ -410,12 +415,18 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                 stack.append(rel + "/")
     _stale_warned.discard(root)
     if not decimals:
+        from zagg.coverage_toc import delete_cover
+
         try:
             obstore.delete(store, ROOT_COVERAGE_NAME)
         except (FileNotFoundError, NotFoundError):
             pass
+        # The §10.5 sibling goes with the carrier it refines (wholesale
+        # discard; a foreign-revision object survives under succession).
+        delete_cover(store_root, **store_kwargs)
         return None
     section = build_temporal_section(contributions, toc_fields, source="refresh")
+    cover_sec = build_cover_section(contributions, toc_fields, order, source="refresh")
     if toc_failed:
         # Fail-open per leaf is fail-DESTRUCTIVE in aggregate. This walk PUTs
         # its envelope outright (no union, by design), so a section rebuilt
@@ -424,17 +435,46 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
         # operator reached for the escape hatch because something was already
         # wrong. Compose with the standing section instead, through the same
         # §10.4 seam the sweep writes across.
-        from zagg.coverage_toc import TEMPORAL_KEY, merge_temporal_sections
+        from zagg.coverage_toc import TEMPORAL_KEY, merge_cover_sections, merge_temporal_sections
         from zagg.hive import read_root_coverage
 
         standing = read_root_coverage(store_root, **store_kwargs)
         section = merge_temporal_sections(
             standing.get(TEMPORAL_KEY) if isinstance(standing, dict) else None, section
         )
+        # The §10.5 sibling composes across the identical seam, for the
+        # identical reason: an all-failed walk must not delete it, a partial
+        # one must not publish the losses as fact.
+        try:
+            standing_cover = read_cover(store_root, **store_kwargs)
+        except ValueError:
+            standing_cover = None  # garbage cannot vouch for anything (D9)
+        try:
+            cover_sec = merge_cover_sections(standing_cover, cover_sec)
+        except (KeyError, TypeError, ValueError):
+            pass  # malformed standing cover: this walk's replaces it
         logger.warning(
             f"refresh: the temporal section is PARTIAL — {len(toc_failed)} shard(s) did "
             f"not read; composing with the standing section rather than replacing it"
         )
+    if cover_sec is not None:
+        # Sibling before marker, exactly as the sweep orders it. `replace`:
+        # this walk is whole-store by construction, so it is the §10.5
+        # authoritative rebuild (the partial case merged above already).
+        written_cover = write_cover(store_root, cover_sec, replace=True, **store_kwargs)
+        if (
+            section is not None
+            and isinstance(written_cover, dict)
+            and isinstance(written_cover.get("spec"), str)
+        ):
+            section[COVER_KEY] = written_cover["spec"]
+    else:
+        # A whole-store walk that found no cover input: the stale sibling is
+        # discarded with the stale section (§10.5's wholesale-rebuild rule),
+        # not left to describe leaves this walk proved absent.
+        from zagg.coverage_toc import delete_cover
+
+        delete_cover(store_root, **store_kwargs)
     envelope = build_root_coverage(
         morton_words_from_decimals(decimals),
         order,
