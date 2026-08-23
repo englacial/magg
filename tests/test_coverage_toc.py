@@ -342,6 +342,77 @@ class TestPruning:
         assert shards_overlapping({"temporal": section}, far, far + DAY_NS) == []
 
 
+class TestCoverPruning:
+    """§10.5 as a query surface: the word SET makes gap windows prune."""
+
+    def _two_campaign_shard(self):
+        """One shard, two pass clusters years apart, and its section pair."""
+        rng = np.random.default_rng(3)
+        a = BASE_NS + rng.integers(0, 6 * 3600 * 10**9, 40).astype(np.uint64)
+        b = BASE_NS + 900 * DAY_NS + rng.integers(0, 6 * 3600 * 10**9, 40).astype(np.uint64)
+        words = np.asarray(time2toc(np.concatenate([a, b])), dtype=np.uint64)
+        digest = np.empty((len(words), 2), dtype=np.float32)
+        digest[:, 0] = np.concatenate([a, b]).astype(np.float64)
+        digest[:, 1] = 1.0
+        contributions = {"11213": [(int(toc_reduce(words)), digest, words, quantize_words(words))]}
+        section = build_temporal_section(contributions, ["h"])
+        cover = build_cover_section(contributions, ["h"], 4)
+        return {"temporal": section}, cover
+
+    def test_a_gap_window_prunes_under_the_cover_but_not_under_tier_one(self):
+        envelope, cover = self._two_campaign_shard()
+        gap0, gap1 = BASE_NS + 400 * DAY_NS, BASE_NS + 401 * DAY_NS
+        # Tier 1's single envelope word bridges the campaigns: candidate.
+        assert shards_overlapping(envelope, gap0, gap1) == ["11213"]
+        # The word set preserves the gap: pruned, no leaf opened.
+        assert shards_overlapping(envelope, gap0, gap1, cover=cover) == []
+
+    def test_a_campaign_window_still_selects_under_the_cover(self):
+        envelope, cover = self._two_campaign_shard()
+        for day in (0, 900):
+            lo = BASE_NS + day * DAY_NS - DAY_NS
+            hi = BASE_NS + day * DAY_NS + 2 * DAY_NS
+            assert shards_overlapping(envelope, lo, hi, cover=cover) == ["11213"]
+
+    def test_a_shard_the_cover_does_not_list_falls_back_to_tier_one(self):
+        envelope, cover = self._two_campaign_shard()
+        # A second shard in the section only: unknown at cover tier.
+        other = _leaf(5)
+        envelope["temporal"]["shards"]["11219"] = str(other[0])
+        gap0, gap1 = BASE_NS + 400 * DAY_NS, BASE_NS + 401 * DAY_NS
+        got = shards_overlapping(envelope, gap0, gap1, cover=cover)
+        assert "11213" not in got  # cover-listed: the gap prunes it
+        # 11219's tier-1 word decides for itself (its data is elsewhere).
+        expect = bool(toc_overlaps(np.asarray([other[0]], np.uint64), gap0, gap1)[0])
+        assert ("11219" in got) == expect
+
+    def test_a_shard_only_the_cover_lists_is_still_a_candidate(self):
+        envelope, cover = self._two_campaign_shard()
+        # Simulate the seam where the sibling ran ahead of the carrier.
+        del envelope["temporal"]["shards"]["11213"]
+        lo, hi = BASE_NS - DAY_NS, BASE_NS + 2 * DAY_NS
+        assert shards_overlapping(envelope, lo, hi, cover=cover) == ["11213"]
+
+    def test_an_unknown_revision_cover_degrades_to_tier_one(self):
+        envelope, cover = self._two_campaign_shard()
+        gap0, gap1 = BASE_NS + 400 * DAY_NS, BASE_NS + 401 * DAY_NS
+        foreign = {**cover, "spec": "zagg-coverage-toc-cover/9"}
+        assert shards_overlapping(envelope, gap0, gap1, cover=foreign) == ["11213"]
+        assert shards_overlapping(envelope, gap0, gap1, cover=None) == ["11213"]
+
+    def test_the_cover_never_under_reports_the_true_instants(self):
+        envelope, cover = self._two_campaign_shard()
+        rng = np.random.default_rng(7)
+        # Windows straddling real instants must always select the shard.
+        for day in (0, 900):
+            t = BASE_NS + day * DAY_NS + int(rng.integers(0, 6 * 3600 * 10**9))
+            assert shards_overlapping(envelope, t - 1, t + 1, cover=cover) == ["11213"]
+
+    def test_no_information_stays_none(self):
+        assert shards_overlapping({}, 0, 1, cover=None) is None
+        assert shards_overlapping({}, 0, 1, cover={"spec": "junk"}) is None
+
+
 class TestOnCommittedStores:
     """End to end, on the §7 fixtures: the writer, and the absence pin."""
 
@@ -712,6 +783,34 @@ class TestOnCommittedStores:
             again = run_sweep(root, leaves, families=["moc"], record=False)
             assert again["families"]["moc"]["root_moc_written"] is False
         assert read_root_coverage(root)["temporal"] == written["temporal"]
+
+    def test_parity_holds_on_every_shard_the_sweep_writes(self, tmp_path):
+        """§10.5's standing invariant, on the production writer's own output.
+
+        For every shard listed by BOTH root objects:
+        ``toc_reduce(cover words) == toc_reduce(quantize(tier-1 word, o))``
+        at the shard's effective order — the cross-object consistency claim
+        the spec tells readers they MAY check cheaply. Asserted over the
+        multi-shard incremental sweep, so the §10.4/§10.5 seams (not just a
+        single-producer PUT) are inside the claim.
+        """
+        from zagg.sweep import run_sweep
+
+        root = self._copy(tmp_path, "temporal")
+        (Path(root) / "coverage.moc").unlink()
+        (Path(root) / COVER_NAME).unlink()
+        a, b = self._clone_shard(root)
+        for leaves in (a, b):
+            run_sweep(root, leaves, families=["moc"], record=False)
+        tier1 = coverage_toc(read_root_coverage(root))
+        cover = read_cover(root)
+        decoded = cover_words(cover)
+        assert set(decoded) == set(tier1) == {"11213", "11214"}
+        for shard, words in decoded.items():
+            order = cover["shards"][shard].get("temporal_order", cover["temporal_order"])
+            lhs = int(toc_reduce(words))
+            rhs = int(toc_reduce(quantize_words([tier1[shard]], order)))
+            assert lhs == rhs, shard
 
     def test_a_non_temporal_store_writes_byte_identical_bytes(self, tmp_path):
         """The §10 absence promise, as bytes.
