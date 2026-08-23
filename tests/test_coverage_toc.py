@@ -581,6 +581,33 @@ class TestOnCommittedStores:
         assert envelope["temporal"] == standing
         assert coverage_toc(envelope) == coverage_toc({"temporal": standing})
 
+    def test_refresh_preserves_a_future_section_without_stamping_it(self, tmp_path, monkeypatch):
+        """§10.4's "verbatim" is verbatim — the refresh writes no key into it.
+
+        The merge hands back a standing section at a revision this producer
+        cannot read; that producer may define ``cover`` differently, or use
+        it for something else entirely. Stamping the §10.5 marker into it
+        would be this revision editing another's bytes at the one seam a
+        mixed-version fleet actually meets.
+        """
+        import zagg.coverage_toc as toc_module
+
+        root = self._copy(tmp_path, "temporal")
+        moc = Path(root) / "coverage.moc"
+        envelope = json.loads(moc.read_text())
+        envelope["temporal"]["spec"] = "zagg-coverage-toc/9"
+        envelope["temporal"].pop(COVER_KEY, None)
+        moc.write_text(json.dumps(envelope, indent=1))
+        standing = envelope["temporal"]
+
+        def reader(*args, **kwargs):
+            raise OSError("credentials expired mid-walk")
+
+        monkeypatch.setattr(toc_module, "read_leaf_temporal", reader)
+        rebuilt = refresh_root_coverage(root)["temporal"]
+        assert rebuilt == standing  # byte for byte, marker included
+        assert COVER_KEY not in rebuilt
+
     def test_refresh_composes_a_partial_rebuild_with_the_standing_section(
         self, tmp_path, monkeypatch
     ):
