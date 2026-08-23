@@ -1424,3 +1424,89 @@ class TestCoverMarker:
         marked = dict(a)
         marked[COVER_KEY] = COVER_SPEC
         assert not section_unchanged(merged, marked)
+
+
+class TestCaliforniaShape:
+    """The issue's real-world shape, scaled (issue #489 acceptance).
+
+    The published CA store's shard 3231242244 holds 2,699,113 exact-timestamp
+    companion words that cluster into 49 distinct pass-days (the plan
+    comment's decode). Scaled to 49 days × 200 instants, the production fold
+    must reproduce that pass-day structure — every observed day answers, a
+    day far from every pass prunes, and the whole day scan agrees with the
+    quantization law — through the same query surface a reader uses.
+    """
+
+    N_DAYS, PER_DAY, SPAN_DAYS = 49, 200, 2_700
+
+    def _shard(self):
+        rng = np.random.default_rng(3231242244 % 2**31)
+        days = np.sort(rng.choice(self.SPAN_DAYS, self.N_DAYS, replace=False))
+        ts = np.concatenate(
+            [
+                BASE_NS + int(d) * DAY_NS + rng.integers(0, 20 * 60 * 10**9, self.PER_DAY)
+                for d in days
+            ]
+        ).astype(np.uint64)
+        words = np.asarray(time2toc(ts), dtype=np.uint64)
+        digest = np.empty((len(words), 2), dtype=np.float32)
+        digest[:, 0] = ts.astype(np.float64)
+        digest[:, 1] = 1.0
+        contributions = {"11213": [(int(toc_reduce(words)), digest, words, quantize_words(words))]}
+        envelope = {"temporal": build_temporal_section(contributions, ["h"])}
+        cover = build_cover_section(contributions, ["h"], 4)
+        return days, words, envelope, cover
+
+    def _day_window(self, d: int) -> tuple[int, int]:
+        return BASE_NS + d * DAY_NS, BASE_NS + (d + 1) * DAY_NS
+
+    def test_the_pass_day_clusters_compress_to_about_one_word_each(self):
+        _days, words, _envelope, cover = self._shard()
+        block = cover["shards"]["11213"]
+        # 9,800 exact timestamps -> at most one word per pass-day cluster,
+        # and nowhere near the cap (no coarsening recorded).
+        assert 1 <= block["count"] <= self.N_DAYS
+        assert "temporal_order" not in block
+        assert np.array_equal(cover_words(cover)["11213"], quantize_words(words))
+
+    def test_every_pass_day_answers_and_far_days_prune(self):
+        days, _words, envelope, cover = self._shard()
+        day_set = set(int(d) for d in days)
+        for d in day_set:
+            assert shards_overlapping(envelope, *self._day_window(d), cover=cover) == ["11213"]
+        # INTERIOR gaps only: tier 1's one envelope word spans first..last
+        # pass, so it prunes nothing between them — the cover must.
+        far = [
+            d for d in range(min(day_set), max(day_set)) if min(abs(p - d) for p in day_set) >= 3
+        ]
+        assert len(far) > 2_000  # the store is overwhelmingly gap
+        for d in far[:: max(1, len(far) // 200)]:
+            assert shards_overlapping(envelope, *self._day_window(d), cover=cover) == []
+            # ... where tier 1 alone cannot prune a single one of them:
+            assert shards_overlapping(envelope, *self._day_window(d)) == ["11213"]
+
+    def test_the_full_day_scan_reproduces_the_pass_day_set(self):
+        days, words, envelope, cover = self._shard()
+        expect = quantize_words(words)
+        selected, law = [], []
+        for d in range(self.SPAN_DAYS):
+            lo, hi = self._day_window(d)
+            if shards_overlapping(envelope, lo, hi, cover=cover):
+                selected.append(d)
+            if bool(np.any(np.atleast_1d(toc_overlaps(expect, lo, hi)))):
+                law.append(d)
+        # The query surface IS the quantization law, day for day...
+        assert selected == law
+        day_set = set(int(d) for d in days)
+        # ...it never misses an observed day...
+        assert day_set <= set(selected)
+        # ...and it over-claims by at most the bucket geometry: every
+        # selected day is within 2 days of a real pass (span 2^47 ns ≈ 1.63
+        # days, so a bucket touching an instant reaches at most 2 days out).
+        assert all(min(abs(p - d) for p in day_set) <= 2 for d in selected)
+
+    def test_parity_holds_at_ca_shape(self):
+        _days, words, envelope, cover = self._shard()
+        cw = cover_words(cover)["11213"]
+        tier1 = int(envelope["temporal"]["shards"]["11213"])
+        assert int(toc_reduce(cw)) == int(toc_reduce(quantize_words([tier1])))
