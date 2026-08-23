@@ -385,6 +385,33 @@ class TestOnCommittedStores:
         assert rebuilt["shards"] == committed_cover["shards"]
         assert envelope["temporal"][COVER_KEY] == rebuilt["spec"] == COVER_SPEC
 
+    def test_refresh_preserves_a_future_sibling_and_points_at_it(self, tmp_path):
+        """§10.4's succession rule at object level, on the refresh's replace path.
+
+        The escape hatch is authoritative about the leaves, never about a
+        revision it cannot read: the standing object stays, and the marker
+        the carrier publishes is that object's own ``spec`` — the truth about
+        what the store actually carries.
+        """
+        root = self._copy(tmp_path, "temporal")
+        future = {"spec": "zagg-coverage-toc-cover/9", "shards": {}}
+        (Path(root) / COVER_NAME).write_text(json.dumps(future, indent=1))
+        envelope = refresh_root_coverage(root)
+        assert read_cover(root) == future
+        assert envelope["temporal"][COVER_KEY] == future["spec"]
+
+    def test_refresh_over_an_unstamped_store_discards_both_objects(self, tmp_path):
+        """The one arm §10.5's delete licence names by hand.
+
+        No stamped leaf remains, so the carrier goes — and the sibling, whose
+        ids are keyed to a carrier that no longer exists, goes with it.
+        """
+        root = self._copy(tmp_path, "temporal")
+        shutil.rmtree(Path(root) / "1")
+        assert refresh_root_coverage(root) is None
+        assert not (Path(root) / "coverage.moc").exists()
+        assert not (Path(root) / COVER_NAME).exists()
+
     def test_a_sweep_writes_the_section_the_fixture_committed(self, tmp_path):
         from zagg.grids.morton import morton_word
         from zagg.sweep import run_sweep
@@ -411,6 +438,16 @@ class TestOnCommittedStores:
         # Idempotence: a second pass over an unchanged tree writes nothing.
         again = run_sweep(root, leaves, families=["moc"], record=False)
         assert again["families"]["moc"]["root_moc_written"] is False
+        # Self-heal — the reason `cover_unchanged` is in the skip test at all.
+        # The carrier is current and the sibling is gone (or debris): a sweep
+        # that tested only the carrier would skip and leave the store with a
+        # `cover` marker pointing at nothing.
+        for damage in (None, b"not json {"):
+            path = Path(root) / COVER_NAME
+            path.unlink() if damage is None else path.write_bytes(damage)
+            healed = run_sweep(root, leaves, families=["moc"], record=False)
+            assert healed["families"]["moc"]["root_moc_written"] is True
+            assert read_cover(root)["shards"] == committed_cover["shards"]
 
     def test_a_sweep_over_a_future_sibling_converges_instead_of_lying(self, tmp_path):
         """§10.4's succession rule, applied to the §10.5 marker.
@@ -578,6 +615,7 @@ class TestOnCommittedStores:
 
         root = self._copy(tmp_path, "temporal")
         standing = json.loads((Path(root) / "coverage.moc").read_text())["temporal"]
+        standing_cover = read_cover(root)
 
         def reader(*args, **kwargs):
             raise OSError("credentials expired mid-walk")
@@ -587,6 +625,9 @@ class TestOnCommittedStores:
         assert envelope["ranges"]  # the spatial refresh still succeeded
         assert envelope["temporal"] == standing
         assert coverage_toc(envelope) == coverage_toc({"temporal": standing})
+        # The §10.5 sibling rides the same seam: an all-failed walk composes
+        # `None` into the standing object and re-publishes it verbatim.
+        assert read_cover(root) == standing_cover
 
     def test_refresh_preserves_a_future_section_without_stamping_it(self, tmp_path, monkeypatch):
         """§10.4's "verbatim" is verbatim — the refresh writes no key into it.
@@ -623,6 +664,7 @@ class TestOnCommittedStores:
         root = self._copy(tmp_path, "temporal")
         self._clone_shard(root)
         refresh_root_coverage(root)  # both shards land in the standing section
+        standing_cover = read_cover(root)
         real = toc_module.read_leaf_temporal
 
         def reader(leaf, *args, **kwargs):
@@ -635,6 +677,14 @@ class TestOnCommittedStores:
         # The shard the walk could not read keeps the word the last whole walk
         # published: a partial rebuild composes, it does not overwrite.
         assert set(envelope["temporal"]["shards"]) == {"11213", "11214"}
+        # The §10.5 sibling composes across the identical seam — the failed
+        # shard's BLOCK survives, so the cover does not shrink to the half of
+        # the store this walk happened to read.
+        composed = read_cover(root)
+        assert set(composed["shards"]) == {"11213", "11214"}
+        np.testing.assert_array_equal(
+            cover_words(composed)["11214"], cover_words(standing_cover)["11214"]
+        )
 
     def test_a_second_pass_over_a_multi_shard_store_writes_nothing(self, tmp_path):
         """Sweep idempotence where the seam actually bites (§10.4).
@@ -655,6 +705,9 @@ class TestOnCommittedStores:
         written = read_root_coverage(root)
         assert set(written["temporal"]["shards"]) == {"11213", "11214"}
         assert "digest" not in written["temporal"]
+        # The §10.5 sibling accumulated BOTH incremental producers' blocks —
+        # the convergence `cover_unchanged` is tested on below.
+        assert set(read_cover(root)["shards"]) == {"11213", "11214"}
         for leaves in (b, a):
             again = run_sweep(root, leaves, families=["moc"], record=False)
             assert again["families"]["moc"]["root_moc_written"] is False
