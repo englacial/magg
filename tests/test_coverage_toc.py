@@ -11,6 +11,7 @@ revision. The committed ``temporal/`` fixture is the real-store end of it;
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from pathlib import Path
 
@@ -430,6 +431,25 @@ class TestCoverPruning:
         foreign = {**cover, "spec": "zagg-coverage-toc-cover/9"}
         assert shards_overlapping(envelope, gap0, gap1, cover=foreign) == ["11213"]
         assert shards_overlapping(envelope, gap0, gap1, cover=None) == ["11213"]
+
+    def test_a_cover_at_another_shard_order_is_ignored_wholesale(self, caplog):
+        """§10.4/§10.5's order gate, on the read side (:func:`merge_cover_sections`).
+
+        A re-shard moves the carrier while a producer with no temporal
+        contribution leaves the sibling standing. D1 ids at two orders are
+        not comparable, so the foreign-order cover must neither decide a
+        shard nor contribute ids of its own — a leaf at ``1121344`` does not
+        exist in an order-4 store.
+        """
+        envelope = json.loads((SPEC_DATA / "temporal" / "coverage.moc").read_text())
+        cover = json.loads((SPEC_DATA / "temporal" / COVER_NAME).read_text())
+        assert envelope["order"] == cover["order"] == 4
+        lo, hi = 0, (1 << 63) - 1
+        bad = {**cover, "order": 6, "shards": {"1121344": cover["shards"]["11213"]}}
+        with caplog.at_level(logging.WARNING, logger="zagg.coverage_toc"):
+            got = shards_overlapping(envelope, lo, hi, cover=bad)
+        assert got == shards_overlapping(envelope, lo, hi, cover=None) == ["11213"]
+        assert "order 6" in caplog.text and "order 4" in caplog.text
 
     def test_the_cover_never_under_reports_the_true_instants(self):
         envelope, cover = self._two_campaign_shard()
