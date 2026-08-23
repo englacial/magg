@@ -686,8 +686,9 @@ The same store may carry one more **root sibling**, `{store_root}/coverage.toc`
 word-set cover — per shard, a small canonical toc word SET instead of the
 section's single envelope word, so a window that falls in a gap *between* a
 shard's observation campaigns prunes that shard too. It is GET-on-demand by
-temporal consumers only (at CA scale it is ~300× the bootstrap object, which
-is why it is not inline), discovered through the section's `cover` marker,
+temporal consumers only (at CA scale ~1.5 MB against the ~0.1 MB
+tier-1-carrying bootstrap object it sits beside — ~15×, and ~300× a
+spatial-only pre-#480 root — which is why it is not inline), discovered through the section's `cover` marker,
 and carries the same regenerable-accelerator staleness posture as everything
 else on this page. Grammar: [`specification.md`](specification.md) §10.5.
 
