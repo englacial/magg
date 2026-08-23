@@ -2470,7 +2470,14 @@ that seam as follows:
   value wins when both sides carry one, and a marker on either side alone
   survives — the object it points at composes under §10.5's own seam, so a
   producer that did not write the sibling must not erase the standing
-  pointer to it.
+  pointer to it. One exception, the succession rule below applied to the
+  marker: an incoming marker naming the producer's OWN cover revision MUST
+  NOT overwrite a standing marker naming a revision that producer cannot
+  read. §10.5 preserves such an unknown-revision object on every write path,
+  so the standing marker still names the object that is actually there;
+  downgrading it would leave the carrier advertising a revision the sibling
+  does not carry, contradicting §10.1's definition of the value, and would
+  leave producers at two revisions rewriting the root object forever.
 - **An existing section at an unknown revision is preserved verbatim, and
   never downgraded.** The strict `spec` gate above makes such a section read
   as absent, but composition is a *write*, and dropping the key is not the

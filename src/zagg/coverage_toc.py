@@ -397,8 +397,18 @@ def merge_temporal_sections(existing, incoming) -> dict | None:
             break
     # The §10.5 presence marker carries through the seam (§10.4): the sibling
     # object composes under its own merge, so a producer that wrote no cover
-    # must not erase the standing pointer to one.
+    # must not erase the standing pointer to one. Incoming wins, with one
+    # exception — the succession rule applied to the marker itself: a standing
+    # marker naming a cover revision this producer cannot read still describes
+    # the object that is actually there, because `write_cover` preserves such
+    # an object on BOTH of its paths. Downgrading the marker to `COVER_SPEC`
+    # would make the carrier advertise a revision the sibling does not carry
+    # (§10.1 defines the value as that object's own `spec`), and the sweep and
+    # the refresh would then take turns re-PUTting the root object forever.
     marker = b.get(COVER_KEY, a.get(COVER_KEY))
+    standing = a.get(COVER_KEY)
+    if marker == COVER_SPEC and isinstance(standing, str) and standing not in ("", COVER_SPEC):
+        marker = standing
     if marker is not None:
         merged[COVER_KEY] = marker
     return merged
