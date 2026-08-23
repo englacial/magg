@@ -277,6 +277,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
 
     from zagg.coverage_toc import (
         COVER_KEY,
+        TEMPORAL_COVERAGE_SPEC,
         build_cover_section,
         build_temporal_section,
         read_cover,
@@ -462,8 +463,13 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
         # this walk is whole-store by construction, so it is the §10.5
         # authoritative rebuild (the partial case merged above already).
         written_cover = write_cover(store_root, cover_sec, replace=True, **store_kwargs)
+        # Only ever stamp into a section at THIS revision. The merge above can
+        # hand back a standing section at an unknown revision, preserved
+        # VERBATIM under §10.4's succession rule — that producer may define
+        # `cover` differently, and "verbatim" is the whole point of the rule.
         if (
-            section is not None
+            isinstance(section, dict)
+            and section.get("spec") == TEMPORAL_COVERAGE_SPEC
             and isinstance(written_cover, dict)
             and isinstance(written_cover.get("spec"), str)
         ):
