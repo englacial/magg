@@ -1094,7 +1094,7 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) 
     if words is None and section is None:
         return None
     words = words or {}
-    hits, tier = {}, []
+    hits, tier, cov_keys, cov_sets = {}, [], [], []
     for key in sorted(words.keys() | blocks.keys()):
         if key not in words:
             # Cover-only: the fresher carrier has never listed it. Unknown,
@@ -1103,10 +1103,21 @@ def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) 
             continue
         cover_set = _query_word_set(section, key) if key in blocks else None
         if cover_set is not None and len(cover_set):
-            hits[key] = bool(np.any(np.atleast_1d(toc_overlaps(cover_set, q_start_ns, q_end_ns))))
+            cov_keys.append(key)
+            cov_sets.append(np.asarray(cover_set, np.uint64))
         else:
             # A word each: one batched call, not one FFI hop per shard.
             tier.append(key)
+    if cov_keys:
+        # Word sets too: one call over the concatenation, then a segmented OR.
+        # Every set here is non-empty (an empty one degraded to tier 1 above),
+        # so no segment can swallow the next shard's verdict.
+        offsets = np.cumsum([0] + [len(a) for a in cov_sets[:-1]])
+        batch = np.atleast_1d(
+            np.asarray(toc_overlaps(np.concatenate(cov_sets), q_start_ns, q_end_ns))
+        )
+        merged = np.add.reduceat(batch.astype(np.int64), offsets) > 0
+        hits.update(zip(cov_keys, (bool(h) for h in merged), strict=True))
     if tier:
         batch = np.atleast_1d(
             np.asarray(
