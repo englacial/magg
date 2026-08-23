@@ -918,6 +918,56 @@ TEMPORAL_BASE = "2019-05-14T02:11:07.250000000"
 #: merged centroid's envelope is a genuine range rather than a rounding
 #: artifact, narrow enough that a cell's whole span stays sub-hour.
 TEMPORAL_STEP_S = 3
+#: The cell whose clock is pushed forward to build §10.5's GAP (issue #489).
+#: The last cell of the plan, so the fixture's cover is TWO words with a hole
+#: between them rather than one bucket that swallows the whole ~30-minute
+#: fixture — which is what makes the §7 parity and containment claims
+#: falsifiable for an external reader.
+TEMPORAL_GAP_CELL = 3
+#: How far, in whole days. §10.5's guaranteed floor for a surviving gap is
+#: TWO bucket spans (2 × 2^47 ns ≈ 78 h at the pinned day order); five days
+#: clears three, so a whole ALIGNED bucket stays uncovered wherever the base
+#: instant falls on the grid. Whole days keep the fixture's clock on the same
+#: fractional second, which is what lets the kernel-parity test drive these
+#: instants through a float-seconds axis and still land on the committed
+#: words to the nanosecond.
+TEMPORAL_GAP_DAYS = 5
+
+
+def _temporal_gap_offset_ns() -> int:
+    """The gap cell's clock offset, checked against §10.5's two-span floor."""
+    from zagg.coverage_toc import TEMPORAL_DAY_ORDER
+
+    offset = TEMPORAL_GAP_DAYS * 86_400 * 10**9
+    assert offset >= 2 * (1 << (63 - TEMPORAL_DAY_ORDER)), "gap below §10.5's survival floor"
+    return offset
+
+
+def _temporal_gap(words: np.ndarray) -> tuple[int, int]:
+    """An aligned interval no §10.5 cover of ``words`` may claim.
+
+    The widest hole between the input envelopes (internal-ns scale, the one
+    ``toc2time`` speaks), narrowed to the bucket grid at the pinned order:
+    the buckets wholly inside the hole are exactly the ones quantization
+    cannot widen into, so the interval is uncovered by construction rather
+    than by inspection of the object under test.
+    """
+    from mortie import toc2time
+
+    from zagg.coverage_toc import TEMPORAL_DAY_ORDER
+
+    lo, hi = (np.atleast_1d(np.asarray(x, dtype=np.uint64)) for x in toc2time(words))
+    # A timestamp decodes to (t, t); a range's decoded end is exclusive.
+    spans = sorted((int(a), max(int(b), int(a) + 1)) for a, b in zip(lo, hi, strict=True))
+    reach, hole = spans[0][1], (0, 0)
+    for start, end in spans[1:]:
+        if start > reach and start - reach > hole[1] - hole[0]:
+            hole = (reach, start)
+        reach = max(reach, end)
+    span = 1 << (63 - TEMPORAL_DAY_ORDER)
+    gap = (-(-hole[0] // span) * span, (hole[1] // span) * span)
+    assert gap[1] > gap[0], f"no whole aligned bucket inside {hole} — raise TEMPORAL_GAP_SPANS"
+    return gap
 
 
 def _obs_times_ns(n: int, cell_ordinal: int) -> np.ndarray:
@@ -1118,6 +1168,13 @@ def build_temporal(out: Path) -> None:
         order = np.argsort(h, kind="stable")
         h, words = h[order], words[order]
         times_ns = _obs_times_ns(n, ordinal)
+        if ordinal == TEMPORAL_GAP_CELL:
+            # The §10.5 gap, built into the INPUTS (issue #489): this cell's
+            # clock sits whole buckets past the rest of the plan, so the
+            # committed coverage.toc carries a real hole. Done here rather
+            # than in `_obs_times_ns`, whose clock the other §8 expectations
+            # (and the frozen digests over the other cells) ride unchanged.
+            times_ns = times_ns + _temporal_gap_offset_ns()
         digest, locs = build_tdigest(h, DELTA, locations=words)
         runs = _centroid_runs(digest, n)
         per_centroid = _toc_words(
@@ -1176,9 +1233,10 @@ def build_temporal(out: Path) -> None:
     # produce no section at all, and writing a bare carrier there would churn
     # four committed trees for nothing (§10's absence rule, pinned as byte
     # identity by the conformance suite).
-    from mortie import toc_reduce
+    from mortie import toc_overlaps, toc_reduce
 
     from zagg.coverage_toc import (
+        COVER_CAP,
         COVER_KEY,
         COVER_SPEC,
         TEMPORAL_DAY_ORDER,
@@ -1227,6 +1285,15 @@ def build_temporal(out: Path) -> None:
     assert np.array_equal(decoded_cover[SHARD_KEY], expect_cover), decoded_cover
     # The §10.5 parity invariant, on the committed pair.
     assert int(toc_reduce(expect_cover)) == int(toc_reduce(quantize_words([shard_word])))
+    # The gap `TEMPORAL_GAP_CELL` bought, DERIVED from the same inputs: the
+    # widest hole between consecutive input envelopes, pulled IN to the
+    # bucket grid, so what is left is whole aligned bucket(s) no widening law
+    # may claim. A cover that swallowed the hole (or a single-word one, the
+    # shape this fixture had before issue #489) fails right here, in the
+    # generator, rather than certifying itself downstream.
+    gap_start, gap_end = _temporal_gap(every_word)
+    assert len(expect_cover) >= 2, expect_cover
+    assert not bool(np.any(np.atleast_1d(toc_overlaps(expect_cover, gap_start, gap_end))))
 
     leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
     expected = {
@@ -1263,7 +1330,18 @@ def build_temporal(out: Path) -> None:
             "object": "coverage.toc",
             "spec": COVER_SPEC,
             "temporal_order": TEMPORAL_DAY_ORDER,
+            "cap": COVER_CAP,
+            "fields": ["h_tdigest"],
+            "element": {"dtype": "uint64", "shape": [-1]},
+            "encoding": "base64",
+            "count": len(expect_cover),
             "words": [str(int(w)) for w in expect_cover],
+            # An interval on the §8 INTERNAL scale that the committed cover
+            # must not claim — derived above from the member instants, never
+            # transcribed. It is what makes the parity and containment claims
+            # discriminating: a cover that bridges the fixture's two clusters
+            # over-claims here (§10.5's never-bridge law).
+            "gap_ns": [str(int(gap_start)), str(int(gap_end))],
         },
         # The declarations the conformance tests assert against the committed
         # attrs — each on the array that HOLDS the words (§8/§9), and the

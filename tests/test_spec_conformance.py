@@ -85,7 +85,9 @@ FROZEN_COMBINED = {
     # The §8.2/§8.3/§9 companion fixture (issue #410) — asserted by
     # TestTemporalCompanions (temporal/ is not in FIXTURES: the leaf-shaped
     # suite's digest assertions assume an UNLOCATED h_tdigest).
-    "temporal": "fcfc8c33810f7a9a6409c2c5d5d69297631d7aabfd79a4ee9dca3614ed853d81",
+    # Re-pinned for the §10.5 gap cell (issue #489): the last cell's clock
+    # moved, so its two toc companions -- and only those -- hash differently.
+    "temporal": "6c7a0c5a3f54684b67e7e2daa66e29ffcf1af102833e7b3c4a4f989e36752887",
 }
 #: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
 #: its leaf, which is ``minimal``'s): the only committed store whose §5 key
@@ -112,14 +114,16 @@ FROZEN_ARRAYS = {
     ): "551f7be5718086c2ca1d379e1d1581368d21e4ca1433ce3ae4ae397e11b08f7f",
     # The §8.2 dense per-cell companion and the §8.3 ragged per-centroid
     # sibling (issue #410) — one frozen literal per companion element kind.
+    # Both re-pinned for the §10.5 gap cell (issue #489); the h_tdigest
+    # payload and its locations sibling are untouched by that offset.
     (
         "temporal",
         "6/observed",
-    ): "bf3b7e75967323db2a2db71d0b58f895f7178e99dd08eab385b5a917ff383d04",
+    ): "b8c48a74213a1a06fdaa554dbe580c222bc83dddf71264bcf88ff9084fb44402",
     (
         "temporal",
         "6/h_tdigest_times",
-    ): "84b51ac52e36710701238d3599dd6947818f20f9ca66a54ae1597b4b53471488",
+    ): "03a1e44b982a553c8a419f66563d712b7f070c5f0761e1982f9912740ffee468",
 }
 
 
@@ -1442,6 +1446,11 @@ class TestTemporalCompanions:
             order = np.argsort(h, kind="stable")
             h, words = h[order], words[order]
             times_ns = gen._obs_times_ns(n, ordinal)
+            if ordinal == gen.TEMPORAL_GAP_CELL:
+                # The §10.5 gap cell's clock offset, taken from the generator
+                # rather than restated, exactly as the rest of this loop is
+                # (issue #489).
+                times_ns = times_ns + gen._temporal_gap_offset_ns()
             toc = observation_words(
                 (times_ns - epoch_ns) / 1e9, epoch=epoch, scale="gps", units="seconds"
             )
@@ -1889,6 +1898,49 @@ class TestRootCoverageTemporalSection:
         shard = _expected("temporal")["shard"]
         assert set(words) == {shard}
         assert [str(int(w)) for w in words[shard]] == exp["words"]
+        # NOT one bucket that swallows the fixture: the committed cover is a
+        # word SET, which is the only shape the parity and containment claims
+        # below can discriminate (issue #489).
+        assert len(words[shard]) == exp["count"] >= 2
+
+    def test_the_cover_declares_the_10_5_grammar(self):
+        # The keys §10.5 REQUIRES on the object, on committed bytes — an
+        # external reader decodes the buffer with them: the cap the writer
+        # coarsens against, the fields the words came from, the element kind
+        # and its encoding, and each block's own `count`, which §10.5 makes a
+        # MUST-check against the buffer's length.
+        exp = _expected("temporal")["cover"]
+        obj = self._cover()
+        shard = _expected("temporal")["shard"]
+        assert obj["cap"] == exp["cap"] == 512
+        assert obj["fields"] == exp["fields"] == ["h_tdigest"]
+        assert obj["element"] == exp["element"] == {"dtype": "uint64", "shape": [-1]}
+        assert obj["encoding"] == exp["encoding"] == "base64"
+        block = obj["shards"][shard]
+        assert block["count"] == exp["count"]
+        # Spec text only — no zagg decoder — exactly as §5's recipes are read.
+        raw = base64.b64decode(block["words"])
+        assert len(raw) == 8 * block["count"]
+        assert [str(int(w)) for w in np.frombuffer(raw, "<u8")] == exp["words"]
+
+    def test_the_cover_preserves_the_gap_between_the_clusters(self):
+        # §10.5's never-bridge law on committed bytes. The fixture's last cell
+        # sits whole buckets past the others, and `gap_ns` is the aligned
+        # interval between them DERIVED from the member instants — a cover
+        # that bridged it (or quantized everything into one bucket) answers
+        # True here while still passing parity and containment (issue #489).
+        from mortie import TOC_MAX_NS, toc_overlaps
+
+        from zagg.coverage_toc import cover_words
+
+        exp = _expected("temporal")
+        words = np.asarray(cover_words(self._cover())[exp["shard"]], dtype=np.uint64)
+        start, end = (int(v) for v in exp["cover"]["gap_ns"])
+        assert start < end
+        assert not bool(np.atleast_1d(toc_overlaps(words, start, end)).any())
+        # The predicate is answering about THESE words, not False for
+        # everything: every one of them hits a window over the whole scale.
+        assert bool(np.atleast_1d(toc_overlaps(words, 0, TOC_MAX_NS)).all())
 
     def test_the_cover_satisfies_the_parity_invariant(self):
         # §10.5: toc_reduce(cover words) == toc_reduce(quantize(tier-1 word))

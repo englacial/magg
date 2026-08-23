@@ -1,7 +1,7 @@
 {
  "spec": "zagg-coverage-toc-cover/1",
  "source": "sweep",
- "generated_at": "2026-08-23T21:07:23+00:00",
+ "generated_at": "2026-08-23T21:36:57+00:00",
  "order": 4,
  "temporal_order": 16,
  "cap": 512,
@@ -17,8 +17,8 @@
  "encoding": "base64",
  "shards": {
   "11213": {
-   "words": "AAAsSgAAV5Q=",
-   "count": 1
+   "words": "AAAsSgAAV5QAgC1KAABalA==",
+   "count": 2
   }
  }
 }

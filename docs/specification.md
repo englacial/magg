@@ -1642,8 +1642,14 @@ product is never sharded, §8/#247):
   finisher beside the carrier (whose section now bears the §10.1 `cover`
   marker); `temporal.expected.json`'s `cover` block records the derived
   word set — the §10.5 quantization of the same inputs the tier-1 word is
-  derived from — and the other six fixtures carry no `coverage.toc` either,
-  the §10.5 absence pin.
+  derived from — the object's declared `cap`/`fields`/`element`/`encoding`
+  and the block's `count`, and `gap_ns`, an interval on the internal scale
+  the committed cover MUST NOT claim. The fixture's last cell is deliberately
+  clocked whole buckets past the rest of the plan, so the cover is a
+  MULTI-word set with a real hole in it: a reader that quantized every word
+  into one bucket would satisfy the parity and containment claims and fail
+  `gap_ns`. The other six fixtures carry no `coverage.toc` either, the §10.5
+  absence pin.
 
 `minimal/` and `kitchen_sink/` pin the layout edge cases a reader must
 handle (`column/`'s leaf is `minimal/`'s, so it pins them again): inner chunk
@@ -2678,6 +2684,8 @@ carrying a `coverage.toc`, written by the production sweep writer beside its
 `coverage.moc`, and `temporal.expected.json`'s `cover` block records the
 decoded word set — derived from the generator's inputs through the
 quantization law above, never transcribed — plus the parity claim on
-committed bytes. The other six fixtures carry no `coverage.toc` at all,
+committed bytes, the required keys above, and the `gap_ns` interval the
+fixture's two clusters leave uncovered, which is what makes the object a
+test of the never-bridge law rather than of a single bucket. The other six fixtures carry no `coverage.toc` at all,
 which pins the absence rule as bytes, exactly as §10's section absence is
 pinned.
