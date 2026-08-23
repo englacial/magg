@@ -493,6 +493,82 @@ class TestCoverPruning:
             t = BASE_NS + day * DAY_NS + int(rng.integers(0, 6 * 3600 * 10**9))
             assert shards_overlapping(envelope, t - 1, t + 1, cover=cover) == ["11213"]
 
+    def _mixed_shape(self):
+        """One store touching every arm: word set, empty, debris, tier 1, cover-only."""
+        from zagg.coverage_toc import _encode_cover_block
+
+        rng = np.random.default_rng(11)
+        contributions = {}
+        for i, key in enumerate(("11213", "11214", "11215", "11216")):
+            t = np.concatenate(
+                [
+                    BASE_NS + off * DAY_NS + rng.integers(0, 6 * 3600 * 10**9, 30)
+                    for off in (30 * i, 700 + 40 * i)
+                ]
+            ).astype(np.uint64)
+            words = np.asarray(time2toc(t), dtype=np.uint64)
+            digest = np.empty((len(words), 2), dtype=np.float32)
+            digest[:, 0] = t.astype(np.float64)
+            digest[:, 1] = 1.0
+            contributions[key] = [(int(toc_reduce(words)), digest, words, quantize_words(words))]
+        envelope = {"temporal": build_temporal_section(contributions, ["h"])}
+        cover = build_cover_section(contributions, ["h"], 4)
+        cover["shards"] = dict(cover["shards"])
+        # 11213/11214 keep their real word sets; the rest are the seams.
+        empty = _encode_cover_block(np.asarray([], np.uint64), TEMPORAL_DAY_ORDER)
+        cover["shards"]["11215"] = empty
+        cover["shards"]["11216"] = {**cover["shards"]["11216"], "count": 99}
+        envelope["temporal"]["shards"]["11217"] = str(_leaf(5)[0])
+        cover["shards"]["11218"] = cover["shards"]["11213"]
+        return envelope, cover
+
+    @staticmethod
+    def _per_shard(envelope, lo, hi, cover):
+        """The pre-batching formulation: one ``toc_overlaps`` call per shard."""
+        from zagg.coverage_toc import _query_word_set
+
+        words = coverage_toc(envelope) or {}
+        section = load_cover(cover)
+        blocks = (section or {}).get("shards") or {}
+        hits = {}
+        for key in sorted(words.keys() | blocks.keys()):
+            if key not in words:
+                hits[key] = True
+                continue
+            cover_set = _query_word_set(section, key) if key in blocks else None
+            if cover_set is not None and len(cover_set):
+                hits[key] = bool(np.any(np.atleast_1d(toc_overlaps(cover_set, lo, hi))))
+            else:
+                hits[key] = bool(toc_overlaps(np.asarray([words[key]], np.uint64), lo, hi)[0])
+        return sorted(k for k, hit in hits.items() if hit)
+
+    def test_the_batched_query_answers_exactly_as_the_per_shard_loop(self):
+        """One concatenated call plus a segmented OR == one call per shard.
+
+        The cover arm answers every word-set shard in a single FFI hop, which
+        is only sound if no segment can absorb its neighbour's verdict. The
+        empty and undecodable blocks never enter the concatenation (they
+        degrade to tier 1 first), so the shape below carries both alongside
+        two real word sets, a tier-1-only shard and a cover-only one.
+        """
+        envelope, cover = self._mixed_shape()
+        assert set(cover["shards"]) == {"11213", "11214", "11215", "11216", "11218"}
+        tier = coverage_toc(envelope)
+        assert "11217" in tier and "11218" not in tier
+        answers = set()
+        for i in range(60):
+            lo = BASE_NS + i * 20 * DAY_NS
+            hi = lo + DAY_NS
+            got = shards_overlapping(envelope, lo, hi, cover=cover)
+            assert got == self._per_shard(envelope, lo, hi, cover)
+            answers.add(tuple(got))
+        # The sweep discriminates — this is not 60 copies of one answer.
+        assert len(answers) > 3
+        # ...only the cover-only shard is unconditional, and the two degraded
+        # blocks still answer (from tier 1) rather than vanishing everywhere.
+        assert all("11218" in a for a in answers)
+        assert any("11215" in a for a in answers) and any("11216" in a for a in answers)
+
     def test_no_information_stays_none(self):
         assert shards_overlapping({}, 0, 1, cover=None) is None
         assert shards_overlapping({}, 0, 1, cover={"spec": "junk"}) is None
