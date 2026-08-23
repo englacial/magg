@@ -835,6 +835,61 @@ class TestCoverComposition:
         same = build_cover_section({"11219": [_leaf(4)]}, ["g"], 4)
         assert set(merge_cover_sections(a, same)["shards"]) == {"11210", "11211", "11219"}
 
+    def test_a_block_decodes_at_the_objects_pin_not_the_modules(self):
+        # §10.5 defines an absent block `temporal_order` against the OBJECT's
+        # declaration. A conforming order-14 object leaves its at-the-pin
+        # blocks unmarked, and a reader must not read them as order 16.
+        from zagg.coverage_toc import _encode_cover_block
+
+        section = build_cover_section({"11213": [_leaf(1)]}, ["h"], 4)
+        words14 = quantize_words(cover_words(section)["11213"], 14)
+        section["temporal_order"] = 14
+        section["shards"]["11213"] = _encode_cover_block(words14, 14, 14)
+        assert "temporal_order" not in section["shards"]["11213"]
+        assert np.array_equal(cover_words(section)["11213"], words14)
+
+    def test_merging_an_object_at_a_coarser_pin_requantizes_there(self):
+        from zagg.coverage_toc import _encode_cover_block
+
+        coarse = build_cover_section({"11213": [_leaf(1)]}, ["h"], 4)
+        words14 = quantize_words(cover_words(coarse)["11213"], 14)
+        coarse["temporal_order"] = 14
+        coarse["shards"]["11213"] = _encode_cover_block(words14, 14, 14)
+        fine = build_cover_section({"11213": [_leaf(2)]}, ["h"], 4)
+        merged = merge_cover_sections(coarse, fine)
+        # The composed object pins at the finer of the two, so every block's
+        # own order is still <= it; this shard coarsened to 14 and says so.
+        assert merged["temporal_order"] == TEMPORAL_DAY_ORDER
+        assert merged["shards"]["11213"]["temporal_order"] == 14
+        expect = quantize_words(np.concatenate([words14, cover_words(fine)["11213"]]), 14)
+        assert np.array_equal(cover_words(merged)["11213"], expect)
+        assert int(toc_reduce(cover_words(merged)["11213"])) == int(
+            toc_reduce(quantize_words(np.concatenate([words14, cover_words(fine)["11213"]]), 14))
+        )
+
+    def test_a_block_above_the_objects_pin_is_refused(self):
+        from zagg.coverage_toc import _encode_cover_block
+
+        section = build_cover_section({"11213": [_leaf(1)]}, ["h"], 4)
+        section["temporal_order"] = 14
+        section["shards"]["11213"] = _encode_cover_block(
+            cover_words(section)["11213"], 20, TEMPORAL_DAY_ORDER
+        )
+        with pytest.raises(ValueError, match="above the object's pinned"):
+            cover_words(section)
+
+    def test_a_pin_change_is_a_content_change(self):
+        # The declared pin and cap are what the blocks MEAN, so a standing
+        # object at another pin is not "already current" (the skip-if-current
+        # test would otherwise never rewrite it).
+        a = build_cover_section({"11213": [_leaf(1)]}, ["h"], 4)
+        merged = merge_cover_sections(None, a)
+        assert cover_unchanged(merged, a)
+        repinned = dict(merged, temporal_order=14)
+        assert not cover_unchanged(repinned, a)
+        recapped = dict(merged, cap=COVER_CAP // 2)
+        assert not cover_unchanged(recapped, a)
+
     def test_an_unknown_incoming_revision_contributes_nothing(self):
         a = build_cover_section(_contributions([1]), ["h"], 4)
         assert merge_cover_sections(a, {"spec": "zagg-coverage-toc-cover/9"}) == a
