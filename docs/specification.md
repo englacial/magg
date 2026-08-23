@@ -2668,9 +2668,9 @@ REPLACES it wholesale rather than unioning. A re-shard therefore moves both
 objects together instead of leaving the sibling holding two orders' ids
 under one declared `order`.
 
-The sibling's life is tied to the carrier's. A producer that overwrites or
-DELETES `{store_root}/coverage.moc` wholesale — the refresh path, when no
-stamped leaf remains — SHOULD discard `{store_root}/coverage.toc` with it:
+The sibling's life is tied to the carrier's. A producer that DELETES
+`{store_root}/coverage.moc` wholesale — the refresh path, when no stamped
+leaf remains — SHOULD discard `{store_root}/coverage.toc` with it:
 the §10.1 `cover` marker lives in the carrier, so a surviving sibling is an
 orphan no reader discovers, and a later carrier at a different shape would
 find ids it cannot key. A reader that reaches the sibling anyway is still
@@ -2678,6 +2678,15 @@ safe: an orphan only over-claims, and a cover shard absent from the carrier's
 map composes under the standing staleness posture — **unknown, a candidate,
 never authoritative**, exactly as a shard the cover does not list is unknown
 rather than empty.
+
+That licence is the deletion case only. A producer that merely REWRITES the
+carrier while producing no cover of its own does not discard the sibling: it
+has looked at no temporal input, which is not evidence of absence, and the
+composition rule above governs instead — the standing object is left
+untouched. Otherwise a defect that costs a walk its inputs (a manifest
+missing `cell_order`, companions not yet written) would destroy a perfectly
+good cover on the strength of the defect, and the two producers would answer
+differently on identical evidence.
 
 Conformance is §7's `temporal/` fixture again: it is the only fixture
 carrying a `coverage.toc`, written by the production sweep writer beside its

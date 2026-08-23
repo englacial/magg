@@ -550,6 +550,7 @@ class TestOnCommittedStores:
         del manifest["cell_order"]
         path.write_text(json.dumps(manifest, indent=1))
         (Path(root) / "coverage.moc").unlink()
+        standing_cover = (Path(root) / COVER_NAME).read_bytes()
         with caplog.at_level("WARNING"):
             summary = run_sweep(
                 root, [(int(morton_word("11213")), None)], families=["moc"], record=False
@@ -558,6 +559,12 @@ class TestOnCommittedStores:
             assert "temporal" not in read_root_coverage(root)
             assert refresh_root_coverage(root).get("temporal") is None
         assert caplog.text.count("cell_order") >= 2
+        # Neither producer touches the §10.5 sibling on this evidence: a
+        # manifest defect proves nothing about the leaves, so "no temporal
+        # contribution leaves the standing object untouched" governs — and
+        # both producers have to answer it the same way, or an operator's
+        # refresh destroys a perfectly good cover the sweep kept.
+        assert (Path(root) / COVER_NAME).read_bytes() == standing_cover
 
     def test_refresh_never_deletes_the_section_when_every_leaf_fails(self, tmp_path, monkeypatch):
         """The escape hatch must not be the thing that destroys the section.
