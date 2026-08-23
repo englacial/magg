@@ -2555,8 +2555,10 @@ is *unknown*, a candidate — never *empty*.
   - **`count`** — the word count. A reader MUST refuse a block whose buffer
     disagrees with it (§10.3's `centroids` rule, one buffer instead of two).
   - **`temporal_order`** (optional) — present **iff** this shard coarsened
-    below the object's pinned order under the cap; absence means the pinned
-    order. Always ≤ the object's `temporal_order`.
+    below the object's pinned order under the cap; absence means **the
+    object's** `temporal_order` (not any order a reader's own build pins),
+    which is also the ceiling: always ≤ the object's `temporal_order`, and a
+    reader MUST refuse a block declaring an order above it.
 
 **Quantization.** Temporal order `o` partitions the toc scale (2^63 ns from
 the grammar's 1850 epoch — the span the 31-bit end code at 2^32 ns closes)

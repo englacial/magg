@@ -570,12 +570,14 @@ def build_cover_section(contributions: dict, fields, shard_order: int, *, source
     }
 
 
-def _encode_cover_block(cover: np.ndarray, order: int) -> dict:
+def _encode_cover_block(cover: np.ndarray, order: int, pinned: int = TEMPORAL_DAY_ORDER) -> dict:
     """One shard's block: base64 of the §1.4 element bytes, plus its k.
 
     ``count`` is the §10.5 MUST-check (the §10.3 ``centroids`` rule, one
     buffer instead of two); ``temporal_order`` appears only when the shard
-    coarsened below the object's pinned order — absence means the pin.
+    coarsened below ``pinned``, the ENCLOSING object's pinned order —
+    absence means that pin, so the key and the object's declaration have to
+    be written against the same number.
     """
     from zagg.sweep_overview import encode_digest
 
@@ -585,13 +587,34 @@ def _encode_cover_block(cover: np.ndarray, order: int) -> dict:
         ),
         "count": int(len(cover)),
     }
-    if order != TEMPORAL_DAY_ORDER:
+    if int(order) != int(pinned):
         block["temporal_order"] = int(order)
     return block
 
 
-def _decode_cover_block(decimal: str, block) -> tuple[np.ndarray, int]:
-    """One shard's ``(words, temporal_order)``, MUST-checked against ``count``."""
+def _object_pin(section) -> int:
+    """A cover object's declared ``temporal_order``, or this revision's pin.
+
+    §10.5 defines a block's missing ``temporal_order`` relative to the OBJECT
+    ("absence means the pinned order"), not to whatever this build happens to
+    pin, so every decode resolves through here.
+    """
+    pinned = (section or {}).get("temporal_order", TEMPORAL_DAY_ORDER)
+    try:
+        return int(pinned)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"cover declares a non-integer temporal_order {pinned!r} (spec §10.5)"
+        ) from e
+
+
+def _decode_cover_block(decimal: str, block, pinned: int = TEMPORAL_DAY_ORDER):
+    """One shard's ``(words, temporal_order)``, MUST-checked against ``count``.
+
+    ``pinned`` is the enclosing object's declared order: it supplies the
+    default for a block that omits its own, and it is the ceiling §10.5's
+    "Always ≤ the object's ``temporal_order``" makes a MUST.
+    """
     from zagg.sweep_overview import decode_digest
 
     if not isinstance(block, dict):
@@ -602,7 +625,13 @@ def _decode_cover_block(decimal: str, block) -> tuple[np.ndarray, int]:
             f"cover shard {decimal} declares {block.get('count')!r} words and decodes "
             f"{len(words)} — the block must agree with its own buffer (spec §10.5)"
         )
-    return words, int(block.get("temporal_order", TEMPORAL_DAY_ORDER))
+    order = int(block.get("temporal_order", pinned))
+    if order > int(pinned):
+        raise ValueError(
+            f"cover shard {decimal} declares temporal order {order} above the object's "
+            f"pinned {int(pinned)} — a block only ever coarsens BELOW the pin (spec §10.5)"
+        )
+    return words, order
 
 
 def merge_cover_sections(existing, incoming):
@@ -642,11 +671,16 @@ def merge_cover_sections(existing, incoming):
             f"D1 ids at two orders are not comparable"
         )
         return dict(b)
+    # Each side's blocks decode against ITS OWN declared pin; the composed
+    # object pins at the finer of the two, which is the only value every
+    # surviving block's order is still ≤ (§10.5's "always ≤ the object's").
+    pins = (_object_pin(a), _object_pin(b))
+    pinned = max(pins)
     shards: dict[str, dict] = {}
     for decimal in sorted(set(a.get("shards") or {}) | set(b.get("shards") or {})):
         sides = [
-            _decode_cover_block(decimal, side["shards"][decimal])
-            for side in (a, b)
+            _decode_cover_block(decimal, side["shards"][decimal], pin)
+            for side, pin in zip((a, b), pins, strict=True)
             if decimal in (side.get("shards") or {})
         ]
         if len(sides) == 1:
@@ -655,13 +689,13 @@ def merge_cover_sections(existing, incoming):
             order = min(o for _, o in sides)
             words = quantize_words(np.concatenate([w for w, _ in sides]), order)
         words, order = _cap_cover(words, order)
-        shards[decimal] = _encode_cover_block(words, order)
+        shards[decimal] = _encode_cover_block(words, order, pinned)
     return {
         "spec": COVER_SPEC,
         "source": b.get("source", a.get("source")),
         "generated_at": b.get("generated_at", a.get("generated_at")),
         "order": b.get("order", a.get("order")),
-        "temporal_order": TEMPORAL_DAY_ORDER,
+        "temporal_order": pinned,
         "cap": COVER_CAP,
         "fields": sorted(set(a.get("fields") or []) | set(b.get("fields") or [])),
         "element": {"dtype": "uint64", "shape": [-1]},
@@ -701,7 +735,17 @@ def _cover_content(section) -> tuple | None:
         for d, b in (section.get("shards") or {}).items()
         if isinstance(b, dict)
     }
-    return (shards, sorted(section.get("fields") or []), section.get("order"))
+    # The two pins are content, not provenance: a block's absent
+    # `temporal_order` means "the object's", so an object at another pin says
+    # something different with the same bytes, and a cap change is a producer
+    # policy change the next pass must re-express.
+    return (
+        shards,
+        sorted(section.get("fields") or []),
+        section.get("order"),
+        section.get("temporal_order"),
+        section.get("cap"),
+    )
 
 
 def _cover_usable(section) -> dict | None:
@@ -880,12 +924,17 @@ def cover_words(obj) -> dict[str, np.ndarray] | None:
     ``None`` when ``obj`` is not a readable cover. Each block's ``count`` is
     MUST-checked against its own buffer (§10.5) — the same rule
     :func:`coverage_toc_digest` applies to the digest block's ``centroids``.
+    A block that omits ``temporal_order`` decodes at the OBJECT's declared
+    pin (not this build's), and one declaring an order above that pin is
+    refused: §10.5's "always ≤ the object's ``temporal_order``".
     """
     section = load_cover(obj)
     if section is None:
         return None
+    pinned = _object_pin(section)
     return {
-        d: _decode_cover_block(d, block)[0] for d, block in (section.get("shards") or {}).items()
+        d: _decode_cover_block(d, block, pinned)[0]
+        for d, block in (section.get("shards") or {}).items()
     }
 
 
