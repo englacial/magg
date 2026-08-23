@@ -1002,25 +1002,45 @@ def cover_words(obj) -> dict[str, np.ndarray] | None:
     }
 
 
-def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int) -> list[str] | None:
-    """Shard ids whose envelope word intersects ``[q_start_ns, q_end_ns)``.
+def shards_overlapping(envelope, q_start_ns: int, q_end_ns: int, *, cover=None) -> list[str] | None:
+    """Shard ids whose temporal claim intersects ``[q_start_ns, q_end_ns)``.
 
-    The tier-1 pruning answer, on the grammar's own predicate
+    The pruning answer, on the grammar's own predicate
     (``mortie.toc_overlaps``): conservative — it never under-reports, and may
     over-report by up to one quantum at a window edge. ``None`` when the
     store carries no temporal section, which a caller MUST read as "no
     temporal information", never as "no shards".
+
+    ``cover`` upgrades the answer to the §10.5 word SET (issue #489): pass
+    the ``coverage.toc`` body (:func:`read_cover`'s return) and a shard the
+    cover lists is tested against its whole word set — so a window that
+    falls in a gap BETWEEN a shard's campaigns no longer selects it, which
+    is the entire point of the sibling. A shard the cover does not list
+    falls back to its tier-1 envelope word (the cover's absent-shard rule:
+    unknown stays a candidate), a shard only the cover lists is tested on
+    the cover alone (never under-report across the two maps' seam), and a
+    ``cover`` at an unknown revision degrades to tier 1 wholesale — exactly
+    ``cover=None`` — per §10.5's strict-gate-then-degrade rule. Widening is
+    the only cover direction (§10.5), so the upgraded answer is still
+    conservative against the true observations: over-report bounded by the
+    quantization bucket at a cluster edge, under-report never.
     """
     from mortie import toc_overlaps
 
     words = coverage_toc(envelope)
-    if words is None:
+    sets = cover_words(cover) if cover is not None else None
+    if words is None and sets is None:
         return None
-    keys = sorted(words)
-    if not keys:
-        return []
-    hit = toc_overlaps(np.asarray([words[k] for k in keys], dtype=np.uint64), q_start_ns, q_end_ns)
-    return [k for k, ok in zip(keys, np.atleast_1d(hit), strict=True) if bool(ok)]
+    words = words or {}
+    out = []
+    for key in sorted(words.keys() | (sets or {}).keys()):
+        if sets is not None and key in sets:
+            hit = bool(np.any(np.atleast_1d(toc_overlaps(sets[key], q_start_ns, q_end_ns))))
+        else:
+            hit = bool(toc_overlaps(words[key], q_start_ns, q_end_ns))
+        if hit:
+            out.append(key)
+    return out
 
 
 __all__ = [
