@@ -659,7 +659,9 @@ class TestQuantization:
         cover = quantize_words(time2toc(ts))
         assert len(cover) <= len(days)
 
-    def test_gaps_of_a_bucket_or_more_survive(self):
+    def test_days_far_from_any_pass_stay_uncovered(self):
+        # Named for what it checks: days at least 3 clear of any pass, i.e.
+        # well past the two-span floor the law above pins exactly.
         days, ts = self._instants()
         cover = quantize_words(time2toc(ts))
         far = [int(d) for d in range(2_700) if np.abs(days - d).min() >= 3][:60]
@@ -667,6 +669,28 @@ class TestQuantization:
         for d in far:
             q0, q1 = BASE_NS + d * DAY_NS, BASE_NS + (d + 1) * DAY_NS
             assert not np.any(toc_overlaps(cover, q0, q1))
+
+    @pytest.mark.parametrize(
+        ("frac", "spans", "survives"),
+        [
+            (0.9, 1.0, False),  # abutting buckets coalesce: one span never survives
+            (0.0, 1.0, False),
+            (0.0, 1.99, False),  # the [1, 2) band is alignment-decided, not length-decided
+            (0.5, 1.5, True),
+            (0.0, 2.0, True),  # two whole spans always leave a bucket free
+            (0.9, 2.0, True),
+        ],
+    )
+    def test_a_gap_survives_iff_it_holds_a_whole_aligned_bucket(self, frac, spans, survives):
+        # §10.5's only resolution promise, pinned as bytes in both directions:
+        # the guaranteed floor is TWO bucket spans (2 * 2^47 ns ~ 78 h), not one.
+        t0 = (BASE_NS // BUCKET_NS) * BUCKET_NS + int(frac * BUCKET_NS)
+        t1 = t0 + int(spans * BUCKET_NS)
+        cover = quantize_words(time2toc(np.array([t0, t1], dtype=np.uint64)))
+        assert (len(cover) == 2) is survives
+        # Either way the law never false-negatives on the instants themselves.
+        assert np.any(toc_overlaps(cover, t0, t0 + 1))
+        assert np.any(toc_overlaps(cover, t1, t1 + 1))
 
     def test_quantization_commutes_with_union(self):
         _days, ts = self._instants()

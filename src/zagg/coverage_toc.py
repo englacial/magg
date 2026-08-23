@@ -472,8 +472,14 @@ def quantize_words(words, order: int = TEMPORAL_DAY_ORDER) -> np.ndarray:
 
     **Widening only.** The output's coverage contains the input's — a cover
     may over-claim, never false-negative — and the never-bridge law holds at
-    bucket resolution: a real gap of at least one bucket survives exactly,
-    while a sub-bucket gap may close. The one clamp is the scale ceiling:
+    bucket resolution: **a gap survives iff it contains a whole ALIGNED
+    bucket.** Widening puts the instants either side of a gap into their own
+    buckets, and ``toc_normalize`` coalesces ranges that merely abut, so a
+    gap of one bucket span never survives (its two buckets abut) and only a
+    gap that leaves an entire bucket uncovered does. The guaranteed floor is
+    therefore TWO bucket spans — at the pinned day order, 2 × 2^47 ns ≈ 78 h
+    — with the ``[1, 2)``-span band decided by where the data falls on the
+    grid, not by the gap's length. The one clamp is the scale ceiling:
     the top bucket's end exceeds the grammar's maximum encodable end
     (``mortie.TOC_MAX_NS``), so it is clamped there — still containing every
     encodable input word, because no encoder-produced envelope reaches past
