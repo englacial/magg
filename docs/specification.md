@@ -2631,9 +2631,32 @@ re-capped — which may coarsen further, under the same widening law. A shard
 on one side carries over unchanged. The §10.4 succession rules apply
 verbatim at object level: an unknown-revision standing object is preserved
 and never downgraded (on the refresh's replace path too); an unmarked or
-unparsable one is debris a producer replaces; a producer whose read of any
-input behind a shard FAILED omits that shard (§10.2's whole-word rule); a
-producer with no temporal contribution leaves the standing object untouched.
+unparsable one is debris a producer replaces — "unparsable" including a
+standing object that is valid JSON but not a decodable cover (a block
+disagreeing with its own `count`, a corrupt `words` buffer, a non-object
+block), since the truth is in the leaves and this object is regenerable; a
+producer whose read of any input behind a shard FAILED omits that shard
+(§10.2's whole-word rule); a producer with no temporal contribution leaves
+the standing object untouched.
+
+`order` gates the union, exactly as it does for the carrier (§10.4): the
+`shards` keys are D1 ids at that order and ids at two orders are not
+comparable, so when the standing object's `order` differs from the incoming
+one's the standing object is incompatible debris and the incoming side
+REPLACES it wholesale rather than unioning. A re-shard therefore moves both
+objects together instead of leaving the sibling holding two orders' ids
+under one declared `order`.
+
+The sibling's life is tied to the carrier's. A producer that overwrites or
+DELETES `{store_root}/coverage.moc` wholesale — the refresh path, when no
+stamped leaf remains — SHOULD discard `{store_root}/coverage.toc` with it:
+the §10.1 `cover` marker lives in the carrier, so a surviving sibling is an
+orphan no reader discovers, and a later carrier at a different shape would
+find ids it cannot key. A reader that reaches the sibling anyway is still
+safe: an orphan only over-claims, and a cover shard absent from the carrier's
+map composes under the standing staleness posture — **unknown, a candidate,
+never authoritative**, exactly as a shard the cover does not list is unknown
+rather than empty.
 
 Conformance is §7's `temporal/` fixture again: it is the only fixture
 carrying a `coverage.toc`, written by the production sweep writer beside its
