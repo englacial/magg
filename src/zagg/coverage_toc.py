@@ -656,9 +656,18 @@ def cover_unchanged(existing, incoming) -> bool:
     The sibling object's half of the MOC family's skip-if-current test,
     built exactly as :func:`section_unchanged` is: on the MERGE's content
     (the per-shard blocks and the field list), never on the carrier fields
-    that churn per pass.
+    that churn per pass. A standing object the merge cannot decode answers
+    ``False`` — the write seam replaces it, so the test must not be the thing
+    that raises first.
     """
-    merged = merge_cover_sections(existing, incoming)
+    try:
+        merged = merge_cover_sections(existing, incoming)
+    except (KeyError, TypeError, ValueError):
+        # A standing object that is JSON but not a decodable cover cannot be
+        # "already current": the writer's own fail-open arm is about to
+        # replace it, so report the change rather than raise here (§10.5's
+        # regenerable-cache posture).
+        return False
     return _cover_content(merged) == _cover_content(
         existing if isinstance(existing, dict) else None
     )
@@ -703,7 +712,12 @@ def write_cover(store_root: str, section: dict | None, *, replace: bool = False,
     except a standing cover at an UNKNOWN revision, which §10.4's succession
     rule preserves on both paths (a producer never downgrades what it cannot
     read). An unparsable standing object is logged and overwritten, the
-    regenerable-cache posture. Returns what was left standing.
+    regenerable-cache posture — "unparsable" covering a standing object that
+    is valid JSON but not a decodable cover (a block disagreeing with its own
+    ``count``, a missing or corrupt ``words`` buffer, a non-object block) as
+    well as one that is not JSON at all: the truth is in the leaves, and this
+    writer runs inside the sweep's spatial rollup, which one corrupt byte in
+    an accelerator must not take down. Returns what was left standing.
 
     A ``None`` section — :func:`build_cover_section`'s empty-walk answer — is
     a no-op on BOTH arms: §10.5's "a producer with no temporal contribution
@@ -741,7 +755,14 @@ def write_cover(store_root: str, section: dict | None, *, replace: bool = False,
             )
         merged = preserved if preserved is not None else dict(section)
     else:
-        merged = merge_cover_sections(existing, section)
+        try:
+            merged = merge_cover_sections(existing, section)
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning(
+                f"existing {COVER_NAME} at {store_root} failed to parse ({e}); "
+                f"overwriting (regenerable cache — the sweep rebuilds authoritatively)"
+            )
+            merged = dict(section)
     if merged is None:
         return None
     obstore.put(store, COVER_NAME, json.dumps(merged, indent=1).encode())
