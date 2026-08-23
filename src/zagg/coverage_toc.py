@@ -693,7 +693,7 @@ def _cover_preserved(section) -> dict | None:
     return None
 
 
-def write_cover(store_root: str, section: dict, *, replace: bool = False, **store_kwargs):
+def write_cover(store_root: str, section: dict | None, *, replace: bool = False, **store_kwargs):
     """PUT the ``coverage.toc`` sibling, composing across the standing object.
 
     The default is the same GET-union-PUT seam ``coverage.moc`` rides
@@ -704,6 +704,12 @@ def write_cover(store_root: str, section: dict, *, replace: bool = False, **stor
     rule preserves on both paths (a producer never downgrades what it cannot
     read). An unparsable standing object is logged and overwritten, the
     regenerable-cache posture. Returns what was left standing.
+
+    A ``None`` section — :func:`build_cover_section`'s empty-walk answer — is
+    a no-op on BOTH arms: §10.5's "a producer with no temporal contribution
+    leaves the standing object untouched", so the refresh escape hatch over a
+    store with no temporal channel writes nothing rather than clobbering (or
+    crashing on ``dict(None)``).
     """
     import json
 
@@ -720,6 +726,12 @@ def write_cover(store_root: str, section: dict, *, replace: bool = False, **stor
             f"(regenerable cache — the sweep is the authoritative rebuilder)"
         )
         existing = None
+    if section is None:
+        # Nothing to say. The default arm reaches the same answer through
+        # `merge_cover_sections(existing, None)`; short-circuiting keeps the
+        # two arms in agreement and skips a PUT that would only rewrite the
+        # standing bytes with themselves.
+        return existing if isinstance(existing, dict) else None
     if replace:
         preserved = _cover_preserved(existing)
         if preserved is not None:
