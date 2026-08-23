@@ -875,6 +875,41 @@ class TestCoverObject:
         write_cover(root, b)
         assert set(read_cover(root)["shards"]) == {"11210"}
 
+    @pytest.mark.parametrize("damage", ["count", "no-words", "bad-words", "not-an-object"])
+    def test_a_corrupt_standing_cover_is_replaced(self, tmp_path, caplog, damage):
+        # JSON-valid but not a decodable cover. The regenerable-cache posture
+        # is the same as for garbage bytes: log and overwrite, never take the
+        # sweep's spatial rollup down with an accelerator (§10.5).
+        root = str(tmp_path)
+        standing = build_cover_section(_contributions([1]), ["h"], 4)
+        (decimal,) = standing["shards"]
+        if damage == "count":
+            standing["shards"][decimal]["count"] += 1
+        elif damage == "no-words":
+            del standing["shards"][decimal]["words"]
+        elif damage == "bad-words":
+            standing["shards"][decimal]["words"] = "junk"
+        else:
+            standing["shards"][decimal] = "junk"
+        (tmp_path / COVER_NAME).write_text(json.dumps(standing))
+        incoming = build_cover_section({"11219": [_leaf(4)]}, ["h"], 4)
+        # The skip-if-current test runs BEFORE the writer, so it must fail
+        # open too rather than raise on the way in.
+        assert not cover_unchanged(read_cover(root), incoming)
+        with caplog.at_level("WARNING"):
+            write_cover(root, incoming)
+        assert "failed to parse" in caplog.text
+        assert set(read_cover(root)["shards"]) == {"11219"}
+
+    def test_the_read_accessor_stays_loud_on_a_corrupt_block(self):
+        # Fail-open is the WRITE seam's posture only: a reader handed a block
+        # that disagrees with its own buffer still gets the §10.5 MUST-check.
+        section = build_cover_section(_contributions([1]), ["h"], 4)
+        (decimal,) = section["shards"]
+        del section["shards"][decimal]["words"]
+        with pytest.raises(KeyError):
+            cover_words(section)
+
     def test_absent_reads_none(self, tmp_path):
         assert read_cover(str(tmp_path)) is None
         assert load_cover(None) is None
