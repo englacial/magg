@@ -677,6 +677,226 @@ def _strata_leaf_cfg():
     )
 
 
+class TestLeafFoldHalfPair:
+    """``_fold_node``'s packed arm when ONE leaf of an output cell is half-paired.
+
+    The leaf fold's counterpart to ``_merge_slabs``' skew: at a geometry where
+    several leaves land in ONE output cell (``target_order < shard_order``), a
+    leaf carrying the divisor digest but not the word would leave the cell's
+    ``N_signal`` counting rows the published word never covered. The whole cell
+    stays at the fill word instead, and the digest is untouched.
+    """
+
+    SHARD_ORDER, CELL_ORDER, K = 3, 4, 1
+
+    def _leaf(self, root, dec, per_cell):
+        import zarr
+        from mortie import generate_morton_children
+
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.grids.morton import morton_word
+        from zagg.hive import shard_leaf_path, stamp_commit
+        from zagg.store import open_store
+
+        grid = HealpixGrid(self.SHARD_ORDER, self.CELL_ORDER, config=_strata_leaf_cfg())
+        word = morton_word(dec)
+        store = open_store(shard_leaf_path(str(root), word))
+        grid.emit_shard_template(store, overwrite=True)
+        group = zarr.open_group(store, path=str(self.CELL_ORDER), mode="r+", zarr_format=3)
+        n = 4 ** (self.CELL_ORDER - self.SHARD_ORDER)
+        assert len(per_cell) == n
+        group["morton"][:] = np.asarray(
+            generate_morton_children(word, self.CELL_ORDER), dtype=np.uint64
+        )
+        group["count"][:] = np.array(
+            [c["n_signal"] + c["n_noise"] for c in per_cell], dtype=np.int32
+        )
+        for field, key in (("h_sig", "sig"), ("h_noise", "noise")):
+            slab = np.full(n, b"", dtype=object)
+            for i, c in enumerate(per_cell):
+                slab[i] = c[key]
+            group[field][:] = slab
+        group["composition"][:] = np.array([c["word"] for c in per_cell], dtype=np.uint64)
+        stamp_commit(store, cells_with_data=n, granule_count=1)
+        return f"{shard_leaf_path(str(root), word)}/{self.CELL_ORDER}"
+
+    def _fold(self, root):
+        from zagg.sweep_overview import _fold_node
+
+        fields = {
+            "count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0},
+            **_STRATA_FIELDS,
+        }
+        counts = {"failed": 0}
+        result = _fold_node(
+            str(root),
+            "-31",
+            self.K,
+            [None],
+            ["-3111", "-3112"],
+            fields,
+            self.CELL_ORDER,
+            self.SHARD_ORDER,
+            counts,
+            {},
+        )
+        return result["slabs"], counts
+
+    @staticmethod
+    def _weight(slab, j):
+        from zagg.sweep_overview import decode_digest
+
+        payload = slab[j]
+        if payload is None or not len(payload):
+            return 0
+        return int(decode_digest(bytes(payload), "float32", (2,))[:, 1].sum())
+
+    def test_a_half_paired_leaf_poisons_its_output_cells(self, tmp_path):
+        import shutil
+
+        from zagg.stats.composition import merge_composition_kway
+
+        a, _ = _strata_cells(k=4, n=40, seed=620)
+        b, _ = _strata_cells(k=4, n=40, seed=621)
+        self._leaf(tmp_path, "-3111", a)
+        path_b = self._leaf(tmp_path, "-3112", b)
+
+        # Both leaves land in output cell 0 (target order 2 < shard order 3),
+        # so the cell has two contributors — the geometry where a per-field
+        # skip can mix.
+        slabs, counts = self._fold(tmp_path)
+        assert counts["failed"] == 0
+        expected = merge_composition_kway(
+            [(c["word"], c["n_signal"]) for c in (*a, *b) if c["n_signal"] > 0]
+        )
+        assert int(slabs["composition"][0]) == expected
+        pooled = self._weight(slabs["h_sig"], 0)
+        assert pooled == sum(c["n_signal"] for c in (*a, *b))
+
+        # Drop ONE leaf's word: its divisor digest still folds into the same
+        # cell, so publishing the sibling's word alone would be a fraction over
+        # a denominator it never covered.
+        shutil.rmtree(f"{path_b}/composition")
+        slabs, counts = self._fold(tmp_path)
+        assert counts["failed"] == 0
+        assert int(slabs["composition"][0]) == 0, "the covered cell keeps the fill word"
+        assert self._weight(slabs["h_sig"], 0) == pooled, "the divisor still folds both"
+
+
+class TestStageMergeHalfPair:
+    """``_merge_slabs``' packed arm when a contributor carries half the pair.
+
+    The stage site's own behavior, which no other fold site has: the word and
+    its ``of`` divisor are DIFFERENT declared fields folded by different loops,
+    so skipping a half-paired contributor for the word alone would publish a
+    word whose lanes are over a strict subset of the level's ``N_signal``
+    (review finding: a ~29% skew). The covered output cells stay at the fill
+    word instead — absence over wrongness — and the contributor counts
+    unreadable.
+    """
+
+    NODE_ORDER, CELL_ORDER, RES = 3, 5, 4
+
+    def _write_column(self, root, dec, per_cell):
+        from zagg.column import column_name, fold_column, write_column
+        from zagg.grids.morton import morton_word
+        from zagg.sweep import _node_rel
+
+        slabs = {
+            "h_sig": np.array([c["sig"] for c in per_cell], dtype=object),
+            "h_noise": np.array([c["noise"] for c in per_cell], dtype=object),
+            "composition": np.array([c["word"] for c in per_cell], dtype=np.uint64),
+        }
+        folded = fold_column(
+            slabs,
+            _STRATA_FIELDS,
+            cell_order=self.CELL_ORDER,
+            resolutions=[self.RES, self.NODE_ORDER],
+        )
+        write_column(
+            str(root),
+            morton_word(dec),
+            folded,
+            _STRATA_FIELDS,
+            node_order=self.NODE_ORDER,
+            cell_order=self.CELL_ORDER,
+            granule_count=1,
+        )
+        return f"{root}/{_node_rel(dec)}/{column_name(None)}"
+
+    def _reader(self, path):
+        from zagg.hive import _utcnow
+        from zagg.sweep_stage import _ColumnReader
+
+        return _ColumnReader(path, run_id="A", run_started=_utcnow(), store_kwargs={})
+
+    def _merge(self, paths):
+        from zagg.sweep_stage import _merge_slabs
+
+        rows = [[self._reader(p)] for p in paths]
+        # One output cell over BOTH children: factor 8 == the two children's
+        # four source cells each, which is where a half-pair can mix.
+        return _merge_slabs(
+            rows,
+            _STRATA_FIELDS,
+            res_src=self.RES,
+            src_per_child=4,
+            factor=8,
+            n_out=1,
+        )
+
+    @staticmethod
+    def _weight(slab, j):
+        from zagg.sweep_overview import decode_digest
+
+        payload = slab[j]
+        if payload is None or not len(payload):
+            return 0
+        return int(decode_digest(bytes(payload), "float32", (2,))[:, 1].sum())
+
+    def test_a_half_paired_contributor_poisons_its_output_cells(self, tmp_path):
+        import shutil
+
+        import zarr
+
+        from zagg.stats.composition import merge_composition_kway
+        from zagg.store import open_store
+        from zagg.sweep_overview import decode_digest
+
+        a, _ = _strata_cells(k=16, n=40, seed=610)
+        b, _ = _strata_cells(k=16, n=40, seed=611)
+        paths = [self._write_column(tmp_path, "1111", a), self._write_column(tmp_path, "1112", b)]
+
+        # The control: both pairs whole, the word is the k-way merge of every
+        # source cell's (word, n) and the cell counts as folded.
+        slabs, folded, missing, unreadable = self._merge(paths)
+        expected = []
+        for path in paths:
+            group = zarr.open_group(
+                open_store(path, read_only=True), path=str(self.RES), mode="r", zarr_format=3
+            )
+            words, sig = group["composition"][:], group["h_sig"][:]
+            expected += [
+                (int(words[i]), n)
+                for i in range(len(words))
+                if (n := int(decode_digest(bytes(sig[i] or b""), "float32", (2,))[:, 1].sum())) > 0
+            ]
+        assert int(slabs["composition"][0]) == merge_composition_kway(expected)
+        assert (folded, missing, unreadable) == (2, 0, 0)
+        pooled = self._weight(slabs["h_sig"], 0)
+        assert pooled == sum(n for _w, n in expected)
+
+        # Now child 1112 loses its word but keeps the divisor digest (schema
+        # evolution on ONE half). The digest loop folds it either way, so the
+        # level's N_signal is unchanged — which is exactly why the word may
+        # not be published over the surviving subset.
+        shutil.rmtree(f"{paths[1]}/{self.RES}/composition")
+        slabs, folded, missing, unreadable = self._merge(paths)
+        assert (folded, missing, unreadable) == (1, 0, 1)
+        assert int(slabs["composition"][0]) == 0, "the covered cell keeps the fill word"
+        assert self._weight(slabs["h_sig"], 0) == pooled, "the divisor still folds both"
+
+
 class TestEndToEndStrataPyramid:
     """Phase 4: template → build → overview fold on a synthetic strata store.
 
