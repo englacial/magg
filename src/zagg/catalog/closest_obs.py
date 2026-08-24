@@ -314,9 +314,11 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
     ----------
     epochs : array-like of datetime64[ns]
         One shard's reference epochs (:func:`reference_epochs`). Any order.
+        ``NaT`` refuses — see the note below.
     times : array-like of datetime64[ns]
         The shard's acquisition times, in catalog record order. Any order —
-        the returned selection indexes THIS array's positions.
+        the returned selection indexes THIS array's positions. ``NaT``
+        refuses — see the note below.
     max_time_offset : np.timedelta64 or int, optional
         An epoch whose nearest acquisition lies further than this selects
         nothing. Exactly-at selects; one ns past does not. A bare int means
@@ -339,6 +341,17 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
         distance, not just the fact of the drop); ``NaT`` only when
         ``times`` is empty.
 
+    Raises
+    ------
+    ValueError
+        If either input carries ``NaT``. A missing instant has no nearest
+        anything: ``NaT`` sorts last but casts to ``iinfo(int64).min``, so it
+        would leave ``ts`` unsorted (silently mis-pairing its neighbours) and
+        wrap the offset subtraction. :func:`reference_epochs` never emits
+        ``NaT`` and the catalog's time parser refuses a missing acquisition
+        time, so ``NaT`` here is caller debris — refused loudly, this
+        module's posture.
+
     Notes
     -----
     A tie — an epoch exactly equidistant between two acquisitions — selects
@@ -349,6 +362,9 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
     """
     epochs = np.asarray(epochs, dtype="datetime64[ns]")
     times = np.asarray(times, dtype="datetime64[ns]")
+    for name, arr in (("epochs", epochs), ("times", times)):
+        if np.isnat(arr).any():
+            raise ValueError(f"{name} carries NaT ({int(np.isnat(arr).sum())} of {arr.size})")
     cap = None
     if max_time_offset is not None:
         cap = int(np.timedelta64(max_time_offset).astype("timedelta64[ns]").astype("int64"))

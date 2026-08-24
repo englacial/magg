@@ -440,6 +440,16 @@ class TestNearestAcquisitions:
             else:
                 assert sel[k] == -1
 
+    def test_a_nat_acquisition_time_refuses(self):
+        times = np.array(["2025-06-01T00", "NaT", "2025-06-01T10"], dtype="datetime64[ns]")
+        with pytest.raises(ValueError, match="times carries NaT"):
+            nearest_acquisitions(self._dt(1, 9), times)
+
+    def test_a_nat_epoch_refuses(self):
+        epochs = np.array(["2025-06-01T01", "NaT"], dtype="datetime64[ns]")
+        with pytest.raises(ValueError, match="epochs carries NaT"):
+            nearest_acquisitions(epochs, self._dt(0, 10))
+
     def test_matches_a_brute_force_oracle(self):
         rng = np.random.default_rng(7)
         base = np.datetime64("2025-01-01").astype("datetime64[ns]").astype("int64")
