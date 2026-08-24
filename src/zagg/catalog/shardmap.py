@@ -208,13 +208,17 @@ def _collision_label(entry: dict) -> str:
     The href when there is one — the prefix is what differs and what the remedy
     acts on. A raster pair has no href and both members carry the same id (that
     IS the collapse), so the datetime is the only thing left that separates them.
+
+    The unidentified entries :func:`_basename_collision_message` warns about carry
+    none of the three, and ``str(None)`` names nothing — say so instead.
     """
     href = entry.get("s3") or entry.get("https")
     if href:
         return str(href)
     if entry.get("id") and entry.get("datetime"):
         return f"{entry['id']} @ {entry['datetime']}"
-    return str(entry.get("id") or entry.get("datetime"))
+    named = entry.get("id") or entry.get("datetime")
+    return str(named) if named else "<entry with no id, href, or datetime>"
 
 
 def _refuse_basename_collisions(shard_keys, granules) -> None:

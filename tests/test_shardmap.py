@@ -2753,7 +2753,13 @@ class TestBasenameCollisions:
             )
         # One warning carrying the count, not one warning per entry.
         assert len(record) == 1
-        assert "2 shard entry(s)" in str(record[0].message)
+        message = str(record[0].message)
+        assert "2 shard entry(s)" in message
+        # The pointer must name the entry it points at: the all-None shape has
+        # nothing to label, and ``str(None)`` pointed the operator at 'None'
+        # (PR #482 review).
+        assert "'None'" not in message
+        assert "<entry with no id, href, or datetime>" in message
 
     def _colliding_fine_map(self, catalog, fine_grid):
         """A fine map whose two sibling shards each hold one of a colliding
