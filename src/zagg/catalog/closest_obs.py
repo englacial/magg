@@ -121,6 +121,23 @@ def _aoi_shard_set(aoi, order: int) -> set[int] | None:
     return {int(c) for c in mortie.moc_to_order(moc, order)}
 
 
+def _shard_order(cover: dict, root: str) -> int:
+    """A cover object's declared shard (dispatch) ``order``, or a loud refusal.
+
+    §10.5 makes ``order`` mandatory; a body missing it (or carrying a
+    non-integer) is debris this builder cannot key shards from, and the bare
+    ``int(...)`` it used to get raised an opaque ``TypeError`` naming nothing.
+    """
+    value = cover.get("order")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"reference_epochs: store {root!r} declares a non-integer cover shard order "
+            f"{value!r} — §10.5 requires it, and shard keys are parsed against it"
+        ) from e
+
+
 @dataclass
 class ReferenceEpochs:
     """Per-shard reference epochs decoded from one or more store covers.
@@ -138,16 +155,29 @@ class ReferenceEpochs:
         are omitted (they claim nothing).
     stores : list of str
         The store roots that contributed, in the order given (provenance).
+    orders : dict of int -> int
+        Shard key -> the **coarsest** temporal order that contributed to that
+        shard's epochs. Normally the pinned
+        :data:`~zagg.coverage_toc.TEMPORAL_COVER_ORDER`, but §10.5 lets a
+        block coarsen below the pin to fit the cover cap, and a coarser order
+        means a wider midpoint bound (``2**(62 - order)`` ns). Phase 2's
+        ``max_time_offset`` reasoning reads this rather than assuming the pin.
     """
 
     order: int
     epochs: dict[int, np.ndarray]
     stores: list[str] = field(default_factory=list)
+    orders: dict[int, int] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
         """Total epoch count across shards (post-union, post-dedupe)."""
         return sum(e.size for e in self.epochs.values())
+
+    def tolerance(self, shard: int) -> np.timedelta64:
+        """Half a bucket at ``shard``'s effective order — its epoch bound."""
+        order = self.orders.get(shard, TEMPORAL_COVER_ORDER)
+        return np.timedelta64(2 ** (62 - int(order)), "ns")
 
 
 def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> ReferenceEpochs:
@@ -169,6 +199,15 @@ def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> Reference
     midpoints. Expanding to buckets first removes that degree of freedom:
     the bucket grid is fixed by the order alone, so a shared pass contributes
     the same bucket midpoint from every store and dedupes exactly.
+
+    §10.5 lets a block coarsen **below** the object's pinned temporal order to
+    fit the cover cap, and its landed order is recorded in the block itself.
+    :func:`zagg.coverage_toc.cover_words` returns only the words, so this
+    reads each block's ``temporal_order`` straight from the grammar, expands
+    that block's words at **its** order, logs a warning whenever a
+    block sits below the pin (the read half of §10.5's "widening only,
+    *loudly recorded*"), and reports the coarsest contributing order per
+    shard on :attr:`ReferenceEpochs.orders`.
 
     A store that carries **no readable cover refuses loudly** — this builder
     is cover-driven by design (store-derived epochs, never the granule
@@ -200,7 +239,8 @@ def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> Reference
         raise ValueError("reference_epochs: at least one reference store root is required")
 
     order: int | None = None
-    words_by_shard: dict[int, list[np.ndarray]] = {}
+    mids_by_shard: dict[int, list[np.ndarray]] = {}
+    orders: dict[int, int] = {}
     for root in reference_stores:
         obj = read_cover(root, **store_kwargs)
         cover = load_cover(obj)
@@ -215,7 +255,7 @@ def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> Reference
                 f"(spec §10.5, issue #509); run the rollup sweep that materializes the "
                 f"cover before pairing against this store"
             )
-        store_order = int(cover.get("order"))
+        store_order = _shard_order(cover, root)
         if order is None:
             order = store_order
         elif store_order != order:
@@ -224,26 +264,42 @@ def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> Reference
                 f"previous stores cover order {order} — D1 ids at two orders are not "
                 f"comparable (spec §10.5)"
             )
-        for decimal, words in cover_words(obj).items():
-            if len(words):
-                # Cover blocks are keyed by the D1 decimal id (the external
-                # string form, sign included); shard maps key on the packed
-                # morton word — parse at the boundary (issue #199).
-                words_by_shard.setdefault(morton_word(decimal), []).append(
-                    np.asarray(words, dtype=np.uint64)
+        # cover_words strict-decodes (and validates the object's pin); the
+        # per-block order it drops is read back off the same grammar.
+        decoded = cover_words(obj)
+        pinned = int(cover.get("temporal_order", TEMPORAL_COVER_ORDER))
+        blocks = cover.get("shards") or {}
+        for decimal, words in decoded.items():
+            if not len(words):
+                continue
+            block = blocks.get(decimal) or {}
+            effective = int(block.get("temporal_order", pinned))
+            if effective < TEMPORAL_COVER_ORDER:
+                logger.warning(
+                    f"reference_epochs: store {root!r} shard {decimal} cover sits at "
+                    f"temporal order {effective}, below the pinned {TEMPORAL_COVER_ORDER} "
+                    f"(§10.5 cap coarsening) — its buckets span 2^{63 - effective} ns, so "
+                    f"these epochs are good to ±2^{62 - effective} ns, not ±4.9 h"
                 )
+            # Cover blocks are keyed by the D1 decimal id (the external
+            # string form, sign included); shard maps key on the packed
+            # morton word — parse at the boundary (issue #199).
+            shard = morton_word(decimal)
+            mids_by_shard.setdefault(shard, []).append(_word_midpoints(words, effective))
+            orders[shard] = min(orders.get(shard, effective), effective)
 
     assert order is not None  # non-empty store list, every cover carried an order
     keep = _aoi_shard_set(aoi, order)
     epochs: dict[int, np.ndarray] = {}
-    for shard in sorted(words_by_shard):
+    for shard in sorted(mids_by_shard):
         if keep is not None and shard not in keep:
             continue
-        words = np.unique(np.concatenate(words_by_shard[shard]))
-        mids = np.unique(_word_midpoints(words))
+        mids = np.unique(np.concatenate(mids_by_shard[shard]))
         if mids.size:
             epochs[shard] = mids
-    return ReferenceEpochs(order, epochs, reference_stores)
+    return ReferenceEpochs(
+        order, epochs, reference_stores, {k: v for k, v in orders.items() if k in epochs}
+    )
 
 
 __all__ = ["ReferenceEpochs", "reference_epochs"]

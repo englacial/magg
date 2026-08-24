@@ -13,10 +13,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from mortie import time2toc, to_datetime64
+from mortie import from_datetime64, time2toc, to_datetime64
 
 from zagg.catalog.closest_obs import ReferenceEpochs, _word_midpoints, reference_epochs
 from zagg.coverage_toc import (
+    COVER_CAP,
     COVER_NAME,
     TEMPORAL_COVER_ORDER,
     build_cover_section,
@@ -209,6 +210,16 @@ class TestReferenceEpochs:
         with pytest.raises(ValueError, match="not.*comparable|shard order"):
             reference_epochs([a, b])
 
+    def test_a_cover_without_a_shard_order_refuses_by_name(self, tmp_path):
+        """A missing ``order`` used to surface as an opaque ``TypeError``."""
+        root = tmp_path / "orderless"
+        root.mkdir()
+        (root / COVER_NAME).write_text(
+            json.dumps({"spec": "zagg-coverage-toc-cover/1", "shards": {}})
+        )
+        with pytest.raises(ValueError, match="non-integer cover shard order"):
+            reference_epochs(str(root))
+
     def test_no_stores_refuses(self):
         with pytest.raises(ValueError, match="at least one"):
             reference_epochs([])
@@ -237,6 +248,56 @@ class TestReferenceEpochs:
         path = tmp_path / "aoi.geojson"
         path.write_text(json.dumps(geojson))
         assert set(reference_epochs(root, aoi=str(path)).epochs) == {SHARD_KEY}
+
+
+class TestCoarsenedBlock:
+    """§10.5 lets a block coarsen below the pin — the read half must be loud."""
+
+    #: Enough single-bucket claims (2 buckets apart, so no gap coalesces) to
+    #: blow the 512-word cap and force ``_cap_cover`` down an order.
+    COARSE_INSTANTS = np.array(
+        [BASE_NS + i * 2 * BUCKET_NS for i in range(COVER_CAP + 88)], dtype=np.uint64
+    )
+
+    def _root(self, tmp_path):
+        return _write_store(tmp_path, {SHARD: self.COARSE_INSTANTS})
+
+    def test_the_block_really_coarsened(self, tmp_path):
+        root = self._root(tmp_path)
+        block = read_cover(root)["shards"][SHARD]
+        assert block["temporal_order"] < TEMPORAL_COVER_ORDER
+
+    def test_a_coarsened_block_warns_and_reports_its_order(self, tmp_path, caplog):
+        root = self._root(tmp_path)
+        landed = read_cover(root)["shards"][SHARD]["temporal_order"]
+        with caplog.at_level("WARNING", logger="zagg.catalog.closest_obs"):
+            out = reference_epochs(root)
+        assert f"temporal order {landed}" in caplog.text
+        assert "below the pinned" in caplog.text
+        assert out.orders == {SHARD_KEY: landed}
+        assert out.tolerance(SHARD_KEY) == np.timedelta64(2 ** (62 - landed), "ns")
+
+    def test_the_epochs_are_the_coarse_buckets_midpoints(self, tmp_path):
+        root = self._root(tmp_path)
+        landed = read_cover(root)["shards"][SHARD]["temporal_order"]
+        k = 63 - landed
+        internal = np.asarray(from_datetime64(reference_epochs(root).epochs[SHARD_KEY]), np.uint64)
+        # Every epoch sits at an aligned coarse-bucket midpoint, and at the
+        # coarse grid's buckets — not the pinned order's.
+        assert set(int(t) % 2**k for t in internal) == {2 ** (k - 1) - 1}
+        covered = {int(t) >> k for t in self.COARSE_INSTANTS}
+        assert set(int(t) >> k for t in internal) == covered
+        assert _nearest_gap(
+            reference_epochs(root).epochs[SHARD_KEY], _utc(self.COARSE_INSTANTS)
+        ) <= np.timedelta64(2 ** (k - 1), "ns")
+
+    def test_an_uncoarsened_block_neither_warns_nor_hides_its_order(self, tmp_path, caplog):
+        root = _write_store(tmp_path, {SHARD: _instants(0, 5)})
+        with caplog.at_level("WARNING", logger="zagg.catalog.closest_obs"):
+            out = reference_epochs(root)
+        assert "below the pinned" not in caplog.text
+        assert out.orders == {SHARD_KEY: TEMPORAL_COVER_ORDER}
+        assert out.tolerance(SHARD_KEY) == HALF_BUCKET
 
 
 class TestGoldenFixture:
