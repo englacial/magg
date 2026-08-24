@@ -20,7 +20,11 @@ REPO_ROOT = Path(__file__).parent.parent
 LAMBDA_UNZIPPED_LIMIT = 250 * 1024 * 1024  # 250MB combined (layer + function)
 
 # Budget allocation — layer gets most of the space, function code should be small
-FUNCTION_SIZE_BUDGET = 30 * 1024 * 1024  # 30MB for function code
+# 32MB function-code budget (espg ruling 2026-08-24, PR #511 question 1): AWS's
+# hard limit for direct-upload zips is 50MB, so this is an early-warning
+# tripwire, not the platform cap — 30MB left ~19KB of headroom on main and any
+# source addition tripped it. Mirrored in deployment/aws/build_function.sh.
+FUNCTION_SIZE_BUDGET = 32 * 1024 * 1024
 
 
 class TestLambdaImports:
