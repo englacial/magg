@@ -2312,8 +2312,16 @@ def _field_provenance(meta: dict) -> dict:
     Exact fields also carry :data:`EXACT_NAN_POLICY`, so a reader of the
     overview knows the reduction it actually got — nan-skipping, never
     NaN-propagating (review finding, issue #201).
+
+    A manifest entry with no ``method`` defaults by CLASS, not to the digest
+    law: :func:`zagg.pyramid.declared_fields` always writes one, but this
+    consumes a manifest, and manifests outlive their writer and may come from
+    an external one (spec §4.5). Stamping ``tdigest_kway`` on a ``packed``
+    entry would have the overview's own provenance claim a t-digest law over
+    a dense composition word (review finding, issue #515).
     """
-    entry = {"class": meta["class"], "method": meta.get("method", TDIGEST_LAW)}
+    default = COMPOSITION_LAW if meta["class"] == "packed" else TDIGEST_LAW
+    entry = {"class": meta["class"], "method": meta.get("method", default)}
     if meta["class"] == "exact":
         entry["nan_policy"] = EXACT_NAN_POLICY
     return entry
