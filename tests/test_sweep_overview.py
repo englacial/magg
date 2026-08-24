@@ -717,6 +717,105 @@ class TestWeightsGate:
         check_weights_match(dict(group["counts_d"].attrs), fields["counts_d"], "counts_d")
 
 
+class TestWaveformPyramidDeclaration:
+    """Template-time classification for the waveform digest (issue #508).
+
+    The SERC probe shape: ``gedi01b_waveform_healpix_hive`` + ``output.pyramid
+    = {}`` + ``rx_flux.overview_delta = 512`` under the probe's uniform-δ4096
+    override (the packaged template ships δ8192). Classification runs
+    worker-side at template time, so this IS the deployed surface the 0.50
+    fleet re-runs the probe against.
+    """
+
+    def _probe_cfg(self):
+        from zagg.config import default_config
+
+        cfg = default_config("gedi01b_waveform_healpix_hive")
+        cfg.output["pyramid"] = {}
+        rx = cfg.aggregation["variables"]["rx_flux"]
+        rx["overview_delta"] = 512
+        rx["params"]["delta"] = 4096  # the probe's uniform-δ override
+        return cfg
+
+    def test_probe_config_declares_the_ladder(self, caplog):
+        from zagg.pyramid import declared_fields
+
+        fields, excluded = declared_fields(self._probe_cfg())
+        # The exact manifest entry the 0.49 probe SHOULD have produced instead
+        # of {"class": "none"} — delta as the test config declares it (#424
+        # records the split budget resolved), companion shape included.
+        assert fields["rx_flux"] == {
+            "class": "approximate",
+            "method": "tdigest_kway",
+            "dtype": "float32",
+            "inner_shape": [2],
+            "delta": 4096,
+            "overview_delta": 512,
+            "temporal": "per-centroid",
+        }
+        assert "rx_flux" not in excluded
+        assert fields["count"]["class"] == "exact"
+        # The per-record companions keep the ruled option-A absence: scalar
+        # reducers without an exact law declare class only, at native
+        # resolution only (issue #201).
+        for name in (
+            "shot_count",
+            "shot_number",
+            "noise_mean",
+            "noise_stddev",
+            "rx_energy",
+            "elevation_bin0",
+            "elevation_lastbin",
+        ):
+            assert fields[name] == {"class": "none"}
+            assert name in excluded
+
+    def test_manifest_block_covers_every_level(self):
+        # pyramid = {} on the gedi grid (9 -> chunk 12 -> 18) takes the ruled
+        # /2 default: the leaf entry plus the fixed ladder to 0, ONE fields map
+        # covering every level — rx_flux is declared at each of them.
+        from zagg.sweep_overview import build_pyramid_block
+
+        block = build_pyramid_block(self._probe_cfg(), 9, 12)
+        assert block["spec"] == "zagg-pyramid/2"
+        assert [e["node"] for e in block["overviews"]] == list(range(9, -1, -1))
+        assert block["overviews"][0]["cells"] == [12]
+        assert block["overview"]["fields"]["rx_flux"]["class"] == "approximate"
+
+    def test_overview_template_emits_the_times_sibling(self, tmp_path):
+        # The companion path at overview levels (issue #410, per-centroid at
+        # EVERY level): the manifest entry is the only description the
+        # overview writer has, and _overview_config must turn its temporal key
+        # into the ``rx_flux_times`` sibling + §8.3 declaration, exactly as a
+        # leaf template does.
+        from zagg.column import composable_fields
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.pyramid import declared_fields
+        from zagg.sweep_overview import _overview_config
+        from zagg.time_axis import temporal_declaration
+
+        fields, _ = declared_fields(self._probe_cfg())
+        # The production writers template only the composable classes (the
+        # sweep filters before _fold_node; the column fold filters in
+        # leaf_column_plan) — the class-none companions never reach the
+        # template, which is what the last assertion pins.
+        grid = HealpixGrid(2, 4, config=_overview_config(composable_fields(fields)), sharded=True)
+        grid.emit_shard_template(open_store(str(tmp_path / "ov.zarr")), overwrite=True)
+        group = zarr.open_group(
+            open_store(str(tmp_path / "ov.zarr")), path="4", mode="r", zarr_format=3
+        )
+        assert "rx_flux_times" in group
+        assert temporal_declaration(dict(group["rx_flux_times"].attrs)) == {
+            "spec": "zagg-toc/1",
+            "shape": "per-centroid",
+            "grammar": "mortie-toc/1",
+        }
+        # The payload binds the sibling by name (§1.2).
+        assert dict(group["rx_flux"].attrs)["times"] == "rx_flux_times"
+        # And the excluded per-record companions are absent from the template.
+        assert "shot_number" not in group
+
+
 class TestPyramidBlock:
     """The manifest declaration (Phase C): template time + config grammar."""
 
