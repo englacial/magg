@@ -955,6 +955,40 @@ class TestStageMergeHalfPair:
         assert int(slabs["composition"][0]) == 0, "the covered cell keeps the fill word"
         assert self._weight(slabs["h_sig"], 0) == pooled, "the divisor still folds both"
 
+    def test_a_contributor_missing_the_divisor_drops_without_poisoning(self, tmp_path):
+        import shutil
+
+        import zarr
+
+        from zagg.stats.composition import merge_composition_kway
+        from zagg.store import open_store
+        from zagg.sweep_overview import decode_digest
+
+        a, _ = _strata_cells(k=16, n=40, seed=610)
+        b, _ = _strata_cells(k=16, n=40, seed=611)
+        paths = [self._write_column(tmp_path, "1111", a), self._write_column(tmp_path, "1112", b)]
+
+        # The REVERSE direction: child 1112 keeps its word but loses the ``of``
+        # digest. The digest loop above reads that same array for ``h_sig``
+        # itself and drops the child too, so the level's N_signal is 1111's
+        # alone and 1111's word describes exactly those rows — consistent, so
+        # nothing is poisoned and the shared cell keeps the surviving word.
+        # Still counted unreadable: the level did fold short.
+        shutil.rmtree(f"{paths[1]}/{self.RES}/h_sig")
+        slabs, folded, missing, unreadable = self._merge(paths)
+        assert (folded, missing, unreadable) == (1, 0, 1)
+        group = zarr.open_group(
+            open_store(paths[0], read_only=True), path=str(self.RES), mode="r", zarr_format=3
+        )
+        words, sig = group["composition"][:], group["h_sig"][:]
+        survivors = [
+            (int(words[i]), n)
+            for i in range(len(words))
+            if (n := int(decode_digest(bytes(sig[i] or b""), "float32", (2,))[:, 1].sum())) > 0
+        ]
+        assert int(slabs["composition"][0]) == merge_composition_kway(survivors)
+        assert self._weight(slabs["h_sig"], 0) == sum(n for _w, n in survivors)
+
 
 class TestEndToEndStrataPyramid:
     """Phase 4: template → build → overview fold on a synthetic strata store.
