@@ -6,9 +6,11 @@
 # the shipped src/zagg/configs/sentinel2_l2a.yaml except ``parent_order: 9`` --
 # the o9 dispatch shard matching the point-pipeline legs (~12.8 km shards, 4
 # over the SERC box, 4^10 order-19 cells each; the same override espg's
-# operational S2 SERC run pins) -- and the harness-local ``pyramid: false``
-# opt-out below. Both are packaging: the semantic hash (D19) of this config
-# equals the shipped one, so the leg measures the shipped product.
+# operational S2 SERC run pins). That override is the whole divergence budget,
+# and it is packaging: the semantic hash (D19) of this config equals the
+# shipped one, so the leg measures the shipped product. ``pyramid: false``
+# below is *not* a divergence -- the shipped config declares the overview
+# family off too (issue #459, issue #399).
 #
 # Layout notes: ``store_layout: hive`` -- the production default for HEALPix
 # raster since issues #247/#253 (issue #237 promoted, ratified by @espg on
@@ -32,7 +34,7 @@ output:
   # Hive: the promoted production default for HEALPix raster (issue #237,
   # ratified issue #272). One leaf zarr object per array per dispatch shard.
   store_layout: hive
-  pyramid: false                 # overview sweep opted out pending Phase E fleet sizing (issue #201)
+  pyramid: false                 # overview family off, as shipped (issue #399, issue #459)
   # Time axis as mortie toc words (spec §8, issue #443) -- output-defining, so
   # it tracks the shipped config (issue #451): a store born on toc is a
   # different product from a legacy-axis one.
