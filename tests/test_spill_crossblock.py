@@ -402,15 +402,19 @@ class TestWaveformSpillBaseline:
 
     Phase 1 characterization, recorded before any registry changes: the SERC
     GEDI fleet runs (0.47–0.49) completed under ``{mode: spill}``, and the
-    mechanism that carried them is the NON-mergeable single-block regime —
+    mechanism that carried them is the NON-mergeable single-block regime.
     ``validate_spill_fold`` refuses the builder (it is outside
-    ``_TDIGEST_SPILL_FUNCTIONS``), so ``SpillAggregator`` records the verdict,
-    replays the pooled machinery byte-identically while the shard fits in one
-    block, and raises ``SpillOverflowError`` naming the field on the first
-    block close. Issue #508 changes NONE of this: the shared digest-family
-    registry feeds the D24 pyramid classification (stored-payload folds), not
-    the build-time spill fold, which would need the noise-model columns
-    re-threaded per block.
+    ``_TDIGEST_SPILL_FUNCTIONS``) — and on the SHIPPED template the refusal is
+    OVER-determined, naming the per-shot ``single_shot_value``/``shot_*``
+    scalar companions alongside it — so ``SpillAggregator`` records the
+    verdict, replays the pooled machinery byte-identically while the shard
+    fits in one block, and raises ``SpillOverflowError`` naming the field on
+    the first block close. The synthetic below declares only ``count`` +
+    ``rx_flux`` so the builder is isolated as the cause; the last test pins
+    the deployed config, where it is not the only one. Issue #508 changes
+    NONE of this: the shared digest-family registry feeds the D24 pyramid
+    classification (stored-payload folds), not the build-time spill fold,
+    which would need the noise-model columns re-threaded per block.
     """
 
     def test_probe_refuses_the_waveform_builder(self):
@@ -467,6 +471,34 @@ class TestWaveformSpillBaseline:
         )
         with pytest.raises(SpillOverflowError, match="'rx_flux'.*build_waveform_digest.*fold law"):
             _run(monkeypatch, cfg, grid, key, dfs)
+
+    def test_the_shipped_template_is_refused_by_more_than_the_builder(self):
+        # The synthetic above isolates the builder; the DEPLOYED config is
+        # over-determined. Seven of its eight fields are per-shot scalars with
+        # no cross-block fold either, so even if issue #508 admitted
+        # ``build_waveform_digest`` to a shared digest-family registry the GEDI
+        # store would stay non-mergeable -- ``spill_blocks_closed: 0`` remains a
+        # hard precondition of the shipped template. Its own
+        # ``worker.extra_disk`` comment says the same: "validate_spill_fold
+        # rejects it (build_waveform_digest and the single_shot_value
+        # companions have no cross-block fold law)".
+        from zagg.config import default_config
+
+        with pytest.raises(ValueError) as exc:
+            validate_spill_fold(default_config("gedi01b_waveform_healpix_hive"))
+        message = str(exc.value)
+        assert "'rx_flux'" in message and "build_waveform_digest" in message
+        for name in (
+            "shot_count",
+            "shot_number",
+            "noise_mean",
+            "noise_stddev",
+            "rx_energy",
+            "elevation_bin0",
+            "elevation_lastbin",
+        ):
+            assert f"'{name}'" in message
+        assert "zagg.stats.waveform.single_shot_value" in message
 
 
 class TestSpillFoldProbe:
