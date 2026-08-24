@@ -1115,8 +1115,18 @@ def _validate_time_source(config: PipelineConfig) -> None:
         )
         if value != windowing[wkey]
     ]
-    if parse_utc(block["epoch"]) != parse_utc(windowing["epoch"]):
-        disagree.append(("epoch", block["epoch"], windowing["epoch"]))
+    # The epoch is compared against the DECLARED windowing value, not the
+    # normalized dict's: get_windowing renders through ``iso_utc``, so comparing
+    # against that would report a config declaring both blocks with the SAME
+    # sub-second epoch as two disagreeing clocks, when the only difference is
+    # that one side has been rendered. Sub-second epochs are refused on their
+    # own terms by _validate_windowing's #390 guard, which runs after this
+    # validator. Reaching this line means get_windowing took its point branch
+    # (the raster branch fixes ``scale`` to ``utc``, which returned above) and
+    # parsed a declared epoch off the block, so the key is present and parses.
+    declared_epoch = config.output["windowing"]["epoch"]
+    if parse_utc(block["epoch"]) != parse_utc(declared_epoch):
+        disagree.append(("epoch", block["epoch"], declared_epoch))
     if disagree:
         detail = ", ".join(f"{k}: {a!r} vs {b!r}" for k, a, b in disagree)
         raise ValueError(

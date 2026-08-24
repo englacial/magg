@@ -2706,6 +2706,31 @@ class TestTimeSource:
         with pytest.raises(ValueError, match="disagrees with output.windowing"):
             validate_config(cfg)
 
+    def test_an_agreeing_sub_second_pair_gets_the_sub_second_refusal(self):
+        # This validator runs ahead of _validate_windowing's #390 guard, so it
+        # is the first to see a sub-second windowing epoch. Comparing the
+        # declared time_source epoch against get_windowing's ALREADY-RENDERED
+        # one made two byte-identical declarations look like two clocks, and
+        # the author got a factually untrue "disagrees" message instead of the
+        # accurate sub-second refusal.
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]), epoch="2018-01-01T00:00:00.5Z")
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00.5Z",
+            "scale": "gps",
+            "units": "seconds",
+        }
+        with pytest.raises(ValueError, match="carries sub-second precision"):
+            validate_config(cfg)
+        # A real epoch disagreement still reports both DECLARED spellings — the
+        # cross-check's purpose is untouched, only the value it quotes.
+        cfg.output["time_source"]["epoch"] = "2020-06-01T00:00:00"
+        with pytest.raises(
+            ValueError, match=r"disagrees with output\.windowing .*2018-01-01T00:00:00\.5Z"
+        ):
+            validate_config(cfg)
+
     def test_a_utc_windowing_block_is_exempt_from_the_cross_check(self):
         # The one path that deliberately carries two declarations of the same
         # column on two scales: a utc windowing block gets no fallback, so the
