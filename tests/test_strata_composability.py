@@ -107,15 +107,17 @@ class TestLiveCaManifestFixture:
             k: v for k, v in published["overview"].items() if k != "fields"
         }
         # The per-field map is the ONLY divergence, and only in the ruled
-        # entries: count byte-identical, composition still the recorded
-        # absence until phase 3, the two strata fields the phase-2 admission.
+        # entries: count byte-identical, the two strata fields the phase-2
+        # admission, composition the phase-3 packed declaration.
         fields = block["overview"]["fields"]
         assert set(fields) == set(CA_FIELDS_BEFORE)
         assert [n for n in CA_FIELDS_BEFORE if fields[n] != CA_FIELDS_BEFORE[n]] == [
             "h_tdigest_signal",
             "h_tdigest_noise",
+            "composition",
         ]
         assert fields["h_tdigest_signal"]["class"] == "approximate"
+        assert fields["composition"]["class"] == "packed"
 
 
 class TestSpillGateAdmissions:
@@ -165,19 +167,20 @@ class TestD24Classification:
     all three; phase 2 admitted the strata builder (espg ruling 2026-08-24);
     phase 3 gives composition its own class."""
 
-    def test_composition_field_classifies_none_today(self):
-        # Flipped by phase 3: ``pack_composition`` has a fold law
-        # (``merge_composition_kway``, issues #321/#370) that neither D24 arm
-        # states yet, so today the classifier says ``none``. Driven off the
-        # SHIPPED field rather than a hand-built meta, so it follows the
-        # template — a declaration the template gains (``temporal``,
-        # ``location``, a params change) moves this verdict here too instead
-        # of leaving a green pin over a shape no store writes. What it adds
-        # over ``test_strata_template_classes`` is the reducer NAME the arm
-        # turns on.
+    def test_composition_field_classifies_packed(self):
+        # Phase 3: ``pack_composition``'s fold law (``merge_composition_kway``,
+        # issues #321/#370) gets its own honest arm — ``packed``, neither
+        # byte-equal (``exact``) nor digest-shaped (``approximate``). Driven
+        # off the SHIPPED field rather than a hand-built meta, so it follows
+        # the template; what it adds over ``test_strata_template_classes`` is
+        # the reducer NAME the arm turns on, and the ``of`` linkage the class
+        # is conditional on: a word with no recorded divisor has no fold.
         meta = get_agg_fields(default_config("atl03_tdigest_strata_healpix"))["composition"]
         assert meta["function"] == "zagg.stats.composition.pack_composition"
-        assert field_composability(meta) == "none"
+        assert field_composability(meta) == "packed"
+        # No ``of`` ⇒ no divisor ⇒ ``none`` (spec §3.3/§3.4).
+        stripped = {**meta, "attrs": {"composition": {"threshold": 2}}}
+        assert field_composability(stripped) == "none"
 
     def test_strata_template_classes(self):
         classes = composability_classes(default_config("atl03_tdigest_strata_healpix"))
@@ -185,20 +188,29 @@ class TestD24Classification:
         # Phase 2: the strata builder is in the digest family (issue #515).
         assert classes["h_tdigest_signal"] == "approximate"
         assert classes["h_tdigest_noise"] == "approximate"
-        # Phase 3 flips this one.
-        assert classes["composition"] == "none"
+        # Phase 3: composition's own honest arm.
+        assert classes["composition"] == "packed"
 
     def test_declared_fields_no_longer_reproduce_the_live_ca_declaration(self):
-        # The before/after known-answer, after phase 2: phase 1 asserted
-        # ``fields == CA_FIELDS_BEFORE`` (today's classifier reproduced the
-        # live store's declaration exactly); the admission changes ONLY the
-        # strata entries — count is untouched and composition still declares
-        # its recorded absence until phase 3.
+        # The before/after known-answer: phase 1 asserted ``fields ==
+        # CA_FIELDS_BEFORE`` (today's classifier reproduced the live store's
+        # declaration exactly); the admissions change ONLY the ruled entries —
+        # count is untouched, the strata declare the digest fold (phase 2),
+        # composition the packed one (phase 3).
         fields, excluded = declared_fields(default_config("atl03_tdigest_strata_healpix"))
         assert fields != CA_FIELDS_BEFORE
         assert fields["count"] == CA_FIELDS_BEFORE["count"]
-        assert fields["composition"] == {"class": "none"}
-        assert excluded == ["composition"]
+        assert fields["composition"] == {
+            "class": "packed",
+            "method": "composition_kway",
+            "dtype": "uint64",
+            "fill_value": 0,
+            # The §3.3 linkage the fold's ``n`` inputs come from, plus the
+            # committed cut for the overview array's attrs block.
+            "of": "h_tdigest_signal",
+            "threshold": 2,
+        }
+        assert excluded == []
         for name in ("h_tdigest_signal", "h_tdigest_noise"):
             assert fields[name] == {
                 "class": "approximate",
@@ -217,7 +229,7 @@ class TestD24Classification:
 
     def test_class_map_gates_the_leaf_column_write_path(self):
         # The class map is not just manifest text: ``column.composable_fields``
-        # filters this same declaration to exact/approximate, and
+        # filters this same declaration to the composable classes, and
         # ``leaf_column_plan``/``fold_column`` carry only what survives. That
         # is why the live CA store has no strata leaf COLUMNS to fold (class
         # ``none`` at build time) and the retrofit must re-read leaves — and
@@ -228,6 +240,7 @@ class TestD24Classification:
         assert composable_fields(CA_FIELDS_BEFORE) == {"count": CA_FIELDS_BEFORE["count"]}
         fields, _ = declared_fields(default_config("atl03_tdigest_strata_healpix"))
         assert sorted(composable_fields(fields)) == [
+            "composition",
             "count",
             "h_tdigest_noise",
             "h_tdigest_signal",
@@ -335,3 +348,222 @@ class TestWhereBuilderFoldParity:
             channels={"locations": [words[i] for i in perm], "temporal": [tocs[i] for i in perm]},
         )
         assert a == b
+
+
+def _strata_cells(k=4, n=120, seed=340):
+    """``k`` synthetic leaf cells: heights + conf columns, strata + word each.
+
+    Returns ``(per_cell, truth)`` where ``per_cell`` carries each cell's
+    encoded signal/noise payloads, packed word and stratum sizes, and
+    ``truth`` the pooled rows for direct whole-group aggregation.
+    """
+    from zagg.stats.composition import pack_composition_n
+    from zagg.stats.tdigest import build_tdigest_where
+    from zagg.sweep_overview import encode_digest
+
+    rng = np.random.default_rng(seed)
+    per_cell, all_values, all_conf = [], [], []
+    for _ in range(k):
+        values = rng.normal(30.0, 5.0, n)
+        conf = np.full((n, 5), -1, dtype=np.int64)
+        n_sig = int(rng.integers(1, n - 1))
+        for i in range(n_sig):
+            conf[i, rng.integers(0, 5)] = rng.integers(2, 5)
+        signal = (conf >= 2).any(axis=1)
+        kwargs = dict(
+            conf_land=conf[:, 0],
+            conf_ocean=conf[:, 1],
+            conf_sea_ice=conf[:, 2],
+            conf_land_ice=conf[:, 3],
+            conf_inland_water=conf[:, 4],
+        )
+        word, n_signal = pack_composition_n(values, **kwargs, threshold=2)
+        d_sig = build_tdigest_where(values, delta=64, where=signal)
+        d_noise = build_tdigest_where(values, delta=64, where=~signal)
+        per_cell.append(
+            {
+                "sig": encode_digest(d_sig, "float32"),
+                "noise": encode_digest(d_noise, "float32"),
+                "word": word,
+                "n_signal": n_signal,
+                "n_noise": int(d_noise[:, 1].sum()),
+            }
+        )
+        all_values.append(values)
+        all_conf.append(conf)
+    return per_cell, (np.concatenate(all_values), np.vstack(all_conf))
+
+
+#: Manifest-shaped field entries for the synthetic strata group above — what
+#: ``declared_fields`` writes, reduced to the keys the folds read.
+_STRATA_FIELDS = {
+    "h_sig": {
+        "class": "approximate",
+        "method": "tdigest_kway",
+        "dtype": "float32",
+        "inner_shape": [2],
+        "delta": 64,
+    },
+    "h_noise": {
+        "class": "approximate",
+        "method": "tdigest_kway",
+        "dtype": "float32",
+        "inner_shape": [2],
+        "delta": 64,
+    },
+    "composition": {
+        "class": "packed",
+        "method": "composition_kway",
+        "dtype": "uint64",
+        "fill_value": 0,
+        "of": "h_sig",
+    },
+}
+
+
+class TestCompositionFoldParity:
+    """Phase 3: the packed class's substance. A folded cell's composition
+    equals the k-way merge of its contributors' ``(word, n)`` pairs with
+    ``n`` sourced from the ``of`` digest — and the signal fraction derived
+    from the folded strata matches leaf truth exactly (digest weights fold
+    exactly, spec §2)."""
+
+    def _fold(self, per_cell, fields=_STRATA_FIELDS, cell_order=5, resolution=4):
+        from zagg.column import fold_column
+
+        k = len(per_cell)
+        slabs = {
+            "h_sig": np.array([c["sig"] for c in per_cell], dtype=object),
+            "h_noise": np.array([c["noise"] for c in per_cell], dtype=object),
+            "composition": np.array([c["word"] for c in per_cell], dtype=np.uint64),
+        }
+        assert 4 ** (cell_order - resolution) == k
+        return fold_column(slabs, fields, cell_order=cell_order, resolutions=[resolution])[
+            resolution
+        ]
+
+    def test_folded_composition_is_the_kway_merge_of_contributors(self):
+        from zagg.stats.composition import (
+            counts_from_composition,
+            merge_composition_kway,
+            unpack_composition,
+        )
+        from zagg.sweep_overview import decode_digest
+
+        per_cell, (values, conf) = _strata_cells()
+        group = self._fold(per_cell)
+        # The law, verbatim: the fold's output word IS merge_composition_kway
+        # over the contributors' (word, n-from-the-of-digest) pairs.
+        expected = merge_composition_kway([(c["word"], c["n_signal"]) for c in per_cell])
+        assert int(group["composition"][0]) == expected
+        # N_signal at the folded level is the folded of-digest's total weight
+        # — exact, so a reader pairs word and divisor at every level the same
+        # way it does at the leaves (spec §3.3).
+        folded_sig = decode_digest(group["h_sig"][0], "float32", (2,))
+        n_total = sum(c["n_signal"] for c in per_cell)
+        assert int(folded_sig[:, 1].sum()) == n_total
+        # Presence exact through the fold; counts within one lane
+        # quantization of the direct whole-group pack (spec §3.4).
+        from zagg.stats.composition import pack_composition_n
+
+        kwargs = dict(
+            conf_land=conf[:, 0],
+            conf_ocean=conf[:, 1],
+            conf_sea_ice=conf[:, 2],
+            conf_land_ice=conf[:, 3],
+            conf_inland_water=conf[:, 4],
+        )
+        pooled, pooled_n = pack_composition_n(values, **kwargs, threshold=2)
+        assert pooled_n == n_total
+        merged_word = int(group["composition"][0])
+        assert np.array_equal(unpack_composition(merged_word) > 0, unpack_composition(pooled) > 0)
+        assert (
+            np.max(
+                np.abs(
+                    counts_from_composition(merged_word, n_total)
+                    - counts_from_composition(pooled, n_total)
+                )
+            )
+            <= 1
+        )
+
+    def test_signal_fraction_matches_leaf_truth(self):
+        from zagg.sweep_overview import decode_digest
+
+        per_cell, (values, conf) = _strata_cells(k=4, n=200, seed=341)
+        group = self._fold(per_cell)
+        n_sig = int(decode_digest(group["h_sig"][0], "float32", (2,))[:, 1].sum())
+        n_noise = int(decode_digest(group["h_noise"][0], "float32", (2,))[:, 1].sum())
+        true_signal = int(((conf >= 2).any(axis=1)).sum())
+        # Stratum weights are exact counts and fold exactly, so the derived
+        # browse quantity — the signal fraction — is leaf truth at every
+        # level, not an estimate.
+        assert n_sig == true_signal
+        assert n_sig + n_noise == len(values)
+
+    def test_empty_divisor_cells_contribute_nothing(self):
+        # A cell whose signal stratum is empty is the (0, 0) identity: its
+        # word (0) must not drag lanes, and an all-empty group folds to 0.
+        per_cell, _ = _strata_cells(k=4)
+
+        empty = {
+            "sig": b"",
+            "noise": per_cell[0]["noise"],
+            "word": 0,
+            "n_signal": 0,
+            "n_noise": per_cell[0]["n_noise"],
+        }
+        from zagg.stats.composition import merge_composition_kway
+
+        group = self._fold([per_cell[0], empty, per_cell[2], empty])
+        expected = merge_composition_kway(
+            [
+                (per_cell[0]["word"], per_cell[0]["n_signal"]),
+                (per_cell[2]["word"], per_cell[2]["n_signal"]),
+            ]
+        )
+        assert int(group["composition"][0]) == expected
+        all_empty = [dict(empty) for _ in range(4)]
+        group = self._fold(all_empty)
+        assert int(group["composition"][0]) == 0
+
+    def test_fold_refuses_a_word_without_its_divisor(self):
+        # The pair may never fold apart (spec §3.3): a fields map that admits
+        # the word but not its of digest is refused by name.
+        from zagg.column import fold_column
+
+        per_cell, _ = _strata_cells(k=4)
+        slabs = {"composition": np.array([c["word"] for c in per_cell], dtype=np.uint64)}
+        fields = {"composition": dict(_STRATA_FIELDS["composition"])}
+        with pytest.raises(ValueError, match="packed composition fold"):
+            fold_column(slabs, fields, cell_order=5, resolutions=[4])
+
+    def test_declaration_demotes_packed_without_an_approximate_divisor(self):
+        # ``declared_fields`` writes ``packed`` only when the ``of`` digest is
+        # itself declared ``approximate`` — the law divides by that digest's
+        # weight at every level, so a composition whose divisor is excluded
+        # from the pyramid is the recorded absence, not a promised fold.
+        from zagg.config import PipelineConfig
+
+        cfg = PipelineConfig(
+            aggregation={
+                "variables": {
+                    "h_vec": {
+                        "kind": "ragged",
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "inner_shape": [3],  # non-(2,) — classifies none
+                        "dtype": "float32",
+                    },
+                    "composition": {
+                        "function": "zagg.stats.composition.pack_composition",
+                        "dtype": "uint64",
+                        "fill_value": 0,
+                        "params": {"threshold": 2},
+                        "attrs": {"composition": {"of": "h_vec", "threshold": 2}},
+                    },
+                }
+            }
+        )
+        fields, excluded = declared_fields(cfg)
+        assert fields["composition"] == {"class": "none"}
+        assert sorted(excluded) == ["composition", "h_vec"]

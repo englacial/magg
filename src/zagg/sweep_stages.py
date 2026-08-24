@@ -166,7 +166,7 @@ def sweep_stage_pass(
     fields = {
         n: dict(m)
         for n, m in (decl.get("fields") or {}).items()
-        if isinstance(m, dict) and m.get("class") in ("exact", "approximate")
+        if isinstance(m, dict) and m.get("class") in ("exact", "approximate", "packed")
     }
     summary: dict = {"run_id": run_id, "tuple_width": int(tuple_width), "stages": []}
     if not fields:

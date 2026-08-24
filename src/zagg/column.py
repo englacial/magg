@@ -138,7 +138,7 @@ def column_resolutions(levels: list, node_order: int) -> list[int]:
 
 
 def composable_fields(fields: dict) -> dict:
-    """The declared fields a column fold may carry: the two composable classes.
+    """The declared fields a column fold may carry: the composable classes.
 
     The D24 ``class: "none"`` entries — expressions, vector fields,
     chunk-resolution companions, temporal companions, and the derived
@@ -152,12 +152,15 @@ def composable_fields(fields: dict) -> dict:
     (:func:`zagg.sweep_overview.sweep_overviews`), so handing a whole
     declaration's ``fields`` map straight through can neither refuse a leaf
     over a non-cell-extent vector slab nor materialize an all-empty ragged
-    group for a companion the column has no business carrying.
+    group for a companion the column has no business carrying. The ``packed``
+    class (issue #515) passes: a composition word is a cell-resolution dense
+    scalar whose fold (:func:`fold_column`'s packed branch) pairs it with its
+    ``of`` digest's weights, both of which this filter keeps.
     """
     return {
         n: m
         for n, m in (fields or {}).items()
-        if isinstance(m, dict) and m.get("class") in ("exact", "approximate")
+        if isinstance(m, dict) and m.get("class") in ("exact", "approximate", "packed")
     }
 
 
@@ -243,12 +246,15 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
     name rather than defaulted: the words are keyed on the centroid partition
     the merge produces (spec §9.1), so the pair may never be folded apart.
     """
+    from zagg.stats.composition import merge_composition_kway
     from zagg.sweep_overview import (
+        _empty_slab,
         decode_digest,
         field_companions,
         fold_dense,
         fold_digests,
         overview_fold_delta,
+        payload_weight,
     )
 
     cell_order = int(cell_order)
@@ -271,6 +277,36 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
                 groups[name] = fold_dense(
                     slab, factor, meta.get("method"), meta.get("fill_value", "NaN")
                 )
+                continue
+            if meta["class"] == "packed":
+                # The packed composition fold (issue #515, spec §3.4): each
+                # child cell contributes its ``(word, n)`` pair, ``n`` being
+                # the ``of`` digest's weight at the SAME cell — required by
+                # name, like a companion sibling: the word is uninterpretable
+                # without its divisor, so the pair may never fold apart.
+                of_name = meta.get("of")
+                of_slab = slabs.get(of_name)
+                if of_slab is None:
+                    raise ValueError(
+                        f"field {name!r} declares the packed composition fold over "
+                        f"{of_name!r} but no such slab was supplied — the fold's n "
+                        f"inputs are that digest's per-cell weights (spec §3.3/§3.4)"
+                    )
+                if slab.shape[0] % factor:
+                    raise ValueError(
+                        f"cannot fold {slab.shape[0]} cells {factor}-to-one for {name!r}"
+                    )
+                of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
+                folded = _empty_slab(meta, slab.shape[0] // factor)
+                for j in range(folded.shape[0]):
+                    parts = [
+                        (int(slab[i]), n)
+                        for i in range(j * factor, (j + 1) * factor)
+                        if (n := payload_weight(of_slab[i], of_dtype)) > 0
+                    ]
+                    if parts:
+                        folded[j] = merge_composition_kway(parts)
+                groups[name] = folded
                 continue
             dtype = meta.get("dtype") or "float32"
             inner = tuple(meta.get("inner_shape") or (2,))
@@ -335,6 +371,14 @@ def _column_provenance(meta: dict) -> dict:
     from zagg.sweep_overview import _field_provenance, overview_fold_delta
 
     entry = dict(_field_provenance(meta))
+    if meta.get("class") == "packed":
+        # The packed group's decode keys (issue #515): the word dtype and the
+        # §3.3 ``of`` linkage a reader pairs it with — recoverable from the
+        # manifest, but recorded here for the same outlive-a-declaration
+        # reason as the digest budget below.
+        entry["dtype"] = meta.get("dtype") or "uint64"
+        if meta.get("of") is not None:
+            entry["of"] = meta["of"]
     if meta.get("class") == "approximate":
         entry["delta"] = int(meta.get("delta") or 512)
         # The budget the column fold actually compressed at (issue #424):

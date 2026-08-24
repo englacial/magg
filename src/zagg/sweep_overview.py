@@ -98,6 +98,16 @@ EXACT_NAN_POLICY = "skip"
 #: permutation, unlike a pairwise left-fold).
 TDIGEST_LAW = "tdigest_kway"
 
+#: Fold law name recorded for the ``packed`` class (issue #515):
+#: :func:`zagg.stats.composition.merge_composition_kway` over per-contributor
+#: ``(word, n_signal)`` pairs, ``n`` sourced from the entry's ``of`` digest's
+#: per-cell weights (spec §3.3/§3.4). One quantization per fold call, so a
+#: permutation of the parts returns identical bytes; presence is exact
+#: through arbitrary chains and counts stay within one lane quantization per
+#: fold — deterministic, but NOT byte-equal to a direct aggregation, which is
+#: why ``packed`` is its own class rather than an ``exact`` method.
+COMPOSITION_LAW = "composition_kway"
+
 
 # ---------------------------------------------------------------------------
 # Phase A: per-field up-aggregation kernels (the D24 merge laws over arrays).
@@ -200,6 +210,20 @@ def encode_digest(digest: np.ndarray, dtype) -> bytes:
 #: chunk-batched k-way fold buffers (4 children × δ × cells), which saturate
 #: toward ~1 GB per slab at a δ=8,192 leaf budget vs ~33 MB here.
 OVERVIEW_DELTA_CAP = 512
+
+
+def payload_weight(raw, dtype, inner_shape=(2,)) -> int:
+    """One stored digest payload's total weight, 0 for the empty cell.
+
+    The ``n`` input of the packed composition fold (spec §3.3/§3.4): every
+    fold site pairs a contributor's composition word with its ``of`` digest's
+    weight at the same cell. Rounded to the count it stores — strata weights
+    are exact stratum photon counts (spec §2), carried as the payload dtype's
+    floats.
+    """
+    if raw is None or not len(raw):
+        return 0
+    return int(round(float(decode_digest(raw, dtype, tuple(inner_shape))[:, 1].sum())))
 
 
 def overview_fold_delta(meta: dict) -> int:
@@ -1006,6 +1030,21 @@ def _field_drift(group, name, meta) -> str | None:
                     f"{sib_element.get('shape')!r}; the channel is one flat uint64 "
                     f"word per centroid row (spec §8.3/§9, §1.1)"
                 )
+    elif meta["class"] == "packed":
+        declared_dt = np.dtype(meta.get("dtype") or "uint64")
+        if arr.dtype != declared_dt:
+            return f"field {name!r}: dtype {arr.dtype} != declared {declared_dt}"
+        # The §3.3 linkage is what the fold's ``n`` inputs come from, so a
+        # store whose stored block binds a DIFFERENT digest than the
+        # declaration would fold every word against the wrong divisor —
+        # checked on the same array this probe already opened.
+        stored_of = dict(arr.attrs.get("composition") or {}).get("of")
+        if stored_of is not None and meta.get("of") is not None and stored_of != meta["of"]:
+            return (
+                f"field {name!r}: the stored composition block binds of={stored_of!r}, "
+                f"not the declared {meta['of']!r} — the fold's n inputs are that "
+                f"digest's per-cell weights (spec §3.3/§3.4)"
+            )
     elif meta["class"] == "exact":
         declared_dt = np.dtype(meta.get("dtype") or "float32")
         if arr.dtype != declared_dt:
@@ -1123,7 +1162,7 @@ def sweep_overviews(
     fields = {
         n: dict(m)
         for n, m in (decl.get("fields") or {}).items()
-        if isinstance(m, dict) and m.get("class") in ("exact", "approximate")
+        if isinstance(m, dict) and m.get("class") in ("exact", "approximate", "packed")
     }
     if not fields:
         logger.info("sweep[overview]: no composable fields declared; nothing to generate")
@@ -1526,6 +1565,7 @@ def _fold_node(
 
     from zagg.grids.morton import morton_word
     from zagg.hive import read_commit, shard_leaf_path
+    from zagg.stats.composition import merge_composition_kway
     from zagg.store import open_store
     from zagg.windows import union_time_range
 
@@ -1534,19 +1574,24 @@ def _fold_node(
     leaf_cells = 4 ** (cell_order - shard_order)
     slabs: dict = {}
     digests: dict = {}
+    # Per packed field, per output cell, the accumulated ``(word, n)`` parts —
+    # merged ONCE at the end (single quantization, the k-way law of spec §3.4).
+    packed: dict = {}
     # Per field, per declared companion channel, the accumulated word vectors —
     # index-aligned with ``digests[name]`` cell by cell so the fold merges the
     # payload and every channel in ONE call (issue #410, spec §9.1/§8.3).
     # ``{field: {kernel kwarg: [per-cell list of vectors]}}``.
     channels: dict = {}
     for name, meta in fields.items():
-        if meta["class"] == "exact":
-            slabs[name] = _empty_slab(meta, n_cells)
-        else:
+        if meta["class"] == "approximate":
             digests[name] = [[] for _ in range(n_cells)]
             declared = field_companions(name, meta)
             if declared:
                 channels[name] = {kw: [[] for _ in range(n_cells)] for kw, _ in declared}
+        else:
+            slabs[name] = _empty_slab(meta, n_cells)
+            if meta["class"] == "packed":
+                packed[name] = {}
     if target_order >= shard_order:
         span = 4 ** (target_order - shard_order)
         fold_factor = 4 ** (shard_order - k)
@@ -1579,6 +1624,7 @@ def _fold_node(
                     )
                 partials: dict = {}
                 cell_digests: dict = {}
+                leaf_packed: dict = {}
                 for name, meta in fields.items():
                     try:
                         arr = group[name]
@@ -1591,6 +1637,28 @@ def _fold_node(
                         partials[name] = fold_dense(
                             arr[:], fold_factor, meta.get("method"), meta.get("fill_value", "NaN")
                         )
+                    elif meta["class"] == "packed":
+                        # The fold's ``n`` inputs are the ``of`` digest's
+                        # per-cell weights (spec §3.3/§3.4). A leaf carrying
+                        # the word without its divisor digest contributes
+                        # nothing — never a part with a guessed ``n``; that is
+                        # the schema-evolution under-coverage posture above.
+                        of_name = meta.get("of")
+                        try:
+                            of_values = group[of_name][:]
+                        except (KeyError, TypeError):
+                            logger.debug(
+                                f"sweep[overview]: leaf {leaf} lacks {of_name!r} for "
+                                f"packed field {name!r}"
+                            )
+                            continue
+                        of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
+                        words_arr = arr[:]
+                        leaf_packed[name] = [
+                            (i, int(words_arr[i]), n)
+                            for i in range(leaf_cells)
+                            if (n := payload_weight(of_values[i], of_dtype)) > 0
+                        ]
                     else:
                         # Mismatched §2.0 weights declarations refuse to merge
                         # (issue #424); the enclosing guard skips the leaf loudly.
@@ -1637,6 +1705,9 @@ def _fold_node(
                     digests[name][j].append(digest)
                     for kwarg, vector in words.items():
                         channels[name][kwarg][j].append(vector)
+            for name, contributions in leaf_packed.items():
+                for i, word, n in contributions:
+                    packed[name].setdefault(start + i // fold_factor, []).append((word, n))
             n_leaves += 1
             timestamps.append(stamp.get("written_at"))
             granules += int(stamp.get("granule_count") or 0)
@@ -1644,6 +1715,9 @@ def _fold_node(
                 ranges.append(stamp["time_range"])
     if n_leaves == 0:
         return None
+    for name, parts_by_cell in packed.items():
+        for j, parts in parts_by_cell.items():
+            slabs[name][j] = merge_composition_kway(parts)
     for name, acc in digests.items():
         meta = fields[name]
         dtype = meta.get("dtype") or "float32"
@@ -1685,8 +1759,10 @@ def _fold_node(
 
 
 def _empty_slab(meta: dict, n_cells: int) -> np.ndarray:
-    """One field's empty output slab: the dense fill, or the ragged empty payload."""
-    if meta["class"] != "exact":
+    """One field's empty output slab: ragged empty payloads for the digest
+    class, the dense fill for the scalar classes (``exact`` and ``packed`` —
+    a packed field's fill is the ``0`` word, spec §3)."""
+    if meta["class"] == "approximate":
         return np.full(n_cells, b"", dtype=object)
     dtype = np.dtype(meta.get("dtype") or "float32")
     return np.full(n_cells, _fill_scalar(meta.get("fill_value", "NaN"), dtype), dtype)
@@ -1753,7 +1829,7 @@ def _cascade_node(
     # #410): ``_fold_child`` returns it beside the payload, and children own
     # disjoint spans, so it assigns exactly as every other slab does.
     for name, meta in fields.items():
-        if meta["class"] == "exact":
+        if meta["class"] != "approximate":
             continue
         for _kwarg, sibling_name in field_companions(name, meta):
             slabs[sibling_name] = np.full(n_cells, b"", dtype=object)
@@ -1873,6 +1949,35 @@ def _fold_child(group, fields, factor, span, path) -> dict:
             partials[name] = fold_dense(
                 arr[:], factor, meta.get("method"), meta.get("fill_value", "NaN")
             )
+            continue
+        if meta["class"] == "packed":
+            # The cascade's ``n`` inputs are the child's ``of`` digest weights
+            # at the same rows (spec §3.3/§3.4); a child carrying the word
+            # without its divisor digest contributes nothing for the field —
+            # the schema-evolution posture above, never a guessed ``n``. Each
+            # level re-quantizes once (the k-way law), which is in the class's
+            # documented contract: presence exact, counts within one lane
+            # quantization per fold.
+            from zagg.stats.composition import merge_composition_kway
+
+            of_name = meta.get("of")
+            try:
+                of_values = group[of_name][:]
+            except (KeyError, TypeError):
+                logger.debug(f"sweep[overview]: overview {path} lacks {of_name!r} for {name!r}")
+                continue
+            of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
+            words_arr = arr[:]
+            folded = _empty_slab(meta, span)
+            for j in range(span):
+                parts = [
+                    (int(words_arr[i]), n)
+                    for i in range(j * factor, min((j + 1) * factor, len(words_arr)))
+                    if (n := payload_weight(of_values[i], of_dtype)) > 0
+                ]
+                if parts:
+                    folded[j] = merge_composition_kway(parts)
+            partials[name] = folded
             continue
         # Mismatched §2.0 weights declarations refuse to merge (issue #424);
         # the enclosing per-child guard skips the child loudly.
@@ -2023,6 +2128,21 @@ def _overview_config(fields):
                 "function": meta.get("method"),
                 "dtype": meta.get("dtype", "float32"),
                 "fill_value": meta.get("fill_value", "NaN"),
+            }
+        elif meta["class"] == "packed":
+            # §3.3: an overview's composition array carries the same attrs
+            # block a leaf does — ``spec``/``lanes`` are stamped from the
+            # writer's constants (``grids.base.apply_field_attrs``), while the
+            # per-product ``of``/``threshold`` halves ride the manifest entry,
+            # which is the only description the overview writer has.
+            block = {"of": meta.get("of")}
+            if meta.get("threshold") is not None:
+                block["threshold"] = meta["threshold"]
+            variables[name] = {
+                "function": "zagg.stats.composition.pack_composition",
+                "dtype": meta.get("dtype", "uint64"),
+                "fill_value": meta.get("fill_value", 0),
+                "attrs": {"composition": block},
             }
         else:
             variables[name] = {

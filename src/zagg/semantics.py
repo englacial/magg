@@ -342,12 +342,16 @@ EXACT_MERGE_LAWS = {
     "nanmax": "max",
 }
 
-#: The three D24 composability classes, weakest first. ``exact`` folds byte-
-#: equal; ``approximate`` merges natively but order-dependently (t-digests —
-#: ``np.isclose`` equality, the merge-vs-spill epistemic class); ``none`` has
-#: no merge law and exists only at native resolution (per-field exclusion —
-#: the ruled D24 default, issue #201).
-COMPOSABILITY_CLASSES = ("none", "approximate", "exact")
+#: The four D24 composability classes, weakest first. ``exact`` folds byte-
+#: equal; ``packed`` folds by a deterministic, order-independent law over
+#: packed lane-quantized words (``merge_composition_kway`` — presence exact
+#: through arbitrary chains, counts within one lane quantization per fold,
+#: NOT byte-equal to a direct aggregation; issue #515); ``approximate``
+#: merges natively but order-dependently (t-digests — ``np.isclose``
+#: equality, the merge-vs-spill epistemic class); ``none`` has no merge law
+#: and exists only at native resolution (per-field exclusion — the ruled D24
+#: default, issue #201).
+COMPOSABILITY_CLASSES = ("none", "packed", "approximate", "exact")
 
 
 def _fold_function_name(name) -> str | None:
@@ -381,6 +385,17 @@ def field_composability(meta: dict) -> str:
       ``build_tdigest_where`` strata builder (issue #515: row selection
       precedes the build, so a stratum's payload is an ordinary centroid
       array), every reducer whose stored payload folds by the k-way law;
+    - ``packed`` — the packed composition word (``pack_composition``, spec §3;
+      issue #515): a dense uint64 whose fold law is
+      :func:`zagg.stats.composition.merge_composition_kway` over ``(word,
+      n_signal)`` pairs, with ``n`` sourced from the ``of`` digest's per-cell
+      weights (spec §3.3/§3.4). Deterministic and order-independent per fold
+      call — presence exact through arbitrary chains, counts within one lane
+      quantization per fold — but not byte-equal to a direct aggregation, so
+      neither of the other two arms states it honestly. Classified only when
+      the field's ``attrs.composition`` block names its ``of`` digest: the
+      law's divisor comes from that field, so a word with no recorded linkage
+      has no fold (``none``);
     - ``none`` — everything else: expressions, vector fields, chunk-resolution
       companions, a ``temporal: per-cell`` dense companion (see below), and any
       scalar reducer without an exact law (mean, std, median, quantiles, ...).
@@ -426,8 +441,14 @@ def field_composability(meta: dict) -> str:
         if meta.get("function") in _DIGEST_FAMILY_FUNCTIONS and tuple(sig["inner_shape"]) == (2,):
             return "approximate"
         return "none"
-    if sig["kind"] == "scalar" and function in EXACT_MERGE_LAWS:
-        return "exact"
+    if sig["kind"] == "scalar":
+        from zagg.processing.streaming import _COMPOSITION_FUNCTION
+
+        if meta.get("function") == _COMPOSITION_FUNCTION:
+            of = ((meta.get("attrs") or {}).get("composition") or {}).get("of")
+            return "packed" if of else "none"
+        if function in EXACT_MERGE_LAWS:
+            return "exact"
     return "none"
 
 

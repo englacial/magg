@@ -515,6 +515,30 @@ associative — fold order never affects presence, and affects counts only
 within `O(n/510)`. The `n` inputs come from the `of` digests' total weights
 (§3.3).
 
+**The k-way form.** A writer folding many parts at once collapses them in
+ONE pass under the same law — `lane = quantize(Σ nᵢ·laneᵢ / Σ nᵢ)`, the same
+presence floor, parts with `n <= 0` skipped, an all-empty part set folding to
+`0` — quantizing **once**, so the result is order-independent (a permutation
+of the parts returns identical bytes) and the count error stays one
+quantization wide however many parts there are. This is zagg's writer-side
+fold everywhere a stored composition folds (the spill block close, issue
+#370, and every pyramid/overview fold site, issue #515;
+`zagg.stats.composition.merge_composition_kway`); the binary law above stays
+the reader-facing contract, the k-way form being inside its documented
+associativity tolerance and strictly tighter than a binary chain.
+
+**Composability (§4.5).** A composition field folds through the pyramid
+under D24 class **`packed`**, method **`composition_kway`** — the k-way form,
+with each contributor's `n` taken from its `of` digest's weight at the same
+cell. An overview's composition array carries the same §3.3 attrs block a
+leaf does, and its `N_signal` at every level is the folded `of` digest's
+total weight at that level (digest weights fold exactly, §2). One
+consequence a reader must hold: each fold re-quantizes once, so a cascaded
+level's counts drift by at most one quantization **per level** while
+presence stays exact through the whole chain — deterministic, but not
+byte-equal to a direct aggregation, which is why the class is neither
+`exact` nor `approximate` (§4.5).
+
 ## 4. Pyramid / overview declarations
 
 **Status: ratified design; implementation in flight
@@ -652,11 +676,13 @@ regionally heterogeneous resolution).
     "fold_source": "cascade", "fold_from_order": 3
     ```
 
-  The distinction is only material for the `approximate` class: the exact
-  merge laws are associative, so a cascaded `sum`/`min`/`max` is the same
-  value either way, while a cascaded digest is a **merge of merges** — it
+  The distinction is material for the `approximate` and `packed` classes: the
+  exact merge laws are associative, so a cascaded `sum`/`min`/`max` is the
+  same value either way, while a cascaded digest is a **merge of merges** — it
   inherits the merge's documented behavior once per level and carries **no
-  precision guarantee**. That is in contract: overviews are display
+  precision guarantee** — and a cascaded composition word re-quantizes once
+  per level (§3.4: presence stays exact through the chain; counts drift at
+  most one lane quantization per level). That is in contract: overviews are display
   artifacts, and the precision promise stops at the levels declared exact
   (`pyramid.overview.exact_levels`, §4.5). A reader that needs the exact
   regime MUST check this key rather than the level's depth, and MUST read an
@@ -730,7 +756,8 @@ group. Concretely, for a member `r` at an order-`k` node:
   `2^24` observations, and there `sum(weights)` is the nearest float32 to the
   true count rather than the count itself;
 - field inclusion is gated by the field's **composability class** (§4.5):
-  `exact` and `approximate` fields appear, `none` fields are **absent**.
+  `exact`, `approximate` and `packed` fields appear, `none` fields are
+  **absent**.
 
 Under `zagg-pyramid/1` every artifact holds exactly **one** resolution
 group, at the constant depth `k_cell = c - (s - k)` for shard order `s` and
@@ -908,7 +935,9 @@ staged sweep's finisher.
   `/2` accuracy contract is §4.4's doctrine, not this pair.)
 - **`fields`** — every aggregation field, keyed by name, with its
   **composability class**: `exact` (folds byte-equal — count/sum/min/max),
-  `approximate` (t-digest merge — `np.isclose` equality class), or `none`
+  `approximate` (t-digest merge — `np.isclose` equality class), `packed`
+  (the §3 composition word — deterministic order-independent k-way fold,
+  presence exact, counts within one lane quantization per fold), or `none`
   (non-composable). A `"class": "none"` entry is the **recorded absence**
   (the ruled D24 default, option A): the field exists only at native
   resolution, and this declaration is how a reader knows without opening
@@ -971,6 +1000,26 @@ staged sweep's finisher.
   (`zagg.semantics.field_composability`), that shape's fold law being the
   word grammar's join over a cell group rather than the field's own reducer,
   so it exists at native resolution only.
+- **A packed composition field is `packed`, and its entry carries `of`.**
+  The §3 composition word ([issue
+  #515](https://github.com/englacial/zagg/issues/515); espg ruling: admit)
+  folds by `method: "composition_kway"` — §3.4's k-way form over
+  `(word, n_signal)` pairs, each contributor's `n` taken from its `of`
+  digest's per-cell weight. The entry carries the dense `dtype`/`fill_value`
+  (a packed field's fill is the `0` word, §3) plus the §3.3 linkage: **`of`**
+  — the digest field whose weights are the fold's `n` inputs and whose folded
+  weight is the level's `N_signal` — and, when declared, `threshold`. `of` is
+  load-bearing exactly as `location` is above: the overview writer
+  reconstructs a level's arrays from this entry alone, so without it the fold
+  has no divisor and the overview array's §3.3 attrs block could not be
+  written. A writer MUST declare a composition field `packed` only when the
+  digest `of` names is itself declared `approximate` in the same map — the
+  law divides by that digest's weight at every level, so a composition whose
+  divisor is excluded from the pyramid is declared `{"class": "none"}`
+  instead. Readers of an older declaration finding an unknown class token
+  MUST treat the field as non-composable for their purposes (fold nothing,
+  read native resolution) rather than erroring — which is exactly how
+  pre-#515 zagg behaves.
 - **`all_time`** — whether the `all.zarr` all-time fold is materialized at
   the declared orders (windowed stores only; a `schedule: none` store's
   single fold is already all-time).
