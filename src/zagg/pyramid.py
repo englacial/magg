@@ -253,6 +253,20 @@ def declared_fields(config) -> tuple[dict, list]:
             # never call ``check_weights_match``). Demoted here instead.
             of_weights = (agg.get(of) or {}).get("weights") if of else None
             if classes.get(of) != "approximate" or of_weights not in (None, "counts"):
+                # Named at the demotion site, because ``warn_excluded``'s line
+                # says "non-composable (D24 class 'none')" — false for this
+                # path (the field DOES classify ``packed``) and it points an
+                # operator at the composition reducer rather than at the ``of``
+                # target, which is the thing to fix (review finding).
+                logger.warning(
+                    f"pyramid: field {name!r} classifies 'packed' but its "
+                    f"attrs.composition.of {of!r} is declared "
+                    f"{classes.get(of)!r}/weights={of_weights or 'counts'!r}, not "
+                    f"approximate/counts — the fold divides by that digest's "
+                    f"per-cell weight at every level (spec §3.3/§3.4), so "
+                    f"{name!r} is demoted to 'none' and exists ONLY at native "
+                    f"resolution"
+                )
                 fields[name] = {"class": "none"}
                 excluded.append(name)
                 continue
