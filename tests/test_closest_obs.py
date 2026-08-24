@@ -9,6 +9,7 @@ the extraction against the frozen §10.5 grammar bytes.
 """
 
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ from mortie import from_datetime64, time2toc, to_datetime64
 from zagg.catalog.closest_obs import (
     ReferenceEpochs,
     _word_midpoints,
+    closest_obs_shardmap,
     nearest_acquisitions,
     reference_epochs,
 )
@@ -495,3 +497,182 @@ class TestNearestAcquisitions:
         times = np.concatenate([raw, raw]).astype("datetime64[ns]")
         epochs = (base + rng.integers(0, 400 * 86_400, 30) * 10**9).astype("datetime64[ns]")
         self._check_oracle(epochs, times, np.timedelta64(2, "D"))
+
+
+# ── phase 3: the builder ─────────────────────────────────────────────────────
+#
+# Geometry: everything happens in shard 11213 (order 4; centre lat 14.54,
+# lon 53.44 from mortie.mort2geo) — the same shard the golden fixture covers —
+# with S2-like STAC items (multi-band assets, NO canonical data asset, a
+# per-item datetime) footprinted around the centre so the spatial build
+# assigns them there.
+
+
+def _s2_item(gid, iso, lat=14.54, lon=53.44, half=0.4):
+    ring = [
+        [lon - half, lat - half],
+        [lon + half, lat - half],
+        [lon + half, lat + half],
+        [lon - half, lat + half],
+        [lon - half, lat - half],
+    ]
+    return {
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": gid,
+        "geometry": {"type": "Polygon", "coordinates": [ring]},
+        "bbox": [lon - half, lat - half, lon + half, lat + half],
+        "properties": {"datetime": iso},
+        "collection": "sentinel-2-l2a",
+        "stac_extensions": [],
+        "links": [],
+        "assets": {
+            "red": {"href": f"https://h/{gid}/B04.tif", "roles": ["data"]},
+            "nir": {"href": f"https://h/{gid}/B08.tif", "roles": ["data"]},
+        },
+    }
+
+
+def _s2_catalog(items):
+    import pyarrow as pa
+    import stac_geoparquet.arrow as sga
+
+    from zagg.catalog.sources import Catalog
+
+    return Catalog(
+        pa.table(sga.parse_stac_items_to_arrow(items)),
+        {"collection": "sentinel-2-l2a", "bbox": [52.0, 13.0, 55.0, 16.0]},
+    )
+
+
+def _grid(parent_order=4):
+    from zagg.grids import HealpixGrid
+
+    return HealpixGrid(parent_order, 6)
+
+
+def _epoch_iso(day):
+    """An ISO instant near BASE_NS + day*DAY (the synthetic covers' passes)."""
+    ns = np.datetime64(to_datetime64(np.array([BASE_NS + day * DAY_NS], dtype=np.uint64))[0], "ns")
+    return np.datetime_as_string(ns.astype("datetime64[s]")) + "Z"
+
+
+class TestClosestObsShardmap:
+    def _setup(self, tmp_path, days=(0, 5, 11), s2_days=(0.1, 5.2, 20.0)):
+        store = _write_store(tmp_path / "ref", {SHARD: _instants(*days)})
+        items = [_s2_item(f"S2_{i}", _epoch_iso(d)) for i, d in enumerate(s2_days)]
+        return store, _s2_catalog(items)
+
+    def test_builds_a_standard_shardmap(self, tmp_path):
+        store, cat = self._setup(tmp_path)
+        sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+        assert sm.shard_keys == [SHARD_KEY]
+        ids = {g["id"] for g in sm.granules[0]}
+        # Epochs at days 0/5/11 pick S2_0 (0.1), S2_1 (5.2), S2_2 (20 vs 5.2:
+        # day 11 is 5.8 days from S2_1 and 9 days from S2_2 -> S2_1), deduped.
+        assert ids == {"S2_0", "S2_1"}
+        assert sm.metadata["total_pairs"] == 2
+        assert sm.metadata["granules_assigned"] == 2
+        assert sm.metadata["closest_obs"]["epochs_paired"] == 3
+        assert sm.metadata["closest_obs"]["epochs_dropped"] == 0
+
+    def test_provenance_rows_reconstruct_the_pairing(self, tmp_path):
+        store, cat = self._setup(tmp_path)
+        sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+        by_id = {g["id"]: g for g in sm.granules[0]}
+        # S2_1 was selected by two epochs (days 5 and 11): dedupe keeps ONE
+        # entry carrying BOTH provenance rows, row-aligned.
+        assert len(by_id["S2_1"]["paired_epochs"]) == 2
+        assert len(by_id["S2_1"]["epoch_offsets_ns"]) == 2
+        # Signed offsets: acquisition - epoch. Day-5 epoch precedes the day-5.2
+        # acquisition -> positive; day-11 epoch follows it -> negative.
+        offs = sorted(by_id["S2_1"]["epoch_offsets_ns"])
+        assert offs[0] < 0 < offs[1]
+        # And each is within half a bucket + the true separation.
+        assert len(by_id["S2_0"]["paired_epochs"]) == 1
+
+    def test_the_map_json_round_trips_with_provenance(self, tmp_path):
+        store, cat = self._setup(tmp_path)
+        sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+        path = tmp_path / "map.json"
+        sm.to_json(str(path))
+        from zagg.catalog.shardmap import ShardMap
+
+        back = ShardMap.from_json(str(path))
+        assert back.shard_keys == sm.shard_keys
+        assert back.granules == sm.granules
+        assert back.metadata["closest_obs"] == sm.metadata["closest_obs"]
+
+    def test_max_time_offset_drops_are_recorded_loudly(self, tmp_path, caplog):
+        # Day-11 epoch's nearest acquisition is 5.8 days away: beyond a 2-day
+        # cap it selects nothing, and the drop carries the near-miss offset.
+        store, cat = self._setup(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="zagg.catalog.closest_obs"):
+            sm = closest_obs_shardmap(
+                cat,
+                store,
+                grid=_grid(),
+                backend="mortie",
+                max_time_offset=np.timedelta64(2, "D"),
+            )
+        rec = sm.metadata["closest_obs"]
+        assert rec["epochs_dropped"] == 1 and len(rec["dropped"]) == 1
+        assert rec["dropped"][0]["shard"] == SHARD
+        assert rec["dropped"][0]["nearest_offset_ns"] is not None
+        assert any("selected nothing" in m for m in caplog.messages)
+        ids = {g["id"] for g in sm.granules[0]}
+        assert ids == {"S2_0", "S2_1"}
+
+    def test_filtered_map_is_a_subset_of_the_spatial_map(self, tmp_path):
+        from zagg.catalog.shardmap import ShardMap
+
+        store, cat = self._setup(tmp_path)
+        spatial = ShardMap.build(cat, _grid(), backend="mortie")
+        sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+        spatial_pairs = {
+            (k, g["id"]) for k, gr in zip(spatial.shard_keys, spatial.granules) for g in gr
+        }
+        paired = {(k, g["id"]) for k, gr in zip(sm.shard_keys, sm.granules) for g in gr}
+        assert paired <= spatial_pairs
+
+    def test_grid_order_mismatch_refuses(self, tmp_path):
+        store, cat = self._setup(tmp_path)
+        with pytest.raises(ValueError, match="parent_order"):
+            closest_obs_shardmap(cat, store, grid=_grid(parent_order=5), backend="mortie")
+
+    def test_max_granules_per_shard_refuses_loudly(self, tmp_path):
+        store, cat = self._setup(tmp_path)
+        with pytest.raises(ValueError, match="max_granules_per_shard"):
+            closest_obs_shardmap(
+                cat, store, grid=_grid(), backend="mortie", max_granules_per_shard=1
+            )
+
+    def test_estimate_reports_without_building(self, tmp_path):
+        store, cat = self._setup(tmp_path)
+        est = closest_obs_shardmap(
+            cat,
+            store,
+            grid=_grid(),
+            backend="mortie",
+            estimate=True,
+            max_granules_per_shard=1,
+            bytes_per_granule=10**6,
+        )
+        assert isinstance(est, dict)
+        assert est["shards"] == 1 and est["granules"] == 2 and est["pairs"] == 2
+        assert est["per_shard"] == {SHARD: 2}
+        assert est["histogram"] == {2: 1}
+        assert est["est_bytes"] == 2 * 10**6
+        assert est["max_cost_usd"] > 0
+        # The cost gate REPORTS violations in a dry run instead of raising.
+        assert est["violations"] == [(SHARD, 2)]
+
+    def test_a_granule_without_acquisition_time_refuses(self, tmp_path):
+        store, _ = self._setup(tmp_path)
+        item = _s2_item("S2_bare", _epoch_iso(0))
+        del item["properties"]["datetime"]  # -> null datetime column
+        # stac-geoparquet requires a datetime key; set None explicitly instead
+        item["properties"]["datetime"] = None
+        cat = _s2_catalog([item])
+        with pytest.raises(ValueError, match="acquisition time"):
+            closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")

@@ -424,4 +424,268 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
     return selection, offsets
 
 
-__all__ = ["ReferenceEpochs", "nearest_acquisitions", "reference_epochs"]
+def _acquisition_times(entries: list[dict], shard: str) -> np.ndarray:
+    """Granule entries -> UTC ``datetime64[ns]`` acquisition instants.
+
+    Reads the entry's ``datetime`` (the raster-source acquisition instant,
+    #218) falling back to ``time_start`` (the STAC acquisition-range start,
+    #246). A granule carrying neither refuses loudly — a catalog without
+    acquisition times cannot be temporally paired, and skipping the granule
+    would silently thin the product.
+    """
+    from datetime import datetime, timezone
+
+    out = np.empty(len(entries), dtype="datetime64[ns]")
+    for i, entry in enumerate(entries):
+        iso = entry.get("datetime") or entry.get("time_start")
+        if iso is None:
+            raise ValueError(
+                f"closest_obs_shardmap: granule {entry.get('id')!r} in shard {shard} "
+                f"carries no acquisition time (neither 'datetime' nor 'time_start') — "
+                f"the catalog cannot be temporally paired (issue #509)"
+            )
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        out[i] = np.datetime64(dt, "ns")
+    return out
+
+
+def closest_obs_shardmap(
+    s2_catalog,
+    reference_stores,
+    *,
+    grid,
+    aoi=None,
+    max_time_offset=None,
+    max_granules_per_shard=None,
+    estimate=False,
+    backend="auto",
+    bytes_per_granule=None,
+    **store_kwargs,
+):
+    """Closest-observation ingest map: covers -> epochs -> nearest granules.
+
+    The issue-#509 builder. Epochs come from the reference stores'
+    ``coverage.toc`` covers (:func:`reference_epochs`); the raster catalog is
+    spatially assigned to shards through the existing machinery
+    (:meth:`~zagg.catalog.shardmap.ShardMap.build` — the stored-index /
+    batch-cover fast paths included); per shard, each epoch then selects its
+    single nearest acquisition (:func:`nearest_acquisitions`) and the
+    selected granules, deduplicated, become the shard's ingest list. The
+    result is a standard :class:`~zagg.catalog.shardmap.ShardMap` — JSON
+    round-trip, ``total_pairs`` bookkeeping — so dispatch consumes it
+    unchanged; the pairing is a property of this query, never of the raster
+    store's schema (espg ruling).
+
+    Parameters
+    ----------
+    s2_catalog : Catalog or str
+        The raster acquisition catalog (stac-geoparquet), or a path to one
+        (``Catalog.from_geoparquet``). Every record must carry an acquisition
+        time (``datetime``, or STAC ``start_datetime``).
+    reference_stores : str or sequence of str
+        Store roots whose covers drive the epochs (e.g. ATL03 + GEDI).
+    grid : HealpixGrid
+        The raster store's output grid. Its ``parent_order`` must equal the
+        covers' shard order — the map's shard keys and the covers' D1 ids
+        live on the same grid, and the emitted ``grid_signature`` is what the
+        ingest run validates against.
+    aoi : optional
+        Restrict the shard set (``mortie.Moc``, GeoJSON path, or ring
+        parts); intersected with the store coverage (:func:`reference_epochs`).
+    max_time_offset : np.timedelta64 or int (ns), optional
+        An epoch whose nearest acquisition lies beyond this selects nothing —
+        recorded per epoch in ``metadata["closest_obs"]["dropped"]`` and
+        warned about, never silent. ``None`` always selects the nearest.
+    max_granules_per_shard : int, optional
+        Cost gate: a shard exceeding this REFUSES loudly (``ValueError``
+        naming the worst shards) — never truncates. ``estimate=True`` reports
+        violations instead of raising, so the gate can be sized first.
+    estimate : bool
+        Dry-run: return the per-shard histogram + cost estimate dict (see
+        Notes) WITHOUT building the map. The espg-operated ingest runs are
+        cost-gated through this.
+    backend : {"auto", "spherely", "mortie"}
+        Forwarded to :meth:`ShardMap.build`.
+    bytes_per_granule : int, optional
+        Per-granule ingest volume for the ``estimate`` byte figure; without
+        it ``est_bytes`` is ``None`` (the catalog does not carry sizes).
+    **store_kwargs
+        Forwarded to the reference stores' object-store opens.
+
+    Returns
+    -------
+    ShardMap or dict
+        The ingest map — or, with ``estimate=True``, a dict:
+        ``{"shards", "granules", "pairs", "epochs_total", "epochs_paired",
+        "epochs_dropped", "per_shard" (decimal -> granule count),
+        "histogram" (granule count -> shard count), "est_bytes",
+        "max_cost_usd", "violations"}``. ``max_cost_usd`` is the
+        :func:`zagg.dispatch.max_cost_usd` ceiling at the production worker
+        size (one invoke per shard, 900 s timeout) — a bound, not a forecast.
+
+    Notes
+    -----
+    Selected granule entries gain two provenance keys so the eventual paired
+    product is reconstructable from the manifest alone: ``paired_epochs``
+    (ISO instants of every epoch that selected the granule) and
+    ``epoch_offsets_ns`` (row-aligned SIGNED ``acquisition - epoch`` ns).
+    ``metadata["closest_obs"]`` records the query: the reference stores, the
+    epoch totals, every dropped epoch with its near-miss offset, shards
+    whose epochs found no acquisition at all, and any cover blocks coarsened
+    below the §10.5 pin. Epochs are bucket midpoints, good to half a bucket
+    (:meth:`ReferenceEpochs.tolerance`) — size ``max_time_offset`` with that
+    slack in mind.
+    """
+    from zagg.catalog.shardmap import ShardMap
+    from zagg.grids.morton import morton_decimal
+
+    if isinstance(s2_catalog, str):
+        from zagg.catalog.sources import Catalog
+
+        s2_catalog = Catalog.from_geoparquet(s2_catalog)
+
+    parent_order = getattr(grid, "parent_order", None)
+    if parent_order is None:
+        raise ValueError(
+            "closest_obs_shardmap: grid must be a HEALPix grid (parent_order) — the "
+            "covers' D1 shard ids and the map's shard keys live on the same grid"
+        )
+    ref = reference_epochs(reference_stores, aoi=aoi, **store_kwargs)
+    if int(parent_order) != int(ref.order):
+        raise ValueError(
+            f"closest_obs_shardmap: grid.parent_order {int(parent_order)} != the covers' "
+            f"shard order {ref.order} — the emitted map would key shards on a different "
+            f"grid than the epochs (spec §10.5)"
+        )
+
+    spatial = ShardMap.build(s2_catalog, grid, backend=backend)
+    spatial_idx = {int(k): i for i, k in enumerate(spatial.shard_keys)}
+
+    shard_keys: list[int] = []
+    granules: list[list[dict]] = []
+    dropped: list[dict] = []
+    no_acquisitions: list[str] = []
+    epochs_paired = 0
+    for shard, epoch_arr in sorted(ref.epochs.items()):
+        decimal = morton_decimal(shard)
+        i = spatial_idx.get(shard)
+        if i is None:
+            no_acquisitions.append(decimal)
+            continue
+        entries = spatial.granules[i]
+        times = _acquisition_times(entries, decimal)
+        sel, off = nearest_acquisitions(epoch_arr, times, max_time_offset=max_time_offset)
+        off_ns = off.astype("int64")
+        chosen: dict[int, dict] = {}
+        for j in range(epoch_arr.size):
+            iso = np.datetime_as_string(epoch_arr[j])
+            if sel[j] < 0:
+                dropped.append(
+                    {
+                        "shard": decimal,
+                        "epoch": iso,
+                        "nearest_offset_ns": None if np.isnat(off[j]) else int(off_ns[j]),
+                    }
+                )
+                continue
+            entry = chosen.setdefault(
+                int(sel[j]),
+                {**entries[sel[j]], "paired_epochs": [], "epoch_offsets_ns": []},
+            )
+            entry["paired_epochs"].append(iso)
+            entry["epoch_offsets_ns"].append(None if np.isnat(off[j]) else int(off_ns[j]))
+            epochs_paired += 1
+        if chosen:
+            shard_keys.append(shard)
+            granules.append([chosen[j] for j in sorted(chosen)])
+
+    if dropped:
+        logger.warning(
+            f"closest_obs_shardmap: {len(dropped)} epoch(s) selected nothing "
+            f"(max_time_offset={max_time_offset!r}); e.g. {dropped[:3]} — every drop is "
+            f"recorded in metadata['closest_obs']['dropped']"
+        )
+    if no_acquisitions:
+        logger.warning(
+            f"closest_obs_shardmap: {len(no_acquisitions)} shard(s) carry reference epochs "
+            f"but NO spatially-assigned acquisitions at all (catalog gap?): "
+            f"{no_acquisitions[:5]}"
+        )
+
+    counts = {morton_decimal(k): len(g) for k, g in zip(shard_keys, granules)}
+    violations = (
+        sorted(
+            ((d, n) for d, n in counts.items() if n > max_granules_per_shard),
+            key=lambda kv: -kv[1],
+        )
+        if max_granules_per_shard is not None
+        else []
+    )
+
+    coarse = {morton_decimal(k): o for k, o in ref.orders.items() if o < TEMPORAL_COVER_ORDER}
+    closest_meta = {
+        "reference_stores": list(ref.stores),
+        "shard_order": int(ref.order),
+        "max_time_offset_ns": (
+            None
+            if max_time_offset is None
+            else int(np.timedelta64(max_time_offset).astype("timedelta64[ns]").astype("int64"))
+        ),
+        "epochs_total": int(ref.total),
+        "epochs_paired": int(epochs_paired),
+        "epochs_dropped": len(dropped),
+        "dropped": dropped,
+        "shards_without_acquisitions": no_acquisitions,
+        "spatial_shards_without_epochs": sum(1 for k in spatial.shard_keys if k not in ref.epochs),
+        "coarsened_orders": coarse,
+    }
+
+    if estimate:
+        from zagg.dispatch import LAMBDA_MEMORY_GB, max_cost_usd
+
+        histogram: dict[int, int] = {}
+        for n in counts.values():
+            histogram[n] = histogram.get(n, 0) + 1
+        distinct = len({g["id"] for shard in granules for g in shard})
+        pairs = sum(len(g) for g in granules)
+        return {
+            **closest_meta,
+            "shards": len(shard_keys),
+            "granules": distinct,
+            "pairs": pairs,
+            "per_shard": counts,
+            "histogram": dict(sorted(histogram.items())),
+            "est_bytes": None if bytes_per_granule is None else pairs * int(bytes_per_granule),
+            "max_cost_usd": round(
+                max_cost_usd(len(shard_keys), LAMBDA_MEMORY_GB, timeout_s=900.0), 2
+            ),
+            "violations": violations,
+        }
+
+    if violations:
+        worst = ", ".join(f"{d}={n}" for d, n in violations[:5])
+        raise ValueError(
+            f"closest_obs_shardmap: {len(violations)} shard(s) exceed "
+            f"max_granules_per_shard={max_granules_per_shard} (worst: {worst}) — refusing "
+            f"loudly rather than truncating; raise the gate, tighten max_time_offset/aoi, "
+            f"or size the run with estimate=True first (issue #509)"
+        )
+
+    meta = {
+        **spatial.metadata,
+        "total_shards": len(shard_keys),
+        "total_pairs": sum(len(g) for g in granules),
+        "granules_assigned": len({g["id"] for shard in granules for g in shard}),
+        "closest_obs": closest_meta,
+    }
+    return ShardMap(spatial.grid_signature, shard_keys, granules, meta, None)
+
+
+__all__ = [
+    "ReferenceEpochs",
+    "closest_obs_shardmap",
+    "nearest_acquisitions",
+    "reference_epochs",
+]
