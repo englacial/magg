@@ -1186,10 +1186,12 @@ def sweep_overviews(
             f"sweep[overview]: declared derived summaries {sorted(decl['summarize'])} are not "
             f"generated yet — no roster-kind ragged field ships (D24 opt-in, issue #265); skipping"
         )
+    from zagg.column import _is_composable
+
     fields = {
         n: dict(m)
         for n, m in (decl.get("fields") or {}).items()
-        if isinstance(m, dict) and m.get("class") in ("exact", "approximate", "packed")
+        if isinstance(m, dict) and _is_composable(m)
     }
     if not fields:
         logger.info("sweep[overview]: no composable fields declared; nothing to generate")

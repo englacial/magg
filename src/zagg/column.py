@@ -137,6 +137,18 @@ def column_resolutions(levels: list, node_order: int) -> list[int]:
     return sorted(within | {node_order}, reverse=True)
 
 
+def _is_composable(meta: dict) -> bool:
+    """One declared entry's fold admission: a known class, fully linked.
+
+    Shared with :func:`zagg.sweep_overview.sweep_overviews`' own filter so the
+    two fold paths admit exactly the same entries.
+    """
+    cls = meta.get("class")
+    if cls == "packed":
+        return bool(meta.get("of"))
+    return cls in ("exact", "approximate")
+
+
 def composable_fields(fields: dict) -> dict:
     """The declared fields a column fold may carry: the composable classes.
 
@@ -155,13 +167,14 @@ def composable_fields(fields: dict) -> dict:
     group for a companion the column has no business carrying. The ``packed``
     class (issue #515) passes: a composition word is a cell-resolution dense
     scalar whose fold (:func:`fold_column`'s packed branch) pairs it with its
-    ``of`` digest's weights, both of which this filter keeps.
+    ``of`` digest's weights, both of which this filter keeps — but ONLY when
+    the entry carries that ``of`` linkage: a packed entry without it declares
+    a fold with no divisor, and a manifest carrying one (never written here,
+    but manifests outlive their writer, spec §4.5) degrades to native
+    resolution exactly as an unknown class does, rather than publishing an
+    all-fill array under an invalid §3.3 declaration.
     """
-    return {
-        n: m
-        for n, m in (fields or {}).items()
-        if isinstance(m, dict) and m.get("class") in ("exact", "approximate", "packed")
-    }
+    return {n: m for n, m in (fields or {}).items() if isinstance(m, dict) and _is_composable(m)}
 
 
 def leaf_slabs(staged: dict, fields: dict, *, group_path: str, n_cells: int) -> dict:
