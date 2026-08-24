@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import types
+import warnings
 
 import numpy as np
 import pyarrow as pa
@@ -2860,3 +2861,50 @@ class TestBasenameCollisions:
         with pytest.raises(ValueError) as excinfo:
             shardmap._refuse_basename_collisions([7], [[a, b]])
         assert "['s3://b/p1/G.h5', 's3://b/p2/G.h5']" in str(excinfo.value)
+
+    # -- loading warns, never refuses (PR #482 question (2) ruling) ---------
+
+    @staticmethod
+    def _collided_manifest():
+        # The constructor does not guard -- only build/reproject/sweep mint
+        # membership -- so a pre-#468 manifest is representable directly.
+        collided = [
+            {"id": "Gdup.h5", "s3": f"s3://b/{p}/Gdup.h5", "https": f"https://h/{p}/Gdup.h5"}
+            for p in ("p1", "p2")
+        ]
+        return ShardMap(
+            {"type": "healpix", "indexing_scheme": "nested", "parent_order": 6},
+            [1050],
+            [collided],
+            {"backend": "mortie", "total_shards": 1},
+        )
+
+    def test_from_json_warns_on_a_loaded_collision_and_keeps_the_map(self, tmp_path):
+        # A manifest built before the guard existed must stay readable -- the
+        # warning makes the hazard visible without making the map unreachable.
+        sm = self._collided_manifest()
+        path = tmp_path / "sm.json"
+        sm.to_json(str(path))
+        with pytest.warns(RuntimeWarning, match="identity collision") as record:
+            loaded = ShardMap.from_json(str(path))
+        assert loaded.granules == sm.granules, "warned, not refused or thinned"
+        # The warning points at the live consequence of keeping it (issue #512).
+        assert "issue #512" in str(record[0].message)
+
+    def test_from_parquet_warns_on_a_loaded_collision_and_keeps_the_map(self, tmp_path):
+        pytest.importorskip("pyarrow")
+        sm = self._collided_manifest()
+        path = tmp_path / "sm.parquet"
+        sm.to_parquet(str(path))
+        with pytest.warns(RuntimeWarning, match="identity collision"):
+            loaded = ShardMap.from_parquet(str(path))
+        assert loaded.granules == sm.granules, "warned, not refused or thinned"
+
+    def test_loading_a_clean_manifest_does_not_warn(self, catalog, hp_grid, tmp_path):
+        sm = ShardMap.build(catalog, hp_grid, backend="mortie")
+        path = tmp_path / "sm.json"
+        sm.to_json(str(path))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            loaded = ShardMap.from_json(str(path))
+        assert loaded.granules == sm.granules
