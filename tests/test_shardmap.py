@@ -2688,6 +2688,36 @@ class TestBasenameCollisions:
         # Named by the s3 hrefs: for THIS pair they are what separates them.
         assert "s3://b/p1/GA.h5" in message and "s3://b/p2/GB.h5" in message
 
+    def test_a_basename_shared_across_spellings_is_not_a_collision(self):
+        # A run reads ONE spelling (``runner._resolve_urls`` picks s3 or https
+        # by driver), so ids are comparable within a spelling and never across.
+        # Pooling both into one namespace refused pairs no driver can collapse
+        # (PR #482 review): here the s3 ids differ AND the https ids differ, yet
+        # ``a``'s https basename equals ``b``'s s3 basename -- an id no single
+        # run ever records.
+        from zagg.telemetry import canonical_granule_id
+
+        a = {"id": "A", "s3": "s3://b/p/X.h5", "https": "https://h/p/Y.h5"}
+        b = {"id": "B", "s3": "s3://b/p/Y.h5", "https": "https://h/p/Z.h5"}
+        for spelling in ("s3", "https"):
+            assert canonical_granule_id(a[spelling]) != canonical_granule_id(b[spelling]), (
+                "neither spelling may collide on its own -- the cross-match is the fixture"
+            )
+        shardmap._refuse_basename_collisions([7], [[a, b]])
+
+    def test_a_pair_colliding_under_both_spellings_is_reported_once(self):
+        # The same two entries collide under s3 AND under https, with a
+        # different basename each time. That is one collision, not two: keying
+        # by spelling registers it in both slots, so the report dedups on the
+        # pair it names (PR #482 review).
+        a = {"id": "C", "s3": "s3://b/p1/G.h5", "https": "https://h/p1/G.nc"}
+        b = {"id": "D", "s3": "s3://b/p2/G.h5", "https": "https://h/p2/G.nc"}
+        with pytest.raises(ValueError, match="identity collision") as excinfo:
+            shardmap._refuse_basename_collisions([7], [[a, b]])
+        message = str(excinfo.value)
+        assert "1 per-shard granule identity collision(s)" in message
+        assert message.count("s3://b/p1/G.h5") == 1, "one entry-pair, one group"
+
     def test_build_refuses_an_https_only_basename_collision(self, hp_grid):
         # The same hole wired through ``build``: two catalog items whose https
         # basenames collapse while their s3 basenames stay distinct.

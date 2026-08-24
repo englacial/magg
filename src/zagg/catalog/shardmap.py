@@ -162,14 +162,16 @@ def _granule_entry(rec: dict) -> dict:
     return entry
 
 
-def _recorded_identity(entry: dict, canonicalize=None) -> tuple[tuple[str, ...], tuple]:
+def _recorded_identity(entry: dict, canonicalize=None) -> tuple[tuple[tuple[str, str], ...], tuple]:
     """``(canonicals, distinguishing)`` for one shard entry.
 
-    ``canonicals`` are the granule ids a run can record for the entry — the
-    basename of **each** href spelling (:func:`zagg.telemetry.canonical_granule_id`
-    over ``s3`` and ``https``, because ``runner._resolve_urls`` picks one by
-    driver and the invariant must hold under either choice) — falling back to
-    the id, then the datetime, for the raster entries that carry no href.
+    ``canonicals`` are the granule ids a run can record for the entry, each
+    tagged with the spelling that yields it — the basename of **each** href
+    (:func:`zagg.telemetry.canonical_granule_id` over ``s3`` and ``https``,
+    because ``runner._resolve_urls`` picks one by driver and the invariant must
+    hold under either choice) — falling back to the id, then the datetime, for
+    the raster entries that carry no href. The tag matters because a run reads
+    ONE spelling: ids are comparable within a spelling, never across.
     Empty when there is nothing to canonicalize.
 
     ``distinguishing`` is what separates one granule from another. ``datetime``
@@ -182,16 +184,16 @@ def _recorded_identity(entry: dict, canonicalize=None) -> tuple[tuple[str, ...],
     if canonicalize is None:
         from zagg.telemetry import canonical_granule_id as canonicalize
 
-    named = [entry.get("s3"), entry.get("https")]
-    if not any(named):
-        named = [entry.get("id") or entry.get("datetime")]
+    named = [("s3", entry.get("s3")), ("https", entry.get("https"))]
+    if not any(n for _, n in named):
+        named = [("id", entry.get("id") or entry.get("datetime"))]
     canonicals: list = []
-    for n in named:
+    for slot, n in named:
         c = canonicalize(n) if n else ""
         # Empty as well as absent: an href of ``s3://b/`` canonicalizes to
         # ``""``, which is no identity at all, not an identity of ``''``.
-        if c and c not in canonicals:
-            canonicals.append(c)
+        if c:
+            canonicals.append((slot, c))
     return tuple(canonicals), (
         entry.get("id"),
         entry.get("s3"),
@@ -263,15 +265,25 @@ def _basename_collision_message(shard_keys, granules) -> str | None:
                     first_unidentified = (key, _collision_label(entry))
                 continue
             label = _collision_label(entry)
-            # Registered under EVERY spelling's canonical: a collision in the
-            # spelling the run's driver picks is a collision, whichever it is.
-            for canonical in canonicals:
-                by_canonical.setdefault(canonical, {})[distinguishing] = label
+            # Registered under EVERY spelling's canonical, but keyed WITH the
+            # spelling: a collision in the spelling the run's driver picks is a
+            # collision whichever it is, while two ids from different spellings
+            # never meet -- no run records both, so they cannot collapse.
+            for slot_canonical in canonicals:
+                by_canonical.setdefault(slot_canonical, {})[distinguishing] = label
         # Filtered before sorting -- on every catalog zagg reads the filter
         # discards all of them, so sorting first is a per-shard sort of nothing.
         # Only the first few groups are retained: the message prints three, and a
         # wholly mis-scoped catalog has one group per granule.
-        found = sorted((c, sorted(n.values())) for c, n in by_canonical.items() if len(n) > 1)
+        found: list = []
+        pairs: set = set()
+        for (_slot, canonical), named in sorted(by_canonical.items()):
+            # One pair of entries is ONE collision however many spellings show
+            # it: a pair colliding under both spellings registers in both slots
+            # and would otherwise be counted -- and printed -- twice.
+            if len(named) > 1 and frozenset(named) not in pairs:
+                pairs.add(frozenset(named))
+                found.append((canonical, sorted(named.values())))
         n_collisions += len(found)
         shown += [(key, c, named) for c, named in found[: max(0, 4 - len(shown))]]
     if n_unidentified:
