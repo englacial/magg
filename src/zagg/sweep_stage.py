@@ -681,10 +681,14 @@ def _merge_slabs(
             for w, reader in enumerate(row or ()):
                 if not _is_reader(reader):
                     continue
-                words = reader.read(res_src, name)
+                # Not ``words``: that name is a free variable of the digest
+                # loop's ``_close`` closure 65 lines up, with an incompatible
+                # type — harmless today (every close happens before this loop
+                # starts) but a latent wrong-cell write for the next editor.
+                word_slab = reader.read(res_src, name)
                 of_values = reader.read(res_src, of_name)
-                if words is None or of_values is None:
-                    if (words is None) != (of_values is None):
+                if word_slab is None or of_values is None:
+                    if (word_slab is None) != (of_values is None):
                         logger.warning(
                             f"stage sweep: column {reader.path} carries only one of "
                             f"{name!r}/{of_name!r} at resolution {res_src}; counting the "
@@ -692,11 +696,11 @@ def _merge_slabs(
                         )
                         broken.add((i, w))
                     continue
-                for pos in range(len(words)):
+                for pos in range(len(word_slab)):
                     n = payload_weight(of_values[pos], of_dtype)
                     if n > 0:
                         parts_by_cell.setdefault((base + pos) // factor, []).append(
-                            (int(words[pos]), n)
+                            (int(word_slab[pos]), n)
                         )
         for j, parts in parts_by_cell.items():
             out[j] = merge_composition_kway(parts)
