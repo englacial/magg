@@ -494,6 +494,10 @@ def closest_obs_shardmap(
     aoi : optional
         Restrict the shard set (``mortie.Moc``, GeoJSON path, or ring
         parts); intersected with the store coverage (:func:`reference_epochs`).
+        Ring parts / a GeoJSON path additionally ride as the spatial build's
+        ``region=``, scoping the raster intersection; a ``mortie.Moc`` has no
+        parts form, so it restricts the epoch side only and the spatial build
+        still covers the whole catalog bbox.
     max_time_offset : np.timedelta64 or int (ns), optional
         An epoch whose nearest acquisition lies beyond this selects nothing —
         recorded per epoch in ``metadata["closest_obs"]["dropped"]`` and
@@ -563,6 +567,17 @@ def closest_obs_shardmap(
             "closest_obs_shardmap: grid must be a HEALPix grid (parent_order) — the "
             "covers' D1 shard ids and the map's shard keys live on the same grid"
         )
+    # Resolve the aoi once. Ring parts (and a GeoJSON path, which loads to
+    # parts) also scope the SPATIAL build via ``region=``, so an AOI run stops
+    # intersecting the whole catalog bbox and discarding the outside shards
+    # afterwards; a ``mortie.Moc`` has no ring-parts form and stays epoch-side.
+    import mortie
+
+    if isinstance(aoi, str):
+        from zagg.catalog import load_polygon
+
+        aoi = load_polygon(aoi)
+    region = None if aoi is None or isinstance(aoi, mortie.Moc) else aoi
     ref = reference_epochs(reference_stores, aoi=aoi, **store_kwargs)
     if int(parent_order) != int(ref.order):
         raise ValueError(
@@ -571,8 +586,9 @@ def closest_obs_shardmap(
             f"grid than the epochs (spec §10.5)"
         )
 
-    spatial = ShardMap.build(s2_catalog, grid, backend=backend)
+    spatial = ShardMap.build(s2_catalog, grid, region=region, backend=backend)
     spatial_idx = {int(k): i for i, k in enumerate(spatial.shard_keys)}
+    aoi_keys = _aoi_shard_set(aoi, ref.order)
 
     shard_keys: list[int] = []
     granules: list[list[dict]] = []
@@ -669,7 +685,14 @@ def closest_obs_shardmap(
         "epochs_dropped": len(dropped),
         "dropped": dropped,
         "shards_without_acquisitions": no_acquisitions,
-        "spatial_shards_without_epochs": sum(1 for k in spatial.shard_keys if k not in ref.epochs),
+        # Coverage disagreement, not self-inflicted clipping: ``ref.epochs`` is
+        # AOI-filtered, so an AOI-excluded shard is not a shard the reference
+        # stores never observed.
+        "spatial_shards_without_epochs": sum(
+            1
+            for k in spatial.shard_keys
+            if k not in ref.epochs and (aoi_keys is None or k in aoi_keys)
+        ),
         "coarsened_orders": coarse,
     }
 
