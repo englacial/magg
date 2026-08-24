@@ -1030,6 +1030,34 @@ class TestCoarsenedCoverTolerance:
         assert rec["epochs_paired"] == rec["epochs_total"] > 0
         assert {g["id"] for g in sm.granules[0]} == {"S2_0"}
 
+    def test_the_cap_arm_warns_that_a_coarsened_cover_dropped_them(self, tmp_path, caplog):
+        """Symmetric to the no-cap arm: the arm that DISCARDS is at least as loud.
+
+        The no-cap arm names the effective resolution and proceeds; the
+        with-cap arm throws epochs away, so it gets its own line naming the
+        count and the cause. The generic summary must stop mis-attributing
+        these rows to distance or a catalog gap — neither ran for them.
+        """
+        store = self._coarse_store(tmp_path)
+        cat = _s2_catalog([_s2_item("S2_0", _epoch_iso(40.0))])
+        with caplog.at_level(logging.WARNING, logger="zagg.catalog.closest_obs"):
+            sm = closest_obs_shardmap(
+                cat, store, grid=_grid(), backend="mortie", max_time_offset=np.timedelta64(3, "D")
+            )
+        n = sm.metadata["closest_obs"]["epochs_dropped_low_resolution"]
+        assert n > 0
+        drops = [m for m in caplog.messages if "UNRESOLVABLE" in m]
+        assert len(drops) == 1
+        assert f"{n} epoch(s) dropped as UNRESOLVABLE" in drops[0]
+        assert "a coarsened cover, NOT distance" in drops[0]
+        assert "temporal order 12" in drops[0]
+        # ...and the generic summary now names the third cause.
+        summary = [m for m in caplog.messages if "selected nothing" in m]
+        assert len(summary) == 1
+        assert "cover block too coarse for the offset" in summary[0]
+        # The no-cap line is the OTHER arm's; it must not fire under a cap.
+        assert not [m for m in caplog.messages if "no max_time_offset" in m]
+
     def test_half_span_exactly_at_the_cap_still_pairs(self, tmp_path):
         """The pinned boundary side: half-span == max_time_offset is pairable.
 
