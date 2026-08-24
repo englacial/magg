@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from zagg.stats.tdigest import _compress
+from zagg.stats.tdigest import _centroid_envelopes, _check_words, _compress
 
 __all__ = [
     "build_waveform_digest",
@@ -179,7 +179,8 @@ def build_waveform_digest(
     false_positive_rate: float = 1e-3,
     samples_per_record: int = 1,
     correlation_length: float = 1.0,
-) -> np.ndarray:
+    temporal: np.ndarray | None = None,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Flux-weighted t-digest of a cell's waveform samples.
 
     The ``kind: ragged`` reducer for waveform sensors: ``values`` (the
@@ -196,6 +197,26 @@ def build_waveform_digest(
     photoelectrons, any quantile is recoverable, and cross-block/overview
     folds are the existing :func:`~zagg.stats.tdigest.merge_tdigests_kway`.
 
+    ``temporal`` is the §8.3 companion channel (issue #410): per-sample
+    ``uint64`` toc words, row-aligned with ``values``, which the clip mask and
+    the value co-sort carry along so each output centroid gets the envelope of
+    the samples that survived into it
+    (:func:`zagg.stats.tdigest._centroid_envelopes`). Given, the return is a
+    ``(digest, words)`` pair. The per-centroid **shape** is the one the espg
+    ruling of 2026-08-17 makes universal, identical to the located channel's;
+    the ruling's *at every level* half does not describe this reducer's stores,
+    because ``build_waveform_digest`` is absent from
+    ``zagg.processing.streaming._TDIGEST_FUNCTIONS`` — so a waveform field is
+    D24 class ``none`` (issue #422, and the GEDI template's ``pyramid: false``)
+    and exists at native resolution only. There is no waveform overview to carry
+    a companion, and a reader must not expect one.
+
+    What the words say is ruling 2's honesty property: a waveform record's
+    samples share one instant, so a single-shot cell's centroids all carry that
+    exact timestamp and only genuinely pooled cells produce ranges — "exact when
+    ``shot_count == 1``, a range when pooled", now expressed per centroid rather
+    than per cell.
+
     Returns the ``(k, 2)`` float32 centroid array (``(0, 2)`` when nothing
     survives the clip).
     """
@@ -209,18 +230,26 @@ def build_waveform_digest(
             raise ValueError(
                 f"{name} shape {np.shape(col)} does not match values shape {values.shape}"
             )
+    if temporal is not None:
+        temporal = _check_words(temporal, "temporal", values.shape)
     n_sigma = threshold_sigma(false_positive_rate, samples_per_record, correlation_length)
     weights = waveform_weights(counts, noise_mean, noise_stddev, gain=gain, n_sigma=n_sigma)
     keep = (weights > 0.0) & np.isfinite(values) & np.isfinite(weights)
     values, weights = values[keep], weights[keep]
     if len(values) == 0:
-        return np.empty((0, 2), dtype=np.float32)
+        empty = np.empty((0, 2), dtype=np.float32)
+        return (empty, np.empty(0, dtype=np.uint64)) if temporal is not None else empty
     order = np.argsort(values, kind="stable")
-    out_means, out_weights, _starts = _compress(values[order], weights[order], float(delta))
+    out_means, out_weights, starts = _compress(values[order], weights[order], float(delta))
     out = np.empty((len(out_means), 2), dtype=np.float32)
     out[:, 0] = out_means
     out[:, 1] = out_weights
-    return out
+    if temporal is None:
+        return out
+    # The clip mask drops samples, so the channel is masked and co-sorted with
+    # the values before reducing over the partition ``_compress`` returned —
+    # never reindexed afterwards, which would misalign it from the payload.
+    return out, _centroid_envelopes(temporal[keep][order], starts, len(values))
 
 
 def shot_count(values: np.ndarray) -> int:

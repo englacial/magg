@@ -230,25 +230,96 @@ def _leaf_slabs(i):
     return {"count": counts, "h_tdigest": dig}
 
 
-def _write_leaf(root, dec, i, granules=1):
+#: The same declaration with the digest field located (ruling 4, issue #410).
+LOCATED_FIELDS = {**FIELDS, "h_tdigest": {**FIELDS["h_tdigest"], "location": "leaf_id"}}
+#: Two located fields, so ``_merge_slabs``' per-field ``pending``/``words`` (which
+#: ``_close`` closes over BY NAME, rebound each iteration) are exercised by more
+#: than one iteration — the late-binding shape a later edit breaks silently.
+TWO_LOCATED_FIELDS = {**LOCATED_FIELDS, "h2_tdigest": dict(LOCATED_FIELDS["h_tdigest"])}
+#: ONE field carrying BOTH channels — the arity the ``channels=`` map exists for
+#: (espg ruling of 2026-08-17: temporal is per-centroid at every level too).
+#: ``TWO_LOCATED_FIELDS`` above is two located FIELDS, a different shape.
+BOTH_CHANNEL_FIELDS = {
+    **LOCATED_FIELDS,
+    "h_tdigest": {**LOCATED_FIELDS["h_tdigest"], "temporal": "per-centroid"},
+}
+#: And the temporal channel alone, which is what a digest field with a clock and
+#: no ``location:`` declares.
+TIMED_FIELDS = {
+    **FIELDS,
+    "h_tdigest": {**FIELDS["h_tdigest"], "temporal": "per-centroid"},
+}
+
+
+def _companion_kwargs(meta):
+    """The ``build_tdigest`` channel kwargs ``meta`` declares, in table order."""
+    return [
+        kwarg
+        for key, kwarg in (("location", "locations"), ("temporal", "temporal"))
+        if meta.get(key) is not None
+    ]
+
+
+def _located_leaf_slabs(i, fields=LOCATED_FIELDS):
+    """``_leaf_slabs`` plus each digest field's declared companion siblings.
+
+    ``{field}_locations`` for a ``location:`` field and ``{field}_times`` for a
+    ``temporal:`` one — both when it declares both, built in the SAME
+    ``build_tdigest`` call so the two siblings describe one partition.
+    """
+    from conftest import TOC_BASE, point_words, toc_words
+
+    from zagg.stats.tdigest import build_tdigest
+
+    slabs = _leaf_slabs(i)
+    for name, meta in fields.items():
+        declared = _companion_kwargs(meta)
+        if not declared:
+            continue
+        dig = np.full(16, b"", dtype=object)
+        sibs = {kwarg: np.full(16, b"", dtype=object) for kwarg in declared}
+        for j in range(16):
+            kw = {}
+            if "locations" in declared:
+                kw["locations"] = point_words(1, seed=3000 + i * 16 + j)
+            if "temporal" in declared:
+                # A distinct instant per (leaf, cell), so no two envelopes are
+                # confusable and a word from the wrong cell is visible.
+                when = np.datetime64(TOC_BASE, "ns") + np.timedelta64(60 * (i * 16 + j), "s")
+                kw["temporal"] = toc_words(1, base=str(when))
+            d, *words = build_tdigest(np.asarray([float(i * 100 + j)]), 16, **kw)
+            dig[j] = encode_digest(d, "float32")
+            for kwarg, w in zip(kw, words, strict=True):
+                sibs[kwarg][j] = encode_digest(w, "uint64")
+        slabs[name] = dig
+        if "locations" in declared:
+            slabs[f"{name}_locations"] = sibs["locations"]
+        if "temporal" in declared:
+            slabs[f"{name}_times"] = sibs["temporal"]
+    return slabs
+
+
+def _write_leaf(root, dec, i, granules=1, fields=FIELDS, slabs=None):
     from zagg.column import column_resolutions, fold_column, write_column
     from zagg.pyramid import expand_overviews
 
     levels = expand_overviews([4], parent_order=3)
     res = column_resolutions(levels, 3)
-    folded = fold_column(_leaf_slabs(i), FIELDS, cell_order=5, resolutions=res)
+    folded = fold_column(
+        _leaf_slabs(i) if slabs is None else slabs, fields, cell_order=5, resolutions=res
+    )
     write_column(
         str(root),
         morton_word(dec),
         folded,
-        FIELDS,
+        fields,
         node_order=3,
         cell_order=5,
         granule_count=granules,
     )
 
 
-def _stage_store(root, leaves=LEAVES, skip_columns=(), write_moc=True):
+def _stage_store(root, leaves=LEAVES, skip_columns=(), write_moc=True, fields=FIELDS):
     """A tiny /2 hive store: manifest + leaf columns + root MOC (accelerator)."""
     from zagg.pyramid import expand_overviews
 
@@ -268,15 +339,17 @@ def _stage_store(root, leaves=LEAVES, skip_columns=(), write_moc=True):
                 "all_time": False,
                 "fold_source": "cascade",
                 "exact_levels": 1,
-                "fields": FIELDS,
+                "fields": fields,
             },
         },
         "generated_at": _utcnow(),
     }
     (root / MANIFEST_NAME).write_text(json.dumps(manifest, indent=1))
+    companioned = any(_companion_kwargs(m) for m in fields.values())
     for i, dec in enumerate(leaves):
         if dec not in skip_columns:
-            _write_leaf(root, dec, i)
+            slabs = _located_leaf_slabs(i, fields) if companioned else None
+            _write_leaf(root, dec, i, fields=fields, slabs=slabs)
     if write_moc:
         write_root_coverage(str(root), build_root_coverage([morton_word(d) for d in leaves], 3))
     return manifest
@@ -408,6 +481,284 @@ class TestStagePass:
         assert attrs["generation"]["n_leaves"] == 3
         counts = list(g["3"]["count"][:])
         assert counts[:2] == [136, 272] and counts[4] == 408
+
+
+class TestLocatedStageSweep:
+    """The staged sweep's §9 located paths (ruling 4 on issue #410).
+
+    ``_gather_slabs``' sibling prealloc and read loop, ``_merge_slabs``' per-cell
+    pair accumulation and its open-boundary close, and ``write_stage_column``'s
+    sibling write-through — none of which had coverage, which is precisely where
+    the half-read-pair bug lived (review finding).
+    """
+
+    def _words(self, group, res, name="h_tdigest", sibling="locations"):
+        from zagg.sweep_overview import decode_digest
+
+        payloads = group[str(res)][name][:]
+        siblings = group[str(res)][f"{name}_{sibling}"][:]
+        return [
+            (
+                decode_digest(bytes(p or b""), "float32"),
+                decode_digest(bytes(s or b""), "uint64", ()),
+            )
+            for p, s in zip(payloads, siblings, strict=True)
+        ]
+
+    def _assert_row_aligned(self, group, res, name="h_tdigest"):
+        from mortie import validate_morton
+
+        seen = 0
+        for payload, words in self._words(group, res, name):
+            assert words.shape == (payload.shape[0],), "§1.1: one word per centroid row"
+            if len(words):
+                validate_morton(words)
+                seen += 1
+        assert seen, "no populated rows -- the assertion would be vacuous"
+
+    def test_the_ladder_carries_the_channel_row_aligned(self, tmp_path):
+        m = _stage_store(tmp_path / "s", fields=LOCATED_FIELDS)
+        (row,) = _sweep(tmp_path / "s", m)["stages"]
+        assert row["written"] == 7 and row["failed"] == 0
+        # A gather level (order 2, cells 3) and a merge level (order 0, cells 1).
+        self._assert_row_aligned(_artifact(tmp_path / "s", "1/1/1/all.zarr"), 3)
+        self._assert_row_aligned(_artifact(tmp_path / "s", "1/all.zarr"), 1)
+
+    def test_the_gather_assigns_gen1_words_untouched(self, tmp_path):
+        m = _stage_store(tmp_path / "s", fields=LOCATED_FIELDS)
+        _sweep(tmp_path / "s", m)
+        leaf = _artifact(tmp_path / "s", "1/1/1/1/all.pyramid.zarr")
+        parent = _artifact(tmp_path / "s", "1/1/1/all.zarr")
+        src = leaf["3"]["h_tdigest_locations"][:]
+        out = parent["3"]["h_tdigest_locations"][:]
+        assert bytes(out[0]) == bytes(src[0]) != b""
+        assert bytes(out[2]) == b""  # uninhabited: fill on the sibling too
+
+    def test_the_merge_words_contain_their_contributors(self, tmp_path):
+        from mortie import common_ancestor
+
+        m = _stage_store(tmp_path / "s", fields=LOCATED_FIELDS)
+        _sweep(tmp_path / "s", m)
+        # The root merge over node '1' folds the three '1***' leaves' relay
+        # partials into one cell; every output word must contain its sources'.
+        merged = self._words(_artifact(tmp_path / "s", "1/all.zarr"), 1)[0][1]
+        sources = []
+        for dec in ("1111", "1112", "1121"):
+            col = _artifact(tmp_path / "s", f"1/{dec[1]}/{dec[2]}/{dec[3]}/all.pyramid.zarr")
+            for _payload, words in self._words(col, 3):
+                sources.extend(words.tolist())
+        assert len(merged) and sources
+        hull = int(common_ancestor(np.asarray(sorted(set(sources)), dtype=np.uint64)))
+        for word in merged.tolist():
+            assert int(common_ancestor(np.asarray([hull, word], dtype=np.uint64))) == hull
+
+    def _drop_member(self, root, rel, res, name):
+        """Delete one array member from a written column (schema evolution)."""
+        import shutil
+
+        shutil.rmtree(root / rel / str(res) / name)
+
+    def test_a_gather_source_without_its_channel_is_not_written_half(self, tmp_path):
+        # The bug this class exists for: ``_StageReader.read`` returns None per
+        # ARRAY, so a column predating the ``location:`` declaration reads its
+        # payload fine and its sibling as None. Assigning the payload anyway
+        # would commit populated rows against b"" words (spec §9.1/§1.1).
+        root = tmp_path / "s"
+        m = _stage_store(root, fields=LOCATED_FIELDS)
+        self._drop_member(root, "1/1/1/1/all.pyramid.zarr", 3, "h_tdigest_locations")
+        (row,) = _sweep(root, m)["stages"]
+        assert row["failed"] == 0, "one stale child must not fail the level"
+        g = _artifact(root, "1/1/1/all.zarr")
+        payloads = g["3"]["h_tdigest"][:]
+        assert bytes(payloads[0]) == b"", "the refused contributor's span stays fill"
+        assert bytes(payloads[1]) != b"", "its sibling child still gathers"
+        self._assert_row_aligned(g, 3)
+        # ... and the artifact SAYS it folded short rather than reporting clean.
+        counts = dict(g.attrs)["zagg_overview"]["source_children"]
+        assert counts == {"folded": 1, "missing": 0, "unreadable": 1}
+        # The skip is PER FIELD: the read succeeded, so the exact class -- which
+        # has no pair contract -- still folds that contributor, and the per-child
+        # ``unreadable`` count is what says the artifact folded short.
+        assert list(g["3"]["count"][:]) == [136, 272, 0, 0]
+
+    def test_a_merge_source_without_its_channel_is_skipped_not_raised(self, tmp_path):
+        # ``_merge_slabs`` used to RAISE here, unguarded at the ``_stage_fold``
+        # call site — taking the level down instead of counting the source. At
+        # the default width the one tuple gathers order 2 from the leaf columns
+        # and MERGES orders 1 and 0 from the same columns' relay members, so the
+        # dropped sibling reaches both paths.
+        root = tmp_path / "s"
+        m = _stage_store(root, fields=LOCATED_FIELDS)
+        self._drop_member(root, "1/1/1/1/all.pyramid.zarr", 3, "h_tdigest_locations")
+        (row,) = _sweep(root, m)["stages"]
+        assert row["failed"] == 0 and row["written"] == 7
+        g = _artifact(root, "1/1/all.zarr")
+        assert dict(g.attrs)["zagg_overview"]["regime"] == "stage-merge"
+        self._assert_row_aligned(g, 2)
+        assert dict(g.attrs)["zagg_overview"]["source_children"]["unreadable"] == 1
+        # The refused contributor is absent from the digest but present in the
+        # exact fold, and the pair it did write is aligned.
+        assert list(g["2"]["count"][:]) == [136 + 272, 408, 0, 0]
+
+    def test_two_located_fields_close_independently(self, tmp_path):
+        # ``_close`` closes over ``pending``/``words`` BY NAME, and both are
+        # rebound each field iteration; a second located field pins that.
+        m = _stage_store(tmp_path / "s", fields=TWO_LOCATED_FIELDS)
+        (row,) = _sweep(tmp_path / "s", m)["stages"]
+        assert row["written"] == 7 and row["failed"] == 0
+        merged = _artifact(tmp_path / "s", "1/all.zarr")
+        for name in ("h_tdigest", "h2_tdigest"):
+            self._assert_row_aligned(merged, 1, name)
+        # The two fields carry identical inputs, so identical bytes -- a
+        # cross-field leak through the closures would break that.
+        first = self._words(merged, 1, "h_tdigest")[0]
+        second = self._words(merged, 1, "h2_tdigest")[0]
+        np.testing.assert_array_equal(first[1], second[1])
+
+    def test_the_relay_column_writes_the_sibling(self, tmp_path):
+        # ``write_stage_column``'s write-through: the relay member a parent
+        # merge consumes must carry the channel, or the next tier reads a
+        # payload with no words.
+        from zagg.grids.base import located_declaration
+
+        m = _stage_store(tmp_path / "s", fields=LOCATED_FIELDS)
+        _sweep(tmp_path / "s", m, width=1)
+        col = _artifact(tmp_path / "s", "1/1/1/all.pyramid.zarr")
+        assert "h_tdigest_locations" in col["3"]
+        self._assert_row_aligned(col, 3)
+        assert located_declaration(dict(col["3"]["h_tdigest_locations"].attrs)) is not None
+        assert dict(col["3"]["h_tdigest"].attrs)["ragged"]["locations"] == "h_tdigest_locations"
+
+    def test_an_unlocated_store_is_byte_identical(self, tmp_path):
+        # The channel is opt-in: the ladder of an unlocated declaration must be
+        # exactly what it was before ruling 4.
+        m = _stage_store(tmp_path / "s")
+        _sweep(tmp_path / "s", m)
+        g = _artifact(tmp_path / "s", "1/1/1/all.zarr")
+        assert "h_tdigest_locations" not in g["3"]
+        assert "locations" not in dict(g["3"]["h_tdigest"].attrs)["ragged"]
+
+
+class TestBothChannelsStageSweep:
+    """One field, TWO channels, through the staged ladder (issue #410).
+
+    Every located test above declares a single channel, where the ``channels=``
+    map has one key and ``_companion_group``'s partial rule degenerates to the
+    old two-array shape. These declare both on ``h_tdigest``, so
+    ``_gather_slabs``' prealloc/read loop and ``_merge_slabs``' per-cell
+    accumulation carry a 3-array group — and each sibling is checked against its
+    OWN grammar, which is what catches a channel dropped, folded separately, or
+    swapped with the other (the two word grammars accept each other's words, so
+    a swap raises nowhere by itself).
+    """
+
+    _words = TestLocatedStageSweep._words
+
+    def _pairs(self, group, res, sibling):
+        return [(p, w) for p, w in self._words(group, res, sibling=sibling) if len(p)]
+
+    def test_the_ladder_carries_both_channels_row_aligned(self, tmp_path):
+        from mortie import toc_is_range, validate_morton
+
+        m = _stage_store(tmp_path / "s", fields=BOTH_CHANNEL_FIELDS)
+        (row,) = _sweep(tmp_path / "s", m)["stages"]
+        assert row["written"] == 7 and row["failed"] == 0
+        # A gather level (order 2) and a merge level (order 0).
+        for rel, res in (("1/1/1/all.zarr", 3), ("1/all.zarr", 1)):
+            g = _artifact(tmp_path / "s", rel)
+            locs = self._pairs(g, res, "locations")
+            times = self._pairs(g, res, "times")
+            assert locs and len(locs) == len(times)
+            for (payload, lw), (_p, tw) in zip(locs, times, strict=True):
+                assert lw.shape == tw.shape == (payload.shape[0],), "§1.1, both siblings"
+                validate_morton(lw)
+                toc_is_range(tw)  # a well-formed word in its own grammar
+                assert not np.array_equal(lw, tw)
+
+    def test_the_gather_relays_each_channel_into_its_own_slot(self, tmp_path):
+        # The gather assigns a gen-1 child's bytes through untouched, so the
+        # parent's two siblings must be the leaf's two siblings — not each
+        # other's. A swap here is byte-detectable, which is the point.
+        m = _stage_store(tmp_path / "s", fields=BOTH_CHANNEL_FIELDS)
+        _sweep(tmp_path / "s", m)
+        leaf = _artifact(tmp_path / "s", "1/1/1/1/all.pyramid.zarr")
+        parent = _artifact(tmp_path / "s", "1/1/1/all.zarr")
+        for sibling in ("locations", "times"):
+            src = leaf["3"][f"h_tdigest_{sibling}"][:]
+            out = parent["3"][f"h_tdigest_{sibling}"][:]
+            assert bytes(out[0]) == bytes(src[0]) != b""
+            assert bytes(out[2]) == b""  # uninhabited: fill on both siblings
+        assert bytes(parent["3"]["h_tdigest_locations"][:][0]) != bytes(
+            parent["3"]["h_tdigest_times"][:][0]
+        )
+
+    def test_the_merge_satisfies_both_containment_claims(self, tmp_path):
+        # The root merge folds the three '1***' leaves' relay partials into one
+        # cell. Its located words must ENCLOSE their sources' (§9.1) and its toc
+        # words must COVER their sources' instants (§8.3) — one partition, two
+        # claims, and neither holds for the other channel's bytes.
+        from mortie import common_ancestor
+
+        from zagg.stats.toc import cell_envelope
+
+        m = _stage_store(tmp_path / "s", fields=BOTH_CHANNEL_FIELDS)
+        _sweep(tmp_path / "s", m)
+        merged = _artifact(tmp_path / "s", "1/all.zarr")
+        src_l, src_t = [], []
+        for dec in ("1111", "1112", "1121"):
+            col = _artifact(tmp_path / "s", f"1/{dec[1]}/{dec[2]}/{dec[3]}/all.pyramid.zarr")
+            for _p, w in self._pairs(col, 3, "locations"):
+                src_l.extend(w.tolist())
+            for _p, w in self._pairs(col, 3, "times"):
+                src_t.extend(w.tolist())
+        out_l = self._words(merged, 1, sibling="locations")[0][1]
+        out_t = self._words(merged, 1, sibling="times")[0][1]
+        assert len(out_l) and len(out_t) and src_l and src_t
+        hull = int(common_ancestor(np.asarray(sorted(set(src_l)), dtype=np.uint64)))
+        for word in out_l.tolist():
+            assert int(common_ancestor(np.asarray([hull, word], dtype=np.uint64))) == hull
+        span = int(cell_envelope(np.asarray(src_t, dtype=np.uint64)))
+        assert int(cell_envelope(out_t)) == span, "§8.3 cell-level envelope identity"
+        # The located bytes do NOT satisfy the temporal claim, which is exactly
+        # what a swapped slot would have to.
+        assert int(cell_envelope(np.asarray(out_l, dtype=np.uint64))) != span
+
+    def test_one_channel_missing_refuses_the_whole_group(self, tmp_path):
+        # ``_companion_group``'s partial rule at the arity it was added for:
+        # payload + ONE of two siblings present. The half-group must be refused
+        # whole, never written as a payload with one channel row-aligned and the
+        # other at b"" (spec §1.1).
+        root = tmp_path / "s"
+        m = _stage_store(root, fields=BOTH_CHANNEL_FIELDS)
+        import shutil
+
+        shutil.rmtree(root / "1/1/1/1/all.pyramid.zarr" / "3" / "h_tdigest_times")
+        (row,) = _sweep(root, m)["stages"]
+        assert row["failed"] == 0, "one stale child must not fail the level"
+        g = _artifact(root, "1/1/1/all.zarr")
+        payloads = g["3"]["h_tdigest"][:]
+        assert bytes(payloads[0]) == b"", "the refused contributor stays fill"
+        intact = g["3"]["h_tdigest_locations"][:]
+        assert bytes(intact[0]) == b"", "and so does its INTACT sibling"
+        assert bytes(payloads[1]) != b"", "its sibling child still gathers"
+        assert dict(g.attrs)["zagg_overview"]["source_children"] == {
+            "folded": 1,
+            "missing": 0,
+            "unreadable": 1,
+        }
+
+    def test_a_timed_only_field_folds_through_the_ladder(self, tmp_path):
+        # A digest field with a clock and no ``location:`` — the temporal channel
+        # on its own, which no other test declares.
+        m = _stage_store(tmp_path / "s", fields=TIMED_FIELDS)
+        (row,) = _sweep(tmp_path / "s", m)["stages"]
+        assert row["written"] == 7 and row["failed"] == 0
+        g = _artifact(tmp_path / "s", "1/all.zarr")
+        assert "h_tdigest_locations" not in g["1"]
+        pairs = self._pairs(g, 1, "times")
+        assert pairs
+        for payload, words in pairs:
+            assert words.shape == (payload.shape[0],)
 
 
 class TestSameSecondSkipGate:
@@ -989,6 +1340,32 @@ class TestChainingAndCli:
         assert summary is not None and summary["lease"]["released"]
         # Scoped to base '1': the untouched '-2' base was not invoked.
         assert not (tmp_path / "s" / "-2" / "all.zarr").exists()
+
+    def test_stage_sweep_after_run_honours_the_never_touch_policy(self, tmp_path):
+        # Issue #501 through the ONE sweep caller that holds a config. The
+        # finisher's step 3 self-copies `aggregation.yaml`; on an archival
+        # destination an operator who declared `never` must not get one new
+        # full-size root-core version per staged sweep. Delete the
+        # `touch_policy=` kwarg anywhere along
+        # stage_sweep_after_run -> run_stage_sweep -> run_finisher and this
+        # fails (review finding on PR #496).
+        from zagg.sweep_stages import stage_sweep_after_run
+
+        _stage_store(tmp_path / "s")
+        (tmp_path / "s" / "aggregation.yaml").write_text("dataset: TEST\n")
+
+        never = stage_sweep_after_run(
+            str(tmp_path / "s"), [(morton_word("1111"), None)], touch_policy="never"
+        )
+        assert never["finisher"]["objects_touched"] == 0
+        assert never["finisher"]["touch_skipped_paths"] == 1
+
+        # The default is `auto` -- the issue #495 phase 4 inference -- so the
+        # CLI entry point, which has no config to read a policy from, is
+        # unchanged: a local core is still touched.
+        auto = stage_sweep_after_run(str(tmp_path / "s"), [(morton_word("1111"), None)])
+        assert auto["finisher"]["objects_touched"] == 1
+        assert "touch_skipped_paths" not in auto["finisher"]
 
     def test_stage_sweep_after_run_is_fail_open(self, tmp_path):
         from zagg.sweep_lease import acquire_lease

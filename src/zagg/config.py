@@ -401,6 +401,11 @@ def validate_config(config: PipelineConfig) -> None:
     # worth catching at submission rather than a knob that silently does
     # nothing.
     _validate_time_encoding(config)
+    # The per-observation clock the §8.2/§8.3 companions encode from (issue
+    # #410) — checked here for the same reason as the block above: the value is
+    # only meaningful where a companion is declared, so declaring it on a
+    # pipeline kind that has none is a typo worth catching at submission.
+    _validate_time_source(config)
 
     ptype = get_pipeline_type(config)
     if ptype != "spatial":
@@ -570,6 +575,34 @@ def validate_config(config: PipelineConfig) -> None:
         config.data_source
     )
     agg_vars = config.aggregation.get("variables", {})
+    # The derived toc word column (spec §8.2/§8.3, issue #410): materialized per
+    # observation from ``output.time_source``, so it is a real base-rate column —
+    # but READABLE only under exactly the condition
+    # ``aggregate.calculate_cell_statistics`` materializes it on, which is a field
+    # declaring a ``temporal:`` companion. Widening on the clock alone is true of
+    # every windowed gps/tai store via the ``toc_source`` fallback, so a config
+    # naming ``toc_word`` there validated clean and then died in the worker with
+    # ``KeyError``/``NameError`` (issue #410 review). The NAME is reserved
+    # unconditionally, like ``leaf_id`` — that side belongs to the reservation,
+    # not to whether the column happens to exist.
+    from zagg.time_axis import TOC_WORD_COLUMN, toc_source
+
+    # ``coordinates`` is in the reservation too (issue #410 review): coordinate
+    # columns are read into the same ``cell_data`` mapping, where the derived
+    # words would overwrite the read column — silently, and only for cells with
+    # observations.
+    coord_names = set((config.data_source or {}).get("coordinates") or {})
+    if TOC_WORD_COLUMN in ds_vars | coord_names:
+        surface = "variables" if TOC_WORD_COLUMN in ds_vars else "coordinates"
+        raise ValueError(
+            f"data_source.{surface} declares {TOC_WORD_COLUMN!r}, which is the "
+            f"reserved name of the derived toc word column output.time_source "
+            f"materializes (spec §8.2/§8.3) — rename the column"
+        )
+    if toc_source(config) is not None and any(
+        isinstance(m, dict) and m.get("temporal") for m in agg_vars.values()
+    ):
+        ds_vars = ds_vars | {TOC_WORD_COLUMN}
 
     # Validate the per-chunk precompute hook (issue #30, item 1). Each entry is
     # evaluated ONCE per chunk over the shard's pooled column data, before the
@@ -635,7 +668,7 @@ def validate_config(config: PipelineConfig) -> None:
             _validate_expression_columns(name, meta["expression"], expr_vars)
 
         # Validate the output-kind declaration (kind + trailing_shape + dtype)
-        _validate_output_kind(name, meta)
+        _validate_output_kind(name, meta, config)
 
         # Located ragged fields (issue #87): the location column is the
         # per-observation morton the HEALPix read path supplies as ``leaf_id``
@@ -701,10 +734,35 @@ def validate_config(config: PipelineConfig) -> None:
                 )
 
         # The §8.3 per-centroid temporal channel takes the same sibling-name
-        # reservation, for the same corruption reason (issue #410).
+        # reservation, for the same corruption reason (issue #410) — plus the
+        # same two reducer-surface checks the location channel gets, because it
+        # rides in the same way: as a reserved ``temporal=`` kwarg injected by
+        # aggregate.py.
         if meta.get("temporal") == "per-centroid":
             from zagg.grids.base import ragged_times_name
 
+            if "temporal" in meta.get("params", {}):
+                raise ValueError(
+                    f"Variable '{name}': params may not name 'temporal' — it is "
+                    f"reserved for the temporal channel (spec §8.3, issue #410)"
+                )
+            if has_func:
+                func = resolve_function(meta["function"])
+                try:
+                    func_params = inspect.signature(func).parameters
+                except (TypeError, ValueError):
+                    func_params = None  # ufuncs/builtins: not introspectable
+                if func_params is not None and "temporal" not in func_params:
+                    has_var_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in func_params.values()
+                    )
+                    if not has_var_kw:
+                        raise ValueError(
+                            f"Variable '{name}': function {meta['function']!r} does not "
+                            f"accept a 'temporal' keyword, which 'temporal: per-centroid' "
+                            f"requires (use a reducer carrying the channel, e.g. "
+                            f"zagg.stats.tdigest.build_tdigest)"
+                        )
             sibling = ragged_times_name(name)
             if sibling in agg_vars or sibling in config.aggregation.get("coordinates", {}):
                 raise ValueError(
@@ -949,6 +1007,127 @@ def _validate_time_encoding(config: PipelineConfig) -> None:
         )
 
 
+def _validate_time_source(config: PipelineConfig) -> None:
+    """Validate ``output.time_source`` — the per-observation clock (issue #410).
+
+    The block a temporal companion's words are encoded from:
+    ``{field, epoch, scale, units}`` (see :func:`zagg.time_axis.toc_source`).
+    Three rules beyond shape:
+
+    - ``field`` must be a BASE-RATE ``data_source.variables`` column, the same
+      constraint ``output.windowing.time_field`` carries — a companion is one
+      word per observation, so a coordinate or a segment-level column would
+      encode at the wrong rate;
+    - ``scale`` must be continuous (:data:`zagg.time_axis.TOC_SOURCE_SCALES`).
+      ``utc`` is refused by name rather than silently tolerated: §8.3 requires
+      an instant exact to the nanosecond and a nominal-UTC column is only good
+      to the leap seconds since its epoch;
+    - the declared column must not be :data:`zagg.time_axis.TOC_WORD_COLUMN`
+      itself, which is the DERIVED word column, not a source.
+
+    Declaring the block without any temporal companion is legal (it materializes
+    the derived column, which an expression may read); the converse is not — see
+    :func:`_validate_temporal_producer`.
+    """
+    from zagg.time_axis import TOC_SOURCE_SCALES, TOC_WORD_COLUMN
+    from zagg.windows import UNIT_SECONDS, parse_utc
+
+    block = (config.output or {}).get("time_source")
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"output.time_source must be a mapping {{field, epoch, scale, units}} "
+            f"(got {block!r}) — spec §8.3, issue #410"
+        )
+    unknown = set(block) - {"field", "epoch", "scale", "units"}
+    if unknown:
+        raise ValueError(
+            f"output.time_source has unknown key(s) {sorted(unknown)} "
+            f"(known: epoch, field, scale, units)"
+        )
+    field = block.get("field")
+    if not isinstance(field, str) or not field:
+        raise ValueError(
+            "output.time_source.field is required: the per-observation time column "
+            "the temporal companion's words are encoded from (issue #410)"
+        )
+    if field == TOC_WORD_COLUMN:
+        raise ValueError(
+            f"output.time_source.field {field!r} is the DERIVED toc word column, not a "
+            f"source — name the dataset-time column it is encoded from (issue #410)"
+        )
+    # Base-rate means "one value per observation AFTER the read", which includes
+    # a coarser-level variable the reader broadcasts down (issue #30): GEDI's
+    # clock is shot-rate and every sample of a waveform carries its shot's
+    # instant, which is exactly what makes a single-shot cell's centroids exact
+    # timestamps. So the accepted set is the same one every other column
+    # reference validates against — declared variables plus broadcast level
+    # variables — and NOT ``data_source.variables`` alone.
+    declared = set((config.data_source or {}).get("variables") or {}) | _segment_variable_names(
+        config.data_source or {}
+    )
+    if field not in declared:
+        raise ValueError(
+            f"output.time_source.field {field!r} is not a declared data_source variable "
+            f"(available, including broadcast level variables: {sorted(declared)}) — a "
+            f"temporal companion is one word per observation, so the column must reach "
+            f"base rate"
+        )
+    if "epoch" not in block:
+        raise ValueError(
+            "output.time_source.epoch is required: the UTC instant the column counts from"
+        )
+    parse_utc(block["epoch"])  # raises with the offending value named
+    scale = block.get("scale") or TOC_SOURCE_SCALES[0]
+    if scale not in TOC_SOURCE_SCALES:
+        raise ValueError(
+            f"output.time_source.scale must be a continuous timescale {TOC_SOURCE_SCALES} "
+            f"(got {scale!r}); a nominal-UTC column cannot carry the nanosecond-exact "
+            f"instant spec §8.3 requires of a timestamp word"
+        )
+    units = block.get("units") or "seconds"
+    if units not in UNIT_SECONDS:
+        raise ValueError(
+            f"output.time_source.units must be one of {sorted(UNIT_SECONDS)} (got {units!r})"
+        )
+    # Cross-check the two clocks (issue #410 review). ``toc_source``'s fallback
+    # single-sources the clock only when THIS block is absent, so when both are
+    # declared nothing else stops a store from routing windows on one clock and
+    # encoding its §8.3 words from another — unbounded disagreement, not a
+    # one-quantum edge effect. A windowing block on ``scale: utc`` is the
+    # deliberate exception: it gets no fallback (a nominal-UTC column cannot
+    # carry a nanosecond-exact word), so an explicit continuous declaration is
+    # the only way to carry words there, and the residual routing gap is
+    # windows.py's own documented tolerance.
+    try:
+        windowing = get_windowing(config)
+    except (KeyError, TypeError, ValueError):
+        return  # malformed windowing block: _validate_windowing names it
+    if windowing is None or windowing["scale"] not in TOC_SOURCE_SCALES:
+        return
+    disagree = [
+        (key, value, windowing[wkey])
+        for key, wkey, value in (
+            ("field", "time_field", field),
+            ("scale", "scale", scale),
+            ("units", "units", units),
+        )
+        if value != windowing[wkey]
+    ]
+    if parse_utc(block["epoch"]) != parse_utc(windowing["epoch"]):
+        disagree.append(("epoch", block["epoch"], windowing["epoch"]))
+    if disagree:
+        detail = ", ".join(f"{k}: {a!r} vs {b!r}" for k, a, b in disagree)
+        raise ValueError(
+            f"output.time_source disagrees with output.windowing ({detail}) — window "
+            f"routing and the spec §8.3 toc words would run on two different clocks, so "
+            f"an observation could be routed into a window its own stored word reads as "
+            f"outside of. Make them agree, or drop output.time_source and let it derive "
+            f"from output.windowing (issue #410)"
+        )
+
+
 def _validate_raster_config(config: PipelineConfig) -> None:
     """Validate a raster (pull-NN) pipeline config (issue #218).
 
@@ -1062,6 +1241,16 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
     store_layout = config.output.get("store_layout")
     if store_layout is not None and store_layout not in ("flat", "hive"):
         raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
+    # Lifecycle-touch policy (issue #501): validated at load so a typo fails at
+    # submission rather than silently resolving to the default deep inside a
+    # worker's skip path, where the wrong answer is either version churn on a
+    # published store or a collaborator's data expiring.
+    touch = config.output.get("touch")
+    if touch is not None and touch not in TOUCH_POLICIES:
+        raise ValueError(
+            f"output.touch must be one of {', '.join(repr(t) for t in TOUCH_POLICIES)} "
+            f"(got {touch!r})"
+        )
     # D19 product name (issue #299): validated at load so a bad name fails
     # before any store I/O. The grammar lives in hive.py (one source).
     name = config.output.get("product_name")
@@ -1599,16 +1788,19 @@ def _validate_chunk_precompute(aggregation: dict, ds_vars: set[str]) -> None:
         return
     if not isinstance(precompute, dict):
         raise ValueError("aggregation.chunk_precompute must be a mapping of name -> entry")
-    reserved = ds_vars | {"leaf_id"}
+    from zagg.time_axis import TOC_WORD_COLUMN
+
+    reserved = ds_vars | {"leaf_id", TOC_WORD_COLUMN}
     for name, meta in precompute.items():
         if not isinstance(name, str) or not name.strip():
             raise ValueError("chunk_precompute entry names must be non-empty strings")
         if name in reserved:
             raise ValueError(
                 f"chunk_precompute '{name}': name collides with a "
-                f"data_source.variables column or the reserved 'leaf_id'; the "
-                f"per-cell namespace merge would shadow the real column with a "
-                f"chunk scalar. Rename the precompute entry."
+                f"data_source.variables column or a reserved derived column "
+                f"('leaf_id', {TOC_WORD_COLUMN!r}); the per-cell namespace merge "
+                f"would shadow the real column with a chunk scalar. Rename the "
+                f"precompute entry."
             )
         if not isinstance(meta, dict):
             raise ValueError(f"chunk_precompute '{name}': entry must be a mapping")
@@ -1666,7 +1858,7 @@ OUTPUT_KINDS = ("scalar", "vector", "ragged")
 OUTPUT_RESOLUTIONS = ("cell", "chunk")
 
 
-def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
+def _validate_temporal_shape(name: str, meta: dict, kind: str, config=None) -> None:
     """Validate a field's ``temporal:`` declaration (spec §8.2/§8.3, #410).
 
     The declared value is a §8 **shape**, and each shape pins the array that
@@ -1685,11 +1877,10 @@ def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
     ``coordinate`` is deliberately not accepted here: a time axis is declared
     by ``output.time_encoding`` (§8.1), not by an aggregation variable.
 
-    A well-formed declaration is then gated on a PRODUCER — see
-    :func:`_validate_temporal_producer`, which refuses every ``temporal:`` in
-    this release. The shape checks run first, and deliberately: they are the
-    live checks the moment the kernel lifts the gate, so they are worth
-    reporting to an author ahead of it.
+    A well-formed declaration is then gated on a PRODUCER and on the store's
+    per-observation clock — see :func:`_validate_temporal_producer`. The shape
+    checks run first, and deliberately: they describe the field itself, so they
+    are the more useful message when both are wrong.
     """
     from zagg.time_axis import (
         TOC_FIELD_SHAPES,
@@ -1748,57 +1939,84 @@ def _validate_temporal_shape(name: str, meta: dict, kind: str) -> None:
                 f"fill_value {TOC_UNOBSERVED} (got {fill!r}) — §8.2 reserves it as the "
                 f"unobserved-cell marker"
             )
-        _validate_temporal_producer(name, meta)
+        _validate_temporal_producer(name, meta, config)
         return
     if kind != "ragged":
         raise ValueError(
             f"Variable '{name}': temporal {TOC_SHAPE_PER_CENTROID!r} is a sibling of a "
             f"ragged payload, so kind must be 'ragged', not {kind!r} (spec §8.3)"
         )
-    _validate_temporal_producer(name, meta)
+    _validate_temporal_producer(name, meta, config)
 
 
-def _validate_temporal_producer(name: str, meta: dict) -> None:
-    """Refuse a ``temporal:`` companion no reducer in this release produces.
+def _validate_temporal_producer(name: str, meta: dict, config=None) -> None:
+    """Refuse a ``temporal:`` companion nothing in this release would produce.
 
-    The §8.2/§8.3 declaration surface landed ahead of the kernel that folds the
-    words (issue #410), so a config declaring a companion today would validate,
-    run, stamp the declaration, and write a store that violates the section it
-    declares — an all-empty ``{field}_times`` sibling beside a populated
-    payload (§8.3's row-alignment MUST), or a dense array holding the field's
-    own reducer output cast to ``uint64`` under a ``zagg-toc/1`` stamp (§8.2's
-    envelope claim). Refusing at submission is the same gate
-    :func:`zagg.processing.streaming.validate_streaming` applies to a located
-    field under ``mode: merge`` — name the channel the chosen path cannot
-    honor, and name the path that will.
+    A declaration whose reducer emits no toc words would validate, run, stamp
+    the §8 declaration, and write a store violating the section it declares —
+    an all-empty ``{field}_times`` sibling beside a populated payload (§8.3's
+    row-alignment MUST), or a dense array holding the field's own reducer output
+    cast to ``uint64`` under a ``zagg-toc/1`` stamp (§8.2's envelope claim). The
+    gate is therefore an allowlist,
+    :data:`zagg.time_axis.TOC_PRODUCING_FUNCTIONS`, split by the shape each
+    reducer can serve: :data:`~zagg.time_axis.TOC_PER_CELL_FUNCTIONS` produce a
+    whole-cell word, the rest carry the channel beside a ragged payload.
 
-    The gate is an allowlist of producing reducers,
-    :data:`zagg.time_axis.TOC_PRODUCING_FUNCTIONS`, **empty in this release**,
-    so the refusal is total for users; the kernel PR lifts it per reducer.
-
-    The one documented bypass is the §7 conformance-fixture generator
-    (``tools/generate_spec_fixtures.py``), which constructs its
-    ``PipelineConfig`` directly and never calls :func:`validate_config` — it
-    feeds hand-computed words through the production write path precisely
-    because no reducer produces them yet. That is a test-only seam: every user
-    entry point (``load_config``, ``zagg.client``, ``client_transport``)
-    validates, so no runnable submission reaches the writer.
+    A producing reducer is necessary but not sufficient: the words have to come
+    from somewhere, so a companion also requires the store's per-observation
+    clock (``output.time_source``, :func:`zagg.time_axis.toc_source` — which
+    falls back to a continuous-scale ``output.windowing``). ``config`` is
+    optional only so the per-field checks stay callable in isolation; every
+    ``validate_config`` path passes it.
     """
-    from zagg.time_axis import TOC_PRODUCING_FUNCTIONS
-
-    func = meta.get("function")
-    if func is not None and func in TOC_PRODUCING_FUNCTIONS:
-        return
-    raise ValueError(
-        f"Variable '{name}': 'temporal' declares a companion that no reducer in this "
-        f"release produces (function {func!r}) — the spec §8.2/§8.3 declaration "
-        f"surface landed ahead of the toc aggregation kernel, so enabling it would "
-        f"write a store violating the section it declares. The gate lifts with the "
-        f"kernel (issue #410)."
+    from zagg.time_axis import (
+        TOC_NO_CLOCK_ERROR,
+        TOC_PER_CELL_FUNCTIONS,
+        TOC_PRODUCING_FUNCTIONS,
+        TOC_SHAPE_PER_CELL,
+        toc_source,
     )
 
+    shape = meta.get("temporal")
+    func = meta.get("function")
+    if func not in TOC_PRODUCING_FUNCTIONS:
+        raise ValueError(
+            f"Variable '{name}': 'temporal' declares a companion that function {func!r} "
+            f"does not produce — only {sorted(TOC_PRODUCING_FUNCTIONS)} emit toc words "
+            f"(spec §8.2/§8.3, issue #410)"
+        )
+    per_cell_reducer = func in TOC_PER_CELL_FUNCTIONS
+    if per_cell_reducer != (shape == TOC_SHAPE_PER_CELL):
+        wants = TOC_SHAPE_PER_CELL if per_cell_reducer else "per-centroid"
+        raise ValueError(
+            f"Variable '{name}': function {func!r} produces the {wants!r} temporal "
+            f"shape, not {shape!r} — a whole-cell reducer cannot fill a per-centroid "
+            f"sibling, and a digest kernel's channel is not a dense per-cell array "
+            f"(spec §8.2/§8.3)"
+        )
+    # The clock cross-check runs through the same resolver the worker encodes
+    # with (``toc_source``: ``output.time_source``, falling back to a
+    # continuous-scale ``output.windowing`` block), and raises the worker's
+    # exact message so the two seams read identically (issue #472) — the
+    # worker's copy stays as defense in depth. Two limits on that parity, both
+    # named here because this is where a reader will look (fold review):
+    #   * this seam is reachable only from ``validate_config``'s spatial,
+    #     non-raster branch (the aggregation-variable loop, after both early
+    #     returns), while ``_toc_word_column`` is ungated. Benign today —
+    #     ``calculate_cell_statistics`` is only reached from the spatial point
+    #     path, so no other branch can produce toc words — but a raster or
+    #     event toc path would inherit the gap silently.
+    #   * the resolver is shared, but the two clock declarations validate their
+    #     COLUMN against different sets: ``_validate_time_source`` accepts a
+    #     broadcast/segment-level column (GEDI's shot-rate clock) where
+    #     ``_validate_windowing`` refuses one (segment-rate window membership
+    #     is unsupported), so the fallback is not interchangeable with the
+    #     explicit block.
+    if config is not None and toc_source(config) is None:
+        raise ValueError(f"Variable '{name}': {TOC_NO_CLOCK_ERROR}")
 
-def _validate_output_kind(name: str, meta: dict) -> None:
+
+def _validate_output_kind(name: str, meta: dict, config=None) -> None:
     """Validate a variable's non-scalar output declaration.
 
     A field may declare ``kind`` (``scalar`` default, ``vector``, or ``ragged``)
@@ -1861,7 +2079,7 @@ def _validate_output_kind(name: str, meta: dict) -> None:
                 f"Variable '{name}': '{key}' is only valid for kind 'ragged', not '{kind}'"
             )
 
-    _validate_temporal_shape(name, meta, kind)
+    _validate_temporal_shape(name, meta, kind, config)
 
     # resolution (cell default, or chunk). A chunk-resolution field stores one
     # value per chunk in a companion array (issue #30 item 2). ``scalar`` and
@@ -2240,7 +2458,10 @@ def _validate_vlen_source(data_source: dict) -> None:
       linspace comes from that level's link);
     - ``data_source.assets`` entries carry a ``join`` block with string
       ``left``/``right`` key paths; every filter's ``asset`` names a declared
-      entry, and asset filters require the vlen route.
+      entry, and asset filters require the vlen route;
+    - asset-sourced level variables (issue #464) require the vlen route, live
+      on ``coordinates.level`` only (the record-key join aligns that level's
+      records), and name a declared asset.
     """
     ds = data_source or {}
     coords = ds.get("coordinates")
@@ -2308,6 +2529,35 @@ def _validate_vlen_source(data_source: dict) -> None:
                 f"filter[{i}]: 'asset' filters require the vlen route "
                 "(set data_source.coordinates.level)"
             )
+    # Asset-sourced level variables (issue #464): shape is validated in
+    # ``_validate_overviews``; the cross-checks live here because they need
+    # ``coordinates.level`` and ``assets``.
+    if isinstance(levels, dict):
+        for lvl_name, lvl in levels.items():
+            lvl_vars = lvl.get("variables") if isinstance(lvl, dict) else None
+            if not isinstance(lvl_vars, dict):
+                continue
+            for var_name, entry in lvl_vars.items():
+                if not isinstance(entry, dict):
+                    continue
+                where = f"levels.{lvl_name}.variables['{var_name}']"
+                if coord_level is None:
+                    raise ValueError(
+                        f"{where}: asset variables require the vlen route "
+                        "(set data_source.coordinates.level)"
+                    )
+                if lvl_name != coord_level:
+                    raise ValueError(
+                        f"{where}: asset variables are record-level by construction "
+                        f"(the join key aligns records); declare them on "
+                        f"coordinates.level {coord_level!r}"
+                    )
+                asset = entry.get("asset")
+                if not isinstance(assets, dict) or asset not in assets:
+                    raise ValueError(
+                        f"{where}: asset {asset!r} is not declared in data_source.assets "
+                        f"(available: {sorted(assets) if isinstance(assets, dict) else []})"
+                    )
 
 
 def _segment_variable_names(data_source: dict) -> set[str]:
@@ -2367,10 +2617,12 @@ def _validate_overviews(data_source: dict) -> None:
             raise ValueError(f"levels.{name}: 'path' is required")
         # A non-base level may declare ``variables`` as a ``{name: path-template}``
         # mapping (issue #30): a readable segment-level variable broadcast to the
-        # base rows at read time. Validate it like ``data_source.variables`` (string
-        # names -> non-empty string path templates) and forbid the mapping form on
-        # the base level (the base level uses ``data_source.variables``). The
-        # documentation-only ``list[str]`` form stays valid on any level.
+        # base rows at read time. An entry may instead be an ``{asset, path}``
+        # mapping (issue #464): the same broadcast, sourced from a sibling asset
+        # via the record-key join. Validate names and entry shapes, and forbid the
+        # mapping form on the base level (the base level uses
+        # ``data_source.variables``). The documentation-only ``list[str]`` form
+        # stays valid on any level.
         lvl_vars = lvl.get("variables")
         if isinstance(lvl_vars, dict):
             if name == base_level:
@@ -2383,10 +2635,38 @@ def _validate_overviews(data_source: dict) -> None:
                     raise ValueError(
                         f"levels.{name}.variables: variable names must be non-empty strings"
                     )
-                if not isinstance(tmpl, str) or not tmpl:
+                if isinstance(tmpl, dict):
+                    # Asset-sourced record-level variable (issue #464): the
+                    # dataset is read from the named sibling asset's handle and
+                    # joined per record on the declared ``assets.<name>.join``
+                    # key. Shape only here; cross-checks against ``assets`` and
+                    # ``coordinates.level`` live in ``_validate_vlen_source``.
+                    unknown = set(tmpl) - {"asset", "path"}
+                    if unknown:
+                        # 'column' is the near-miss worth naming: the plain
+                        # variable form takes one, while the asset form is
+                        # scoped to record-rate scalars and does not (issue
+                        # #464 review; richer L2A companions ride issue #465).
+                        hint = (
+                            "; the asset form reads 1-D datasets only, with no "
+                            "'column' selector yet (refs issue #465)"
+                            if "column" in unknown
+                            else ""
+                        )
+                        raise ValueError(
+                            f"levels.{name}.variables.{var_name}: unknown keys "
+                            f"{sorted(unknown)} (the asset form takes 'asset' and 'path'){hint}"
+                        )
+                    for key in ("asset", "path"):
+                        if not isinstance(tmpl.get(key), str) or not tmpl[key]:
+                            raise ValueError(
+                                f"levels.{name}.variables.{var_name}.{key} must be a "
+                                f"non-empty string"
+                            )
+                elif not isinstance(tmpl, str) or not tmpl:
                     raise ValueError(
                         f"levels.{name}.variables.{var_name}: path template must be a "
-                        f"non-empty string (got {tmpl!r})"
+                        f"non-empty string or an {{asset, path}} mapping (got {tmpl!r})"
                     )
                 if var_name in base_vars:
                     raise ValueError(
@@ -2911,6 +3191,51 @@ def get_store_path(config: PipelineConfig) -> str | None:
     str or None
     """
     return config.output.get("store")
+
+
+#: Legal ``output.touch`` values (issue #501). ``auto`` is the issue #495
+#: phase 4 inference; the other two are the operator's override of it.
+TOUCH_POLICIES = ("auto", "always", "never")
+
+
+def get_touch_policy(config: PipelineConfig) -> str:
+    """Return the skip-run lifecycle-touch policy (issue #501).
+
+    The touch (issue #388) defeats a bucket EXPIRATION rule, so whether to run
+    it is a property of the destination — one we cannot read cross-account
+    (``s3:GetLifecycleConfiguration`` is bucket-owner only) and that no bucket
+    name reliably encodes. The operator knows, so it is declarable:
+
+    ``auto`` (default)
+        The issue #495 phase 4 inference, verbatim: touch unless the
+        destination is in :data:`zagg.store._PUBLISHED_BUCKETS`. A pure no-op
+        for every config that predates this knob.
+    ``always``
+        Touch regardless of destination — an un-negotiated external target
+        whose expiry rule we know about but whose name says nothing.
+    ``never``
+        Never touch, local paths included — an archival destination, or one
+        where version churn outweighs the protection.
+
+    An override layered ON TOP of the inference, not a replacement.
+
+    An unrecognized value falls through to ``auto`` (:func:`zagg.lifecycle.
+    _touch_applies`) but WARNS first: :func:`validate_config` rejects a typo at
+    submission, but the worker's own funnel — :func:`load_config_from_dict` on
+    a hand-built invoke event — does not validate, so ``touch: "nevr"`` would
+    otherwise touch an archival destination against the operator's stated
+    intent with nothing in the log. One greppable line instead (review finding
+    on PR #496).
+    """
+    touch = config.output.get("touch", "auto")
+    if touch not in TOUCH_POLICIES:
+        logger.warning(
+            f"output.touch={touch!r} is not one of "
+            f"{', '.join(repr(t) for t in TOUCH_POLICIES)} — falling through to 'auto' "
+            "(the issue #495 phase 4 inference); this config was not validated at "
+            "submission (issue #501)"
+        )
+    return touch
 
 
 def get_store_layout(config: PipelineConfig) -> str:

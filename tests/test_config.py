@@ -1,6 +1,7 @@
 """Tests for the YAML pipeline configuration system."""
 
 import json
+import re
 from dataclasses import asdict
 
 import numpy as np
@@ -9,6 +10,7 @@ import pytest
 
 from zagg.config import (
     PipelineConfig,
+    _segment_variable_names,
     _validate_output_kind,
     default_config,
     evaluate_expression,
@@ -32,6 +34,7 @@ from zagg.config import (
     validate_config,
 )
 from zagg.processing import calculate_cell_statistics
+from zagg.time_axis import TOC_NO_CLOCK_ERROR
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -2127,6 +2130,24 @@ def _ragged_cfg(inner_shape=None, **overrides):
     )
 
 
+def _clocked(cfg, field="delta_time", **overrides):
+    """Add the store's per-observation clock to a config (spec §8.3, #410).
+
+    ``output.time_source`` is what a temporal companion encodes its words from,
+    so every valid ``temporal:`` config carries it; the declared column has to
+    be a base-rate ``data_source.variables`` entry, hence the pair.
+    """
+    cfg.data_source["variables"][field] = f"{{group}}/{field}"
+    cfg.output["time_source"] = {
+        "field": field,
+        "epoch": "2018-01-01T00:00:00",
+        "scale": "gps",
+        "units": "seconds",
+        **overrides,
+    }
+    return cfg
+
+
 class TestRaggedKind:
     def test_valid_ragged_validates(self):
         """A ragged field with inner_shape declared validates without error."""
@@ -2336,58 +2357,105 @@ class TestTemporalShapeDeclaration:
 
     def _cell_cfg(self, **overrides):
         meta = {
-            "function": "nanmax",
-            "source": "h_ph",
+            "function": "zagg.stats.toc.cell_envelope",
+            "source": "toc_word",
             "dtype": "uint64",
             "fill_value": 0,
             "temporal": "per-cell",
             **overrides,
         }
-        cfg = _ragged_cfg(inner_shape=[2])
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
         cfg.aggregation["variables"] = {"observed": meta}
         return cfg
 
-    @staticmethod
-    def _allow(monkeypatch, *functions):
-        """Lift the #410 producer gate for the named reducers.
+    def _centroid_cfg(self, **overrides):
+        return _clocked(
+            _ragged_cfg(
+                inner_shape=[2],
+                temporal="per-centroid",
+                function="zagg.stats.tdigest.build_tdigest",
+                **overrides,
+            )
+        )
 
-        Stands in for the kernel PR, which lifts it by naming its reducer in
-        ``TOC_PRODUCING_FUNCTIONS``. Every shape check below is live the
-        moment it does, so they are exercised through this seam rather than
-        left untested behind the gate.
-        """
-        from zagg import time_axis
+    def test_per_centroid_on_a_ragged_field_validates(self):
+        validate_config(self._centroid_cfg())
 
-        monkeypatch.setattr(time_axis, "TOC_PRODUCING_FUNCTIONS", frozenset(functions))
-
-    def test_per_centroid_on_a_ragged_field_validates(self, monkeypatch):
-        self._allow(monkeypatch, "mean")
-        validate_config(_ragged_cfg(inner_shape=[2], temporal="per-centroid"))
-
-    def test_per_cell_on_a_dense_uint64_field_validates(self, monkeypatch):
-        self._allow(monkeypatch, "nanmax")
+    def test_per_cell_on_a_dense_uint64_field_validates(self):
         validate_config(self._cell_cfg())
 
-    def test_temporal_is_refused_until_a_reducer_produces_words(self):
-        # The declaration surface landed ahead of the kernel: no reducer
-        # produces toc words today, so a runnable config declaring one would
-        # write a store violating §8.2/§8.3. Refuse at submission, the way
-        # validate_streaming refuses a located field under mode: merge.
-        for cfg in (_ragged_cfg(inner_shape=[2], temporal="per-centroid"), self._cell_cfg()):
-            with pytest.raises(ValueError, match="no reducer in this release produces"):
-                validate_config(cfg)
+    def test_a_non_producing_reducer_is_refused(self):
+        # The gate keys on the FIELD's reducer: only the allowlisted ones emit
+        # toc words, and anything else would stamp a zagg-toc/1 declaration over
+        # its own output cast to uint64 (spec §8.2's envelope claim).
+        with pytest.raises(ValueError, match="does not produce"):
+            validate_config(self._cell_cfg(function="nanmax"))
+        with pytest.raises(ValueError, match="does not produce"):
+            validate_config(_clocked(_ragged_cfg(inner_shape=[2], temporal="per-centroid")))
 
-    def test_the_refusal_names_the_kernel_that_lifts_it(self):
+    def test_the_refusal_names_the_issue(self):
         with pytest.raises(ValueError, match=r"issue #410"):
-            validate_config(self._cell_cfg())
+            validate_config(self._cell_cfg(function="nanmax"))
 
-    def test_an_allowlisted_reducer_is_the_only_way_through(self, monkeypatch):
-        # The gate keys on the FIELD's reducer, not on the shape: allowlisting
-        # one reducer does not open the declaration to another's.
-        self._allow(monkeypatch, "nanmax")
-        validate_config(self._cell_cfg())
-        with pytest.raises(ValueError, match="no reducer in this release produces"):
-            validate_config(self._cell_cfg(function="nanmin"))
+    def test_shape_and_reducer_must_agree(self):
+        # A whole-cell reducer cannot fill a per-centroid sibling, and a digest
+        # kernel's channel is not a dense per-cell array. The two allowlist
+        # halves partition, so a crossed declaration is named as such.
+        cfg = self._cell_cfg(function="zagg.stats.tdigest.build_tdigest")
+        with pytest.raises(ValueError, match="produces the 'per-centroid' temporal shape"):
+            validate_config(cfg)
+
+    def test_temporal_requires_the_stores_clock(self):
+        # Without output.time_source (or a continuous-scale windowing block to
+        # fall back to) there is no column to encode words from. The refusal is
+        # the worker's own text (issue #472) prefixed with the variable name.
+        cfg = self._centroid_cfg()
+        del cfg.output["time_source"]
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            validate_config(cfg)
+
+    def test_windowing_satisfies_the_clock(self):
+        # One declaration for window routing AND toc ingest, so the two cannot
+        # disagree at a window boundary.
+        cfg = self._centroid_cfg()
+        del cfg.output["time_source"]
+        cfg.data_source["variables"]["delta_time"] = "{group}/delta_time"
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+        }
+        validate_config(cfg)
+
+    def test_params_may_not_shadow_the_temporal_kwarg(self):
+        with pytest.raises(ValueError, match="reserved for the temporal channel"):
+            validate_config(self._centroid_cfg(params={"temporal": "h_ph"}))
+
+    def test_per_centroid_requires_a_temporal_capable_reducer(self):
+        # A reducer with no ``temporal`` keyword would raise per cell; reject at
+        # load, exactly as the located channel does for ``locations``. Note the
+        # producer allowlist is checked too, so a reducer must fail BOTH gates to
+        # be a clean case — ``np.sort`` takes no such keyword and produces no
+        # words. (``build_waveform_digest`` carries the channel as of phase 4, so
+        # it is no longer the example here.)
+        cfg = self._centroid_cfg()
+        cfg.aggregation["variables"]["h_ph_tdigest"]["function"] = "np.sort"
+        with pytest.raises(
+            ValueError, match="does not accept a 'temporal' keyword|does not produce"
+        ):
+            validate_config(cfg)
+
+    def test_the_waveform_reducer_carries_the_channel(self):
+        # Phase 4 (issue #410): GEDI's flux reducer accepts ``temporal=`` and is
+        # on the producer allowlist, so a waveform field may declare a companion.
+        import inspect
+
+        from zagg.stats.waveform import build_waveform_digest
+        from zagg.time_axis import TOC_PRODUCING_FUNCTIONS
+
+        assert "temporal" in inspect.signature(build_waveform_digest).parameters
+        assert "zagg.stats.waveform.build_waveform_digest" in TOC_PRODUCING_FUNCTIONS
 
     def test_undeclared_fields_are_untouched_by_the_gate(self):
         # The gate is scoped to `temporal:` — every other config still loads.
@@ -2435,10 +2503,8 @@ class TestTemporalShapeDeclaration:
                 _ragged_cfg(inner_shape=[2], temporal="per-centroid", resolution="chunk")
             )
 
-    def test_sibling_name_collision_rejected(self, monkeypatch):
-        # Behind the producer gate, like every other shape check here.
-        self._allow(monkeypatch, "mean")
-        cfg = _ragged_cfg(inner_shape=[2], temporal="per-centroid")
+    def test_sibling_name_collision_rejected(self):
+        cfg = self._centroid_cfg()
         cfg.aggregation["variables"]["h_ph_tdigest_times"] = {
             "function": "mean",
             "source": "h_ph",
@@ -2456,6 +2522,317 @@ class TestTemporalShapeDeclaration:
         assert entries[0]["temporal"] == "per-centroid"
         # Undeclared: keyed-only-when-set, so existing signatures are stable.
         assert "temporal" not in output_field_signature(_ragged_cfg(inner_shape=[2]))[0]
+
+
+class TestTimeSource:
+    """``output.time_source`` — the per-observation clock (spec §8.3, #410)."""
+
+    def test_valid_block_validates(self):
+        validate_config(_clocked(_ragged_cfg(inner_shape=[2])))
+
+    def test_absent_block_resolves_to_none(self):
+        from zagg.time_axis import toc_source
+
+        assert toc_source(_ragged_cfg(inner_shape=[2])) is None
+
+    def test_resolved_shape(self):
+        from zagg.time_axis import toc_source
+
+        assert toc_source(_clocked(_ragged_cfg(inner_shape=[2]))) == {
+            "field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+            "units": "seconds",
+        }
+
+    def test_units_default_to_seconds(self):
+        from zagg.time_axis import toc_source
+
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        del cfg.output["time_source"]["units"]
+        assert toc_source(cfg)["units"] == "seconds"
+
+    def test_utc_scale_refused_by_name(self):
+        # §8.3 wants an instant exact to the nanosecond; a nominal-UTC offset
+        # column is only good to the leap seconds since its epoch.
+        with pytest.raises(ValueError, match="continuous timescale"):
+            validate_config(_clocked(_ragged_cfg(inner_shape=[2]), scale="utc"))
+
+    def test_unknown_units_refused(self):
+        with pytest.raises(ValueError, match="time_source.units must be one of"):
+            validate_config(_clocked(_ragged_cfg(inner_shape=[2]), units="ticks"))
+
+    def test_field_must_be_a_declared_variable(self):
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        del cfg.data_source["variables"]["delta_time"]
+        with pytest.raises(ValueError, match="not a declared data_source variable"):
+            validate_config(cfg)
+
+    def test_field_may_not_be_the_derived_word_column(self):
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.output["time_source"]["field"] = "toc_word"
+        with pytest.raises(ValueError, match="is the DERIVED toc word column"):
+            validate_config(cfg)
+
+    def test_epoch_required_and_parsed(self):
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        del cfg.output["time_source"]["epoch"]
+        with pytest.raises(ValueError, match="time_source.epoch is required"):
+            validate_config(cfg)
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]), epoch="not-a-date")
+        with pytest.raises(ValueError, match="is not an ISO-8601 datetime"):
+            validate_config(cfg)
+
+    def test_unknown_keys_refused(self):
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.output["time_source"]["quantum"] = 1
+        with pytest.raises(ValueError, match=r"unknown key\(s\) \['quantum'\]"):
+            validate_config(cfg)
+
+    def test_non_mapping_refused(self):
+        cfg = _ragged_cfg(inner_shape=[2])
+        cfg.output["time_source"] = "delta_time"
+        with pytest.raises(ValueError, match="time_source must be a mapping"):
+            validate_config(cfg)
+
+    def test_utc_windowing_is_not_a_fallback(self):
+        # The fallback exists to keep ONE clock in a windowed store; a utc-scale
+        # windowing block cannot serve as one, so a companion must declare its
+        # own continuous column rather than silently inherit a coarser one.
+        from zagg.time_axis import toc_source
+
+        cfg = _ragged_cfg(inner_shape=[2])
+        cfg.data_source["variables"]["delta_time"] = "{group}/delta_time"
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "utc",
+        }
+        assert toc_source(cfg) is None
+
+    def test_derived_column_is_a_valid_source_reference(self):
+        # ``toc_word`` becomes a real base-rate column once the clock is
+        # declared, so a per-cell companion may name it — and only then.
+        cfg = _ragged_cfg(inner_shape=[2])
+        cfg.aggregation["variables"]["observed"] = {
+            "function": "zagg.stats.toc.cell_envelope",
+            "source": "toc_word",
+            "dtype": "uint64",
+            "fill_value": 0,
+            "temporal": "per-cell",
+        }
+        with pytest.raises(ValueError, match="source 'toc_word' not in data_source.variables"):
+            validate_config(cfg)
+        validate_config(_clocked(cfg))
+
+    def test_derived_column_is_only_readable_where_it_is_materialized(self):
+        # Validation and materialization must gate on the SAME condition — a
+        # declared ``temporal:`` companion. Widening on the clock alone is true of
+        # every windowed gps/tai store via the fallback, so these two configs
+        # validated clean and then raised KeyError/NameError in the worker
+        # (issue #410 review).
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.aggregation["variables"]["t_max"] = {
+            "function": "numpy.max",
+            "source": "toc_word",
+            "dtype": "uint64",
+            "fill_value": 0,
+        }
+        with pytest.raises(ValueError, match="source 'toc_word' not in data_source.variables"):
+            validate_config(cfg)
+        # Declaring a companion materializes the column, and both readers resolve.
+        cfg.aggregation["variables"]["observed"] = {
+            "function": "zagg.stats.toc.cell_envelope",
+            "source": "toc_word",
+            "dtype": "uint64",
+            "fill_value": 0,
+            "temporal": "per-cell",
+        }
+        validate_config(cfg)
+
+    def test_chunk_precompute_cannot_read_the_unmaterialized_derived_column(self):
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.aggregation["chunk_precompute"] = {"tmax": {"expression": "toc_word.max()"}}
+        with pytest.raises(ValueError, match="expression references 'toc_word'"):
+            validate_config(cfg)
+
+    def test_declared_column_may_not_shadow_the_derived_name(self):
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.data_source["variables"]["toc_word"] = "{group}/toc_word"
+        with pytest.raises(ValueError, match="reserved name of the derived toc word column"):
+            validate_config(cfg)
+        # The NAME is reserved unconditionally — the reservation does not depend
+        # on whether a clock (or a companion) happens to be declared.
+        bare = _ragged_cfg(inner_shape=[2])
+        bare.data_source["variables"]["toc_word"] = "{group}/toc_word"
+        with pytest.raises(ValueError, match="reserved name of the derived toc word column"):
+            validate_config(bare)
+
+    def test_declared_coordinate_may_not_shadow_the_derived_name(self):
+        # Coordinates are read into the same cell_data mapping the derived words
+        # are merged into, so an unreserved name there would be overwritten
+        # silently, and only for the cells with observations (issue #410 review).
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.data_source["coordinates"] = {
+            **(cfg.data_source.get("coordinates") or {}),
+            "toc_word": "{group}/toc_word",
+        }
+        with pytest.raises(ValueError, match=r"data_source.coordinates declares 'toc_word'"):
+            validate_config(cfg)
+
+    def test_both_clock_declarations_must_agree(self):
+        # The fallback single-sources the clock only when time_source is ABSENT.
+        # Unchecked, a store declaring both routes windows on one clock and
+        # encodes its §8.3 words from another (issue #410 review).
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+            "units": "seconds",
+        }
+        validate_config(cfg)  # an agreeing pair is the normal case
+        cfg.data_source["variables"]["other_time"] = "{group}/other_time"
+        cfg.output["time_source"].update(
+            {
+                "field": "other_time",
+                "epoch": "2020-06-01T00:00:00",
+                "scale": "tai",
+                "units": "days",
+            }
+        )
+        with pytest.raises(ValueError, match="disagrees with output.windowing"):
+            validate_config(cfg)
+
+    def test_a_utc_windowing_block_is_exempt_from_the_cross_check(self):
+        # The one path that deliberately carries two declarations of the same
+        # column on two scales: a utc windowing block gets no fallback, so the
+        # explicit continuous declaration must be allowed to differ from it.
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "utc",
+        }
+        validate_config(cfg)
+
+    def test_chunk_precompute_may_not_shadow_the_derived_name(self):
+        cfg = _clocked(_ragged_cfg(inner_shape=[2]))
+        cfg.aggregation["chunk_precompute"] = {"toc_word": {"function": "mean", "source": "h_ph"}}
+        with pytest.raises(ValueError, match="reserved derived column"):
+            validate_config(cfg)
+
+
+class TestTemporalClockAtSubmission:
+    """``validate_config`` refuses a ``temporal:`` companion whose clock does
+    not resolve, in the worker's own words (issue #472).
+
+    The config shape is the observed one: the ``02_write`` demo grafted
+    ``aggregation["variables"]`` from ``atl03_tdigest_located_healpix`` (whose
+    variables declare ``temporal: per-centroid``, PR #463) onto the hive base
+    template without also grafting ``output.time_source`` and the
+    ``delta_time`` source column.
+
+    These are **validator-level** pins: the checks themselves predate this PR
+    (``a67be395``/``ef68ef74``, issue #410) and pass on ``main`` — what is new
+    here is the single-sourced message text (``test_both_seams_raise_the_same_text``).
+    The regression for the reported symptom is one seam up, where the graft
+    actually dispatched unvalidated:
+    ``tests/test_client.py::TestSubmissionValidation`` (fold review).
+    """
+
+    def _graft(self):
+        import copy
+
+        base = default_config("atl03_tdigest_healpix_hive", validate=False)
+        located = default_config("atl03_tdigest_located_healpix", validate=False)
+        base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
+        return base, located
+
+    def test_graft_without_clock_refused_at_submission(self):
+        # The exact observed shape, pinned to the worker's message text so the
+        # two seams read identically.
+        cfg, _ = self._graft()
+        assert (cfg.output or {}).get("time_source") is None
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            validate_config(cfg)
+
+    def test_graft_clock_without_column_refused_at_submission(self):
+        # The graft's second missing piece: time_source present but its field
+        # not a declared data_source variable — refused here, not as a worker
+        # KeyError one seam later.
+        cfg, located = self._graft()
+        cfg.output["time_source"] = dict(located.output["time_source"])
+        # Guard the precondition against the SAME set the validator checks —
+        # declared variables plus broadcast level variables — so it tracks
+        # ``_validate_time_source`` rather than agreeing with it by luck of
+        # this template (fold review).
+        declared = set(cfg.data_source["variables"]) | _segment_variable_names(cfg.data_source)
+        assert cfg.output["time_source"]["field"] not in declared
+        with pytest.raises(ValueError, match="not a declared data_source variable"):
+            validate_config(cfg)
+
+    def test_graft_with_full_clock_validates(self):
+        # Grafting BOTH missing pieces (the clock block and its column) is the
+        # correct form of the demo's config, and it validates.
+        cfg, located = self._graft()
+        cfg.output["time_source"] = dict(located.output["time_source"])
+        field = cfg.output["time_source"]["field"]
+        cfg.data_source["variables"][field] = located.data_source["variables"][field]
+        validate_config(cfg)
+
+    def test_windowing_fallback_satisfies_the_graft(self):
+        # The continuous-scale windowing fallback (PR #463) resolves the clock
+        # through the same resolver the worker uses (toc_source), so the graft
+        # with a windowing block and its column — but no time_source — is valid.
+        cfg, _ = self._graft()
+        cfg.data_source["variables"]["delta_time"] = "{group}/heights/delta_time"
+        cfg.output["windowing"] = {
+            "schedule": "yearly",
+            "time_field": "delta_time",
+            "epoch": "2018-01-01T00:00:00",
+            "scale": "gps",
+        }
+        validate_config(cfg)
+
+    def test_both_seams_raise_the_same_text(self):
+        # Parity pin: the worker's defense-in-depth refusal is the exact string
+        # the validator embeds (single-sourced in zagg.time_axis, issue #472).
+        from zagg.processing.aggregate import _toc_word_column
+
+        cfg, _ = self._graft()
+        with pytest.raises(ValueError) as worker_exc:
+            _toc_word_column({}, cfg)
+        with pytest.raises(ValueError) as submit_exc:
+            validate_config(cfg)
+        assert str(worker_exc.value) == TOC_NO_CLOCK_ERROR
+        assert TOC_NO_CLOCK_ERROR in str(submit_exc.value)
+
+    def test_every_shipped_temporal_template_validates(self):
+        # Sweep the packaged configs for aggregation variables carrying the
+        # ``temporal:`` key; each such template must pass validate_config, and
+        # the sweep must actually find the known carriers (a guard against the
+        # discovery matching nothing).
+        from importlib import resources
+
+        import zagg.configs
+
+        names = sorted(
+            p.name[: -len(".yaml")]
+            for p in resources.files(zagg.configs).iterdir()
+            if p.name.endswith(".yaml")
+        )
+        carriers = set()
+        for name in names:
+            cfg = default_config(name, validate=False)
+            agg_vars = (cfg.aggregation or {}).get("variables") or {}
+            if any(isinstance(m, dict) and m.get("temporal") for m in agg_vars.values()):
+                carriers.add(name)
+                validate_config(cfg)
+        assert carriers >= {"atl03_tdigest_located_healpix", "gedi01b_waveform_healpix_hive"}
 
 
 class TestOverviewDelta:
@@ -2610,18 +2987,30 @@ class TestLocationChannel:
         assert "location" not in plain
 
     def test_located_builtin_config_loads_and_validates(self):
-        """The shipped located t-digest template (issue #87) loads, validates,
-        and differs from the value-only template ONLY by the location channel."""
+        """The shipped companion t-digest template loads, validates, and differs
+        from the value-only template only by its two COMPANION channels.
+
+        Issue #87 added the location channel; issue #410 added the §8.3 temporal
+        one, which brings its clock with it — the ``delta_time`` read column and
+        the ``output.time_source`` block that says how to convert it. Everything
+        else must still be the plain template's, which is what this pins.
+        """
         located = default_config("atl03_tdigest_located_healpix")
         plain = default_config("atl03_tdigest_healpix")
         sig = get_output_signature(get_agg_fields(located)["h_tdigest"])
         assert sig["location"] == "leaf_id"
+        assert sig["temporal"] == "per-centroid"
         assert sig["kind"] == "ragged" and sig["inner_shape"] == (2,)
-        # Same read plan and grid; the only variables delta is the location key.
-        assert located.data_source == plain.data_source
-        assert located.output == plain.output
+        # Same read plan and grid, modulo the clock the temporal channel needs.
+        ds = {k: dict(v) if k == "variables" else v for k, v in located.data_source.items()}
+        assert ds["variables"].pop("delta_time") == "/{group}/heights/delta_time"
+        assert ds == plain.data_source
+        out = dict(located.output)
+        assert out.pop("time_source")["scale"] == "gps"
+        assert out == plain.output
         located_meta = dict(get_agg_fields(located)["h_tdigest"])
         located_meta.pop("location")
+        located_meta.pop("temporal")
         assert located_meta == get_agg_fields(plain)["h_tdigest"]
 
 
@@ -3087,6 +3476,61 @@ class TestNonFiniteFloatsAreRefusedAtValidation:
         d = self._cfg_dict()
         d["bounds"] = {"temporal": {"start": _dt(2020, 1, 1)}}
         _validate_json_floats(load_config_from_dict(d))  # must not raise
+
+
+class TestTouchPolicy:
+    """``output.touch`` (issue #501): declare the lifecycle-touch behaviour
+    instead of inferring it from the bucket name."""
+
+    def test_defaults_to_auto(self):
+        from zagg.config import default_config, get_touch_policy
+
+        assert get_touch_policy(default_config()) == "auto"
+
+    def test_reads_the_declared_value(self):
+        from zagg.config import default_config, get_touch_policy
+
+        cfg = default_config()
+        for value in ("auto", "always", "never"):
+            cfg.output["touch"] = value
+            assert get_touch_policy(cfg) == value
+
+    def test_rejects_anything_outside_the_three_values(self):
+        # Validated at LOAD so a typo fails at submission rather than
+        # resolving to the default deep inside a worker's skip path, where the
+        # wrong answer is either version churn on a published store or a
+        # collaborator's data expiring.
+        import pytest
+
+        from zagg.config import _validate_store_layout_keys, default_config
+
+        cfg = default_config()
+        cfg.output["touch"] = "sometimes"
+        with pytest.raises(ValueError, match="output.touch must be one of"):
+            _validate_store_layout_keys(cfg)
+
+    def test_absent_is_legal(self):
+        from zagg.config import _validate_store_layout_keys, default_config
+
+        cfg = default_config()
+        cfg.output.pop("touch", None)
+        _validate_store_layout_keys(cfg)
+
+    def test_unvalidated_typo_warns_before_falling_through_to_auto(self, caplog):
+        # validate_config catches a typo at submission, but the worker's own
+        # funnel (load_config_from_dict) does not validate -- so a hand-built
+        # invoke event carrying `touch: "nevr"` reaches here. Fall-through to
+        # `auto` is deliberate (fail-open), but it must be GREPPABLE rather
+        # than silent (review finding on PR #496).
+        import logging
+
+        from zagg.config import default_config, get_touch_policy
+
+        cfg = default_config()
+        cfg.output["touch"] = "nevr"
+        with caplog.at_level(logging.WARNING, logger="zagg.config"):
+            assert get_touch_policy(cfg) == "nevr"  # fall-through is `auto` in _touch_applies
+        assert any("'nevr'" in r.message and "'auto'" in r.message for r in caplog.records)
 
 
 class TestPackagedConfigsAreDispatchable:

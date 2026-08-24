@@ -1984,6 +1984,366 @@ class TestTemporalCompanionSeams:
             write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(), chunk_idx=(0,))
 
 
+class TestTemporalCompanionProduction:
+    """The §8.2/§8.3 companions as the AGGREGATION produces them (issue #410).
+
+    The seam tests above pin the template and the writer over handed-in words;
+    these pin the words themselves — one conversion (``output.time_source`` ->
+    the derived ``toc_word`` column) feeding both companion shapes.
+    """
+
+    EPOCH = "2018-01-01T00:00:00"
+
+    @staticmethod
+    def _cfg(**overrides):
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={
+                "groups": ["g"],
+                "variables": {"h_li": "{group}/h_li", "delta_time": "{group}/delta_time"},
+            },
+            aggregation={
+                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+                "variables": {
+                    "h_tdigest": {
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [2],
+                        "location": "leaf_id",
+                        "temporal": "per-centroid",
+                        "dtype": "float32",
+                        "params": {"delta": 16},
+                    },
+                    "observed": {
+                        "function": "zagg.stats.toc.cell_envelope",
+                        "source": "toc_word",
+                        "dtype": "uint64",
+                        "fill_value": 0,
+                        "temporal": "per-cell",
+                    },
+                    **overrides,
+                },
+            },
+            output={
+                "time_source": {
+                    "field": "delta_time",
+                    "epoch": "2018-01-01T00:00:00",
+                    "scale": "gps",
+                    "units": "seconds",
+                }
+            },
+        )
+
+    def _cell(self, n=200, spread=1e-4):
+        from conftest import point_words
+
+        rng = np.random.default_rng(410)
+        h = rng.normal(30.0, 5.0, n)
+        return {
+            "h_li": h,
+            "delta_time": 3.0 * np.arange(n, dtype=np.float64),
+            # The default jitter keeps every point in one cell; a wider spread
+            # populates several, for the multi-chunk shapes below.
+            "leaf_id": point_words(n, seed=7, spread=spread),
+        }
+
+    def test_the_config_validates(self):
+        from zagg.config import validate_config
+
+        cfg = self._cfg()
+        cfg.output["grid"] = {"type": "healpix", "parent_order": 6, "child_order": 12}
+        validate_config(cfg)
+
+    def test_both_shapes_come_out_of_one_conversion(self):
+        import mortie
+
+        from zagg.stats.toc import cell_envelope
+        from zagg.time_axis import observation_words
+
+        cell = self._cell()
+        stats = calculate_cell_statistics(cell, config=self._cfg())
+        digest, locs, times = stats["h_tdigest"]
+        expected_obs = observation_words(
+            cell["delta_time"], epoch=self.EPOCH, scale="gps", units="seconds"
+        )
+        # §8.4's licensed reduction: the per-cell word IS the envelope of the
+        # per-centroid words, and equally of the raw observations.
+        assert int(stats["observed"]) == int(cell_envelope(expected_obs))
+        assert int(cell_envelope(times)) == int(cell_envelope(expected_obs))
+        assert len(times) == len(digest) == len(locs)
+        assert times.dtype == np.uint64
+        assert mortie.toc_is_range(times).any(), "a compressed digest must produce ranges"
+
+    def test_per_centroid_words_contain_their_members(self):
+        # The words are value-ordered (§8.3), and the fixture's times rise with
+        # the observation index, so verify containment through the digest's own
+        # weights rather than assuming a run order: every stored word's envelope
+        # must lie inside the cell's whole envelope, and the join over them must
+        # equal it exactly.
+        import mortie
+
+        from zagg.stats.toc import cell_envelope
+        from zagg.time_axis import observation_words
+
+        cell = self._cell()
+        _, _, times = calculate_cell_statistics(cell, config=self._cfg())["h_tdigest"]
+        whole = np.array([int(cell_envelope(times))], dtype=np.uint64)
+        lo, hi = (int(b[0]) for b in mortie.toc2time(whole))
+        obs = mortie.toc2time(
+            observation_words(cell["delta_time"], epoch=self.EPOCH, scale="gps", units="seconds")
+        )[0]
+        assert lo <= int(obs.min()) and int(obs.max()) < hi
+        starts, ends = mortie.toc2time(times)
+        assert int(starts.min()) >= lo and int(ends.max()) <= hi
+
+    def test_empty_cell_keeps_the_channel_arity(self):
+        # A companion-carrying field's contract is ``(payload, *channels)`` even
+        # for an empty cell, so a direct caller always unpacks one shape.
+        stats = calculate_cell_statistics({"h_li": np.array([])}, config=self._cfg())
+        digest, locs, times = stats["h_tdigest"]
+        assert digest.shape == (0, 2)
+        assert locs.shape == times.shape == (0,)
+        assert locs.dtype == times.dtype == np.uint64
+
+    def test_temporal_only_field_needs_no_location(self):
+        cfg = self._cfg()
+        del cfg.aggregation["variables"]["h_tdigest"]["location"]
+        payload, times = calculate_cell_statistics(self._cell(), config=cfg)["h_tdigest"]
+        assert len(times) == len(payload) and times.dtype == np.uint64
+
+    def test_the_words_track_the_declared_clock_not_the_field_source(self):
+        # Shifting the declared epoch moves every word; touching the digest's
+        # own source column does not. One clock, declared in one place.
+        cell = self._cell(50)
+        base = calculate_cell_statistics(cell, config=self._cfg())["h_tdigest"][2]
+        cfg = self._cfg()
+        cfg.output["time_source"]["epoch"] = "2019-01-01T00:00:00"
+        moved = calculate_cell_statistics(cell, config=cfg)["h_tdigest"][2]
+        assert not np.array_equal(base, moved)
+
+    def test_missing_clock_column_names_itself(self):
+        cell = self._cell(10)
+        del cell["delta_time"]
+        with pytest.raises(ValueError, match="output.time_source.field 'delta_time' is not"):
+            calculate_cell_statistics(cell, config=self._cfg())
+
+    def test_undeclared_clock_refused_at_the_reducer_too(self):
+        # Config validation is the front door, but a config built without it
+        # must still fail loudly rather than write an empty companion.
+        cfg = self._cfg()
+        del cfg.output["time_source"]
+        with pytest.raises(ValueError, match="no per-observation clock"):
+            calculate_cell_statistics(self._cell(10), config=cfg)
+
+    def test_chunk_cells_collects_both_channels(self):
+        from zagg.processing.aggregate import _aggregate_chunk_cells, _group_columns
+        from zagg.processing.write import _channel_entry
+
+        cfg = self._cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        cell = self._cell(60)
+        cells = grid.cells_of(cell["leaf_id"])
+        children = np.unique(cells)
+        cols, cell_to_slice = _group_columns(dict(cell), cells)
+        _, payloads, idx, channels, _ = _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], get_agg_fields(cfg)
+        )
+        assert list(channels["h_tdigest"]) == ["locations", "times"]
+        for words in channels["h_tdigest"].values():
+            assert len(words) == len(payloads["h_tdigest"]) == len(idx)
+        # The sink entry the worker builds from it: (payloads, cells, locs, times).
+        entry = (payloads["h_tdigest"], idx, *_channel_entry(channels["h_tdigest"]))
+        assert len(entry) == 4
+
+    def test_channel_entry_arities(self):
+        from zagg.processing.write import _channel_entry, _ragged_entry
+
+        assert _channel_entry({}) == ()
+        assert len(_channel_entry({"locations": [1]})) == 1
+        # A temporal-only field gets an explicit None location slot, which
+        # ``_ragged_entry`` already reads as "no location channel".
+        slots = _channel_entry({"times": [1]})
+        assert slots == (None, [1])
+        assert _ragged_entry((["v"], [0], *slots)) == (["v"], [0], None, [1])
+
+    # -- the per-chunk toc encode hoist (issue #476) -------------------------
+
+    def _grouped(self, n=60, spread=1e-4):
+        from zagg.processing.aggregate import _group_columns
+
+        cfg = self._cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        cell = self._cell(n, spread=spread)
+        cells = grid.cells_of(cell["leaf_id"])
+        children = np.unique(cells)
+        cols, cell_to_slice = _group_columns(dict(cell), cells)
+        return cfg, children, cols, cell_to_slice
+
+    def _unoccupied(self, n=6):
+        """Cell ids of the same grid holding none of the shard's rows."""
+        from conftest import point_words
+
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=self._cfg())
+        return np.unique(grid.cells_of(point_words(n, seed=99, lat0=-30.0, lon0=200.0)))
+
+    def test_chunk_encode_matches_the_per_cell_encode(self):
+        # The hoisted one-pass encode is element-wise, so each cell's slice must
+        # be byte-identical to encoding that cell's rows alone (issue #476).
+        from zagg.processing.aggregate import _chunk_toc_words, _toc_word_column
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        by_cell = _chunk_toc_words(cols, cell_to_slice, children, cfg)
+        assert set(by_cell) == set(cell_to_slice)
+        for key, (start, end) in cell_to_slice.items():
+            per_cell = _toc_word_column({col: arr[start:end] for col, arr in cols.items()}, cfg)
+            np.testing.assert_array_equal(by_cell[key], per_cell)
+
+    def test_the_pooled_gather_is_the_same_gather(self):
+        # Both callers pool the chunk's columns for the precompute one statement
+        # earlier, walking the same children in the same order — so reusing that
+        # column instead of rebuilding the index must not move a byte, while a
+        # pooled dict built for other children is refused rather than trusted.
+        from zagg.processing.aggregate import _chunk_toc_words, _pool_chunk_columns
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        pooled = _pool_chunk_columns(cols, cell_to_slice, children)
+        built = _chunk_toc_words(cols, cell_to_slice, children, cfg)
+        reused = _chunk_toc_words(cols, cell_to_slice, children, cfg, pooled=pooled)
+        assert set(built) == set(reused) == set(cell_to_slice)
+        for key in built:
+            np.testing.assert_array_equal(built[key], reused[key])
+        stale = {name: arr[:-1] for name, arr in pooled.items()}
+        with pytest.raises(ValueError, match="pooled chunk columns hold"):
+            _chunk_toc_words(cols, cell_to_slice, children, cfg, pooled=stale)
+
+    def test_chunk_path_never_encodes_per_cell(self, monkeypatch):
+        # The chunk path injects the pre-encoded column, so the per-cell encode
+        # (and its dict copy) must not run — while the emitted words stay
+        # byte-identical to the per-cell route (issue #476).
+        import zagg.processing.aggregate as agg_mod
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        agg_fields = get_agg_fields(cfg)
+        calls = []
+        orig = agg_mod._toc_word_column
+        monkeypatch.setattr(
+            agg_mod, "_toc_word_column", lambda *a, **k: calls.append(1) or orig(*a, **k)
+        )
+        stats, payloads, idx, channels, _ = _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], agg_fields
+        )
+        assert calls == [], "the chunk path must not fall back to the per-cell encode"
+        for j, i in enumerate(idx["h_tdigest"]):
+            start, end = cell_to_slice[int(children[i])]
+            cell = {col: arr[start:end] for col, arr in cols.items()}
+            digest, locs, times = calculate_cell_statistics(cell, config=cfg)["h_tdigest"]
+            np.testing.assert_array_equal(payloads["h_tdigest"][j], digest)
+            np.testing.assert_array_equal(channels["h_tdigest"]["locations"][j], locs)
+            np.testing.assert_array_equal(channels["h_tdigest"]["times"][j], times)
+            assert stats["observed"][i] == calculate_cell_statistics(cell, config=cfg)["observed"]
+
+    def test_the_batch_is_armed_only_for_companion_configs(self, monkeypatch):
+        # No declared channel, no deferral machinery: a config predating issue
+        # #87/#410 must never see the ContextVar, so an arbitrary reducer can
+        # only meet a placeholder on the configs that ask for one.
+        import zagg.stats.tdigest as td_mod
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        calls: list[int] = []
+        orig = td_mod.batched_companion_folds
+        monkeypatch.setattr(td_mod, "batched_companion_folds", lambda: calls.append(1) or orig())
+        cfg, children, cols, cell_to_slice = self._grouped()
+        _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], get_agg_fields(cfg)
+        )
+        assert calls == [1]
+        plain = self._cfg()
+        del plain.aggregation["variables"]["h_tdigest"]["location"]
+        del plain.aggregation["variables"]["h_tdigest"]["temporal"]
+        del plain.aggregation["variables"]["observed"]
+        calls.clear()
+        _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, plain, ["h_tdigest"], get_agg_fields(plain)
+        )
+        assert calls == []
+
+    def test_no_clock_refused_on_the_chunk_path(self):
+        # §8.3's refusal stays reachable after the hoist: a populated chunk with
+        # a declared companion but no clock fails exactly as the per-cell route.
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        del cfg.output["time_source"]
+        with pytest.raises(ValueError, match="no per-observation clock"):
+            _aggregate_chunk_cells(
+                children,
+                cols,
+                cell_to_slice,
+                {},
+                cfg,
+                ["h_tdigest", "observed"],
+                get_agg_fields(cfg),
+            )
+
+    def test_all_empty_chunk_needs_no_clock(self):
+        # Parity with the per-cell route, where an empty cell never reaches the
+        # encode: a chunk with no populated cells must not demand a clock. The
+        # shape the multi-chunk path actually produces — shard-level columns and
+        # cell_to_slice, a chunk whose children are all unoccupied — is where the
+        # ``present`` filter is doing the work.
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, _, cols, cell_to_slice = self._grouped()
+        del cfg.output["time_source"]
+        empty_chunk = self._unoccupied()
+        assert cell_to_slice and not set(map(int, empty_chunk)) & set(cell_to_slice)
+        _, payloads, idx, _, cwd = _aggregate_chunk_cells(
+            empty_chunk,
+            cols,
+            cell_to_slice,
+            {},
+            cfg,
+            ["h_tdigest", "observed"],
+            get_agg_fields(cfg),
+        )
+        assert cwd == 0 and payloads["h_tdigest"] == [] and idx["h_tdigest"] == []
+
+    def test_partial_chunks_split_the_shard_columns(self):
+        # chunks_per_shard > 1 is how the worker actually calls this: shard-level
+        # col_arrays/cell_to_slice with per-chunk children covering only part of
+        # the populated cells (plus unoccupied ones). Each chunk's payloads and
+        # both channels must stay byte-equal to the per-cell route — the encode's
+        # ``present`` filter and its slice accounting are all that stand between.
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, children, cols, cell_to_slice = self._grouped(240, spread=0.5)
+        assert len(cell_to_slice) > 3, "need several populated cells for a partial chunk"
+        agg_fields = get_agg_fields(cfg)
+        half = len(children) // 2
+        chunks = [
+            np.concatenate([children[:half], self._unoccupied(2)]),
+            children[half:],
+        ]
+        seen = 0
+        for chunk in chunks:
+            _, payloads, idx, channels, cwd = _aggregate_chunk_cells(
+                chunk, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], agg_fields
+            )
+            assert cwd == sum(int(c) in cell_to_slice for c in chunk)
+            seen += cwd
+            for j, i in enumerate(idx["h_tdigest"]):
+                start, end = cell_to_slice[int(chunk[i])]
+                cell = {col: arr[start:end] for col, arr in cols.items()}
+                digest, locs, times = calculate_cell_statistics(cell, config=cfg)["h_tdigest"]
+                np.testing.assert_array_equal(payloads["h_tdigest"][j], digest)
+                np.testing.assert_array_equal(channels["h_tdigest"]["locations"][j], locs)
+                np.testing.assert_array_equal(channels["h_tdigest"]["times"][j], times)
+        assert seen == len(cell_to_slice), "every populated cell lands in exactly one chunk"
+
+
 class TestRaggedChunkCompanion:
     """Issue #82 phase 4c: a ``kind: ragged`` + ``resolution: chunk`` field stores
     ONE variable-length payload per chunk (collapsed from the populated cells under

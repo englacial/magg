@@ -405,6 +405,68 @@ def _summed_generation(rows: list) -> dict:
     }
 
 
+def _source_counts(rows: list, broken=()) -> tuple:
+    """``(folded, missing, unreadable)`` over the dense child range.
+
+    A child counts **folded** when at least one of its windows delivered a
+    usable column, **missing** when every window's column is cleanly absent
+    (never generated, or a fleet still in flight), and **unreadable**
+    otherwise — the distinction the two counters must not launder into one.
+
+    ``broken`` is the set of ``(child index, window index)`` contributors a
+    fold refused MID-READ: a located payload present without its §9 channel
+    (:func:`_located_pair`). Such a contributor is not usable, exactly as an
+    unreadable column is not, so it is classified here rather than counted as
+    a clean fold — the counters are what ``source_children`` records, and an
+    artifact folded without a contributor must say so (spec §4.5).
+    """
+    folded = missing = unreadable = 0
+    for i, row in enumerate(rows):
+        if row is None:
+            continue
+        if any(_is_reader(r) and (i, w) not in broken for w, r in enumerate(row)):
+            folded += 1
+        elif all(r is None for r in row):
+            missing += 1
+        else:
+            unreadable += 1
+    return folded, missing, unreadable
+
+
+def _companion_group(reader, res: int, name: str, declared: list) -> dict | None:
+    """One contributor's ``{array: values}`` at ``res``, or ``None`` if refused.
+
+    A field and EVERY companion it declares are read together and validated
+    before any of them is used (issue #410). ``_StageReader.read`` returns
+    ``None`` per ARRAY, not per member — its documented schema-evolution
+    contract — so a column written before ``location:``/``temporal:`` joined the
+    declaration reads its payload fine and its siblings as ``None``. That is not
+    under-coverage: the words are exact only *given* the centroid partition the
+    payload describes (spec §9.1/§8.3/§2.3), so a payload gathered or folded
+    without its words is **corruption**, not a missing member. All absent
+    together is the honest schema-evolution case and reads as fill.
+
+    Returns ``None`` for a partial group; the caller counts the contributor
+    unreadable and skips it, which is the posture
+    ``sweep_overview._fold_node`` takes at a leaf missing a sibling (skip
+    loudly, ``failed += 1``) rather than aborting the level — a single stale
+    child column must not take a whole stage down.
+    """
+    arrays = {name: reader.read(res, name)}
+    for _kwarg, sibling in declared:
+        arrays[sibling] = reader.read(res, sibling)
+    present = [k for k, v in arrays.items() if v is not None]
+    if not present or len(present) == len(arrays):
+        return arrays
+    logger.warning(
+        f"stage sweep: column {reader.path} carries {sorted(present)} at resolution {res} "
+        f"but not {sorted(set(arrays) - set(present))}; counting the contributor "
+        f"unreadable rather than writing a payload and channels that describe different "
+        f"partitions (spec §9.1/§8.3, §1.1)"
+    )
+    return None
+
+
 def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) -> tuple:
     """Concatenate child members at ``res`` — gen-1 content, untouched.
 
@@ -414,27 +476,53 @@ def _gather_slabs(rows: list, fields: dict, *, res: int, span: int, n_out: int) 
     itself ``None`` when the candidate's column is missing — under-coverage,
     counted). Payloads are ASSIGNED, never decoded or re-folded — the
     acceptance contract that gather levels carry gen-1 bytes untouched.
-    Returns ``(slabs, folded, missing)``.
+    Returns ``(slabs, folded, missing, unreadable)``.
+
+    A located field's sibling is gathered under the same rule as its payload
+    (ruling 4 on issue #410): a gather ASSIGNS gen-1 bytes, so the pair stays
+    row-aligned by construction — **given that both arrays are present**, which
+    is the one thing the read does not establish. The pair is therefore read
+    and validated (:func:`_located_pair`) BEFORE anything is assigned, so a
+    child carrying one half contributes neither and is counted unreadable
+    rather than half-applied into the span.
     """
-    from zagg.sweep_overview import _empty_slab
+    from zagg.sweep_overview import _empty_slab, field_companions
 
     slabs = {name: _empty_slab(meta, n_out) for name, meta in fields.items()}
-    folded = missing = unreadable = 0
+    companions = {
+        name: field_companions(name, meta)
+        for name, meta in fields.items()
+        if field_companions(name, meta)
+    }
+    for declared in companions.values():
+        for _kwarg, sibling in declared:
+            slabs[sibling] = np.full(n_out, b"", dtype=object)
+    broken: set = set()
     for i, row in enumerate(rows):
         if row is None:
             continue
         reader = row[0]
         if not _is_reader(reader):
-            missing += reader is None
-            unreadable += reader is not None
             continue
-        folded += 1
+        grouped: dict = {}
+        skip: set = set()
+        for name, declared in companions.items():
+            group = _companion_group(reader, res, name, declared)
+            if group is None:
+                # EVERY half stays fill: the child's span for this field reads
+                # as under-covered, never as a payload with an absent channel.
+                broken.add((i, 0))
+                skip |= {name, *(sib for _kw, sib in declared)}
+                continue
+            grouped.update(group)
         seg = slice(i * span, (i + 1) * span)
-        for name in fields:
-            values = reader.read(res, name)
+        for name in list(slabs):
+            if name in skip:
+                continue
+            values = grouped[name] if name in grouped else reader.read(res, name)
             if values is not None:
                 slabs[name][seg] = values
-    return slabs, folded, missing, unreadable
+    return (slabs, *_source_counts(rows, broken))
 
 
 def _merge_slabs(
@@ -457,11 +545,23 @@ def _merge_slabs(
     child's slab plus the open output cells' decoded digests (~``factor``
     digests per cell — the envelope the ruling priced). Missing candidates
     contribute fill and are counted (``source_children.missing``).
+
+    A located field's pair is read together (:func:`_located_pair`) and a
+    contributor carrying one half is **skipped for that field and counted
+    unreadable** — the same posture as the gather, and as
+    ``sweep_overview._fold_node``'s at a leaf missing the sibling. It is not a
+    raise: one stale child column must not take a whole stage level down, and
+    the fold is a fold — dropping a contributor is under-coverage the artifact
+    records, where writing a payload without its words would be corruption
+    (spec §9.1). Fields whose reads are sound still fold that contributor: the
+    read succeeded, so the loss is known per field, and the per-child
+    ``unreadable`` count is what says the artifact folded short.
     """
     from zagg.sweep_overview import (
         _empty_slab,
         combine_dense,
         decode_digest,
+        field_companions,
         fold_dense,
         fold_digests,
         overview_fold_delta,
@@ -469,9 +569,11 @@ def _merge_slabs(
 
     windows = next((len(row) for row in rows if row is not None), 1)
     n_src = src_per_child * len(rows)
-    folded = sum(1 for row in rows if row is not None and any(_is_reader(r) for r in row))
-    missing = sum(1 for row in rows if row is not None and all(r is None for r in row))
-    unreadable = len([r for r in rows if r is not None]) - folded - missing
+    # The coverage counters are computed at the END, from the same
+    # ``(child, window)`` classification the gather uses: a contributor whose
+    # located pair this fold refuses (:func:`_located_pair`) is unreadable, not
+    # a clean fold, and that is only known once the sources have been read.
+    broken: set = set()
     slabs: dict = {}
     for name, meta in fields.items():
         if meta["class"] != "exact":
@@ -496,29 +598,69 @@ def _merge_slabs(
         dtype = meta.get("dtype") or "float32"
         inner = tuple(meta.get("inner_shape") or (2,))
         delta = overview_fold_delta(meta)
+        # A located field folds its sibling in the SAME k-way call as its
+        # payload (ruling 4 on issue #410): the merged words are keyed on the
+        # centroid partition that merge produces (spec §9.1), so the two are
+        # accumulated together per open cell and folded together. A contributor
+        # carrying one half of the pair is SKIPPED loudly and counted
+        # unreadable — the gather's posture, and ``_fold_node``'s at a leaf
+        # missing the sibling — never folded payload-only, and never a raise
+        # that takes the whole level down over one stale child column.
+        declared = field_companions(name, meta)
         out = np.full(n_out, b"", dtype=object)
+        sibling_slabs = {kwarg: np.full(n_out, b"", dtype=object) for kwarg, _ in declared}
         pending: dict[int, list] = {}
+        # {kernel kwarg: {open cell: [word vectors]}} — accumulated in lockstep
+        # with ``pending`` so a cell closes with its payload and every channel.
+        words: dict[str, dict[int, list]] = {kwarg: {} for kwarg, _ in declared}
+
+        def _close(j, out=out, delta=delta, dtype=dtype, declared=declared):
+            cell = pending.pop(j)
+            if not declared:
+                out[j] = fold_digests(cell, delta=delta, dtype=dtype)
+                return
+            payload, *encoded = fold_digests(
+                cell,
+                delta=delta,
+                dtype=dtype,
+                channels={kwarg: words[kwarg].pop(j) for kwarg, _ in declared},
+            )
+            out[j] = payload
+            for (kwarg, _), value in zip(declared, encoded, strict=True):
+                sibling_slabs[kwarg][j] = value
+
         for i, row in enumerate(rows):
             base = i * src_per_child
-            for reader in row or ():
+            for w, reader in enumerate(row or ()):
                 if not _is_reader(reader):
                     continue
-                slab = reader.read(res_src, name)
+                group = _companion_group(reader, res_src, name, declared)
+                if group is None:
+                    broken.add((i, w))
+                    continue
+                slab = group[name]
                 if slab is None:
                     continue
-                for p, payload in enumerate(slab):
-                    if payload is not None and len(payload):
-                        cell = pending.setdefault((base + p) // factor, [])
-                        cell.append(decode_digest(payload, dtype, inner))
+                for pos, payload in enumerate(slab):
+                    if payload is None or not len(payload):
+                        continue
+                    key = (base + pos) // factor
+                    pending.setdefault(key, []).append(decode_digest(payload, dtype, inner))
+                    for kwarg, sibling in declared:
+                        words[kwarg].setdefault(key, []).append(
+                            decode_digest(group[sibling][pos], "uint64", ())
+                        )
             # Cells wholly covered by children 0..i are complete: fold and
             # free them, so resident state never exceeds the open boundary.
             done = ((i + 1) * src_per_child) // factor
             for j in [j for j in pending if j < done]:
-                out[j] = fold_digests(pending.pop(j), delta=delta, dtype=dtype)
-        for j, cell in pending.items():
-            out[j] = fold_digests(cell, delta=delta, dtype=dtype)
+                _close(j)
+        for j in list(pending):
+            _close(j)
         slabs[name] = out
-    return slabs, folded, missing, unreadable
+        for kwarg, sibling in declared:
+            slabs[sibling] = sibling_slabs[kwarg]
+    return (slabs, *_source_counts(rows, broken))
 
 
 def _dense_rows(readers: dict, node: str, *, depth: int) -> list:

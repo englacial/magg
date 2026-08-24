@@ -298,6 +298,224 @@ class TestFoldColumn:
                     assert [bytes(p) for p in a[res][name]] == [bytes(p) for p in b[res][name]]
 
 
+#: The same declaration with the digest field located (ruling 4, issue #410).
+LOCATED_FIELDS = {**FIELDS, "h_tdigest": {**FIELDS["h_tdigest"], "location": "leaf_id"}}
+#: ONE field carrying BOTH channels — the arity the ``channels=`` map exists for
+#: (espg ruling of 2026-08-17: temporal is per-centroid at every level too).
+BOTH_CHANNEL_FIELDS = {
+    **LOCATED_FIELDS,
+    "h_tdigest": {**LOCATED_FIELDS["h_tdigest"], "temporal": "per-centroid"},
+}
+
+#: ``{field meta key: (kernel kwarg, sibling suffix)}`` for the harness below.
+_CHANNELS = {"location": ("locations", "locations"), "temporal": ("temporal", "times")}
+
+
+def _located_cell_slabs(cells: dict, fields: dict = LOCATED_FIELDS) -> tuple[dict, dict]:
+    """``_cell_slabs`` plus every companion sibling ``fields`` declares.
+
+    Both are built in ONE ``build_tdigest`` call per cell, so the siblings
+    describe the one partition their payload does. Returns the slabs and the
+    per-channel truth: ``{kernel kwarg: {cell: per-observation words}}``.
+    """
+    from conftest import TOC_BASE, point_words, toc_words
+
+    declared = [key for key in _CHANNELS if fields["h_tdigest"].get(key) is not None]
+    slabs = _cell_slabs(cells)
+    sibs = {key: np.full(LEAF_CELLS, b"", dtype=object) for key in declared}
+    truth: dict = {_CHANNELS[key][0]: {} for key in declared}
+    for i, obs in cells.items():
+        kw = {}
+        if "location" in declared:
+            kw["locations"] = point_words(len(obs), seed=2000 + i)
+        if "temporal" in declared:
+            # A distinct instant run per cell, so no two envelopes are confusable.
+            when = np.datetime64(TOC_BASE, "ns") + np.timedelta64(600 * (i + 1), "s")
+            kw["temporal"] = toc_words(len(obs), base=str(when))
+        d, *words = build_tdigest(np.asarray(obs, dtype=np.float64), DELTA, **kw)
+        slabs["h_tdigest"][i] = encode_digest(d, "float32")
+        for key in declared:
+            kwarg = _CHANNELS[key][0]
+            sibs[key][i] = encode_digest(words[list(kw).index(kwarg)], "uint64")
+            truth[kwarg][i] = kw[kwarg]
+    for key in declared:
+        slabs[f"h_tdigest_{_CHANNELS[key][1]}"] = sibs[key]
+    return slabs, truth
+
+
+class TestLocatedColumn:
+    """The §4.6 column artifact carries the §9 channel (review finding).
+
+    ``_overview_config`` emits the sibling array and the payload's §1.2 binding
+    for every located field, so a fold that returned payload slabs only
+    committed populated payload rows against ``b""`` sibling rows — §1.1's
+    row-alignment MUST broken under a §9 declaration, and hashed into the §5
+    sidecar as content.
+    """
+
+    CELLS = {0: [1.0, 2.0], 5: [10.0, 4.0], 6: [7.0], 15: [3.0, 8.0, 5.0]}
+
+    def test_leaf_slabs_picks_up_the_sibling(self):
+        slabs, _truth = _located_cell_slabs(self.CELLS)
+        staged = {f"{CELL_ORDER}/{n}": s for n, s in slabs.items()}
+        out = leaf_slabs(staged, LOCATED_FIELDS, group_path=str(CELL_ORDER), n_cells=LEAF_CELLS)
+        assert out["h_tdigest_locations"] is slabs["h_tdigest_locations"]
+
+    def test_leaf_slabs_checks_the_sibling_extent(self):
+        slabs, _truth = _located_cell_slabs(self.CELLS)
+        staged = {f"{CELL_ORDER}/{n}": s for n, s in slabs.items()}
+        staged[f"{CELL_ORDER}/h_tdigest_locations"] = np.full(3, b"", dtype=object)
+        with pytest.raises(ValueError, match="cell extent"):
+            leaf_slabs(staged, LOCATED_FIELDS, group_path=str(CELL_ORDER), n_cells=LEAF_CELLS)
+
+    def test_the_fold_returns_the_sibling_row_aligned(self):
+        from mortie import validate_morton
+
+        slabs, _truth = _located_cell_slabs(self.CELLS)
+        folded = fold_column(slabs, LOCATED_FIELDS, cell_order=CELL_ORDER, resolutions=[3, 2])
+        for res in (3, 2):
+            group = folded[res]
+            assert "h_tdigest_locations" in group
+            for payload, raw in zip(group["h_tdigest"], group["h_tdigest_locations"], strict=True):
+                words = decode_digest(raw, "uint64", ())
+                assert words.shape == (decode_digest(payload, "float32").shape[0],)
+                if len(words):
+                    validate_morton(words)
+        # Row 1 of order 3 pools cells 5 and 6: the pair comes from ONE k-way
+        # call, so it is byte-equal to the located merge of the two members.
+        oracle, oracle_words = merge_tdigests_kway(
+            [decode_digest(slabs["h_tdigest"][i], "float32") for i in (5, 6)],
+            delta=DELTA,
+            locations=[
+                decode_digest(slabs["h_tdigest_locations"][i], "uint64", ()) for i in (5, 6)
+            ],
+        )
+        assert bytes(folded[3]["h_tdigest"][1]) == encode_digest(oracle, "float32")
+        assert bytes(folded[3]["h_tdigest_locations"][1]) == encode_digest(oracle_words, "uint64")
+        # An empty row keeps the ragged fill on BOTH arrays.
+        assert folded[3]["h_tdigest"][2] == b"" and folded[3]["h_tdigest_locations"][2] == b""
+
+    def test_a_missing_sibling_slab_refuses_by_name(self):
+        slabs, _truth = _located_cell_slabs(self.CELLS)
+        del slabs["h_tdigest_locations"]
+        with pytest.raises(ValueError, match="declares a locations channel"):
+            fold_column(slabs, LOCATED_FIELDS, cell_order=CELL_ORDER, resolutions=[3])
+
+    def test_a_short_sibling_row_refuses_rather_than_writing_it(self):
+        # The failure this whole path guards: a populated payload row against an
+        # empty sibling row. ``fold_digests``' length check makes it loud.
+        slabs, _truth = _located_cell_slabs(self.CELLS)
+        slabs["h_tdigest_locations"][0] = b""
+        with pytest.raises(ValueError, match="row-aligned with its payload"):
+            fold_column(slabs, LOCATED_FIELDS, cell_order=CELL_ORDER, resolutions=[3])
+
+    def test_the_written_column_carries_populated_words(self, tmp_path):
+        from zagg.column import write_column
+        from zagg.grids.base import located_declaration
+
+        slabs, _truth = _located_cell_slabs(self.CELLS)
+        folded = fold_column(
+            slabs, LOCATED_FIELDS, cell_order=CELL_ORDER, resolutions=[3, SHARD_ORDER]
+        )
+        basename = write_column(
+            str(tmp_path),
+            morton_word("-311"),
+            folded,
+            LOCATED_FIELDS,
+            node_order=SHARD_ORDER,
+            cell_order=CELL_ORDER,
+            granule_count=3,
+        )
+        store = open_store(f"{tmp_path}/-3/1/1/{basename}")
+        for res in (3, SHARD_ORDER):
+            group = zarr.open_group(store, path=str(res), mode="r", zarr_format=3)
+            stored = [bytes(p) for p in group["h_tdigest_locations"][:]]
+            assert stored == [bytes(p) for p in folded[res]["h_tdigest_locations"]]
+            # ... and it is not the all-empty array a payload-only fold left.
+            assert any(stored), "the §9 sibling is populated, not a bound empty array"
+            assert located_declaration(dict(group["h_tdigest_locations"].attrs)) is not None
+            assert dict(group["h_tdigest"].attrs)["ragged"]["locations"] == "h_tdigest_locations"
+
+
+class TestBothChannelsColumn:
+    """One field, TWO channels, through ``fold_column`` (issue #410).
+
+    Every test above declares a single channel, where the ``channels=`` map has
+    one key and the fold's slot order cannot be observed. These declare both, so
+    each sibling is pinned against its OWN oracle — a swapped pair is a
+    well-formed word in either grammar and raises nowhere on its own.
+    """
+
+    CELLS = TestLocatedColumn.CELLS
+
+    def test_the_fold_returns_both_siblings_against_their_own_oracles(self):
+        slabs, _truth = _located_cell_slabs(self.CELLS, BOTH_CHANNEL_FIELDS)
+        folded = fold_column(slabs, BOTH_CHANNEL_FIELDS, cell_order=CELL_ORDER, resolutions=[3, 2])
+        for res in (3, 2):
+            group = folded[res]
+            assert "h_tdigest_locations" in group and "h_tdigest_times" in group
+            rows = zip(
+                group["h_tdigest"],
+                group["h_tdigest_locations"],
+                group["h_tdigest_times"],
+                strict=True,
+            )
+            for payload, raw_l, raw_t in rows:
+                n = decode_digest(payload, "float32").shape[0]
+                assert decode_digest(raw_l, "uint64", ()).shape == (n,)
+                assert decode_digest(raw_t, "uint64", ()).shape == (n,)
+                # A populated row's two siblings are never the same bytes.
+                assert n == 0 or bytes(raw_l) != bytes(raw_t)
+        # Row 1 of order 3 pools cells 5 and 6, and both siblings must be
+        # byte-equal to the SAME k-way call's corresponding output — the slot
+        # order the kernel fixes, not the order the caller's dict happened to be
+        # built in.
+        oracle, ow_l, ow_t = merge_tdigests_kway(
+            [decode_digest(slabs["h_tdigest"][i], "float32") for i in (5, 6)],
+            delta=DELTA,
+            locations=[
+                decode_digest(slabs["h_tdigest_locations"][i], "uint64", ()) for i in (5, 6)
+            ],
+            temporal=[decode_digest(slabs["h_tdigest_times"][i], "uint64", ()) for i in (5, 6)],
+        )
+        assert bytes(folded[3]["h_tdigest"][1]) == encode_digest(oracle, "float32")
+        assert bytes(folded[3]["h_tdigest_locations"][1]) == encode_digest(ow_l, "uint64")
+        assert bytes(folded[3]["h_tdigest_times"][1]) == encode_digest(ow_t, "uint64")
+        # Row 0 pools cells 0..3, of which only cell 0 is populated, so it takes
+        # ``fold_digests``' single-contributor arm — the one that bypasses the
+        # k-way merge, and the majority case at the finest level. Each sibling
+        # must pass its OWN cell's bytes through, not the other's.
+        for name in ("h_tdigest", "h_tdigest_locations", "h_tdigest_times"):
+            assert bytes(folded[3][name][0]) == bytes(slabs[name][0])
+        # An empty row keeps the ragged fill on ALL THREE arrays.
+        for name in ("h_tdigest", "h_tdigest_locations", "h_tdigest_times"):
+            assert folded[3][name][2] == b""
+
+    def test_leaf_slabs_picks_up_both_siblings(self):
+        slabs, _truth = _located_cell_slabs(self.CELLS, BOTH_CHANNEL_FIELDS)
+        staged = {f"{CELL_ORDER}/{n}": s for n, s in slabs.items()}
+        out = leaf_slabs(
+            staged, BOTH_CHANNEL_FIELDS, group_path=str(CELL_ORDER), n_cells=LEAF_CELLS
+        )
+        assert out["h_tdigest_locations"] is slabs["h_tdigest_locations"]
+        assert out["h_tdigest_times"] is slabs["h_tdigest_times"]
+
+    def test_a_missing_temporal_slab_refuses_by_name(self):
+        # The located arm's counterpart: the refusal names the channel that is
+        # absent, so a half-declared column is diagnosable.
+        slabs, _truth = _located_cell_slabs(self.CELLS, BOTH_CHANNEL_FIELDS)
+        del slabs["h_tdigest_times"]
+        with pytest.raises(ValueError, match="declares a temporal channel"):
+            fold_column(slabs, BOTH_CHANNEL_FIELDS, cell_order=CELL_ORDER, resolutions=[3])
+
+    def test_an_unlocated_column_is_unchanged(self):
+        # The channel is opt-in: the same cells under the unlocated declaration
+        # produce exactly the pre-#410 groups, sibling absent.
+        slabs = _cell_slabs(self.CELLS)
+        folded = fold_column(slabs, FIELDS, cell_order=CELL_ORDER, resolutions=[3, SHARD_ORDER])
+        assert all("h_tdigest_locations" not in group for group in folded.values())
+
+
 def _assert_group_matches(overview, group: dict, n: int) -> None:
     """The leaf's ``n`` overview rows are byte-equal to its column group."""
     for name, meta in FIELDS.items():

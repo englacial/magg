@@ -17,6 +17,7 @@ generator's INPUTS (the arrays handed to the writers), so writer, reader,
 and spec text are pinned against each other through the committed bytes.
 """
 
+import base64
 import hashlib
 import json
 import struct
@@ -28,6 +29,7 @@ import zarr
 from numcodecs import Zstd
 from zarr.storage import LocalStore
 
+from zagg.coverage_toc import coverage_toc, coverage_toc_digest
 from zagg.readers.tdigest_tensor import read_cell, read_locations
 from zagg.stats.composition import counts_from_composition, unpack_composition
 
@@ -83,7 +85,9 @@ FROZEN_COMBINED = {
     # The §8.2/§8.3/§9 companion fixture (issue #410) — asserted by
     # TestTemporalCompanions (temporal/ is not in FIXTURES: the leaf-shaped
     # suite's digest assertions assume an UNLOCATED h_tdigest).
-    "temporal": "fcfc8c33810f7a9a6409c2c5d5d69297631d7aabfd79a4ee9dca3614ed853d81",
+    # Re-pinned for the §10.5 gap cell (issue #489): the last cell's clock
+    # moved, so its two toc companions -- and only those -- hash differently.
+    "temporal": "6c7a0c5a3f54684b67e7e2daa66e29ffcf1af102833e7b3c4a4f989e36752887",
 }
 #: The same pin over the §4.6 COLUMN artifact of the ``column/`` fixture (not
 #: its leaf, which is ``minimal``'s): the only committed store whose §5 key
@@ -110,14 +114,16 @@ FROZEN_ARRAYS = {
     ): "551f7be5718086c2ca1d379e1d1581368d21e4ca1433ce3ae4ae397e11b08f7f",
     # The §8.2 dense per-cell companion and the §8.3 ragged per-centroid
     # sibling (issue #410) — one frozen literal per companion element kind.
+    # Both re-pinned for the §10.5 gap cell (issue #489); the h_tdigest
+    # payload and its locations sibling are untouched by that offset.
     (
         "temporal",
         "6/observed",
-    ): "bf3b7e75967323db2a2db71d0b58f895f7178e99dd08eab385b5a917ff383d04",
+    ): "b8c48a74213a1a06fdaa554dbe580c222bc83dddf71264bcf88ff9084fb44402",
     (
         "temporal",
         "6/h_tdigest_times",
-    ): "84b51ac52e36710701238d3599dd6947818f20f9ca66a54ae1597b4b53471488",
+    ): "03a1e44b982a553c8a419f66563d712b7f070c5f0761e1982f9912740ffee468",
 }
 
 
@@ -990,6 +996,151 @@ class TestColumnArtifact:
         assert exp["declared"] == {"overviews": 5}
 
 
+class TestFixtureSemanticHash:
+    """The committed ``semantic_hash`` must be reproducible from the config
+    that built the fixture (issue #415).
+
+    Nothing else in the suite reads that manifest field — the §5 hashes cover
+    decoded values, not identity — so before this pin a semantic-core edit
+    could ship fixtures carrying a digest no zagg reproduces, and moczarr
+    would vendor them (espg/moczarr#19/#20) with every parity gate green. The
+    D19 hash epoch is exactly the change that would have done it.
+    """
+
+    @staticmethod
+    def _generator():
+        """The fixture generator as a module (the ``test_content_hash`` precedent)."""
+        import importlib.util
+
+        path = Path(__file__).parent.parent / "tools" / "generate_spec_fixtures.py"
+        spec = importlib.util.spec_from_file_location("zagg_spec_fixture_generator", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @staticmethod
+    def _recorded(name):
+        return json.loads((SPEC_DATA / name / "morton_hive.json").read_text())["semantic_hash"]
+
+    #: Every fixture this class recomputes, and how its config is rebuilt.
+    #: ``test_every_fixture_is_covered`` refuses a fixture that is not here.
+    COVERED = ("minimal", "kitchen_sink", "column", "flux", PYRAMID, "raster_toc", "temporal")
+
+    @pytest.mark.parametrize(
+        "name,kwargs",
+        [
+            ("minimal", {"kitchen_sink": False}),
+            ("kitchen_sink", {"kitchen_sink": True}),
+            ("column", {"kitchen_sink": False, "pyramid": {"overviews": 5}}),
+            # The §2.0 flux fixture (issue #424) landed after the epoch's
+            # phase 3, so its committed digest was pre-epoch until now.
+            ("flux", {"kitchen_sink": False, "flux": True}),
+        ],
+    )
+    def test_leaf_fixture_hash_is_reproducible(self, name, kwargs):
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded(name) == semantic_hash(gen._config(**kwargs))
+
+    def test_the_raster_toc_fixture_hash_is_reproducible(self):
+        # The §8 fixture (issue #443) is built from its own config literal
+        # rather than `_config`, so the builder hands it over through
+        # `_raster_toc_config`. It also pins the one INCLUDED output key that
+        # is not leaf-shaping: `time_encoding: toc` is in the core, so this
+        # digest is not the same product as the default-encoding raster.
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded("raster_toc") == semantic_hash(gen._raster_toc_config())
+
+    def test_the_temporal_fixture_hash_is_reproducible(self):
+        # The §8.2/§8.3 fixture (issue #410) merged in carrying a pre-epoch
+        # digest — the third fixture this gate has caught (after `flux/` and
+        # `raster_toc/`) — and was regenerated at the sync. Its config is its
+        # own literal too, handed over through `_temporal_config`.
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        assert self._recorded("temporal") == semantic_hash(gen._temporal_config())
+
+    def test_every_fixture_is_covered(self):
+        # The gate on the gate: a fixture added without a hash pin ships a
+        # digest nothing reproduces, which is exactly how `flux/` and
+        # `raster_toc/` came to carry pre-epoch values while the suite stayed
+        # green. Adding a fixture now fails here until it is pinned above.
+        recorded = {
+            p.parent.relative_to(SPEC_DATA).as_posix()
+            for p in SPEC_DATA.glob("**/morton_hive.json")
+            if json.loads(p.read_text()).get("semantic_hash")
+        }
+        assert recorded == set(self.COVERED)
+
+    def test_the_pyramid_fixture_hash_is_reproducible(self):
+        # Its manifest is built from the /1 config and then retrofitted by
+        # declare_pyramid under the /2 one, so the recorded hash pins BOTH
+        # halves at once: the digest reproduces, and the two configs agree —
+        # which is the property that keeps the retrofit legal (the pyramid
+        # block is deliberately outside the semantic core, issue #415).
+        from zagg.semantics import semantic_hash
+
+        gen = self._generator()
+        cfg_v1 = gen._config(False)
+        cfg_v2 = gen._config(False, pyramid=gen.PYRAMID_KNOB)
+        for cfg in (cfg_v1, cfg_v2):
+            cfg.aggregation["variables"].update(gen.PYRAMID_EXTRA_VARIABLES)
+            cfg.output["grid"] = dict(gen.PYRAMID_GRID)
+        assert semantic_hash(cfg_v1) == semantic_hash(cfg_v2)
+        assert self._recorded(PYRAMID) == semantic_hash(cfg_v1)
+
+
+class TestFixtureGranuleIdentity:
+    """The OTHER half of the identity pair: each leaf's ``granules.json``
+    sibling (issue #388) must self-pair and be recorded in the CANONICAL
+    granule-id space (issue #415's granule ruling).
+
+    Nothing else in the suite reads that object —
+    :class:`TestFixtureSemanticHash` recomputes ``semantic_hash`` only — so the
+    epoch's edits to the committed siblings were covered by no assertion at
+    all. Both properties matter to a reader: a sibling whose digest does not
+    pair with its own id list is rejected as ``unrecorded-ids``
+    (``zagg.dedup._sibling_ids``), which silently disarms the contraction guard
+    on that leaf; and an id list still in the pre-epoch href space would pair
+    with nothing a post-epoch run plans.
+    """
+
+    #: Every committed sibling, enumerated over the tree the way
+    #: ``test_every_fixture_is_covered`` is, so a new fixture cannot ship one
+    #: unguarded.
+    SIBLINGS = sorted(
+        p.relative_to(SPEC_DATA).as_posix() for p in SPEC_DATA.glob("**/granules.json")
+    )
+
+    def test_every_leaf_fixture_carries_the_sibling(self):
+        # The gate on the gate, on ``test_every_fixture_is_covered``'s pattern:
+        # a fixture with a leaf but no recorded id list ships a leaf the
+        # contraction guard cannot protect. ``pyramid/`` is manifest-only (no
+        # leaf, hence no sibling), which is why this keys on the leaf.
+        want = {
+            f"{name}/{Path(_expected(name)['leaf']).parent.as_posix()}/granules.json"
+            for name in TestFixtureSemanticHash.COVERED
+            if _expected(name).get("leaf")
+        }
+        assert set(self.SIBLINGS) == want
+
+    @pytest.mark.parametrize("rel", SIBLINGS)
+    def test_the_sibling_self_pairs_on_canonical_ids(self, rel):
+        from zagg.telemetry import GRANULE_IDS_SPEC, canonical_granule_ids, granules_sha256
+
+        sibling = json.loads((SPEC_DATA / rel).read_text())
+        ids = sibling["granule_ids"]
+        assert sibling["spec"] == GRANULE_IDS_SPEC
+        assert granules_sha256(ids) == sibling["granules_sha256"]
+        # Already canonical, and sorted as the writer records them: the epoch is
+        # a fixed point on these ids, so re-canonicalizing moves nothing.
+        assert canonical_granule_ids(ids) == ids == sorted(ids)
+
+
 class TestTemporalDeclaration:
     """§8 — the temporal declaration, pinned on the committed `raster_toc/`.
 
@@ -1243,6 +1394,78 @@ class TestTemporalCompanions:
         far = int(from_datetime64(np.array(["2099-01-01"], dtype="datetime64[ns]"))[0])
         assert not np.asarray(toc_overlaps(words, far, far + 10**9), dtype=bool).any()
 
+    def test_the_production_kernel_reproduces_the_committed_words(self):
+        """§7 parity: the aggregation kernel emits the committed bytes.
+
+        The `temporal/` fixture was generated one PR ahead of the kernel, with
+        its words computed in the generator and handed to the production write
+        path. This drives the generator's OWN inputs through the production
+        reducer instead (``build_tdigest(..., temporal=)`` and
+        ``zagg.stats.toc.cell_envelope``) and asserts the result equals the
+        committed expectations word for word — so a kernel change that moved a
+        single word fails here rather than silently diverging from the spec
+        bytes external readers decode against (issue #410, CLAUDE.md §4).
+
+        The generator is imported rather than re-implemented: its clock, its
+        RNG, and its cell plan are the inputs, so nothing here can drift from
+        the fixture it checks.
+        """
+        import importlib.util
+
+        from zagg.grids import HealpixGrid
+        from zagg.grids.morton import morton_word
+        from zagg.stats.tdigest import build_tdigest
+        from zagg.stats.toc import cell_envelope
+        from zagg.time_axis import observation_words
+
+        root = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "_spec_fixture_gen", root / "tools" / "generate_spec_fixtures.py"
+        )
+        gen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gen)
+
+        exp = _expected("temporal")
+        cfg = gen._temporal_config()
+        grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
+        children = grid.children(morton_word(gen.SHARD_KEY))
+        rng = np.random.default_rng(410)
+        # The fixture's clock is ns since the Unix epoch; express it as offsets
+        # from a declared epoch so the words come from the PRODUCTION encoder.
+        epoch = "2018-01-01T00:00:00"
+        epoch_ns = np.datetime64(epoch, "ns").astype("int64")
+
+        plan = [(0, 0, 40), (0, 2, 1), (1, 1, 5), (3, 3, 300)]
+        assert len(plan) == len(exp["cells"])
+        for ordinal, ((chunk, local, n), expected) in enumerate(zip(plan, exp["cells"])):
+            cell_index = chunk * grid.cells_per_chunk + local
+            assert cell_index == expected["index"]
+            cell_word = int(children[cell_index])
+            h = np.round(rng.normal(30.0, 5.0, n), 3).astype(np.float64)
+            words = np.asarray(gen._point_words(grid, cell_word, n, rng))
+            order = np.argsort(h, kind="stable")
+            h, words = h[order], words[order]
+            times_ns = gen._obs_times_ns(n, ordinal)
+            if ordinal == gen.TEMPORAL_GAP_CELL:
+                # The §10.5 gap cell's clock offset, taken from the generator
+                # rather than restated, exactly as the rest of this loop is
+                # (issue #489).
+                times_ns = times_ns + gen._temporal_gap_offset_ns()
+            toc = observation_words(
+                (times_ns - epoch_ns) / 1e9, epoch=epoch, scale="gps", units="seconds"
+            )
+            digest, locs, per_centroid = build_tdigest(h, gen.DELTA, locations=words, temporal=toc)
+            np.testing.assert_array_equal(
+                locs, np.array(expected["h_tdigest_locations"], dtype=np.uint64)
+            )
+            np.testing.assert_array_equal(
+                per_centroid, np.array(expected["h_tdigest_times"], dtype=np.uint64)
+            )
+            assert int(cell_envelope(toc)) == int(expected["observed"])
+            np.testing.assert_allclose(
+                digest, np.array(expected["h_tdigest"], dtype=np.float32), rtol=0, atol=0
+            )
+
     def test_absent_declaration_on_every_pre_companion_fixture(self):
         from zagg.time_axis import temporal_declaration
 
@@ -1255,14 +1478,20 @@ class TestTemporalCompanions:
             "times" not in _array_meta("minimal", _expected("minimal"), "h_tdigest")["attributes"]
         )
 
-    def test_companions_are_absent_from_the_leaf_column(self):
-        """A companion exists at native resolution only, for now.
+    def test_both_companions_fold_into_the_leaf_column(self):
+        """Both companions ride every §4.6 column group, per-centroid.
 
-        Its fold law is the grammar's join (§8.2), which no zagg fold
-        implements yet, so the D24 class is ``none`` and the §4.6 column this
-        same worker invocation wrote carries neither companion — rather than
-        carrying words folded through the field's own reducer, whose envelope
-        claim would be false. The #410 kernel PR is what flips this.
+        espg-ruled 2026-08-17 (amending ruling 3 on issue #410): the temporal
+        channel is **per-centroid at every level**, symmetric with located — so
+        each column group carries the digest and BOTH siblings, and there is no
+        per-cell overview companion anywhere in the tree. §8.4's shape-coarsening
+        reduction stays licensed for producers that want it; zagg's digest
+        pyramids do not use it.
+
+        The dense per-cell field (``observed``, the §8.2 shape) is absent from
+        every group on purpose: its fold law is the grammar's join over a cell
+        group rather than its own reducer, so it is D24 class ``none`` and exists
+        at native resolution only.
         """
         exp = _expected("temporal")
         column = _leaf_dir("temporal", exp).parent / "all.pyramid.zarr"
@@ -1270,7 +1499,121 @@ class TestTemporalCompanions:
         assert groups
         for group in groups:
             arrays = sorted(p.name for p in (column / group).iterdir() if p.is_dir())
-            assert arrays == ["count", "morton"]
+            assert arrays == [
+                "count",
+                "h_tdigest",
+                "h_tdigest_locations",
+                "h_tdigest_times",
+                "morton",
+            ], f"column group {group}"
+
+    def test_the_columns_companions_are_row_aligned_and_declared(self):
+        """§1.1 row alignment and the §8.3/§9 declarations, on committed bytes.
+
+        The column is a *fold*, so its words are the merge's own output rather
+        than the leaf's — this is the one place in the fixture set where a folded
+        companion is pinned. Every populated payload row has exactly one word in
+        each sibling, and each sibling declares the words IT holds.
+        """
+        from zagg.grids.base import located_declaration
+        from zagg.time_axis import temporal_declaration
+
+        exp = _expected("temporal")
+        column = _leaf_dir("temporal", exp).parent / "all.pyramid.zarr"
+        store = LocalStore(str(column))
+        for group in sorted(p.name for p in column.iterdir() if p.is_dir()):
+            payload = zarr.open_array(
+                store, path=f"{group}/h_tdigest", zarr_format=3, consolidated=False
+            )[:]
+            sibs = {
+                name: zarr.open_array(
+                    store, path=f"{group}/{name}", zarr_format=3, consolidated=False
+                )
+                for name in ("h_tdigest_locations", "h_tdigest_times")
+            }
+            assert located_declaration(dict(sibs["h_tdigest_locations"].attrs))["shape"] == (
+                "per-centroid"
+            )
+            assert temporal_declaration(dict(sibs["h_tdigest_times"].attrs)) == {
+                "spec": "zagg-toc/1",
+                "shape": "per-centroid",
+                "grammar": "mortie-toc/1",
+            }
+            populated = 0
+            for i, raw in enumerate(payload):
+                rows = len(np.frombuffer(bytes(raw), "<f4")) // 2
+                if not rows:
+                    continue
+                populated += 1
+                for name, arr in sibs.items():
+                    words = np.frombuffer(bytes(arr[:][i]), "<u8")
+                    assert words.shape == (rows,), f"{group}/{name} row {i}"
+                    # §8.2's reserved 0 never appears in a real word.
+                    assert words.all()
+            assert populated, f"column group {group} folded no populated cell"
+
+    def test_the_columns_words_reproduce_the_leafs_cell_by_cell(self):
+        """The fold identities, on the committed column bytes (§8.3, §9.1).
+
+        The row-alignment test above cannot tell a correct fold from one that
+        swapped the two siblings: the grammars accept each other's words, so a
+        swap survives ``shape == (rows,)`` and a nonzero check, and the
+        declarations it would contradict live in attrs, which do not move when
+        the bytes do. So pin the VALUES — per column cell, against the leaf cells
+        it folded:
+
+        * the toc **cell envelope** over a column cell's words equals the
+          envelope over every leaf instant under it. This is the identity
+          :func:`zagg.stats.tdigest._centroid_envelopes` names as what survives
+          an arbitrary fold tree (a per-centroid vector is indexed by the
+          centroid partition, so the words themselves do not).
+        * the located **hull** — ``mortie.common_ancestor`` over the column
+          cell's words equals the hull over the leaf's, §9.1's containment claim
+          read at cell granularity.
+
+        This is the fixture set's only golden for a *merge*-produced companion,
+        so these are the checks that make it load-bearing for moczarr.
+        """
+        from mortie import common_ancestor
+
+        from zagg.stats.toc import cell_envelope
+
+        exp = _expected("temporal")
+        leaf_order = int(exp["group"])
+        leaf_store = _leaf_store("temporal", exp)
+        leaf = {
+            name: zarr.open_array(
+                leaf_store, path=f"{exp['group']}/{name}", zarr_format=3, consolidated=False
+            )[:]
+            for name in ("h_tdigest_locations", "h_tdigest_times")
+        }
+        column = _leaf_dir("temporal", exp).parent / "all.pyramid.zarr"
+        store = LocalStore(str(column))
+        reducers = {
+            "h_tdigest_locations": lambda w: int(common_ancestor(w)),
+            "h_tdigest_times": lambda w: int(cell_envelope(w)),
+        }
+        checked = 0
+        for group in sorted(p.name for p in column.iterdir() if p.is_dir()):
+            factor = 4 ** (leaf_order - int(group))
+            for name, reduce in reducers.items():
+                words = zarr.open_array(
+                    store, path=f"{group}/{name}", zarr_format=3, consolidated=False
+                )[:]
+                for j, raw in enumerate(words):
+                    got = np.frombuffer(bytes(raw), "<u8")
+                    members = np.concatenate(
+                        [
+                            np.frombuffer(bytes(m), "<u8")
+                            for m in leaf[name][j * factor : (j + 1) * factor]
+                        ]
+                    )
+                    if not len(got):
+                        assert not len(members), f"{group}/{name} cell {j} dropped its members"
+                        continue
+                    assert reduce(got) == reduce(members), f"{group}/{name} cell {j}"
+                    checked += 1
+        assert checked, "no populated column cell — the assertions would be vacuous"
 
     def test_leaf_is_stamped_and_manifest_marked(self):
         exp = _expected("temporal")
@@ -1371,3 +1714,267 @@ class TestLocatedDeclaration:
         for bad in ({"spec": "zagg-located/2"}, {"shape": "per-cell"}, {"grammar": "geohash/1"}):
             with pytest.raises(ValueError):
                 located_declaration({"located": {**block, **bad}})
+
+
+class TestRootCoverageTemporalSection:
+    """§10 — the ``zagg-coverage-toc/1`` section, on the committed sidecar.
+
+    ``temporal/`` is the only fixture with a root coverage object at all:
+    every other fixture store declares no temporal field, so a sweep of one
+    produces no section. Their *lack* of the object is §10's absence rule
+    pinned as bytes, asserted below.
+    """
+
+    def _envelope(self):
+        return json.loads((SPEC_DATA / "temporal" / "coverage.moc").read_text())
+
+    def test_the_carrier_still_reads_as_a_plain_root_moc(self):
+        # §10 adds ONE key to the `morton-moc/1` carrier; a reader that knows
+        # nothing about §10 must decode the object exactly as before.
+        from zagg.coverage import load_coverage
+        from zagg.grids.morton import morton_word
+        from zagg.hive import root_coverage_words
+
+        envelope = self._envelope()
+        assert envelope["spec"] == "morton-moc/1"
+        assert envelope["encoding"] == "ranges"
+        assert envelope["ranges"] == [[_expected("temporal")["shard"]] * 2]
+        assert load_coverage(str(SPEC_DATA / "temporal")) == envelope
+        assert set(root_coverage_words(envelope)) == {
+            int(morton_word(_expected("temporal")["shard"]))
+        }
+
+    def test_section_grammar(self):
+        exp = _expected("temporal")["root_coverage"]
+        section = self._envelope()["temporal"]
+        assert section["spec"] == exp["spec"] == "zagg-coverage-toc/1"
+        assert section["source"] == "sweep"
+        assert section["fields"] == exp["fields"]
+        # Words are DECIMAL STRINGS: a uint64 exceeds 2^53 and a float-based
+        # JSON parser would mangle a raw number, exactly as for the ranges.
+        assert section["shards"] == exp["shards"]
+        assert all(isinstance(w, str) for w in section["shards"].values())
+        digest = section["digest"]
+        assert digest["element"] == {"dtype": "float32", "shape": [-1, 2]}
+        assert (digest["encoding"], digest["weights"], digest["value"]) == (
+            "base64",
+            "counts",
+            "toc-ns",
+        )
+        assert digest["delta"] == exp["digest"]["delta"]
+
+    def test_digest_decodes_through_the_native_grammars(self):
+        """§10.3: the payload is §2.1 bytes and the sibling is §8.3 words.
+
+        Decoded here with the SPEC-TEXT recipe (base64, then the §1.4 raw
+        little-endian buffer at the declared dtype) — no zagg decoder — so the
+        "zero new grammar" claim is what is being asserted.
+        """
+        exp = _expected("temporal")["root_coverage"]["digest"]
+        block = self._envelope()["temporal"]["digest"]
+        payload = np.frombuffer(
+            base64.b64decode(block["payload"]), dtype=np.dtype("float32").newbyteorder("<")
+        ).reshape(-1, 2)
+        words = np.frombuffer(
+            base64.b64decode(block["times"]), dtype=np.dtype("uint64").newbyteorder("<")
+        )
+        assert len(payload) == len(words) == block["centroids"]
+        np.testing.assert_array_equal(payload, np.array(exp["centroids"], dtype=np.float32))
+        np.testing.assert_array_equal(words, np.array(exp["times"], dtype=np.uint64))
+        # §2.1: rows ascend by mean, and every weight is a positive count.
+        assert (np.diff(payload[:, 0]) >= 0).all()
+        assert (payload[:, 1] > 0).all()
+
+    def test_weight_conservation(self):
+        """§10.3: `sum(weights)` is the store's temporal observation count."""
+        exp = _expected("temporal")
+        block = self._envelope()["temporal"]["digest"]
+        payload, _words = coverage_toc_digest(self._envelope())
+        total = exp["root_coverage"]["obs_total"]
+        assert total == sum(cell["count"] for cell in exp["cells"])
+        assert float(payload[:, 1].sum()) == block["weight_total"] == float(total)
+
+    def test_shard_word_conservatively_contains_every_instant(self):
+        """§10.2's whole claim, on committed bytes.
+
+        Every observation instant in the shard falls inside that shard's one
+        envelope word, and the grammar's own overlap predicate says so for
+        each instant without any decoding by the caller.
+        """
+        from mortie import from_datetime64, to_datetime64, toc2time, toc_overlaps
+
+        exp = _expected("temporal")
+        word = coverage_toc(self._envelope())[exp["shard"]]
+        lo, hi = (int(np.asarray(to_datetime64(b)).astype("int64")) for b in toc2time(word))
+        instants = np.array(
+            [int(t) for cell in exp["cells"] for t in cell["obs_span_ns"]], dtype="int64"
+        )
+        assert (lo <= instants).all() and (instants < hi).all()
+        internal = np.asarray(from_datetime64(instants.astype("datetime64[ns]")), dtype=np.uint64)
+        for t in internal:
+            assert bool(np.asarray(toc_overlaps(np.array([word]), int(t), int(t) + 1))[0])
+
+    def test_the_value_axis_is_the_envelope_midpoint(self):
+        """§10.3: column 0 is derived from the words, not from the observations.
+
+        Each contributing centroid enters the fold at the midpoint of its own
+        §8.3 envelope, so a weight-1 centroid — whose word is a timestamp and
+        whose ``toc2time`` envelope is a point — carries that EXACT instant,
+        and every other mean is a convex combination of midpoints and so lies
+        inside its own centroid's word. Both hold to the float32 quantum the
+        section documents, which is why the words, never the means, are the
+        exact temporal claim.
+        """
+        from mortie import toc2time
+
+        payload, words = coverage_toc_digest(self._envelope())
+        start, end = (np.asarray(b, dtype=np.float64) for b in toc2time(np.asarray(words)))
+        means = payload[:, 0].astype(np.float64)
+        # The one exact arm: weight-1 rows sit on their word's instant.
+        single = payload[:, 1] == 1
+        assert single.any()
+        assert (start[single] == end[single]).all()
+        np.testing.assert_array_equal(payload[single, 0], start[single].astype(np.float32))
+        # Everything else: inside its own envelope, up to float32 rounding
+        # (~2^-24 relative — roughly ten minutes at present-day magnitudes).
+        quantum = np.abs(means) * 2.0**-23
+        assert ((means >= start - quantum) & (means <= end + quantum)).all()
+
+    def test_the_root_words_reduce_to_the_shard_word(self):
+        # The tier-2 companion and the tier-1 map are two views of the same
+        # join: reducing the digest's per-centroid envelopes reproduces the
+        # shard's envelope word exactly (mortie's semilattice, spec §8.4).
+        from mortie import toc_reduce
+
+        exp = _expected("temporal")
+        _payload, words = coverage_toc_digest(self._envelope())
+        assert int(toc_reduce(words)) == coverage_toc(self._envelope())[exp["shard"]]
+
+    def test_the_shard_word_is_the_join_of_the_committed_leaf_words(self):
+        # Derived from the LEAF bytes, not from the sidecar: a writer that
+        # folded the wrong thing fails here instead of agreeing with itself.
+        from mortie import toc_reduce
+
+        exp = _expected("temporal")
+        leaf = np.concatenate(
+            [np.array(cell["h_tdigest_times"], dtype=np.uint64) for cell in exp["cells"]]
+        )
+        assert int(toc_reduce(leaf)) == coverage_toc(self._envelope())[exp["shard"]]
+
+    @pytest.mark.parametrize(
+        "name", ["minimal", "kitchen_sink", "column", "flux", "raster_toc", "pyramid"]
+    )
+    def test_non_temporal_fixtures_carry_no_root_coverage_object(self, name):
+        # §10's absence rule, pinned as bytes — WITH its precondition, which
+        # is what makes the missing object evidence of the rule rather than
+        # of the generator simply never having been pointed at these trees.
+        # §10.5 extends the same pin to the word-set cover sibling.
+        from zagg.coverage_toc import temporal_fields
+
+        manifest = json.loads((SPEC_DATA / name / "morton_hive.json").read_text())
+        assert temporal_fields(manifest) == {}
+        assert not (SPEC_DATA / name / "coverage.moc").exists()
+        assert not (SPEC_DATA / name / "coverage.toc").exists()
+
+    def _cover(self):
+        return json.loads((SPEC_DATA / "temporal" / "coverage.toc").read_text())
+
+    def test_the_cover_sibling_decodes_to_the_expected_word_set(self):
+        # §10.5 on committed bytes: the object gates on its own spec marker,
+        # the carrier's section points at it, and the word set equals the
+        # expectation DERIVED from the generator's inputs (never read back).
+        from zagg.coverage_toc import COVER_KEY, cover_words, load_cover
+
+        exp = _expected("temporal")["cover"]
+        obj = self._cover()
+        section = self._envelope()["temporal"]
+        assert obj["spec"] == exp["spec"] == "zagg-coverage-toc-cover/1"
+        assert section[COVER_KEY] == obj["spec"]
+        assert obj["order"] == self._envelope()["order"]
+        assert obj["temporal_order"] == exp["temporal_order"]
+        loaded = load_cover(obj)
+        assert loaded is not None
+        words = cover_words(loaded)
+        shard = _expected("temporal")["shard"]
+        assert set(words) == {shard}
+        assert [str(int(w)) for w in words[shard]] == exp["words"]
+        # NOT one bucket that swallows the fixture: the committed cover is a
+        # word SET, which is the only shape the parity and containment claims
+        # below can discriminate (issue #489).
+        assert len(words[shard]) == exp["count"] >= 2
+
+    def test_the_cover_declares_the_10_5_grammar(self):
+        # The keys §10.5 REQUIRES on the object, on committed bytes — an
+        # external reader decodes the buffer with them: the cap the writer
+        # coarsens against, the fields the words came from, the element kind
+        # and its encoding, and each block's own `count`, which §10.5 makes a
+        # MUST-check against the buffer's length.
+        exp = _expected("temporal")["cover"]
+        obj = self._cover()
+        shard = _expected("temporal")["shard"]
+        assert obj["cap"] == exp["cap"] == 512
+        assert obj["fields"] == exp["fields"] == ["h_tdigest"]
+        assert obj["element"] == exp["element"] == {"dtype": "uint64", "shape": [-1]}
+        assert obj["encoding"] == exp["encoding"] == "base64"
+        block = obj["shards"][shard]
+        assert block["count"] == exp["count"]
+        # Spec text only — no zagg decoder — exactly as §5's recipes are read.
+        raw = base64.b64decode(block["words"])
+        assert len(raw) == 8 * block["count"]
+        assert [str(int(w)) for w in np.frombuffer(raw, "<u8")] == exp["words"]
+
+    def test_the_cover_preserves_the_gap_between_the_clusters(self):
+        # §10.5's never-bridge law on committed bytes. The fixture's last cell
+        # sits whole buckets past the others, and `gap_ns` is the aligned
+        # interval between them DERIVED from the member instants — a cover
+        # that bridged it (or quantized everything into one bucket) answers
+        # True here while still passing parity and containment (issue #489).
+        from mortie import TOC_MAX_NS, toc_overlaps
+
+        from zagg.coverage_toc import cover_words
+
+        exp = _expected("temporal")
+        words = np.asarray(cover_words(self._cover())[exp["shard"]], dtype=np.uint64)
+        start, end = (int(v) for v in exp["cover"]["gap_ns"])
+        assert start < end
+        assert not bool(np.atleast_1d(toc_overlaps(words, start, end)).any())
+        # The predicate is answering about THESE words, not False for
+        # everything: every one of them hits a window over the whole scale.
+        assert bool(np.atleast_1d(toc_overlaps(words, 0, TOC_MAX_NS)).all())
+
+    def test_the_cover_satisfies_the_parity_invariant(self):
+        # §10.5: toc_reduce(cover words) == toc_reduce(quantize(tier-1 word))
+        # at the shard's effective order — the cross-object consistency claim.
+        from mortie import toc_reduce
+
+        from zagg.coverage_toc import TEMPORAL_COVER_ORDER, cover_words, quantize_words
+
+        obj = self._cover()
+        shard = _expected("temporal")["shard"]
+        words = cover_words(obj)[shard]
+        order = obj["shards"][shard].get("temporal_order", obj["temporal_order"])
+        assert order == TEMPORAL_COVER_ORDER
+        tier1 = coverage_toc(self._envelope())[shard]
+        assert int(toc_reduce(words)) == int(toc_reduce(quantize_words([tier1], order)))
+
+    def test_the_cover_conservatively_contains_every_member_instant(self):
+        # §10.5's widening-only law, on the same derived instants §8.3's
+        # containment is asserted from: every real member instant the
+        # generator recorded (Unix-epoch ns, converted to the §8 internal
+        # scale exactly as the other containment tests do) lies inside the
+        # committed cover.
+        from mortie import from_datetime64, toc2time
+
+        from zagg.coverage_toc import cover_words
+
+        exp = _expected("temporal")
+        words = cover_words(self._cover())[exp["shard"]]
+        start, end = toc2time(words)
+        start, end = np.atleast_1d(start), np.atleast_1d(end)
+        for cell in exp["cells"]:
+            spans = np.array(cell["centroid_spans_ns"], dtype="int64")
+            internal = np.asarray(
+                from_datetime64(spans.reshape(-1).astype("datetime64[ns]")), dtype=np.uint64
+            )
+            for t in internal:
+                assert bool(np.any((start.astype(np.uint64) <= t) & (t < end.astype(np.uint64))))

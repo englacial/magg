@@ -3,9 +3,8 @@
 > **Status: maintainer notes — partially out of date (audited against the code
 > 2026-06-15, see [#34](https://github.com/englacial/zagg/issues/34)).** The
 > canonical, rendered deploy docs live in the docs site:
-> [Standing Up the Backend](../docs/deployment/standup.md) (preferred path),
-> [AWS Lambda](../docs/deployment/lambda.md), and
-> [Execution Role](../docs/deployment/execution-role.md). This file keeps the
+> [Standing Up the Backend](../docs/deployment/standup.md) (preferred path)
+> and [AWS Lambda](../docs/deployment/lambda.md). This file keeps the
 > build/layer internals and the size/cost rationale; several figures below
 > (layer/function sizes, the role/bucket names, the layer contents) are
 > historical and were not all re-measured — trust the scripts
@@ -23,13 +22,21 @@ x86_64 / py3.12 is available for local/testing parity.
 - **Architecture**: arm64 (default; x86_64 also supported)
 - **Layer**: `zagg-deps-{arch}` (py3.12; contents defined by `build_layer.sh` — see below)
 - **Function code**: `lambda_handler.py` + `zagg/` package + obstore/zarr/pydantic-zarr/pyyaml
-- **Role**: created by `template.yaml` (CloudFormation-auto-named; the template
-  sets no `RoleName`), scoped least-privilege to the `OutputBucketName` bucket
-  you pass to `stand_up.sh` — *not* a fixed `zagg-lambda-execution`/`xagg`. (The
-  dependency layer is named `<FunctionName>-deps`, default `process-shard-deps`.
-  The legacy `deploy.sh` in-place updater still defaults `ZAGG_S3_BUCKET=xagg`
-  for its >50MB staging copies; that is the updater's staging bucket, not the
-  output bucket.)
+- **Role**: created by `template.yaml` with an explicit, stable `RoleName` —
+  the `ExecutionRoleName` parameter, default `zagg-lambda-execution` (issue
+  #495). The name is a cross-organization contract, since Source Cooperative
+  names the ARN in their bucket policy, so a second stack in the same account
+  must override `EXECUTION_ROLE_NAME`. It reaches three destinations: the
+  `OutputBucketName` bucket you pass to `stand_up.sh`, the public
+  `sliderule-public-cors` bucket (whole-bucket, by intent — PR #176; being
+  retired, issue #499, and its sidecar-cache successor is **not** the
+  source.coop prefix below — a different bucket under a different org, post-MVP
+  and not yet chosen), and zagg's published prefix on Source Cooperative
+  (`us-west-2.opendata.source.coop/englacial/zagg/demo/*`, plus bucket-level
+  `ListBucket`). (The dependency layer is named `<FunctionName>-deps`, default
+  `process-shard-deps`. The legacy `deploy.sh` in-place updater still defaults
+  `ZAGG_S3_BUCKET=xagg` for its >50MB staging copies; that is the updater's
+  staging bucket, not the output bucket.)
 
 ### What's in the layer vs function code
 

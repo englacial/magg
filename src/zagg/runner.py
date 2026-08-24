@@ -46,7 +46,9 @@ from zagg.config import (
     get_store_layout,
     get_store_path,
     get_sweep,
+    get_touch_policy,
     get_windowing,
+    validate_config,
 )
 from zagg.dispatch import (
     BENIGN_ERRORS,
@@ -212,10 +214,12 @@ def agg(
     output_credentials : dict, optional
         Explicit credentials for writing the output store (camelCase
         ``accessKeyId``/``secretAccessKey``/``sessionToken``). Omit to use
-        the ambient credential chain / execution role (writes to in-account
-        buckets, unchanged behavior). Supply to write an external or
-        S3-compatible target (e.g. source.coop). Runtime-only -- never read
-        from config.
+        the ambient credential chain / execution role, which reaches the
+        in-account buckets, ``sliderule-public-cors``, AND zagg's published
+        prefix on Source Cooperative (issue #495). Supply only for a target we
+        have not negotiated a bucket policy with -- a collaborator's private
+        bucket, or an S3-compatible store like R2/MinIO. Runtime-only -- never
+        read from config.
     output_endpoint_url : str, optional
         Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
         Overrides ``output.endpoint_url`` in the config.
@@ -339,6 +343,20 @@ def agg(
         Summary with keys: ``total_cells``, ``cells_with_data``,
         ``cells_error``, ``total_obs``, ``wall_time_s``, ``store_path``.
     """
+    # The validation choke point for this entry (issue #485): direct agg
+    # callers on any backend or pipeline kind, plus zagg.notebook.run, whose
+    # dispatch bottoms out here — so a PipelineConfig mutated after
+    # load_config's own call (the issue #472 graft) is refused before agg
+    # reads a catalog, touches a store, or invokes. Two sibling seams call
+    # validate_config themselves rather than routing through this one, and
+    # both must stay: client.Run.from_config dispatches via Run/StatusPoller,
+    # never through agg (client.py, same error text), and notebook.run repeats
+    # the call above its max_cost_preview branch, which reads the shardmap
+    # before reaching agg. validate_config branches on pipeline kind itself,
+    # so the temporal and raster paths get their own (smaller) checks rather
+    # than a false refusal.
+    validate_config(config)
+
     # Pipeline kind picks the strategy (issue #12, Phase 5). The strategy seam
     # is dispatch-level: the spatial path is the existing code, moved verbatim
     # into SpatialStrategy so its behavior/output stays byte-identical; the
@@ -1144,9 +1162,12 @@ class RasterStrategy:
             if identity["cells_current"]:
                 from zagg.lifecycle import touch_store_root
 
-                root_touch = touch_store_root(store_path, store_kwargs=store_kwargs)
+                root_touch = touch_store_root(
+                    store_path, store_kwargs=store_kwargs, policy=get_touch_policy(config)
+                )
                 identity["objects_touched"] += root_touch["touched"]
                 identity["touch_failures"] += root_touch["failed"]
+                _add_skipped_paths(identity, root_touch)
         # Store-root refusal manifest (issue #388) — see _write_refusals.
         refusal_manifest_path = _write_refusals(
             store_path, ok_metas, identity, run_id, run_semantic_hash, store_kwargs
@@ -2751,6 +2772,12 @@ def _clamped_data_source(data_source: dict, n_granules: int) -> dict | None:
     caller then passes the shared config through untouched, keeping unclamped
     cell payloads byte-identical. Just the simple ``min()`` policy; the
     worker still resolves the value through its ``_granule_workers`` guard.
+
+    The write-back uses whichever key the source dict carries — canonical
+    ``shard_workers`` if present, else the legacy ``granule_workers``. Writing
+    the legacy name unconditionally would leave both keys in the merged dict,
+    and ``_granule_workers`` prefers the canonical one, so the clamp would be
+    a silent no-op for any config using ``shard_workers``.
     """
     from zagg.processing.worker import _granule_workers
 
@@ -2758,7 +2785,8 @@ def _clamped_data_source(data_source: dict, n_granules: int) -> dict | None:
     clamped = min(k, max(int(n_granules), 1))
     if clamped == k:
         return None
-    return {**data_source, "granule_workers": clamped}
+    key = "shard_workers" if "shard_workers" in data_source else "granule_workers"
+    return {**data_source, key: clamped}
 
 
 def _check_signature(grid, catalog_data: dict) -> None:
@@ -2866,15 +2894,40 @@ def _identity_counts(metas) -> dict:
       here, never folded into ``cells_error``). The local paths ADD the
       once-per-run ``touch_store_root`` counts to these after the fact — the
       root objects belong to no unit, so they cannot come from ``metas``.
+    - ``touch_skipped_paths`` — PATHS (not objects) the touch found NOT
+      APPLICABLE because they live on a published bucket (issue #495 phase 4,
+      ``zagg.lifecycle._skip_published``). CONDITIONAL: present only when
+      non-zero, so a run that touches nothing published carries exactly the
+      key set it did before. Without it a published run records
+      ``objects_touched: 0, touch_failures: 0`` — byte-identical to a touch
+      that never ran, which is the ambiguity the skip must not inherit.
     """
     metas = [m for m in metas if isinstance(m, dict)]
-    return {
+    counts = {
         "cells_current": sum(1 for m in metas if m.get("current")),
         "cells_refused": sum(1 for m in metas if m.get("refused")),
         "cells_unrecorded": sum(1 for m in metas if m.get("identity") == "unrecorded-ids"),
         "objects_touched": sum(int(m.get("touched_objects") or 0) for m in metas),
         "touch_failures": sum(int(m.get("touch_failed") or 0) for m in metas),
     }
+    skipped = sum(int(m.get("touch_skipped_paths") or 0) for m in metas)
+    if skipped:
+        counts["touch_skipped_paths"] = skipped
+    return counts
+
+
+def _add_skipped_paths(identity: dict, touch: dict) -> None:
+    """Roll a store-root touch's not-applicable PATH count into ``identity``.
+
+    The root objects belong to no unit, so they never reach
+    :func:`_identity_counts` through ``metas``. Conditional on both sides —
+    the key appears only once something was actually skipped (issue #495
+    phase 4).
+    """
+    if touch.get("skipped_paths"):
+        identity["touch_skipped_paths"] = (
+            identity.get("touch_skipped_paths", 0) + touch["skipped_paths"]
+        )
 
 
 def _warn_partial_auth_denials(metas) -> int:
@@ -3283,9 +3336,12 @@ def _run_local(
     if store_layout == "hive" and identity["cells_current"]:
         from zagg.lifecycle import touch_store_root
 
-        root_touch = touch_store_root(store_path, store_kwargs=store_kwargs)
+        root_touch = touch_store_root(
+            store_path, store_kwargs=store_kwargs, policy=get_touch_policy(config)
+        )
         identity["objects_touched"] += root_touch["touched"]
         identity["touch_failures"] += root_touch["failed"]
+        _add_skipped_paths(identity, root_touch)
     refusal_manifest_path = _write_refusals(
         store_path, report.results, identity, run_id, run_semantic_hash, store_kwargs
     )
@@ -3338,7 +3394,12 @@ def _run_local(
             if config.output.get("sweep") == "stages":
                 from zagg.sweep_stages import stage_sweep_after_run
 
-                stage_sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
+                stage_sweep_after_run(
+                    store_path,
+                    leaves,
+                    store_kwargs=store_kwargs,
+                    touch_policy=get_touch_policy(config),
+                )
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -5243,6 +5304,20 @@ def _invoke_lambda_ping(
       seconds. Same last-writer caveat the manifest write itself has always
       had.
 
+    - **Read-only grant:** the handler PUT-then-DELETEs a zero-byte probe
+      object under the run's own ``<store>.status/`` sibling (issue #495 --
+      the prefix the async transport already requires writable, so the probe
+      adds no grant surface), so output credentials that can READ the store
+      but not write it -- the shape a fresh cross-account bucket policy fails
+      in, and the one Source Cooperative's in-region path has no interactive
+      step to catch -- refuse here instead of after every worker has
+      aggregated its shard. The response tags this failure
+      ``"check": "write_probe"`` so the remedy below points at the failing
+      REQUEST (grant being the likely cause) rather than at the store's
+      contents. A function that predates #495 simply omits the tag and the
+      older message applies. A DELETE that fails is fail-open but reported
+      (``probe_delete``) and warned about here.
+
     The raster lambda path reuses this ping (issue #264) ahead of its sync
     template-writing setup invoke: a raster config carries no hive layout, so
     only the stale-deployment half applies (the handler's manifest precheck
@@ -5277,6 +5352,21 @@ def _invoke_lambda_ping(
             body = json.loads(result.get("body") or "{}")
         except (TypeError, ValueError):
             body = {}
+        if body.get("check") == "write_probe":
+            # The store is reachable and compatible; the zero-byte probe PUT
+            # did not land (issue #495). Naming the store's contents here — the
+            # message below — would send the operator to clear a store root
+            # that is not the problem. The cause is stated as LIKELY, not
+            # determined: the tag says which request failed, not why, and the
+            # echoed error carries "Access Denied" when that is what happened.
+            raise RuntimeError(
+                f"Lambda ping could not WRITE to {store_path}: "
+                f"{body.get('error')!r} — the output credentials can reach the "
+                f"store but a zero-byte probe PUT failed, most likely a denied "
+                f"grant (bucket policy or assumed role); resolve it before "
+                f"dispatching this run, or the fan-out will aggregate every "
+                f"shard and then fail at write time"
+            )
         if body.get("mode") == "ping":
             # The deployed function KNOWS ping — this is validate_manifest
             # refusing the store, not a stale deployment.
@@ -5292,10 +5382,24 @@ def _invoke_lambda_ping(
             f"redeploy the function before dispatching this run"
         )
     try:
-        version = json.loads(result.get("body") or "{}").get("zagg_version")
+        ok_body = json.loads(result.get("body") or "{}")
     except (TypeError, ValueError):
-        version = None
-    logger.info(f"Preflight OK (function zagg version {version})")
+        ok_body = {}
+    if ok_body.get("probe_delete") is False:
+        # The probe PUT succeeded but its cleanup DELETE did not (issue #495).
+        # Deliberately not fatal — write permission, the thing this preflight
+        # gates on, is proven. But s3:DeleteObject is not optional for zagg's
+        # real writes (store overwrite and manifest cleanup), so the run is
+        # likely to fail later, and every run strands one zero-byte object
+        # under a prefix nothing sweeps. Surfaced HERE because the function's
+        # own log group is not where the dispatching operator is looking.
+        logger.warning(
+            f"Write probe could not delete {ok_body.get('probe_key')!r}: the output "
+            f"credentials can PUT but likely lack s3:DeleteObject, which zagg needs "
+            f"for store overwrite and manifest cleanup — this run may fail at write "
+            f"time, and the probe object is stranded"
+        )
+    logger.info(f"Preflight OK (function zagg version {ok_body.get('zagg_version')})")
 
 
 def _invoke_lambda_finalize(

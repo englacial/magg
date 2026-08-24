@@ -118,19 +118,20 @@ This approach avoids rate limiting from 1,872 simultaneous NASA logins and elimi
 
 ### Output Credentials (external write targets)
 
-By default the function writes the output store with its **execution role**
-against the in-account bucket; omit `output_credentials` entirely to keep this
-behavior. To write an **external or S3-compatible target** (another account, or
-e.g. source.coop) without changing the execution role, supply
-`output_credentials` in the event — symmetric to how `s3_credentials` injects
-read credentials:
+By default the function writes the output store with its **execution role**,
+which reaches the in-account output bucket, `sliderule-public-cors`, and zagg's
+published prefix on Source Cooperative (issue #495) — omit `output_credentials`
+entirely for all three. Injection is for targets we have **not** negotiated a
+bucket policy with: a collaborator's private bucket, or an S3-compatible store
+like R2/MinIO. Supply `output_credentials` in the event — symmetric to how
+`s3_credentials` injects read credentials:
 
 ```python
 from zagg import load_config, agg
 
 results = agg(
     config, catalog="catalog.json", backend="lambda",
-    store="s3://us-west-2.opendata.source.coop/org/dataset.zarr",
+    store="s3://a-collaborators-private-bucket/shared/dataset.zarr",
     output_credentials={  # runtime-only; never store in config/YAML
         "accessKeyId": "ASIA...",
         "secretAccessKey": "...",
@@ -146,16 +147,93 @@ secrets out of shell history):
 
 ```bash
 python -m zagg --config atl06.yaml --catalog catalog.json --backend lambda \
-  --store s3://us-west-2.opendata.source.coop/org/dataset.zarr \
+  --store s3://a-collaborators-private-bucket/shared/dataset.zarr \
   --output-creds /path/to/output-creds.json
 ```
 
 The non-secret `endpoint_url` / `region` may also be set in the config's
 `output:` section (overridable at runtime); **credentials are runtime-only**.
-source.coop uses the standard AWS S3 endpoint with injected STS credentials —
 `endpointUrl` is only needed for non-AWS S3-compatible stores. Dotted bucket
 names (e.g. `us-west-2.opendata.source.coop`) and custom endpoints use
 path-style addressing automatically.
+
+A write target this account does not own carries
+`x-amz-acl: bucket-owner-full-control` on every request (issue #495). S3 object
+ownership follows the *writing* account, so without that canned ACL a
+cross-account PUT under the `ObjectWriter` setting leaves objects the bucket
+owner cannot manage or delete — Source Cooperative's in-region upload path
+requires it. Two shapes qualify, and the second is the one phase 3 added:
+
+- `output_credentials` **without** an `endpointUrl` — an un-negotiated target;
+- an **ambient** (execution-role) write to a bucket zagg publishes to but does
+  not own. Today that is `us-west-2.opendata.source.coop`, the one entry in
+  `zagg.store._PUBLISHED_BUCKETS`. Since the fleet now reaches it with the
+  execution role and no injected credentials, keying the header on credentials
+  alone would publish owner-less objects silently.
+
+It is derived, not configured: there is no ACL knob to set. Writes to buckets we
+*do* own — the output bucket, `sliderule-public-cors` — still send no header;
+that is deliberate, since the header requires `s3:PutObjectAcl` on the target
+and the execution role holds it only on the published prefix (see
+`deployment/aws/template.yaml`). Any target reached through an `endpointUrl` is
+excluded —
+both the S3-compatible stores behind that knob (R2, MinIO), which do not
+implement canned ACLs at all, and an endpoint-routed *AWS* target such as the
+retired `data.source.coop` proxy hop, which this native-write path exists to
+replace. A caller that must send no ACL at all can pass
+`client_options={"default_headers": {"x-amz-acl": None}}`, which strips the
+header; nothing in the Lambda config surface does.
+
+### Write probe {#write-probe}
+
+Reachability is not permission, so the pre-fan-out ping
+([issue #495](https://github.com/englacial/zagg/issues/495)) does not stop at
+the read-only store check: it PUT-then-DELETEs one zero-byte object before any
+worker is dispatched. **Two requests, added to the ping, and only for `s3://`
+stores** (a local store has nothing to prove). It is not hive-specific — every
+`s3://` ping runs it, the raster path included.
+
+Why it exists: credentials that can read the store but not write it are exactly
+how a fresh cross-account grant fails, and Source Cooperative's in-region path
+vends no credentials of its own (our IAM role writes through *their* bucket
+policy), so no interactive step would catch a misconfigured grant. Without the
+probe the first real write is the fire-and-forget `mode="setup"` invoke whose
+failure nobody sees, and the denial surfaces only after every worker has read
+and aggregated its shard.
+
+**Grant requirement.** The probe writes `<store>.status/probe-<uuid>` — the
+run's async-result sibling, *not* the store root and *not* a prefix of its own.
+That prefix is one the run already needs writable (the async invoke/poll
+transport writes every per-shard status object under it), so a grant covering
+`<store>/*` + `<store>.status/*` passes the probe exactly when the run's real
+writes would succeed. Nothing new to enumerate. Keeping the probe out of the
+store root is deliberate: `docs/specification.md` §5.2 makes the leaf hash set
+discovery-based, so a probe object stranded inside a leaf by a denied DELETE
+would be a *key-set difference* and a verifier would report an intact leaf as
+tampered.
+
+**What it covers, and what it does not.** The PUT proves `s3:PutObject`, and one
+small PUT is representative of the multipart path
+(`CreateMultipartUpload`/`UploadPart`/`CompleteMultipartUpload` are all
+authorized by `s3:PutObject`). It cannot exercise `s3:AbortMultipartUpload` or
+`s3:ListMultipartUploadParts`, which the grant carries deliberately for
+aborted/retried uploads — a grant missing those still passes.
+
+**Outcomes.** A failed PUT is **fail-closed**: the ping returns 500 tagged
+`"check": "write_probe"` and the dispatcher refuses the run, naming the failing
+request (a denied grant being the likely cause) rather than sending you to clear
+a store root that is not the problem. A failed DELETE is **fail-open** — write
+permission is proven, which is what the preflight gates on — but it is reported
+(`probe_delete: false` plus `probe_key` in the 200 body) and the dispatcher logs
+a warning naming the stranded object and the likely missing `s3:DeleteObject`.
+Do not ignore it: `s3:DeleteObject` is not optional for zagg's real writes
+(store overwrite, manifest cleanup), so that run is likely to fail later, and
+each run leaves one zero-byte object behind under a prefix nothing sweeps.
+
+> Not to be confused with the manual `s3://BUCKET/PREFIX/.probe` check in
+> [`benchmark-cicd.md`](benchmark-cicd.md) — that one is a human-run
+> `aws s3 cp` *inside* the prefix, cleaned up by hand in the same command. The
+> automated probe deliberately never writes inside the store root.
 
 ## Deployment
 
@@ -171,11 +249,9 @@ OUTPUT_BUCKET=my-results-bucket bash deployment/aws/stand_up.sh
 
 See **[Standing Up the Backend](standup.md)** for the full walkthrough: what the
 script does, the parameter/environment-variable reference, cross-region staging,
-and teardown. By default (`CreateExecutionRole=true`) the stack creates the IAM
-execution role for you; the only exception is an account whose deploy identity
-*cannot* create IAM roles (e.g. an AWS SSO "power user" set) — see
-[Execution Role](execution-role.md) for that IAM-constrained, legacy/unverified
-path.
+and teardown. The stack always creates the IAM execution role, so the identity
+running the standup needs `iam:CreateRole` — in an account whose deploy identity
+cannot (e.g. an AWS SSO "power user" set), have an admin run the standup itself.
 
 ### Worker-size variants {#worker-size-variants}
 

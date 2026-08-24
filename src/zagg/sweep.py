@@ -171,9 +171,81 @@ class MocFamily(SweepFamily):
     already covers the folded words and time range (sweep idempotence). The
     O8 in-leaf bitmap contract is untouched: this family reads only the
     stamp envelope, never the cell-order bitmap sidecar.
+
+    The spec §10 TEMPORAL section (issue #480) rides this same walk: every
+    stamped leaf of a temporal-declaring store also yields its §8.3 toc
+    envelope word and a per-leaf time digest
+    (:func:`zagg.coverage_toc.read_leaf_temporal`), accumulated on the family
+    INSTANCE — one per run, since :func:`get_family` constructs a fresh one —
+    and folded into the section :meth:`finish` writes. It stays OUT of the
+    per-node rollup payloads on purpose: those are the skip-if-current
+    currency, compared byte for byte, and a per-node k-way fold would
+    describe a different centroid partition at every node (the fold-tree
+    caveat on :func:`zagg.stats.tdigest.merge_tdigests_kway`). A store
+    declaring no temporal field accumulates nothing, and its root object is
+    byte-identical to a pre-#480 one.
     """
 
     name = "moc"
+
+    def __init__(self):
+        #: ``{shard decimal: [(word, digest, times, cover), ...]}`` — one
+        #: entry per window leaf this run visited (issues #480, #489; the
+        #: fourth element is the leaf's §10.5 word-set cover).
+        self._temporal: dict[str, list] = {}
+        #: Shards whose temporal read failed: dropped from the map entirely,
+        #: never published from the window leaves that did read (issue #480).
+        self._temporal_failed: set[str] = set()
+        #: Resolved once, on the first leaf read; ``None`` until then.
+        self._temporal_fields: dict | None = None
+        self._cell_order = 0
+
+    def _accumulate_temporal(self, store_root, decimal, leaf, store_kwargs) -> None:
+        """Read one leaf's §10 temporal contribution; fail-open per SHARD (D9).
+
+        A store declaring no temporal field short-circuits after one manifest
+        read. An unreadable companion is logged and skipped rather than
+        failing the leaf: the temporal section is a regenerable accelerator,
+        and the spatial rollup this walk exists for must not die on it.
+
+        The fail-open is shard-scoped, not leaf-scoped. A windowed shard has
+        several leaves behind ONE map entry, and §10.2 promises that a LISTED
+        shard's word conservatively contains every instant in it — a word
+        joined over whichever windows happened to read is not that. So one
+        failed window drops its whole shard from the map, permanently for this
+        run; a shard absent from ``shards`` reads as *unknown* (still a
+        candidate), which is always safe, while a shard listed with a partial
+        word is not.
+        """
+        from zagg.coverage_toc import read_leaf_temporal, temporal_cell_order, temporal_fields
+
+        if self._temporal_fields is None:
+            from zagg.hive import read_manifest
+
+            manifest = read_manifest(store_root, **store_kwargs) or {}
+            self._temporal_fields = temporal_fields(manifest)
+            cell_order = temporal_cell_order(manifest)
+            if self._temporal_fields and cell_order is None:
+                logger.warning(
+                    f"sweep[moc]: {store_root} declares temporal fields but carries no "
+                    f"cell_order — publishing no §10 section rather than guessing a group"
+                )
+                self._temporal_fields = {}
+            self._cell_order = cell_order or 0
+        if not self._temporal_fields or decimal in self._temporal_failed:
+            return
+        try:
+            got = read_leaf_temporal(leaf, self._cell_order, self._temporal_fields, **store_kwargs)
+        except Exception as e:
+            logger.warning(
+                f"sweep[moc]: dropping shard {decimal} from the temporal section — "
+                f"leaf {leaf} did not read ({e})"
+            )
+            self._temporal_failed.add(decimal)
+            self._temporal.pop(decimal, None)
+            return
+        if got is not None:
+            self._temporal.setdefault(decimal, []).append(got)
 
     def read_leaf(self, store_root, decimal, window, spec, store_kwargs):
         # ``spec`` is unused here: leaf PATHS are the frozen /1-/2 grammar
@@ -187,6 +259,7 @@ class MocFamily(SweepFamily):
         stamp = read_commit(open_store(leaf, **store_kwargs))
         if stamp is None:
             return None  # absent leaf or unstamped debris (D4)
+        self._accumulate_temporal(store_root, decimal, leaf, store_kwargs)
         payload = _moc_payload([morton_word(decimal)], stamp.get("time_range"))
         return payload, stamp.get("written_at")
 
@@ -205,12 +278,35 @@ class MocFamily(SweepFamily):
         Unions with the existing root object (the sweep may cover only the
         dirty subtrees — untouched bases must keep their listing), via the
         same :func:`zagg.hive.write_root_coverage` transport the runner uses.
-        No PUT when the existing root already lists every folded word and
-        covers the folded time range, so an unchanged tree re-sweep is a
-        no-op here too.
+        No PUT when the existing root already lists every folded word,
+        covers the folded time range, and would be UNCHANGED by composing
+        this run's §10 temporal section into it
+        (:func:`zagg.coverage_toc.section_unchanged` — the test is on the
+        merge's output rather than on the raw section, because §10.4 drops a
+        partial producer's digest at the seam), so an unchanged tree re-sweep
+        is a no-op here too, on a multi-shard store as much as a one-shard one.
+
+        The §10.5 word-set cover (issue #489) rides the same pass: the
+        sibling ``coverage.toc`` is composed from the identical accumulator
+        (GET-union-PUT via :func:`zagg.coverage_toc.write_cover`, BEFORE the
+        root object that carries its presence marker), and its half of the
+        skip test (:func:`zagg.coverage_toc.cover_unchanged`) is paid only
+        once the root object already vouches for everything else — so a
+        non-temporal store's finisher never GETs the sibling at all.
         """
         import numpy as np
 
+        from zagg.coverage_toc import (
+            COVER_KEY,
+            COVER_SPEC,
+            TEMPORAL_KEY,
+            build_cover_section,
+            build_temporal_section,
+            cover_unchanged,
+            read_cover,
+            section_unchanged,
+            write_cover,
+        )
         from zagg.hive import (
             build_root_coverage,
             read_root_coverage,
@@ -221,6 +317,17 @@ class MocFamily(SweepFamily):
 
         if not tops:
             return {"root_moc_written": False}
+        section = build_temporal_section(
+            self._temporal, self._temporal_fields or {}, source="sweep"
+        )
+        cover = build_cover_section(
+            self._temporal, self._temporal_fields or {}, shard_order, source="sweep"
+        )
+        if section is not None and cover is not None:
+            # The §10.1 presence marker: this producer is about to PUT (or
+            # leave standing) a sibling at its own revision. A hint, per the
+            # spec — a reader falls back when the object is gone or foreign.
+            section[COVER_KEY] = COVER_SPEC
         words = np.unique(np.concatenate([root_coverage_words(t["payload"]) for t in tops]))
         time_range = union_time_range(*(t["payload"].get("time_range") for t in tops))
         try:
@@ -234,16 +341,38 @@ class MocFamily(SweepFamily):
                     union_time_range(existing.get("time_range"), time_range)
                     == existing.get("time_range")
                 )
+                covered = covered and section_unchanged(existing.get(TEMPORAL_KEY), section)
+                # The sibling's half of the same test — reached (and its GET
+                # paid) only once the root object vouches for everything
+                # else. `cover_unchanged` answers False on a malformed
+                # standing object, which routes to the rewrite.
+                if covered and cover is not None:
+                    covered = cover_unchanged(read_cover(store_root, **store_kwargs), cover)
                 if covered:
                     return {"root_moc_written": False}
             except (KeyError, TypeError, ValueError):
                 pass  # malformed cache cannot vouch for coverage -> rewrite
+        if cover is not None:
+            # Sibling before marker: the root object that names the cover
+            # must never land while the object it points at is still absent.
+            write_cover(store_root, cover, **store_kwargs)
         write_root_coverage(
             store_root,
-            build_root_coverage(words, shard_order, source="sweep", time_range=time_range),
+            build_root_coverage(
+                words, shard_order, source="sweep", time_range=time_range, temporal=section
+            ),
             **store_kwargs,
         )
-        return {"root_moc_written": True}
+        out = {"root_moc_written": True}
+        if section is not None:
+            # THIS pass's contribution, not the store's total. The section
+            # composes with the standing one at the seam (§10.4), so the map
+            # that landed lists at least these shards and usually more; the
+            # run summary reports what the run did.
+            out["temporal_shards"] = len(section["shards"])
+        if cover is not None:
+            out["cover_shards"] = len(cover["shards"])
+        return out
 
 
 def _moc_payload(words, time_range) -> dict:

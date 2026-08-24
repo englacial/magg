@@ -727,11 +727,97 @@ neither gap and is safe now.
   a different product; the original list omitted it only because the
   temporal path wasn't in frame, and pre-merge was the free moment to add
   it — no store carries a hash yet). Excluded as packaging: cell order (a
-  resolution axis — D24), parent/shard order, `chunk_inner`/`sharded`,
-  worker size, streaming mode (merge-vs-spill lands `np.isclose` and
-  shares one store, with the actual mode recorded per-run), and read
+  resolution axis — D24), parent/shard order, `chunk_inner`/`sharded`
+  (`sharded` amended below — the D19 hash epoch),
+  worker size, the whole `aggregation.streaming` block (mode AND its
+  sizing knobs, `buffer_granules`/`block_bytes` — merge-vs-spill lands
+  `np.isclose` and shares one store, with the actual mode recorded
+  per-run; see the law-equivalence contract below), and read
   knobs — hashing the whole template would have made o8 and o9 runs
-  different products and blocked mixed-order processing. The hash is a
+  different products and blocked mixed-order processing.
+  **Amended by the D19 hash epoch** (espg-ruled on-thread 2026-08-07 as
+  PR #397 questions (7)(b)/(8)(c), recorded in
+  [#384 plan delta 2](https://github.com/englacial/zagg/issues/384#issuecomment-5223266761);
+  implemented in #415): two corrections to the lists above, landed together
+  because each one moves every existing digest. (a) *Worker size* was
+  already named as packaging but its keys were never excluded, so the
+  per-cell `min(K, n_granules)` clamp made a small shard's worker-side hash
+  differ from the run's — `shard_workers`/`granule_workers` now exclude
+  properly. (b) The **leaf-shaping `output` knobs** — `aoi_mask`,
+  `windowing`, `grid.sharded` — are now *included*:
+  they change what a leaf contains, so leaving them out made the D20 skip
+  gate (#388) read a config-changed rerun as `equal`. `sharded` therefore
+  moves from the exclusion list above into the core; the orders it sits
+  beside do **not** (D24 is untouched, and the object-layout hole is
+  narrowed rather than closed — `chunk_inner` still moves K without moving
+  the digest, espg-ruled 2026-08-17 as the bounded state to ship). The
+  `pyramid` block stays excluded: D11 keeps it out of the
+  frozen manifest keys, and the leaf column it declares is verified by
+  reading the artifact (§4.6) rather than by the digest —
+  and `grid.emit_cell_ids` stays excluded on the *same* argument
+  (espg-ruled 2026-08-17): the #304 hatch is scheduled for removal, so a
+  hashed hatch would strand every store built with it ON behind a digest
+  no legal config can reproduce, in exchange for an array inventory that
+  reading the leaf already verifies. (c) A third
+  exclusion rode the same epoch (espg-ruled 2026-08-17, issue #449):
+  `credentials_provider` is packaging — it selects how source bytes are
+  fetched (the same class as the read knobs and as `anonymous`, already
+  excluded), never what is computed, and a wrong credential fails the fetch
+  loudly rather than silently. Ruled at the epoch so the first GEDI store's
+  identity is born without an auth knob, and so a credential migration over
+  unchanged data (the MERRA-2/gesdisc path) never rehashes. (d) The same
+  ruling extended to the **byte-movement knobs** `read_workers`,
+  `write_buffer` and `source_region` (espg-ruled 2026-08-17 on the epoch
+  PR): each selects how bytes are fetched or moved, never what is computed;
+  each fails loudly rather than silently; and `source_region` sat in the
+  same dict literal as the already-excluded `anonymous`, so the D19 line ran
+  through the middle of one decision. The live demonstration is dated and
+  covers the fan-out widths only: two GEDI flux builds of one shard on
+  2026-08-17 produced identical `total_obs` and `cells_with_data` in the exact
+  single-block spill regime and still hashed apart on `read_workers` and the
+  two `*_workers` spellings. `write_buffer` and `source_region` are
+  raster-only and a flux build is the point path, so those two rest on the
+  arguments rather than on the measurement. (e) The epoch also
+  canonicalized the OTHER half of the identity pair, the catalog hash below
+  (espg-ruled 2026-08-17: *"we want the granule to trigger the hash, not how
+  that granule is fetched"*) — see that clause. Operator
+  consequences — every pre-epoch hash invalidated, and the three migration
+  paths — are in `docs/hive_layout.md`, "Migration: the D19 hash epoch".
+
+  **Amended again — the streaming exclusion and its law-equivalence
+  contract** (the PR #475 D19 question, resolved 2026-08-17 as option (b);
+  the decision record is on that PR's thread; issue #474): the whole
+  `aggregation.streaming` block — `mode`, `buffer_granules`,
+  `block_bytes` — is excluded from the core as packaging
+  (`AGGREGATION_PACKAGING_KEYS`), landing the code on the side this
+  record already stated twice while `semantic_core` still hashed the
+  block as spelled. The exclusion holds **on condition of the
+  law-equivalence contract**: every streaming mode MUST produce output
+  within the documented approximation law of the pooled path. Three law
+  classes are admitted, and a mode that cannot maintain the class its
+  channels fall in may not join the streaming block: (1) **exact** — the
+  single-block regime and the summation reducers; (2) the
+  **kway/`np.isclose`** class — the payload channel across merge flushes
+  and block closes; (3) the **channel-specific documented bounds** for
+  the companion channels, conservative rather than close — a located
+  companion word folds toward the contributors' common ancestor, so its
+  pin is an ancestor-or-equal hull bound (§9.1), and the packed
+  composition word keeps presence (`lane > 0`) exactly with counts within
+  one lane quantization (`tol = 1 + n / 255.0`) of pooled.
+  The contract, not the digest, is what makes one shared identity across
+  all streaming regimes honest; its enforcement is the single-block
+  exactness pins (`tests/test_spill.py::TestSpillWorkerSingleBlock`), the
+  cross-block suites (`tests/test_spill_crossblock.py`, being extended to
+  the temporal channel by issue #477), and `tests/test_streaming.py`'s
+  pooled-parity pins.
+  Store compatibility was priced at decision time: no long-lived store
+  carries a streaming-declared digest (the deployed stores age out on a
+  30-day cycle), so the epoch moves nothing that outlives it — and the
+  fat-shard rescue that motivated the knob (issue #474) stays deployable
+  on an existing store, where the as-spelled hash would have tripped the
+  frozen-key refusal.
+
+  The hash is a
   **frozen manifest key** (reusing a name with different aggregation
   semantics refuses up front, like any frozen-key mismatch) and is
   recorded in leaf attrs and D20 sidecars. The *literal* template is
@@ -754,7 +840,24 @@ neither gap and is safe now.
   granule count + sha256 of sorted granule ids + zagg version;
   dedup/`has_run` consults the computed path, the `semantic_hash`, *and*
   the sidecar catalog identity (a catalog-grown shard is "stale", not
-  "hit"). Immutable-provenance naming (product root
+  "hit"). **Amended at the D19 hash epoch** (espg-ruled 2026-08-17, PR #420
+  question (1)(b)): the ids are canonicalized to the **driver-stripped bare
+  granule id** before hashing, and the recorded id list beside the hash is
+  written in that same space. One granule reaches these seams as an `s3://`
+  href, an `https://` href or a bare catalog id depending only on
+  `data_source.driver` — which the semantic core has always treated as
+  packaging — so hashing the href form made a driver switch look like a
+  catalog change and rewrote whole stores over a fetch-mechanism edit. The
+  canonical form is the basename because it is the only component the s3 and
+  https spellings of one granule agree on; the accepted cost is that two
+  granules whose hrefs differ only in prefix collapse to one identity, which
+  every catalog zagg reads rules out by naming granules globally uniquely
+  (that is why the catalog's own id equals the basename). Where a collapse
+  *does* happen the cost is not only a collision: the contraction guard's
+  set diff loses per-granule resolution inside the collapsed group, so a
+  dropped member reads as `id-multiset-drift` and rewrites rather than
+  refusing — logged loudly per leaf, with the predicate question left
+  standing (PR #420 review finding (2)). Immutable-provenance naming (product root
   `{name}+{catalog-hash}/`) stays an opt-in for frozen-catalog archival
   runs. The output content hash that makes dedup *verifiable* is O11
   (resolved — adopted; it complements the semantic hash — "intended identical" vs
@@ -1122,9 +1225,12 @@ registry — CI coverage should be auditable against this list:
   members (cf. D24).
 - **Semantic-hash canonicalization** (D19): syntactic edits (whitespace,
   key order, comments) never change the hash; packaging-knob edits
-  (orders, chunking, worker size, streaming mode) never change the hash;
-  any semantic edit does. Name-grammar validation (base-component
-  exclusion, URL-safe charset).
+  (orders, chunking, worker size, the `aggregation.streaming` block in
+  every spelling — the law-equivalence contract above is the exclusion's
+  condition) never change the hash;
+  any semantic edit does; and, post-epoch (#415), a leaf-shaping `output`
+  edit does while an explicit default hashes as absence. Name-grammar
+  validation (base-component exclusion, URL-safe charset).
 - **Manifest guard** (§3): frozen-key match ⇒ idempotent accept, no
   second PUT; mismatch ⇒ pre-dispatch refusal; `path_grouping` absent⇒1
   normalization; allowed-set membership for `cell_order`/`shard_order`.

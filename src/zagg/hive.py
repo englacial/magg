@@ -953,7 +953,12 @@ def _rank_tail(rank: int, depth: int) -> str:
 
 
 def build_root_coverage(
-    shard_keys, order: int, *, source: str = "dispatcher", time_range: tuple | list | None = None
+    shard_keys,
+    order: int,
+    *,
+    source: str = "dispatcher",
+    time_range: tuple | list | None = None,
+    temporal: dict | None = None,
 ) -> dict:
     """Store-root coverage envelope from completed shard keys (issue #200 phase 3).
 
@@ -973,6 +978,12 @@ def build_root_coverage(
     CACHE, never truth (the per-leaf stamps are the truth; the walk and the
     sweep regenerate this). Omitted for unwindowed stores, keeping their root
     object byte-identical to pre-#246 runs.
+
+    ``temporal`` (issue #480): the spec §10 ``zagg-coverage-toc/1`` section —
+    the per-shard toc envelope word map plus the optional root time-digest,
+    built by :func:`zagg.coverage_toc.build_temporal_section`. ``None`` for a
+    store with no temporal channel, which keeps ITS root object byte-identical
+    to a pre-#480 one; absence of the section is never a refusal.
     """
     from zagg.grids.morton import to_morton_array
 
@@ -1008,6 +1019,10 @@ def build_root_coverage(
     }
     if time_range is not None:
         envelope["time_range"] = [str(t) for t in time_range]
+    if temporal is not None:
+        from zagg.coverage_toc import TEMPORAL_KEY
+
+        envelope[TEMPORAL_KEY] = temporal
     return envelope
 
 
@@ -1056,6 +1071,13 @@ def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict
     re-unions — accepted under D9/O7 (a missing listing degrades to "reader
     doesn't see the newest run", never a wrong answer; do NOT add a lock).
     Returns the payload actually written.
+
+    The spec §10 temporal section (issue #480) composes across the same seam
+    (:func:`zagg.coverage_toc.merge_temporal_sections`): its per-shard word
+    map unions elementwise under the grammar's join, its digest is replaced
+    rather than unioned (weights are counts), and a producer carrying no
+    section leaves an existing one standing. Two stores with no temporal
+    channel at all still write byte-identical bytes to a pre-#480 zagg.
     """
     import obstore
 
@@ -1098,6 +1120,17 @@ def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict
                 f"existing {ROOT_COVERAGE_NAME} at {store_root} has an incompatible "
                 f"envelope; overwriting (regenerable cache)"
             )
+    from zagg.coverage_toc import TEMPORAL_KEY, merge_temporal_sections
+
+    # A rebuilt `merged` dropped the existing carrier's extra keys with it;
+    # an OVERWRITE (`merged is envelope`) deliberately discards the stale
+    # section too, exactly as it discards the stale ranges.
+    carried = isinstance(existing, dict) and merged is not envelope
+    section = merge_temporal_sections(
+        existing.get(TEMPORAL_KEY) if carried else None, envelope.get(TEMPORAL_KEY)
+    )
+    if section is not None:
+        merged[TEMPORAL_KEY] = section
     obstore.put(store, ROOT_COVERAGE_NAME, json.dumps(merged, indent=1).encode())
     return merged
 
@@ -1453,14 +1486,17 @@ def process_and_write_hive(
         # The issue #383 column rides this seam AFTER the gate, and its
         # declaration moves neither identity half — so the gate verifies the
         # artifact itself (leaf_column_expectation).
+        from zagg.telemetry import canonical_granule_ids
+
         column_path, column_declared = leaf_column_expectation(
             store_root, shard_key, grid, config, window
         )
         identity, unit_meta = leaf_identity_gate(
             leaf_path,
-            # Paired-asset entries (issue #425) identify by their primary URL,
-            # so the planned-id space matches the strings-only local path.
-            [u["url"] if isinstance(u, dict) else str(u) for u in granule_urls],
+            # ONE canonical id space for both sides of the gate (espg-ruled
+            # 2026-08-17): the driver-stripped bare id, with paired-asset
+            # entries (issue #425) identifying by their primary.
+            canonical_granule_ids(granule_urls),
             semantic_hash=semantic_hash,
             allow_contraction=allow_contraction,
             sidecar_spec=sidecar_spec,
@@ -1479,6 +1515,7 @@ def process_and_write_hive(
                 # so the touch never resurrects the column-drift ambiguity).
                 # Fail-open both here and inside: a failed touch logs and
                 # counts, never fails or un-skips the unit.
+                from zagg.config import get_touch_policy
                 from zagg.lifecycle import touch_current_unit
 
                 try:
@@ -1487,6 +1524,7 @@ def process_and_write_hive(
                         column_path=column_path if column_declared else None,
                         sidecar_spec=sidecar_spec,
                         store_kwargs=store_kwargs,
+                        policy=get_touch_policy(config),
                     )
                 except Exception as e:
                     logger.warning(
@@ -1495,6 +1533,13 @@ def process_and_write_hive(
                     counts = {"touched": 0, "failed": 1}
                 unit_meta["touched_objects"] = counts["touched"]
                 unit_meta["touch_failed"] = counts["failed"]
+                # A published target is NOT APPLICABLE, not failed (issue #495
+                # phase 4) — but the pair above records that as 0/0, which is
+                # byte-identical to a touch that never ran. Recorded so the
+                # run parquet and the .status objects say it out loud; absent
+                # when zero, so every non-published record stays as it was.
+                if counts.get("skipped_paths"):
+                    unit_meta["touch_skipped_paths"] = counts["skipped_paths"]
             return unit_meta
 
     box: dict = {}
@@ -1684,13 +1729,14 @@ def process_and_write_hive(
         # Fail-open inside (telemetry class, D9). Inside the write bracket:
         # it is a write this seam performs, so ``phase_timings["write"]``
         # must account for it.
-        from zagg.telemetry import write_granule_ids
+        from zagg.telemetry import canonical_granule_ids, write_granule_ids
 
         write_granule_ids(
             leaf_path,
-            # Same primary-URL identity as the gate above (issue #425): the
-            # recorded and planned id spaces must share one shape.
-            [u["url"] if isinstance(u, dict) else str(u) for u in granule_urls],
+            # Same canonical identity as the gate above: the recorded and
+            # planned id spaces must share one shape (``write_granule_ids``
+            # canonicalizes too — this keeps the two call sites reading alike).
+            canonical_granule_ids(granule_urls),
             spec=sidecar_spec,
             **store_kwargs,
         )

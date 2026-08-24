@@ -141,10 +141,13 @@ def composable_fields(fields: dict) -> dict:
     """The declared fields a column fold may carry: the two composable classes.
 
     The D24 ``class: "none"`` entries — expressions, vector fields,
-    chunk-resolution companions, located ragged, and the derived statistics
-    (:func:`zagg.semantics.field_composability`, recorded by
+    chunk-resolution companions, temporal companions, and the derived
+    statistics (:func:`zagg.semantics.field_composability`, recorded by
     :func:`zagg.pyramid.declared_fields`) — exist at native resolution ONLY,
-    and no coarser fold of them is defined. The fold core filters them here,
+    and no coarser fold of them is defined. A **located** ragged field is not
+    among them: since ruling 4 on issue #410 it is ``approximate`` and folds
+    through the pyramid with its ``{field}_locations`` channel, so it passes
+    this filter and :func:`fold_column` carries the pair. The fold core filters them here,
     the same posture the sweep takes before ``_fold_node``
     (:func:`zagg.sweep_overview.sweep_overviews`), so handing a whole
     declaration's ``fields`` map straight through can neither refuse a leaf
@@ -175,26 +178,36 @@ def leaf_slabs(staged: dict, fields: dict, *, group_path: str, n_cells: int) -> 
     ``fields`` is filtered to the composable classes first
     (:func:`composable_fields`), which is what makes the ``(n_cells,)`` extent
     check sound: those two classes admit nothing but cell-resolution scalars
-    and unlocated ragged payloads, so a staged slab of any other extent really
-    is a sink that disagrees with the grid — and folding it would write a
-    wrong column, so it raises.
+    and ragged payloads, both of which are one row per cell, so a staged slab
+    of any other extent really is a sink that disagrees with the grid — and
+    folding it would write a wrong column, so it raises.
+
+    A field's companion siblings — ``{field}_locations`` (§9) and
+    ``{field}_times`` (§8.3) — are picked up under the same rule and the same
+    extent check (issue #410): each is one more cell-extent slab in the same
+    sink, and :func:`fold_column` needs them in one place because the merge
+    produces all of them in one call (spec §9.1/§8.3).
     """
-    from zagg.sweep_overview import _empty_slab
+    from zagg.sweep_overview import _empty_slab, field_companions
+
+    def _slab(key: str, meta: dict):
+        slab = staged.get(f"{group_path}/{key}")
+        if slab is None:
+            return _empty_slab(meta, n_cells)
+        slab = np.asarray(slab)
+        if slab.shape != (int(n_cells),):
+            raise ValueError(
+                f"staged slab for field {key!r} has shape {slab.shape}, not the "
+                f"leaf's ({int(n_cells)},) cell extent — refusing to fold a column "
+                f"from a sink that disagrees with the grid"
+            )
+        return slab
 
     slabs: dict = {}
     for name, meta in composable_fields(fields).items():
-        slab = staged.get(f"{group_path}/{name}")
-        if slab is None:
-            slab = _empty_slab(meta, n_cells)
-        else:
-            slab = np.asarray(slab)
-            if slab.shape != (int(n_cells),):
-                raise ValueError(
-                    f"staged slab for field {name!r} has shape {slab.shape}, not the "
-                    f"leaf's ({int(n_cells)},) cell extent — refusing to fold a column "
-                    f"from a sink that disagrees with the grid"
-                )
-        slabs[name] = slab
+        slabs[name] = _slab(name, meta)
+        for _kwarg, sibling in field_companions(name, meta):
+            slabs[sibling] = _slab(sibling, meta)
     return slabs
 
 
@@ -218,8 +231,25 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
     resolution FINER than ``cell_order`` is refused by name: it would ask for
     a fractional fold factor, which no guard downstream can read as a divisor
     (both classes would surface it as an opaque numpy failure instead).
+
+    A **located** field folds its ``{field}_locations`` sibling in the SAME
+    k-way call as its payload and returns it as its own group member (ruling 4
+    on issue #410, review finding): the §4.6 template
+    (:func:`zagg.sweep_overview._overview_config`) emits the sibling array and
+    the payload's §1.2 binding for every located field, so a fold returning
+    payload slabs only would commit populated payload rows against ``b""``
+    sibling rows under a §9 declaration — §1.1's row-alignment MUST broken, and
+    hashed into the §5 sidecar as content. The sibling slab is required by
+    name rather than defaulted: the words are keyed on the centroid partition
+    the merge produces (spec §9.1), so the pair may never be folded apart.
     """
-    from zagg.sweep_overview import decode_digest, fold_dense, fold_digests, overview_fold_delta
+    from zagg.sweep_overview import (
+        decode_digest,
+        field_companions,
+        fold_dense,
+        fold_digests,
+        overview_fold_delta,
+    )
 
     cell_order = int(cell_order)
     fields = composable_fields(fields)
@@ -241,24 +271,51 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
                 groups[name] = fold_dense(
                     slab, factor, meta.get("method"), meta.get("fill_value", "NaN")
                 )
-            else:
-                dtype = meta.get("dtype") or "float32"
-                inner = tuple(meta.get("inner_shape") or (2,))
-                delta = overview_fold_delta(meta)
-                if slab.shape[0] % factor:
+                continue
+            dtype = meta.get("dtype") or "float32"
+            inner = tuple(meta.get("inner_shape") or (2,))
+            delta = overview_fold_delta(meta)
+            if slab.shape[0] % factor:
+                raise ValueError(f"cannot fold {slab.shape[0]} cells {factor}-to-one for {name!r}")
+            declared = field_companions(name, meta)
+            for kwarg, sibling in declared:
+                if slabs.get(sibling) is None:
                     raise ValueError(
-                        f"cannot fold {slab.shape[0]} cells {factor}-to-one for {name!r}"
+                        f"field {name!r} declares a {kwarg} channel but no {sibling!r} slab "
+                        f"was supplied — the words are keyed on the centroid partition the "
+                        f"merge produces (spec §9.1/§8.3), so the pair cannot be folded apart"
                     )
-                folded = np.full(slab.shape[0] // factor, b"", dtype=object)
-                for j in range(folded.shape[0]):
-                    cell = [
-                        decode_digest(payload, dtype, inner)
-                        for payload in slab[j * factor : (j + 1) * factor]
-                        if payload is not None and len(payload)
-                    ]
-                    if cell:
-                        folded[j] = fold_digests(cell, delta=delta, dtype=dtype)
-                groups[name] = folded
+            folded = np.full(slab.shape[0] // factor, b"", dtype=object)
+            sibling_slabs = {
+                kwarg: np.full(folded.shape[0], b"", dtype=object) for kwarg, _ in declared
+            }
+            for j in range(folded.shape[0]):
+                rows = [
+                    i
+                    for i in range(j * factor, (j + 1) * factor)
+                    if slab[i] is not None and len(slab[i])
+                ]
+                if not rows:
+                    continue
+                cell = [decode_digest(slab[i], dtype, inner) for i in rows]
+                if not declared:
+                    folded[j] = fold_digests(cell, delta=delta, dtype=dtype)
+                    continue
+                payload, *words = fold_digests(
+                    cell,
+                    delta=delta,
+                    dtype=dtype,
+                    channels={
+                        kwarg: [decode_digest(slabs[sibling][i], "uint64", ()) for i in rows]
+                        for kwarg, sibling in declared
+                    },
+                )
+                folded[j] = payload
+                for (kwarg, _), encoded in zip(declared, words, strict=True):
+                    sibling_slabs[kwarg][j] = encoded
+            groups[name] = folded
+            for kwarg, sibling in declared:
+                groups[sibling] = sibling_slabs[kwarg]
         out[res] = groups
     return out
 

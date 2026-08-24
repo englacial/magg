@@ -18,7 +18,14 @@
 # would make `op: le, value: 0` admit or reject every shot), is what to check
 # there first.
 data_source:
-  granule_workers: 4
+  shard_workers: 4               # measured optimized envelope (run 5d081b68):
+                                 # workers=4 on the 4096-disk tier runs 300 s/shard
+                                 # at 60% memory (vs 587-757 s serial on 8192,
+                                 # run 8344cde5) for identical output. If a denser
+                                 # AOI pinches 4096 on MEMORY at workers=4, drop
+                                 # shard_workers to 2 before raising the tier --
+                                 # but not for a SpillOverflowError, which this
+                                 # knob cannot move (see worker.extra_disk).
   reader: h5coro
   driver: s3
   # DAAC S3 credentials are per-DAAC: GEDI is LP DAAC's lp-prod-protected,
@@ -26,8 +33,12 @@ data_source:
   # body, so every granule read raises memoryview(None) and the shard reports
   # "No data after filtering" (issue #449, first-fleet-run failure).
   credentials_provider: lpdaac
-  # No index block: the hierarchical route is the pinned baseline for the
-  # first GEDI builds; the vlen route also runs behind index: inline.
+  index:
+    backend: hierarchical      # pinned: an ABSENT block resolves to inline since
+                               # issue #170, and inline's chunk-map B-tree walk
+                               # strands 4 MiB h5coro cache lines on GEDI (issue
+                               # #460). Re-benchmark inline on GEDI after #460
+                               # lands before flipping.
   groups: [BEAM0000, BEAM0001, BEAM0010, BEAM0011, BEAM0101, BEAM0110, BEAM1000, BEAM1011]
   coordinates:
     # The base (sample) level carries no native coordinates: lat/lon expand
@@ -62,11 +73,23 @@ data_source:
         # Per-shot L1B pass-throughs, broadcast to sample rate (plain
         # companion names per the issue #422 ruling).
         shot_number: "/{group}/shot_number"
+        # The clock the section-8.3 temporal companion encodes from (issue
+        # #410). Shot-rate on GEDI, so it broadcasts to sample rate here: every
+        # sample of one waveform shares its shot's instant, which is what makes
+        # a single-shot cell's centroids exact timestamps.
+        delta_time: "/{group}/geolocation/delta_time"
         noise_mean: "/{group}/noise_mean_corrected"
         noise_stddev: "/{group}/noise_stddev_corrected"
         rx_energy: "/{group}/rx_energy"
         elevation_bin0: "/{group}/geolocation/elevation_bin0"
         elevation_lastbin: "/{group}/geolocation/elevation_lastbin"
+        digital_elevation_model:
+          # Asset-sourced shot variable (issue #464): read from the paired L2A
+          # sibling via the shot_number join, broadcast to sample rate like the
+          # companions above. Powers the geolocation-validity gate below only —
+          # filter-only, not stored (per-shot L2A companions: issue #465).
+          asset: l2a
+          path: "/{group}/digital_elevation_model"
   assets:
     # The paired L2A sibling (one shardmap, {l1b, l2a} per entry), joined by
     # shot_number. After the retrieval-fitness filters were dropped (espg
@@ -103,14 +126,35 @@ data_source:
       dataset: "/{group}/rx_assess/rx_clipbin_count"   # saturation counter: 0 = unclipped
       op: le
       value: 0
+    # DEM-referenced geolocation-validity gate (issue #464): epoch-poisoned
+    # absolute geolocation passes degrade == 0 (2019-121 ≈ +860 m, 2023-031 ≈
+    # +5.8 km constant offsets — the first flux store's kilometer-span cells),
+    # so gate the waveform window's MIDPOINT against the L2A DEM (espg ruling
+    # 2026-08-17: midpoint form, not elev_lowestmode — tests geolocation
+    # without entangling retrieval quality). A third VALIDITY gate, distinct
+    # from the excluded retrieval-fitness gates above. DEM-void (NaN) shots
+    # drop by plain expression semantics — including DEM-void water shots;
+    # revisiting that inclusion is tracked in issue #465.
+    - expression: "abs((elevation_bin0 + elevation_lastbin)/2 - digital_elevation_model) <= 200"
   read_plan:
     spatial_index: shots
     pad: 1
 
 aggregation:
-  # Pooled (no streaming block): o9 shards are light at GEDI density, and the
-  # flux field's composability is `none` initially (issue #422 -- no pyramid,
-  # no spill whitelist growth). Promote alongside overviews when needed.
+  # o9 shards are NOT light at GEDI density: the first successful run (run
+  # 8344cde5, issue #460) read 50-82 M rows/shard pre-clip (21-33 M kept) --
+  # the pooled-mode assumption here reasoned about post-clip density and
+  # undersized the envelope. The other GEDI failure rounds had unrelated
+  # causes (issue #449 DAAC credentials, issue #452 read-plan striding, issue
+  # #460 inline cache-line residency -- the index.backend: hierarchical pin
+  # above is what unblocked that one, not this streaming block). Spill wrote
+  # 1.6-2.5 GB /tmp per shard with spill_blocks_closed: 0 (exact single-block
+  # regime, pooled-identical results). Pairs with worker.extra_disk below.
+  streaming:
+    mode: spill
+    buffer_granules: 8           # optimized probe (run 5d081b68): 8 with
+                                 # shard_workers 4 held container HWM at 2,472 MB
+                                 # (60% of the 4096 tier), identical output
   coordinates:
     morton:
       dtype: uint64
@@ -130,6 +174,13 @@ aggregation:
       kind: ragged
       function: "zagg.stats.waveform.build_waveform_digest"
       source: elevation
+      # Per-centroid toc words (spec section 8.3, issue #410). Ruling 2 called
+      # for GEDI's companion per CELL; the 2026-08-17 amendment makes every
+      # companion per-centroid, and the honesty property is unchanged -- all of
+      # a shot's samples carry its one instant, so a single-shot cell's
+      # centroids are exact timestamps and only genuinely pooled cells produce
+      # ranges. One shape means readers bind one contract across sensors.
+      temporal: per-centroid
       inner_shape: [2]
       dtype: float32
       fill_value: 0
@@ -195,6 +246,19 @@ aggregation:
       fill_value: "NaN"
 
 output:
+  # The store's per-observation clock (issue #410). GEDI `delta_time` shares
+  # ICESat-2's convention: seconds on the CONTINUOUS GPS scale since
+  # 2018-01-01. Verified against two real granules rather than assumed --
+  # BEAM0000/ancillary/master_time_epoch reads exactly 1198800018.000000 in
+  # GEDI01_B_2019128… and GEDI01_B_2020024…, i.e. the 2018-01-01 epoch in
+  # leap-aware GPS seconds (a naive UTC count would be 1198800000; the +18 is
+  # GPS-UTC at 2018). That is what admits `scale: gps` here -- a nominal-UTC
+  # column would be refused by name (spec section 8.3's nanosecond MUST).
+  time_source:
+    field: delta_time
+    epoch: "2018-01-01T00:00:00"
+    scale: gps
+    units: seconds
   grid:
     type: healpix
     indexing_scheme: nested
@@ -206,4 +270,42 @@ output:
   pyramid: false                 # composability none initially (issue #422)
 
 worker:
-  memory: 2048                   # pooled path, no spill: the light variant
+  memory: 4096                   # optimized probe (run 5d081b68, 4/4 green):
+                                 # process-shard-4096-disk at shard_workers 4 /
+                                 # buffer_granules 8 -> 300 s/shard, worker
+                                 # max_memory 2,464 MB / container HWM 2,472 MB
+                                 # (60% of tier), $0.069/run vs $0.286 at
+                                 # 8192/serial (run 8344cde5), identical output.
+                                 # Fallback ladder, BY FAILURE MODE:
+                                 #   memory pinch (OOM / container HWM near the
+                                 #     tier) -> shard_workers 4 -> 2, then raise
+                                 #     the tier; shard_workers is what bounds
+                                 #     concurrent in-memory read buffers.
+                                 #   SpillOverflowError (block close, see below)
+                                 #     -> the 8192-disk tier (10240 MB /tmp,
+                                 #     4608 MB threshold) or a finer
+                                 #     parent_order. shard_workers is INERT for
+                                 #     this one: it does not change total
+                                 #     spilled bytes, only in-flight buffers.
+  extra_disk: true               # the -disk twin sizes /tmp at memory + 2048 MB,
+                                 # so 6144 MB here. The spill block-close
+                                 # threshold is min(0.2 x memory x K, 0.45 x free
+                                 # /tmp); K = 4^(12-9) = 64 puts the memory term
+                                 # at ~52 GB, so /tmp always dominates -> ~2765
+                                 # MB. Measured spill is 1.6-2.5 GB/shard (run
+                                 # 8344cde5), a ~1.16x margin on the worst shard,
+                                 # and f_bavail is read live so anything else in
+                                 # /tmp eats into it. Clearing the threshold for
+                                 # a 2.5 GB block needs ~5.6 GB free /tmp, not
+                                 # 2.5 GB: /tmp holds the closing block beside
+                                 # the filling one, which is what the 45% is for.
+                                 # This is a cliff, not a slope, because the
+                                 # config is EXACT-SINGLE-BLOCK-ONLY --
+                                 # validate_spill_fold rejects it
+                                 # (build_waveform_digest and the
+                                 # single_shot_value companions have no
+                                 # cross-block fold law), so a threshold
+                                 # crossing raises SpillOverflowError instead of
+                                 # degrading. spill_blocks_closed: 0 is a
+                                 # PRECONDITION of these results, not merely an
+                                 # observation of them.

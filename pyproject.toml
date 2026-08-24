@@ -37,7 +37,22 @@ dependencies = [
     # what PyPI has published (as 0.2.0 once was) fails resolution loudly — the
     # state build_layer.sh's MORTIE_SPEC derivation cites this block for.
     "h5coro-hidefix>=0.3.2",
-    # Floor 0.9.8 for the authalic latitude convention (espg/mortie#186, landed
+    # Floor 0.9.10 because mortie 0.9.10 RETIRED the `mortie.toc` submodule
+    # (espg/mortie#199, following #197 for `mortie.moc`): the name is now the
+    # `Toc` constructor, so statement-form `from mortie.toc import X` raises —
+    # its migration shim covers attribute access only, a callable cannot also
+    # be a module. The flat top-level spelling this repo now uses
+    # (`from mortie import Q_START_NS, Q_END_NS, TOC_MAX_NS`) exists only from
+    # 0.9.10; those three names are NOT top-level in 0.9.9, so this floor and
+    # the import style are one change, not two (issue #493).
+    # Previously floor 0.9.9 for the SEGMENTED toc reduce (espg/mortie#177,
+    # released in 0.9.9): tocs_reduce(words, offsets) is the per-group
+    # semilattice join the
+    # spec §8.2/§8.3 temporal companions fold with — one Rust crossing for a
+    # whole cell's centroid partition, where the scalar toc_reduce 0.9.6 ships
+    # would be a Python loop per centroid (issue #410,
+    # zagg.stats.tdigest._centroid_envelopes). Earlier floors: 0.9.8
+    # for the authalic latitude convention (espg/mortie#186, landed
     # in espg/mortie#188): binning is equal-area on the WGS84 ellipsoid by
     # construction — latitude="authalic" is the new mortie default, with
     # "geodetic-spherical" as the legacy escape. Cell ids differ between the
@@ -71,7 +86,7 @@ dependencies = [
     # route through (issue #199) — decimal_repr / to_decimal, the
     # _decimal_to_word parse-back, hive_path, and the MortonIndexScalar decimal
     # display.
-    "mortie>=0.9.8",
+    "mortie>=0.9.10",
     "earthaccess",
     "boto3",
     "fastparquet",

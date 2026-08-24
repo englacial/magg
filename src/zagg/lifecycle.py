@@ -17,6 +17,17 @@ across the unit's WHOLE footprint (lifecycle rules act per object):
   artifact agree (``column-drift`` never reaches the touch), so the caller
   simply passes the column path on the declared arm and ``None`` otherwise.
 
+**Not applicable to a PUBLISHED bucket** (issue #495 phase 4). The touch
+exists to defeat an expiration rule; an archival published bucket has none, so
+there is nothing to defeat — and on a VERSIONED bucket the self-copy is
+actively harmful, for the reason the ``versioned`` bullet below already names:
+it writes a new FULL-SIZE version and demotes the old one to noncurrent, where
+it keeps consuming storage. Source Cooperative's bucket is versioned, so one
+full-skip run over the CA store would add ~332 GB of noncurrent versions and
+double the footprint — invisibly, since ``ListObjectsV2`` reports only current
+versions — on a bucket where AWS pays the bill as an Open Data sponsor. See
+:func:`_skip_published`.
+
 Mechanism: local stores get ``os.utime``; S3 gets a server-side self-copy
 (``CopyObject`` onto itself with ``MetadataDirective="REPLACE"`` — S3
 rejects an identity copy without it; already a ``boto3`` dependency, and
@@ -36,9 +47,18 @@ properties. Exactly what that costs, and what this module does about it:
   (``InvalidObjectState``) and counts as failed;
 - **ACL**: NOT preserved — ``CopyObject`` grants the destination the
   requester's default private ACL unless ``x-amz-acl``/``x-amz-grant-*``
-  rides the request. A no-op on a ``BucketOwnerEnforced`` bucket (the
-  default since 2023), but a public-read-BY-ACL bucket would have the
-  touched objects made private. Documented, not solved;
+  rides the request. SOLVED for the case that matters: on an
+  INJECTED-CREDENTIAL external target the copy carries
+  ``x-amz-acl: bucket-owner-full-control``, so a touch cannot claw back
+  ownership the writing PUT handed to the bucket owner. ``zagg.store``'s
+  issue #495 predicate has a second arm — an ambient write to a published
+  bucket — that is UNREACHABLE from here since phase 4: the touch skips
+  those paths before any copy. The predicate is still imported whole, and
+  still resolved against the destination bucket, only so this raw-boto3
+  path cannot drift from the store seam's. Still a caveat for the
+  in-account case: a public-read-BY-ACL bucket would have the touched
+  objects made private (a no-op on ``BucketOwnerEnforced``, the default
+  since 2023);
 - **SSE-KMS**: a self-copy re-encrypts under the BUCKET DEFAULT key, not
   the source object's key, and needs ``kms:Decrypt`` +
   ``kms:GenerateDataKey``. Fails loudly into ``failed`` when the role lacks
@@ -102,6 +122,7 @@ def touch_current_unit(
     column_path=None,
     sidecar_spec=None,
     store_kwargs=None,
+    policy="auto",
 ) -> dict:
     """The issue #388 skip-path touch for ONE ``(shard, window)`` unit.
 
@@ -138,10 +159,10 @@ def touch_current_unit(
     except Exception as e:
         logger.warning(f"lifecycle touch skipped — footprint unresolved (fail-open): {e}")
         return {"touched": 0, "failed": 1}
-    return touch_unit_footprint(trees, objects, store_kwargs=store_kwargs)
+    return touch_unit_footprint(trees, objects, store_kwargs=store_kwargs, policy=policy)
 
 
-def touch_store_root(store_root, *, store_kwargs=None) -> dict:
+def touch_store_root(store_root, *, store_kwargs=None, policy="auto") -> dict:
     """Touch the store-ROOT objects no unit footprint covers (issue #388).
 
     A run whose every unit skipped writes nothing at the root either:
@@ -161,10 +182,12 @@ def touch_store_root(store_root, *, store_kwargs=None) -> dict:
     except Exception as e:
         logger.warning(f"store-root touch skipped — names unresolved (fail-open): {e}")
         return {"touched": 0, "failed": 1}
-    return touch_unit_footprint([], [f"{root}/{name}" for name in names], store_kwargs=store_kwargs)
+    return touch_unit_footprint(
+        [], [f"{root}/{name}" for name in names], store_kwargs=store_kwargs, policy=policy
+    )
 
 
-def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
+def touch_unit_footprint(trees, objects, *, store_kwargs=None, policy="auto") -> dict:
     """Touch every object under each of ``trees`` + each single ``objects`` path.
 
     Paths are either local filesystem paths or ``s3://`` URLs; ``store_kwargs``
@@ -172,23 +195,68 @@ def touch_unit_footprint(trees, objects, *, store_kwargs=None) -> dict:
     ``endpoint_url``) and keys the S3 client. Returns ``{"touched": n,
     "failed": m}`` and never raises — an unexpected error (client build, LIST
     fault) counts one failure and abandons the remainder (best-effort).
+
+    A path the touch does not apply to under ``policy`` — a published bucket
+    under ``auto`` (issue #495 phase 4), any path at all under ``never`` (issue
+    #501) — is NOT APPLICABLE rather than failed (:func:`_touch_applies`): it is
+    counted under a
+    ``"skipped_paths"`` key, added only when non-zero, and never touches
+    ``"failed"`` — so a skipped run cannot be read as an error in the run
+    parquet or the status objects. That key counts INPUT PATHS, not objects,
+    unlike its two siblings: a tree path is one skip here but would have been
+    one ``"touched"`` per listed key, so the three are not summable (review
+    finding on PR #496). It is omitted when zero to leave every existing
+    caller's dict byte-identical; the callers that record it are named in
+    :func:`zagg.runner._identity_counts`.
     """
     counts = {"touched": 0, "failed": 0}
+    skipped = 0
+    skipped_buckets: set = set()
     try:
         for tree in trees:
+            bucket = _split_s3(tree)[0] if _is_s3(tree) else None
+            if not _touch_applies(bucket, policy):
+                skipped += 1
+                if bucket is not None:
+                    skipped_buckets.add(bucket)
+                continue
             if _is_s3(tree):
-                _touch_s3_tree(_client(store_kwargs), tree, counts)
+                _touch_s3_tree(
+                    _client(store_kwargs), tree, counts, _copy_acl(store_kwargs, bucket), policy
+                )
             else:
                 _touch_local_tree(tree, counts)
         for obj in objects:
+            bucket, key = _split_s3(obj) if _is_s3(obj) else (None, None)
+            if not _touch_applies(bucket, policy):
+                skipped += 1
+                if bucket is not None:
+                    skipped_buckets.add(bucket)
+                continue
             if _is_s3(obj):
-                bucket, key = _split_s3(obj)
-                _touch_s3_object(_client(store_kwargs), bucket, key, counts)
+                acl = _copy_acl(store_kwargs, bucket)
+                _touch_s3_object(_client(store_kwargs), bucket, key, counts, acl=acl, policy=policy)
             else:
                 _touch_local_object(obj, counts)
     except Exception as e:
         counts["failed"] += 1
         logger.warning(f"lifecycle touch aborted mid-footprint (fail-open, issue #388): {e}")
+    if skipped:
+        counts["skipped_paths"] = skipped
+        # This fires once per (shard, window) unit — thousands of times on an
+        # all-skip run — so it IDENTIFIES rather than explains: the rationale
+        # lives in _touch_applies and docs/hive_layout.md, where a reader can
+        # afford it. It names the POLICY, not the inference: a skip is now
+        # either the issue #495 phase 4 published-bucket call or the operator's
+        # own `output.touch` (issue #501), and under `never` there may be no
+        # bucket at all (a local store) — so the bucket list appears only when
+        # non-empty, and when it does it is what the operator needs at 3 a.m.
+        # to tell the published target from something new.
+        where = f" on bucket(s) {sorted(skipped_buckets)}" if skipped_buckets else ""
+        logger.info(
+            f"lifecycle touch not applicable for {skipped} path(s) under "
+            f"policy={policy!r}{where} — see zagg.lifecycle._touch_applies (issue #501)"
+        )
     return counts
 
 
@@ -220,6 +288,85 @@ def _client(store_kwargs):
         if key not in _CLIENTS:
             _CLIENTS[key] = _s3_client(store_kwargs)
         return _CLIENTS[key]
+
+
+def _skip_published(bucket) -> bool:
+    """Whether ``bucket`` is a published target the touch must leave alone.
+
+    Guarded on membership in :data:`zagg.store._PUBLISHED_BUCKETS`, NOT on
+    ``_external_target(...)``, and the difference is load-bearing:
+    ``_external_target`` is also true for injected-credential targets, whose
+    lifecycle and versioning configuration we do not know. Skipping the touch
+    on one of those could let a collaborator's data expire — the exact failure
+    the touch exists to prevent. Only the published set is known not to expire.
+
+    Note the set is doing DOUBLE DUTY here. It enumerates buckets that are both
+    (a) not ours, which is what the canned ACL keys on, and (b) not expiring,
+    which is what this skip keys on. Those two properties coincide today rather
+    than being the same thing; if they ever diverge — a published bucket that
+    does expire, or a non-owned bucket that does not — the touch needs its own
+    set and this predicate must stop borrowing that one.
+    """
+    from .store import _PUBLISHED_BUCKETS
+
+    return bucket in _PUBLISHED_BUCKETS
+
+
+def _touch_applies(bucket, policy="auto") -> bool:
+    """Whether the touch applies to this path under ``policy`` (issue #501).
+
+    The operator's ``output.touch`` declaration layered ON TOP of the issue
+    #495 phase 4 inference, which it overrides rather than replaces:
+
+    ``auto``
+        Fall through to :func:`_skip_published` — the phase 4 behaviour
+        verbatim, and the default, so every config predating the knob is
+        byte-identical.
+    ``always``
+        Applies everywhere, published buckets included. For an un-negotiated
+        external target with an expiry rule the bucket name does not encode.
+    ``never``
+        Applies nowhere — LOCAL paths included, since "never touch" is a
+        statement about the run, not about S3.
+
+    ``bucket`` is None for a local path, which only ``never`` acts on.
+    """
+    if policy == "never":
+        return False
+    if policy == "always":
+        return True
+    return not (bucket is not None and _skip_published(bucket))
+
+
+def _copy_acl(store_kwargs, bucket) -> str | None:
+    """Canned ACL the self-copy must carry, or ``None`` (issue #495).
+
+    ``CopyObject`` CREATES an object, so on a cross-account target it re-creates
+    every touched object owned by THIS account under the requester's default
+    private ACL -- stripping the ownership the writing store handed to the
+    bucket owner, and doing it silently (the touch is fail-open). Predicate and
+    value both come from :mod:`zagg.store`, the seam every store write already
+    goes through, so this raw-boto3 path cannot drift from it.
+
+    ``bucket`` is the DESTINATION being touched, and since issue #501 the
+    BUCKET arm of ``_external_target`` is LIVE here — do not delete this
+    argument. Under ``output.touch: always`` (:func:`_touch_applies`) a
+    published bucket reaches this function, and under the ambient execution
+    role — no injected credentials — the bucket arm is the ONLY arm that can
+    fire. Dropping the argument would therefore strip
+    ``bucket-owner-full-control`` from every object an ``always`` run
+    self-copies to Source Cooperative: the exact fail-open, invisible ownership
+    strip the phase-4 grant round added this ACL to prevent. Pinned by
+    ``test_policy_always_touches_the_published_destination_too``. It is resolved
+    per path rather than once per call because one footprint's paths need not
+    share a bucket.
+    """
+    from .store import _BUCKET_OWNER_ACL, _external_target
+
+    store_kwargs = store_kwargs or {}
+    if _external_target(store_kwargs.get("credentials"), store_kwargs.get("endpoint_url"), bucket):
+        return _BUCKET_OWNER_ACL
+    return None
 
 
 def _s3_client(store_kwargs: dict):
@@ -266,30 +413,55 @@ def _touch_local_object(path, counts) -> None:
         logger.warning(f"lifecycle touch failed for {path} (fail-open): {e}")
 
 
-def _touch_s3_tree(s3, path, counts) -> None:
+def _touch_s3_tree(s3, path, counts, acl=None, policy="auto") -> None:
     bucket, key = _split_s3(path)
     prefix = key.rstrip("/") + "/"
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         for entry in page.get("Contents") or []:
             # The LIST already carries the class; echoing it back is what
             # keeps the self-copy from demoting the object to STANDARD.
-            _touch_s3_object(s3, bucket, entry["Key"], counts, entry.get("StorageClass"))
+            _touch_s3_object(
+                s3, bucket, entry["Key"], counts, entry.get("StorageClass"), acl, policy
+            )
 
 
-def _touch_s3_object(s3, bucket, key, counts, storage_class=None) -> None:
+def _touch_s3_object(s3, bucket, key, counts, storage_class=None, acl=None, policy="auto") -> None:
+    if not _touch_applies(bucket, policy):
+        # Belt and braces (issue #495 phase 4, review finding). The counting
+        # guard lives in touch_unit_footprint — the only route here today —
+        # but this is the one function that issues CopyObject, so putting the
+        # invariant HERE makes it unbypassable by a future entry point rather
+        # than a property of two ``if``s in one loop body. Blast radius if it
+        # ever leaked: ~332 GB of noncurrent versions per full-skip run,
+        # invisible to ListObjectsV2, on a bucket AWS sponsors. It counts
+        # NOTHING — the path-based accounting above already counted this
+        # path, and counting again would double it — and it is unreachable in
+        # practice, so a hit means a new caller skipped the seam: WARNING.
+        logger.warning(
+            f"lifecycle touch reached the copy seam for s3://{bucket}/{key} under "
+            f"policy={policy!r} — refused (issue #495 phase 4, issue #501); a caller "
+            "bypassed touch_unit_footprint's guard"
+        )
+        return
     try:
         if storage_class is None:
             # A named object has no LIST entry: one HEAD buys its class (and
             # detects absence a request earlier than the copy would).
             storage_class = s3.head_object(Bucket=bucket, Key=key).get("StorageClass")
-        s3.copy_object(
-            Bucket=bucket,
-            Key=key,
-            CopySource={"Bucket": bucket, "Key": key},
-            MetadataDirective="REPLACE",
+        params = {
+            "Bucket": bucket,
+            "Key": key,
+            "CopySource": {"Bucket": bucket, "Key": key},
+            "MetadataDirective": "REPLACE",
             # S3 omits StorageClass for STANDARD in both LIST and HEAD.
-            StorageClass=storage_class or "STANDARD",
-        )
+            "StorageClass": storage_class or "STANDARD",
+        }
+        if acl:
+            # The re-created object keeps the bucket owner's ownership
+            # (issue #495); omitted in-account, where there is nothing to hand
+            # over and an ACL would be a change the touch has no business making.
+            params["ACL"] = acl
+        s3.copy_object(**params)
         counts["touched"] += 1
     except Exception as e:
         code = ""

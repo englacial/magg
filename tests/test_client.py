@@ -6,9 +6,11 @@ tests exercise the real payload construction, future resolution, error
 surfacing, and the worker-invoke post-run tail.
 """
 
+import copy
 import errno
 import importlib
 import json
+import re
 import sys
 import threading
 import time
@@ -227,6 +229,58 @@ class TestFromConfig:
         }
         with pytest.raises(NotImplementedError, match="windowed"):
             Run.from_config(cfg, shardmap=catalog, store=_STORE)
+
+
+class TestSubmissionValidation:
+    """A mutated ``PipelineConfig`` is cross-validated at the submission seam.
+
+    ``from_config`` used to validate only its dict and path inputs, so the
+    observed failure (issue #472) had nothing re-check the ``02_write`` graft:
+    ``default_config`` validated the hive base template, the notebook then
+    grafted ``atl03_tdigest_located_healpix``'s ``temporal:`` variables onto it
+    without ``output.time_source``, and the config error only surfaced one
+    Lambda invoke per shard later, in the worker's refusal.
+    """
+
+    def _graft(self):
+        base = default_config("atl03_tdigest_healpix_hive", validate=False)
+        located = default_config("atl03_tdigest_located_healpix", validate=False)
+        base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
+        return base, located
+
+    def test_grafted_config_refused_before_any_invoke(self, catalog):
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        cfg, _ = self._graft()
+        stub = StubLambdaClient()
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            Run.from_config(
+                cfg,
+                shardmap=catalog,
+                store=_STORE,
+                function_name="process-shard-test",
+                lambda_client=stub,
+                source_credentials=_CREDS,
+            )
+        assert stub.events == []  # refused at submission, nothing dispatched
+
+    def test_grafted_config_with_its_clock_constructs(self, catalog):
+        # Positive control: grafting the clock block and its column too is the
+        # correct form, and it still builds a Run (no false refusal).
+        cfg, located = self._graft()
+        cfg.output["time_source"] = dict(located.output["time_source"])
+        field = cfg.output["time_source"]["field"]
+        cfg.data_source["variables"][field] = located.data_source["variables"][field]
+        cfg.output["grid"] = dict(_ATL06_SIG)
+        run = Run.from_config(
+            cfg,
+            shardmap=catalog,
+            store=_STORE,
+            function_name="process-shard-test",
+            lambda_client=StubLambdaClient(),
+            source_credentials=_CREDS,
+        )
+        assert len(run) == 3
 
 
 # -- dispatch fan-out --------------------------------------------------------
