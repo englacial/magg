@@ -41,26 +41,19 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-BENCH = REPO / "tests" / "data" / "benchmark"
 sys.path.insert(0, str(REPO / ".github" / "scripts"))
-import bench_metrics  # noqa: E402
-
-MANIFEST = json.loads((BENCH / "targets.json").read_text())
-
-
-def resolve_aoi_temporal_cmr(sm_meta: dict) -> tuple[dict, dict, dict]:
-    """Resolve a shard map's ``aoi``/``temporal``/``cmr`` (issue #121).
-
-    A per-entry override wins; an absent key falls back to the top-level manifest
-    default. Existing single-AOI (NEON) shard maps carry no override, so they
-    resolve byte-identically to the top-level ``aoi``/``temporal``/``cmr``.
-    """
-    return (
-        sm_meta.get("aoi", MANIFEST["aoi"]),
-        sm_meta.get("temporal", MANIFEST["temporal"]),
-        sm_meta.get("cmr", MANIFEST["cmr"]),
-    )
-
+# The rebuild recipe and the pin rule live in ``bench_metrics`` (shared with the
+# issue #444 re-pin driver, ``tools/repin_benchmark_shardmaps.py`` -- neither a
+# ``tools/`` script nor CI should depend on a test module for core logic); this
+# guard CALLS them, so the accident detector and the deliberate counterpart
+# cannot build or pin differently.
+from bench_metrics import (  # noqa: E402
+    BENCH,
+    MANIFEST,
+    _config_for_shardmap,
+    rebuild_shardmap,
+    select_pin,
+)
 
 #: The network gate is the drift check's own, not the module's (it was
 #: module-level while the drift check was the only test here): the issue #444
@@ -69,115 +62,6 @@ needs_cmr = pytest.mark.skipif(
     os.environ.get("ZAGG_BENCHMARK_DRIFT") != "1",
     reason="set ZAGG_BENCHMARK_DRIFT=1 to run the CMR shard-map drift check",
 )
-
-
-def _containing_shard(parent_grid, shard_key: int) -> int:
-    """The parent-grid shard containing a finer shard (via its center point).
-
-    HEALPix cells nest, so a finer cell's center maps unambiguously into its
-    containing coarser cell; routing through ``assign``/``shards_of`` keeps this
-    on the same mortie machinery the shard maps themselves are built with.
-    """
-    import numpy as np
-    from mortie import mort2geo
-
-    lat, lon = mort2geo(np.array([shard_key], dtype=np.uint64))
-    leaf = parent_grid.assign(np.atleast_1d(lat), np.atleast_1d(lon))
-    return int(parent_grid.shards_of(leaf)[0])
-
-
-def _config_for_shardmap(sm_key: str) -> Path:
-    """Any target's config that uses this shard map (config sets the grid).
-
-    Searches the committed matrix first, then ``provisional_targets`` (issue
-    #130 block) — the 88S stress shard maps (issue #148) are referenced only by
-    provisional targets, and the drift check still needs their grid config.
-    """
-    provisional = {
-        k: v for k, v in MANIFEST.get("provisional_targets", {}).items() if k != "_comment"
-    }
-    for target in list(MANIFEST["targets"].values()) + list(provisional.values()):
-        if target["shardmap"] == sm_key:
-            return BENCH / target["config"]
-    raise AssertionError(f"no target references shardmap '{sm_key}'")
-
-
-def rebuild_shardmap(sm_key: str, sm_meta: dict):
-    """Rebuild one shard map from its ``targets.json`` entry — THE recipe.
-
-    Entry config → grid; the entry's resolved AOI/temporal/CMR (a per-entry
-    override, issue #121, over the top-level manifest default — NEON entries
-    carry none); the committed map's ``metadata.backend``; and either the
-    committed ``catalog_parquet`` snapshot when the entry carries one or a live
-    CMR fetch when it does not.
-
-    Build-once catalog (issue #148): an entry carrying ``catalog_parquet``
-    rebuilds from the committed stac-geoparquet snapshot instead of re-fetching
-    CMR — the rebuild is then deterministic and offline, per the catalog design
-    (fetch once, save the parquet, reuse). Regenerate the snapshot only to
-    deliberately re-pin.
-
-    Shared with the issue #444 re-pin driver rather than restated there: the
-    drift guard and its deliberate counterpart must build the same way, and a
-    second copy of this recipe is exactly what would let them drift apart.
-    """
-    from zagg.catalog import load_polygon, polygon_to_bbox
-    from zagg.catalog.shardmap import ShardMap
-    from zagg.catalog.sources import Catalog, CMRSource, Query
-    from zagg.config import load_config
-    from zagg.grids import from_config
-
-    backend = json.loads((BENCH / sm_meta["path"]).read_text())["metadata"]["backend"]
-    grid = from_config(load_config(str(_config_for_shardmap(sm_key))))
-    aoi, temporal, cmr = resolve_aoi_temporal_cmr(sm_meta)
-    # aoi.file is relative to the manifest dir, like the config/shardmap paths.
-    parts = load_polygon(str(BENCH / aoi["file"]))
-    if sm_meta.get("catalog_parquet"):
-        catalog = Catalog.from_geoparquet(str(BENCH / sm_meta["catalog_parquet"]))
-    else:
-        catalog = CMRSource().fetch(
-            Query(
-                cmr["short_name"],
-                cmr["version"],
-                temporal["start"],
-                temporal["end"],
-                region=polygon_to_bbox(parts),
-                provider=cmr["provider"],
-            )
-        )
-    return ShardMap.build(catalog, grid, region=parts, backend=backend, footprint=cmr["footprint"])
-
-
-def select_pin(rebuilt, sm_meta: dict, parent_key: int | None = None) -> tuple[int, int]:
-    """The ``(shard_key, n_granules)`` pin for a rebuilt map — THE pin rule.
-
-    A nested pin (issue #148: the 88S o10 stress shard is the densest o10 shard
-    INSIDE the pinned o9 stress shard, so one o9 extraction pass covers both
-    orders) is selected over the shards nested in the parent's pin, never the
-    global densest — otherwise a correct rebuild would read as drift.
-
-    ``parent_key`` lets the issue #444 driver extract against a parent pin it
-    has just rewritten on disk; the guard passes none and reads the manifest as
-    loaded at import. Shared with that driver for the same reason as
-    :func:`rebuild_shardmap`.
-    """
-    from zagg.config import load_config
-    from zagg.grids import from_config
-
-    shard_keys, granules = rebuilt.shard_keys, rebuilt.granules
-    nested_in = sm_meta.get("nested_in")
-    if nested_in:
-        if parent_key is None:
-            parent_key = int(MANIFEST["shardmaps"][nested_in]["shard_key"])
-        parent_grid = from_config(load_config(str(_config_for_shardmap(nested_in))))
-        keep = [
-            i
-            for i, k in enumerate(shard_keys)
-            if int(_containing_shard(parent_grid, int(k))) == parent_key
-        ]
-        shard_keys = [shard_keys[i] for i in keep]
-        granules = [granules[i] for i in keep]
-    return bench_metrics.select_densest_shard({"shard_keys": shard_keys, "granules": granules})
 
 
 @pytest.mark.slow
@@ -203,11 +87,12 @@ def test_pinned_shardmap_no_drift(sm_key):
 #
 # ``tools/repin_benchmark_shardmaps.py`` is the counterpart of the drift check
 # above: the guard detects an accidental move, the driver makes a deliberate
-# one. It CALLS ``rebuild_shardmap`` and ``select_pin`` above, so the rebuild
-# and the pin rule are already covered by the drift check; these tests pin the
-# parts they do not reach -- the pruning, the pin write-back, the re-pin
-# ordering, and the claim the driver exists to support: that it reproduces the
-# PR #441 artifacts from the committed catalogs.
+# one. Both CALL ``bench_metrics.rebuild_shardmap`` and
+# ``bench_metrics.select_pin`` (the shared recipe the drift check runs
+# through), so the rebuild and the pin rule are already covered by the drift
+# check; these tests pin the parts they do not reach -- the pruning, the pin
+# write-back, the re-pin ordering, and the claim the driver exists to support:
+# that it reproduces the PR #441 artifacts from the committed catalogs.
 
 OFFLINE_PINS = [k for k, v in MANIFEST["shardmaps"].items() if v.get("catalog_parquet")]
 
@@ -230,8 +115,8 @@ sys.path.insert(0, str(REPO / "tools"))
 def _driver():
     """The re-pin driver, imported from ``tools/`` (not an installed module).
 
-    The import itself stays lazy: the driver imports THIS module for the
-    rebuild recipe, so importing it at module scope would be circular.
+    The import stays lazy so a broken driver fails the driver tests, not this
+    whole module's collection (the drift check above does not need it).
     """
     import repin_benchmark_shardmaps
 

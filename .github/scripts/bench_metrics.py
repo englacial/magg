@@ -4,7 +4,9 @@ Kept import-light and side-effect-free so the workflow CLIs (``run_benchmark``,
 ``update_series``, ``plot_series``) and the unit tests can all call in. The live
 Lambda dispatch lives in ``run_benchmark.py``; everything here is arithmetic over
 the run summary ``zagg.runner.agg`` already returns plus the pinned target
-metadata, so it runs with no AWS/network access.
+metadata, so it runs with no AWS/network access. (The one import-time read is
+the committed ``targets.json`` manifest, for the shard-map recipe section at the
+bottom -- a repo fixture, still no AWS/network.)
 
 The benchmark dispatches exactly ONE shard, so the summary's per-fan-out worker
 stats collapse to that single worker: ``worker_max_s`` is the shard's runtime and
@@ -13,8 +15,10 @@ stats collapse to that single worker: ``worker_max_s`` is the shard's runtime an
 
 from __future__ import annotations
 
+import json
 import math
 import re
+from pathlib import Path
 
 # Cost model and grid types come straight from the package so the benchmark can
 # never drift from what production actually bills/uses (arm64, 4 GB -- issue #110/#193).
@@ -510,3 +514,146 @@ def latest_markdown(records: list[dict]) -> str:
     lines += _table_block(records)
     lines += ["", "Machine-readable companion: `metrics.json` (same directory)."]
     return "\n".join(lines)
+
+
+# --- pinned shard-map recipe (issues #110 / #148 / #444) ---------------------
+#
+# THE rebuild recipe and THE pin rule for the committed benchmark shard maps,
+# shared by the drift guard (``tests/test_benchmark_shardmap.py``, the accident
+# detector) and the deliberate re-pin driver
+# (``tools/repin_benchmark_shardmaps.py``). Both CALL these rather than
+# restating them, so the guard and its counterpart cannot build or pin
+# differently -- and neither a ``tools/`` script nor CI depends on a test
+# module for core logic. The heavy zagg imports stay inside the functions;
+# importing this module stays light.
+
+REPO = Path(__file__).resolve().parents[2]
+BENCH = REPO / "tests" / "data" / "benchmark"
+
+#: The pinned-target manifest, as committed. Loaded once at import; the re-pin
+#: driver deliberately re-reads the file instead when it needs the on-disk NOW.
+MANIFEST = json.loads((BENCH / "targets.json").read_text())
+
+
+def resolve_aoi_temporal_cmr(sm_meta: dict) -> tuple[dict, dict, dict]:
+    """Resolve a shard map's ``aoi``/``temporal``/``cmr`` (issue #121).
+
+    A per-entry override wins; an absent key falls back to the top-level manifest
+    default. Existing single-AOI (NEON) shard maps carry no override, so they
+    resolve byte-identically to the top-level ``aoi``/``temporal``/``cmr``.
+    """
+    return (
+        sm_meta.get("aoi", MANIFEST["aoi"]),
+        sm_meta.get("temporal", MANIFEST["temporal"]),
+        sm_meta.get("cmr", MANIFEST["cmr"]),
+    )
+
+
+def _containing_shard(parent_grid, shard_key: int) -> int:
+    """The parent-grid shard containing a finer shard (via its center point).
+
+    HEALPix cells nest, so a finer cell's center maps unambiguously into its
+    containing coarser cell; routing through ``assign``/``shards_of`` keeps this
+    on the same mortie machinery the shard maps themselves are built with.
+    """
+    import numpy as np
+    from mortie import mort2geo
+
+    lat, lon = mort2geo(np.array([shard_key], dtype=np.uint64))
+    leaf = parent_grid.assign(np.atleast_1d(lat), np.atleast_1d(lon))
+    return int(parent_grid.shards_of(leaf)[0])
+
+
+def _config_for_shardmap(sm_key: str) -> Path:
+    """Any target's config that uses this shard map (config sets the grid).
+
+    Searches the committed matrix first, then ``provisional_targets`` (issue
+    #130 block) — the 88S stress shard maps (issue #148) are referenced only by
+    provisional targets, and the drift check still needs their grid config.
+    """
+    provisional = {
+        k: v for k, v in MANIFEST.get("provisional_targets", {}).items() if k != "_comment"
+    }
+    for target in list(MANIFEST["targets"].values()) + list(provisional.values()):
+        if target["shardmap"] == sm_key:
+            return BENCH / target["config"]
+    raise AssertionError(f"no target references shardmap '{sm_key}'")
+
+
+def rebuild_shardmap(sm_key: str, sm_meta: dict):
+    """Rebuild one shard map from its ``targets.json`` entry — THE recipe.
+
+    Entry config → grid; the entry's resolved AOI/temporal/CMR (a per-entry
+    override, issue #121, over the top-level manifest default — NEON entries
+    carry none); the committed map's ``metadata.backend``; and either the
+    committed ``catalog_parquet`` snapshot when the entry carries one or a live
+    CMR fetch when it does not.
+
+    Build-once catalog (issue #148): an entry carrying ``catalog_parquet``
+    rebuilds from the committed stac-geoparquet snapshot instead of re-fetching
+    CMR — the rebuild is then deterministic and offline, per the catalog design
+    (fetch once, save the parquet, reuse). Regenerate the snapshot only to
+    deliberately re-pin.
+
+    Shared by the drift guard and the issue #444 re-pin driver rather than
+    restated in either: the guard and its deliberate counterpart must build the
+    same way, and a second copy of this recipe is exactly what would let them
+    drift apart.
+    """
+    from zagg.catalog import load_polygon, polygon_to_bbox
+    from zagg.catalog.shardmap import ShardMap
+    from zagg.catalog.sources import Catalog, CMRSource, Query
+    from zagg.config import load_config
+    from zagg.grids import from_config
+
+    backend = json.loads((BENCH / sm_meta["path"]).read_text())["metadata"]["backend"]
+    grid = from_config(load_config(str(_config_for_shardmap(sm_key))))
+    aoi, temporal, cmr = resolve_aoi_temporal_cmr(sm_meta)
+    # aoi.file is relative to the manifest dir, like the config/shardmap paths.
+    parts = load_polygon(str(BENCH / aoi["file"]))
+    if sm_meta.get("catalog_parquet"):
+        catalog = Catalog.from_geoparquet(str(BENCH / sm_meta["catalog_parquet"]))
+    else:
+        catalog = CMRSource().fetch(
+            Query(
+                cmr["short_name"],
+                cmr["version"],
+                temporal["start"],
+                temporal["end"],
+                region=polygon_to_bbox(parts),
+                provider=cmr["provider"],
+            )
+        )
+    return ShardMap.build(catalog, grid, region=parts, backend=backend, footprint=cmr["footprint"])
+
+
+def select_pin(rebuilt, sm_meta: dict, parent_key: int | None = None) -> tuple[int, int]:
+    """The ``(shard_key, n_granules)`` pin for a rebuilt map — THE pin rule.
+
+    A nested pin (issue #148: the 88S o10 stress shard is the densest o10 shard
+    INSIDE the pinned o9 stress shard, so one o9 extraction pass covers both
+    orders) is selected over the shards nested in the parent's pin, never the
+    global densest — otherwise a correct rebuild would read as drift.
+
+    ``parent_key`` lets the issue #444 driver extract against a parent pin it
+    has just rewritten on disk; the guard passes none and reads the manifest as
+    loaded at import. Shared with that driver for the same reason as
+    :func:`rebuild_shardmap`.
+    """
+    from zagg.config import load_config
+    from zagg.grids import from_config
+
+    shard_keys, granules = rebuilt.shard_keys, rebuilt.granules
+    nested_in = sm_meta.get("nested_in")
+    if nested_in:
+        if parent_key is None:
+            parent_key = int(MANIFEST["shardmaps"][nested_in]["shard_key"])
+        parent_grid = from_config(load_config(str(_config_for_shardmap(nested_in))))
+        keep = [
+            i
+            for i, k in enumerate(shard_keys)
+            if int(_containing_shard(parent_grid, int(k))) == parent_key
+        ]
+        shard_keys = [shard_keys[i] for i in keep]
+        granules = [granules[i] for i in keep]
+    return select_densest_shard({"shard_keys": shard_keys, "granules": granules})
