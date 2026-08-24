@@ -168,6 +168,13 @@ class ReferenceEpochs:
     epochs: dict[int, np.ndarray]
     stores: list[str] = field(default_factory=list)
     orders: dict[int, int] = field(default_factory=dict)
+    epoch_orders: dict[int, np.ndarray] = field(default_factory=dict)
+    """Shard key -> int64 array row-aligned with ``epochs``: each epoch's own
+    effective temporal order (espg tolerance ruling, 2026-08-24). :attr:`orders`
+    is the per-shard COARSEST — right for a headline warning, too blunt for a
+    precision gate: one shard can mix a pinned store's epochs with a coarsened
+    store's, and only the coarse ones fail a stated ``max_time_offset``. A
+    midpoint claimed at two orders keeps the finest."""
 
     @property
     def total(self) -> int:
@@ -239,7 +246,7 @@ def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> Reference
         raise ValueError("reference_epochs: at least one reference store root is required")
 
     order: int | None = None
-    mids_by_shard: dict[int, list[np.ndarray]] = {}
+    mids_by_shard: dict[int, list[tuple[np.ndarray, int]]] = {}
     orders: dict[int, int] = {}
     for root in reference_stores:
         obj = read_cover(root, **store_kwargs)
@@ -285,21 +292,64 @@ def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> Reference
             # string form, sign included); shard maps key on the packed
             # morton word — parse at the boundary (issue #199).
             shard = morton_word(decimal)
-            mids_by_shard.setdefault(shard, []).append(_word_midpoints(words, effective))
+            mids_by_shard.setdefault(shard, []).append(
+                (_word_midpoints(words, effective), effective)
+            )
             orders[shard] = min(orders.get(shard, effective), effective)
 
     assert order is not None  # non-empty store list, every cover carried an order
     keep = _aoi_shard_set(aoi, order)
     epochs: dict[int, np.ndarray] = {}
+    epoch_orders: dict[int, np.ndarray] = {}
     for shard in sorted(mids_by_shard):
         if keep is not None and shard not in keep:
             continue
-        mids = np.unique(np.concatenate(mids_by_shard[shard]))
+        parts = mids_by_shard[shard]
+        mids = np.concatenate([m for m, _ in parts])
+        ords = np.concatenate([np.full(m.size, o, dtype=np.int64) for m, o in parts])
+        # Dedupe exact midpoints keeping each epoch's FINEST claiming order
+        # (the precision gate reads per-epoch orders): sort by (mid, -order)
+        # so the first row of every equal-midpoint run is the finest.
+        ix = np.lexsort((-ords, mids.astype("int64")))
+        mids, ords = mids[ix], ords[ix]
+        first = np.ones(mids.size, dtype=bool)
+        first[1:] = mids[1:] != mids[:-1]
+        mids, ords = mids[first], ords[first]
         if mids.size:
             epochs[shard] = mids
+            epoch_orders[shard] = ords
     return ReferenceEpochs(
-        order, epochs, reference_stores, {k: v for k, v in orders.items() if k in epochs}
+        order,
+        epochs,
+        reference_stores,
+        {k: v for k, v in orders.items() if k in epochs},
+        epoch_orders,
     )
+
+
+def _cap_ns(max_time_offset) -> int | None:
+    """``max_time_offset`` as validated non-negative nanoseconds, or ``None``.
+
+    One conversion for the selection gate (:func:`nearest_acquisitions`) and
+    the builder's cover-resolution gate, so both refuse the same inputs with
+    the same message: NaT, a duration that does not round-trip through
+    ``timedelta64[ns]`` (~292-year span), and a negative cap.
+    """
+    if max_time_offset is None:
+        return None
+    offset = np.timedelta64(max_time_offset)
+    if np.isnat(offset):
+        raise ValueError(f"max_time_offset must be a real duration (got {max_time_offset!r})")
+    as_ns = offset.astype("timedelta64[ns]")
+    if as_ns.astype(offset.dtype) != offset:
+        raise ValueError(
+            "max_time_offset does not convert exactly to nanoseconds "
+            f"(got {max_time_offset!r}; timedelta64[ns] spans ~292 years)"
+        )
+    cap = int(as_ns.astype("int64"))
+    if cap < 0:
+        raise ValueError(f"max_time_offset must be non-negative (got {max_time_offset!r})")
+    return cap
 
 
 def nearest_acquisitions(epochs, times, *, max_time_offset=None):
@@ -371,20 +421,7 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
     for name, arr in (("epochs", epochs), ("times", times)):
         if np.isnat(arr).any():
             raise ValueError(f"{name} carries NaT ({int(np.isnat(arr).sum())} of {arr.size})")
-    cap = None
-    if max_time_offset is not None:
-        offset = np.timedelta64(max_time_offset)
-        if np.isnat(offset):
-            raise ValueError(f"max_time_offset must be a real duration (got {max_time_offset!r})")
-        as_ns = offset.astype("timedelta64[ns]")
-        if as_ns.astype(offset.dtype) != offset:
-            raise ValueError(
-                "max_time_offset does not convert exactly to nanoseconds "
-                f"(got {max_time_offset!r}; timedelta64[ns] spans ~292 years)"
-            )
-        cap = int(as_ns.astype("int64"))
-        if cap < 0:
-            raise ValueError(f"max_time_offset must be non-negative (got {max_time_offset!r})")
+    cap = _cap_ns(max_time_offset)
     selection = np.full(epochs.shape, -1, dtype=np.int64)
     offsets = np.full(epochs.shape, np.timedelta64("NaT"), dtype="timedelta64[ns]")
     if epochs.size == 0 or times.size == 0:
@@ -501,7 +538,17 @@ def closest_obs_shardmap(
     max_time_offset : np.timedelta64 or int (ns), optional
         An epoch whose nearest acquisition lies beyond this selects nothing —
         recorded per epoch in ``metadata["closest_obs"]["dropped"]`` and
-        warned about, never silent. ``None`` always selects the nearest.
+        warned about, never silent. It is also a **precision bar** on the
+        epochs themselves (espg tolerance ruling, 2026-08-24): an epoch from
+        a cover block coarsened far enough that its bucket half-span exceeds
+        this offset cannot be paired to the stated precision, and is dropped
+        into the ledger as its own category (rows carrying
+        ``temporal_order``/``cover_half_span_ns``; counted in
+        ``epochs_dropped_low_resolution``). Half-span exactly at the offset
+        stays pairable — the same side the selection gate's exactly-at rule
+        pins. ``None`` always selects the nearest, at whatever resolution the
+        covers offer (a single warning names the effective resolution when
+        any block sits below the §10.5 pin).
     max_granules_per_shard : int, optional
         Cost gate: a shard exceeding this REFUSES loudly (``ValueError``
         naming the worst shards) — never truncates. ``estimate=True`` reports
@@ -523,7 +570,7 @@ def closest_obs_shardmap(
     ShardMap or dict
         The ingest map — or, with ``estimate=True``, a dict:
         ``{"shards", "granules", "pairs", "epochs_total", "epochs_paired",
-        "epochs_dropped", "per_shard" (decimal -> granule count),
+        "epochs_dropped", "epochs_dropped_low_resolution", "per_shard" (decimal -> granule count),
         "histogram" (granule count -> shard count), "est_bytes",
         "max_cost_usd", "violations"}``. ``max_cost_usd`` is the
         :func:`zagg.dispatch.max_cost_usd` ceiling at the production worker
@@ -592,6 +639,7 @@ def closest_obs_shardmap(
             f"grid than the epochs (spec §10.5)"
         )
 
+    cap_ns = _cap_ns(max_time_offset)
     spatial = ShardMap.build(s2_catalog, grid, region=region, backend=backend)
     spatial_idx = {int(k): i for i, k in enumerate(spatial.shard_keys)}
     aoi_keys = _aoi_shard_set(aoi, ref.order)
@@ -601,6 +649,7 @@ def closest_obs_shardmap(
     dropped: list[dict] = []
     no_acquisitions: list[str] = []
     epochs_paired = 0
+    low_resolution = 0
     for shard, epoch_arr in sorted(ref.epochs.items()):
         decimal = morton_decimal(shard)
         i = spatial_idx.get(shard)
@@ -617,6 +666,36 @@ def closest_obs_shardmap(
             )
             continue
         entries = spatial.granules[i]
+        # Cover-resolution gate (espg tolerance ruling, 2026-08-24, thread
+        # r3845481805): an epoch whose bucket HALF-SPAN exceeds the caller's
+        # stated ``max_time_offset`` cannot be paired to that precision — the
+        # true pass sits anywhere inside the bucket, so any pairing within the
+        # cap would be arbitrary. Dropped loudly, per epoch, as its own ledger
+        # category (``temporal_order``/``cover_half_span_ns`` rows), BEFORE the
+        # nearest selection. Strictly greater: half-span exactly at the cap
+        # stays pairable, the same side the selection gate's exactly-at rule
+        # pins. With no cap the caller declared no precision bar — the build
+        # warns once (below) and proceeds; widening is lawful (§10.5).
+        eo = ref.epoch_orders.get(shard)
+        if cap_ns is not None and eo is not None:
+            half_span = np.int64(1) << (np.int64(62) - eo)
+            unresolvable = half_span > cap_ns
+            if unresolvable.any():
+                dropped.extend(
+                    {
+                        "shard": decimal,
+                        "epoch": np.datetime_as_string(t),
+                        "temporal_order": int(o),
+                        "cover_half_span_ns": int(h),
+                    }
+                    for t, o, h in zip(
+                        epoch_arr[unresolvable], eo[unresolvable], half_span[unresolvable]
+                    )
+                )
+                low_resolution += int(unresolvable.sum())
+                epoch_arr = epoch_arr[~unresolvable]
+                if epoch_arr.size == 0:
+                    continue
         times = _acquisition_times(entries, decimal)
         sel, off = nearest_acquisitions(epoch_arr, times, max_time_offset=max_time_offset)
         off_ns = off.astype("int64")
@@ -678,17 +757,26 @@ def closest_obs_shardmap(
     )
 
     coarse = {morton_decimal(k): o for k, o in ref.orders.items() if o < TEMPORAL_COVER_ORDER}
+    if coarse and cap_ns is None:
+        worst = min(coarse.values())
+        logger.warning(
+            f"closest_obs_shardmap: cover blocks in {len(coarse)} shard(s) sit below the "
+            f"§10.5 pin (coarsest temporal order {worst}); effective epoch resolution is "
+            f"±2^{62 - worst} ns (~{2 ** (62 - worst) / 3.6e12:.1f} h) — no max_time_offset "
+            f"was set, so pairing proceeds at that resolution"
+        )
     closest_meta = {
         "reference_stores": list(ref.stores),
         "shard_order": int(ref.order),
-        "max_time_offset_ns": (
-            None
-            if max_time_offset is None
-            else int(np.timedelta64(max_time_offset).astype("timedelta64[ns]").astype("int64"))
-        ),
+        "max_time_offset_ns": cap_ns,
         "epochs_total": int(ref.total),
         "epochs_paired": int(epochs_paired),
         "epochs_dropped": len(dropped),
+        # The cover-resolution category's own count (espg tolerance ruling):
+        # these rows are inside ``dropped`` — the ledger invariant stays
+        # ``epochs_total == epochs_paired + epochs_dropped`` — but an operator
+        # sizing max_time_offset needs them told apart from near-misses.
+        "epochs_dropped_low_resolution": int(low_resolution),
         "dropped": dropped,
         "shards_without_acquisitions": no_acquisitions,
         # Coverage disagreement, not self-inflicted clipping: ``ref.epochs`` is
