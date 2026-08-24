@@ -214,7 +214,11 @@ is recorded per-epoch in `metadata["closest_obs"]["dropped"]` with its
 near-miss offset; a shard past `max_granules_per_shard` raises naming the
 worst shards (`estimate=True` reports the violations instead, so the gate
 can be sized first); a cover block coarsened below the §10.5 pin is warned
-about and reported in `coarsened_orders`. Selected granule entries carry
+about and reported in `coarsened_orders` — and under a `max_time_offset`,
+epochs whose coarse-bucket half-span exceeds the stated offset cannot be
+paired to that precision, so they drop into the ledger as their own category
+(`epochs_dropped_low_resolution`, rows naming the block's effective order;
+espg tolerance ruling 2026-08-24). Selected granule entries carry
 `paired_epochs` / `epoch_offsets_ns` provenance so the paired product is
 reconstructable from the manifest alone. Epochs are bucket midpoints —
 size `max_time_offset` with `ReferenceEpochs.tolerance()`'s half-bucket

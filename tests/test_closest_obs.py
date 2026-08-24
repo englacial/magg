@@ -26,7 +26,9 @@ from zagg.catalog.closest_obs import (
 from zagg.coverage_toc import (
     COVER_CAP,
     COVER_NAME,
+    COVER_SPEC,
     TEMPORAL_COVER_ORDER,
+    _encode_cover_block,
     build_cover_section,
     cover_words,
     quantize_words,
@@ -941,3 +943,139 @@ class TestTwoStoreScenarios:
         rec = past.metadata["closest_obs"]
         assert rec["epochs_dropped"] == 1
         assert rec["dropped"][0]["nearest_offset_ns"] == int(exact.astype("int64"))
+
+
+# ── espg tolerance ruling (2026-08-24, thread r3845481805) ───────────────────
+
+
+def _write_store_at_order(root, decimal, instants, block_order, order=4):
+    """A store whose cover block sits EXPLICITLY at ``block_order`` < the pin."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    words = quantize_words(time2toc(np.asarray(instants, dtype=np.uint64)), block_order)
+    section = {
+        "spec": COVER_SPEC,
+        "source": "test",
+        "order": order,
+        "temporal_order": TEMPORAL_COVER_ORDER,
+        "cap": COVER_CAP,
+        "fields": ["h"],
+        "element": {"dtype": "uint64", "shape": [-1]},
+        "encoding": "base64",
+        "shards": {decimal: _encode_cover_block(np.asarray(words, np.uint64), block_order)},
+    }
+    (root / COVER_NAME).write_text(json.dumps(section))
+    return str(root)
+
+
+class TestCoarsenedCoverTolerance:
+    """max_time_offset is a precision bar on the epochs, not just the offsets.
+
+    The ruling of record: with a cap set, an epoch whose bucket half-span
+    exceeds it cannot be paired to the stated precision and drops loudly as
+    its own ledger category; with no cap, one warning names the effective
+    resolution and pairing proceeds (widening is lawful, §10.5). Flat-warn
+    risks silently arbitrary pairings from a cap-degraded store; flat-refuse
+    fails whole builds over blocks that may not even intersect the AOI.
+    """
+
+    #: An order-12 bucket's half-span: 2^50 ns ≈ 13.03 days.
+    ORDER12_HALF = np.timedelta64(2**50, "ns")
+
+    def _coarse_store(self, tmp_path, days=(40.0,), name="coarse"):
+        return _write_store_at_order(tmp_path / name, SHARD, _instants(*days), 12)
+
+    def test_low_resolution_epochs_drop_under_a_cap(self, tmp_path):
+        store = self._coarse_store(tmp_path)
+        cat = _s2_catalog([_s2_item("S2_0", _epoch_iso(40.0))])
+        sm = closest_obs_shardmap(
+            cat, store, grid=_grid(), backend="mortie", max_time_offset=np.timedelta64(3, "D")
+        )
+        rec = sm.metadata["closest_obs"]
+        # Every epoch in the order-12 block is unresolvable at ±3 d.
+        assert sm.shard_keys == []
+        assert rec["epochs_total"] > 0
+        assert rec["epochs_dropped_low_resolution"] == rec["epochs_dropped"] == rec["epochs_total"]
+        assert rec["epochs_total"] == rec["epochs_paired"] + rec["epochs_dropped"]
+        row = rec["dropped"][0]
+        assert row["temporal_order"] == 12
+        assert row["cover_half_span_ns"] == 2**50
+        # Its own category: no near-miss offset — the selection never ran.
+        assert "nearest_offset_ns" not in row
+
+    def test_the_estimate_reports_the_category(self, tmp_path):
+        store = self._coarse_store(tmp_path)
+        cat = _s2_catalog([_s2_item("S2_0", _epoch_iso(40.0))])
+        est = closest_obs_shardmap(
+            cat,
+            store,
+            grid=_grid(),
+            backend="mortie",
+            estimate=True,
+            max_time_offset=np.timedelta64(3, "D"),
+        )
+        assert est["epochs_dropped_low_resolution"] == est["epochs_total"] > 0
+        assert est["dropped"][0]["temporal_order"] == 12
+
+    def test_no_cap_warns_once_and_pairs_everything(self, tmp_path, caplog):
+        store = self._coarse_store(tmp_path)
+        cat = _s2_catalog([_s2_item("S2_0", _epoch_iso(40.0))])
+        with caplog.at_level(logging.WARNING, logger="zagg.catalog.closest_obs"):
+            sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+        build_warnings = [m for m in caplog.messages if "no max_time_offset" in m]
+        assert len(build_warnings) == 1
+        assert "temporal order 12" in build_warnings[0]
+        rec = sm.metadata["closest_obs"]
+        assert rec["epochs_dropped_low_resolution"] == 0
+        assert rec["epochs_paired"] == rec["epochs_total"] > 0
+        assert {g["id"] for g in sm.granules[0]} == {"S2_0"}
+
+    def test_half_span_exactly_at_the_cap_still_pairs(self, tmp_path):
+        """The pinned boundary side: half-span == max_time_offset is pairable.
+
+        Strictly-greater drops, matching the selection gate where an offset
+        exactly at the cap SELECTS — both boundaries sit on the permissive
+        side. (The acquisition inside the epoch's own bucket is within
+        half-span of its midpoint, so the selection also passes.)
+        """
+        store = self._coarse_store(tmp_path)
+        cat = _s2_catalog([_s2_item("S2_0", _epoch_iso(40.0))])
+        sm = closest_obs_shardmap(
+            cat, store, grid=_grid(), backend="mortie", max_time_offset=self.ORDER12_HALF
+        )
+        rec = sm.metadata["closest_obs"]
+        assert rec["epochs_dropped_low_resolution"] == 0
+        assert rec["epochs_paired"] == rec["epochs_total"] > 0
+        one_ns_under = self.ORDER12_HALF - np.timedelta64(1, "ns")
+        dropped = closest_obs_shardmap(
+            cat, store, grid=_grid(), backend="mortie", max_time_offset=one_ns_under
+        )
+        assert (
+            dropped.metadata["closest_obs"]["epochs_dropped_low_resolution"] == rec["epochs_total"]
+        )
+
+    def test_mixed_orders_drop_only_the_coarse_epochs(self, tmp_path):
+        """One shard, a pinned store beside a coarsened one: per-epoch gating."""
+        fine = _write_store(tmp_path / "fine", {SHARD: _instants(0, 5)})
+        coarse = self._coarse_store(tmp_path)
+        ref = reference_epochs([fine, coarse])
+        assert set(ref.epoch_orders[SHARD_KEY].tolist()) == {TEMPORAL_COVER_ORDER, 12}
+        n_coarse = int((ref.epoch_orders[SHARD_KEY] == 12).sum())
+        assert n_coarse > 0
+        cat = _s2_catalog(
+            [_s2_item(f"S2_{i}", _epoch_iso(d)) for i, d in enumerate((0.1, 5.2, 40.0))]
+        )
+        sm = closest_obs_shardmap(
+            cat,
+            [fine, coarse],
+            grid=_grid(),
+            backend="mortie",
+            max_time_offset=np.timedelta64(3, "D"),
+        )
+        rec = sm.metadata["closest_obs"]
+        # Only the coarse-block epochs fail the precision bar; the pinned
+        # store's epochs pair through the same shard.
+        assert rec["epochs_dropped_low_resolution"] == n_coarse
+        assert rec["epochs_total"] == rec["epochs_paired"] + rec["epochs_dropped"]
+        ids = {g["id"] for g in sm.granules[0]}
+        assert ids == {"S2_0", "S2_1"}
