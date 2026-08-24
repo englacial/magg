@@ -215,6 +215,24 @@ class TestD24Classification:
                 "location": "leaf_id",
             }
 
+    def test_class_map_gates_the_leaf_column_write_path(self):
+        # The class map is not just manifest text: ``column.composable_fields``
+        # filters this same declaration to exact/approximate, and
+        # ``leaf_column_plan``/``fold_column`` carry only what survives. That
+        # is why the live CA store has no strata leaf COLUMNS to fold (class
+        # ``none`` at build time) and the retrofit must re-read leaves — and
+        # it is the half phase 2 also flips: the admission turns worker-side
+        # strata column writes ON for new runs.
+        from zagg.column import composable_fields
+
+        assert composable_fields(CA_FIELDS_BEFORE) == {"count": CA_FIELDS_BEFORE["count"]}
+        fields, _ = declared_fields(default_config("atl03_tdigest_strata_healpix"))
+        assert sorted(composable_fields(fields)) == [
+            "count",
+            "h_tdigest_noise",
+            "h_tdigest_signal",
+        ]
+
 
 class TestWhereBuilderFoldParity:
     """Phase 2: the admission's substance — a stratum payload built by
