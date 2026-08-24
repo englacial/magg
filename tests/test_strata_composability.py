@@ -168,15 +168,15 @@ class TestD24Classification:
     def test_composition_field_classifies_none_today(self):
         # Flipped by phase 3: ``pack_composition`` has a fold law
         # (``merge_composition_kway``, issues #321/#370) that neither D24 arm
-        # states yet, so today the classifier says ``none``.
-        meta = {
-            "function": "zagg.stats.composition.pack_composition",
-            "source": "h_ph",
-            "dtype": "uint64",
-            "fill_value": 0,
-            "params": {"threshold": 2},
-            "attrs": {"composition": {"of": "h_tdigest_signal", "threshold": 2}},
-        }
+        # states yet, so today the classifier says ``none``. Driven off the
+        # SHIPPED field rather than a hand-built meta, so it follows the
+        # template — a declaration the template gains (``temporal``,
+        # ``location``, a params change) moves this verdict here too instead
+        # of leaving a green pin over a shape no store writes. What it adds
+        # over ``test_strata_template_classes`` is the reducer NAME the arm
+        # turns on.
+        meta = get_agg_fields(default_config("atl03_tdigest_strata_healpix"))["composition"]
+        assert meta["function"] == "zagg.stats.composition.pack_composition"
         assert field_composability(meta) == "none"
 
     def test_strata_template_classes(self):
