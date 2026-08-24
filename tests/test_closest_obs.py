@@ -537,7 +537,7 @@ def _s2_item(gid, iso, lat=14.54, lon=53.44, half=0.4):
     }
 
 
-def _s2_catalog(items):
+def _s2_catalog(items, bbox=(52.0, 13.0, 55.0, 16.0)):
     import pyarrow as pa
     import stac_geoparquet.arrow as sga
 
@@ -545,7 +545,7 @@ def _s2_catalog(items):
 
     return Catalog(
         pa.table(sga.parse_stac_items_to_arrow(items)),
-        {"collection": "sentinel-2-l2a", "bbox": [52.0, 13.0, 55.0, 16.0]},
+        {"collection": "sentinel-2-l2a", "bbox": list(bbox)},
     )
 
 
@@ -731,3 +731,73 @@ class TestClosestObsShardmap:
         sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
         entry = sm.granules[0][0]
         assert entry["datetime"] == entry["time_start"]
+
+    def _two_shard(self, tmp_path):
+        """Cover + catalog spanning 11213 and its lon neighbour 11212."""
+        store = _write_store(
+            tmp_path / "ref", {SHARD: _instants(0, 5, 11), SHARD_B: _instants(0, 5, 11)}
+        )
+        items = [_s2_item(f"A{i}", _epoch_iso(d)) for i, d in enumerate((0.1, 5.2))]
+        items += [_s2_item(f"B{i}", _epoch_iso(d), lon=59.06) for i, d in enumerate((0.1, 5.2))]
+        return store, _s2_catalog(items, bbox=(51.0, 12.0, 61.0, 18.0))
+
+    def _spy_build(self, monkeypatch):
+        """Record the kwargs the builder hands ``ShardMap.build``."""
+        from zagg.catalog.shardmap import ShardMap
+
+        calls = []
+        real = ShardMap.build.__func__
+
+        def spy(cls, catalog, grid, **kw):
+            calls.append(kw)
+            return real(cls, catalog, grid, **kw)
+
+        monkeypatch.setattr(ShardMap, "build", classmethod(spy))
+        return calls
+
+    def _pairs(self, sm):
+        return {(k, g["id"]) for k, gr in zip(sm.shard_keys, sm.granules) for g in gr}
+
+    def test_an_aoi_excluded_shard_is_not_coverage_disagreement(self, tmp_path, monkeypatch):
+        # A Moc aoi has no ring-parts form, so the spatial build stays unscoped
+        # and still assigns 11212 — whose epochs the aoi clipped away. That is
+        # self-inflicted, not "the reference stores never observed this ground".
+        from mortie import Moc
+
+        calls = self._spy_build(monkeypatch)
+        store, cat = self._two_shard(tmp_path)
+        sm = closest_obs_shardmap(
+            cat, store, grid=_grid(), backend="mortie", aoi=Moc.from_polygon(*AOI_AT_SHARD[0])
+        )
+        assert calls[0]["region"] is None
+        assert sm.shard_keys == [SHARD_KEY]
+        assert sm.metadata["closest_obs"]["spatial_shards_without_epochs"] == 0
+
+    def test_ring_parts_aoi_scopes_the_spatial_build(self, tmp_path, monkeypatch):
+        calls = self._spy_build(monkeypatch)
+        store, cat = self._two_shard(tmp_path)
+        full = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+        scoped = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie", aoi=AOI_AT_SHARD)
+        assert calls[0]["region"] is None  # aoi=None is unchanged
+        assert calls[1]["region"] is AOI_AT_SHARD
+        # Scoping the intersection changes the cost, never the answer.
+        assert SHARD_B_KEY in full.shard_keys
+        assert self._pairs(scoped) == {p for p in self._pairs(full) if p[0] == SHARD_KEY}
+
+    def test_a_geojson_aoi_scopes_the_spatial_build_as_parts(self, tmp_path, monkeypatch):
+        calls = self._spy_build(monkeypatch)
+        store, cat = self._two_shard(tmp_path)
+        lats, lons = AOI_AT_SHARD[0]
+        path = tmp_path / "aoi.geojson"
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "Polygon",
+                    "coordinates": [[[float(x), float(y)] for x, y in zip(lons, lats)]],
+                }
+            )
+        )
+        sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie", aoi=str(path))
+        # Resolved to ring parts before it reaches the build, never the path.
+        assert isinstance(calls[0]["region"], list)
+        assert sm.shard_keys == [SHARD_KEY]
