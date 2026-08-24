@@ -65,8 +65,14 @@ _TDIGEST_SPILL_FUNCTIONS = (*_TDIGEST_FUNCTIONS, _TDIGEST_WHERE_FUNCTION)
 #: weights-sorted ``(k, 2)`` centroid arrays and therefore fold by the
 #: order-independent k-way t-digest law (``merge_tdigests_kway``) wherever a
 #: fold operates on stored payloads rather than raw rows — the D24
-#: composability arm (:func:`zagg.semantics.field_composability`) and the
-#: overview pyramid it licenses (:func:`zagg.sweep_overview.fold_digests`).
+#: composability arm (:func:`zagg.semantics.field_composability`) and BOTH
+#: stored-payload fold sites it licenses: the sweep's overview fold
+#: (:func:`zagg.sweep_overview.fold_digests`) and the worker-side leaf column
+#: (:func:`zagg.column.fold_column`, gated by
+#: :func:`zagg.column.leaf_column_plan`, which filters the same declaration
+#: through :func:`zagg.column.composable_fields`). Membership here is
+#: therefore not free at build time — see ``build_waveform_digest``'s
+#: docstring for why a GEDI-scale store declares its ladder sweep-only.
 #: The k-way law is weight-agnostic — flux weights fold like counts (spec
 #: §2.0, issue #431) — which is what admits ``build_waveform_digest``: its
 #: build is waveform-specific, but its stored payload is a standard §2

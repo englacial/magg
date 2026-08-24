@@ -209,9 +209,21 @@ def build_waveform_digest(
     (``zagg.processing.streaming._DIGEST_FAMILY_FUNCTIONS``, issue #508), so a
     waveform field is D24 class ``approximate`` and folds through the overview
     pyramid when one is declared — each overview level carries the
-    per-centroid companion beside the folded payload. (The build-time gates
-    are unchanged: the merge/spill folds still refuse the builder, so a
-    waveform shard aggregates pooled or single-block-spill only.)
+    per-centroid companion beside the folded payload. The build-time GATES are
+    unchanged (the merge/spill folds still refuse the builder, so a waveform
+    shard aggregates pooled or single-block-spill only), but the build-time
+    WORK is not: ``leaf_column_plan`` filters the declaration through the same
+    composable classes, so a pyramid-ON waveform config also folds this column
+    worker-side (:func:`zagg.column.fold_column` at the tail of
+    ``hive.process_and_write_hive``) — a node-order k-way merge over every
+    resident digest, whose measured envelope
+    (:func:`zagg.column.write_leaf_column`'s memory note: ~2.0 GB at ~17.6M
+    centroids, on top of a loaded 4 GB heap) is NOT validated at GEDI's
+    21-33M-kept-rows-per-shard scale. So the ruled deployment path for a
+    GEDI-scale store is pyramids-OFF aggregation, then
+    :func:`zagg.sweep_overview.declare_pyramid` plus a sweep-only overview
+    pass (the runbook contingency) — which builds the ladder without ever
+    putting the column fold on the aggregating worker.
 
     What the words say is ruling 2's honesty property: a waveform record's
     samples share one instant, so a single-shot cell's centroids all carry that
