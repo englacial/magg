@@ -669,13 +669,30 @@ def _merge_slabs(
         # cell contributes its ``(word, n)`` pair, ``n`` being the ``of``
         # digest's weight at the same cell, and every output cell collapses in
         # ONE k-way call (single quantization). A contributor carrying one
-        # half of the pair is SKIPPED and counted unreadable — the
-        # ``_companion_group`` posture: the word is uninterpretable without
-        # its divisor digest, and a divisor without its word says nothing.
+        # half of the pair is SKIPPED and counted unreadable — the word is
+        # uninterpretable without its divisor digest, and a divisor without
+        # its word says nothing.
+        #
+        # Skipping alone does NOT keep the pair consistent, though, and that is
+        # the difference from the located pair above: there both halves are the
+        # same field's, so refusing one refuses both. Here the divisor is a
+        # DIFFERENT declared field, folded by the digest loop above, which
+        # knows nothing about this one — so a half-paired contributor can land
+        # in the level's ``N_signal`` while its word is excluded, and a reader
+        # doing the §3.3 recovery divides by a denominator the word never
+        # covered (a ~29% skew, reproduced on review). Absence over wrongness:
+        # every output cell that contributor's span covers keeps the fill word
+        # ``0``, which makes no §3.2 presence/fraction claim, while the digest
+        # itself stays correct on its own and ``source_children.unreadable``
+        # records that the level folded short (spec §4.5). Keyed on the PAIR
+        # rather than on the skew direction — a contributor's windows all land
+        # on the same output cells, so one window's half-pair would otherwise
+        # mix into cells another window filled.
         of_name = meta.get("of")
         of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
         out = _empty_slab(meta, n_out)
         parts_by_cell: dict[int, list] = {}
+        poisoned: set[int] = set()
         for i, row in enumerate(rows):
             base = i * src_per_child
             for w, reader in enumerate(row or ()):
@@ -695,6 +712,12 @@ def _merge_slabs(
                             f"contributor unreadable (spec §3.3, §1.1)"
                         )
                         broken.add((i, w))
+                        poisoned.update(
+                            range(
+                                base // factor,
+                                (base + src_per_child + factor - 1) // factor,
+                            )
+                        )
                     continue
                 for pos in range(len(word_slab)):
                     n = payload_weight(of_values[pos], of_dtype)
@@ -702,8 +725,11 @@ def _merge_slabs(
                         parts_by_cell.setdefault((base + pos) // factor, []).append(
                             (int(word_slab[pos]), n)
                         )
+        # Poisoned cells drop out HERE, after accumulation: every surviving
+        # cell still folds its parts in one k-way call (single quantization).
         for j, parts in parts_by_cell.items():
-            out[j] = merge_composition_kway(parts)
+            if j not in poisoned:
+                out[j] = merge_composition_kway(parts)
         slabs[name] = out
     return (slabs, *_source_counts(rows, broken))
 

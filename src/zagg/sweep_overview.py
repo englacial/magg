@@ -1606,6 +1606,17 @@ def _fold_node(
     # Per packed field, per output cell, the accumulated ``(word, n)`` parts —
     # merged ONCE at the end (single quantization, the k-way law of spec §3.4).
     packed: dict = {}
+    # Per packed field, the output cells a HALF-PAIRED leaf covers. The fold's
+    # divisor is a different declared field, folded by the digest arm below,
+    # which knows nothing about this one: a leaf carrying the word without its
+    # ``of`` digest (or the reverse) would leave the level's ``N_signal``
+    # counting rows the word excludes, so a reader's §3.3 recovery divides by a
+    # denominator the word never covered. Absence over wrongness — those cells
+    # keep the fill word ``0``, which makes no §3.2 presence/fraction claim,
+    # while the digest stays correct on its own. A leaf carrying NEITHER half
+    # is the ordinary schema-evolution case (nothing folds from it either way)
+    # and poisons nothing.
+    packed_poison: dict = {}
     # Per field, per declared companion channel, the accumulated word vectors —
     # index-aligned with ``digests[name]`` cell by cell so the fold merges the
     # payload and every channel in ONE call (issue #410, spec §9.1/§8.3).
@@ -1621,6 +1632,7 @@ def _fold_node(
             slabs[name] = _empty_slab(meta, n_cells)
             if meta["class"] == "packed":
                 packed[name] = {}
+                packed_poison[name] = set()
     if target_order >= shard_order:
         span = 4 ** (target_order - shard_order)
         fold_factor = 4 ** (shard_order - k)
@@ -1654,6 +1666,7 @@ def _fold_node(
                 partials: dict = {}
                 cell_digests: dict = {}
                 leaf_packed: dict = {}
+                leaf_poison: set = set()
                 for name, meta in fields.items():
                     try:
                         arr = group[name]
@@ -1661,6 +1674,12 @@ def _fold_node(
                         # Schema evolution: the field postdates this leaf — it
                         # contributes fill, exactly what re-running would write.
                         logger.debug(f"sweep[overview]: leaf {leaf} lacks field {name!r}")
+                        # Unless it is HALF a packed pair: the divisor digest is
+                        # here and the digest arm will fold it, so the word must
+                        # not be reconstructed over a denominator this leaf's
+                        # rows are in but its word is not.
+                        if meta["class"] == "packed" and (meta.get("of") or "") in group:
+                            leaf_poison.add(name)
                         continue
                     if meta["class"] == "exact":
                         partials[name] = fold_dense(
@@ -1680,6 +1699,7 @@ def _fold_node(
                                 f"sweep[overview]: leaf {leaf} lacks {of_name!r} for "
                                 f"packed field {name!r}"
                             )
+                            leaf_poison.add(name)
                             continue
                         of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
                         words_arr = arr[:]
@@ -1737,6 +1757,13 @@ def _fold_node(
             for name, contributions in leaf_packed.items():
                 for i, word, n in contributions:
                     packed[name].setdefault(start + i // fold_factor, []).append((word, n))
+            # The leaf's whole span, which is exactly the output cells its
+            # rows reach (``leaf_cells // fold_factor == span`` in both fold
+            # geometries). Applied only once the leaf has read cleanly: an
+            # UNREADABLE leaf is skipped whole, so the digest excludes it too
+            # and the pair stays consistent without poisoning anything.
+            for name in leaf_poison:
+                packed_poison[name].update(range(start, start + span))
             n_leaves += 1
             timestamps.append(stamp.get("written_at"))
             granules += int(stamp.get("granule_count") or 0)
@@ -1745,8 +1772,11 @@ def _fold_node(
     if n_leaves == 0:
         return None
     for name, parts_by_cell in packed.items():
+        # Poisoned cells drop out HERE, after accumulation: every surviving
+        # cell still folds its parts in one k-way call (single quantization).
         for j, parts in parts_by_cell.items():
-            slabs[name][j] = merge_composition_kway(parts)
+            if j not in packed_poison[name]:
+                slabs[name][j] = merge_composition_kway(parts)
     for name, acc in digests.items():
         meta = fields[name]
         dtype = meta.get("dtype") or "float32"
@@ -1983,7 +2013,12 @@ def _fold_child(group, fields, factor, span, path) -> dict:
             # The cascade's ``n`` inputs are the child's ``of`` digest weights
             # at the same rows (spec §3.3/§3.4); a child carrying the word
             # without its divisor digest contributes nothing for the field —
-            # the schema-evolution posture above, never a guessed ``n``. Each
+            # the schema-evolution posture above, never a guessed ``n``. That
+            # skip needs no poisoning counterpart (unlike ``_fold_node``'s and
+            # ``_merge_slabs``'): children own DISJOINT spans of the parent
+            # slab and ``_cascade_node`` ASSIGNS them, so a skipped child
+            # leaves its whole span at the fill word — no output cell can mix
+            # this child's absence with a sibling's contribution. Each
             # level re-quantizes once (the k-way law), which is in the class's
             # documented contract: presence exact, counts within one lane
             # quantization per fold.
