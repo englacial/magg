@@ -267,6 +267,41 @@ class TestD24Classification:
         assert _is_composable(broken["composition"]) is False
         assert _is_composable(fields["composition"]) is True
 
+    def test_the_stage_pass_drops_a_packed_entry_without_its_of_linkage(self, tmp_path):
+        # The THIRD admission site: ``sweep_stage_pass`` builds its own fields
+        # map and hands it to ``stage_node`` unfiltered, so an of-less packed
+        # entry would reach ``_merge_slabs`` and read ``group[None]`` (a
+        # ``TypeError`` ``_ColumnReader.read`` does not catch, aborting the
+        # pass). Behavioral: with no composable field left the pass returns at
+        # its own gate, BEFORE the candidate discovery that stamps
+        # ``root_moc_stale`` — so that key's presence is the "got past the
+        # gate" witness (review finding).
+        from zagg.pyramid import PYRAMID_SPEC_V2
+        from zagg.sweep_stages import sweep_stage_pass
+
+        fields, _ = declared_fields(default_config("atl03_tdigest_strata_healpix"))
+        packed = {"composition": dict(fields["composition"])}
+        broken = {"composition": {k: v for k, v in packed["composition"].items() if k != "of"}}
+
+        def run(entries):
+            return sweep_stage_pass(
+                str(tmp_path),
+                {
+                    "shard_order": 2,
+                    "cell_order": 4,
+                    "pyramid": {
+                        "spec": PYRAMID_SPEC_V2,
+                        "overviews": [{"node": 1, "cells": [2]}, {"node": 0, "cells": [1]}],
+                        "overview": {"fields": entries},
+                    },
+                },
+                {},
+                run_id="A",
+            )
+
+        assert run(broken)["stages"] == [] and "root_moc_stale" not in run(broken)
+        assert run(packed)["stages"] == [] and run(packed)["root_moc_stale"] is True
+
 
 class TestWhereBuilderFoldParity:
     """Phase 2: the admission's substance — a stratum payload built by
