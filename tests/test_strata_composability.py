@@ -247,6 +247,26 @@ class TestD24Classification:
             "h_tdigest_signal",
         ]
 
+    def test_a_packed_entry_without_its_of_linkage_is_not_composable(self):
+        # A packed entry whose §3.3 linkage is missing declares a fold with no
+        # divisor. ``declared_fields`` never writes one, but a manifest can
+        # (they outlive their writer, spec §4.5) — and admitting it publishes
+        # an all-fill composition array under an invalid declaration, where
+        # fill 0 reads as "empty signal stratum" rather than absence. It
+        # degrades to native resolution exactly as an unknown class does, on
+        # BOTH fold paths (the column write path and the sweep's own filter).
+        from zagg.column import _is_composable, composable_fields
+
+        fields, _ = declared_fields(default_config("atl03_tdigest_strata_healpix"))
+        broken = {
+            **fields,
+            "composition": {k: v for k, v in fields["composition"].items() if k != "of"},
+        }
+        assert broken["composition"]["class"] == "packed"
+        assert "composition" not in composable_fields(broken)
+        assert _is_composable(broken["composition"]) is False
+        assert _is_composable(fields["composition"]) is True
+
 
 class TestWhereBuilderFoldParity:
     """Phase 2: the admission's substance — a stratum payload built by
