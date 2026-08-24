@@ -24,11 +24,13 @@ from zagg.grids.base import (
     chunk_array_spec,
     ragged_array_spec,
     ragged_locations_name,
+    ragged_times_name,
     sharded_array_spec,
     vector_array_spec,
     vlen_dtype_warning_suppressed,
 )
 from zagg.grids.morton import MORTON_CONVENTION, morton_decimal, to_morton_array
+from zagg.time_axis import TOC_SHAPE_PER_CENTROID
 
 HEALPIX_BASE_CELLS: int = 12
 # Reference order at which ``assign`` resolves points before ``cells_of`` /
@@ -720,17 +722,33 @@ class HealpixGrid:
                         "shard_shape": rag_shard,
                     }
                 located = ragged_locations_name(name) if sig.get("location") else None
+                # The §8.3 temporal sibling (issue #410): same geometry and
+                # row alignment as the located one, its own spec-owned
+                # declaration, bound from the payload by the ``times`` key.
+                timed = (
+                    ragged_times_name(name)
+                    if sig.get("temporal") == TOC_SHAPE_PER_CENTROID
+                    else None
+                )
                 members[name] = apply_field_attrs(
                     ragged_array_spec(
                         element_dtype=sig["dtype"] or "float32",
                         inner_shape=sig["inner_shape"],
                         locations=located,
+                        weights=sig.get("weights"),
+                        times=timed,
                         **rag_kw,
                     ),
                     meta,
                 )
                 if located:
-                    members[located] = ragged_array_spec(element_dtype="uint64", **rag_kw)
+                    members[located] = ragged_array_spec(
+                        element_dtype="uint64", located=True, **rag_kw
+                    )
+                if timed:
+                    members[timed] = ragged_array_spec(
+                        element_dtype="uint64", temporal=TOC_SHAPE_PER_CENTROID, **rag_kw
+                    )
                 continue
             dtype = meta.get("dtype", "float32")
             fill = meta.get("fill_value", "NaN")

@@ -58,6 +58,106 @@ RAGGED_SPEC = "zagg-ragged/1"
 #: produce identical objects across workers.
 RAGGED_ZSTD_LEVEL = 3
 
+#: Array-attrs key declaring a digest payload's weight-column semantics
+#: (spec §2.0, issue #424): a SIBLING of :data:`RAGGED_ELEMENT_ATTR` on the
+#: payload array — never a key inside the versioned ``ragged`` block, which
+#: is retired wholesale under ``zagg-ragged/2`` (a sibling key survives that
+#: metadata-only migration untouched; espg ruling on issue #422). Spec-owned:
+#: stamped at template time from the field's ``weights:`` declaration,
+#: reserved against config-declared attrs.
+WEIGHTS_ATTR = "weights"
+
+#: The defined §2.0 declarations. ``counts`` — integer weights ≥ 1 summing to
+#: the exact observation count (the default: an ABSENT key reads as counts,
+#: keeping every pre-#424 store conformant verbatim). ``flux`` — positive
+#: reals whose sum estimates detected photoelectrons (calibration provenance
+#: required in attrs). Merges are legal only between matching declarations.
+WEIGHTS_KINDS = ("counts", "flux")
+
+#: Array-attrs key binding a ragged payload array to its §8.3 per-centroid
+#: temporal sibling — the sibling's array NAME. It mirrors the ``locations``
+#: binding but sits OUTSIDE the versioned ``ragged`` block, exactly as
+#: :data:`WEIGHTS_ATTR` does and for the same reason (the block is retired
+#: wholesale under ``zagg-ragged/2``), so `/1`'s block grammar does not move
+#: for this revision. Spec-owned: writer-stamped from the field's
+#: ``temporal:`` declaration, reserved against config-declared attrs.
+TIMES_ATTR = "times"
+
+#: Array-attrs key of the spec §9 spatial declaration, stamped on a located
+#: field's ``{field}_locations`` sibling — the array that HOLDS the morton
+#: words. §8's word-typed declaration pattern, keyed by its domain.
+LOCATED_ATTR = "located"
+#: The §9 convention revision, strict-checked on read.
+LOCATED_SPEC = "zagg-located/1"
+#: The §9 word-grammar revision token. It names mortie's morton conventions
+#: — specification §1 (bit layout) and §4 (encoding-carried kind), both
+#: enumerated as frozen for 1.x by that document's §10 — as a
+#: ``{name}/{major}`` token, never a URL or an installed-version stamp.
+LOCATED_GRAMMAR = "mortie-morton/1"
+#: The only §9 ``shape``: one word per centroid row of the payload the
+#: sibling accompanies.
+LOCATED_SHAPE_PER_CENTROID = "per-centroid"
+
+
+def located_declaration_block() -> dict:
+    """The §9 declaration a writer stamps on a located sibling array."""
+    return {
+        "spec": LOCATED_SPEC,
+        "shape": LOCATED_SHAPE_PER_CENTROID,
+        "grammar": LOCATED_GRAMMAR,
+    }
+
+
+def located_declaration(attrs) -> dict | None:
+    """The §9 ``located`` block from a sibling array's attrs, strict-checked.
+
+    Returns ``None`` when the key is absent — which §9 defines as §2.2
+    verbatim (kind-keyed words decoded per word, and the deepest common
+    ancestor of the members' words after a merge), never a refusal, so every
+    located store written before the declaration stays conformant. Raises on a block this reader cannot
+    decode: an unknown ``spec``, an unimplemented ``shape``, or an uncited
+    word ``grammar``. Unrecognized keys are informative and ignored.
+    """
+    block = dict(attrs or {}).get(LOCATED_ATTR)
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise ValueError(f"{LOCATED_ATTR!r} attrs must be a mapping (got {block!r}) — spec §9")
+    if block.get("spec") != LOCATED_SPEC:
+        raise ValueError(
+            f"unknown located declaration spec {block.get('spec')!r} (spec §9 defines "
+            f"{LOCATED_SPEC!r}); refusing to guess a future revision's word encoding"
+        )
+    if block.get("shape") != LOCATED_SHAPE_PER_CENTROID:
+        raise ValueError(
+            f"located declaration shape {block.get('shape')!r} is not implemented "
+            f"(spec §9 defines {LOCATED_SHAPE_PER_CENTROID!r})"
+        )
+    if block.get("grammar") != LOCATED_GRAMMAR:
+        raise ValueError(
+            f"located declaration cites word grammar {block.get('grammar')!r}, not "
+            f"{LOCATED_GRAMMAR!r} (spec §9); refusing to decode words under a grammar "
+            f"this reader does not implement"
+        )
+    return block
+
+
+def weights_declaration(attrs) -> str:
+    """The §2.0 weights declaration recorded in a payload array's attrs.
+
+    Absent key reads as ``"counts"`` (spec §2.0 — existing stores are
+    conformant verbatim); an unknown value is a future spec revision and
+    raises rather than half-parsing (the strict-check discipline every
+    versioned convention on the spec page gets).
+    """
+    value = dict(attrs or {}).get(WEIGHTS_ATTR, "counts")
+    if value not in WEIGHTS_KINDS:
+        raise ValueError(
+            f"unknown weights declaration {value!r} (spec §2.0 defines {WEIGHTS_KINDS}); "
+            f"refusing to guess weight semantics for a future spec revision"
+        )
+    return value
+
 
 def apply_field_attrs(spec, meta: dict):
     """Merge a variable's config-declared ``attrs`` onto its array spec.
@@ -80,8 +180,24 @@ def apply_field_attrs(spec, meta: dict):
     (:func:`zagg.stats.composition.composition_attrs_block`), with config
     validation rejecting a declaration that disagrees — so neither convention
     marker in tree is an author transcription (review finding, issue #340).
+
+    A field declaring ``temporal: per-cell`` (spec §8.2, issue #410) gets the
+    spec-owned ``temporal`` block stamped here from the module constants for
+    the same reason: the dense uint64 array IS the array holding the words,
+    and the declaration must be the writer's, never an author's transcription.
     """
+    from zagg.time_axis import TOC_SHAPE_PER_CELL, temporal_attrs
+
     attrs = meta.get("attrs")
+    declared = meta.get("temporal")
+    if declared is not None and declared != TOC_SHAPE_PER_CELL:
+        # per-centroid rides the ragged sibling (§8.3), stamped by
+        # ``ragged_array_spec``; nothing else is a dense-array shape.
+        declared = None
+    if not attrs and declared is None:
+        return spec
+    if declared is not None:
+        spec = spec.with_attributes({**dict(spec.attributes or {}), **temporal_attrs(declared)})
     if not attrs:
         return spec
     from zagg.stats.composition import COMPOSITION_ATTR, composition_attrs_block
@@ -102,6 +218,17 @@ def ragged_locations_name(field_name: str) -> str:
     array node.
     """
     return f"{field_name}_locations"
+
+
+def ragged_times_name(field_name: str) -> str:
+    """On-disk array name of a temporal ragged field's uint64 channel (§8.3).
+
+    The per-centroid temporal sibling (``{field}_times``), row-aligned with
+    the digest payload exactly as the located sibling is. Stored under the
+    payload array's :data:`TIMES_ATTR` binding — a reader binds by that
+    declaration, never by reconstructing this convention (spec §8.3).
+    """
+    return f"{field_name}_times"
 
 
 @contextmanager
@@ -135,6 +262,10 @@ def ragged_array_spec(
     element_dtype,
     inner_shape=(),
     locations=None,
+    weights=None,
+    times=None,
+    temporal=None,
+    located=False,
 ):
     """Vlen-bytes ``ArraySpec`` for a ``kind: ragged`` field (issue #209).
 
@@ -180,6 +311,27 @@ def ragged_array_spec(
         declared in the payload array's attrs so a reader binds the channel
         by METADATA, not by reconstructing the naming convention (review,
         PR #211). ``None`` (unlocated) records nothing.
+    weights : str, optional
+        The field's §2.0 weights declaration (issue #424), stamped as the
+        :data:`WEIGHTS_ATTR` SIBLING key beside the ``ragged`` block (never
+        inside it — the block is retired under ``/2``). ``None`` (undeclared)
+        records nothing: the spec reads an absent key as ``"counts"``, so
+        pre-#424 configs emit byte-identical templates. Pass it for the
+        payload array only — a companion sibling carries no user attrs.
+    times : str, optional
+        Name of the field's per-centroid TEMPORAL sibling (spec §8.3, issue
+        #410), stamped as the :data:`TIMES_ATTR` SIBLING key beside the
+        ``ragged`` block on the PAYLOAD array — a binding, not a
+        declaration. ``None`` records nothing (no temporal companion).
+    temporal : str, optional
+        Spec §8 ``shape`` of the words THIS array holds — passed for a
+        per-centroid sibling, never for a payload array. Stamps the
+        spec-owned ``temporal`` declaration block.
+    located : bool, optional
+        Stamp the spec §9 ``located`` declaration on THIS array — passed for
+        a ``{field}_locations`` sibling, the array that holds the morton
+        words. Its absence on an older store is §2.2 verbatim, never a
+        refusal.
 
     Returns
     -------
@@ -215,8 +367,28 @@ def ragged_array_spec(
     ragged_meta: dict = {"spec": RAGGED_SPEC, "element": element}
     if locations is not None:
         ragged_meta["locations"] = str(locations)
+    attributes: dict = {RAGGED_ELEMENT_ATTR: ragged_meta}
+    if weights is not None:
+        if weights not in WEIGHTS_KINDS:
+            raise ValueError(
+                f"weights declaration {weights!r} is not one of {WEIGHTS_KINDS} (spec §2.0)"
+            )
+        attributes[WEIGHTS_ATTR] = str(weights)
+    if times is not None:
+        attributes[TIMES_ATTR] = str(times)
+    if temporal is not None:
+        from zagg.time_axis import TOC_SHAPE_PER_CENTROID, temporal_attrs
+
+        if temporal != TOC_SHAPE_PER_CENTROID:
+            raise ValueError(
+                f"a ragged sibling declares temporal shape {TOC_SHAPE_PER_CENTROID!r}, "
+                f"not {temporal!r} (spec §8.3)"
+            )
+        attributes.update(temporal_attrs(temporal))
+    if located:
+        attributes[LOCATED_ATTR] = located_declaration_block()
     return ArraySpec(
-        attributes={RAGGED_ELEMENT_ATTR: ragged_meta},
+        attributes=attributes,
         shape=tuple(int(s) for s in shape),
         dimension_names=tuple(dims),
         data_type="variable_length_bytes",
@@ -584,11 +756,22 @@ __all__ = [
     "RAGGED_ELEMENT_ATTR",
     "RAGGED_SPEC",
     "RAGGED_ZSTD_LEVEL",
+    "WEIGHTS_ATTR",
+    "WEIGHTS_KINDS",
+    "weights_declaration",
+    "TIMES_ATTR",
+    "LOCATED_ATTR",
+    "LOCATED_GRAMMAR",
+    "LOCATED_SHAPE_PER_CENTROID",
+    "LOCATED_SPEC",
+    "located_declaration",
+    "located_declaration_block",
     "ShardKey",
     "InconsistentShardError",
     "shard_label",
     "ragged_array_spec",
     "ragged_locations_name",
+    "ragged_times_name",
     "vector_array_spec",
     "vlen_dtype_warning_suppressed",
     "chunk_array_spec",

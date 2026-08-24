@@ -23,6 +23,28 @@ PYTHON=$(command -v python3.12 || echo /opt/python/cp312-cp312/bin/python)
 PIP="$PYTHON -m pip"
 PYVER=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
+# Every exact layer pin is single-sourced from the `lambda` extra in
+# pyproject.toml (PR #436, extending the issue-322 mortie pattern below): one
+# edit site, and a pin that drifts from the extra cannot exist. The
+# assignments run before any install and fail the build loudly under `set -e`
+# when the extra stops carrying an exact pin for a requested name.
+lambda_pin() {
+    $PYTHON -c '
+import pathlib, sys, tomllib
+extra = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["project"]["optional-dependencies"]["lambda"]
+print(next(d for d in extra if "==" in d and d.split("==")[0].strip() == sys.argv[2]))
+' "${SCRIPT_DIR}/../../pyproject.toml" "$1"
+}
+NUMPY_PIN=$(lambda_pin numpy)
+PANDAS_PIN=$(lambda_pin pandas)
+ARRO3_PIN=$(lambda_pin arro3-core)
+H5CORO_PIN=$(lambda_pin h5coro)
+HIDEFIX_PIN=$(lambda_pin h5coro-hidefix)
+ASYNC_TIFF_PIN=$(lambda_pin async-tiff)
+XARRAY_PIN=$(lambda_pin xarray)
+H5NETCDF_PIN=$(lambda_pin h5netcdf)
+H5PY_PIN=$(lambda_pin h5py)
+
 # Sanity: machine arch must match the requested layer arch.
 MACHINE_ARCH=$(uname -m)
 if [[ "$ARCH" == "arm64" && "$MACHINE_ARCH" != "aarch64" ]]; then
@@ -43,14 +65,15 @@ CONSTRAINTS="$OUTPUT_DIR/constraints.txt"
 echo "numpy<2.3" > "$CONSTRAINTS"
 
 # numpy: arm64 Lambda requires 64KB page alignment, so build from source with
-# the right LDFLAGS; x86_64 uses the prebuilt wheel.
-echo "Installing numpy..."
+# the right LDFLAGS; x86_64 uses the prebuilt wheel. Both arches install the
+# extra's exact pin, so the two layers carry the same numpy.
+echo "Installing numpy ($NUMPY_PIN)..."
 if [[ "$ARCH" == "arm64" ]]; then
     export LDFLAGS="-Wl,-z,max-page-size=0x10000"
     export NPY_BLAS_ORDER=openblas
-    $PIP install "numpy==2.2.6" --no-binary numpy -t "$OUTPUT_DIR/python" --no-cache-dir
+    $PIP install "$NUMPY_PIN" --no-binary numpy -t "$OUTPUT_DIR/python" --no-cache-dir
 else
-    $PIP install "numpy>=2.0,<2.3" -t "$OUTPUT_DIR/python" --no-cache-dir
+    $PIP install "$NUMPY_PIN" -t "$OUTPUT_DIR/python" --no-cache-dir
 fi
 
 # Core processing deps. pyproj + odc-geo (and affine/cachetools) are required:
@@ -61,15 +84,15 @@ echo "Installing processing deps..."
 # arro3-core (issue #130) is the deployed-worker Arrow carrier, replacing pyarrow:
 # ~7 MB, zero required deps, importable (pyarrow's bindings hard-link a ~100 MB
 # unstrippable C++ core that can't fit the gate while importable). pyarrow is NOT
-# installed here -- its only use is off-Lambda zagg.catalog. Keep the pin in sync
-# with the `lambda` extra in pyproject.toml.
+# installed here -- its only use is off-Lambda zagg.catalog.
 # xarray + h5netcdf/h5py (issue #220): the temporal worker (process_event)
 # reads collections/masks as xarray datasets and opens NetCDF4/HDF5 bytes
 # in-memory through the h5netcdf engine (h5coro is a byte-range reader, not
-# an xarray engine). Keep the pins in sync with the `lambda` extra.
+# an xarray engine). All exact pins here come from the `lambda` extra
+# (lambda_pin above).
 $PIP install \
-    "pandas==2.2.3" "arro3-core==0.8.1" fastparquet cramjam \
-    "xarray==2026.7.0" "h5netcdf==1.8.1" "h5py==3.16.0" \
+    "$PANDAS_PIN" "$ARRO3_PIN" fastparquet cramjam \
+    "$XARRAY_PIN" "$H5NETCDF_PIN" "$H5PY_PIN" \
     shapely pyproj odc-geo affine cachetools \
     -c "$CONSTRAINTS" \
     -t "$OUTPUT_DIR/python" \
@@ -77,8 +100,8 @@ $PIP install \
 
 # h5coro-hidefix (issue #149): compiled hidefix chunk reader backing the
 # `sidecar` index backend. abi3 manylinux_2_28 wheel (~2.2 MB) on both arches;
-# its only runtime dep is numpy (already installed above). Keep the pin in
-# sync with the `lambda` extra in pyproject.toml.
+# its only runtime dep is numpy (already installed above). The pin comes from
+# the `lambda` extra (lambda_pin above).
 # mortie's version spec is single-sourced from pyproject.toml (issue #322):
 # --no-deps means pip never resolves the runtime floor declared there, so an
 # unpinned install silently accepted whatever was latest at build time -- even
@@ -93,8 +116,8 @@ import pathlib, re, sys, tomllib
 deps = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["project"]["dependencies"]
 print(next(d for d in deps if re.match(r"mortie($|[\s<>=!~\[])", d)))
 ' "${SCRIPT_DIR}/../../pyproject.toml")
-echo "Installing h5coro, h5coro-hidefix and mortie ('$MORTIE_SPEC' from pyproject, --no-deps)..."
-$PIP install "h5coro==1.0.5" "h5coro-hidefix==0.3.1" "$MORTIE_SPEC" --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
+echo "Installing h5coro ($H5CORO_PIN), h5coro-hidefix ($HIDEFIX_PIN) and mortie ('$MORTIE_SPEC' from pyproject, --no-deps)..."
+$PIP install "$H5CORO_PIN" "$HIDEFIX_PIN" "$MORTIE_SPEC" --no-deps -t "$OUTPUT_DIR/python" --no-cache-dir
 
 # Assert the derived spec actually landed: mortie is the one dep whose spec is
 # computed, and pip exits 0 on specs it skips (a PEP 508 marker that does not
@@ -106,10 +129,10 @@ fi
 
 # async-tiff (issue #218): the raster worker's GeoTIFF/COG decode engine
 # (mode="process_raster"). abi3 manylinux_2_28 wheel (~4 MB) on both arches;
-# its only dep is obspec (pure-python, tiny). Keep the pins in sync with the
-# `lambda` extra in pyproject.toml.
-echo "Installing async-tiff (+obspec)..."
-$PIP install "async-tiff==0.7.2" obspec -t "$OUTPUT_DIR/python" --no-cache-dir
+# its only dep is obspec (pure-python, tiny). The pin comes from the `lambda`
+# extra (lambda_pin above).
+echo "Installing async-tiff ($ASYNC_TIFF_PIN, +obspec)..."
+$PIP install "$ASYNC_TIFF_PIN" obspec -t "$OUTPUT_DIR/python" --no-cache-dir
 
 # Verify numpy stayed < 2.3
 NUMPY_VERSION=$(ls "$OUTPUT_DIR/python" | grep -E "^numpy-" | head -1)

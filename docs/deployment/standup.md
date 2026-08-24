@@ -81,20 +81,63 @@ to hand-assemble zips or wire up the IAM role yourself.
   60 s) and self-recycle/worker-error metric-filter pair as the base
   function; idle variants cost nothing (Lambda bills invocations only).
 - **`DepsLayer`** -- the dependency layer version (`<FunctionName>-deps`).
-- **`ExecutionRole`** -- created only when `CreateExecutionRole=true` (the
-  default). It trusts `lambda.amazonaws.com` and is scoped least-privilege to
-  CloudWatch Logs plus `Get/Put/DeleteObject` + `ListBucket` on **one** output
-  bucket. In IAM-constrained accounts (e.g. an AWS SSO power-user that lacks
-  `iam:CreateRole`), set `CreateExecutionRole=false` and pass a pre-made role via
-  `ExecutionRoleArn` -- see [Execution Role](execution-role.md).
+- **`ExecutionRole`** -- always created by the stack, named by
+  `ExecutionRoleName` (default `zagg-lambda-execution`). It trusts
+  `lambda.amazonaws.com` and grants CloudWatch Logs plus, statement by
+  statement: `Get/Put/DeleteObject` **and** `ListBucket` on the output bucket;
+  `Get/Put/DeleteObject` on the public `sliderule-public-cors` bucket
+  (whole-bucket, by intent -- PR #176; that bucket is being retired, issue
+  #499, and its sidecar-cache successor is **not** the Source Cooperative
+  prefix below -- a different bucket under a different org, post-MVP and not
+  yet chosen); and, on Source Cooperative, `Get/Put/PutObjectAcl/DeleteObject`
+  plus the multipart pair on the published object prefix
+  `englacial/zagg/demo/*`, with plain `ListBucket` granted on the **bucket**
+  rather than the prefix, unconditioned on purpose, because S3 answers a GET
+  for an absent key with 404 only when the caller holds bucket-level
+  `ListBucket`, and zagg's absence checks catch 404 only.
+  `ListBucketMultipartUploads` is deliberately absent: it is bucket-wide and
+  cannot be prefix-constrained, so Source Cooperative does not grant it and
+  uploads leaked by a killed worker age out on their 7-day lifecycle rule
+  instead. Standing the stack up therefore needs `iam:CreateRole`: in an
+  IAM-constrained account (e.g. an AWS SSO power-user), have an admin run the
+  standup rather than mint a role separately. The name is explicit and stable
+  because it is zagg's **published identity** -- Source Cooperative names this
+  ARN in their bucket policy -- so a second stack in the same account must
+  override `EXECUTION_ROLE_NAME` to avoid a collision.
+
+  **Run the first update after [issue #495](https://github.com/englacial/zagg/issues/495)
+  with an idle fleet.** Adding `RoleName` to an already-deployed *unnamed* role
+  is a **replacement**, not an in-place edit: CloudFormation creates the new
+  role, re-points the five `Role:` references, then **deletes the old one**
+  during cleanup. A warm Lambda sandbox holds credentials vended from the old
+  role, so that delete invalidates them and any 900 s worker still mid-shard
+  starts getting `AccessDenied`. IAM/Lambda propagation is not instant either
+  -- `UpdateFunctionConfiguration` against a freshly created role can fail with
+  *The role defined for the function cannot be assumed by Lambda* until IAM
+  catches up; CloudFormation retries, but a rollback there leaves five
+  functions to re-point by hand. The same applies to any later change of
+  `EXECUTION_ROLE_NAME` on a live stack.
 - **`OutputBucket`** -- created only when `CreateOutputBucket=true`; otherwise the
   bucket named by `OutputBucketName` must already exist and be writable by the
   role.
 
-> Writing to **external** object stores (source.coop, other accounts/clouds)
-> does *not* go through the execution role -- those use credentials injected
-> per-invocation in the event (see [AWS Lambda](lambda.md#output-credentials-external-write-targets)).
-> So the role stays scoped to a single in-account bucket.
+> Publishing to **Source Cooperative** goes through the execution role itself
+> (issue #495): the fleet is one communal writer, and staging
+> (`sliderule-public*`) versus published (source.coop) is a difference in store
+> maturity, not in identity. Credential **injection** remains for targets we
+> have not negotiated a bucket policy with -- a collaborator's private bucket,
+> R2/MinIO -- see
+> [AWS Lambda](lambda.md#output-credentials-external-write-targets).
+>
+> **Publish into a subdirectory of the granted prefix, never at the prefix
+> root.** A run's status objects are a string-concatenated *sibling* of the
+> store, not a child: a store at
+> `s3://us-west-2.opendata.source.coop/englacial/zagg/demo/foo.zarr` puts them
+> under `.../demo/foo.zarr.status/`, inside the grant, but a store written at
+> the prefix root (`.../englacial/zagg/demo`) puts them at
+> `.../englacial/zagg/demo.status/`, outside it. The
+> [write probe](lambda.md#write-probe) makes that fail closed before fan-out
+> rather than mid-campaign, so the policy is deliberately not widened for it.
 
 ## `stand_up.sh` environment variables
 
@@ -105,8 +148,7 @@ the pre-deploy confirmation prompt):
 |----------|---------|---------|
 | `OUTPUT_BUCKET` | *(required)* | Bucket where results are written; the execution role is scoped to it |
 | `CREATE_BUCKET` | `false` | `true` makes the stack create `OUTPUT_BUCKET` |
-| `CREATE_ROLE` | `true` | `false` skips role creation; requires `ROLE_ARN` |
-| `ROLE_ARN` | *(none)* | Pre-existing execution-role ARN, required only when `CREATE_ROLE=false` |
+| `EXECUTION_ROLE_NAME` | `zagg-lambda-execution` | Name of the execution role -- zagg's published identity. Override for a second stack in the same account |
 | `ARCH` | `arm64` | `arm64` or `x86_64` (both py3.12) |
 | `REGION` | `us-west-2` | Deployment region |
 | `STAGING_BUCKET` | *(none)* | Required outside us-west-2: a same-region bucket the release zips are copied into |
@@ -116,21 +158,22 @@ the pre-deploy confirmation prompt):
 
 These map onto the `template.yaml` parameters (`Architecture`, `ArtifactBucket`,
 `LayerS3Key`, `FunctionS3Key`, `OutputBucketName`, `CreateOutputBucket`,
-`CreateExecutionRole`, `ExecutionRoleArn`); `MemorySize` and `Timeout` keep their
-template defaults and aren't surfaced as script variables.
+`ExecutionRoleName`); `MemorySize` and `Timeout` keep their template defaults
+and aren't surfaced as script variables.
 
 ## Examples
 
 ```bash
-# us-west-2, stack creates the role, output bucket already exists
+# us-west-2, output bucket already exists
 OUTPUT_BUCKET=my-results bash deployment/aws/stand_up.sh
 
 # Different region -- stage the zips into a bucket you own there first
 REGION=us-east-1 OUTPUT_BUCKET=my-results STAGING_BUCKET=my-stage \
   bash deployment/aws/stand_up.sh
 
-# IAM-constrained account: admin made the role, you deploy against it
-CREATE_ROLE=false ROLE_ARN=arn:aws:iam::123456789012:role/zagg-exec \
+# A second stack in the same account: the role name must not collide
+STACK_NAME=zagg-backend-test FUNCTION_NAME=process-shard-test \
+  EXECUTION_ROLE_NAME=zagg-lambda-execution-test \
   OUTPUT_BUCKET=my-results bash deployment/aws/stand_up.sh
 ```
 

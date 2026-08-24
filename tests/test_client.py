@@ -6,9 +6,11 @@ tests exercise the real payload construction, future resolution, error
 surfacing, and the worker-invoke post-run tail.
 """
 
+import copy
 import errno
 import importlib
 import json
+import re
 import sys
 import threading
 import time
@@ -229,6 +231,58 @@ class TestFromConfig:
             Run.from_config(cfg, shardmap=catalog, store=_STORE)
 
 
+class TestSubmissionValidation:
+    """A mutated ``PipelineConfig`` is cross-validated at the submission seam.
+
+    ``from_config`` used to validate only its dict and path inputs, so the
+    observed failure (issue #472) had nothing re-check the ``02_write`` graft:
+    ``default_config`` validated the hive base template, the notebook then
+    grafted ``atl03_tdigest_located_healpix``'s ``temporal:`` variables onto it
+    without ``output.time_source``, and the config error only surfaced one
+    Lambda invoke per shard later, in the worker's refusal.
+    """
+
+    def _graft(self):
+        base = default_config("atl03_tdigest_healpix_hive", validate=False)
+        located = default_config("atl03_tdigest_located_healpix", validate=False)
+        base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
+        return base, located
+
+    def test_grafted_config_refused_before_any_invoke(self, catalog):
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        cfg, _ = self._graft()
+        stub = StubLambdaClient()
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            Run.from_config(
+                cfg,
+                shardmap=catalog,
+                store=_STORE,
+                function_name="process-shard-test",
+                lambda_client=stub,
+                source_credentials=_CREDS,
+            )
+        assert stub.events == []  # refused at submission, nothing dispatched
+
+    def test_grafted_config_with_its_clock_constructs(self, catalog):
+        # Positive control: grafting the clock block and its column too is the
+        # correct form, and it still builds a Run (no false refusal).
+        cfg, located = self._graft()
+        cfg.output["time_source"] = dict(located.output["time_source"])
+        field = cfg.output["time_source"]["field"]
+        cfg.data_source["variables"][field] = located.data_source["variables"][field]
+        cfg.output["grid"] = dict(_ATL06_SIG)
+        run = Run.from_config(
+            cfg,
+            shardmap=catalog,
+            store=_STORE,
+            function_name="process-shard-test",
+            lambda_client=StubLambdaClient(),
+            source_credentials=_CREDS,
+        )
+        assert len(run) == 3
+
+
 # -- dispatch fan-out --------------------------------------------------------
 
 
@@ -283,6 +337,24 @@ class TestDispatch:
             "metadata": {"short_name": "ATL06", "version": "006"},
             "granules": [_rec(3)],
         }
+
+    def test_pairless_report_stays_out_of_the_cell_submap(self, catalog):
+        # The sibling join's exclusion report (issue #425) holds one entry per
+        # unpaired granule — unbounded in the catalog size — so it must not
+        # ride every cell event: it counts against the 256 KB async cap, whose
+        # only remedy is silently dropping the whole submap block, and
+        # ``write_leaf_submap`` strips it again on the way out anyway (review
+        # finding, PR #432).
+        catalog["metadata"]["pairless"] = [{"id": f"g{i}", "missing": "l2a"} for i in range(500)]
+        catalog["metadata"]["sibling_asset"] = "l2a"
+        stub = StubLambdaClient()
+        _run(catalog, client=stub).dispatch(shard_keys=[_WORDS[1]]).results()
+        (_, _, event) = stub.cell_events()[0]
+        meta = event["submap"]["metadata"]
+        assert "pairless" not in meta
+        # The small identity fields still ride along.
+        assert meta["sibling_asset"] == "l2a"
+        assert meta["short_name"] == "ATL06"
 
     def test_hive_setup_handshake_precedes_cells(self, catalog):
         stub = StubLambdaClient()
@@ -645,6 +717,30 @@ class TestRunnerParity:
         href = _rec(3)["s3"] if driver == "s3" else _rec(3)["https"]
         assert client_events[_WORDS[1]]["granule_urls"] == [href]
         assert agg_events[_WORDS[1]]["granule_urls"] == [href]
+
+    def test_paired_asset_entries_reach_both_paths(self, tmp_path, monkeypatch):
+        """A paired-asset map's sibling hrefs (issue #425) ride the facade's
+        cell events too: the agg path resolved through
+        ``_resolve_granule_entries`` while the client still resolved bare urls,
+        so every paired run would have failed on the missing sibling handle
+        (review finding, PR #432)."""
+        paired = _catalog_dict()
+        sib = {"id": "s4", "s3": "s3://bucket/s4.h5", "https": "https://h/s4.h5"}
+        paired["granules"] = [[{**_rec(4), "assets": {"l2a": sib}}], [_rec(3)], [_rec(1)]]
+        path = tmp_path / "paired.json"
+        path.write_text(json.dumps(paired))
+
+        agg_events = self._agg_cell_events(str(path), monkeypatch)
+        stub = StubLambdaClient()
+        _run(paired, client=stub).dispatch().results()
+        client_events = {e["shard_key"]: e for _, _, e in stub.cell_events()}
+
+        entry = {"url": _rec(4)["s3"], "assets": {"l2a": sib["s3"]}}
+        assert client_events[_WORDS[0]]["granule_urls"] == [entry]
+        assert agg_events[_WORDS[0]]["granule_urls"] == [entry]
+        # Single-asset cells stay plain url strings on both paths.
+        assert client_events[_WORDS[1]]["granule_urls"] == [_rec(3)["s3"]]
+        assert agg_events[_WORDS[1]]["granule_urls"] == [_rec(3)["s3"]]
 
 
 # -- dispatch manifest (issue #327 phase 2) ------------------------------------

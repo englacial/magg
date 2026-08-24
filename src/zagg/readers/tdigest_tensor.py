@@ -13,6 +13,9 @@ A ragged field is ONE ``variable_length_bytes`` array on the cell grid::
                                   bytes of its (n, *inner_shape) payload
     {group}/{field}_locations  <- located fields only (issue #87): the uint64
                                   per-row location words, row-aligned
+    {group}/{field}_times      <- temporal fields only (spec §8.3, issue #410):
+                                  the uint64 per-row toc words, row-aligned the
+                                  same way. Both shipped templates write it.
     {group}/morton             <- per-cell uint64 morton coordinate (zagg's
                                   standard HEALPix coordinate array)
 
@@ -21,11 +24,20 @@ The element interpretation is self-describing via the array attrs
 
     attrs["ragged"] = {"element": {"dtype": "float32", "shape": [-1, 2]},
                        "locations": "<sibling name>"}   # located fields only
+    attrs["times"] = "<sibling name>"                   # temporal fields only
 
 so the readers decode what the writer declared rather than hardcoding a dtype,
 and bind the location channel by metadata, not naming convention. A store
 without these attrs is not a zagg ragged vlen array (pre-issue-209 CSR stores
 are a hard break) and raises a pointed error.
+
+**No helper here binds the temporal channel yet.** :func:`read_locations` is the
+§9 counterpart and refuses a field by name when it declares no locations
+channel; :func:`read_raw_values` decodes a ``(n, 2)`` digest and cannot be
+pointed at a flat word vector. Until a ``times`` helper lands, a client decodes
+``{field}_times`` directly off its own ``ragged`` attrs and interprets the words
+with mortie (``toc_is_range``, ``toc2time``). Recorded here so this layout
+description matches what the shipped templates write.
 
 The read plan honors the layout the writer chose: a whole-store sweep LISTs the
 array's stored chunk objects (one object per shard under the ShardingCodec, or
@@ -80,7 +92,7 @@ import numpy as np
 import zarr
 from zarr.abc.store import Store
 
-from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC
+from zagg.grids.base import RAGGED_ELEMENT_ATTR, RAGGED_SPEC, weights_declaration
 from zagg.readers._layout import (
     normalize_subtree,
     rank_to_rowcol,
@@ -265,6 +277,13 @@ def _open_ragged(store: Store, field: str, zarr_format) -> tuple:
     readers decode by (never a hardcoded dtype). Raises a pointed error when
     the attrs are missing/malformed: silently guessing an element layout would
     misinterpret every payload (pre-issue-209 CSR stores are a hard break).
+
+    The sibling §2.0 ``weights`` declaration is strict-checked here too — the
+    reader is the party that spec sentence's MUST is addressed to, and this
+    is the seam gating the other spec markers. Both DEFINED values open:
+    what the readers bind of flux semantics is issue #426's read-validation
+    phase, and this only refuses the undefined ones (a future revision of
+    §2.0, which must never be read as either defined value).
     """
     arr = zarr.open_array(store, path=field, mode="r", zarr_format=zarr_format)
     raw_meta = arr.attrs.get(RAGGED_ELEMENT_ATTR)
@@ -286,6 +305,7 @@ def _open_ragged(store: Store, field: str, zarr_format) -> tuple:
             f"understands {RAGGED_SPEC!r} only — a newer writer's layout must be "
             f"adopted deliberately, not half-parsed"
         )
+    weights_declaration(dict(arr.attrs))  # §2.0: refuse an unknown declaration
     if arr.ndim != 1:
         raise ValueError(
             f"{field!r} has {arr.ndim} dimensions; the t-digest tensor readers "
@@ -695,6 +715,11 @@ def read_tensors(
         counts to the nearest integer; ``float32`` keeps fractional counts.  A
         per-bin count exceeding the dtype's max (65535 for ``uint16``) wraps on
         cast — keep ``uint32`` for dense cells with many observations per bin.
+        On a field declaring ``weights: "flux"`` (spec §2.0) the weights are
+        positive reals, not counts, so an integer dtype rounds each bin's
+        photoelectron estimate away — pass ``"float32"`` for a flux field.
+        (Rasterization does not otherwise bind flux semantics yet; the flux
+        read path is issue #426.)
     block_order : int, optional
         HEALPix order of the emitted blocks (default ``None`` — one block per
         read chunk). Must be at or coarser than the chunk order; a block is
@@ -761,7 +786,9 @@ def read_tensors(
     ------
     ValueError
         On an unknown ``dtype``/``fit``, a store missing the ragged element
-        attrs or the ``morton`` sibling, an out-of-range ``block_order``, a
+        attrs or the ``morton`` sibling, a payload declaring a §2.0
+        ``weights`` value this zagg does not define, an out-of-range
+        ``block_order``, a
         block tensor over ``max_block_bytes``, a corrupt/misaligned occupancy
         sidecar, a ``subtree`` finer than the read chunks (or malformed /
         too-deep), or (with ``fit="raise"``) a block whose trimmed range

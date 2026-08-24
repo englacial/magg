@@ -47,6 +47,17 @@ class ProcessingMetadata(TypedDict):
     # group of it was read. Warn-and-continue like ``read_errors``, but a
     # different diagnosis, hence a separate counter. Present only when non-zero.
     granule_errors: NotRequired[int]
+    # Count of read failures that are DEFINITELY credentials-shaped (issue
+    # #449): a botocore 401/403, or a denial token in the exception text. A
+    # subset of ``read_errors``/``granule_errors``, split out because the
+    # diagnosis inverts — a denied read is a CONFIGURATION fault (wrong
+    # ``data_source.credentials_provider`` for the DAAC hosting the product),
+    # so retrying the shard just burns another invoke. Present only when
+    # non-zero, INCLUDING when the shard still produced data (a partially
+    # denied read is a partial product — the run summary warns on that case).
+    # The ambiguous empty-body shape is deliberately not counted here; it is a
+    # hint in ``error`` instead (fold review — see ``is_empty_body_failure``).
+    auth_errors: NotRequired[int]
     # First N distinct read exception messages, truncated (issue #341): the
     # bounded diagnosis payload for ``read_errors``/``granule_errors`` — present
     # exactly when either is. Messages only; tracebacks stay in the worker log.

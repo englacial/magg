@@ -445,6 +445,32 @@ def _open_fixture():
     return h5c.H5Coro(str(FIXTURE_H5), filedriver.FileDriver, errorChecking=True, verbose=False)
 
 
+def _open_fixture_small_lines(counting=False):
+    """Fixture handle with tiny (512-byte) cache lines, for the issue #460
+    eviction tests: at the default 4 MiB line the whole 86 KB fixture is one
+    cache line, so walk-added and pre-existing keys are indistinguishable; at
+    512 bytes the B-tree node lands on its own line(s), outside the
+    object-header metadata lines. ``counting=True`` wraps the driver so each
+    ranged read is counted (``h5obj.driver.reads``)."""
+    from h5coro import filedriver
+    from h5coro import h5coro as h5c
+
+    driver = filedriver.FileDriver
+    if counting:
+
+        class _CountingFileDriver(filedriver.FileDriver):
+            def __init__(self, resource, credentials):
+                super().__init__(resource, credentials)
+                self.reads = 0
+
+            def read(self, pos, size):
+                self.reads += 1
+                return super().read(pos, size)
+
+        driver = _CountingFileDriver
+    return h5c.H5Coro(str(FIXTURE_H5), driver, errorChecking=True, verbose=False, cacheLineSize=512)
+
+
 def _fixture_data_source(**extra):
     """ATL03-shaped hierarchical data_source over the fixture (mirrors the
     shipped atl03.yaml: photon base level, segment spatial index, TEP filter)."""
@@ -579,6 +605,237 @@ class TestChunkMap:
         assert not cm.starts_on_boundary(255)
         assert not cm.starts_on_boundary(257)
         assert not cm.starts_on_boundary(2432)  # dataset end, not a chunk start
+
+
+class TestChunkMapCacheEviction:
+    """Issue #460: the B-tree walk must not strand h5coro cache lines.
+
+    ``H5Coro.cache`` keeps a full cache line per touched byte range until
+    granule close; on sparse files (GEDI L1B) the walk's node lines stranded
+    ~4 MiB per chunk B-tree node (+531 MB per beam group). ``build_chunk_map``
+    now snapshots the cache keys after the object-header parse and evicts
+    every key the walk added.
+    """
+
+    PATH = "/gt1l/heights/h_ph"
+
+    def _unevicted_reference(self):
+        """Parse + raw (unevicted) walk on a fresh handle: returns the handle's
+        parse-line keys, the walk-added keys, and the resulting map."""
+        from h5coro.h5dataset import H5Dataset
+
+        from zagg.index.inline import _chunk_map_from_dataset
+
+        ref = _open_fixture_small_lines()
+        ds = H5Dataset(ref, self.PATH, earlyExit=True, metaOnly=True, enableAttributes=False)
+        parse_lines = set(ref.cache)
+        cm = _chunk_map_from_dataset(ref, ds, self.PATH)
+        walk_lines = set(ref.cache) - parse_lines
+        return parse_lines, walk_lines, cm
+
+    def test_walk_lines_evicted_preexisting_lines_survive(self):
+        h5obj = _open_fixture_small_lines()
+        pre = set(h5obj.cache)  # the open's superblock/root lines
+        assert pre
+        build_chunk_map(h5obj, self.PATH)
+        post = set(h5obj.cache)
+        assert pre <= post  # pre-existing lines are never evicted
+        parse_lines, walk_lines, _ = self._unevicted_reference()
+        assert walk_lines  # the fixture's B-tree node lives outside the metadata lines
+        assert post == parse_lines  # exactly the parse's lines are retained...
+        assert not post & walk_lines  # ...and none of the walk's
+
+    def test_map_identical_to_unevicted_walk(self):
+        cm = build_chunk_map(_open_fixture_small_lines(), self.PATH)
+        _, _, ref = self._unevicted_reference()
+        assert cm.raw == ref.raw
+        for f in ("elem_start", "elem_end", "byte_offset", "nbytes", "filter_mask"):
+            assert getattr(cm, f).tolist() == getattr(ref, f).tolist()
+        assert (cm.dims, cm.chunk_dims, cm.dtype, cm.gzip, cm.shuffle) == (
+            ref.dims,
+            ref.chunk_dims,
+            ref.dtype,
+            ref.gzip,
+            ref.shuffle,
+        )
+
+    def test_rebuild_refetches_only_the_walk_lines(self):
+        # The eviction's whole cost: a rebuild re-fetches the walk's lines
+        # (the parse's lines stayed cached), nothing else.
+        h5obj = _open_fixture_small_lines(counting=True)
+        first = build_chunk_map(h5obj, self.PATH)
+        r1 = h5obj.driver.reads
+        second = build_chunk_map(h5obj, self.PATH)
+        _, walk_lines, _ = self._unevicted_reference()
+        assert h5obj.driver.reads - r1 == len(walk_lines)
+        assert second.raw == first.raw
+
+    def test_cache_less_handle_is_a_noop(self):
+        from zagg.index.inline import _cache_keys, _evict_new_cache_lines
+
+        assert _cache_keys(object()) == set()
+        assert _evict_new_cache_lines(object(), set()) == 0
+
+    def test_cache_stays_flat_across_repeated_builds(self):
+        # Issue #460 phase 3 guard: N successive build_chunk_map calls leave
+        # len(h5obj.cache) flat. The leak this pins against was ~a cache line
+        # per B-tree node per build, retained until granule close. The lock
+        # table is pinned too (review finding on PR #462): cache_locks is a
+        # defaultdict keyed by the same offsets, so an eviction that left it
+        # alone kept a Lock + dict slot per line ever touched.
+        h5obj = _open_fixture_small_lines()
+        paths = ("/gt1l/heights/h_ph", "/gt1l/heights/lat_ph", "/gt1l/heights/signal_conf_ph")
+        for p in paths:  # first round warms the shared object-header lines
+            build_chunk_map(h5obj, p)
+        baseline, baseline_locks = len(h5obj.cache), len(h5obj.cache_locks)
+        assert baseline_locks  # the walks really did populate the lock table
+        for _ in range(5):
+            for p in paths:
+                build_chunk_map(h5obj, p)
+            assert len(h5obj.cache) == baseline
+            assert len(h5obj.cache_locks) == baseline_locks
+        # The counts alone are weak (a rebuild re-fetches the same offsets, so
+        # even an unpruned lock table stays flat across identical builds): pin
+        # that no evicted line is still holding a lock.
+        _, walk_lines, _ = self._unevicted_reference()
+        assert walk_lines and not walk_lines & set(h5obj.cache_locks)
+        assert set(h5obj.cache_locks) <= set(h5obj.cache)
+
+    def test_pooled_read_fn_defers_eviction_under_concurrency(self):
+        # Review finding on PR #462: read_fn's lazy map builds run across
+        # ``read_workers`` threads sharing one h5obj (_read_paths_pooled), and
+        # h5coro's cached ioRequest reads ``self.cache`` OUTSIDE cache_locks --
+        # so evicting there raced concurrent readDatasets (KeyError inside
+        # ioRequest, or a silently degraded H5Promise parse). read_fn now only
+        # records its lines; read_group drops them after the pool joins. This
+        # drives the real seam: read_fn hyperslices concurrently with plain
+        # readDatasets on one handle, with the switch interval tightened.
+        import sys
+        import threading
+        import time
+
+        from zagg.index.inline import _evict_deferred_lines
+
+        mapped = [f"/gt1l/heights/{n}" for n in ("h_ph", "lat_ph", "lon_ph", "delta_time")]
+        other = [f"/gt2l/heights/{n}" for n in ("h_ph", "lat_ph", "lon_ph", "delta_time")]
+        lo, hi = 300, 1500  # spans several 256-photon chunks, not chunk-aligned
+        ref = _open_fixture()
+        expect = {p: ref.readDatasets([p])[p] for p in mapped + other}
+
+        h5obj = _open_fixture_small_lines()
+        errors: list = []
+        deferred_seen: set = set()
+
+        def mapped_read(read_fn, path):
+            try:
+                got = read_fn(path, hyperslice=[(lo, hi)])
+                assert np.array_equal(got, expect[path][lo:hi]), path
+            except Exception as exc:
+                errors.append((path, repr(exc)))
+
+        def direct_read(path):
+            try:
+                assert np.array_equal(h5obj.readDatasets([path])[path], expect[path]), path
+            except Exception as exc:
+                errors.append((path, repr(exc)))
+
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-7)
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not errors:
+                # A fresh read_fn per round: its map cache starts empty, so the
+                # lazy builds (and their deferred lines) happen again.
+                read_fn = InlineIndex()._chunk_aligned_read_fn(h5obj, planned=True)
+                threads = [threading.Thread(target=mapped_read, args=(read_fn, p)) for p in mapped]
+                threads += [threading.Thread(target=direct_read, args=(p,)) for p in other]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                # Single-threaded again -- the point read_group evicts at.
+                lines = set(read_fn.deferred_lines)
+                deferred_seen |= lines
+                _evict_deferred_lines(h5obj, read_fn.deferred_lines)
+                assert not lines & set(h5obj.cache)  # every deferred line dropped
+        finally:
+            sys.setswitchinterval(interval)
+        assert not errors
+        assert deferred_seen  # the walks really did strand lines to evict
+
+    def test_read_group_drains_deferred_lines_on_the_planned_route(self, monkeypatch):
+        # Review finding on PR #462: nothing exercised ``read_group``'s
+        # ``finally`` drains, so removing them kept the suite green while
+        # restoring the full issue #460 leak (worse than pre-PR: the lazy builds
+        # now only RECORD their lines). Reference arm = the identical read with
+        # the drain neutralized; the discriminator is the scale-free strict
+        # subset, not a count.
+        import zagg.index.inline as inline_mod
+
+        ds = _fixture_data_source()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        h5obj = _open_fixture_small_lines()
+        df = InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid)
+
+        ref = _open_fixture_small_lines()
+        monkeypatch.setattr(inline_mod, "_evict_deferred_lines", lambda h5obj, deferred: 0)
+        df_ref = InlineIndex().read_group(ref, "gt1l", ds, 1, grid)
+
+        assert df is not None and len(df) > 0
+        pd.testing.assert_frame_equal(df, df_ref)  # the drain changes no output...
+        assert set(h5obj.cache) < set(ref.cache)  # ...and really does drop lines
+
+    def test_read_group_drains_deferred_lines_on_the_vlen_route(self, monkeypatch):
+        # The vlen dispatch (``coordinates.level`` set) is read_group's FIRST
+        # arm and the route issue #460 was filed against (GEDI L1B), yet no test
+        # reached its drain (review finding on PR #462). Stub the route itself so
+        # this stays a ~ms unit test of the dispatch: the stub does one read that
+        # forces a lazy map build (hence deferred lines), and by the time
+        # read_group returns the drain must have dropped them.
+        import zagg.processing.read_vlen as read_vlen_mod
+
+        seen: dict = {}
+
+        def stub(h5obj, group, data_source, shard_key, grid, *, read_fn=None, **kw):
+            read_fn(self.PATH, hyperslice=[(0, 10)])
+            seen["deferred"] = set(read_fn.deferred_lines)
+            return None
+
+        monkeypatch.setattr(read_vlen_mod, "_vlen_read_group", stub)
+        ds = _fixture_data_source()
+        ds["coordinates"] = dict(ds["coordinates"], level="segments")
+        h5obj = _open_fixture_small_lines()
+        grid = _LeafSetGrid(_UNALIGNED_LEAVES)
+        assert InlineIndex().read_group(h5obj, "gt1l", ds, 1, grid) is None
+        _, walk_lines, _ = self._unevicted_reference()
+        assert walk_lines and seen["deferred"] >= walk_lines  # deferred, not evicted...
+        assert not walk_lines & set(h5obj.cache)  # ...then drained by the finally
+
+    def test_lines_touched_logged_at_debug(self, caplog):
+        # Issue #460 phase 3: each map build reports the walk's cache-line
+        # footprint at DEBUG, so a pathological granule is visible in logs.
+        h5obj = _open_fixture_small_lines()
+        with caplog.at_level("DEBUG", logger="zagg.index.inline"):
+            build_chunk_map(h5obj, self.PATH)
+        assert any(
+            "cache line" in r.message and self.PATH in r.message and "evicted" in r.message
+            for r in caplog.records
+        )
+
+    def test_deferred_lines_touched_logged_at_debug(self, caplog):
+        # Review finding on PR #462: the counter above only fires on the
+        # IMMEDIATE branch, which production never takes with ``write_back`` off
+        # (the shipped default) -- every default-config build defers. Drive the
+        # real seam (a read_fn lazy build) and pin the per-path record there too,
+        # so the group-level aggregate is not the only attribution.
+        h5obj = _open_fixture_small_lines()
+        read_fn = InlineIndex()._chunk_aligned_read_fn(h5obj, planned=True)
+        with caplog.at_level("DEBUG", logger="zagg.index.inline"):
+            read_fn(self.PATH, hyperslice=[(300, 1500)])
+        assert any(
+            "cache line" in r.message and self.PATH in r.message and "deferred" in r.message
+            for r in caplog.records
+        )
 
 
 class TestInlineReadGroup:
@@ -912,9 +1169,9 @@ class TestSelectionReads:
         built = []
         orig = inline_mod.build_chunk_map
 
-        def spy(h5obj, path):
+        def spy(h5obj, path, **kwargs):  # kwargs: evict_into (issue #460)
             built.append(path)
-            return orig(h5obj, path)
+            return orig(h5obj, path, **kwargs)
 
         monkeypatch.setattr(inline_mod, "build_chunk_map", spy)
         return built
@@ -1510,6 +1767,49 @@ class TestFullCoverageWalk:
         assert "/gt1l/heights/h_ph" in maps  # everything else covered
         assert "/gt2l/heights/lat_ph" in maps
         assert any("boom" in r.message for r in caplog.records)
+
+    def test_full_coverage_walk_evicts_its_cache_lines(self, monkeypatch):
+        # Issue #460 phase 2: the full-coverage walk maps EVERY dataset in the
+        # granule, so unevicted it accumulates walk lines worst of all. After
+        # the walk only pre-existing lines plus the enumeration's own
+        # object-header/metadata lines remain resident -- and eviction changes
+        # no map (identical to a walk with eviction disabled).
+        import zagg.index.inline as inline_mod
+        from zagg.index.inline import full_granule_maps
+
+        h5obj = _open_fixture_small_lines()
+        read = {"/gt1l/heights/h_ph": build_chunk_map(h5obj, "/gt1l/heights/h_ph")}
+        pre = set(h5obj.cache)
+        maps = full_granule_maps(h5obj, read)
+        assert pre <= set(h5obj.cache)  # pre-existing lines survive
+
+        # Reference arm: the identical read sequence with eviction off.
+        ref = _open_fixture_small_lines()
+        monkeypatch.setattr(inline_mod, "_evict_new_cache_lines", lambda *a: 0)
+        read_ref = {"/gt1l/heights/h_ph": build_chunk_map(ref, "/gt1l/heights/h_ph")}
+        maps_ref = full_granule_maps(ref, read_ref)
+        # Eviction actually removed the walks' lines...
+        assert set(h5obj.cache) < set(ref.cache)
+        # ...and this is the many-distinct-datasets shape the GEDI residual
+        # lives in (review finding on PR #462): with the whole granule mapped,
+        # residency tracks the parses' object-header lines (a couple per
+        # dataset at the fixture's 512-B lines) and NOT the walks' per-B-tree-
+        # node lines. On GEDI L1B at the 4 MiB default those headers co-locate:
+        # 11 lines / 46 MB resident per beam group, 90 distinct lines touched.
+        assert len(maps) > 20  # every dataset in the granule, not just one
+        # Pin the WALK's lines directly rather than a count bound: a magic
+        # lines-per-dataset factor sat five lines from flipping either way on
+        # this fixture, and was carried by parse lines, not walk lines (second
+        # review finding on PR #462). These keys are scale-free -- the walk
+        # lines of a known dataset, present in the unevicted arm and gone here.
+        _, walk_lines, _ = TestChunkMapCacheEviction()._unevicted_reference()
+        assert walk_lines <= set(ref.cache)  # the unevicted arm strands them...
+        assert not walk_lines & set(h5obj.cache)  # ...and eviction dropped them
+        # ...and altered no map.
+        assert set(maps) == set(maps_ref)
+        for p in maps:
+            a, b = maps[p], maps_ref[p]
+            assert a.raw == b.raw and a.dtype == b.dtype and a.dims == b.dims
 
 
 class TestInlineInterleavedGranules:

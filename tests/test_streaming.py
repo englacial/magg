@@ -66,27 +66,55 @@ class TestStreamingConfig:
         assert get_streaming(_config()) is None
 
     def test_block_defaults_buffer(self):
-        assert get_streaming(_config(streaming={})) == {"buffer_granules": 50, "mode": "merge"}
+        # 20 since issue #474 (was 50): the pre-flush buffer is the
+        # obs-proportional resident term that OOM'd fat shards.
+        assert get_streaming(_config(streaming={})) == {
+            "buffer_granules": 20,
+            "mode": "merge",
+            "block_bytes": None,
+        }
 
     def test_explicit_buffer(self):
         assert get_streaming(_config(streaming={"buffer_granules": 7})) == {
             "buffer_granules": 7,
             "mode": "merge",
+            "block_bytes": None,
         }
 
-    @pytest.mark.parametrize(
-        "key", ["state_layout", "arena_backing", "block_bytes", "buffer_granuels"]
-    )
+    def test_explicit_block_bytes(self):
+        # issue #474: the fold-regime threshold is reachable from config.
+        assert get_streaming(_config(streaming={"mode": "spill", "block_bytes": 1 << 30})) == {
+            "buffer_granules": 20,
+            "mode": "spill",
+            "block_bytes": 1 << 30,
+        }
+
+    @pytest.mark.parametrize("key", ["state_layout", "arena_backing", "buffer_granuels"])
     def test_unknown_keys_rejected(self, key):
         # The removed #260 arena knobs (and any typo) must fail loudly, not
-        # silently run the dict path (#239 discipline).
-        with pytest.raises(ValueError, match="unknown key"):
+        # silently run the dict path (#239 discipline). The refusal names the
+        # full grammar, block_bytes included (issue #474).
+        with pytest.raises(ValueError, match="buffer_granules, mode and block_bytes"):
             get_streaming(_config(streaming={key: "arena"}))
 
-    @pytest.mark.parametrize("bad", [0, -1, "50", 2.5])
+    # True/False are the bool arm: bool subclasses int, so a YAML `true` (or
+    # `yes`/`on`, which PyYAML also resolves to booleans) would otherwise
+    # validate and run as 1 — a 1-byte block closes on every flush.
+    @pytest.mark.parametrize("bad", [0, -1, "50", 2.5, True, False])
     def test_bad_buffer_raises(self, bad):
         with pytest.raises(ValueError, match="buffer_granules"):
             get_streaming(_config(streaming={"buffer_granules": bad}))
+
+    @pytest.mark.parametrize("bad", [0, -1, "1048576", 2.5, True, False])
+    def test_bad_block_bytes_raises(self, bad):
+        with pytest.raises(ValueError, match="block_bytes"):
+            get_streaming(_config(streaming={"mode": "spill", "block_bytes": bad}))
+
+    def test_block_bytes_requires_spill_mode(self):
+        # Merge mode has no spill blocks; a silently-ignored knob is the #239
+        # failure mode.
+        with pytest.raises(ValueError, match="only applies to mode: spill"):
+            get_streaming(_config(streaming={"block_bytes": 1 << 20}))
 
     def test_non_mapping_block_raises(self):
         with pytest.raises(ValueError, match="mapping"):
@@ -402,6 +430,15 @@ class TestStreamingOccupied:
             occ[label] = np.concatenate(sink) if sink else np.empty(0, dtype=np.uint64)
         assert occ["merge"].size > 0
         np.testing.assert_array_equal(np.sort(occ["merge"]), np.sort(occ["pooled"]))
+
+
+class TestDeclaredDeltaPropagation:
+    """Issue #424: streaming folds honor the field's declared δ, not the default."""
+
+    def test_streaming_state_carries_the_declared_delta(self):
+        cfg = _config(streaming={"buffer_granules": 2}, delta=8192)
+        agg = StreamingAggregator(cfg, _grid(cfg), "pandas", 2)
+        assert agg._digest_fields["h_tdigest"] == ("h_ph", 8192)
 
 
 class TestStreamingReviewFolds:

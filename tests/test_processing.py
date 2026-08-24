@@ -18,16 +18,20 @@ from zagg.processing import (
     _concat_and_group,
     _empty_cell_value,
     _eval_chunk_precompute,
+    _expand_mask_at_rows,
     _expand_mask_to_base,
+    _gather_segment_at_rows,
     _group_columns,
     _has_ragged_fields,
     _has_vector_fields,
     _iter_carrier_columns,
+    _link_parent_at_rows,
     _predicate_mask,
     _read_group,
     _read_segment_broadcasts,
     _segment_level_variables,
     calculate_cell_statistics,
+    link_base_extent,
     process_shard,
     write_dataframe_to_zarr,
     write_ragged_to_zarr,
@@ -1815,6 +1819,529 @@ class TestRaggedWriteGuards:
         ragged = {"h_raw": ([np.ones(3, np.float32)], [0])}
         with pytest.raises(ValueError, match="does not tile inner_shape"):
             write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(inner=2), chunk_idx=(0,))
+
+
+class TestTemporalCompanionSeams:
+    """Spec §8.2/§8.3/§9 declaration + write seams (issue #410).
+
+    Declaration-only: the words here are handed to the writer, because the
+    kernel that PRODUCES them is the follow-on PR. What is pinned is the
+    template's spec-owned stamping and the sibling's row alignment.
+    """
+
+    @staticmethod
+    def _cfg():
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={"groups": ["g"]},
+            aggregation={
+                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+                "variables": {
+                    "h_tdigest": {
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [2],
+                        "location": "leaf_id",
+                        "temporal": "per-centroid",
+                        "dtype": "float32",
+                    },
+                    "observed": {
+                        "function": "nanmax",
+                        "source": "h_li",
+                        "dtype": "uint64",
+                        "fill_value": 0,
+                        "temporal": "per-cell",
+                    },
+                },
+            },
+        )
+
+    def _grid(self):
+        return HealpixGrid(6, 8, layout="fullsphere", config=self._cfg())
+
+    def test_template_stamps_the_declarations_on_the_word_arrays(self):
+        import zarr
+        from zarr.storage import MemoryStore
+
+        from zagg.grids.base import located_declaration
+        from zagg.time_axis import temporal_declaration
+
+        grid = self._grid()
+        store = MemoryStore()
+        grid.emit_template(store)
+
+        def attrs(name):
+            return dict(zarr.open_array(store, path=f"{grid.group_path}/{name}", mode="r").attrs)
+
+        # The payload carries the BINDING, never a declaration (§8.3) — and
+        # the binding is a sibling key, outside the versioned ragged block.
+        payload = attrs("h_tdigest")
+        assert payload["times"] == "h_tdigest_times"
+        assert "times" not in payload["ragged"]
+        assert "temporal" not in payload and "located" not in payload
+        # Each companion declares the words IT holds.
+        assert temporal_declaration(attrs("h_tdigest_times")) == {
+            "spec": "zagg-toc/1",
+            "shape": "per-centroid",
+            "grammar": "mortie-toc/1",
+        }
+        assert temporal_declaration(attrs("observed")) == {
+            "spec": "zagg-toc/1",
+            "shape": "per-cell",
+            "grammar": "mortie-toc/1",
+        }
+        assert located_declaration(attrs("h_tdigest_locations")) == {
+            "spec": "zagg-located/1",
+            "shape": "per-centroid",
+            "grammar": "mortie-morton/1",
+        }
+        # §8.2: the dense companion is uint64 with the reserved fill.
+        observed = zarr.open_array(store, path=f"{grid.group_path}/observed", mode="r")
+        assert observed.dtype == np.uint64 and int(observed.fill_value) == 0
+
+    def test_absent_per_cell_fill_dies_in_zarr_which_is_why_config_refuses_it(self):
+        # The template half of the §8.2 fill contract. The dense default is
+        # "NaN" (grids/healpix.py, grids/rectilinear.py), so an absent
+        # fill_value reaches zarr as a NaN on a uint64 array and raises a
+        # bare TypeError with nothing about §8.2 in it. That is exactly why
+        # config validation requires the key instead of defaulting it —
+        # test_config.TestTemporalShapeDeclaration pins the message users see.
+        from zarr.storage import MemoryStore
+
+        cfg = self._cfg()
+        del cfg.aggregation["variables"]["observed"]["fill_value"]
+        with pytest.raises(TypeError, match="NaN"):
+            HealpixGrid(6, 8, layout="fullsphere", config=cfg).emit_template(MemoryStore())
+
+    def test_undeclared_field_stamps_nothing(self):
+        # The absent-key rule is a template property too: a field that
+        # declares no companion emits byte-identical attrs to pre-#410.
+        import zarr
+        from zarr.storage import MemoryStore
+
+        cfg = self._cfg()
+        del cfg.aggregation["variables"]["h_tdigest"]["temporal"]
+        del cfg.aggregation["variables"]["observed"]
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        store = MemoryStore()
+        grid.emit_template(store)
+        payload = dict(zarr.open_array(store, path=f"{grid.group_path}/h_tdigest", mode="r").attrs)
+        assert set(payload) == {"ragged"}
+        assert f"{grid.group_path}/h_tdigest_times/zarr.json" not in list(store._store_dict)
+
+    def test_write_fills_both_sibling_channels_row_aligned(self):
+        import zarr
+        from zarr.storage import MemoryStore
+
+        grid = self._grid()
+        store = MemoryStore()
+        grid.emit_template(store)
+        payloads = [np.array([[1.0, 1.0], [2.0, 3.0]], np.float32)]
+        locs = [np.array([11, 12], np.uint64)]
+        times = [np.array([2**31 + 5, 7], np.uint64)]
+        write_ragged_to_zarr(
+            {"h_tdigest": (payloads, [0], locs, times)},
+            store,
+            grid=grid,
+            chunk_idx=(0,),
+        )
+        stored = {}
+        for name in ("h_tdigest", "h_tdigest_locations", "h_tdigest_times"):
+            stored[name] = zarr.open_array(store, path=f"{grid.group_path}/{name}", mode="r")[0:1][
+                0
+            ]
+        rows = len(np.frombuffer(stored["h_tdigest"], "<f4")) // 2
+        for name, want in (("h_tdigest_locations", locs[0]), ("h_tdigest_times", times[0])):
+            got = np.frombuffer(stored[name], "<u8")
+            assert len(got) == rows
+            np.testing.assert_array_equal(got, want)
+
+    def test_times_values_length_mismatch_raises(self):
+        ragged = {
+            "h_tdigest": (
+                [np.ones((1, 2), np.float32)],
+                [0],
+                None,
+                [np.array([1], np.uint64), np.array([2], np.uint64)],
+            )
+        }
+        with pytest.raises(ValueError, match="times_list .* must have the same length"):
+            write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(), chunk_idx=(0,))
+
+    def test_per_cell_time_misalignment_raises(self):
+        # 2 payload rows vs 3 words: the channels would de-align in the store.
+        ragged = {
+            "h_tdigest": (
+                [np.ones((2, 2), np.float32)],
+                [0],
+                None,
+                [np.arange(3, dtype=np.uint64)],
+            )
+        }
+        with pytest.raises(ValueError, match=r"expected \(2,\) to stay row-aligned"):
+            write_ragged_to_zarr(ragged, MemoryStore(), grid=self._grid(), chunk_idx=(0,))
+
+
+class TestTemporalCompanionProduction:
+    """The §8.2/§8.3 companions as the AGGREGATION produces them (issue #410).
+
+    The seam tests above pin the template and the writer over handed-in words;
+    these pin the words themselves — one conversion (``output.time_source`` ->
+    the derived ``toc_word`` column) feeding both companion shapes.
+    """
+
+    EPOCH = "2018-01-01T00:00:00"
+
+    @staticmethod
+    def _cfg(**overrides):
+        from zagg.config import PipelineConfig
+
+        return PipelineConfig(
+            data_source={
+                "groups": ["g"],
+                "variables": {"h_li": "{group}/h_li", "delta_time": "{group}/delta_time"},
+            },
+            aggregation={
+                "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+                "variables": {
+                    "h_tdigest": {
+                        "function": "zagg.stats.tdigest.build_tdigest",
+                        "source": "h_li",
+                        "kind": "ragged",
+                        "inner_shape": [2],
+                        "location": "leaf_id",
+                        "temporal": "per-centroid",
+                        "dtype": "float32",
+                        "params": {"delta": 16},
+                    },
+                    "observed": {
+                        "function": "zagg.stats.toc.cell_envelope",
+                        "source": "toc_word",
+                        "dtype": "uint64",
+                        "fill_value": 0,
+                        "temporal": "per-cell",
+                    },
+                    **overrides,
+                },
+            },
+            output={
+                "time_source": {
+                    "field": "delta_time",
+                    "epoch": "2018-01-01T00:00:00",
+                    "scale": "gps",
+                    "units": "seconds",
+                }
+            },
+        )
+
+    def _cell(self, n=200, spread=1e-4):
+        from conftest import point_words
+
+        rng = np.random.default_rng(410)
+        h = rng.normal(30.0, 5.0, n)
+        return {
+            "h_li": h,
+            "delta_time": 3.0 * np.arange(n, dtype=np.float64),
+            # The default jitter keeps every point in one cell; a wider spread
+            # populates several, for the multi-chunk shapes below.
+            "leaf_id": point_words(n, seed=7, spread=spread),
+        }
+
+    def test_the_config_validates(self):
+        from zagg.config import validate_config
+
+        cfg = self._cfg()
+        cfg.output["grid"] = {"type": "healpix", "parent_order": 6, "child_order": 12}
+        validate_config(cfg)
+
+    def test_both_shapes_come_out_of_one_conversion(self):
+        import mortie
+
+        from zagg.stats.toc import cell_envelope
+        from zagg.time_axis import observation_words
+
+        cell = self._cell()
+        stats = calculate_cell_statistics(cell, config=self._cfg())
+        digest, locs, times = stats["h_tdigest"]
+        expected_obs = observation_words(
+            cell["delta_time"], epoch=self.EPOCH, scale="gps", units="seconds"
+        )
+        # §8.4's licensed reduction: the per-cell word IS the envelope of the
+        # per-centroid words, and equally of the raw observations.
+        assert int(stats["observed"]) == int(cell_envelope(expected_obs))
+        assert int(cell_envelope(times)) == int(cell_envelope(expected_obs))
+        assert len(times) == len(digest) == len(locs)
+        assert times.dtype == np.uint64
+        assert mortie.toc_is_range(times).any(), "a compressed digest must produce ranges"
+
+    def test_per_centroid_words_contain_their_members(self):
+        # The words are value-ordered (§8.3), and the fixture's times rise with
+        # the observation index, so verify containment through the digest's own
+        # weights rather than assuming a run order: every stored word's envelope
+        # must lie inside the cell's whole envelope, and the join over them must
+        # equal it exactly.
+        import mortie
+
+        from zagg.stats.toc import cell_envelope
+        from zagg.time_axis import observation_words
+
+        cell = self._cell()
+        _, _, times = calculate_cell_statistics(cell, config=self._cfg())["h_tdigest"]
+        whole = np.array([int(cell_envelope(times))], dtype=np.uint64)
+        lo, hi = (int(b[0]) for b in mortie.toc2time(whole))
+        obs = mortie.toc2time(
+            observation_words(cell["delta_time"], epoch=self.EPOCH, scale="gps", units="seconds")
+        )[0]
+        assert lo <= int(obs.min()) and int(obs.max()) < hi
+        starts, ends = mortie.toc2time(times)
+        assert int(starts.min()) >= lo and int(ends.max()) <= hi
+
+    def test_empty_cell_keeps_the_channel_arity(self):
+        # A companion-carrying field's contract is ``(payload, *channels)`` even
+        # for an empty cell, so a direct caller always unpacks one shape.
+        stats = calculate_cell_statistics({"h_li": np.array([])}, config=self._cfg())
+        digest, locs, times = stats["h_tdigest"]
+        assert digest.shape == (0, 2)
+        assert locs.shape == times.shape == (0,)
+        assert locs.dtype == times.dtype == np.uint64
+
+    def test_temporal_only_field_needs_no_location(self):
+        cfg = self._cfg()
+        del cfg.aggregation["variables"]["h_tdigest"]["location"]
+        payload, times = calculate_cell_statistics(self._cell(), config=cfg)["h_tdigest"]
+        assert len(times) == len(payload) and times.dtype == np.uint64
+
+    def test_the_words_track_the_declared_clock_not_the_field_source(self):
+        # Shifting the declared epoch moves every word; touching the digest's
+        # own source column does not. One clock, declared in one place.
+        cell = self._cell(50)
+        base = calculate_cell_statistics(cell, config=self._cfg())["h_tdigest"][2]
+        cfg = self._cfg()
+        cfg.output["time_source"]["epoch"] = "2019-01-01T00:00:00"
+        moved = calculate_cell_statistics(cell, config=cfg)["h_tdigest"][2]
+        assert not np.array_equal(base, moved)
+
+    def test_missing_clock_column_names_itself(self):
+        cell = self._cell(10)
+        del cell["delta_time"]
+        with pytest.raises(ValueError, match="output.time_source.field 'delta_time' is not"):
+            calculate_cell_statistics(cell, config=self._cfg())
+
+    def test_undeclared_clock_refused_at_the_reducer_too(self):
+        # Config validation is the front door, but a config built without it
+        # must still fail loudly rather than write an empty companion.
+        cfg = self._cfg()
+        del cfg.output["time_source"]
+        with pytest.raises(ValueError, match="no per-observation clock"):
+            calculate_cell_statistics(self._cell(10), config=cfg)
+
+    def test_chunk_cells_collects_both_channels(self):
+        from zagg.processing.aggregate import _aggregate_chunk_cells, _group_columns
+        from zagg.processing.write import _channel_entry
+
+        cfg = self._cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        cell = self._cell(60)
+        cells = grid.cells_of(cell["leaf_id"])
+        children = np.unique(cells)
+        cols, cell_to_slice = _group_columns(dict(cell), cells)
+        _, payloads, idx, channels, _ = _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], get_agg_fields(cfg)
+        )
+        assert list(channels["h_tdigest"]) == ["locations", "times"]
+        for words in channels["h_tdigest"].values():
+            assert len(words) == len(payloads["h_tdigest"]) == len(idx)
+        # The sink entry the worker builds from it: (payloads, cells, locs, times).
+        entry = (payloads["h_tdigest"], idx, *_channel_entry(channels["h_tdigest"]))
+        assert len(entry) == 4
+
+    def test_channel_entry_arities(self):
+        from zagg.processing.write import _channel_entry, _ragged_entry
+
+        assert _channel_entry({}) == ()
+        assert len(_channel_entry({"locations": [1]})) == 1
+        # A temporal-only field gets an explicit None location slot, which
+        # ``_ragged_entry`` already reads as "no location channel".
+        slots = _channel_entry({"times": [1]})
+        assert slots == (None, [1])
+        assert _ragged_entry((["v"], [0], *slots)) == (["v"], [0], None, [1])
+
+    # -- the per-chunk toc encode hoist (issue #476) -------------------------
+
+    def _grouped(self, n=60, spread=1e-4):
+        from zagg.processing.aggregate import _group_columns
+
+        cfg = self._cfg()
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=cfg)
+        cell = self._cell(n, spread=spread)
+        cells = grid.cells_of(cell["leaf_id"])
+        children = np.unique(cells)
+        cols, cell_to_slice = _group_columns(dict(cell), cells)
+        return cfg, children, cols, cell_to_slice
+
+    def _unoccupied(self, n=6):
+        """Cell ids of the same grid holding none of the shard's rows."""
+        from conftest import point_words
+
+        grid = HealpixGrid(6, 8, layout="fullsphere", config=self._cfg())
+        return np.unique(grid.cells_of(point_words(n, seed=99, lat0=-30.0, lon0=200.0)))
+
+    def test_chunk_encode_matches_the_per_cell_encode(self):
+        # The hoisted one-pass encode is element-wise, so each cell's slice must
+        # be byte-identical to encoding that cell's rows alone (issue #476).
+        from zagg.processing.aggregate import _chunk_toc_words, _toc_word_column
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        by_cell = _chunk_toc_words(cols, cell_to_slice, children, cfg)
+        assert set(by_cell) == set(cell_to_slice)
+        for key, (start, end) in cell_to_slice.items():
+            per_cell = _toc_word_column({col: arr[start:end] for col, arr in cols.items()}, cfg)
+            np.testing.assert_array_equal(by_cell[key], per_cell)
+
+    def test_the_pooled_gather_is_the_same_gather(self):
+        # Both callers pool the chunk's columns for the precompute one statement
+        # earlier, walking the same children in the same order — so reusing that
+        # column instead of rebuilding the index must not move a byte, while a
+        # pooled dict built for other children is refused rather than trusted.
+        from zagg.processing.aggregate import _chunk_toc_words, _pool_chunk_columns
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        pooled = _pool_chunk_columns(cols, cell_to_slice, children)
+        built = _chunk_toc_words(cols, cell_to_slice, children, cfg)
+        reused = _chunk_toc_words(cols, cell_to_slice, children, cfg, pooled=pooled)
+        assert set(built) == set(reused) == set(cell_to_slice)
+        for key in built:
+            np.testing.assert_array_equal(built[key], reused[key])
+        stale = {name: arr[:-1] for name, arr in pooled.items()}
+        with pytest.raises(ValueError, match="pooled chunk columns hold"):
+            _chunk_toc_words(cols, cell_to_slice, children, cfg, pooled=stale)
+
+    def test_chunk_path_never_encodes_per_cell(self, monkeypatch):
+        # The chunk path injects the pre-encoded column, so the per-cell encode
+        # (and its dict copy) must not run — while the emitted words stay
+        # byte-identical to the per-cell route (issue #476).
+        import zagg.processing.aggregate as agg_mod
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        agg_fields = get_agg_fields(cfg)
+        calls = []
+        orig = agg_mod._toc_word_column
+        monkeypatch.setattr(
+            agg_mod, "_toc_word_column", lambda *a, **k: calls.append(1) or orig(*a, **k)
+        )
+        stats, payloads, idx, channels, _ = _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], agg_fields
+        )
+        assert calls == [], "the chunk path must not fall back to the per-cell encode"
+        for j, i in enumerate(idx["h_tdigest"]):
+            start, end = cell_to_slice[int(children[i])]
+            cell = {col: arr[start:end] for col, arr in cols.items()}
+            digest, locs, times = calculate_cell_statistics(cell, config=cfg)["h_tdigest"]
+            np.testing.assert_array_equal(payloads["h_tdigest"][j], digest)
+            np.testing.assert_array_equal(channels["h_tdigest"]["locations"][j], locs)
+            np.testing.assert_array_equal(channels["h_tdigest"]["times"][j], times)
+            assert stats["observed"][i] == calculate_cell_statistics(cell, config=cfg)["observed"]
+
+    def test_the_batch_is_armed_only_for_companion_configs(self, monkeypatch):
+        # No declared channel, no deferral machinery: a config predating issue
+        # #87/#410 must never see the ContextVar, so an arbitrary reducer can
+        # only meet a placeholder on the configs that ask for one.
+        import zagg.stats.tdigest as td_mod
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        calls: list[int] = []
+        orig = td_mod.batched_companion_folds
+        monkeypatch.setattr(td_mod, "batched_companion_folds", lambda: calls.append(1) or orig())
+        cfg, children, cols, cell_to_slice = self._grouped()
+        _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], get_agg_fields(cfg)
+        )
+        assert calls == [1]
+        plain = self._cfg()
+        del plain.aggregation["variables"]["h_tdigest"]["location"]
+        del plain.aggregation["variables"]["h_tdigest"]["temporal"]
+        del plain.aggregation["variables"]["observed"]
+        calls.clear()
+        _aggregate_chunk_cells(
+            children, cols, cell_to_slice, {}, plain, ["h_tdigest"], get_agg_fields(plain)
+        )
+        assert calls == []
+
+    def test_no_clock_refused_on_the_chunk_path(self):
+        # §8.3's refusal stays reachable after the hoist: a populated chunk with
+        # a declared companion but no clock fails exactly as the per-cell route.
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, children, cols, cell_to_slice = self._grouped()
+        del cfg.output["time_source"]
+        with pytest.raises(ValueError, match="no per-observation clock"):
+            _aggregate_chunk_cells(
+                children,
+                cols,
+                cell_to_slice,
+                {},
+                cfg,
+                ["h_tdigest", "observed"],
+                get_agg_fields(cfg),
+            )
+
+    def test_all_empty_chunk_needs_no_clock(self):
+        # Parity with the per-cell route, where an empty cell never reaches the
+        # encode: a chunk with no populated cells must not demand a clock. The
+        # shape the multi-chunk path actually produces — shard-level columns and
+        # cell_to_slice, a chunk whose children are all unoccupied — is where the
+        # ``present`` filter is doing the work.
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, _, cols, cell_to_slice = self._grouped()
+        del cfg.output["time_source"]
+        empty_chunk = self._unoccupied()
+        assert cell_to_slice and not set(map(int, empty_chunk)) & set(cell_to_slice)
+        _, payloads, idx, _, cwd = _aggregate_chunk_cells(
+            empty_chunk,
+            cols,
+            cell_to_slice,
+            {},
+            cfg,
+            ["h_tdigest", "observed"],
+            get_agg_fields(cfg),
+        )
+        assert cwd == 0 and payloads["h_tdigest"] == [] and idx["h_tdigest"] == []
+
+    def test_partial_chunks_split_the_shard_columns(self):
+        # chunks_per_shard > 1 is how the worker actually calls this: shard-level
+        # col_arrays/cell_to_slice with per-chunk children covering only part of
+        # the populated cells (plus unoccupied ones). Each chunk's payloads and
+        # both channels must stay byte-equal to the per-cell route — the encode's
+        # ``present`` filter and its slice accounting are all that stand between.
+        from zagg.processing.aggregate import _aggregate_chunk_cells
+
+        cfg, children, cols, cell_to_slice = self._grouped(240, spread=0.5)
+        assert len(cell_to_slice) > 3, "need several populated cells for a partial chunk"
+        agg_fields = get_agg_fields(cfg)
+        half = len(children) // 2
+        chunks = [
+            np.concatenate([children[:half], self._unoccupied(2)]),
+            children[half:],
+        ]
+        seen = 0
+        for chunk in chunks:
+            _, payloads, idx, channels, cwd = _aggregate_chunk_cells(
+                chunk, cols, cell_to_slice, {}, cfg, ["h_tdigest", "observed"], agg_fields
+            )
+            assert cwd == sum(int(c) in cell_to_slice for c in chunk)
+            seen += cwd
+            for j, i in enumerate(idx["h_tdigest"]):
+                start, end = cell_to_slice[int(chunk[i])]
+                cell = {col: arr[start:end] for col, arr in cols.items()}
+                digest, locs, times = calculate_cell_statistics(cell, config=cfg)["h_tdigest"]
+                np.testing.assert_array_equal(payloads["h_tdigest"][j], digest)
+                np.testing.assert_array_equal(channels["h_tdigest"]["locations"][j], locs)
+                np.testing.assert_array_equal(channels["h_tdigest"]["times"][j], times)
+        assert seen == len(cell_to_slice), "every populated cell lands in exactly one chunk"
 
 
 class TestRaggedChunkCompanion:
@@ -4461,6 +4988,134 @@ class TestExpandMaskToBase:
         np.testing.assert_array_equal(out, [True, True, True, True])
 
 
+class TestLinkBaseExtent:
+    """``link_base_extent``: the base extent a record link tiles (issue #452).
+
+    A no-op on the contiguous links this route reads — it reduces to ``Σcount``,
+    pinned below down to the byte-identical planned hyperslices. The correction
+    is for strided products, where ``Σcount`` understates the flat array and
+    ``plan_read`` clamps every run to an empty slice."""
+
+    def test_contiguous_equals_sum_of_counts(self):
+        ibeg = np.arange(0, 12, 2, dtype=np.int64)
+        cnt = np.full(6, 2, dtype=np.int64)
+        assert link_base_extent(ibeg, cnt, 0) == int(cnt.sum()) == 12
+
+    def test_atl03_shaped_link_equals_sum_of_counts(self):
+        # Origin-1 starts with issue #116 empties (``ph_index_beg == 0``): the
+        # empties are skipped, so the extent is still ``Σcount``.
+        ibeg = np.array([1, 0, 3, 0, 5], dtype=np.int64)
+        cnt = np.array([2, 0, 2, 0, 2], dtype=np.int64)
+        assert link_base_extent(ibeg, cnt, 1) == int(cnt.sum()) == 6
+
+    def test_strided_link_exceeds_sum_of_counts(self):
+        # The GEDI L1B shape: a fixed window per record, count == valid samples.
+        ibeg = np.array([1, 1421, 2841], dtype=np.int64)
+        cnt = np.array([700, 800, 650], dtype=np.int64)
+        assert int(cnt.sum()) == 2150
+        assert link_base_extent(ibeg, cnt, 1) == 2840 + 650
+
+    def test_single_record_and_index_base(self):
+        assert link_base_extent(np.array([0]), np.array([5]), 0) == 5
+        assert link_base_extent(np.array([1]), np.array([5]), 1) == 5
+
+    def test_all_empty_link_is_zero(self):
+        assert link_base_extent(np.array([0, 0]), np.array([0, 0]), 1) == 0
+        assert link_base_extent(np.array([], dtype=np.int64), np.array([], dtype=np.int64), 0) == 0
+
+    def test_planned_read_hyperslices_unchanged(self):
+        """The contiguous (ATL03-shaped) planned read stays byte-identical."""
+
+        class _RecordingH5(_FakeH5):
+            def __init__(self, arrays):
+                super().__init__(arrays)
+                self.requests = []
+
+            def readDatasets(self, datasets):  # noqa: N802 (mirror real h5coro API)
+                for d in datasets:
+                    if isinstance(d, dict) and d["hyperslice"]:
+                        self.requests.append((d["dataset"], tuple(map(tuple, d["hyperslice"]))))
+                return super().readDatasets(datasets)
+
+        ds = _planned_read_data_source()
+        h5 = _RecordingH5(_planned_read_h5()._arrays)
+        grid = _LatBboxGrid((-0.1, 100.0, 0.1, 250.0))
+        df = _read_group(h5, "gt1l", ds, 0, grid)
+        assert df["h"].tolist() == [20.0, 30.0, 40.0, 50.0]
+        # Exactly the three base-rate reads over photons 2..5 (the plan's one
+        # run), unchanged by deriving the extent from the link.
+        assert sorted(h5.requests) == [
+            ("/heights/h", ((2, 6),)),
+            ("/heights/lat_ph", ((2, 6),)),
+            ("/heights/lon_ph", ((2, 6),)),
+        ]
+
+
+class TestPlannedRateExpansion:
+    """The planned-rate twins of the paint-and-slice expansions (issue #452).
+
+    Each must equal ``<base-rate form>(...)[base_rows]`` exactly — the base-rate
+    arrays were only ever consumed at the read's rows, so the gather is a pure
+    memory win (7 GB per GEDI beam group)."""
+
+    STRIDED_IBEG = np.array([1, 11, 21, 31], dtype=np.int64)  # origin-1, stride 10
+    STRIDED_CNT = np.array([5, 3, 0, 4], dtype=np.int64)  # record 2 is empty
+
+    def test_parent_at_rows_matches_the_paint_order(self):
+        rows = np.arange(34, dtype=np.int64)
+        parent = _link_parent_at_rows(self.STRIDED_IBEG, self.STRIDED_CNT, 1, rows)
+        expected = np.full(34, -1, dtype=np.int64)
+        expected[0:5] = 0
+        expected[10:13] = 1
+        expected[30:34] = 3
+        np.testing.assert_array_equal(parent, expected)
+
+    def test_parent_at_rows_handles_edges(self):
+        empty_link = _link_parent_at_rows(np.array([0, 0]), np.array([0, 0]), 1, np.arange(3))
+        np.testing.assert_array_equal(empty_link, [-1, -1, -1])
+        no_rows = _link_parent_at_rows(
+            self.STRIDED_IBEG, self.STRIDED_CNT, 1, np.array([], dtype=np.int64)
+        )
+        assert no_rows.shape == (0,)
+
+    def test_expand_mask_at_rows_equals_base_rate_form(self):
+        coarse = np.array([True, False, True, True])
+        rows = np.array([0, 4, 5, 9, 10, 12, 13, 30, 33], dtype=np.int64)
+        base = _expand_mask_to_base(coarse, self.STRIDED_IBEG, self.STRIDED_CNT, 1, 34)
+        at_rows = _expand_mask_at_rows(coarse, self.STRIDED_IBEG, self.STRIDED_CNT, 1, rows)
+        np.testing.assert_array_equal(at_rows, base[rows])
+        # Slack rows (owned by no record) are False, never a neighbour's verdict.
+        assert at_rows.tolist() == [True, True, False, False, False, False, False, True, True]
+
+    def test_expand_mask_at_rows_validates_negative_start(self):
+        with pytest.raises(ValueError, match="less than index_base"):
+            _expand_mask_at_rows(np.array([True]), np.array([0]), np.array([3]), 1, np.arange(3))
+
+    def test_gather_segment_at_rows_equals_base_rate_form(self):
+        seg = np.array([10.0, 20.0, 0.0, 40.0], dtype=np.float32)
+        rows = np.array([0, 4, 5, 9, 10, 12, 13, 30, 33], dtype=np.int64)
+        base = _broadcast_segment_to_base(seg, self.STRIDED_IBEG, self.STRIDED_CNT, 1, 34)
+        at_rows = _gather_segment_at_rows(seg, self.STRIDED_IBEG, self.STRIDED_CNT, 1, 34, rows)
+        np.testing.assert_array_equal(at_rows, base[rows])
+        assert at_rows.dtype == seg.dtype
+        # Float fill for a row no record owns is NaN, as in the base-rate form.
+        assert np.isnan(at_rows[2])
+
+    def test_gather_segment_at_rows_zero_fills_non_float(self):
+        seg = np.array([7, 8], dtype=np.int32)
+        ibeg = np.array([0, 10])
+        cnt = np.array([2, 2])
+        out = _gather_segment_at_rows(seg, ibeg, cnt, 0, 12, np.array([0, 5, 11]))
+        assert out.tolist() == [7, 0, 8]
+        assert out.dtype == seg.dtype
+
+    def test_gather_segment_at_rows_validates_overrun(self):
+        with pytest.raises(ValueError, match="exceeds base size"):
+            _gather_segment_at_rows(
+                np.array([1.0]), np.array([1]), np.array([5]), 1, 3, np.arange(3)
+            )
+
+
 class TestReadGroupCrossLevel:
     """Phase B: cross-level filters expand coarse verdicts to base-rate rows."""
 
@@ -6356,7 +7011,10 @@ class TestGranuleScopeReadErrors:
     def test_serial_granule_failure_is_counted_and_exemplared(self, monkeypatch):
         # The credential/endpoint shape: H5Coro construction raises for every
         # granule. Previously: read_errors absent, error == "No data after
-        # filtering". Now: counted, exemplared, and the scope is named.
+        # filtering". Now: counted, exemplared, and the scope is named -- and
+        # since this fixture's message is literally the credential shape, it
+        # now takes the issue #449 auth class (the generic no-data wording is
+        # covered by the non-auth failures elsewhere in this class).
         def factory(*a, **k):
             raise RuntimeError("h5coro open failed: expired token")
 
@@ -6368,8 +7026,10 @@ class TestGranuleScopeReadErrors:
         assert "read_errors" not in meta  # no GROUP read ever ran
         assert meta["read_error_exemplars"] == ["RuntimeError: h5coro open failed: expired token"]
         assert meta["error"] == (
-            "No data after filtering (2 granule reads raised; "
-            "e.g. RuntimeError: h5coro open failed: expired token)"
+            "Access denied reading source granules (2 auth-shaped failures; "
+            "2 granule reads raised): check data_source.credentials_provider names "
+            "the DAAC hosting this product; "
+            "e.g. RuntimeError: h5coro open failed: expired token"
         )
 
     def test_pool_granule_failure_is_counted_and_exemplared(self, monkeypatch):
@@ -6422,6 +7082,134 @@ class TestGranuleScopeReadErrors:
         )
         assert meta["read_errors"] == 1 and meta["granule_errors"] == 1
         assert "1 group reads raised, 1 granule reads raised" in meta["error"]
+
+
+class TestAuthFailureClass:
+    """A denied read is its own failure class (issue #449).
+
+    The GEDI template shipped without a ``credentials_provider``, so the NSIDC
+    default hit LP DAAC's ``lp-prod-protected``; each 403 came back as an empty
+    body, which the reader raised as ``TypeError: memoryview: a bytes-like
+    object is required, not 'NoneType'`` — swallowed into the per-granule path
+    and reported as the data-shaped "No data after filtering". The fault is the
+    CONFIG, not the data, so it gets its own loud message and its own counter.
+
+    Fold review: the empty-body shape is NOT proof of denial — h5coro's S3
+    driver returns the same ``None`` for a missing object, throttling, a
+    timeout or a reset (bare ``except Exception``), and zagg's own spill fold
+    raises the identical ``TypeError``. So it is a HINT on the generic no-data
+    message and never sets the class or the ``auth_errors`` counter; only a
+    status code / denial token does.
+    """
+
+    def _patch_h5(self, monkeypatch, factory):
+        monkeypatch.setattr("zagg.processing.h5coro.H5Coro", factory)
+        monkeypatch.setattr("zagg.processing._make_url_rewriter", lambda driver: lambda u: u)
+
+    def _run(self, monkeypatch, exc):
+        def factory(*a, **k):
+            raise exc
+
+        self._patch_h5(monkeypatch, factory)
+        return process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+        )
+
+    def test_memoryview_none_signature_is_a_hint_not_the_class(self, monkeypatch):
+        # The exact GEDI first-fleet-run exception — which is ALSO what a 404,
+        # a SlowDown, a timeout and a reset all look like through h5coro's
+        # catch-all. It must not claim the auth class or the counter...
+        _df, meta = self._run(
+            monkeypatch,
+            TypeError("memoryview: a bytes-like object is required, not 'NoneType'"),
+        )
+        assert "auth_errors" not in meta
+        assert meta["error"].startswith("No data after filtering")
+        # ...but the diagnosis that motivated the arm survives as a hint, with
+        # the credentials/DAAC check named first among the likely causes.
+        assert "EMPTY body" in meta["error"]
+        assert "credentials_provider" in meta["error"]
+        assert "missing object" in meta["error"] and "throttling" in meta["error"]
+        assert meta["error"].index("credentials_provider") < meta["error"].index("missing object")
+
+    def test_empty_body_hint_reaches_the_log(self, monkeypatch, caplog):
+        import logging as _logging
+
+        with caplog.at_level(_logging.WARNING, logger="zagg.processing.worker"):
+            self._run(
+                monkeypatch,
+                TypeError("memoryview: a bytes-like object is required, not 'NoneType'"),
+            )
+        skipped = [r.getMessage() for r in caplog.records if "No data after filtering" in r.msg]
+        assert skipped and "EMPTY body" in skipped[0]
+        # WARNING, not the auth branch's ERROR: an unproven denial is not an
+        # error-level diagnosis.
+        assert all(r.levelno == _logging.WARNING for r in caplog.records if "EMPTY" in r.msg)
+
+    def test_no_empty_body_means_no_hint(self, monkeypatch):
+        _df, meta = self._run(monkeypatch, KeyError("/gt1l/h_li"))
+        assert "EMPTY body" not in meta["error"]
+
+    def test_botocore_shaped_403_is_auth_shaped(self, monkeypatch):
+        # Duck-typed on the ClientError ``response`` mapping (no botocore
+        # import in the worker), both by status code and by error code.
+        class _ClientError(Exception):
+            def __init__(self, response):
+                super().__init__("An error occurred")
+                self.response = response
+
+        by_status = _ClientError({"ResponseMetadata": {"HTTPStatusCode": 403}})
+        by_code = _ClientError({"Error": {"Code": "AccessDenied"}})
+        for exc in (by_status, by_code):
+            _df, meta = self._run(monkeypatch, exc)
+            assert meta["auth_errors"] == 2
+            assert meta["error"].startswith("Access denied reading source granules")
+
+    def test_ordinary_read_failure_keeps_the_no_data_message(self, monkeypatch):
+        # The classifier must not swallow the generic path: a schema fault is
+        # still reported as "No data after filtering (...)", with no counter.
+        _df, meta = self._run(monkeypatch, KeyError("/gt1l/h_li"))
+        assert "auth_errors" not in meta
+        assert meta["error"].startswith("No data after filtering (2 granule reads raised")
+
+    def test_auth_errors_counted_even_when_the_shard_produces_data(self, monkeypatch):
+        # One granule denied, one fine: the shard succeeds (no error), but the
+        # partial denial is still visible in the payload — a partially-denied
+        # read is a partially-wrong product.
+        calls = {"n": 0}
+
+        def factory(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("S3 GetObject: AccessDenied")
+            return _CloseRecordingH5(_canned_arrays(), [])
+
+        self._patch_h5(monkeypatch, factory)
+        df, meta = process_shard(
+            _ReleaseGrid(), 0, ["s3://a", "s3://b"], s3_credentials={}, config=_release_cfg()
+        )
+        assert not df.empty
+        assert meta["error"] is None
+        assert meta["auth_errors"] == 1
+
+    def test_classifier_units(self):
+        from zagg.processing.worker import is_auth_failure, is_empty_body_failure
+
+        assert is_auth_failure(RuntimeError("S3 GetObject: AccessDenied"))
+        assert is_auth_failure(RuntimeError("The provided token has expired token"))
+        assert is_auth_failure(OSError("HTTP 403 Forbidden"))
+        assert not is_auth_failure(KeyError("/gt1l/h_li"))
+        # A bare 403 in a URL/granule name must NOT classify (deliberate).
+        assert not is_auth_failure(RuntimeError("bad granule GEDI01_B_403_x.h5"))
+        # The empty-body shape is a hint, never the class: a 404'd granule and
+        # a throttled read raise this byte-for-byte, so does spill's
+        # ``memoryview(arr).cast("B")`` on a None array.
+        none_body = TypeError("memoryview: a bytes-like object is required, not 'NoneType'")
+        assert not is_auth_failure(none_body)
+        assert is_empty_body_failure(none_body)
+        # A memoryview TypeError with a different cause is not the signature.
+        assert not is_empty_body_failure(TypeError("memoryview: invalid stride"))
+        assert not is_empty_body_failure(KeyError("/gt1l/h_li"))
 
 
 class TestGranuleReadPool:

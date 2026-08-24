@@ -19,6 +19,7 @@ Two subcommands::
     # Compare any two catalogs (old-dict or new shard_keys/granules format):
     python bench/drift_catalog.py compare A.json B.json --label-a old --label-b recent
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,6 +34,7 @@ PARENT_ORDER = 6
 
 
 # ── catalog loading (format-agnostic) ────────────────────────────────────────
+
 
 def _basename(url: str) -> str:
     """Granule identity, independent of s3://, https://, or bucket prefix."""
@@ -80,6 +82,7 @@ def _pair_set(cat: dict[int, set[str]]) -> set[tuple[int, str]]:
 
 
 # ── compare ──────────────────────────────────────────────────────────────────
+
 
 def compare(path_a: str, path_b: str, label_a: str, label_b: str) -> dict:
     """Diff two catalogs and return a summary dict.
@@ -135,6 +138,7 @@ def _print_compare(summary: dict, label_a: str, label_b: str) -> None:
 
 # ── build ─────────────────────────────────────────────────────────────────────
 
+
 def _catalog_from_umm(granules):
     """Build a Catalog from cached raw UMM-JSON granules.
 
@@ -150,10 +154,20 @@ def _catalog_from_umm(granules):
     items = []
     for g in granules:
         umm = g.get("umm", {})
-        s3 = next((u["URL"] for u in umm.get("RelatedUrls", [])
-                   if u.get("URL", "").startswith("s3://") and u["URL"].endswith(".h5")), None)
-        gpoly = (umm.get("SpatialExtent", {}).get("HorizontalSpatialDomain", {})
-                 .get("Geometry", {}).get("GPolygons", []))
+        s3 = next(
+            (
+                u["URL"]
+                for u in umm.get("RelatedUrls", [])
+                if u.get("URL", "").startswith("s3://") and u["URL"].endswith(".h5")
+            ),
+            None,
+        )
+        gpoly = (
+            umm.get("SpatialExtent", {})
+            .get("HorizontalSpatialDomain", {})
+            .get("Geometry", {})
+            .get("GPolygons", [])
+        )
         if not s3 or not gpoly:
             continue
         pts = gpoly[0].get("Boundary", {}).get("Points", [])
@@ -164,14 +178,20 @@ def _catalog_from_umm(granules):
             ring.append(ring[0])
         lons = [c[0] for c in ring]
         lats = [c[1] for c in ring]
-        items.append({
-            "type": "Feature", "stac_version": "1.0.0", "id": umm.get("GranuleUR", ""),
-            "geometry": {"type": "Polygon", "coordinates": [ring]},
-            "bbox": [min(lons), min(lats), max(lons), max(lats)],
-            "properties": {"datetime": "2024-01-01T00:00:00Z"},
-            "collection": "ATL06", "stac_extensions": [], "links": [],
-            "assets": {"data_s3": {"href": s3, "roles": ["data"]}},
-        })
+        items.append(
+            {
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": umm.get("GranuleUR", ""),
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+                "bbox": [min(lons), min(lats), max(lons), max(lats)],
+                "properties": {"datetime": "2024-01-01T00:00:00Z"},
+                "collection": "ATL06",
+                "stac_extensions": [],
+                "links": [],
+                "assets": {"data_s3": {"href": s3, "roles": ["data"]}},
+            }
+        )
     return Catalog(pa.table(sga.parse_stac_items_to_arrow(items)), {})
 
 
@@ -194,24 +214,30 @@ def build(backend: str, out: str, *, mortie_order: int = 8) -> None:
     cat = _catalog_from_umm(granules)
     grid = HealpixGrid(PARENT_ORDER, PARENT_ORDER, layout="fullsphere")
     t0 = time.perf_counter()
-    sm = ShardMap.build(cat, grid, region=load_antarctic_basins(),
-                        backend=backend, mortie_order=mortie_order)
+    sm = ShardMap.build(
+        cat, grid, region=load_antarctic_basins(), backend=backend, mortie_order=mortie_order
+    )
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     sm.to_json(out)
-    print(f"[build] {len(sm.shard_keys)} shards, {sm.metadata['total_pairs']:,} pairs, "
-          f"{time.perf_counter() - t0:.1f}s -> {out}")
+    print(
+        f"[build] {len(sm.shard_keys)} shards, {sm.metadata['total_pairs']:,} pairs, "
+        f"{time.perf_counter() - t0:.1f}s -> {out}"
+    )
 
 
 # ── cli ────────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pb = sub.add_parser("build", help="snapshot a baseline catalog from the cache")
-    pb.add_argument("--backend", default="mortie",
-                    choices=["mortie", "spherely", "shapely", "auto"])
+    pb.add_argument(
+        "--backend", default="mortie", choices=["mortie", "spherely", "shapely", "auto"]
+    )
     pb.add_argument("--out", required=True)
     pb.add_argument("--mortie-order", type=int, default=8)
 

@@ -184,12 +184,141 @@ def _walk_chunk_btree(ds) -> list[tuple[tuple[int, ...], int, int, int]]:
     return entries
 
 
-def build_chunk_map(h5obj, path: str) -> ChunkMap:
+def _cache_keys(h5obj) -> set:
+    """Snapshot of ``h5obj.cache``'s keys (empty for cache-less handles).
+
+    ``set(dict)`` is a single C-level copy, so it cannot observe a concurrent
+    insertion mid-iteration the way a Python-level comprehension can (review
+    finding on PR #462).
+    """
+    return set(getattr(h5obj, "cache", None) or ())
+
+
+def _drop_cache_lines(h5obj, keys) -> int:
+    """Pop ``keys`` from ``h5obj.cache`` **and** their ``cache_locks`` entries.
+
+    ``H5Coro.cache_locks`` is a ``defaultdict(threading.Lock)`` keyed by the
+    same aligned offsets, so evicting the line alone still retains a ``Lock``
+    plus a dict slot for every line ever touched — ~13.8k entries for a GEDI
+    L1B beam group's ``rxwaveform`` B-tree, ~110k (order 15-20 MB) per granule
+    (review finding on PR #462). Pruning it is safe only because every eviction
+    point is single-threaded on the handle (immediate: ``_prebuild_group_maps``,
+    the full-coverage walk, direct use; deferred: after the read pool joined —
+    :func:`_evict_deferred_lines`). Were another thread mid-``ioRequest``, it
+    could hold the popped lock while a third thread took the fresh defaultdict
+    entry — two locks for one line, and a duplicate fetch. ``pop(k, None)`` on
+    both tables (``cache_locks`` is absent on stub handles) keeps this
+    non-raising. Returns the number of cache lines actually dropped.
+    """
+    cache = h5obj.cache
+    locks = getattr(h5obj, "cache_locks", None)
+    dropped = 0
+    for k in keys:
+        if cache.pop(k, None) is not None:
+            dropped += 1
+        if locks is not None:
+            locks.pop(k, None)
+    return dropped
+
+
+def _evict_new_cache_lines(h5obj, before: set) -> int:
+    """Drop every h5coro cache line added since ``before`` was snapshotted.
+
+    The snapshot-and-evict half of issue #460: ``H5Coro.cache`` retains a full
+    ``cacheLineSize`` line (4 MiB default) for every byte range a cached
+    ``ioRequest`` touches, and releases nothing until granule close. A chunk
+    B-tree walk reads each node exactly once, but on a sparse file the nodes
+    rarely share a line (GEDI L1B ``rxwaveform``: 13,790 chunks → +531 MB
+    retained per beam group, ~4.2 GB per granule), so the walk's lines are
+    pure dead weight afterwards. Evicting them caps residency at one walk's
+    transient peak; a later read that does want an evicted line just
+    re-fetches it (B-tree nodes are not data, so in practice none does).
+    Only keys absent from ``before`` are dropped — pre-existing lines (the
+    front-of-file metadata block every parse shares) always survive, and each
+    dropped line takes its ``cache_locks`` entry with it
+    (:func:`_drop_cache_lines`). Returns the number of lines evicted.
+
+    Structurally non-raising, which matters because callers run it from a
+    ``finally`` where a raise would replace a successful ``ChunkMap`` return
+    with a housekeeping error (review finding on PR #462): ``list(cache)``
+    snapshots the keys in one C-level copy instead of iterating the live dict
+    (a Python-level comprehension can hit ``RuntimeError: dictionary changed
+    size during iteration``), and ``pop(k, None)`` cannot ``KeyError`` on a
+    line another thread already dropped. Both operations complete without
+    releasing the GIL, so no blanket ``except`` is needed here.
+    """
+    cache = getattr(h5obj, "cache", None)
+    if not cache:
+        return 0
+    added = [k for k in list(cache) if k not in before]
+    return _drop_cache_lines(h5obj, added)
+
+
+def _evict_deferred_lines(h5obj, deferred: set) -> int:
+    """Drop the cache lines a pooled ``read_fn`` fan-out deferred (issue #460).
+
+    :func:`build_chunk_map`'s immediate eviction is only safe on a handle no
+    other thread is reading: ``read_fn``'s lazy map builds run inside
+    ``_read_paths_pooled``'s thread pool (``data_source.read_workers``,
+    default 8, one shared ``h5obj`` — both the planned and the vlen route fan
+    out that way), and h5coro's cached ``ioRequest`` reads ``self.cache``
+    *outside* ``cache_locks``, so popping a line another thread is mid-read
+    raises there (review finding on PR #462, reproduced as a ``KeyError`` in
+    ``ioRequest`` plus silently-degraded ``H5Promise`` parses). Those builds
+    therefore only *record* their walk lines, and ``read_group`` evicts them
+    through this helper in a ``finally`` — after the route returned, so the
+    ``ThreadPoolExecutor`` context has joined and the handle is back to the
+    single worker thread that owns this granule (the ``_pending`` docstring's
+    "each granule is read by a single worker thread" invariant). Returns the
+    number of lines evicted; same non-raising discipline as
+    :func:`_evict_new_cache_lines`.
+    """
+    cache = getattr(h5obj, "cache", None)
+    if not cache or not deferred:
+        return 0
+    evicted = _drop_cache_lines(h5obj, list(deferred))
+    deferred.clear()
+    if evicted:
+        logger.debug(f"  chunk maps: evicted {evicted} deferred cache line(s) after the fan-out")
+    return evicted
+
+
+def build_chunk_map(h5obj, path: str, *, evict_into: set | None = None) -> ChunkMap:
     """Build a :class:`ChunkMap` for one dataset by walking its metadata.
 
     Metadata-only: no chunk is ever read or decompressed. A contiguous-layout
     dataset yields a single pseudo-chunk covering the full first axis
     (mirroring h5py's ``get_offset()`` treatment in the bench extractor).
+    Cache lines the B-tree walk pulls into ``h5obj.cache`` are evicted before
+    returning (issue #460); the lines the ``H5Dataset`` parse itself touched
+    are deliberately kept (the snapshot is taken after the parse). Parse-line
+    residency does grow per *distinct* dataset rather than being fully shared,
+    but it is bounded by the group's object-header / metadata footprint, not by
+    the chunk count: measured on a real GEDI L1B beam group (PR #462 evidence),
+    a whole group's read left **11 lines / 46 MB** resident at the 4 MiB
+    default — the data path's own lines included — out of **90 distinct lines**
+    ever touched across the group, against the hundreds of MB the unevicted
+    walks stranded. The absent-path ``KeyError`` below returns before the
+    snapshot on purpose: nothing walk-touched exists yet, and its parse lines
+    are retained by the same choice. That retention is exact only on the
+    immediate path (single-threaded); the deferred path below drops some parse
+    lines too, so the GEDI figure above — measured through it at the default
+    ``read_workers`` — is if anything the lower residency of the two.
+
+    ``evict_into`` defers that eviction for a caller whose builds run
+    concurrently on one handle: pass a set and the walk's keys are *added* to
+    it (a GIL-atomic ``set.update``) instead of popped, for the caller to
+    evict once its fan-out has joined — see :func:`_evict_deferred_lines`.
+    The window is a plain before/after key diff, so lines *other threads* add
+    inside it are swept in as well — measurably, including other datasets'
+    object-header parse lines (review finding on PR #462: 23 of 40 concurrent
+    rounds on the test fixture). Those lines re-fetch on next touch (one small
+    ranged read each), and that bounded cost is the deliberate price of a
+    race-free drain: the alternative — subtracting a floor of every build's
+    ``before`` snapshot — is extra machinery to protect what is a memory *win*.
+    The default (``None``) evicts immediately, which is what every
+    single-threaded caller wants (``_prebuild_group_maps``, the full-coverage
+    walk, direct use).
 
     Raises ``KeyError`` for an absent path (h5coro's ``metaOnly`` traversal
     never raises on its own — it just leaves default metadata) and
@@ -200,7 +329,30 @@ def build_chunk_map(h5obj, path: str) -> ChunkMap:
     ds = H5Dataset(h5obj, path, earlyExit=True, metaOnly=True, enableAttributes=False)
     if ds.meta.typeSize == 0:
         raise KeyError(path)
-    return _chunk_map_from_dataset(h5obj, ds, path)
+    before = _cache_keys(h5obj)
+    try:
+        return _chunk_map_from_dataset(h5obj, ds, path)
+    finally:
+        if evict_into is not None:
+            added = _cache_keys(h5obj) - before
+            evict_into.update(added)
+            if added:
+                # Per-build attribution on the DEFERRED branch too (review
+                # finding on PR #462): with ``write_back`` off — the shipped
+                # default — every build goes through here, so without this line
+                # the only DEBUG record is ``_evict_deferred_lines``' group-level
+                # aggregate, which cannot single out the one pathological dataset
+                # (GEDI L1B's ``rxwaveform``) inside a group of dozens.
+                logger.debug(
+                    f"  chunk map {path}: walk touched {len(added)} cache line(s); "
+                    "deferred for post-read eviction"
+                )
+        else:
+            evicted = _evict_new_cache_lines(h5obj, before)
+            if evicted:
+                logger.debug(
+                    f"  chunk map {path}: evicted {evicted} cache line(s) the walk touched"
+                )
 
 
 def _chunk_map_from_dataset(h5obj, ds, path: str) -> ChunkMap:
@@ -291,7 +443,12 @@ def _iter_datasets(h5obj):
     whole enumeration is served from the front-of-file metadata block h5coro
     already cached — one ranged GET, no chunk data (issue #190; the full walk
     stays inside the single ~4 MiB cache line the config's read already paid
-    for, measured on real ATL03). A node whose ``typeSize == 0`` is a group
+    for, measured on real ATL03). Since issue #460 that "already cached" is a
+    best case rather than a guarantee: each group's deferred drain may have
+    swept out object-header lines the read had cached (see ``evict_into`` in
+    :func:`build_chunk_map`), so on a sparse file this walk re-fetches some of
+    them — bounded extra ranged reads, still no chunk data. A node whose
+    ``typeSize == 0`` is a group
     (or a typeless link) and is descended; anything else is a dataset yielded
     with the ``H5Dataset`` its classification already parsed, so the caller
     can build its chunk map without re-parsing the object header. Each node's
@@ -350,6 +507,13 @@ def full_granule_maps(h5obj, existing: dict[str, ChunkMap]) -> dict[str, ChunkMa
     for path, ds in _iter_datasets(h5obj):
         if path in maps:
             continue
+        # Per-dataset snapshot-and-evict, same as build_chunk_map (issue
+        # #460): this walk maps EVERY dataset in the granule, so unevicted it
+        # accumulates worst of all. Evicting after each dataset keeps the
+        # transient peak one walk deep; the enumeration's own object-header
+        # lines are in each snapshot (the generator parses the next node
+        # before the loop body runs) and stay cached for the datasets after.
+        before = _cache_keys(h5obj)
         try:
             maps[path] = _chunk_map_from_dataset(h5obj, ds, path)
         except ValueError:
@@ -360,6 +524,12 @@ def full_granule_maps(h5obj, existing: dict[str, ChunkMap]) -> dict[str, ChunkMa
             # there): drop just this dataset from the manifest instead of
             # sinking the whole granule's write-back.
             logger.warning(f"  write-back: no chunk map for {path} ({exc}); skipping")
+        finally:
+            evicted = _evict_new_cache_lines(h5obj, before)
+            if evicted:
+                logger.debug(
+                    f"  write-back map {path}: evicted {evicted} cache line(s) the walk touched"
+                )
     return maps
 
 
@@ -540,34 +710,61 @@ class InlineIndex(VirtualIndex):
         addresses), plus the spatial-index level's coordinate and link arrays
         (read in full by the planned route, and part of the bench extractor's
         manifest convention). Missing datasets raise ``KeyError`` — the same
-        group-read failure the data read would produce.
+        group-read failure the data read would produce, so nothing this
+        granule does NOT hold belongs in the set: a vlen source (issue #425)
+        contributes its record level's coordinates and link, the endpoint
+        datasets its synthesized columns interpolate between, and no
+        sibling-asset filter dataset (those live in the paired granule, which
+        this backend never opens).
         """
         from zagg.config import filters_from_data_source
         from zagg.processing.read import _level_coord_paths, _variable_specs
+        from zagg.processing.read_vlen import path_form_variables, synthesized_specs
 
-        paths = [tmpl.format(group=group) for tmpl in data_source["coordinates"].values()]
+        # ``coordinates.level`` names a record LEVEL, not a dataset (the vlen
+        # route: the base level has no native coordinates), so it is not a
+        # path to map — the record level's own lat/lon are the sibling keys.
+        paths = [
+            tmpl.format(group=group)
+            for key, tmpl in data_source["coordinates"].items()
+            if key != "level"
+        ]
         # Variables go through the read path's normalizer: an entry is either a
         # path-template string or the ``{path, column}`` mapping form (issue
         # #321). Chunk maps are per DATASET, so the column selector is
         # irrelevant here — several selectors on one path collapse in the
         # ``dict.fromkeys`` dedup below (one chunk map for all five
-        # ``signal_conf_ph`` surfaces).
+        # ``signal_conf_ph`` surfaces). ``synthesize:`` entries carry no
+        # ``path`` at all (the normalizer raises on one); what the read
+        # touches for them is the record-rate endpoint pair.
+        variables = data_source["variables"]
         paths += [
             tmpl.format(group=group)
-            for tmpl, _ in _variable_specs(data_source["variables"]).values()
+            for tmpl, _ in _variable_specs(path_form_variables(variables)).values()
         ]
+        for entry in synthesized_specs(variables).values():
+            paths += [entry[k].format(group=group) for k in ("start", "stop") if entry.get(k)]
         base_level = data_source.get("base_level")
         for f in filters_from_data_source(data_source):
-            if "expression" in f:
+            # A sibling-asset predicate reads the OTHER granule (issue #425).
+            if "expression" in f or f.get("asset") is not None:
                 continue
             if f.get("level") is None or f.get("level") == base_level:
                 paths.append(f["dataset"].format(group=group))
-        si_lvl = (data_source.get("levels") or {}).get(
-            (data_source.get("read_plan") or {}).get("spatial_index")
+        # Levels read in full by the group read: the planned route's spatial
+        # index, and — on a vlen source — the record level the coordinates and
+        # the gather map expand from (the same level, in every config that
+        # declares both).
+        level_keys = (
+            (data_source.get("read_plan") or {}).get("spatial_index"),
+            (data_source.get("coordinates") or {}).get("level"),
         )
-        if isinstance(si_lvl, dict):
-            paths.extend(_level_coord_paths(si_lvl, group))
-            link = si_lvl.get("link") or {}
+        for level_key in dict.fromkeys(k for k in level_keys if k):
+            lvl = (data_source.get("levels") or {}).get(level_key)
+            if not isinstance(lvl, dict):
+                continue
+            paths.extend(_level_coord_paths(lvl, group))
+            link = lvl.get("link") or {}
             for key in ("index_beg", "count"):
                 if key in link:
                     paths.append(link[key].format(group=group))
@@ -618,12 +815,40 @@ class InlineIndex(VirtualIndex):
         arrow=False,
         granule_url=None,
         io_stats=None,
+        siblings=None,
     ):
         from zagg.processing.read import (
             _planned_read_group,
             _read_group_full,
             _validate_planned_config,
         )
+
+        # Vlen-packed sources (issue #425) take their own route, which owns
+        # the record-expansion and planned/full arms; the compiled read_fn
+        # rides along so the flat base datasets still decode through it.
+        coords = data_source.get("coordinates")
+        if isinstance(coords, dict) and coords.get("level") is not None:
+            from zagg.processing.read_vlen import _vlen_read_group
+
+            if self.write_back:
+                self._prebuild_group_maps(h5obj, group, data_source)
+            # read_fn is hoisted out of the call so the finally can reach its
+            # deferred cache lines (issue #460 — see _evict_deferred_lines).
+            read_fn = self._chunk_aligned_read_fn(h5obj, planned=True)
+            try:
+                return _vlen_read_group(
+                    h5obj,
+                    group,
+                    data_source,
+                    shard_key,
+                    grid,
+                    arrow=arrow,
+                    read_fn=read_fn,
+                    io_stats=io_stats,
+                    siblings=siblings,
+                )
+            finally:
+                _evict_deferred_lines(h5obj, read_fn.deferred_lines)
 
         rp = data_source.get("read_plan")
         # Two routes, one addressing seam (issue #170 phase 2): sources with a
@@ -643,8 +868,19 @@ class InlineIndex(VirtualIndex):
             # group's datasets to the granule manifest.
             self._prebuild_group_maps(h5obj, group, data_source)
         read_fn = self._chunk_aligned_read_fn(h5obj, planned=planned)
-        if planned:
-            return _planned_read_group(
+        try:
+            if planned:
+                return _planned_read_group(
+                    h5obj,
+                    group,
+                    data_source,
+                    shard_key,
+                    grid,
+                    arrow=arrow,
+                    read_fn=read_fn,
+                    io_stats=io_stats,
+                )
+            return _read_group_full(
                 h5obj,
                 group,
                 data_source,
@@ -654,16 +890,10 @@ class InlineIndex(VirtualIndex):
                 read_fn=read_fn,
                 io_stats=io_stats,
             )
-        return _read_group_full(
-            h5obj,
-            group,
-            data_source,
-            shard_key,
-            grid,
-            arrow=arrow,
-            read_fn=read_fn,
-            io_stats=io_stats,
-        )
+        finally:
+            # The route's pooled fan-out has joined here, so the lines its
+            # lazy chunk-map builds deferred can be dropped (issue #460).
+            _evict_deferred_lines(h5obj, read_fn.deferred_lines)
 
     def _chunk_aligned_read_fn(self, h5obj, *, planned=True):
         """Build the addressing seam: planned ranges, compiled decode.
@@ -692,7 +922,10 @@ class InlineIndex(VirtualIndex):
         THIS granule's pending sub-dict instead (``_pending_for`` — keyed per
         granule so concurrent in-flight granules never interleave, issue
         #180), accumulating the granule's maps across groups for
-        ``finish_granule`` to persist. Each dataset gets
+        ``finish_granule`` to persist. Those lazy builds defer their cache-line
+        eviction onto ``read_fn.deferred_lines`` (issue #460) because they run
+        across the read pool's threads; ``read_group`` drains it once the route
+        has joined. Each dataset gets
         its own single-dataset in-memory ``Index`` (~ms), so a spec hidefix
         rejects degrades that dataset alone.
 
@@ -724,6 +957,13 @@ class InlineIndex(VirtualIndex):
         # and degrade innocent paths with it (review finding, PR #173).
         indices: dict = {}
         direct: set[str] = set()  # datasets pinned to the h5coro decoder
+        # Cache lines the lazy builds below touched, evicted by ``read_group``
+        # once this callable's fan-out has joined (issue #460): these builds
+        # run on ``read_workers`` threads sharing one h5obj, where popping a
+        # line races h5coro's unlocked cached ``ioRequest`` — see
+        # :func:`_evict_deferred_lines`. Exposed on the callable so every
+        # route can drain it in a ``finally``.
+        deferred: set = set()
 
         def _vidx_for(path):
             vidx = indices.get(path)
@@ -773,7 +1013,7 @@ class InlineIndex(VirtualIndex):
                     # boundary workaround is needed here.
                     return h5obj.readDatasets([path])[path]
                 try:
-                    cm = maps[path] = build_chunk_map(h5obj, path)
+                    cm = maps[path] = build_chunk_map(h5obj, path, evict_into=deferred)
                 except Exception:
                     if planned and hyperslice is not None:
                         # The planned route required the map before #170 too:
@@ -797,4 +1037,5 @@ class InlineIndex(VirtualIndex):
                     )
             return _h5coro_read(path, hyperslice, cm)
 
+        read_fn.deferred_lines = deferred
         return read_fn

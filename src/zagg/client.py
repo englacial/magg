@@ -440,8 +440,9 @@ class Run:
         ----------
         config : PipelineConfig, dict, or str
             A loaded :class:`~zagg.config.PipelineConfig`, a plain config
-            dict, or a path to a YAML config file. Dicts and paths are
-            validated on load.
+            dict, or a path to a YAML config file. **Every** shape is
+            cross-validated here (issue #472), including an already-built
+            ``PipelineConfig`` that was mutated after ``default_config``.
         shardmap : dict or str, optional
             A loaded ShardMap manifest dict or a path to its JSON. Falls back
             to the config's ``catalog:`` key. The map's grid signature must
@@ -479,7 +480,6 @@ class Run:
             config = load_config(config)
         elif isinstance(config, dict):
             config = load_config_from_dict(config)
-            validate_config(config)
 
         # v1 scope gate: the spatial point path only. The other pipelines
         # already run through agg()/zagg.notebook.run; refusing here beats a
@@ -501,6 +501,17 @@ class Run:
                 "configs fan out (shard, window) units — use zagg.runner.agg / "
                 "zagg.notebook.run until the v2 transport (issue #327)"
             )
+
+        # Cross-validate EVERY input shape, not just the dict/path ones (issue
+        # #472): a ``PipelineConfig`` from ``default_config`` validates once, at
+        # build time, so a notebook that then grafts another template's
+        # ``aggregation.variables`` onto it (the 02_write graft) dispatched a
+        # config nothing had re-checked — and the error surfaced one invoke per
+        # shard later, fleet-side. Runs after the scope gates above so an
+        # out-of-scope pipeline still gets its "use agg" pointer rather than a
+        # config error for a facade it was never going to run through, and
+        # before the shard map / store resolution so nothing touches AWS first.
+        validate_config(config)
 
         if isinstance(shardmap, dict):
             catalog_data = shardmap
@@ -967,17 +978,20 @@ class Run:
         The url selection honors ``data_source.driver`` — as does ``_cell_work``
         since the espg ruling on PR #333 (it hardcoded ``"s3"`` before), so the
         two paths build identical events for an ``https`` config too;
-        ``TestRunnerParity`` asserts that field-by-field.
+        ``TestRunnerParity`` asserts that field-by-field. It also resolves
+        through ``_resolve_granule_entries`` (issue #425), so a paired-asset
+        map's sibling hrefs reach the worker here as they do on the agg path —
+        a plain URL string per granule for every single-asset map.
         """
         from zagg import runner
 
         label = runner._safe_label(self.grid, shard_key)
-        granule_urls = runner._resolve_urls(records, self.driver)
+        granule_urls = runner._resolve_granule_entries(records, self.driver)
         ds = runner._clamped_data_source(dict(self.config.data_source), len(granule_urls))
         cell_config = {**config_dict, "data_source": ds} if ds is not None else config_dict
         submap = {
             "grid_signature": self.catalog_data["grid_signature"],
-            "metadata": self.catalog_data.get("metadata"),
+            "metadata": runner._submap_metadata(self.catalog_data.get("metadata")),
             "granules": records,
         }
         result = runner._invoke_lambda_cell(

@@ -116,6 +116,209 @@ class TestOpenS3Store:
         assert "credential_provider" not in kwargs
 
 
+class TestBucketOwnerAcl:
+    """Issue #495: writes to a target we do not own must hand ownership to the
+    bucket owner. S3 object ownership follows the WRITING account, so a
+    cross-account PUT without ``x-amz-acl: bucket-owner-full-control`` leaves
+    objects the bucket owner cannot manage -- Source Cooperative's in-region
+    upload grant requires the canned ACL for exactly that reason. obstore has no
+    ACL config key, so it rides as a default request header."""
+
+    HEADER = {"x-amz-acl": "bucket-owner-full-control"}
+    CREDS = {"accessKeyId": "ASIA", "secretAccessKey": "secret", "sessionToken": "tok"}
+
+    def test_external_target_sets_canned_acl(self, mock_s3):
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr", credentials=self.CREDS
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == self.HEADER
+
+    def test_side_channel_objects_get_the_header_too(self, mock_s3):
+        # Status envelopes, hive manifests, stats sidecars and the temporal
+        # tabular object are real writes to the same external store, so the
+        # raw-obstore route must carry the ACL as well.
+        s3_cls, _ = mock_s3
+        open_object_store(
+            "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr.status/run1",
+            credentials=self.CREDS,
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == self.HEADER
+
+    def test_ambient_write_to_a_published_bucket_sends_the_header(self, mock_s3):
+        # Phase 3 (issue #495) made publishing AMBIENT: the execution role
+        # reaches source.coop with no injected credentials. Keying the ACL on
+        # "did the caller pass credentials?" would therefore stop sending it on
+        # exactly the path it exists for, and the fleet would publish objects
+        # Source Cooperative cannot manage -- silently, since the PUT succeeds.
+        # The destination decides instead (review finding on PR #496).
+        s3_cls, _ = mock_s3
+        open_store("s3://us-west-2.opendata.source.coop/englacial/zagg/demo/d.zarr")
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == self.HEADER
+        # ...and through the raw-obstore route too (status envelopes, hive
+        # manifests, stats sidecars), including its ambient per-process cache.
+        open_object_store(
+            "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/d.zarr.status/run1"
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == self.HEADER
+
+    def test_in_account_write_sends_no_acl_header(self, mock_s3):
+        # Ambient writes to a bucket we OWN: nothing to hand over, and no
+        # client_options are introduced at all. Scoped to ownership, not to
+        # ambience -- the header requires s3:PutObjectAcl on the target, which
+        # the execution role holds on the published prefix only, so sending it
+        # to every AWS endpoint would 403 self-hosters' own output buckets and
+        # sliderule-public-cors (whose bucket policy is not ours to change).
+        s3_cls, _ = mock_s3
+        open_store("s3://our-bucket/out.zarr")
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+        open_object_store("s3://our-bucket/out.zarr.status/run1")
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+        open_store("s3://sliderule-public-cors/zagg-examples/d.zarr")
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+
+    def test_anonymous_read_sends_no_acl_header(self, mock_s3):
+        s3_cls, _ = mock_s3
+        open_store("s3://public-bucket/demo.zarr", read_only=True, skip_signature=True)
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+
+    def test_read_only_published_store_sends_no_acl_header(self, mock_s3):
+        # The read_only exclusion is unchanged by the destination-keyed
+        # predicate: reading the published store back is not a write.
+        s3_cls, _ = mock_s3
+        open_store("s3://us-west-2.opendata.source.coop/englacial/zagg/demo/d.zarr", read_only=True)
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+
+    def test_custom_endpoint_sends_no_acl_header(self, mock_s3):
+        # Canned ACLs are an AWS-S3 concept; the S3-compatible stores behind
+        # endpoint_url (R2, MinIO) do not implement them.
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://bucket/foo.zarr",
+            credentials=self.CREDS,
+            endpoint_url="https://acct.r2.cloudflarestorage.com",
+        )
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+        # ...and the exclusion still wins over the destination, which is what
+        # keeps the retired data.source.coop proxy hop (an endpoint-routed AWS
+        # target) out of the header path.
+        open_store(
+            "s3://us-west-2.opendata.source.coop/englacial/zagg/demo/d.zarr",
+            endpoint_url="https://data.source.coop",
+        )
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+
+    def test_read_with_input_credentials_sends_no_acl_header(self, mock_s3):
+        # The issue #223 consumer-INPUT channel: explicit credentials that read
+        # somebody else's bucket (temporal.open_dataset's .zarr branch), not a
+        # write target of ours. read_only is consumed by _s3_object_store and
+        # never reaches S3Store.
+        s3_cls, _ = mock_s3
+        open_store("s3://someones-input/mask.zarr", read_only=True, credentials=self.CREDS)
+        _, kwargs = s3_cls.call_args
+        assert "client_options" not in kwargs
+        assert "read_only" not in kwargs
+
+    def test_object_store_reads_are_the_documented_exception(self, mock_s3):
+        # open_object_store has no read_only concept, so temporal's NetCDF
+        # branch (a pure GET of an input bucket) still carries the header. Inert
+        # -- S3 reads x-amz-acl only on object-creating requests -- and pinned
+        # here so the exception stays visible.
+        s3_cls, _ = mock_s3
+        open_object_store("s3://someones-input", credentials=self.CREDS, region="us-west-2")
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == self.HEADER
+
+    def test_caller_client_options_are_preserved(self, mock_s3):
+        # Additive merge: unrelated client options survive, and a caller who
+        # sets x-amz-acl explicitly wins over the default.
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://external/foo.zarr",
+            credentials=self.CREDS,
+            client_options={
+                "timeout": "30s",
+                "default_headers": {"x-amz-acl": "private", "x-custom": "1"},
+            },
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["timeout"] == "30s"
+        assert kwargs["client_options"]["default_headers"] == {
+            "x-amz-acl": "private",
+            "x-custom": "1",
+        }
+
+    def test_caller_mixed_case_acl_header_still_wins(self, mock_s3):
+        # obstore lowercases header keys, so a raw setdefault cannot see
+        # ``X-Amz-Acl`` and the collision resolves inside obstore in OUR
+        # favour -- a caller who deliberately asked for ``private`` would be
+        # silently overridden (review finding). Lowercasing the merge fixes it.
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://external/foo.zarr",
+            credentials=self.CREDS,
+            client_options={"default_headers": {"X-Amz-Acl": "private", "X-Custom": "1"}},
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == {
+            "x-amz-acl": "private",
+            "x-custom": "1",
+        }
+
+    def test_caller_can_strip_the_header_with_an_explicit_none(self, mock_s3):
+        # The escape hatch for an external AWS target that must send no ACL:
+        # neither obstore-legal value expresses absence (None is rejected, ""
+        # is a live empty header S3 rejects), so a None value means REMOVE.
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://external/foo.zarr",
+            credentials=self.CREDS,
+            client_options={"default_headers": {"x-amz-acl": None, "x-custom": "1"}},
+        )
+        _, kwargs = s3_cls.call_args
+        assert kwargs["client_options"]["default_headers"] == {"x-custom": "1"}
+
+    def test_a_real_obstore_store_accepts_and_normalizes_the_header(self):
+        # Deliberately UNMOCKED (no network: construction only). Every other
+        # test here mocks S3Store, so they pin what zagg passes and never what
+        # obstore accepts -- client_options/default_headers validate only at
+        # real construction (a typo raises ValueError: Invalid key), so an
+        # obstore rename would leave this class green while the fleet wrote
+        # owner-less objects into someone else's bucket. Note the bytes:
+        # obstore normalizes header values.
+        from zagg.store import _s3_object_store
+
+        s3 = _s3_object_store("s3://external/foo.zarr", credentials=self.CREDS)
+        assert s3.client_options["default_headers"]["x-amz-acl"] == b"bucket-owner-full-control"
+
+    def test_a_real_obstore_read_only_store_carries_no_header(self):
+        # The issue #223 consumer-input shape, unmocked: no client_options at
+        # all reach obstore, so nothing rides the GET.
+        from zagg.store import _s3_object_store
+
+        s3 = _s3_object_store(
+            "s3://someones-input/mask.zarr", credentials=self.CREDS, read_only=True
+        )
+        assert s3.client_options is None
+
+    def test_caller_client_options_are_not_mutated(self, mock_s3):
+        s3_cls, _ = mock_s3
+        options = {"default_headers": {"x-custom": "1"}}
+        open_store("s3://external/foo.zarr", credentials=self.CREDS, client_options=options)
+        assert options == {"default_headers": {"x-custom": "1"}}
+
+
 class TestS3RetryConfig:
     """Issue #186: S3 stores get a paced retry policy by default. obstore's
     default (10 retries, 100 ms init backoff, uniform jitter) exhausts its whole

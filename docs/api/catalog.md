@@ -39,6 +39,94 @@ Endpoint selection (S3 vs HTTPS) is **not** made here — each granule record
 keeps both hrefs, and the aggregator picks one at run time via
 `data_source.driver`.
 
+## The `footprint_cells` convention column
+
+The per-granule footprint→cells cover is identical for every shard map built
+against the same catalog, so a catalog can carry it
+([issue #396](https://github.com/englacial/zagg/issues/396)):
+
+```bash
+# index while fetching, so the saved catalog ships pre-indexed
+python -m zagg.catalog --config atl06.yaml --short-name ATL06 --cycle 22 \
+    --polygon antarctica.geojson --catalog-out cycle22.parquet \
+    --index-footprints 9
+```
+
+```python
+cat = Catalog.from_geoparquet("cycle22.parquet").index_footprints(9)
+cat.to_geoparquet("cycle22_indexed.parquet")
+```
+
+`footprint_cells` is a ragged `large_list` of morton MOC words — mortie's
+`morton_index` extension type, the same typed-morton convention as
+[morton arrow](../morton_arrow.md) — one entry per table row. This is a **zagg
+convention column, not a stac-geoparquet upstream field**: an indexed catalog is
+still an ordinary stac-geoparquet file, and any other reader ignores the extra
+column. It is *not* part of the [store specification](../specification.md),
+which governs the Zarr store the aggregator writes, not the catalog it reads.
+
+**It cannot go stale.** The column rides in the same file as the `geometry` it
+was covered from, so there is no second artifact to keep in sync and no version
+skew to detect: subsetting the catalog (`filter_bbox`) carries the column with
+the rows, and rewriting the geometry means rewriting the file.
+
+`ShardMap.build` against an indexed catalog does no geometry at all — each
+granule's stored MOC is intersected (`moc_and`) with the AOI's own shard MOC —
+and records `metadata["footprint_cells"] = True` when it took that path, `False`
+when the catalog is indexed but the build took the geometry path anyway. The
+catalog's own `footprint_cells_order` rides into the manifest either way and only
+says the column exists, so read `footprint_cells` for the verdict; a manifest
+with neither key came from a catalog that was never indexed. The
+fast path engages only where the stored cover is exactly what the build asked
+for: the mortie backend, `footprint="swath"`, and no caller-pinned
+`mortie_order`. Anything else takes the geometry path unchanged, so an
+exact-S2 spherely run is never silently swapped for a MOC one.
+
+The assignment it produces is the geometry path's, with one intended exception:
+a **MultiPolygon** footprint. `index_footprints` covers the union of the rings in
+each blob, while `granule_records` reads only the largest part's exterior ring —
+so for a multi-part granule the column is a superset and the index can place it
+in shards the geometry path misses. No CMR ATL03/06 footprint is multi-part
+today; antimeridian-split STAC footprints are the natural producer.
+
+### What indexing buys, after #445
+
+An **unindexed** mortie `swath` build on a HEALPix grid now covers the geometry
+column itself — the same `from_wkbs` cover, at the grid's `parent_order`, thrown
+away when the build ends — and runs the same intersection
+([issue #445](https://github.com/englacial/zagg/issues/445)). The column no
+longer buys a *different* code path; it buys **skipping the cover**, which is
+most of a first build. Index when many builds share one catalog; skip it for a
+one-shot build and pay the cover once, in memory. The MultiPolygon superset
+above and the null-geometry refusal are properties of that shared cover, so the
+unindexed path has them too. `footprint="beams"`, the spherely backend,
+rectilinear grids and paired builds still cover from decoded records, and the
+`footprint_cells` metadata verdict still means "the stored column answered this
+build" — an unindexed build that covered its own is not that.
+
+### Choosing the order
+
+**Index at the grid's `parent_order`.** A MOC answers any shard order coarser
+than or equal to its own; a build against a grid whose `parent_order` is *finer*
+than the column is refused outright, because answering it would refine every
+cell onto all its descendants and put ~every granule in ~every shard
+([issue #92](https://github.com/englacial/zagg/issues/92)). The other end is
+mortie's order-18 coverage cap, which `index_footprints` refuses above — the
+same bound `ShardMap.build` clamps its own derived MOC order to.
+
+Going finer than you need is expensive in both directions — words per granule
+roughly double per order:
+
+| order | words/granule (88S) | column, 35,639 granules | index pass | build (35,639 granules) |
+| --- | --- | --- | --- | --- |
+| 9 | 288 | 17 MB parquet | 2.6 s | 1.6 s (vs 4.8 s from geometry) |
+| 13 | 7,207 | 560 MB parquet | 53.3 s | 22.9 s (vs 59.3 s from geometry) |
+
+At the shard order the index pays for itself on the first build. At the chunk
+order it does not: the pass costs about as much as the build it replaces, and
+the column is two orders of magnitude larger for resolution the shard cells
+cannot see.
+
 ## Fetch
 
 ::: zagg.catalog.sources.Query

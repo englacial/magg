@@ -21,6 +21,7 @@ import warnings
 
 import numpy as np
 
+from zagg.column import COLUMN_SUFFIX
 from zagg.hive import (
     COVERAGE_SPEC,
     MANIFEST_NAME,
@@ -251,8 +252,16 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     supersedes it). DERIVED zarrs at ancestor nodes — the overview pyramid
     family, issue #201 — are stamped and can wear leaf-shaped basenames, so a
     ``.zarr`` off the shard-order depth is checked for the D11 ``role`` attr and
-    skipped when it carries one (never classified by position). A
-    supersedes it). A successful refresh also re-arms the
+    skipped when it carries one (never classified by position) — as is a
+    ``{stem}.pyramid.zarr`` column (issue #383), the one derived family that
+    lives at the leaf's OWN node. A
+    supersedes it). A temporal-declaring store (spec §10, issue #480) also has
+    its ``zagg-coverage-toc/1`` section rebuilt from this same walk —
+    fail-open per SHARD, so an unreadable companion costs the section that
+    shard and never the refresh; and a walk that lost any shard COMPOSES its
+    rebuild with the standing section (§10.4) instead of replacing it, so the
+    escape hatch can never be the thing that deletes the section. A successful
+    refresh also re-arms the
     :func:`warn_if_stale` once-per-episode latch for this store. Returns the
     envelope written, or ``None`` — deleting any existing root object — when
     no stamped leaf exists (absence is truthful, a stale cache is not, and
@@ -266,6 +275,17 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     import obstore
     from obstore.exceptions import NotFoundError
 
+    from zagg.coverage_toc import (
+        COVER_KEY,
+        TEMPORAL_COVERAGE_SPEC,
+        build_cover_section,
+        build_temporal_section,
+        read_cover,
+        read_leaf_temporal,
+        temporal_cell_order,
+        temporal_fields,
+        write_cover,
+    )
     from zagg.grids.morton import morton_words_from_decimals
     from zagg.store import open_store
 
@@ -273,6 +293,21 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
     if manifest is None:
         raise ValueError(f"no {MANIFEST_NAME} at {store_root} — not a hive store root")
     order = int(manifest["shard_order"])
+    # The §10 temporal section (issue #480) is rebuilt from the SAME walk, so
+    # the escape hatch regenerates it rather than deleting it — and, because
+    # this walk is whole-store by construction, its root time-digest is the
+    # authoritative one (spec §10's whole-coverage rule). The §10.5 word-set
+    # cover sibling (issue #489) rebuilds from the same contributions.
+    toc_fields = temporal_fields(manifest)
+    cell_order = temporal_cell_order(manifest)
+    if toc_fields and cell_order is None:
+        logger.warning(
+            f"refresh: {store_root} declares temporal fields but carries no cell_order — "
+            f"rebuilding no §10 section rather than guessing a group"
+        )
+        toc_fields = {}
+    contributions: dict[str, list] = {}
+    toc_failed: set[str] = set()
     store = open_object_store(store_root, **store_kwargs)
     root = store_root.rstrip("/")
     # Decimals accumulate through the walk and parse once at the end (issue
@@ -295,11 +330,17 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                 stamp = read_commit(open_store(f"{root}/{rel}", **store_kwargs))
                 if stamp is None:
                     continue  # unstamped debris (D4)
-                if rel.count("/") - 1 != order and _is_derived_zarr(f"{root}/{rel}", store_kwargs):
-                    # A DERIVED artifact at an ancestor node, not source data:
-                    # overview pyramid zarrs are stamped and their basenames can
-                    # collide with the leaf grammar (issue #201). Silent like all
-                    # non-data children — the role attr is authoritative (D11).
+                at_leaf_depth = rel.count("/") - 1 == order
+                if (not at_leaf_depth or name.endswith(COLUMN_SUFFIX)) and _is_derived_zarr(
+                    f"{root}/{rel}", store_kwargs
+                ):
+                    # A DERIVED artifact, not source data: overview pyramid zarrs
+                    # are stamped and their basenames can collide with the leaf
+                    # grammar (issue #201), and a leaf's own column (issue #383)
+                    # is a derived zarr AT shard-order depth — so the depth gate
+                    # is a cost optimization only, widened by the column suffix.
+                    # Silent like all non-data children — role is authoritative
+                    # (D11), position never is.
                     logger.debug(f"refresh: skipping derived zarr {rel!r} (D11 role attr)")
                     continue
                 # Windowed leaves (issue #246, D13): `{full_id}_{window}.zarr`
@@ -343,6 +384,26 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                     )
                     continue
                 decimals.append(decimal)
+                if toc_fields and decimal not in toc_failed:
+                    try:
+                        got = read_leaf_temporal(
+                            f"{root}/{rel}", cell_order, toc_fields, **store_kwargs
+                        )
+                    except Exception as e:  # fail-open: the section is a cache
+                        # Shard-scoped, not leaf-scoped: §10.2's word must
+                        # contain EVERY instant in a listed shard, which a
+                        # word joined over the window leaves that happened to
+                        # read cannot promise. Drop the shard — absent means
+                        # "unknown", which stays a candidate.
+                        logger.warning(
+                            f"refresh: dropping shard {decimal} from the temporal section "
+                            f"— leaf {rel} did not read ({e})"
+                        )
+                        toc_failed.add(decimal)
+                        contributions.pop(decimal, None)
+                        got = None
+                    if got is not None:
+                        contributions.setdefault(decimal, []).append(got)
                 # D15: windowed stamps carry the leaf's actual time range;
                 # the rebuilt root summary re-derives the union from this
                 # walk's stamps (truth), superseding any cached value.
@@ -355,16 +416,78 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
                 stack.append(rel + "/")
     _stale_warned.discard(root)
     if not decimals:
+        from zagg.coverage_toc import delete_cover
+
         try:
             obstore.delete(store, ROOT_COVERAGE_NAME)
         except (FileNotFoundError, NotFoundError):
             pass
+        # The §10.5 sibling goes with the carrier it refines (wholesale
+        # discard; a foreign-revision object survives under succession).
+        delete_cover(store_root, **store_kwargs)
         return None
+    section = build_temporal_section(contributions, toc_fields, source="refresh")
+    cover_sec = build_cover_section(contributions, toc_fields, order, source="refresh")
+    if toc_failed:
+        # Fail-open per leaf is fail-DESTRUCTIVE in aggregate. This walk PUTs
+        # its envelope outright (no union, by design), so a section rebuilt
+        # from a partial read publishes the losses as fact, and an all-failed
+        # walk deletes the section entirely — at exactly the moment an
+        # operator reached for the escape hatch because something was already
+        # wrong. Compose with the standing section instead, through the same
+        # §10.4 seam the sweep writes across.
+        from zagg.coverage_toc import TEMPORAL_KEY, merge_cover_sections, merge_temporal_sections
+        from zagg.hive import read_root_coverage
+
+        standing = read_root_coverage(store_root, **store_kwargs)
+        section = merge_temporal_sections(
+            standing.get(TEMPORAL_KEY) if isinstance(standing, dict) else None, section
+        )
+        # The §10.5 sibling composes across the identical seam, for the
+        # identical reason: an all-failed walk must not delete it, a partial
+        # one must not publish the losses as fact.
+        try:
+            standing_cover = read_cover(store_root, **store_kwargs)
+        except ValueError:
+            standing_cover = None  # garbage cannot vouch for anything (D9)
+        try:
+            cover_sec = merge_cover_sections(standing_cover, cover_sec)
+        except (KeyError, TypeError, ValueError):
+            pass  # malformed standing cover: this walk's replaces it
+        logger.warning(
+            f"refresh: the temporal section is PARTIAL — {len(toc_failed)} shard(s) did "
+            f"not read; composing with the standing section rather than replacing it"
+        )
+    if cover_sec is not None:
+        # Sibling before marker, exactly as the sweep orders it. `replace`:
+        # this walk is whole-store by construction, so it is the §10.5
+        # authoritative rebuild (the partial case merged above already).
+        written_cover = write_cover(store_root, cover_sec, replace=True, **store_kwargs)
+        # Only ever stamp into a section at THIS revision. The merge above can
+        # hand back a standing section at an unknown revision, preserved
+        # VERBATIM under §10.4's succession rule — that producer may define
+        # `cover` differently, and "verbatim" is the whole point of the rule.
+        if (
+            isinstance(section, dict)
+            and section.get("spec") == TEMPORAL_COVERAGE_SPEC
+            and isinstance(written_cover, dict)
+            and isinstance(written_cover.get("spec"), str)
+        ):
+            section[COVER_KEY] = written_cover["spec"]
+    # No `else` arm. A whole-store walk that produced no cover input has
+    # proved nothing about the leaves — `toc_fields` is empty on a manifest
+    # that merely lost its `cell_order`, and a store whose companions are not
+    # written yet reads the same way — so the standing sibling stays standing,
+    # the posture §10.5 states ("a producer with no temporal contribution
+    # leaves the standing object untouched") and the one the sweep takes on
+    # the same evidence through `write_cover(None)`. §10.5's delete licence is
+    # scoped to the arm above, where no stamped leaf remains at all.
     envelope = build_root_coverage(
         morton_words_from_decimals(decimals),
         order,
         source="refresh",
         time_range=union_time_range(*time_ranges),
+        temporal=section,
     )
     obstore.put(store, ROOT_COVERAGE_NAME, json.dumps(envelope, indent=1).encode())
     return envelope

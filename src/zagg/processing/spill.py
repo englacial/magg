@@ -66,6 +66,7 @@ from zagg.stats.tdigest import (
     merge_tdigests,
     merge_tdigests_kway,
 )
+from zagg.time_axis import TOC_SHAPE_PER_CENTROID, TOC_WORD_COLUMN
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,9 @@ class SpillReduceError(RuntimeError):
     """
 
 
-def check_tmp_headroom(need_bytes: int, tmp_dir: str | None = None) -> None:
+def check_tmp_headroom(
+    need_bytes: int, tmp_dir: str | None = None, from_config: bool = False
+) -> None:
     """Refuse to enable spill when ``/tmp`` cannot hold its working set.
 
     Standalone spill guard (issue #217 plan: written independently of the
@@ -106,14 +109,24 @@ def check_tmp_headroom(need_bytes: int, tmp_dir: str | None = None) -> None:
     config-style ``RuntimeError`` naming the deployment fix when the spill
     directory's free space is below ``need_bytes`` — typically the block
     threshold, the most a single spill block is allowed to grow.
+
+    ``from_config`` says the requirement is derived from an operator-set
+    ``aggregation.streaming.block_bytes`` (issue #474), which puts lowering
+    that knob at the head of the remedies — otherwise the message quotes a
+    number the operator controls without naming what controls it.
     """
     tmp_dir = tmp_dir or tempfile.gettempdir()
     st = os.statvfs(tmp_dir)
     avail = st.f_bavail * st.f_frsize
     if avail < need_bytes:
+        knob = (
+            "lower aggregation.streaming.block_bytes (this requirement is derived from it), "
+            if from_config
+            else ""
+        )
         raise RuntimeError(
             f"aggregation.streaming.mode: spill needs {need_bytes:,} bytes of free "
-            f"space in {tmp_dir!r} but only {avail:,} are available; deploy on a "
+            f"space in {tmp_dir!r} but only {avail:,} are available; {knob}deploy on a "
             f"function variant with larger ephemeral storage (the '-disk' variants, "
             f"e.g. process-shard-4096-disk) or fall back to mode: merge."
         )
@@ -337,6 +350,10 @@ class _DigestField(NamedTuple):
     ``where`` the field's raw ``where`` param (a column name or expression the
     fold resolves per cell, exactly like the pooled path) or ``None``.
 
+    ``temporal`` records the spec §8.3 ``temporal: per-centroid`` declaration
+    (issue #410): its words are the DERIVED toc column, not a read column, so
+    unlike ``location`` there is no column name to carry.
+
     ``stratum`` records that the DECLARED function is ``build_tdigest_where``
     and is what selects the reducer in :meth:`SpillAggregator._fold_block` —
     never ``where``'s presence. Keying on the param would let a config drop
@@ -353,6 +370,24 @@ class _DigestField(NamedTuple):
     location: str | None
     where: object | None
     stratum: bool
+    temporal: bool
+
+
+#: A digest field's companion channels in the kernel's FIXED return order
+#: ``(digest, locations, temporal)`` — the same channels in the same order
+#: ``sweep_overview.COMPANION_CHANNELS`` folds overviews by. Per entry: the
+#: declaring :class:`_DigestField` attribute, the reducer kwarg, and the
+#: ``chunk_outputs`` emission key (``_aggregate_chunk_cells``'s — ``times``, not
+#: ``temporal``, for the §8.3 sibling). The ONLY place that order lives: every
+#: fold site zips against this tuple, so none can drift on a dict's insertion
+#: order (``strict=True`` checks a zip's length, never its order, and the two
+#: word grammars accept each other's values, so a swap would be silent).
+_CHANNELS = (("location", "locations", "locations"), ("temporal", "temporal", "times"))
+
+
+def _channels(f: _DigestField) -> tuple[tuple[str, str], ...]:
+    """``(reducer kwarg, emission key)`` per channel ``f`` declares, in kernel order."""
+    return tuple((kwarg, emit) for attr, kwarg, emit in _CHANNELS if getattr(f, attr))
 
 
 def _resolve_param(param, cell_data: dict[str, np.ndarray]):
@@ -455,8 +490,12 @@ def _default_block_bytes(n_partitions: int, tmp_dir: str | None = None) -> int:
     closing block beside the filling one, so the result is capped at 45% of
     the spill directory's current free space. A finer ``chunk_inner`` raises
     K and with it the usable block (the build unit is one partition, not the
-    block). Injectable for tests and ops via
-    ``SpillAggregator(block_bytes=...)``.
+    block). Overridable from **config** —
+    ``aggregation.streaming.block_bytes`` (issue #474), the route operators
+    take — and from ``SpillAggregator(block_bytes=...)`` for tests and ops.
+    An explicit value replaces this whole formula, 45% cap included, so the
+    constructor headroom-checks the pair it will actually hold (2x under
+    overlap); keep it at or below ~45% of the tier's ephemeral storage.
     """
     mem = _memory_budget_bytes()
     st = os.statvfs(tmp_dir or tempfile.gettempdir())
@@ -486,22 +525,23 @@ class SpillAggregator:
       the output is byte-identical to pooled **by construction**: the
       partition holds exactly the chunk's rows in global read order, so the
       stable sort reproduces the pooled per-cell slices bit for bit.
-    - **Multi block** (bytes hit the threshold — see
-      :func:`_default_block_bytes`): each closing block is reduced
+    - **Multi block** (bytes hit the threshold — ``aggregation.streaming.block_bytes``
+      when the config sets it, else :func:`_default_block_bytes`): each closing block is reduced
       partition-by-partition into running mergeable state (counts by
       summation, tdigests via ``merge_tdigests``/``merge_tdigests_kway`` —
-      including located fields and ``build_tdigest_where`` strata, whose
-      per-block builds fold under the located overloads — and composition
-      words via ``merge_composition_kway``, issue #370),
-      collapsing merge rounds from N/buffer to ~spill/threshold. A
-      config with any reducer outside the ``validate_spill_fold`` surface
-      raises :class:`SpillOverflowError` at the first crossing instead of
-      silently approximating.
+      including ``build_tdigest_where`` strata and, under the :data:`_CHANNELS`
+      overloads, companion-carrying fields — and composition words via
+      ``merge_composition_kway``), collapsing merge rounds from N/buffer to
+      ~spill/threshold. A config with any reducer outside the
+      ``validate_spill_fold`` surface raises :class:`SpillOverflowError` at the
+      first crossing instead of silently approximating.
 
     ``chunk_outputs`` returns the 5-tuple ``_aggregate_chunk_cells`` contract
-    (``stats_arrays, ragged_payloads, ragged_cell_indices, ragged_locations,
-    cells_with_data``) — one element more than StreamingAggregator, since
-    spill serves located fields.
+    (``stats_arrays, ragged_payloads, ragged_cell_indices, ragged_channels,
+    cells_with_data``) — one element more than StreamingAggregator, since spill
+    serves companion-carrying fields. Both :data:`_CHANNELS` ride BOTH regimes
+    (issue #477): single-block through the pooled machinery unchanged,
+    multi-block through the per-channel fold state below.
     """
 
     def __init__(
@@ -564,6 +604,7 @@ class SpillAggregator:
                         location=sig["location"],
                         where=params.get("where"),
                         stratum=meta.get("function") == _TDIGEST_WHERE_FUNCTION,
+                        temporal=sig["temporal"] == TOC_SHAPE_PER_CENTROID,
                     )
                 elif meta.get("function") == _COMPOSITION_FUNCTION:
                     self._composition_fields[name] = (
@@ -579,11 +620,22 @@ class SpillAggregator:
         else:
             self._n_partitions = 1
         if block_bytes is not None:
+            # An explicit threshold skips _default_block_bytes' 45%-of-free-/tmp
+            # cap, so the guard has to reserve what the run actually holds: under
+            # overlap a CLOSING block is resident beside the FILLING one
+            # (_close_block), i.e. 2x. Without the doubling any value between
+            # ~50% and 100% of free /tmp passes here and then ENOSPCs mid-shard —
+            # the failure check_tmp_headroom exists to pre-empt (issue #474).
             self.block_bytes = int(block_bytes)
-            check_tmp_headroom(max(_MIN_SPILL_BYTES, self.block_bytes), self.tmp_dir)
+            resident = self.block_bytes * (2 if overlap else 1)
+            check_tmp_headroom(max(_MIN_SPILL_BYTES, resident), self.tmp_dir, from_config=True)
         else:
             check_tmp_headroom(_MIN_SPILL_BYTES, self.tmp_dir)
             self.block_bytes = _default_block_bytes(self._n_partitions, self.tmp_dir)
+        # Whether the threshold is the operator's (aggregation.streaming.block_bytes)
+        # or disk-derived — the overflow message only offers the knob when it is
+        # actually the thing that set the number (issue #474).
+        self._block_bytes_from_config = block_bytes is not None
         self._block = SpillBlock(self.tmp_dir)
         self._closed_blocks = 0
         self._finalized = False
@@ -596,14 +648,17 @@ class SpillAggregator:
         # Cross-block mergeable running state (only ever fed on block close).
         self._counts: dict[int, int] = {}
         self._digests: dict[str, dict[int, np.ndarray]] = {n: {} for n in self._digest_fields}
-        # Located channel running state (issue #370): per-cell uint64 location
-        # vectors row-aligned with the running digests, for fields declaring
-        # ``location:`` only — the per-block build returns (digest, locations)
-        # pairs and the fold laws carry the channel through the located
-        # merge_tdigests / merge_tdigests_kway overloads.
-        self._digest_locs: dict[str, dict[int, np.ndarray]] = {
-            n: {} for n, f in self._digest_fields.items() if f.location
+        # Companion-channel running state (issues #370/#410), per field and per
+        # DECLARED channel (:data:`_CHANNELS`): the per-cell uint64 word vector
+        # row-aligned with the running digest. Every channel rides the SAME
+        # merge_tdigests / merge_tdigests_kway call as its payload, so a field
+        # declaring both never has one folded against a partition the other
+        # did not see.
+        self._digest_words: dict[str, dict[str, dict[int, np.ndarray]]] = {
+            n: {kw: {} for kw, _ in _channels(f)} for n, f in self._digest_fields.items()
         }
+        # Whether any field needs the derived toc word column at fold time.
+        self._needs_toc = any(f.temporal for f in self._digest_fields.values())
         # Composition state (issue #370): per-cell (word, n_signal), written
         # once at finalize from the per-block parts below.
         self._compositions: dict[str, dict[int, tuple[int, int]]] = {
@@ -637,11 +692,12 @@ class SpillAggregator:
         self._digest_parts: dict[str, dict[int, list[np.ndarray]]] = {
             n: {} for n, f in self._digest_fields.items() if not f.pairwise
         }
-        # Location parts stashed alongside (issue #370), index-aligned with
-        # ``_digest_parts`` so the finalize k-way collapse folds both channels
-        # in the same order-independent pass.
-        self._digest_loc_parts: dict[str, dict[int, list[np.ndarray]]] = {
-            n: {} for n, f in self._digest_fields.items() if not f.pairwise and f.location
+        # Companion words stashed alongside, index-aligned with ``_digest_parts``
+        # so the finalize k-way collapse folds every channel in the same pass.
+        self._digest_word_parts: dict[str, dict[str, dict[int, list[np.ndarray]]]] = {
+            n: {kw: {} for kw, _ in _channels(f)}
+            for n, f in self._digest_fields.items()
+            if not f.pairwise
         }
         # Per-flush unique cell words; unioned lazily by occupied_cells().
         self._occupied: list[np.ndarray] = []
@@ -740,15 +796,24 @@ class SpillAggregator:
         the sequential path. ``overlap=False`` reduces inline.
         """
         if not self._mergeable:
+            # The threshold is the operator's own number when it came from
+            # config, so raising it — the one remedy that keeps this shard in
+            # the exact single-block regime — leads the list (issue #474).
+            knob = (
+                "a larger aggregation.streaming.block_bytes (this threshold came from it), "
+                if self._block_bytes_from_config
+                else ""
+            )
             raise SpillOverflowError(
                 f"spill block hit the {self.block_bytes:,}-byte threshold but the "
                 f"config carries reducers with no cross-block fold law, so per-block "
                 f"results cannot combine (the fold covers 'len'/'count', tdigest "
-                f"fields — located, where-strata, pairwise — and the packed "
-                f"composition word; single-block spill is exact for every reducer). "
+                f"fields — located, temporal, where-strata, pairwise — and the "
+                f"packed composition word; single-block spill is exact for every "
+                f"reducer). "
                 f"{self._fold_problems}. "
-                f"Remedies: a bigger memory tier, a '-disk' function variant with "
-                f"more ephemeral storage, or a finer parent_order (smaller shards)."
+                f"Remedies: {knob}a bigger memory tier, a '-disk' function variant "
+                f"with more ephemeral storage, or a finer parent_order (smaller shards)."
             )
         if self._closed_blocks == 0:
             # Once per shard, at the moment the exact regime is left (issue
@@ -758,7 +823,8 @@ class SpillAggregator:
                 f"spill block threshold ({self.block_bytes:,} bytes) crossed: this "
                 f"shard leaves the exact single-block regime and its outputs now "
                 f"fold across blocks — digests merge under t-digest semantics, "
-                f"located centroids coarsen to common ancestors, composition takes "
+                f"located centroids coarsen to common ancestors, temporal words "
+                f"widen to their members' envelope, composition takes "
                 f"one k-way re-quantization; counts stay exact."
             )
         block = self._block
@@ -810,19 +876,20 @@ class SpillAggregator:
         strata, issue #370). Which of the two reducers runs is decided by the
         field's **declared function** (``_DigestField.stratum``), never by
         whether a ``where`` param happens to be present, so the fold can never
-        substitute a reducer the config did not declare — and then, per the
-        field's fold law: **k-way**
-        fields stash the block digest (+ locations) for one order-independent
-        collapse at finalize (:meth:`_finalize_kway`); **pairwise** fields
-        merge it into the running digest here, the located overload carrying
-        the location channel. Composition fields pack a per-block ``(word,
-        n_signal)`` pair (``pack_composition_n`` — the same predicate and
-        bytes as the pooled reducer) and stash it for the same finalize
-        collapse (``merge_composition_kway``). Either way it is one build round
-        per block instead of per buffer — the ~6x merge-CPU collapse the design targets
-        (issue #279).
+        substitute a reducer the config did not declare. A ``temporal:
+        per-centroid`` field (spec §8.3) additionally rides the derived toc word
+        column, encoded per cell below as the pooled path does and passed as the
+        build's ``temporal=`` channel. Then, per the field's fold law: **k-way**
+        fields stash the block digest (+ every declared channel's words) for the
+        order-independent collapse at finalize (:meth:`_finalize_kway`);
+        **pairwise** fields merge it into the running digest here, the companion
+        overloads carrying the channels. Composition fields stash a per-block
+        ``pack_composition_n`` ``(word, n_signal)`` pair — the same predicate and
+        bytes as the pooled reducer — for the same finalize collapse
+        (``merge_composition_kway``). Either way it is one build round per block
+        instead of per buffer (the ~6x merge-CPU collapse of issue #279).
         """
-        from zagg.processing.aggregate import _group_columns
+        from zagg.processing.aggregate import _group_columns, _toc_word_column
 
         self._check_fold_columns(block.schema)
         for key in block.partition_keys():
@@ -838,37 +905,53 @@ class SpillAggregator:
                 # and the strata config declares two complementary `where`
                 # fields over the same source.
                 cell_data = {col: arr[start:end] for col, arr in col_arrays.items()}
+                if self._needs_toc:
+                    # The derived toc word column (spec §8.3), encoded where the
+                    # pooled path encodes it — right after the namespace is
+                    # built (``calculate_cell_statistics``) — so the two
+                    # ``cell_data`` dicts match and a ``where`` reading the
+                    # column resolves identically. Per cell, not once per
+                    # partition: this path exists because memory is scarce, and
+                    # the encode's transient allocation is unbudgeted by
+                    # ``_default_block_bytes`` / ``_BUILD_MULT``.
+                    cell_data[TOC_WORD_COLUMN] = _toc_word_column(cell_data, self.config)
                 for name, f in self._digest_fields.items():
                     values = cell_data[f.source]
-                    locs = cell_data[f.location] if f.location else None
+                    declared = _channels(f)  # every zip below is against THIS tuple
+                    chans = {
+                        kw: cell_data[f.location if kw == "locations" else TOC_WORD_COLUMN]
+                        for kw, _ in declared
+                    }
                     if f.stratum:
                         where = _resolve_param(f.where, cell_data)
-                        built = build_tdigest_where(
-                            values, delta=f.delta, where=where, locations=locs
-                        )
+                        built = build_tdigest_where(values, delta=f.delta, where=where, **chans)
                     else:
-                        built = build_tdigest(values, delta=f.delta, locations=locs)
-                    fresh, fresh_locs = built if f.location else (built, None)
+                        built = build_tdigest(values, delta=f.delta, **chans)
+                    # ``(digest, *words)`` with any channel declared, the bare
+                    # digest without — the kernel's arity contract.
+                    fresh, *words = built if declared else (built,)
                     if not f.pairwise:
                         self._digest_parts[name].setdefault(cell, []).append(fresh)
-                        if f.location:
-                            self._digest_loc_parts[name].setdefault(cell, []).append(fresh_locs)
+                        parts = self._digest_word_parts[name]
+                        for (kw, _), vec in zip(declared, words, strict=True):
+                            parts[kw].setdefault(cell, []).append(vec)
                         continue
+                    running = self._digest_words[name]
                     held = self._digests[name].get(cell)
                     if held is None:
                         self._digests[name][cell] = fresh
-                        if f.location:
-                            self._digest_locs[name][cell] = fresh_locs
-                    elif f.location:
-                        merged, merged_locs = merge_tdigests(
-                            held,
-                            fresh,
-                            delta=f.delta,
-                            locations1=self._digest_locs[name][cell],
-                            locations2=fresh_locs,
-                        )
+                        for (kw, _), vec in zip(declared, words, strict=True):
+                            running[kw][cell] = vec
+                    elif declared:
+                        # Both channels ride ONE merge (kwargs ``{kw}1``/``{kw}2``),
+                        # so the words describe the digest this call produced.
+                        pairs = {}
+                        for (kw, _), vec in zip(declared, words, strict=True):
+                            pairs[f"{kw}1"], pairs[f"{kw}2"] = running[kw][cell], vec
+                        merged, *merged_words = merge_tdigests(held, fresh, delta=f.delta, **pairs)
                         self._digests[name][cell] = merged
-                        self._digest_locs[name][cell] = merged_locs
+                        for (kw, _), vec in zip(declared, merged_words, strict=True):
+                            running[kw][cell] = vec
                     else:
                         self._digests[name][cell] = merge_tdigests(held, fresh, delta=f.delta)
                 for name, (source, params) in self._composition_fields.items():
@@ -883,21 +966,27 @@ class SpillAggregator:
 
         Covers every column the fold resolves out of the block: a field's
         ``source`` and ``location``, a stratum's ``where``, and a composition
-        field's ``conf_*`` params (the hand-written ones — five per field — and
-        the ones whose failure mode is worst; see :func:`_unresolvable_names`).
-        A column the block never carried would surface as a bare
-        ``KeyError`` raised on the overlap reducer thread, which
-        :meth:`_join_reducer` re-wraps as :class:`SpillReduceError` with the real
-        cause reachable only via ``__cause__`` — a materially worse diagnostic
-        than ``calculate_cell_statistics``'s named ``ValueError`` for the same
-        config error, and one that only appears on shards big enough to close a
-        block. Checked once per block against the block schema, off the per-cell
-        loop. An empty block (nothing appended, so no schema) has nothing to
-        fold and nothing to check.
+        field's ``conf_*`` params (see :func:`_unresolvable_names`). A column the
+        block never carried would otherwise surface as a bare ``KeyError`` on the
+        overlap reducer thread, which :meth:`_join_reducer` re-wraps as
+        :class:`SpillReduceError` with the real cause reachable only via
+        ``__cause__`` — materially worse than ``calculate_cell_statistics``'s
+        named ``ValueError`` for the same config error, and visible only on
+        shards big enough to close a block. Checked once per block against the
+        block schema, off the per-cell loop; an empty block has nothing to check.
         """
         available = sorted(name for name, _ in schema or [])
         if not available:
             return
+        # The derived toc word column is not spilled — ``_fold_block`` encodes it
+        # per cell — but it IS resolvable there, as on the pooled path, so a
+        # ``where`` reading it is not a missing column. It stays OUT of
+        # ``available``, which is the block's true contents: the source/location
+        # messages must not advertise ``toc_word``, and a ``location: toc_word``
+        # must still raise here rather than reach ``mortie.common_ancestor``. An
+        # absent CLOCK column is named by ``_toc_word_column``, with the pooled
+        # path's message.
+        resolvable = sorted([*available, TOC_WORD_COLUMN]) if self._needs_toc else available
         for name, f in self._digest_fields.items():
             if f.source not in available:
                 raise ValueError(
@@ -910,7 +999,7 @@ class SpillAggregator:
                     f"column is not in the spilled block (available: {available}); "
                     f"per-observation mortons require a HEALPix grid"
                 )
-            missing = _unresolvable_names(f.where, available)
+            missing = _unresolvable_names(f.where, resolvable)
             if missing:
                 raise ValueError(
                     f"ragged field {name!r} declares where: {f.where!r}, which names "
@@ -929,7 +1018,7 @@ class SpillAggregator:
             # _resolve_param as a literal string and dies inside
             # np.column_stack naming neither the field nor the column.
             for pname, pval in params.items():
-                missing = _unresolvable_names(pval, available) if pname.startswith("conf_") else ()
+                missing = _unresolvable_names(pval, resolvable) if pname.startswith("conf_") else ()
                 if missing:
                     raise ValueError(
                         f"field {name!r} param {pname}: {pval!r} names {list(missing)}, "
@@ -943,12 +1032,12 @@ class SpillAggregator:
         Runs once, after the final block is folded and before the first emission.
         The single-pass k-way merge is order-independent (t-digest merge is not
         associative), so the result does not depend on block reduce order — the
-        property #280 relies on to parallelize the reducer. A located field's
-        location parts collapse in the same pass (the located
-        ``merge_tdigests_kway`` overload), keeping both channels row-aligned —
-        and the location channel is order-independent too, since the located
-        merge breaks ``(mean, weight)`` ties on the location word itself
-        (issue #370). Composition parts collapse the same way
+        property #280 relies on to parallelize the reducer. A companion-carrying
+        field's word parts collapse in the SAME pass (the ``merge_tdigests_kway``
+        channel overloads, in :data:`_CHANNELS` order), keeping every channel
+        row-aligned with the payload — and order-independent too, since the merge
+        breaks ``(mean, weight)`` ties on the words themselves, location tertiary
+        and toc quaternary. Composition parts collapse the same way
         (``merge_composition_kway`` over the block ``(word, n_signal)`` pairs:
         one weighted lane mean, quantized once), so a reducer parallelized
         under #280 inherits the property on all three channels rather than
@@ -957,14 +1046,21 @@ class SpillAggregator:
         for name, cell_parts in self._digest_parts.items():
             f = self._digest_fields[name]
             dest = self._digests[name]
-            if f.location:
-                loc_parts = self._digest_loc_parts[name]
-                dest_locs = self._digest_locs[name]
+            word_parts = self._digest_word_parts[name]
+            declared = _channels(f)  # ``_CHANNELS`` order, as in _fold_block
+            if declared:
+                dest_words = self._digest_words[name]
                 for cell, parts in cell_parts.items():
-                    dest[cell], dest_locs[cell] = merge_tdigests_kway(
-                        parts, delta=f.delta, locations=loc_parts[cell]
+                    folded = merge_tdigests_kway(
+                        parts,
+                        delta=f.delta,
+                        **{kw: word_parts[kw][cell] for kw, _ in declared},
                     )
-                loc_parts.clear()
+                    dest[cell] = folded[0]
+                    for (kw, _), vec in zip(declared, folded[1:], strict=True):
+                        dest_words[kw][cell] = vec
+                for by_cell in word_parts.values():
+                    by_cell.clear()
             else:
                 for cell, parts in cell_parts.items():
                     dest[cell] = merge_tdigests_kway(parts, delta=f.delta)
@@ -1010,6 +1106,7 @@ class SpillAggregator:
             self.config,
             self._data_vars,
             agg_fields,
+            chunk_pooled=chunk_pooled,
         )
 
     def _load_partition(self, key: int) -> None:
@@ -1086,9 +1183,15 @@ class SpillAggregator:
             stats_arrays[name] = np.full(n_cells, fill, dtype=dtype)
         ragged_payloads: dict[str, list] = {n: [] for n in self._digest_fields}
         ragged_cell_indices: dict[str, list[int]] = {n: [] for n in self._digest_fields}
-        # Located fields only (issue #87): keyed presence tells the worker to
-        # deliver the 3-tuple ragged contract, mirroring _aggregate_chunk_cells.
-        ragged_locs: dict[str, list] = {n: [] for n, f in self._digest_fields.items() if f.location}
+        # Companion-carrying fields only: keyed presence tells the worker which
+        # sibling slots to deliver, mirroring _aggregate_chunk_cells — the same
+        # :data:`_CHANNELS` emission keys in the same order, so a folded chunk
+        # and a pooled one are indistinguishable to the writer.
+        ragged_channels: dict[str, dict[str, list]] = {
+            n: {emit: [] for _, emit in _channels(f)}
+            for n, f in self._digest_fields.items()
+            if _channels(f)
+        }
         cells_with_data = 0
         for i, child in enumerate(children):
             cell = int(child)
@@ -1109,9 +1212,11 @@ class SpillAggregator:
                 if digest is not None and digest.size > 0:
                     ragged_payloads[name].append(digest)
                     ragged_cell_indices[name].append(i)
-                    if name in ragged_locs:
-                        ragged_locs[name].append(self._digest_locs[name][cell])
-        return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_locs, cells_with_data
+                    if name in ragged_channels:
+                        running = self._digest_words[name]
+                        for kw, emit in _channels(self._digest_fields[name]):
+                            ragged_channels[name][emit].append(running[kw][cell])
+        return stats_arrays, ragged_payloads, ragged_cell_indices, ragged_channels, cells_with_data
 
     def close(self) -> None:
         """Release every spill fd and the cached partition (idempotent).

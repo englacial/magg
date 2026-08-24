@@ -22,6 +22,10 @@ data_source:
     longitude: "/{group}/heights/lon_ph"
   variables:
     h_ph: "/{group}/heights/h_ph"
+    # Per-photon transmit time, the clock the section-8.3 temporal companion
+    # encodes from (issue #410). Photon-rate on ATL03 (heights/delta_time), so
+    # no segment broadcast is needed.
+    delta_time: "/{group}/heights/delta_time"
   filters:
     - dataset: "/{group}/heights/signal_conf_ph"
       column: 0                  # land surface type; TEP is uniform across columns
@@ -66,13 +70,37 @@ aggregation:
       function: "zagg.stats.tdigest.build_tdigest"
       source: h_ph
       location: leaf_id
+      # Per-centroid toc words beside the located ones (spec section 8.3, issue
+      # #410): the envelope of the photons merged into each centroid, exact to
+      # the nanosecond while a centroid is one photon. Per-centroid at EVERY
+      # pyramid level, symmetric with the located channel (espg-ruled
+      # 2026-08-17). Stored as the {field}_times sibling, bound from the
+      # payload's `times` attr. NOTE zagg.readers has no helper for this channel
+      # yet: read_locations binds the section 9 `ragged.locations` key only, and
+      # read_raw_values decodes a (n, 2) digest, not a flat word vector. Until
+      # one exists, decode the sibling directly -- it is an ordinary ragged
+      # uint64 vlen array whose element dtype/shape its own `ragged` attrs
+      # declare -- and interpret the words with mortie (toc_is_range, toc2time).
+      temporal: per-centroid
       inner_shape: [2]
       params:
-        delta: 256
+        delta: 8192              # leaf centroid budget: loss-free bound (issues #414/#424)
+      overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
       dtype: float32
       fill_value: 0
 
 output:
+  # The store's per-observation clock (issue #410): the column a temporal
+  # companion's toc words are encoded from, plus the conversion that reaches the
+  # grammar's continuous scale. ATLAS `delta_time` is GPS-continuous seconds
+  # since the SDP epoch, so `scale: gps` is exact offset arithmetic -- no leap
+  # table in the hot path. A `utc`-scale column would be refused by name (spec
+  # section 8.3 wants an instant exact to the nanosecond).
+  time_source:
+    field: delta_time
+    epoch: "2018-01-01T00:00:00"
+    scale: gps
+    units: seconds
   grid:
     type: healpix
     indexing_scheme: nested

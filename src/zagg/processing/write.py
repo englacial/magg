@@ -17,7 +17,7 @@ from zagg.config import (
     get_agg_fields,
     get_output_signature,
 )
-from zagg.grids.base import ragged_locations_name
+from zagg.grids.base import ragged_locations_name, ragged_times_name
 from zagg.grids.morton import is_morton_array, is_morton_arrow, morton_to_arrow, morton_words
 
 
@@ -449,7 +449,10 @@ def write_ragged_to_zarr(
         ``cell_ids`` are positions in THIS chunk's ``children`` block. A located
         field (issue #87) arrives as ``(values_list, cell_ids, locations_list)``
         and additionally writes the sibling ``{field}_locations`` uint64 vlen
-        array, row-aligned with the payload.
+        array, row-aligned with the payload; a field carrying the §8.3
+        per-centroid temporal channel (issue #410) adds a fourth element,
+        ``times_list``, written to ``{field}_times`` under the same row
+        alignment.
     store : Store
         Zarr store with the template (including the ragged arrays) present.
     grid : OutputGrid
@@ -628,15 +631,43 @@ def write_leaf_to_zarr(
 
 
 def _ragged_entry(entry) -> tuple:
-    """Normalize a ragged sink entry to ``(values_list, cell_ids, locations_list)``.
+    """Normalize a ragged sink entry to ``(values, cell_ids, locations, times)``.
 
-    Located fields (issue #87) deliver the 3-tuple; unlocated fields keep the
-    2-tuple contract (``locations_list`` is ``None``).
+    Three arities, all live: the 2-tuple is an unlocated field, the 3-tuple a
+    located one (issue #87), and the 4-tuple additionally carries the §8.3
+    per-centroid temporal channel (issue #410). Absent channels normalize to
+    ``None``, so a caller reads one shape whatever the producer sent.
     """
-    if len(entry) == 3:
+    if len(entry) == 4:
         return entry
+    if len(entry) == 3:
+        values_list, cell_ids, locations_list = entry
+        return values_list, cell_ids, locations_list, None
     values_list, cell_ids = entry
-    return values_list, cell_ids, None
+    return values_list, cell_ids, None, None
+
+
+#: The sink entry's companion slots, in order — the positional contract
+#: :func:`_ragged_entry` reads back.
+RAGGED_CHANNELS = ("locations", "times")
+
+
+def _channel_entry(channels: dict) -> tuple:
+    """A field's declared companion channels as the sink entry's trailing slots.
+
+    ``channels`` is the aggregation stage's ``{channel: [per-cell words]}`` for
+    one field (:func:`zagg.processing.aggregate._aggregate_chunk_cells`). Returns
+    the slots :data:`RAGGED_CHANNELS` names, truncated after the last declared
+    one, so a field with no companion still yields the historical 2-tuple and a
+    located-only field the historical 3-tuple — byte-identical sink entries for
+    every config written before spec §8.3. A field declaring ``times`` without
+    ``locations`` gets an explicit ``None`` in the location slot, which
+    :func:`_ragged_entry` already reads as "no location channel".
+    """
+    slots = [channels.get(label) for label in RAGGED_CHANNELS]
+    while slots and slots[-1] is None:
+        slots.pop()
+    return tuple(slots)
 
 
 def _ragged_sig(name: str, grid) -> dict:
@@ -675,14 +706,15 @@ def _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_
     cells land in ``slabs[...][region]`` at their ``cell_ids`` position within
     the chunk (row-major over ``grid.chunk_shape``, grid-agnostic via
     ``np.unravel_index``). A located field (issue #87) fills the sibling
-    ``{name}_locations`` slab row-aligned with the payload, with the same
-    per-cell length contract ``write_csr`` enforced.
+    ``{name}_locations`` slab row-aligned with the payload, and a temporal
+    one (spec §8.3, issue #410) the ``{name}_times`` slab under the same rule
+    — both with the per-cell length contract ``write_csr`` enforced.
     """
     inner_shape = tuple(int(s) for s in grid.chunk_shape)
     for name, entry in (ragged or {}).items():
         if name in chunk_res_fields:
             continue  # chunk companion — written per chunk block
-        values_list, cell_ids, locations_list = _ragged_entry(entry)
+        values_list, cell_ids, locations_list, times_list = _ragged_entry(entry)
         if len(values_list) != len(cell_ids):
             raise ValueError(
                 f"values_list (len {len(values_list)}) and cell_ids (len {len(cell_ids)}) "
@@ -692,34 +724,42 @@ def _accumulate_ragged_slabs(ragged, slabs, region, grid, slab_shape, chunk_res_
         if name not in slabs:
             slabs[name] = np.full(slab_shape, b"", dtype=object)
         out = slabs[name][region]
-        loc_out = None
-        if locations_list is not None:
-            if len(locations_list) != len(values_list):
+        # The uint64 companion channels, in one shape: (channel label,
+        # sibling array name, per-cell word lists, that sibling's slab view).
+        companions = []
+        for label, sibling, channel in (
+            ("locations", ragged_locations_name(name), locations_list),
+            ("times", ragged_times_name(name), times_list),
+        ):
+            if channel is None:
+                continue
+            if len(channel) != len(values_list):
                 raise ValueError(
-                    f"locations_list (len {len(locations_list)}) and values_list "
+                    f"{label}_list (len {len(channel)}) and values_list "
                     f"(len {len(values_list)}) must have the same length"
                 )
-            loc_name = ragged_locations_name(name)
-            if loc_name not in slabs:
-                slabs[loc_name] = np.full(slab_shape, b"", dtype=object)
-            loc_out = slabs[loc_name][region]
-        loc_sig = {"kind": "ragged", "inner_shape": (), "dtype": "uint64"}
+            if sibling not in slabs:
+                slabs[sibling] = np.full(slab_shape, b"", dtype=object)
+            companions.append((label, sibling, channel, slabs[sibling][region]))
+        word_sig = {"kind": "ragged", "inner_shape": (), "dtype": "uint64"}
         width = int(np.prod(sig.get("inner_shape") or ()))  # prod(()) == 1
-        locs = locations_list if locations_list is not None else [None] * len(values_list)
-        for cid, value, loc in zip(cell_ids, values_list, locs):
+        for row, (cid, value) in enumerate(zip(cell_ids, values_list)):
             payload = _ragged_payload_bytes(name, value, sig)
             pos = np.unravel_index(int(cid), inner_shape)
-            if loc is not None and loc_out is not None:
+            for label, sibling, channel, sib_out in companions:
+                words = channel[row]
+                if words is None:
+                    continue
                 n_rows = np.asarray(value).size // width
-                loc_arr = np.asarray(loc)
-                if loc_arr.shape != (n_rows,):
+                word_arr = np.asarray(words)
+                if word_arr.shape != (n_rows,):
                     raise ValueError(
-                        f"locations for cell {int(cid)} of {name!r} have shape "
-                        f"{loc_arr.shape}, expected ({n_rows},) to stay row-aligned "
+                        f"{label} for cell {int(cid)} of {name!r} have shape "
+                        f"{word_arr.shape}, expected ({n_rows},) to stay row-aligned "
                         f"with the payload"
                     )
                 if n_rows:
-                    loc_out[pos] = _ragged_payload_bytes(loc_name, loc_arr, loc_sig)
+                    sib_out[pos] = _ragged_payload_bytes(sibling, word_arr, word_sig)
             if payload:
                 out[pos] = payload
 
@@ -741,12 +781,13 @@ def _write_ragged_companions(ragged, store, grid, block_index, chunk_res_fields)
     for name, entry in (ragged or {}).items():
         if name not in chunk_res_fields:
             continue
-        values_list, _cell_ids, locations_list = _ragged_entry(entry)
-        if locations_list is not None:
-            raise ValueError(
-                f"ragged field {name!r} is resolution: chunk but carries a location "
-                f"channel; located ragged fields are cell-resolution only"
-            )
+        values_list, _cell_ids, locations_list, times_list = _ragged_entry(entry)
+        for label, channel in (("location", locations_list), ("temporal", times_list)):
+            if channel is not None:
+                raise ValueError(
+                    f"ragged field {name!r} is resolution: chunk but carries a {label} "
+                    f"channel; companion channels are cell-resolution only"
+                )
         chunk_payload = _chunk_uniform_ragged(name, values_list)
         if chunk_payload is None:
             continue  # whole chunk is fill — nothing to record

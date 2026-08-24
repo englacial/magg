@@ -166,6 +166,213 @@ def _broadcast_segment_to_base(
     return out
 
 
+def link_base_extent(index_beg_arr, count_arr, index_base: int) -> int:
+    """Length of the base array a record link tiles (issue #452).
+
+    ``max(index_beg - index_base + count)`` over the non-empty records: the last
+    base row any record reaches, which is the extent every consumer of a link
+    needs — :func:`zagg.read_plan.plan_read`'s ``base_end`` clamp, the gather
+    maps, the broadcasts.
+
+    On a **contiguous** product (records tile the base array end to end — #43's
+    assumption, ATL03's shape) this IS ``Σcount``, so substituting it is a
+    no-op. On a **strided** one it is not: GEDI L1B allocates a fixed
+    1,420-sample window per shot in ``rxwaveform`` while ``rx_sample_count`` is
+    the valid-sample count (61–1,420, typically ~700), so ``Σcount``
+    understates the flat array by ~50%, every planned run clamps to
+    ``base_end <= base_start``, and the whole read silently returns zero rows
+    (issue #452).
+
+    Empty records contribute nothing: ``count == 0`` marks them and their
+    origin-1 sentinel start (0) is not a real position (issue #116) — the same
+    skip :func:`_expand_mask_to_base` and :func:`_broadcast_segment_to_base`
+    apply. An all-empty link has extent 0.
+    """
+    beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
+    cnt = np.asarray(count_arr).astype(np.int64)
+    nonempty = cnt > 0
+    if not nonempty.any():
+        return 0
+    return int((beg[nonempty] + cnt[nonempty]).max())
+
+
+def _validate_link_disjoint(
+    index_beg_arr, count_arr, index_base: int, level: str | None = None
+) -> None:
+    """Refuse a link whose non-empty records overlap (issue #452).
+
+    Disjointness is the link grammar's standing precondition (#43's contiguity
+    assumption, minus the requirement that the ranges also *tile* — a strided
+    product leaves gaps). Until now it was assumed everywhere and checked
+    nowhere: the paint maps (:func:`zagg.processing.read_vlen.expand_link_indices`,
+    :func:`zagg.processing.read_vlen._planned_gather_map`,
+    :func:`_broadcast_segment_to_base`) validate only ``beg >= 0`` and
+    ``beg + cnt <= n_base``, and *resolve* an overlap by paint order — a later
+    record silently shadows an earlier one.
+
+    That mattered because the route carries two independently-derived owner
+    maps: paint order above, and last-start-wins in
+    :func:`_link_parent_at_rows`. On disjoint records they agree exactly (3,000
+    randomized links, 0 divergences); on overlapping ones they do not, and the
+    disagreement is per-row and silent — coordinates and the synthesized column
+    would come from one record while a companion variable and any record-level
+    filter verdict came from another. Validating here, once per level where the
+    link is first assembled, turns the precondition into enforced truth: a
+    malformed product now fails loudly instead of writing mismatched columns.
+
+    Empty records (``count == 0``) own no rows and are skipped (issue #116).
+    """
+    beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
+    cnt = np.asarray(count_arr).astype(np.int64)
+    nonempty = np.flatnonzero(cnt > 0)
+    if nonempty.size < 2:
+        return
+    order = nonempty[np.argsort(beg[nonempty], kind="stable")]
+    beg_sorted = beg[order]
+    end_sorted = beg_sorted + cnt[order]
+    bad = np.flatnonzero(beg_sorted[1:] < end_sorted[:-1])
+    if bad.size:
+        i = int(bad[0])
+        where = f" on level {level!r}" if level is not None else ""
+        raise ValueError(
+            f"link records{where} overlap: record {int(order[i])} covers base rows "
+            f"[{int(beg_sorted[i])}:{int(end_sorted[i])}] but record {int(order[i + 1])} "
+            f"starts at {int(beg_sorted[i + 1])}; the link grammar requires disjoint "
+            f"record ranges"
+        )
+
+
+def _link_parent_at_rows(
+    index_beg_arr, count_arr, index_base: int, base_rows: np.ndarray
+) -> np.ndarray:
+    """Owning record index per given base row, ``-1`` where none (issue #452).
+
+    The planned-rate twin of the paint-and-slice loops above: instead of
+    building a length-``n_base`` array and selecting the read's rows out of it,
+    each requested row's record is located directly, with one ``searchsorted``
+    over the link's starts. On the vlen route ``n_base`` is sample rate (~2·10^8
+    per GEDI beam group) while ``base_rows`` is the plan's rows (~3·10^5), so
+    the difference is a 2 GB worker surviving or not (the issue #43 OOM
+    posture, applied to the expansion side).
+
+    Records must not overlap — the link grammar's contract, enforced by
+    :func:`_validate_link_disjoint` where each level's link is assembled, since
+    this derivation (last start at or before the row wins) and the paint maps'
+    (later record shadows earlier) agree only on disjoint records. Ties on an
+    identical start resolve to the later record either way, matching the paint
+    order of :func:`_broadcast_segment_to_base`. Empty records (``count == 0``)
+    own nothing (issue #116).
+    """
+    beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
+    cnt = np.asarray(count_arr).astype(np.int64)
+    rows = np.asarray(base_rows, dtype=np.int64)
+    nonempty = np.flatnonzero(cnt > 0)
+    if nonempty.size == 0 or rows.size == 0:
+        return np.full(rows.shape, -1, dtype=np.int64)
+    order = nonempty[np.argsort(beg[nonempty], kind="stable")]
+    pos = np.searchsorted(beg[order], rows, side="right") - 1
+    inside = pos >= 0
+    owner = order[np.where(inside, pos, 0)]
+    inside &= rows < beg[owner] + cnt[owner]
+    return np.where(inside, owner, -1)
+
+
+def _expand_mask_at_rows(
+    coarse_mask: np.ndarray,
+    index_beg_arr,
+    count_arr,
+    index_base: int,
+    base_rows: np.ndarray,
+) -> np.ndarray:
+    """:func:`_expand_mask_to_base` restricted to ``base_rows`` (issue #452).
+
+    Identical to ``_expand_mask_to_base(...)[base_rows]`` — a row owned by no
+    record is ``False`` there and here — without the length-``n_base``
+    intermediate (196 MB per cross-level filter on a GEDI beam group).
+
+    Equivalence includes the *scope* of the ``beg < 0`` refusal: the base-rate
+    form checks it inside a loop the predicate guard has already ``continue``\\ d
+    past, so a record the predicate rejects is never validated. Widening that to
+    every non-empty record would fail-hard on a granule the production route
+    reads fine (a malformed start on a record that is filtered out anyway), so
+    the keep-mask is part of the test here too.
+    """
+    keep = np.asarray(coarse_mask, dtype=bool)
+    beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
+    cnt = np.asarray(count_arr).astype(np.int64)
+    bad = keep & (cnt > 0) & (beg < 0)
+    if bad.any():
+        p = int(np.argmax(bad))
+        raise ValueError(
+            f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
+        )
+    parent = _link_parent_at_rows(index_beg_arr, count_arr, index_base, base_rows)
+    valid = parent >= 0
+    return keep[np.where(valid, parent, 0)] & valid
+
+
+def _gather_segment_at_rows(
+    seg_values: np.ndarray,
+    index_beg_arr,
+    count_arr,
+    index_base: int,
+    total_base_size: int,
+    base_rows: np.ndarray,
+) -> np.ndarray:
+    """:func:`_broadcast_segment_to_base` restricted to ``base_rows`` (issue #452).
+
+    Identical to ``_broadcast_segment_to_base(...)[base_rows]``, fill semantics
+    included (``NaN`` for float dtypes on a row no record owns, zero otherwise),
+    without the length-``n_base`` intermediate — one per segment-level variable,
+    which on GEDI's six per-shot companions is ~7 GB against a 2 GB worker.
+    """
+    beg = np.asarray(index_beg_arr).astype(np.int64) - index_base
+    cnt = np.asarray(count_arr).astype(np.int64)
+    nonempty = cnt > 0
+    bad = nonempty & (beg < 0)
+    if bad.any():
+        p = int(np.argmax(bad))
+        raise ValueError(
+            f"index_beg_arr[{p}]={index_beg_arr[p]} is less than index_base={index_base}"
+        )
+    over = nonempty & (beg + cnt > total_base_size)
+    if over.any():
+        p = int(np.argmax(over))
+        raise ValueError(
+            f"segment {p} range [{beg[p]}:{beg[p] + cnt[p]}] exceeds base size "
+            f"{total_base_size}; the segment-level variable's link does not tile "
+            f"the read's base extent"
+        )
+    parent = _link_parent_at_rows(index_beg_arr, count_arr, index_base, base_rows)
+    valid = parent >= 0
+    return _gather_segment_at_parents(seg_values, np.where(valid, parent, 0), valid)
+
+
+def _gather_segment_at_parents(
+    seg_values: np.ndarray, parent_safe: np.ndarray, valid: np.ndarray
+) -> np.ndarray:
+    """The gather half of :func:`_gather_segment_at_rows`, owner map supplied.
+
+    Split out so a caller that is ALREADY holding the per-row owner map does not
+    derive a second one (issue #452 review). On the vlen route the coordinates
+    level's gather map is exactly that map, and the shipped GEDI template hangs
+    six companion variables off that same level: without this the route ran six
+    searchsorted derivations of a map it had in hand, by a different rule (last
+    start wins) than the one that produced it (paint order) — two owner maps
+    that have to agree, where one will do.
+
+    ``parent_safe`` is the owner index per row with unowned rows clamped to 0
+    and flagged in ``valid``; unowned rows take the same fill
+    :func:`_broadcast_segment_to_base` gives an untiled row (``NaN`` for float
+    dtypes, zero otherwise).
+    """
+    seg_values = np.asarray(seg_values)
+    out = seg_values[parent_safe]
+    if not valid.all():
+        out[~valid] = np.nan if np.issubdtype(seg_values.dtype, np.floating) else 0
+    return out
+
+
 def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
     """Collect declared segment-level (non-base) readable variables (issue #30).
 
@@ -177,6 +384,11 @@ def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
     ``chunk_precompute`` can reduce. Returns ``{level_key: {name: template}}`` for
     every non-base level carrying a dict ``variables``; empty when none do, so the
     read path is unchanged for configs without it.
+
+    Asset-sourced entries (the ``{asset, path}`` mapping form, issue #464) are
+    excluded: they read the PAIRED granule via the sibling join, never this
+    handle — the vlen route collects them separately
+    (:func:`zagg.processing.read_vlen.asset_variable_specs`).
     """
     levels = data_source.get("levels")
     base_level = data_source.get("base_level")
@@ -188,12 +400,21 @@ def _segment_level_variables(data_source: dict) -> dict[str, dict[str, str]]:
             continue
         lvl_vars = lvl.get("variables")
         if isinstance(lvl_vars, dict) and lvl_vars:
-            out[name] = dict(lvl_vars)
+            plain = {k: v for k, v in lvl_vars.items() if not isinstance(v, dict)}
+            if plain:
+                out[name] = plain
     return out
 
 
 def _read_segment_broadcasts(
-    h5obj, group: str, data_source: dict, levels: dict, n_base: int, read_fn=None
+    h5obj,
+    group: str,
+    data_source: dict,
+    levels: dict,
+    n_base: int,
+    read_fn=None,
+    base_rows: np.ndarray | None = None,
+    parents_by_level: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict[str, np.ndarray]:
     """Read each segment-level variable and broadcast it to a base-rate column (issue #30).
 
@@ -203,6 +424,18 @@ def _read_segment_broadcasts(
     ``{name: base_rate_array}`` (length ``n_base``), ready to be sliced through the
     same spatial / keep masks the base-rate variables are. A variable name colliding
     with a ``data_source.variables`` column is rejected (it would shadow the read).
+
+    ``base_rows`` (issue #452) hands back the same values at the read's rows only
+    — length ``len(base_rows)``, gathered via :func:`_gather_segment_at_rows`
+    instead of built at length ``n_base`` and sliced. The vlen route passes its
+    plan's rows: ``n_base`` is sample rate there, so the base-rate form costs
+    ~1.2 GB per companion variable on a GEDI beam group.
+
+    ``parents_by_level`` maps a level key to a ``(parent_safe, valid)`` owner map
+    the caller already holds, for levels whose link the caller has already
+    resolved per row. Those levels skip both the link read and the owner
+    derivation and gather straight off the supplied map — one derivation, one
+    truth (issue #452 review). Levels absent from it are resolved as before.
     """
     seg_vars = _segment_level_variables(data_source)
     if not seg_vars:
@@ -210,18 +443,25 @@ def _read_segment_broadcasts(
     base_cols = set(data_source.get("variables", {}))
     out: dict[str, np.ndarray] = {}
     for level_key, mapping in seg_vars.items():
-        lvl = levels[level_key]
-        link = lvl["link"]
-        index_base = int(link.get("index_base", 0))
-        ibeg_path = link["index_beg"].format(group=group)
-        cnt_path = link["count"].format(group=group)
-        if read_fn is None:
-            link_data = h5obj.readDatasets([ibeg_path, cnt_path])
-            ibeg_arr = link_data[ibeg_path]
-            cnt_arr = link_data[cnt_path]
-        else:
-            ibeg_arr = read_fn(ibeg_path)
-            cnt_arr = read_fn(cnt_path)
+        held = (parents_by_level or {}).get(level_key)
+        if held is None:
+            lvl = levels[level_key]
+            link = lvl["link"]
+            index_base = int(link.get("index_base", 0))
+            ibeg_path = link["index_beg"].format(group=group)
+            cnt_path = link["count"].format(group=group)
+            if read_fn is None:
+                link_data = h5obj.readDatasets([ibeg_path, cnt_path])
+                ibeg_arr = link_data[ibeg_path]
+                cnt_arr = link_data[cnt_path]
+            else:
+                ibeg_arr = read_fn(ibeg_path)
+                cnt_arr = read_fn(cnt_path)
+            # First assembly of this level's link on this route: refuse
+            # overlapping records once here rather than let the two owner
+            # derivations disagree per row further down (issue #452). A level
+            # the caller already resolved was validated where it was assembled.
+            _validate_link_disjoint(ibeg_arr, cnt_arr, index_base, level=level_key)
         for col_name, tmpl in mapping.items():
             if col_name in base_cols:
                 raise ValueError(
@@ -233,9 +473,16 @@ def _read_segment_broadcasts(
                 seg_values = np.asarray(h5obj.readDatasets([seg_path])[seg_path])
             else:
                 seg_values = np.asarray(read_fn(seg_path))
-            out[col_name] = _broadcast_segment_to_base(
-                seg_values, ibeg_arr, cnt_arr, index_base, n_base
-            )
+            if held is not None:
+                out[col_name] = _gather_segment_at_parents(seg_values, held[0], held[1])
+            elif base_rows is None:
+                out[col_name] = _broadcast_segment_to_base(
+                    seg_values, ibeg_arr, cnt_arr, index_base, n_base
+                )
+            else:
+                out[col_name] = _gather_segment_at_rows(
+                    seg_values, ibeg_arr, cnt_arr, index_base, n_base, base_rows
+                )
     return out
 
 
@@ -441,13 +688,14 @@ def _planned_read_group(
         _record_obs_read(io_stats, 0)
         return None
 
-    # ``n_base`` under #43's contiguity assumption ("ranges do not overlap and
-    # together tile the full base array" -- :func:`_expand_mask_to_base`).
-    # ``int(cnt_arr.sum())`` makes the assumption explicit and is identical to
-    # ``ibeg_arr[-1] - index_base + cnt_arr[-1]`` when contiguity holds. If a
-    # future granule format drops trailing photons or gaps between parents,
-    # either form under- or over-estimates -- track via a follow-up to #43.
-    n_base = int(np.asarray(cnt_arr).sum())
+    # ``n_base`` is the extent the coarse link tiles: the last base row any
+    # non-empty parent reaches (:func:`link_base_extent`, issue #452). On this
+    # route's contiguous products (#43's assumption: ranges neither overlap nor
+    # leave holes) that is exactly ``Σcount``, so the plan below is unchanged;
+    # deriving it from the link instead makes the route correct for a strided
+    # product too, where ``Σcount`` understates the array and clamps every run
+    # to an empty slice.
+    n_base = link_base_extent(ibeg_arr, cnt_arr, index_base)
     if n_base <= 0:
         _record_obs_read(io_stats, 0)
         return None
@@ -731,12 +979,20 @@ def _read_group(
     arrow: bool = False,
     granule_url: str | None = None,
     io_stats: dict | None = None,
+    siblings: dict | None = None,
 ):
     """Read and spatially filter one HDF5 group.
 
     Returns a ``pandas.DataFrame`` (default) or, when ``arrow=True``, an
     ``arro3.core.Table`` carrying the identical columns. Returns ``None`` when the
     group has no observations in this shard.
+
+    When ``data_source.coordinates.level`` names a record level (issue #425),
+    the group is a vlen-packed product (GEDI-style): coordinates expand from
+    the record level and the flat base datasets are gathered by the record
+    link — see :mod:`zagg.processing.read_vlen`. ``siblings`` (open h5coro
+    handles per sibling-asset name, from a paired-asset shard map) is consumed
+    only by that route's asset filters and ignored elsewhere.
 
     When ``data_source.read_plan.chunk_boundaries`` is set (issue #148 arm 2a),
     the read is planned a priori from the granule's chunk-boundary parquet —
@@ -773,6 +1029,23 @@ def _read_group(
     by the dispatcher after the read completes — no lock (the point-path
     analogue of the raster ``io_stats`` sink). ``None`` counts nothing.
     """
+    # Vlen-packed sources (issue #425) dispatch on the coordinates.level key
+    # before the plan-shape branches below — the vlen route owns its own
+    # planned/full arms (read_plan.spatial_index must name the record level).
+    coords = data_source.get("coordinates")
+    if isinstance(coords, dict) and coords.get("level") is not None:
+        from zagg.processing.read_vlen import _vlen_read_group
+
+        return _vlen_read_group(
+            h5obj,
+            group,
+            data_source,
+            shard_key,
+            grid,
+            arrow=arrow,
+            io_stats=io_stats,
+            siblings=siblings,
+        )
     rp = data_source.get("read_plan")
     # Presence check, not truthiness: an empty/misconfigured ``chunk_boundaries``
     # block must fail loudly inside the a-priori path (missing ``prefix``), not

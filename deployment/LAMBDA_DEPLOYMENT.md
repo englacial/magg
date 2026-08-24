@@ -3,9 +3,8 @@
 > **Status: maintainer notes — partially out of date (audited against the code
 > 2026-06-15, see [#34](https://github.com/englacial/zagg/issues/34)).** The
 > canonical, rendered deploy docs live in the docs site:
-> [Standing Up the Backend](../docs/deployment/standup.md) (preferred path),
-> [AWS Lambda](../docs/deployment/lambda.md), and
-> [Execution Role](../docs/deployment/execution-role.md). This file keeps the
+> [Standing Up the Backend](../docs/deployment/standup.md) (preferred path)
+> and [AWS Lambda](../docs/deployment/lambda.md). This file keeps the
 > build/layer internals and the size/cost rationale; several figures below
 > (layer/function sizes, the role/bucket names, the layer contents) are
 > historical and were not all re-measured — trust the scripts
@@ -23,19 +22,28 @@ x86_64 / py3.12 is available for local/testing parity.
 - **Architecture**: arm64 (default; x86_64 also supported)
 - **Layer**: `zagg-deps-{arch}` (py3.12; contents defined by `build_layer.sh` — see below)
 - **Function code**: `lambda_handler.py` + `zagg/` package + obstore/zarr/pydantic-zarr/pyyaml
-- **Role**: created by `template.yaml` (CloudFormation-auto-named; the template
-  sets no `RoleName`), scoped least-privilege to the `OutputBucketName` bucket
-  you pass to `stand_up.sh` — *not* a fixed `zagg-lambda-execution`/`xagg`. (The
-  dependency layer is named `<FunctionName>-deps`, default `process-shard-deps`.
-  The legacy `deploy.sh` in-place updater still defaults `ZAGG_S3_BUCKET=xagg`
-  for its >50MB staging copies; that is the updater's staging bucket, not the
-  output bucket.)
+- **Role**: created by `template.yaml` with an explicit, stable `RoleName` —
+  the `ExecutionRoleName` parameter, default `zagg-lambda-execution` (issue
+  #495). The name is a cross-organization contract, since Source Cooperative
+  names the ARN in their bucket policy, so a second stack in the same account
+  must override `EXECUTION_ROLE_NAME`. It reaches three destinations: the
+  `OutputBucketName` bucket you pass to `stand_up.sh`, the public
+  `sliderule-public-cors` bucket (whole-bucket, by intent — PR #176; being
+  retired, issue #499, and its sidecar-cache successor is **not** the
+  source.coop prefix below — a different bucket under a different org, post-MVP
+  and not yet chosen), and zagg's published prefix on Source Cooperative
+  (`us-west-2.opendata.source.coop/englacial/zagg/demo/*`, plus bucket-level
+  `ListBucket`). (The dependency layer is named `<FunctionName>-deps`, default
+  `process-shard-deps`. The legacy `deploy.sh` in-place updater still defaults
+  `ZAGG_S3_BUCKET=xagg` for its >50MB staging copies; that is the updater's
+  staging bucket, not the output bucket.)
 
 ### What's in the layer vs function code
 
-**Layer** (built by `build_layer.sh` — the normative build entry point; its pins
-are co-owned with the `lambda` extra in `pyproject.toml`, and mortie's version
-spec is read from `pyproject.toml` at build time — issue #322):
+**Layer** (built by `build_layer.sh` — the normative build entry point; it holds
+no pins of its own: every exact pin is read out of the `lambda` extra in
+`pyproject.toml` at build time by its `lambda_pin` helper, as mortie's version
+spec already was — issue #322, PR #436):
 numpy, pandas, arro3-core, fastparquet, cramjam, xarray, h5netcdf, h5py, shapely,
 pyproj, odc-geo, affine, cachetools, h5coro, h5coro-hidefix, mortie, async-tiff,
 obspec, and their transitive deps. (`earthaccess` is orchestrator-only and
@@ -96,11 +104,16 @@ GB-seconds per full run, this saves ~$0.60/run. Over many runs it adds up.
 ### The build (containerized — the one normative path)
 
 `deployment/aws/build_layer.sh` is the normative build entry point for the layer
-(package set, numpy page-alignment build, bloat strip, 250 MB gate). Its pins
-are co-owned with the `lambda` extra in `pyproject.toml` — the script says "keep
-in sync" at each one — and mortie's spec is read out of `pyproject.toml`
-directly (issue #322), so a floor bump there reaches the layer with no second
-edit. Do not hand-maintain a parallel pip recipe.
+(package set, numpy page-alignment build, bloat strip, 250 MB gate). It declares
+no versions itself: the `lambda` extra in `pyproject.toml` is the sole edit site,
+and the script derives every exact pin from it at build time (PR #436) with the
+`lambda_pin` helper — `NAME_PIN=$(lambda_pin <dist>)` before any install —
+extending the mortie spec read that issue #322 introduced. So a version change
+in the extra reaches the layer with no second edit, and a *literal* pin
+reintroduced into the script is a second declaration site that
+`tests/test_lambda_build.py::TestLayerExtraParity` fails on (as it does on a pin
+derived but never passed to a `$PIP install` line). Do not hand-maintain a
+parallel pip recipe.
 
 The script must run inside an arch-matched `manylinux_2_28` container (cp312),
 and it hard-fails on a mismatch (`ERROR: building <arch> layer on <machine>
@@ -138,8 +151,9 @@ docker run --rm \
 On an SELinux-enforcing Linux host, add `:z` to the podman volume mount
 (`-v "$(pwd)":/workspace:z`). Without it the container cannot *read* the
 unlabeled mount either, so the build dies at the top (`chmod +x build_layer.sh`,
-or reading `../../pyproject.toml` for `MORTIE_SPEC`) rather than at zip-write
-time. Note `:z` relabels the mount **recursively with a shared label** — and the
+or the first `../../pyproject.toml` read — since PR #436 that is every
+`lambda_pin` call, before any install, not just `MORTIE_SPEC`) rather than at
+zip-write time. Note `:z` relabels the mount **recursively with a shared label** — and the
 mount here is the whole repo root, not a scratch dir; `:Z` is the private-label
 variant. Neither is needed on macOS (`podman machine`).
 

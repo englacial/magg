@@ -52,6 +52,78 @@ _S3_READONLY_RETRY_CONFIG = {
 }
 
 
+# Cross-account object ownership on external writes (issue #495). S3 object
+# ownership follows the WRITING account, so under the ``ObjectWriter`` setting a
+# cross-account PUT without this canned ACL creates objects the BUCKET owner can
+# neither manage nor delete. Source Cooperative's in-region upload path (their
+# "Option 3" grant) requires it for exactly that reason -- it is what retires the
+# ``data.source.coop`` proxy hop, and with it the egress the CA campaign paid.
+# Since phase 3 the fleet reaches that bucket with the AMBIENT execution role,
+# so the trigger is the destination bucket (:data:`_PUBLISHED_BUCKETS`) as well
+# as injected credentials -- see :func:`_external_target`.
+# The value is correct in all three Object Ownership modes: ``BucketOwnerEnforced``
+# ignores ACLs, but AWS explicitly carves out this one canned value instead of
+# failing the request, so it is sent unconditionally rather than gated on the
+# target's configuration.
+#
+# obstore exposes no ACL config key (``aws_acl``/``acl``/``x-amz-acl`` all raise
+# ``UnknownConfigurationKeyError``), so it rides as a default request header --
+# verified end-to-end against a real ACL-enabled bucket, and traced per-request
+# against a local endpoint. obstore applies ``default_headers`` on the reqwest
+# client, i.e. AFTER object_store signs, so the header rides OUTSIDE the
+# signature: ``x-amz-acl`` never appears in ``SignedHeaders``, and AWS accepts it
+# because S3 ignores unsigned non-required ``x-amz-*`` on header-auth requests --
+# it would NOT survive a presigned-URL path, which rejects unsigned ``x-amz-*``.
+# The header rides ``CreateMultipartUpload`` (``POST ?uploads``) as well as a
+# single-shot ``PUT``, and that is the load-bearing half: the create request is
+# what sets a multipart object's ACL (``UploadPart``/``CompleteMultipartUpload``
+# ignore it), and at ~131 MB/shard multipart is the normal write path. S3
+# interprets ``x-amz-acl`` only on object-creating requests, so a GET/LIST issued
+# by the same store carries the header inertly. That inertness is what makes the
+# one route that cannot tell reads from writes safe: ``open_object_store`` has no
+# read-only concept, so its credentialed callers -- including
+# ``temporal.open_dataset``'s NetCDF branch, a pure GET of a consumer INPUT
+# bucket (issue #223) -- still send the header. ``open_store(read_only=True)``
+# does not: it knows, so it is gated (see ``_s3_object_store``).
+_BUCKET_OWNER_ACL = "bucket-owner-full-control"
+
+# Buckets this account writes to but does not OWN, reached with the ambient
+# execution role (issue #495). Since phase 3 the fleet publishes to Source
+# Cooperative as itself -- no injected credentials -- so "did the caller pass
+# credentials?" no longer separates our buckets from theirs, and keying the
+# canned ACL on that alone would silently publish owner-less objects. The
+# destination is the thing that decides, so the destination is what the
+# predicate reads. A fixed external fact, of the same class as the literal
+# bucket ARNs in ``deployment/aws/template.yaml``: this is the bucket named in
+# Source Cooperative's grant, and it changes only when that grant does.
+#
+# Deliberately NOT "every AWS-endpoint write": the header requires
+# ``s3:PutObjectAcl`` on the target, which zagg holds on this bucket alone --
+# sending it everywhere would 403 every self-hoster's own output bucket and
+# ``sliderule-public-cors``, whose bucket policy is not ours to change.
+_PUBLISHED_BUCKETS = frozenset({"us-west-2.opendata.source.coop"})
+
+
+def _external_target(credentials, endpoint_url, bucket=None) -> bool:
+    """Whether these store kwargs describe a target this account does not own.
+
+    True on either route to a not-ours destination: explicit write credentials
+    against the AWS endpoint (the un-negotiated targets injection still exists
+    for), or an ambient write to a bucket in :data:`_PUBLISHED_BUCKETS`. A
+    custom ``endpoint_url`` excludes both, unchanged.
+
+    The issue #495 predicate, in one place because it has a second caller
+    outside this module: ``zagg.lifecycle``'s skip-run touch re-creates objects
+    with a boto3 ``CopyObject`` -- an object-CREATING request that never passes
+    through :func:`_s3_object_store` -- and must apply
+    :data:`_BUCKET_OWNER_ACL` on exactly this condition, or it strips the
+    ownership an earlier PUT handed over.
+    """
+    if endpoint_url:
+        return False
+    return bool(credentials) or bucket in _PUBLISHED_BUCKETS
+
+
 def open_store(
     path: str,
     read_only: bool = False,
@@ -83,6 +155,18 @@ def open_store(
         :data:`_S3_READONLY_RETRY_CONFIG` when ``read_only=True``; and
         ``skip_signature=True`` for anonymous reads of public buckets (no
         AWS credentials needed, e.g. binder).
+
+    Notes
+    -----
+    A write target this account does not own makes the store send
+    ``x-amz-acl: bucket-owner-full-control`` on every request, so the bucket
+    owner owns what it writes (issue #495; see :data:`_BUCKET_OWNER_ACL`). Two
+    shapes qualify: explicit ``credentials`` without an ``endpoint_url``, and an
+    ambient write to a bucket in :data:`_PUBLISHED_BUCKETS` (Source Cooperative,
+    which the execution role now reaches directly). ``read_only=True``
+    suppresses it: a read opened with explicit credentials is the issue #223
+    consumer-INPUT channel (somebody else's input bucket, as
+    ``temporal.open_dataset`` opens it), not a write target of ours.
 
     Returns
     -------
@@ -137,6 +221,19 @@ def open_object_store(
     extra ``kwargs``) are cached per process and reused across calls (issue #287)
     -- this is the sidecar manifest-fetch hot path. Every other call builds a
     fresh store, unchanged.
+
+    Side-channel objects are real writes to the output store (status envelopes,
+    hive manifests, stats sidecars, the temporal tabular object), so the
+    external-target canned ACL applies here exactly as it does to
+    :func:`open_store` -- both routes share :func:`_s3_object_store`, so an
+    ambient write to a published bucket carries the header here too, cached
+    store included (the cache is keyed by path, and the path is what decides)
+    (issue #495). Known exception: this route has no ``read_only`` concept, so a
+    credentialed READER built through it sends the header too -- notably
+    ``temporal.open_dataset``'s NetCDF branch, a pure GET of a consumer-input
+    bucket (issue #223). It is inert there (S3 interprets ``x-amz-acl`` only on
+    object-creating requests); ``open_store(read_only=True)``, which can tell,
+    suppresses it.
     """
     if path.startswith("s3://"):
         if credentials is None and endpoint_url is None and not kwargs:
@@ -182,7 +279,13 @@ def _open_s3_store(
         # on the constant). Set here so _s3_object_store's write-policy
         # default doesn't kick in; an explicit caller retry_config still wins.
         kwargs["retry_config"] = _S3_READONLY_RETRY_CONFIG
-    s3 = _s3_object_store(path, credentials=credentials, endpoint_url=endpoint_url, **kwargs)
+    s3 = _s3_object_store(
+        path,
+        credentials=credentials,
+        endpoint_url=endpoint_url,
+        read_only=read_only,
+        **kwargs,
+    )
     return ObjectStore(store=s3, read_only=read_only)
 
 
@@ -190,9 +293,15 @@ def _s3_object_store(
     path: str,
     credentials: dict | None = None,
     endpoint_url: str | None = None,
+    read_only: bool = False,
     **kwargs,
 ):
-    """Build the raw obstore ``S3Store`` for ``path`` (credential rules above)."""
+    """Build the raw obstore ``S3Store`` for ``path`` (credential rules above).
+
+    ``read_only`` is consumed here, never forwarded to ``S3Store`` (obstore has
+    no such option): it only gates the issue #495 canned ACL, since a read
+    opened with explicit credentials is an input we do not write.
+    """
     from obstore.store import S3Store
 
     bucket, prefix = parse_s3_path(path)
@@ -205,6 +314,32 @@ def _s3_object_store(
     # _POLL_RETRY_CONFIG). obstore only reads it at construction, but a
     # future mutation of one store's config must not edit a shared global.
     kwargs["retry_config"] = copy.deepcopy(kwargs["retry_config"])
+
+    if (
+        _external_target(credentials, endpoint_url, bucket)
+        and not read_only
+        and not kwargs.get("skip_signature")
+    ):
+        # A WRITE target this account does not own (issue #495), reached either
+        # way: injected credentials against the AWS endpoint (the ambient
+        # execution role covers every in-account store, so injected write
+        # credentials exist precisely to write somewhere else), or an ambient
+        # write to a published bucket -- which is how the fleet reaches Source
+        # Cooperative since phase 3, and is why this gate reads the BUCKET and
+        # not just the credential shape.
+        #
+        # ``read_only`` is the other shape of injected credentials -- the issue
+        # #223 consumer-INPUT channel reading somebody else's bucket -- and is
+        # excluded, as is ``skip_signature`` (an anonymous public read). A
+        # custom ``endpoint_url`` is excluded deliberately, and that exclusion
+        # covers TWO shapes: the S3-compatible stores behind that knob (R2,
+        # MinIO) do not implement canned ACLs at all, so the header would be
+        # noise at best there; and an endpoint-routed AWS target (the retired
+        # ``data.source.coop`` proxy hop was reached exactly that way) is
+        # excluded with them. Retiring that hop -- and the egress it paid -- is
+        # what this header buys, so the exclusion costs nothing under the
+        # no-egress rule.
+        kwargs["client_options"] = _with_bucket_owner_acl(kwargs.get("client_options"))
 
     if credentials or endpoint_url:
         opts = {
@@ -242,6 +377,34 @@ def _s3_object_store(
             **kwargs,
         )
     return s3
+
+
+def _with_bucket_owner_acl(client_options):
+    """Merge the issue #495 canned ACL into obstore ``client_options``.
+
+    Additive rather than replacing: any other client option survives, and an
+    ``x-amz-acl`` the caller set explicitly wins -- the header is a default for
+    external targets, not an override of a caller who knows better.
+
+    Caller header keys are lowercased first, which is lossless (obstore
+    lowercases them itself) and is what makes that precedence real: a
+    mixed-case ``X-Amz-Acl`` would slip past the ``setdefault`` and then lose
+    to our key inside obstore, where last insertion wins.
+
+    Passing ``{"x-amz-acl": None}`` in ``default_headers`` REMOVES the header
+    instead of setting one -- the escape hatch for a future external AWS target
+    that must send no ACL at all. It exists because neither obstore-legal value
+    can express absence (obstore rejects a ``None`` header value, and ``""`` is
+    a live empty ``x-amz-acl`` S3 rejects), and it keeps the derivation itself
+    knob-free: no config surface, no per-run flag.
+    """
+    options = dict(client_options or {})
+    headers = {str(k).lower(): v for k, v in (options.get("default_headers") or {}).items()}
+    headers.setdefault("x-amz-acl", _BUCKET_OWNER_ACL)
+    if headers["x-amz-acl"] is None:
+        del headers["x-amz-acl"]
+    options["default_headers"] = headers
+    return options
 
 
 def parse_s3_path(path: str) -> tuple[str, str]:

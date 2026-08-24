@@ -1,0 +1,311 @@
+# GEDI L1B waveform flux t-digest (HEALPix, hive store layout) -- issue #425.
+# The vlen-grammar template (issue #422 rulings): GEDI is pure config -- the
+# three generic primitives (origin-aware ragged gather, expand-by-count,
+# linspace coordinate synthesis) turn each waveform sample into an ordinary
+# flux-weighted point observation; nothing here is sensor code.
+#
+# Catalog build (off-config, the CMRSource path): provider LPCLOUD,
+# collections GEDI01_B_002 (primary) + GEDI02_A_002 (sibling), joined at
+# ShardMap.build(..., sibling_catalog=l2a_catalog) -- pairless granules are
+# excluded and reported (metadata["pairless"]).
+#
+# The HDF5 paths below follow the GEDI V002 product layout. The test suite
+# drives them over a synthetic mini-granule keyed off these same strings, so
+# it pins the GRAMMAR wiring, not the product dictionary: a wrong path fails
+# on the first real granule. Verification against real GEDI01_B / GEDI02_A
+# granules is part of the #426 fleet validation -- the L2A trio, and
+# rx_assess/rx_clipbin_count in particular (a per-algorithm or deeper dataset
+# would make `op: le, value: 0` admit or reject every shot), is what to check
+# there first.
+data_source:
+  shard_workers: 4               # measured optimized envelope (run 5d081b68):
+                                 # workers=4 on the 4096-disk tier runs 300 s/shard
+                                 # at 60% memory (vs 587-757 s serial on 8192,
+                                 # run 8344cde5) for identical output. If a denser
+                                 # AOI pinches 4096 on MEMORY at workers=4, drop
+                                 # shard_workers to 2 before raising the tier --
+                                 # but not for a SpillOverflowError, which this
+                                 # knob cannot move (see worker.extra_disk).
+  reader: h5coro
+  driver: s3
+  # DAAC S3 credentials are per-DAAC: GEDI is LP DAAC's lp-prod-protected,
+  # which the NSIDC default cannot read -- the 403 comes back as an empty
+  # body, so every granule read raises memoryview(None) and the shard reports
+  # "No data after filtering" (issue #449, first-fleet-run failure).
+  credentials_provider: lpdaac
+  index:
+    backend: hierarchical      # pinned: an ABSENT block resolves to inline since
+                               # issue #170, and inline's chunk-map B-tree walk
+                               # strands 4 MiB h5coro cache lines on GEDI (issue
+                               # #460). Re-benchmark inline on GEDI after #460
+                               # lands before flipping.
+  groups: [BEAM0000, BEAM0001, BEAM0010, BEAM0011, BEAM0101, BEAM0110, BEAM1000, BEAM1011]
+  coordinates:
+    # The base (sample) level carries no native coordinates: lat/lon expand
+    # from the shot level by rx_sample_count (the vlen expand primitive).
+    latitude: "/{group}/geolocation/latitude_bin0"
+    longitude: "/{group}/geolocation/longitude_bin0"
+    level: shots
+  variables:
+    rxwaveform: "/{group}/rxwaveform"
+    elevation:
+      # Per-sample elevation synthesized as linspace(elevation_bin0,
+      # elevation_lastbin, rx_sample_count) within each shot -- endpoints
+      # exact, never read at sample rate.
+      synthesize: linspace
+      level: shots
+      start: "/{group}/geolocation/elevation_bin0"
+      stop: "/{group}/geolocation/elevation_lastbin"
+  base_level: samples
+  levels:
+    samples:
+      path: "/{group}"
+      link: null
+    shots:
+      path: "/{group}/geolocation"
+      coordinates: {latitude: latitude_bin0, longitude: longitude_bin0}
+      link:
+        to: samples
+        index_beg: "/{group}/rx_sample_start_index"
+        count: "/{group}/rx_sample_count"
+        index_base: 1            # rx_sample_start_index is ORIGIN-1 (GEDI product dictionary)
+      variables:
+        # Per-shot L1B pass-throughs, broadcast to sample rate (plain
+        # companion names per the issue #422 ruling).
+        shot_number: "/{group}/shot_number"
+        # The clock the section-8.3 temporal companion encodes from (issue
+        # #410). Shot-rate on GEDI, so it broadcasts to sample rate here: every
+        # sample of one waveform shares its shot's instant, which is what makes
+        # a single-shot cell's centroids exact timestamps.
+        delta_time: "/{group}/geolocation/delta_time"
+        noise_mean: "/{group}/noise_mean_corrected"
+        noise_stddev: "/{group}/noise_stddev_corrected"
+        rx_energy: "/{group}/rx_energy"
+        elevation_bin0: "/{group}/geolocation/elevation_bin0"
+        elevation_lastbin: "/{group}/geolocation/elevation_lastbin"
+        digital_elevation_model:
+          # Asset-sourced shot variable (issue #464): read from the paired L2A
+          # sibling via the shot_number join, broadcast to sample rate like the
+          # companions above. Powers the geolocation-validity gate below only —
+          # filter-only, not stored (per-shot L2A companions: issue #465).
+          asset: l2a
+          path: "/{group}/digital_elevation_model"
+  assets:
+    # The paired L2A sibling (one shardmap, {l1b, l2a} per entry), joined by
+    # shot_number. After the retrieval-fitness filters were dropped (espg
+    # ruling 2026-08-17, refs #425) the one consumed L2A dataset is the
+    # saturation counter ``rx_assess/rx_clipbin_count`` -- L1B carries no such
+    # per-shot assessment, and clipped waveforms are radiometrically invalid,
+    # so the join stays core to the flux currency (issue #422 ruling).
+    l2a:
+      join:
+        left: "/{group}/shot_number"
+        right: "/{group}/shot_number"
+  filters:
+    # Two VALIDITY gates only -- geolocation validity and saturation. The L2A
+    # retrieval-fitness gates (quality_flag == 1, sensitivity >= 0.9) are
+    # deliberately NOT here (espg ruling 2026-08-17, refs #425 / issue #422):
+    #   - They gate GROUND-RETRIEVAL fitness, not waveform validity, and
+    #     quality_flag already contains a sensitivity test internally, so the
+    #     AND is brutally tight -- measured on a real SERC granule, 1.61% of
+    #     shots pass quality_flag and 0 of 434 in-shard shots survive the
+    #     joint stack.
+    #   - zagg's own ratified clip policy IS the signal criterion (issue #422:
+    #     the declared false-positive operating point against each shot's
+    #     noise model), so a second, differently-derived signal gate would
+    #     double-count.
+    #   - Sensitivity gating biases the flux store against low-SNR /
+    #     dense-canopy shots, asymmetrically vs the ATL03 products.
+    # Sensitivity stays per-shot recoverable downstream through the L2A join
+    # on shot_number.
+    - level: shots
+      dataset: "/{group}/geolocation/degrade"
+      op: eq
+      value: 0
+    - asset: l2a
+      dataset: "/{group}/rx_assess/rx_clipbin_count"   # saturation counter: 0 = unclipped
+      op: le
+      value: 0
+    # DEM-referenced geolocation-validity gate (issue #464): epoch-poisoned
+    # absolute geolocation passes degrade == 0 (2019-121 ≈ +860 m, 2023-031 ≈
+    # +5.8 km constant offsets — the first flux store's kilometer-span cells),
+    # so gate the waveform window's MIDPOINT against the L2A DEM (espg ruling
+    # 2026-08-17: midpoint form, not elev_lowestmode — tests geolocation
+    # without entangling retrieval quality). A third VALIDITY gate, distinct
+    # from the excluded retrieval-fitness gates above. DEM-void (NaN) shots
+    # drop by plain expression semantics — including DEM-void water shots;
+    # revisiting that inclusion is tracked in issue #465.
+    - expression: "abs((elevation_bin0 + elevation_lastbin)/2 - digital_elevation_model) <= 200"
+  read_plan:
+    spatial_index: shots
+    pad: 1
+
+aggregation:
+  # o9 shards are NOT light at GEDI density: the first successful run (run
+  # 8344cde5, issue #460) read 50-82 M rows/shard pre-clip (21-33 M kept) --
+  # the pooled-mode assumption here reasoned about post-clip density and
+  # undersized the envelope. The other GEDI failure rounds had unrelated
+  # causes (issue #449 DAAC credentials, issue #452 read-plan striding, issue
+  # #460 inline cache-line residency -- the index.backend: hierarchical pin
+  # above is what unblocked that one, not this streaming block). Spill wrote
+  # 1.6-2.5 GB /tmp per shard with spill_blocks_closed: 0 (exact single-block
+  # regime, pooled-identical results). Pairs with worker.extra_disk below.
+  streaming:
+    mode: spill
+    buffer_granules: 8           # optimized probe (run 5d081b68): 8 with
+                                 # shard_workers 4 held container HWM at 2,472 MB
+                                 # (60% of the 4096 tier), identical output
+  coordinates:
+    morton:
+      dtype: uint64
+      fill_value: 0
+  variables:
+    count:
+      function: len
+      source: rxwaveform
+      dtype: int32
+      fill_value: 0
+    rx_flux:
+      # Per-cell flux-weighted elevation digest: (k, 2) ragged payload of
+      # (elevation, photoelectron-weight) centroids over the shared t-digest
+      # compress path; sum(weights) estimates the cell's detected
+      # photoelectrons. Loss-free below delta, so single-shot cells
+      # reconstruct the clipped waveform exactly (stored rows + companions).
+      kind: ragged
+      function: "zagg.stats.waveform.build_waveform_digest"
+      source: elevation
+      # Per-centroid toc words (spec section 8.3, issue #410). Ruling 2 called
+      # for GEDI's companion per CELL; the 2026-08-17 amendment makes every
+      # companion per-centroid, and the honesty property is unchanged -- all of
+      # a shot's samples carry its one instant, so a single-shot cell's
+      # centroids are exact timestamps and only genuinely pooled cells produce
+      # ranges. One shape means readers bind one contract across sensors.
+      temporal: per-centroid
+      inner_shape: [2]
+      dtype: float32
+      fill_value: 0
+      # weights: flux            # PR #431 rebase: the section-2.0 weights
+      #                          # declaration lands there; enable on rebase.
+      params:
+        delta: 8192              # ratified cross-sensor floor (issue #422, decision 7)
+        counts: rxwaveform       # params-as-column: per-sample ADC values
+        noise_mean: noise_mean
+        noise_stddev: noise_stddev
+        gain: 1.0
+        false_positive_rate: 1.0e-3
+        samples_per_record: 1420 # nominal GEDI rx window length
+        correlation_length: 5    # receiver noise correlation, samples
+      attrs:
+        # Provenance (issue #321 field attrs): the named/versioned gain and
+        # the declared operating point the clip threshold derives from.
+        gain_name: "unit"
+        gain_version: "gedi01b-v002-placeholder"
+        gain: 1.0
+        clip: "threshold-to-zero"
+        operating_point:
+          false_positive_rate: 1.0e-3
+          samples_per_record: 1420
+          correlation_length: 5
+    shot_count:
+      # Distinct shots contributing to the cell; the per-shot companions
+      # below are valid exactly when it is 1.
+      function: "zagg.stats.waveform.shot_count"
+      source: shot_number
+      dtype: int32
+      fill_value: 0
+    shot_number:
+      # The shot id when unique, sentinel 0 when pooled (issue #422 ruling).
+      function: "zagg.stats.waveform.shot_number"
+      source: shot_number
+      dtype: uint64
+      fill_value: 0
+    noise_mean:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: noise_mean
+      dtype: float32
+      fill_value: "NaN"
+    noise_stddev:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: noise_stddev
+      dtype: float32
+      fill_value: "NaN"
+    rx_energy:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: rx_energy
+      dtype: float32
+      fill_value: "NaN"
+    elevation_bin0:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: elevation_bin0
+      dtype: float64
+      fill_value: "NaN"
+    elevation_lastbin:
+      function: "zagg.stats.waveform.single_shot_value"
+      source: elevation_lastbin
+      dtype: float64
+      fill_value: "NaN"
+
+output:
+  # The store's per-observation clock (issue #410). GEDI `delta_time` shares
+  # ICESat-2's convention: seconds on the CONTINUOUS GPS scale since
+  # 2018-01-01. Verified against two real granules rather than assumed --
+  # BEAM0000/ancillary/master_time_epoch reads exactly 1198800018.000000 in
+  # GEDI01_B_2019128… and GEDI01_B_2020024…, i.e. the 2018-01-01 epoch in
+  # leap-aware GPS seconds (a naive UTC count would be 1198800000; the +18 is
+  # GPS-UTC at 2018). That is what admits `scale: gps` here -- a nominal-UTC
+  # column would be refused by name (spec section 8.3's nanosecond MUST).
+  time_source:
+    field: delta_time
+    epoch: "2018-01-01T00:00:00"
+    scale: gps
+    units: seconds
+  grid:
+    type: healpix
+    indexing_scheme: nested
+    parent_order: 9              # shard / dispatch unit
+    chunk_inner: 12              # inner Zarr chunk: 4^(18-12) = 64x64 cells
+    sharded: true
+    child_order: 18              # leaf cell resolution (~20 m, ~GEDI footprint)
+  store_layout: hive
+  pyramid: false                 # composability none initially (issue #422)
+
+worker:
+  memory: 4096                   # optimized probe (run 5d081b68, 4/4 green):
+                                 # process-shard-4096-disk at shard_workers 4 /
+                                 # buffer_granules 8 -> 300 s/shard, worker
+                                 # max_memory 2,464 MB / container HWM 2,472 MB
+                                 # (60% of tier), $0.069/run vs $0.286 at
+                                 # 8192/serial (run 8344cde5), identical output.
+                                 # Fallback ladder, BY FAILURE MODE:
+                                 #   memory pinch (OOM / container HWM near the
+                                 #     tier) -> shard_workers 4 -> 2, then raise
+                                 #     the tier; shard_workers is what bounds
+                                 #     concurrent in-memory read buffers.
+                                 #   SpillOverflowError (block close, see below)
+                                 #     -> the 8192-disk tier (10240 MB /tmp,
+                                 #     4608 MB threshold) or a finer
+                                 #     parent_order. shard_workers is INERT for
+                                 #     this one: it does not change total
+                                 #     spilled bytes, only in-flight buffers.
+  extra_disk: true               # the -disk twin sizes /tmp at memory + 2048 MB,
+                                 # so 6144 MB here. The spill block-close
+                                 # threshold is min(0.2 x memory x K, 0.45 x free
+                                 # /tmp); K = 4^(12-9) = 64 puts the memory term
+                                 # at ~52 GB, so /tmp always dominates -> ~2765
+                                 # MB. Measured spill is 1.6-2.5 GB/shard (run
+                                 # 8344cde5), a ~1.16x margin on the worst shard,
+                                 # and f_bavail is read live so anything else in
+                                 # /tmp eats into it. Clearing the threshold for
+                                 # a 2.5 GB block needs ~5.6 GB free /tmp, not
+                                 # 2.5 GB: /tmp holds the closing block beside
+                                 # the filling one, which is what the 45% is for.
+                                 # This is a cliff, not a slope, because the
+                                 # config is EXACT-SINGLE-BLOCK-ONLY --
+                                 # validate_spill_fold rejects it
+                                 # (build_waveform_digest and the
+                                 # single_shot_value companions have no
+                                 # cross-block fold law), so a threshold
+                                 # crossing raises SpillOverflowError instead of
+                                 # degrading. spill_blocks_closed: 0 is a
+                                 # PRECONDITION of these results, not merely an
+                                 # observation of them.

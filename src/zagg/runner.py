@@ -46,7 +46,9 @@ from zagg.config import (
     get_store_layout,
     get_store_path,
     get_sweep,
+    get_touch_policy,
     get_windowing,
+    validate_config,
 )
 from zagg.dispatch import (
     BENIGN_ERRORS,
@@ -164,6 +166,7 @@ def agg(
     max_retries: int = 3,
     invocation: str = "async",
     force_cold: bool = False,
+    allow_contraction: bool = False,
     events=None,
     on_progress=None,
 ) -> dict:
@@ -211,10 +214,12 @@ def agg(
     output_credentials : dict, optional
         Explicit credentials for writing the output store (camelCase
         ``accessKeyId``/``secretAccessKey``/``sessionToken``). Omit to use
-        the ambient credential chain / execution role (writes to in-account
-        buckets, unchanged behavior). Supply to write an external or
-        S3-compatible target (e.g. source.coop). Runtime-only -- never read
-        from config.
+        the ambient credential chain / execution role, which reaches the
+        in-account buckets, ``sliderule-public-cors``, AND zagg's published
+        prefix on Source Cooperative (issue #495). Supply only for a target we
+        have not negotiated a bucket policy with -- a collaborator's private
+        bucket, or an S3-compatible store like R2/MinIO. Runtime-only -- never
+        read from config.
     output_endpoint_url : str, optional
         Custom S3-compatible endpoint for the output store (e.g. R2, MinIO).
         Overrides ``output.endpoint_url`` in the config.
@@ -299,6 +304,19 @@ def agg(
         env vars (issue #171), independently of ``force_cold`` -- both can
         be on. Ignored by the ``"local"`` backend.
 
+    allow_contraction : bool
+        Hive-leaf contraction-guard escape hatch (issue #388). A re-dispatched
+        unit whose planned granule-id set fails to COVER its leaf's recorded
+        set (``recorded ∖ planned ≠ ∅`` — an upstream purge behind a fresh
+        catalog query, or a deliberate trim) REFUSES for that leaf and is
+        counted in the summary's ``cells_refused`` instead of silently
+        destroying aggregated data. Pass ``True`` to let such units rewrite
+        wholesale (a normal D4 update). Deliberately a run kwarg, never a
+        config knob — a config would pre-approve contraction store-wide. On
+        the ``"lambda"`` backend the flag rides each cell event
+        (``allow_contraction``, added only when true, so default runs' event
+        payloads stay byte-identical); the deployed worker acts on it once it
+        opts into the skip-if-current seam. Default ``False``.
     events : iterable, optional
         Temporal pipeline only (``pipeline.type: temporal``/``event``), one
         work unit per event. Local backend: ``(event_key, event_mask,
@@ -325,6 +343,20 @@ def agg(
         Summary with keys: ``total_cells``, ``cells_with_data``,
         ``cells_error``, ``total_obs``, ``wall_time_s``, ``store_path``.
     """
+    # The validation choke point for this entry (issue #485): direct agg
+    # callers on any backend or pipeline kind, plus zagg.notebook.run, whose
+    # dispatch bottoms out here — so a PipelineConfig mutated after
+    # load_config's own call (the issue #472 graft) is refused before agg
+    # reads a catalog, touches a store, or invokes. Two sibling seams call
+    # validate_config themselves rather than routing through this one, and
+    # both must stay: client.Run.from_config dispatches via Run/StatusPoller,
+    # never through agg (client.py, same error text), and notebook.run repeats
+    # the call above its max_cost_preview branch, which reads the shardmap
+    # before reaching agg. validate_config branches on pipeline kind itself,
+    # so the temporal and raster paths get their own (smaller) checks rather
+    # than a false refusal.
+    validate_config(config)
+
     # Pipeline kind picks the strategy (issue #12, Phase 5). The strategy seam
     # is dispatch-level: the spatial path is the existing code, moved verbatim
     # into SpatialStrategy so its behavior/output stays byte-identical; the
@@ -355,6 +387,7 @@ def agg(
         max_retries=max_retries,
         invocation=invocation,
         force_cold=force_cold,
+        allow_contraction=allow_contraction,
         events=events,
         on_progress=on_progress,
     )
@@ -391,6 +424,7 @@ class SpatialStrategy:
         max_retries=3,
         invocation="async",
         force_cold=False,
+        allow_contraction=False,
         events=None,
         on_progress=None,
     ):
@@ -451,6 +485,7 @@ class SpatialStrategy:
                 output_credentials=output_credentials,
                 output_endpoint_url=resolved_endpoint,
                 handoff=resolved_handoff,
+                allow_contraction=allow_contraction,
                 on_progress=on_progress,
             )
         elif backend == "lambda":
@@ -484,6 +519,7 @@ class SpatialStrategy:
                 max_retries=max_retries,
                 invocation=invocation,
                 force_cold=force_cold,
+                allow_contraction=allow_contraction,
                 on_progress=on_progress,
             )
         else:
@@ -527,6 +563,10 @@ class TemporalStrategy:
         max_retries=3,
         invocation="async",
         force_cold=False,
+        # Accepted for signature parity with ``agg``; the leaf skip-if-current
+        # gate (issue #388) is a hive-leaf concern the temporal path has no
+        # seam for.
+        allow_contraction=False,
         events=None,
         on_progress=None,
     ):
@@ -763,6 +803,7 @@ class RasterStrategy:
         output_endpoint_url,
         profile=False,
         invocation="async",
+        allow_contraction=False,
         on_progress=None,
         **_ignored,
     ):
@@ -776,6 +817,7 @@ class RasterStrategy:
             write_raster_slab,
         )
         from zagg.telemetry import build_record, raster_granule_ids, write_sidecar
+        from zagg.time_axis import time_encoding
 
         catalog_path = catalog or config.catalog
         if not catalog_path:
@@ -800,7 +842,9 @@ class RasterStrategy:
 
         grid = from_config(config)
         _check_signature(grid, catalog_data)
-        time_index, times_us = raster_time_index(catalog_data["granules"])
+        time_index, times_us = raster_time_index(
+            catalog_data["granules"], encoding=time_encoding(config)
+        )
         if not time_index:
             raise ValueError("catalog carries no raster granule entries (no assets/datetime)")
 
@@ -850,6 +894,7 @@ class RasterStrategy:
                 },
                 profile=profile,
                 invocation=invocation,
+                allow_contraction=allow_contraction,
                 on_progress=on_progress,
             )
 
@@ -932,6 +977,13 @@ class RasterStrategy:
                     window=window,
                     profile=profile,
                     stage_stats=stage_stats,
+                    # Leaf skip-if-current (issue #388): armed by default on
+                    # the local backend; an explicit overwrite keeps today's
+                    # unconditional rewrite (the operator's big hammer).
+                    skip_if_current=not overwrite,
+                    allow_contraction=allow_contraction,
+                    semantic_hash=run_semantic_hash,
+                    sidecar_spec=manifest["spec"] if manifest else None,
                     **src_kwargs,
                 )
                 write_s = (meta.get("phase_timings") or {}).get("write", 0.0)
@@ -963,6 +1015,12 @@ class RasterStrategy:
                 logger.debug(
                     f"raster shard {shard_label(grid, int(shard_key))} stages: {stage_stats}"
                 )
+            # Skip-if-current / contraction guard (issue #388): the unit wrote
+            # nothing — no record, no sidecar, no sub-map. A skipped unit's
+            # leaf keeps its good sidecar; clobbering it with a zero-count
+            # record is exactly what the gate exists to prevent.
+            if meta.get("current") or meta.get("refused"):
+                return meta, stage_stats, write_s
             # Per-shard stats record (issue #297), the raster-local flavor:
             # hive units that wrote a leaf get the sidecar sibling; the record
             # rides ``meta`` for the run parquet either way. Gate on the
@@ -1052,6 +1110,12 @@ class RasterStrategy:
                         except Exception:  # noqa: BLE001 - progress is cosmetic, never fatal
                             logger.warning("on_progress hook raised; ignoring", exc_info=True)
                 ok_metas.append(meta)
+                if meta.get("refused"):
+                    logger.warning(
+                        f"raster shard {label} refused: planned inputs drop "
+                        f"{len(meta.get('missing_granules') or [])} recorded granule(s); "
+                        f"allow_contraction=True rewrites (issue #388)"
+                    )
                 if meta["timesteps"]:
                     shards_with_data += 1
                     timesteps_written += meta["timesteps"]
@@ -1059,6 +1123,7 @@ class RasterStrategy:
                     _fold_raster_stages(stage_max, stage_counts, stage_stats, write_s)
 
         wall_time = time.time() - t0
+        identity = _identity_counts(ok_metas)
         if store_layout == "hive":
             # End-of-run manifest backstop (issue #252 hybrid, local flavor):
             # idempotent re-ensure — a frozen-key-matching manifest is
@@ -1089,6 +1154,24 @@ class RasterStrategy:
                         logger.info(f"Wrote root coverage.moc ({len(envelope['ranges'])} ranges)")
                 except Exception as e:
                     logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
+            # Store-root lifecycle touch (issue #388 phase 3): no unit
+            # footprint covers a root object and an all-skip run re-PUTs none
+            # of them, so the D6 manifest would expire under a lifecycle rule
+            # with every leaf it indexes fresh. Rides this seam for the same
+            # reason the root coverage.moc above does: local = worker.
+            if identity["cells_current"]:
+                from zagg.lifecycle import touch_store_root
+
+                root_touch = touch_store_root(
+                    store_path, store_kwargs=store_kwargs, policy=get_touch_policy(config)
+                )
+                identity["objects_touched"] += root_touch["touched"]
+                identity["touch_failures"] += root_touch["failed"]
+                _add_skipped_paths(identity, root_touch)
+        # Store-root refusal manifest (issue #388) — see _write_refusals.
+        refusal_manifest_path = _write_refusals(
+            store_path, ok_metas, identity, run_id, run_semantic_hash, store_kwargs
+        )
         # Run-level stats parquet (issue #297 phase 3), BEFORE the all-failed
         # raise below so the failure evidence persists at the store root.
         from zagg.telemetry import failure_record, flatten_record
@@ -1127,6 +1210,9 @@ class RasterStrategy:
             "total_cells": len(cells),
             "cells_with_data": shards_with_data,
             "cells_error": errors,
+            # Skip-if-current run stats (issue #388) — see _identity_counts.
+            **identity,
+            "refusal_manifest_path": refusal_manifest_path,
             # Shared summary key across strategies. For the raster path this is
             # the count of shard×timestep slabs written, not a per-cell obs tally
             # (see RasterStrategy docstring); ``timesteps`` is the datatake count.
@@ -1170,6 +1256,7 @@ class RasterStrategy:
         catalog_signature=None,
         profile=False,
         invocation="async",
+        allow_contraction=False,
         on_progress=None,
     ):
         """Fan shards out, one ``mode="process_raster"`` invoke each.
@@ -1359,6 +1446,11 @@ class RasterStrategy:
                 # full ShardMap JSON sub-map next to the leaf on success.
                 if catalog_signature is not None:
                     ev["submap"] = catalog_signature
+                # Contraction-guard escape hatch (issue #388): only-when-true,
+                # so default runs' events stay byte-identical; the worker acts
+                # on it once it opts into the skip-if-current seam.
+                if allow_contraction:
+                    ev["allow_contraction"] = True
             else:
                 keys = {e.get("time_key") or e.get("datetime") for e in granules if e.get("assets")}
                 ev["time_index"] = {k: time_index[k] for k in keys}
@@ -1586,6 +1678,10 @@ class RasterStrategy:
             "total_cells": len(cells),
             "cells_with_data": shards_with_data,
             "cells_error": errors,
+            # Skip-if-current run stats (issue #388), from the worker
+            # envelopes — zeros until the deployed handler opts into the
+            # seam's gate; the key set stays deterministic either way.
+            **_identity_counts([b for _k, b in ok_units]),
             # Shard x timestep slab tally (see the class docstring note).
             "total_obs": timesteps_written,
             "timesteps": int(len(time_index)),
@@ -2578,7 +2674,8 @@ def _resolve_source_credentials(config) -> dict:
     """S3 read credentials for the source datasets, provider-selected.
 
     ``data_source.credentials_provider`` names a credential-provider registry
-    entry (built-ins ``nsidc``/``gesdisc``; plugins may register others,
+    entry (built-ins ``nsidc``/``gesdisc``/``lpdaac``; plugins may register
+    others,
     including non-NASA S3-compatible sources -- providers run
     orchestrator-side, so the built-ins-only Lambda rule does not apply).
     Absent, the historical spatial default (NSIDC) stands, via the module
@@ -2620,6 +2717,51 @@ def _resolve_urls(records: list, driver: str | None) -> list[str]:
     return [r[key] for r in records if r.get(key)]
 
 
+def _resolve_granule_entries(records: list, driver: str | None) -> list:
+    """Worker-payload granule entries: URL strings, or paired-asset mappings.
+
+    The worker-facing sibling of :func:`_resolve_urls` (issue #425). A
+    single-asset record resolves to its plain URL string — byte-identical
+    payloads for every existing map. A record whose ``assets`` carry sibling
+    href trios (``{"s3": ..., "https": ...}`` values, the paired-asset shard
+    map's shape) resolves to ``{"url": <primary>, "assets": {name: <url>}}``
+    so the worker can open each sibling beside the primary. Entries stay
+    one-to-one with :func:`_resolve_urls` (same href-less drop rule, and the
+    granule_workers clamp counts through that function); a sibling without
+    the driver's endpoint is omitted from ``assets`` — the read then raises
+    on the missing handle rather than silently reading unfiltered data.
+    """
+    key = "https" if driver == "https" else "s3"
+    out: list = []
+    for r in records:
+        url = r.get(key)
+        if not url:
+            continue
+        assets = {
+            name: a[key]
+            for name, a in (r.get("assets") or {}).items()
+            if isinstance(a, dict) and a.get(key)
+        }
+        out.append({"url": url, "assets": assets} if assets else url)
+    return out
+
+
+def _submap_metadata(metadata: dict | None) -> dict | None:
+    """Run-catalog metadata as it rides a per-cell leaf sub-map (issue #300).
+
+    Strips the run-wide fields whose size scales with the CATALOG rather than
+    the cell: ``pairless`` (issue #425) is one entry per unpaired granule, so
+    at mission scale it is O(MB) of JSON copied into every cell event — where
+    it counts against the 256 KB async cap that silently drops the whole
+    sub-map block (``_cell_payload``) — and then into every leaf object.
+    ``write_leaf_submap`` strips it on the way out for the same reason; the
+    full report stays on the run's own map, which is where it is read.
+    """
+    if not metadata or "pairless" not in metadata:
+        return metadata
+    return {k: v for k, v in metadata.items() if k != "pairless"}
+
+
 def _clamped_data_source(data_source: dict, n_granules: int) -> dict | None:
     """Per-cell ``granule_workers`` clamp: ``min(K, n_granules)`` (issue #184).
 
@@ -2630,6 +2772,12 @@ def _clamped_data_source(data_source: dict, n_granules: int) -> dict | None:
     caller then passes the shared config through untouched, keeping unclamped
     cell payloads byte-identical. Just the simple ``min()`` policy; the
     worker still resolves the value through its ``_granule_workers`` guard.
+
+    The write-back uses whichever key the source dict carries — canonical
+    ``shard_workers`` if present, else the legacy ``granule_workers``. Writing
+    the legacy name unconditionally would leave both keys in the merged dict,
+    and ``_granule_workers`` prefers the canonical one, so the clamp would be
+    a silent no-op for any config using ``shard_workers``.
     """
     from zagg.processing.worker import _granule_workers
 
@@ -2637,7 +2785,8 @@ def _clamped_data_source(data_source: dict, n_granules: int) -> dict | None:
     clamped = min(k, max(int(n_granules), 1))
     if clamped == k:
         return None
-    return {**data_source, "granule_workers": clamped}
+    key = "shard_workers" if "shard_workers" in data_source else "granule_workers"
+    return {**data_source, key: clamped}
 
 
 def _check_signature(grid, catalog_data: dict) -> None:
@@ -2709,7 +2858,7 @@ def _process_and_write(
     _df_out, metadata = process_shard(
         grid,
         int(shard_key),
-        _resolve_urls(records, driver),
+        _resolve_granule_entries(records, driver),
         s3_credentials=s3_creds,
         config=config,
         driver=driver,
@@ -2721,6 +2870,122 @@ def _process_and_write(
     if sharded:
         write_shard_to_zarr(chunk_results, zarr_store, grid=grid, shard_key=int(shard_key))
     return metadata
+
+
+def _identity_counts(metas) -> dict:
+    """Skip-if-current run-stats counters (issue #388), for a run summary.
+
+    Deterministic key set on every summary (the ``run_stats_path`` precedent):
+
+    - ``cells_current`` — units whose planned identity matched the leaf's
+      recorded one; the fold no-oped and the unit wrote nothing.
+    - ``cells_refused`` — units the contraction guard refused (planned inputs
+      drop recorded granule ids, no ``allow_contraction``). Deliberately NOT
+      folded into ``cells_error``: a refusal is the guard working, and a fleet
+      run's refusal set must be auditable in one place.
+    - ``cells_unrecorded`` — units rewritten against a pre-#388 sidecar with
+      no recorded id set to diff (``unrecorded-ids``). Counted apart from
+      ordinary rewrites because the guard was INERT for them: a contracted
+      rerun over such a leaf performs the wholesale rewrite the guard exists
+      to prevent (see ``dedup.classify_leaf_identity``).
+    - ``objects_touched`` / ``touch_failures`` — the phase-3 lifecycle touch
+      rollup (``zagg.lifecycle``): objects whose ``LastModified`` the skipped
+      units refreshed, and touch failures (fail-open — logged and counted
+      here, never folded into ``cells_error``). The local paths ADD the
+      once-per-run ``touch_store_root`` counts to these after the fact — the
+      root objects belong to no unit, so they cannot come from ``metas``.
+    - ``touch_skipped_paths`` — PATHS (not objects) the touch found NOT
+      APPLICABLE because they live on a published bucket (issue #495 phase 4,
+      ``zagg.lifecycle._skip_published``). CONDITIONAL: present only when
+      non-zero, so a run that touches nothing published carries exactly the
+      key set it did before. Without it a published run records
+      ``objects_touched: 0, touch_failures: 0`` — byte-identical to a touch
+      that never ran, which is the ambiguity the skip must not inherit.
+    """
+    metas = [m for m in metas if isinstance(m, dict)]
+    counts = {
+        "cells_current": sum(1 for m in metas if m.get("current")),
+        "cells_refused": sum(1 for m in metas if m.get("refused")),
+        "cells_unrecorded": sum(1 for m in metas if m.get("identity") == "unrecorded-ids"),
+        "objects_touched": sum(int(m.get("touched_objects") or 0) for m in metas),
+        "touch_failures": sum(int(m.get("touch_failed") or 0) for m in metas),
+    }
+    skipped = sum(int(m.get("touch_skipped_paths") or 0) for m in metas)
+    if skipped:
+        counts["touch_skipped_paths"] = skipped
+    return counts
+
+
+def _add_skipped_paths(identity: dict, touch: dict) -> None:
+    """Roll a store-root touch's not-applicable PATH count into ``identity``.
+
+    The root objects belong to no unit, so they never reach
+    :func:`_identity_counts` through ``metas``. Conditional on both sides —
+    the key appears only once something was actually skipped (issue #495
+    phase 4).
+    """
+    if touch.get("skipped_paths"):
+        identity["touch_skipped_paths"] = (
+            identity.get("touch_skipped_paths", 0) + touch["skipped_paths"]
+        )
+
+
+def _warn_partial_auth_denials(metas) -> int:
+    """WARN once when shards that PRODUCED data also hit denied reads (#449).
+
+    A shard whose every read was denied says so itself — the worker's own
+    ``Access denied reading source granules`` error reaches the summary through
+    ``cells_error``. The silent case is the PARTIAL one: some granules read,
+    some 403'd, so the shard returns data, no error, and a leaf that is missing
+    exactly the granules the credentials could not reach. Nothing in the
+    summary would have shown it, which is the same misdiagnosis-costs-a-rerun
+    shape issue #449 exists to remove (espg ruling, 2026-08-17), so one WARNING
+    names the shard count and the provider check.
+
+    Returns the number of such shards (0 when silent).
+    """
+    metas = [m for m in metas if isinstance(m, dict)]
+    hits = [m for m in metas if int(m.get("auth_errors") or 0) and int(m.get("total_obs") or 0)]
+    if not hits:
+        return 0
+    denied = sum(int(m["auth_errors"]) for m in hits)
+    logger.warning(
+        f"  {len(hits)} shard(s) wrote data despite DENIED source reads "
+        f"({denied} auth-shaped read failures): those leaves are PARTIAL — check "
+        f"data_source.credentials_provider names the DAAC hosting this product, "
+        f"then rerun the affected shards (issue #449)"
+    )
+    return len(hits)
+
+
+def _write_refusals(store_path, metas, identity, run_id, semantic_hash, store_kwargs) -> str | None:
+    """The run's store-root refusal manifest, or ``None`` (issue #388).
+
+    A refused unit writes nothing at all, so without this the missing-granule
+    diff lives only in a worker log line truncated to five ids. Ruled
+    (question (9)(c)): ONE small root object per run that refused, and — ruled
+    (9)(a) — nothing whatsoever for a pure-skip run, which stays row-less.
+
+    Rides the LOCAL wrap-up seam for the same reason the root ``coverage.moc``
+    union and the phase-3 ``touch_store_root`` do: this process is also the
+    worker and already PUTs every leaf with these credentials, so the D8
+    orchestrator-no-write rule (which sends the Lambda paths through a worker
+    invoke) does not constrain it. The FLEET has no once-per-run worker-side
+    seam to carry it, exactly as the store-root touch does not — the two share
+    a resolution (the PR #397 question (10) fork). Fail-open inside
+    ``write_refusal_manifest`` (D9).
+    """
+    if not identity["cells_refused"]:
+        return None
+    from zagg.telemetry import write_refusal_manifest
+
+    return write_refusal_manifest(
+        store_path,
+        [m for m in metas if isinstance(m, dict) and m.get("refused")],
+        run_id=run_id,
+        semantic_hash=semantic_hash,
+        store_kwargs=store_kwargs,
+    )
 
 
 def _run_local(
@@ -2739,6 +3004,7 @@ def _run_local(
     output_credentials=None,
     output_endpoint_url=None,
     handoff="arrow",
+    allow_contraction=False,
     on_progress=None,
 ):
     """Run processing locally via the generic dispatch loop on a thread pool.
@@ -2861,7 +3127,7 @@ def _run_local(
             if store_layout == "hive":
                 meta = process_and_write_hive(
                     shard_key,
-                    _resolve_urls(records, driver),
+                    _resolve_granule_entries(records, driver),
                     grid,
                     s3_creds,
                     store_path,
@@ -2869,8 +3135,24 @@ def _run_local(
                     store_kwargs=store_kwargs,
                     driver=driver,
                     handoff=handoff,
+                    # Leaf skip-if-current (issue #388): armed by default on
+                    # the local backend; an explicit overwrite keeps today's
+                    # unconditional rewrite (the operator's big hammer). The
+                    # RUN config's hash rides in so the per-cell
+                    # granule_workers clamp cannot perturb the comparison.
+                    skip_if_current=not overwrite,
+                    allow_contraction=allow_contraction,
+                    semantic_hash=run_semantic_hash,
+                    sidecar_spec=manifest["spec"],
                     **extra,
                 )
+                # A current/refused unit wrote nothing — no record, no
+                # sidecar, no sub-map (a skipped unit's leaf keeps its good
+                # sidecar; clobbering it with a zero-count record is exactly
+                # what the gate exists to prevent). No stats -> no run-parquet
+                # row and no sweep work either.
+                if meta.get("current") or meta.get("refused"):
+                    return {"shard_key": shard_key, "ok": True, "meta": meta}
             else:
                 meta = _process_and_write(
                     shard_key,
@@ -2964,6 +3246,17 @@ def _run_local(
         report.results.append(meta)
         if meta.get("error"):
             logger.info(f"  [{i}/{n}] {label}: {meta['error']}")
+        elif meta.get("current"):
+            # Skip-if-current (issue #388): counted apart in the summary
+            # (_identity_counts), never as cells_with_data — this run wrote
+            # nothing for the unit.
+            logger.info(f"  [{i}/{n}] {label}: current — inputs unchanged, leaf untouched")
+        elif meta.get("refused"):
+            logger.warning(
+                f"  [{i}/{n}] {label}: REFUSED — planned inputs drop "
+                f"{len(meta.get('missing_granules') or [])} recorded granule(s); "
+                f"allow_contraction=True rewrites (issue #388)"
+            )
         else:
             obs = meta.get("total_obs", 0)
             report.total_obs += obs
@@ -3033,10 +3326,37 @@ def _run_local(
         except Exception as e:
             logger.warning(f"root coverage.moc write failed (fail-open, D9): {e}")
 
+    # Store-root lifecycle touch (issue #388 phase 3): the unit touches cover
+    # no root object, and an all-skip run re-PUTs none of them (ensure_manifest
+    # early-returns on a frozen-key match, and a skip-capable run is by
+    # definition overwrite=False) — so the D6 manifest would expire under a
+    # lifecycle rule with every leaf it indexes fresh. Same seam and same
+    # justification as the root coverage.moc above: this process is the worker.
+    identity = _identity_counts(report.results)
+    if store_layout == "hive" and identity["cells_current"]:
+        from zagg.lifecycle import touch_store_root
+
+        root_touch = touch_store_root(
+            store_path, store_kwargs=store_kwargs, policy=get_touch_policy(config)
+        )
+        identity["objects_touched"] += root_touch["touched"]
+        identity["touch_failures"] += root_touch["failed"]
+        _add_skipped_paths(identity, root_touch)
+    refusal_manifest_path = _write_refusals(
+        store_path, report.results, identity, run_id, run_semantic_hash, store_kwargs
+    )
+    # Partially-denied leaves (issue #449) — see _warn_partial_auth_denials.
+    _warn_partial_auth_denials(report.results)
+
     summary = {
         "total_cells": len(cells),
         "cells_with_data": report.cells_with_data,
         "cells_error": report.cells_error,
+        # Skip-if-current run stats (issue #388) — see _identity_counts.
+        **identity,
+        # Store-root refusal manifest (issue #388), local-only like the root
+        # touch above; None when nothing refused — see _write_refusals.
+        "refusal_manifest_path": refusal_manifest_path,
         "total_obs": report.total_obs,
         "wall_time_s": wall_time,
         "store_path": store_path,
@@ -3067,6 +3387,19 @@ def _run_local(
         leaves = leaves_from_stats_records([m.get("stats") for m in report.results])
         if leaves:
             sweep_after_run(store_path, leaves, store_kwargs=store_kwargs)
+            # Post-fleet staged chaining (issue #384) — OPT-IN via
+            # `output.sweep: "stages"` (the recorded lean for open question
+            # (c); flipping it to the default is espg's call). Runs AFTER the
+            # families sweep, auto-scoped to this run's footprint; fail-open.
+            if config.output.get("sweep") == "stages":
+                from zagg.sweep_stages import stage_sweep_after_run
+
+                stage_sweep_after_run(
+                    store_path,
+                    leaves,
+                    store_kwargs=store_kwargs,
+                    touch_policy=get_touch_policy(config),
+                )
     logger.info(
         f"Done: {report.cells_with_data} cells, {report.total_obs:,} obs, {report.cells_error} errors, {wall_time:.1f}s"
     )
@@ -3170,6 +3503,7 @@ def _run_lambda(
     max_retries=3,
     invocation="async",
     force_cold=False,
+    allow_contraction=False,
     on_progress=None,
 ):
     """Run processing via AWS Lambda invocation.
@@ -3412,7 +3746,7 @@ def _run_lambda(
         # (processing/worker.py:250-254), so an explicit override has to reach
         # the url selection. Was hardcoded "s3" while ``agg`` resolved driver
         # for _run_local only, which handed s3:// urls to an HTTP driver.
-        granule_urls = _resolve_urls(records, driver)
+        granule_urls = _resolve_granule_entries(records, driver)
         ds = _clamped_data_source(config.data_source, len(granule_urls))
         cell_config_dict = {**config_dict, "data_source": ds} if ds is not None else config_dict
         # Leaf sub-map fields (issue #300, D22): the worker writes the full
@@ -3422,7 +3756,7 @@ def _run_lambda(
         # (size-gated in _invoke_lambda_cell; dropped, never fatal).
         submap = {
             "grid_signature": catalog_data["grid_signature"],
-            "metadata": catalog_data.get("metadata"),
+            "metadata": _submap_metadata(catalog_data.get("metadata")),
             "granules": records,
         }
         # v2 Event transport (issue #327): the SAME event construction as the
@@ -3450,6 +3784,7 @@ def _run_lambda(
                 window=window,
                 invoked_by=invoked_by,
                 run_id=run_id,
+                allow_contraction=allow_contraction,
             )
             cell_payload = _cell_payload(cell_event, submap=submap, async_invoke=True, label=label)
 
@@ -3486,6 +3821,7 @@ def _run_lambda(
             invoked_by=invoked_by,
             run_id=run_id,
             submap=submap,
+            allow_contraction=allow_contraction,
             **extra,
         )
 
@@ -3833,6 +4169,9 @@ def _run_lambda(
             [r.get("body") or {} for r in report.results]
         )
 
+        # Partially-denied leaves (issue #449) — see _warn_partial_auth_denials.
+        _warn_partial_auth_denials([r.get("body") or {} for r in report.results])
+
         # Per-phase worker breakdown (issue #100 phase 2), only when --profile fed
         # the workers a "profile" event so they emitted body["phase_timings"]. Roll
         # the straggler (max) per phase across cells, matching the wall-time framing.
@@ -3848,6 +4187,10 @@ def _run_lambda(
             "total_cells": len(cells),
             "cells_with_data": report.cells_with_data,
             "cells_error": report.cells_error,
+            # Skip-if-current run stats (issue #388), from the worker
+            # envelopes — zeros until the deployed handler opts into the
+            # seam's gate; the key set stays deterministic either way.
+            **_identity_counts([r.get("body") or {} for r in report.results]),
             "total_obs": report.total_obs,
             "wall_time_s": wall_time,
             "lambda_time_s": total_lambda_time,
@@ -4854,8 +5197,11 @@ def _invoke_lambda_raster_setup(
     deliberately invoke-only and must never PUT to the store. Synchronous
     because the template is load-bearing before fan-out (workers write slabs
     into its arrays) — the flat point-path lifecycle, not the #252 async
-    hybrid. ``times_us`` is the catalog-derived global time coordinate
-    (int64 μs since the epoch), JSON-safe as a plain int list.
+    hybrid. ``times_us`` is the catalog-derived global time coordinate in the
+    config's declared encoding — int64 μs since the Unix epoch by default, or
+    uint64 mortie toc words under ``output.time_encoding: toc`` (spec §8) —
+    JSON-safe as a plain int list either way; the worker re-derives the dtype
+    from ``config``, so the parameter name is historical, not a width claim.
 
     A deployed function that predates the raster setup branch would fall
     through to the point-path ``grid.emit_template`` — wrong template, right
@@ -4870,8 +5216,9 @@ def _invoke_lambda_raster_setup(
         "overwrite": overwrite,
         "config": config_dict,
         # times_us rides inline in this sync RequestResponse payload (6 MB
-        # cap, not the 256 KB async/Event cap); int64 μs stamps serialize at
-        # ~17 B each → ~350K-timestep headroom, orders above any real catalog
+        # cap, not the 256 KB async/Event cap); the widest stamp is a 20-digit
+        # uint64 toc word at ~21 B → ~285K-timestep headroom (int64 μs stamps
+        # are ~17 B / ~350K), both orders above any real catalog
         # (the pinned NEON benchmark catalog is 85 items). No chunking
         # fallback — a pathological series would surface as a boto ClientError.
         "times_us": [int(t) for t in times_us],
@@ -4957,6 +5304,20 @@ def _invoke_lambda_ping(
       seconds. Same last-writer caveat the manifest write itself has always
       had.
 
+    - **Read-only grant:** the handler PUT-then-DELETEs a zero-byte probe
+      object under the run's own ``<store>.status/`` sibling (issue #495 --
+      the prefix the async transport already requires writable, so the probe
+      adds no grant surface), so output credentials that can READ the store
+      but not write it -- the shape a fresh cross-account bucket policy fails
+      in, and the one Source Cooperative's in-region path has no interactive
+      step to catch -- refuse here instead of after every worker has
+      aggregated its shard. The response tags this failure
+      ``"check": "write_probe"`` so the remedy below points at the failing
+      REQUEST (grant being the likely cause) rather than at the store's
+      contents. A function that predates #495 simply omits the tag and the
+      older message applies. A DELETE that fails is fail-open but reported
+      (``probe_delete``) and warned about here.
+
     The raster lambda path reuses this ping (issue #264) ahead of its sync
     template-writing setup invoke: a raster config carries no hive layout, so
     only the stale-deployment half applies (the handler's manifest precheck
@@ -4991,6 +5352,21 @@ def _invoke_lambda_ping(
             body = json.loads(result.get("body") or "{}")
         except (TypeError, ValueError):
             body = {}
+        if body.get("check") == "write_probe":
+            # The store is reachable and compatible; the zero-byte probe PUT
+            # did not land (issue #495). Naming the store's contents here — the
+            # message below — would send the operator to clear a store root
+            # that is not the problem. The cause is stated as LIKELY, not
+            # determined: the tag says which request failed, not why, and the
+            # echoed error carries "Access Denied" when that is what happened.
+            raise RuntimeError(
+                f"Lambda ping could not WRITE to {store_path}: "
+                f"{body.get('error')!r} — the output credentials can reach the "
+                f"store but a zero-byte probe PUT failed, most likely a denied "
+                f"grant (bucket policy or assumed role); resolve it before "
+                f"dispatching this run, or the fan-out will aggregate every "
+                f"shard and then fail at write time"
+            )
         if body.get("mode") == "ping":
             # The deployed function KNOWS ping — this is validate_manifest
             # refusing the store, not a stale deployment.
@@ -5006,10 +5382,24 @@ def _invoke_lambda_ping(
             f"redeploy the function before dispatching this run"
         )
     try:
-        version = json.loads(result.get("body") or "{}").get("zagg_version")
+        ok_body = json.loads(result.get("body") or "{}")
     except (TypeError, ValueError):
-        version = None
-    logger.info(f"Preflight OK (function zagg version {version})")
+        ok_body = {}
+    if ok_body.get("probe_delete") is False:
+        # The probe PUT succeeded but its cleanup DELETE did not (issue #495).
+        # Deliberately not fatal — write permission, the thing this preflight
+        # gates on, is proven. But s3:DeleteObject is not optional for zagg's
+        # real writes (store overwrite and manifest cleanup), so the run is
+        # likely to fail later, and every run strands one zero-byte object
+        # under a prefix nothing sweeps. Surfaced HERE because the function's
+        # own log group is not where the dispatching operator is looking.
+        logger.warning(
+            f"Write probe could not delete {ok_body.get('probe_key')!r}: the output "
+            f"credentials can PUT but likely lack s3:DeleteObject, which zagg needs "
+            f"for store overwrite and manifest cleanup — this run may fail at write "
+            f"time, and the probe object is stranded"
+        )
+    logger.info(f"Preflight OK (function zagg version {ok_body.get('zagg_version')})")
 
 
 def _invoke_lambda_finalize(
@@ -5190,6 +5580,7 @@ def _build_cell_event(
     invoked_by=None,
     run_id=None,
     result_url=None,
+    allow_contraction=False,
 ) -> dict:
     """One shard's worker event dict — the single construction site.
 
@@ -5248,6 +5639,11 @@ def _build_cell_event(
     # envelope. Absent -> the legacy synchronous / v2 status-object invoke.
     if result_url is not None:
         event["result_url"] = result_url
+    # Contraction-guard escape hatch (issue #388): only-when-true, so default
+    # runs' events stay byte-identical; the worker acts on it once it opts
+    # into the skip-if-current seam.
+    if allow_contraction:
+        event["allow_contraction"] = True
     return event
 
 
@@ -5308,6 +5704,7 @@ def _invoke_lambda_cell(
     invoked_by=None,
     run_id=None,
     submap=None,
+    allow_contraction=False,
 ):
     """Invoke Lambda for a single cell with retry logic.
 
@@ -5339,6 +5736,9 @@ def _invoke_lambda_cell(
     ShardMap JSON sub-map next to the leaf; size-gated below (dropped, never
     fatal, when it would push an async event over the 256 KB cap) and omitted
     (``None``) the event stays byte-identical.
+    ``allow_contraction`` (issue #388) forwards the contraction-guard escape
+    hatch as an ``"allow_contraction": true`` event key; ``False`` (the
+    default) omits the key, keeping the event byte-identical.
     """
     wall_start = time.time()
 
@@ -5359,6 +5759,7 @@ def _invoke_lambda_cell(
         invoked_by=invoked_by,
         run_id=run_id,
         result_url=result_url,
+        allow_contraction=allow_contraction,
     )
     # Async dispatch (issue #151): result_url flips the invoke to
     # fire-and-forget. Absent -> the legacy synchronous invoke.

@@ -45,7 +45,7 @@ from zagg.processing.aggregate import (
     _has_vector_fields,
     _pool_chunk_columns,
 )
-from zagg.processing.write import _build_output
+from zagg.processing.write import _build_output, _channel_entry
 from zagg.schema import ProcessingMetadata
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,92 @@ _EXEMPLAR_CHARS = 300
 #: cause was invisible. The bound still caps the issue #175 WorkerErrorCount
 #: metric filter (which matches "Traceback") at N per shard.
 _TRACEBACK_LIMIT = 5
+
+
+#: Error codes / message tokens that mean "the read was DENIED", not "the data
+#: was bad" (issue #449). Matched case-insensitively against the exception text
+#: and, for botocore-shaped errors, against ``response["Error"]["Code"]``.
+#: Deliberately specific: a bare ``403`` would match a granule name.
+_AUTH_ERROR_TOKENS = (
+    "accessdenied",
+    "access denied",
+    "invalidaccesskeyid",
+    "signaturedoesnotmatch",
+    "expiredtoken",
+    "expired token",
+    "expired credentials",
+    "invalidtoken",
+    "tokenrefreshrequired",
+    "403 forbidden",
+    "http 403",
+    "status 403",
+    "unauthorized",
+)
+
+
+def is_auth_failure(exc: BaseException) -> bool:
+    """Whether a granule/group read failure is DEFINITELY credentials-shaped
+    (issue #449).
+
+    Two signatures, cheapest first:
+
+    * a **botocore** ``ClientError`` — duck-typed on its ``response`` mapping so
+      no botocore import is needed here — carrying HTTP 403 or a denial code;
+    * any exception whose text carries one of :data:`_AUTH_ERROR_TOKENS`.
+
+    Both are unambiguous: the status code or the denial token is *in* the
+    exception. The empty-body signature is deliberately NOT here — see
+    :func:`is_empty_body_failure`, which the caller uses as a hint only.
+
+    Classification only: the caller decides what to do with it. The point is
+    that a shard whose every read was denied must not report the data-shaped
+    "No data after filtering" — that misdiagnosis cost issue #449 a fleet
+    round trip.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        meta = response.get("ResponseMetadata")
+        if isinstance(meta, dict) and meta.get("HTTPStatusCode") in (401, 403):
+            return True
+        error = response.get("Error")
+        if isinstance(error, dict):
+            code = str(error.get("Code", "")).lower()
+            if code in ("403", "401") or any(t in code for t in _AUTH_ERROR_TOKENS):
+                return True
+    return any(token in str(exc).lower() for token in _AUTH_ERROR_TOKENS)
+
+
+def is_empty_body_failure(exc: BaseException) -> bool:
+    """Whether a read failure is the **empty-body** signature (issue #449).
+
+    A read that returned ``None`` where bytes were expected hands the HDF5
+    reader nothing, which surfaces as ``TypeError: memoryview: a bytes-like
+    object is required, not 'NoneType'`` — the GEDI first-fleet-run shape,
+    where every 403 from ``lp-prod-protected`` arrived as an empty body.
+
+    **Ambiguous by construction** (fold review): ``h5coro.s3driver.S3Driver.
+    read`` returns ``None`` from a bare ``except Exception`` as well as from
+    ``NoSuchKey``, so a missing object, a ``SlowDown``/503, a read timeout and
+    a connection reset all produce this exact exception too — and
+    :mod:`zagg.processing.spill`'s ``memoryview(arr).cast("B")`` raises it
+    byte-for-byte from a cause with nothing to do with credentials. So it is
+    reported as a HINT on the generic no-data message (empty body; likely
+    denial / missing object / throttling) and never sets the auth class or the
+    ``auth_errors`` counter — the diagnostic value without the false
+    certainty. The real boto exception is logged by h5coro at ERROR either way.
+    """
+    text = str(exc).lower()
+    return isinstance(exc, TypeError) and "memoryview" in text and "nonetype" in text
+
+
+def _entry_url(entry) -> str:
+    """Primary URL of a granule entry (issue #425).
+
+    An entry is a plain URL string (single-asset granule — every pre-#425
+    payload) or a ``{"url": ..., "assets": {name: url}}`` mapping from a
+    paired-asset shard map; labels/logs always use the primary URL.
+    """
+    return entry["url"] if isinstance(entry, dict) else entry
 
 
 def _granule_workers(data_source: dict) -> int:
@@ -346,12 +432,26 @@ def process_shard(
     _exemplar_lock = threading.Lock()
     read_error_exemplars: list = []
     traced_messages: set = set()
+    # Auth-shaped failures, counted separately (issue #449): a denied read is a
+    # CONFIGURATION fault, not a data fault, and the two want opposite
+    # responses -- rerunning a shard whose credentials are wrong for the DAAC
+    # just burns another invoke. Only DEFINITE matches count (fold review):
+    # see :func:`is_auth_failure`. ``empty_body_errors`` is the ambiguous
+    # sibling -- a hint on the generic message, never a classification
+    # (:func:`is_empty_body_failure`), so it stays off the wire.
+    auth_errors = 0
+    empty_body_errors = 0
 
     def _record_read_error(what: str, exc: Exception) -> None:
         """Warn + exemplar one read failure. ``what`` is the log phrase (and so
         the scope): ``reading track <group>`` or ``processing file <url>``."""
+        nonlocal auth_errors, empty_body_errors
         msg = f"{type(exc).__name__}: {exc}"[:_EXEMPLAR_CHARS]
         with _exemplar_lock:
+            if is_auth_failure(exc):
+                auth_errors += 1
+            elif is_empty_body_failure(exc):
+                empty_body_errors += 1
             if msg not in read_error_exemplars and len(read_error_exemplars) < _EXEMPLAR_LIMIT:
                 read_error_exemplars.append(msg)
             trace = msg not in traced_messages and len(traced_messages) < _TRACEBACK_LIMIT
@@ -379,12 +479,18 @@ def process_shard(
 
     streaming_cfg = get_streaming(config)
     spill_mode = streaming_cfg is not None and streaming_cfg["mode"] == "spill"
-    if spill_mode:
-        buffered = SpillAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
-    elif streaming_cfg is not None:
-        buffered = StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
-    else:
+    if streaming_cfg is None:
         buffered = None
+    elif spill_mode:
+        buffered = SpillAggregator(
+            config,
+            grid,
+            handoff,
+            streaming_cfg["buffer_granules"],
+            block_bytes=streaming_cfg["block_bytes"],
+        )
+    else:
+        buffered = StreamingAggregator(config, grid, handoff, streaming_cfg["buffer_granules"])
 
     # Per-phase timing (issue #100; always-on collection since issue #297 —
     # the stats sidecar needs complete timings by default, and the cost is a
@@ -399,10 +505,17 @@ def process_shard(
     # — its lazy-init race was fixed upstream — enforced by the pyproject pin.)
     granule_workers = _granule_workers(data_source)
 
-    def _read_granule(s3_url: str) -> tuple:
+    def _read_granule(entry) -> tuple:
         """One granule end-to-end: H5Coro open → group loop → ``finish_granule``
         → close, all in the calling thread (issue #180 — under the pool each
         granule gets its own ``H5Coro``, never shared across threads).
+
+        ``entry`` is a plain URL string (single-asset granule, unchanged), or a
+        ``{"url": ..., "assets": {name: url}}`` mapping from a paired-asset
+        shard map (issue #425): each sibling asset gets its own ``H5Coro``
+        opened beside the primary and handed to the read as ``siblings`` so
+        the vlen route's asset filters can join per record; all handles are
+        released together in the ``finally``.
 
         Returns ``(reads, group_errors, io_stats)``: ``reads`` is the carriers
         of the groups that returned data (group order, ``None`` — legitimately
@@ -416,7 +529,12 @@ def process_shard(
         Raises when the granule itself fails (e.g. the open) — the caller warns
         and skips it, shard continues (issue #116 semantics).
         """
+        if isinstance(entry, dict):
+            s3_url, asset_urls = entry["url"], dict(entry.get("assets") or {})
+        else:
+            s3_url, asset_urls = entry, {}
         h5obj = None
+        siblings: dict = {}
         reads: list = []
         group_errors = 0
         io_stats: dict = {}
@@ -430,10 +548,20 @@ def process_shard(
                 errorChecking=True,
                 verbose=False,
             )
+            for name, url in asset_urls.items():
+                siblings[name] = _processing.h5coro.H5Coro(
+                    _rewrite_url(url),
+                    h5coro_driver,
+                    credentials=credentials,
+                    errorChecking=True,
+                    verbose=False,
+                )
 
             for g in data_source["groups"]:
                 try:
                     read_kwargs = {"arrow": use_arrow, "io_stats": io_stats}
+                    if siblings:
+                        read_kwargs["siblings"] = siblings
                     if apriori:
                         read_kwargs["granule_url"] = s3_url
                     chunk = index_backend.read_group(
@@ -467,12 +595,15 @@ def process_shard(
             # loop → Lambda OOM. ``close()`` is the live path; ``cache.clear()`` is a
             # fallback for builds lacking it. Retained ``reads`` data is already
             # copied off the cache lines (see PR #94), so releasing here is safe.
-            if h5obj is not None:
+            # Sibling-asset handles (issue #425) release under the same rule.
+            for handle in [h5obj, *siblings.values()]:
+                if handle is None:
+                    continue
                 try:
-                    if hasattr(h5obj, "close"):
-                        h5obj.close()
-                    elif getattr(h5obj, "cache", None) is not None:
-                        h5obj.cache.clear()
+                    if hasattr(handle, "close"):
+                        handle.close()
+                    elif getattr(handle, "cache", None) is not None:
+                        handle.cache.clear()
                 except Exception:
                     logger.debug("h5coro cache release failed", exc_info=True)
 
@@ -491,9 +622,10 @@ def process_shard(
         """
         nonlocal granule_errors
         if granule_workers == 1:
-            for s3_url in granule_urls:
+            for entry in granule_urls:
+                s3_url = _entry_url(entry)
                 try:
-                    yield s3_url, *_read_granule(s3_url)
+                    yield s3_url, *_read_granule(entry)
                 except Exception as e:
                     granule_errors += 1
                     _record_read_error(f"processing file {s3_url}", e)
@@ -503,7 +635,8 @@ def process_shard(
             ) as pool:
                 urls = iter(granule_urls)
                 in_flight = deque(
-                    (u, pool.submit(_read_granule, u)) for u in islice(urls, granule_workers)
+                    (_entry_url(u), pool.submit(_read_granule, u))
+                    for u in islice(urls, granule_workers)
                 )
                 while in_flight:
                     s3_url, future = in_flight.popleft()
@@ -519,7 +652,7 @@ def process_shard(
                     # (including streaming granule_done flushes) — the ≤ K
                     # bound and the fold order are unchanged.
                     for u in islice(urls, 1):
-                        in_flight.append((u, pool.submit(_read_granule, u)))
+                        in_flight.append((_entry_url(u), pool.submit(_read_granule, u)))
                     if reads is not None:
                         yield s3_url, reads, group_errors, granule_io
 
@@ -569,6 +702,10 @@ def process_shard(
         metadata["read_errors"] = read_errors
     if granule_errors:
         metadata["granule_errors"] = granule_errors
+    if auth_errors:
+        # Counted even when the shard still produced data (a partially-denied
+        # read is a partially-wrong product), so the run summary can see it.
+        metadata["auth_errors"] = auth_errors
     if read_errors or granule_errors:
         # Bounded diagnosis payload (issue #341): messages only, no tracebacks
         # on the wire — full tracebacks were logged above. Success-path
@@ -607,13 +744,47 @@ def process_shard(
                 for n, scope in ((read_errors, "group"), (granule_errors, "granule"))
                 if n
             )
-            logger.warning(f"  No data after filtering for shard {label} and {raised} - skipping")
-            # Carry the exemplars in the error text too (issue #341): this
-            # string is what surfaces in the status object / run summary, so
-            # it must be a one-glance diagnosis, not just a count.
-            metadata["error"] = (
-                f"No data after filtering ({raised}; e.g. {' | '.join(read_error_exemplars)})"
-            )
+            exemplars = " | ".join(read_error_exemplars)
+            if auth_errors:
+                # Its own failure CLASS (issue #449): the GEDI template shipped
+                # without a credentials_provider, so NSIDC creds hit LP DAAC's
+                # lp-prod-protected and the shard reported the data-shaped "No
+                # data after filtering". The fault is the config, not the data,
+                # and the message must say so. Reached only on a DEFINITE match
+                # (a status code or a denial token in the exception) — the
+                # empty-body shape those 403s also produce is a hint on the
+                # generic branch below, not this class (fold review).
+                logger.error(
+                    f"  Access denied reading source granules for shard {label} "
+                    f"({auth_errors} auth-shaped failures of {raised}) - skipping"
+                )
+                metadata["error"] = (
+                    f"Access denied reading source granules ({auth_errors} auth-shaped "
+                    f"failures; {raised}): check data_source.credentials_provider names "
+                    f"the DAAC hosting this product; e.g. {exemplars}"
+                )
+            else:
+                # Empty-body HINT (fold review, issue #449): the None-body
+                # signature cannot prove a denial — h5coro returns the same
+                # ``None`` for a missing object, throttling, a timeout or a
+                # reset — so it appends likely causes to the generic message
+                # instead of asserting the auth class. Credentials/DAAC
+                # mismatch leads the list because it is the one cause the
+                # operator can only find by being told to look.
+                hint = ""
+                if empty_body_errors:
+                    hint = (
+                        f"; {empty_body_errors} read(s) got an EMPTY body — likely a denied "
+                        f"read (check data_source.credentials_provider names the DAAC hosting "
+                        f"this product), a missing object, or throttling"
+                    )
+                logger.warning(
+                    f"  No data after filtering for shard {label} and {raised}{hint} - skipping"
+                )
+                # Carry the exemplars in the error text too (issue #341): this
+                # string is what surfaces in the status object / run summary, so
+                # it must be a one-glance diagnosis, not just a count.
+                metadata["error"] = f"No data after filtering ({raised}{hint}; e.g. {exemplars})"
         else:
             logger.info(f"  No data after filtering for shard {label} - skipping")
             metadata["error"] = "No data after filtering"
@@ -721,26 +892,37 @@ def process_shard(
             # driven through the pooled aggregation machinery (single-block) or
             # emitted from the cross-block merged state (multi-block); either
             # way the return is the full _aggregate_chunk_cells 5-tuple, so
-            # located ragged fields and chunk_precompute are served.
-            stats_arrays, ragged_payloads, ragged_idx, ragged_locs, cwd = buffered.chunk_outputs(
-                chunk_children, agg_fields
-            )
+            # companion-carrying ragged fields and chunk_precompute are served.
+            (
+                stats_arrays,
+                ragged_payloads,
+                ragged_idx,
+                ragged_channels,
+                cwd,
+            ) = buffered.chunk_outputs(chunk_children, agg_fields)
         elif buffered is not None:
             # Buffered path (issue #148 phase 4): emit this chunk's outputs from
             # the running merged state; chunk_precompute is rejected at validation
-            # so there are no chunk scalars to evaluate. Located ragged fields
-            # (issue #87) are likewise rejected by validate_streaming, so the
-            # location sink is empty here by construction.
+            # so there are no chunk scalars to evaluate. Companion-carrying
+            # ragged fields (issue #87's located channel, spec §8.3's temporal
+            # one) are likewise rejected by validate_streaming, so the channel
+            # sink is empty here by construction.
             stats_arrays, ragged_payloads, ragged_idx, cwd = buffered.chunk_outputs(
                 chunk_children, agg_fields
             )
-            ragged_locs = {}
+            ragged_channels = {}
         else:
             # Per-chunk precompute (issue #82 phase 6): pool only this chunk's rows
             # from the shard's sorted column arrays, then reduce the anchor over them.
             chunk_pooled = _pool_chunk_columns(col_arrays, cell_to_slice, chunk_children)
             chunk_scalars = _eval_chunk_precompute(config, chunk_pooled)
-            stats_arrays, ragged_payloads, ragged_idx, ragged_locs, cwd = _aggregate_chunk_cells(
+            (
+                stats_arrays,
+                ragged_payloads,
+                ragged_idx,
+                ragged_channels,
+                cwd,
+            ) = _aggregate_chunk_cells(
                 chunk_children,
                 col_arrays,
                 cell_to_slice,
@@ -748,6 +930,9 @@ def process_shard(
                 config,
                 data_vars,
                 agg_fields,
+                # Already gathered for the precompute above — the toc hoist reuses
+                # it instead of rebuilding the same index (review finding, PR #478).
+                chunk_pooled=chunk_pooled,
             )
         cells_with_data += cwd
         # Strict-AOI per-cell mask (issue #101): expand the shard's manifest payload
@@ -773,14 +958,17 @@ def process_shard(
             children=(chunk_children if chunks_per_shard > 1 else None),
             aoi_mask=chunk_aoi_mask,
         )
-        # A located field (issue #87) carries its per-cell uint64 location vectors
-        # as a third element; unlocated fields keep the 2-tuple contract unchanged.
+        # A companion-carrying field appends one element per declared channel, in
+        # the ``write._ragged_entry`` order (``locations`` then ``times`` — issue
+        # #87 and spec §8.3): the located 3-tuple, the temporal-only 4-tuple with
+        # a ``None`` location slot, and the both-channels 4-tuple. A field with
+        # neither channel keeps the 2-tuple contract unchanged.
         ragged = (
             {
                 name: (
-                    (ragged_payloads[name], ragged_idx[name], ragged_locs[name])
-                    if name in ragged_locs
-                    else (ragged_payloads[name], ragged_idx[name])
+                    ragged_payloads[name],
+                    ragged_idx[name],
+                    *_channel_entry(ragged_channels.get(name, {})),
                 )
                 for name in ragged_payloads
             }

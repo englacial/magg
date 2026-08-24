@@ -47,7 +47,12 @@ aggregation:
                                # single-block regime; every reducer). Omit the block for
                                # the fully-pooled path; mode: merge folds incrementally
                                # (mergeable reducers only). Pairs with worker.extra_disk.
-                               # buffer_granules defaults to 50.
+                               # buffer_granules defaults to 20 (issue #474);
+                               # block_bytes caps a spill block before it closes
+                               # and folds (absent: disk-derived default). Keep it
+                               # at or below ~45% of the variant's ephemeral storage:
+                               # a closing block stays resident beside the filling
+                               # one, and the /tmp guard reserves both.
   coordinates:
     morton:
       dtype: uint64
@@ -66,7 +71,8 @@ aggregation:
       source: h_ph
       inner_shape: [2]
       params:
-        delta: 256               # centroid budget (accuracy knob)
+        delta: 8192              # leaf centroid budget: loss-free bound (issues #414/#424)
+      overview_delta: 512        # pyramid-fold budget: ~1/512 accuracy (issue #424)
       dtype: float32
       fill_value: 0
 

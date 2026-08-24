@@ -21,6 +21,7 @@ from zagg.processing.raster import (
     _shard_cell_range,
     _shard_workers,
     _write_buffer,
+    emit_raster_leaf_template,
     emit_raster_template,
     new_stage_stats,
     process_raster_shard,
@@ -31,13 +32,20 @@ from zagg.processing.raster import (
     write_raster_coords,
     write_raster_slab,
 )
+from zagg.time_axis import decode_time_axis, read_time_axis, time_axis_attrs
 
 T0 = "2026-07-13T16:02:20+00:00"
 T0B = "2026-07-13T16:02:24+00:00"  # same datatake, adjacent tile: seconds later
 T1 = "2026-07-18T16:02:20+00:00"
 
 
-def _raster_config(bands=None, nodata=0, grid=None):
+def _raster_config(bands=None, nodata=0, grid=None, time_encoding=None):
+    output = {
+        "grid": grid or {"type": "healpix", "parent_order": 10, "child_order": 16},
+        "store": "memory://",
+    }
+    if time_encoding:
+        output["time_encoding"] = time_encoding
     return load_config_from_dict(
         {
             "data_source": {
@@ -55,18 +63,19 @@ def _raster_config(bands=None, nodata=0, grid=None):
                 },
                 "nodata": nodata,
             },
-            "output": {
-                "grid": grid or {"type": "healpix", "parent_order": 10, "child_order": 16},
-                "store": "memory://",
-            },
+            "output": output,
         }
     )
 
 
-def _entry(gid, assets, dt, time_key=None):
+def _entry(gid, assets, dt, time_key=None, time_start=None, time_end=None):
     e = {"id": gid, "s3": None, "https": None, "assets": assets, "datetime": dt}
     if time_key:
         e["time_key"] = time_key
+    if time_start:
+        e["time_start"] = time_start
+    if time_end:
+        e["time_end"] = time_end
     return e
 
 
@@ -322,6 +331,133 @@ class TestRasterTimeIndex:
     def test_missing_datetime_raises(self):
         with pytest.raises(ValueError, match="no datetime"):
             raster_time_index([[{"id": "bad", "assets": {"red": "x"}}]])
+
+
+class TestTocTimeIndex:
+    """The §8 toc encoding of the acquisition-group axis (issue #443)."""
+
+    def _granules(self):
+        return [
+            [
+                _entry("a", {"red": "x"}, T0, time_key="dt-1"),
+                _entry("b", {"red": "y"}, T0B, time_key="dt-1"),
+                _entry("c", {"red": "z"}, T1, time_key="dt-2"),
+            ]
+        ]
+
+    def test_group_span_becomes_a_range_word(self):
+        index, words = raster_time_index(self._granules(), encoding="toc")
+        # Row assignment is the encoding-independent part: same order, same
+        # index, so a leaf's slab rows cannot drift with the encoding.
+        assert index == raster_time_index(self._granules())[0] == {"dt-1": 0, "dt-2": 1}
+        assert words.dtype == np.uint64 and words.shape == (2,)
+        lo, hi = decode_time_axis(words, time_axis_attrs("toc"))
+        # dt-1 spans T0..T0B (4 s apart) — a conservative range containing both.
+        assert lo[0] <= np.datetime64(T0[:-6], "ns") and hi[0] > np.datetime64(T0B[:-6], "ns")
+        # dt-2 is a single item: an exact instant, not widened into a range.
+        assert lo[1] == hi[1] == np.datetime64(T1[:-6], "ns")
+
+    def test_stac_start_end_datetime_widens_the_envelope(self):
+        granules = [
+            [
+                _entry(
+                    "a",
+                    {"red": "x"},
+                    T0,
+                    time_key="dt-1",
+                    time_start="2026-07-13T16:02:18+00:00",
+                    time_end="2026-07-13T16:02:29+00:00",
+                )
+            ]
+        ]
+        _index, words = raster_time_index(granules, encoding="toc")
+        lo, hi = decode_time_axis(words, time_axis_attrs("toc"))
+        assert lo[0] <= np.datetime64("2026-07-13T16:02:18", "ns")
+        assert hi[0] > np.datetime64("2026-07-13T16:02:29", "ns")
+
+    def test_legacy_encoding_ignores_the_span(self):
+        # A pre-§8 axis is the earliest ITEM datetime, spans or not — the
+        # legacy values must not move when a catalog gains start/end columns.
+        granules = [
+            [
+                _entry(
+                    "a",
+                    {"red": "x"},
+                    T0,
+                    time_key="dt-1",
+                    time_start="2026-07-13T16:02:18+00:00",
+                    time_end="2026-07-13T16:02:29+00:00",
+                )
+            ]
+        ]
+        _index, times = raster_time_index(granules)
+        assert times.dtype == np.int64 and times[0] == np.int64(1_783_958_540_000_000)
+
+    def test_a_leading_span_puts_the_stored_words_out_of_row_order(self):
+        # The §8.1 divergence, on the production function: row order keys on
+        # the group's earliest ITEM datetime, but the word encodes the
+        # ENVELOPE start. A later row whose declared start_datetime precedes
+        # an earlier row's item datetime therefore encodes a SMALLER word --
+        # so the stored axis is materially unsorted and MUST NOT be bisected,
+        # while the row assignment stays identical to the legacy encoding.
+        granules = [
+            [
+                _entry("a", {"red": "x"}, T0, time_key="dt-1"),
+                _entry(
+                    "b",
+                    {"red": "y"},
+                    "2026-07-13T16:02:30+00:00",
+                    time_key="dt-2",
+                    time_start="2026-07-13T16:00:59+00:00",
+                    time_end="2026-07-13T16:02:40+00:00",
+                ),
+            ]
+        ]
+        index, words = raster_time_index(granules, encoding="toc")
+        # Row assignment is stable across encodings — the load-bearing claim.
+        assert index == raster_time_index(granules)[0] == {"dt-1": 0, "dt-2": 1}
+        # ...but the stored words descend, by the span's ~81 s lead.
+        assert words[1] < words[0]
+        assert not np.array_equal(np.sort(words), words)
+        lo, _hi = decode_time_axis(words, time_axis_attrs("toc"))
+        assert lo[1] <= np.datetime64("2026-07-13T16:00:59", "ns") < lo[0]
+
+    def test_empty_toc_axis(self):
+        index, words = raster_time_index([[]], encoding="toc")
+        assert index == {} and words.dtype == np.uint64 and words.size == 0
+
+    def test_template_declares_and_round_trips(self, tmp_path):
+        cfg, grid, _shard = _healpix_setup(tmp_path, time_encoding="toc")
+        _index, words = raster_time_index(self._granules(), encoding="toc")
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, words)
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        assert tarr.dtype == np.uint64
+        assert "units" not in tarr.attrs and "calendar" not in tarr.attrs
+        assert dict(tarr.attrs)["temporal"]["spec"] == "zagg-toc/1"
+        np.testing.assert_array_equal(tarr[:], words)
+        # And the read path decodes the store without being told the encoding.
+        lo, hi = read_time_axis(store, grid.group_path)
+        assert lo.shape == (2,) and (hi >= lo).all()
+
+    def test_leaf_template_declares_toc(self, tmp_path):
+        cfg, grid, shard = _healpix_setup(tmp_path, time_encoding="toc")
+        _index, words = raster_time_index(self._granules(), encoding="toc")
+        store = MemoryStore()
+        emit_raster_leaf_template(store, grid, cfg, shard, words)
+        tarr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
+        assert tarr.dtype == np.uint64
+        np.testing.assert_array_equal(tarr[:], words)
+
+    def test_legacy_store_still_reads(self, tmp_path):
+        # Schema evolution: a store written before §8 decodes through the same
+        # reader, no declaration and no refusal.
+        cfg, grid, _shard = _healpix_setup(tmp_path)
+        store = MemoryStore()
+        emit_raster_template(store, grid, cfg, np.array([1_000_000, 2_000_000], dtype=np.int64))
+        lo, hi = read_time_axis(store, grid.group_path)
+        np.testing.assert_array_equal(lo, hi)
+        assert lo[0] == np.datetime64("1970-01-01T00:00:01", "ns")
 
 
 class _FakeGrid:
@@ -629,7 +765,7 @@ class TestOwnership:
             np.testing.assert_array_equal(streamed[t]["red"], golden[t]["red"])
 
 
-def _healpix_setup(tmp_path):
+def _healpix_setup(tmp_path, time_encoding=None):
     """Order-10 shard over the synthetic raster; order-16 cells (~97 m)."""
     from mortie import clip2order, geo2mort
 
@@ -640,6 +776,7 @@ def _healpix_setup(tmp_path):
     cfg = _raster_config(
         bands={"red": {"asset": "red", "dtype": "uint16", "scale": 0.0001, "offset": -0.1}},
         grid={"type": "healpix", "parent_order": 10, "child_order": 16},
+        time_encoding=time_encoding,
     )
     grid = HealpixGrid(10, 16, config=cfg)
     return cfg, grid, shard
@@ -1232,6 +1369,324 @@ class TestRasterHiveWorker:
         assert stamp and stamp["complete"]
         red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
         assert red.shape == (1, grid.cells_per_shard)
+
+    # ── leaf skip-if-current + contraction guard (issue #388 phase 2) ────────
+
+    def _committed_leaf_with_sidecar(self, tmp_path, use=None):
+        """First run: the real seam commits the leaf; then the sidecar a
+        dispatcher would write (issue #297), carrying the #388 identity.
+        ``use`` seals the record over a PREFIX of the granules, so a later run
+        over the whole set reads as an expansion."""
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.telemetry import build_record, raster_granule_ids, write_sidecar
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        first = granules if use is None else granules[:use]
+        meta = process_and_write_raster_hive(shard, first, grid, root, cfg, store_kwargs={})
+        leaf = hive.shard_leaf_path(root, shard)
+        record = build_record(
+            shard_key=int(shard),
+            metadata={**meta, "total_obs": meta["timesteps"]},
+            granule_ids=raster_granule_ids(first),
+            run_id="r1",
+            semantic_hash=meta["semantic_hash"],
+        )
+        write_sidecar(leaf, record)
+        return cfg, grid, shard, granules, root, leaf
+
+    def _counting(self, monkeypatch):
+        """Count real ``process_raster_shard`` calls — the did-it-fold pin."""
+        import zagg.processing.raster as raster_mod
+
+        real = raster_mod.process_raster_shard
+        calls: list = []
+
+        def counting(*a, **k):
+            calls.append(1)
+            return real(*a, **k)
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", counting)
+        return calls
+
+    @staticmethod
+    def _boom(monkeypatch):
+        import zagg.processing.raster as raster_mod
+
+        def boom(*_a, **_k):
+            raise AssertionError("sampling ran on a gated unit")
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", boom)
+
+    @staticmethod
+    def _tree(root):
+        import os as _os
+
+        out = {}
+        for dirpath, _dirs, files in _os.walk(root):
+            for name in files:
+                p = _os.path.join(dirpath, name)
+                out[_os.path.relpath(p, root)] = _os.stat(p).st_mtime_ns
+        return out
+
+    @staticmethod
+    def _contents(root):
+        import os as _os
+
+        out = {}
+        for dirpath, _dirs, files in _os.walk(root):
+            for name in files:
+                p = _os.path.join(dirpath, name)
+                with open(p, "rb") as fh:
+                    out[_os.path.relpath(p, root)] = fh.read()
+        return out
+
+    @staticmethod
+    def _age(root, epoch=10_000):
+        import os as _os
+
+        for dirpath, _dirs, files in _os.walk(root):
+            for name in files:
+                _os.utime(_os.path.join(dirpath, name), (epoch, epoch))
+        return epoch * 10**9
+
+    def test_skip_if_current_no_ops_and_writes_nothing(self, tmp_path, monkeypatch):
+        import zagg.processing.raster as raster_mod
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        before = self._contents(root)
+        aged_ns = self._age(root)
+
+        def boom(*_a, **_k):
+            raise AssertionError("sampling ran on a current unit")
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", boom)
+        skipped = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert skipped["current"] is True and skipped["identity"] == "equal"
+        assert skipped["timesteps"] == 0 and skipped["leaf_written"] is False
+        # The unit wrote NOTHING: same object set, every byte identical...
+        assert self._contents(root) == before
+        # ...and the lifecycle touch refreshed every object under the unit
+        # (issue #388 phase 3): the purge clock resets on a skip.
+        after = self._tree(root)
+        assert set(after) == set(before)
+        assert all(mtime > aged_ns for mtime in after.values())
+        assert skipped["touched_objects"] == len(after) and skipped["touch_failed"] == 0
+        # Conditional key (issue #495 phase 4): a touch that RAN carries no
+        # not-applicable count, so this record is what it was before.
+        assert "touch_skipped_paths" not in skipped
+
+    def test_declared_touch_policy_reaches_the_skip_seam(self, tmp_path, monkeypatch):
+        # Issue #501 END TO END through the raster seam: the config's
+        # `output.touch` must govern the touch, not just the lifecycle unit
+        # tests that call touch_current_unit directly. Delete the
+        # `policy=get_touch_policy(config)` kwarg in process_and_write_raster_hive
+        # and this fails (review finding on PR #496).
+        import zagg.processing.raster as raster_mod
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        aged_ns = self._age(root)
+
+        def boom(*_a, **_k):
+            raise AssertionError("sampling ran on a current unit")
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", boom)
+        cfg.output["touch"] = "never"
+        skipped = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert skipped["current"] is True
+        assert skipped["touched_objects"] == 0 and skipped["touch_failed"] == 0
+        assert skipped["touch_skipped_paths"] > 0
+        assert all(mtime == aged_ns for mtime in self._tree(root).values())
+
+    def test_a_published_skip_is_recorded_not_silently_zero(self, tmp_path, monkeypatch):
+        # Mirror of the aggregation seam (issue #495 phase 4, review finding
+        # on PR #496): touched_objects: 0 / touch_failed: 0 cannot be told
+        # from a touch that never ran -- the comment at the bottom of
+        # zagg/processing/raster.py names that exact ambiguity -- so the
+        # not-applicable PATH count is recorded too.
+        import zagg.lifecycle as lifecycle_mod
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "touch_current_unit",
+            lambda *_a, **_k: {"touched": 0, "failed": 0, "skipped_paths": 3},
+        )
+        skipped = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert skipped["current"] is True
+        assert skipped["touched_objects"] == 0 and skipped["touch_failed"] == 0
+        assert skipped["touch_skipped_paths"] == 3
+
+    def test_contraction_refuses_without_the_flag(self, tmp_path, monkeypatch):
+        import zagg.processing.raster as raster_mod
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.telemetry import raster_granule_ids
+
+        cfg, grid, shard, granules, root, leaf = self._committed_leaf_with_sidecar(tmp_path)
+
+        def boom(*_a, **_k):
+            raise AssertionError("sampling ran on a refused unit")
+
+        monkeypatch.setattr(raster_mod, "process_raster_shard", boom)
+        refused = process_and_write_raster_hive(
+            shard, granules[:1], grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert refused["refused"] is True and refused["identity"] == "contraction"
+        assert refused["missing_granules"] == [raster_granule_ids(granules)[1]]
+        # The committed leaf is protected: still stamped complete — and NOT
+        # touched (only a certified-current unit resets the purge clock).
+        assert hive.read_commit(leaf)["complete"] is True
+        assert "touched_objects" not in refused
+
+    def test_allow_contraction_rewrites(self, tmp_path):
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, leaf = self._committed_leaf_with_sidecar(tmp_path)
+        redo = process_and_write_raster_hive(
+            shard,
+            granules[:1],
+            grid,
+            root,
+            cfg,
+            store_kwargs={},
+            skip_if_current=True,
+            allow_contraction=True,
+        )
+        # A flagged contraction is a normal wholesale rewrite (D13 semantics).
+        assert "refused" not in redo and redo["identity"] == "contraction"
+        assert redo["timesteps"] == 1 and redo["leaf_written"] is True
+        red = open_array(leaf + f"/{grid.group_path}/red", zarr_format=3, consolidated=False)
+        assert red.shape == (1, grid.cells_per_shard)
+
+    def test_seam_stamps_semantic_hash(self, tmp_path):
+        # The raster seam stamps the D19 hash for the sidecar fallback too.
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.semantics import semantic_hash as semhash
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        meta = process_and_write_raster_hive(shard, granules, grid, root, cfg, store_kwargs={})
+        assert meta["semantic_hash"] == semhash(cfg)
+
+    # The rest of the vector gate matrix (tests/test_hive.py::
+    # TestLeafSkipIfCurrent), mirrored: the raster seam has its own gate call
+    # site and its own early return, so every branch is pinned on both.
+
+    def test_gate_is_off_by_default(self, tmp_path, monkeypatch):
+        # The byte-identity pin for the deployed handler: without
+        # skip_if_current the seam rewrites unconditionally, exactly as today.
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(shard, granules, grid, root, cfg, store_kwargs={})
+        assert len(calls) == 1
+        assert "current" not in meta and "identity" not in meta
+
+    def test_no_sidecar_rewrites(self, tmp_path, monkeypatch):
+        # The raster sidecar is written only when ``leaf_written``, so this
+        # seam reaches ``no-sidecar`` over a strictly wider set of states than
+        # the vector one (a unit with acquisitions but no occupied cell writes
+        # no leaf, hence no record).
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root = self._setup(tmp_path)
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert len(calls) == 1 and meta["identity"] == "no-sidecar"
+
+    def test_unrecorded_ids_rewrites_with_its_own_classification(self, tmp_path, monkeypatch):
+        # A leaf written before issue #388 has no granule-id sibling: the
+        # guard is INERT, and the classification is what run stats count apart.
+        import os
+
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.telemetry import granule_ids_path
+
+        cfg, grid, shard, granules, root, leaf = self._committed_leaf_with_sidecar(tmp_path)
+        os.remove(granule_ids_path(leaf))
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard, granules[:1], grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert len(calls) == 1
+        assert meta["identity"] == "unrecorded-ids" and "refused" not in meta
+
+    def test_expansion_rewrites(self, tmp_path, monkeypatch):
+        # A new acquisition: planned ⊇ recorded never trips the guard.
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path, use=1)
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert len(calls) == 1 and meta["identity"] == "expansion"
+        assert "refused" not in meta and "current" not in meta
+
+    def test_semantic_mismatch_rewrites(self, tmp_path, monkeypatch):
+        # Same id set under a different semantic hash: rewrite, never refuse.
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard,
+            granules,
+            grid,
+            root,
+            cfg,
+            store_kwargs={},
+            skip_if_current=True,
+            semantic_hash="f" * 64,
+        )
+        assert len(calls) == 1 and meta["identity"] == "semantic-mismatch"
+        assert meta["semantic_hash"] == "f" * 64
+
+    def test_mixed_add_and_drop_refuses(self, tmp_path, monkeypatch):
+        # The ruled predicate is ``recorded ∖ planned ≠ ∅``, NOT strict-subset.
+        from zagg.processing.raster import process_and_write_raster_hive
+        from zagg.telemetry import raster_granule_ids
+
+        cfg, grid, shard, granules, root, _leaf = self._committed_leaf_with_sidecar(tmp_path)
+        fresh = _entry("g2", {"red": str(tmp_path / "h0.tif")}, T1, time_key="dt-3")
+        self._boom(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard, [granules[0], fresh], grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert meta["refused"] is True and meta["identity"] == "mixed"
+        assert meta["missing_granules"] == [raster_granule_ids(granules)[1]]
+
+    def test_destroyed_leaf_with_surviving_sidecar_rebuilds(self, tmp_path, monkeypatch):
+        # The sidecar is a SIBLING of the leaf, so a prefix-scoped lifecycle
+        # purge leaves the record over an absent leaf. The D4 stamp is the
+        # skip precondition on both seams (hive._leaf_is_committed).
+        import shutil
+
+        from zagg import hive
+        from zagg.processing.raster import process_and_write_raster_hive
+
+        cfg, grid, shard, granules, root, leaf = self._committed_leaf_with_sidecar(tmp_path)
+        shutil.rmtree(leaf)
+        assert hive.read_commit(leaf) is None
+        calls = self._counting(monkeypatch)
+        meta = process_and_write_raster_hive(
+            shard, granules, grid, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert len(calls) == 1 and meta["identity"] == "unstamped-leaf"
+        assert "current" not in meta
+        assert hive.read_commit(leaf)["complete"] is True
 
 
 class TestRasterHiveContentHashes:

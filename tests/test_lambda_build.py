@@ -6,6 +6,8 @@ These tests verify that:
 3. The zagg package can be imported as Lambda would see it
 """
 
+import inspect
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -66,11 +68,21 @@ class TestLambdaImports:
     def test_h5coro_hidefix_available(self):
         """h5coro-hidefix ships the compiled reader for the sidecar backend (issue #149).
 
-        importorskip, not a bare import: the pinned 0.2.0 is not on PyPI until
-        upstream cuts that release, so an env that could not install it yet
-        skips here instead of failing the whole suite.
+        importorskip, not a bare import: the floor can sit ahead of what PyPI
+        has published, so an env that could not install it yet skips here
+        instead of failing the whole suite.
+
+        The signature assertion pins the >=0.3.2 floor's reason: the worker
+        forwards io_stats to every backend ungated (``worker.py`` read_kwargs,
+        issue #374), and 0.3.1's read_group raised TypeError on every sidecar
+        group read — silently, as a caught per-group error reported as "No data
+        after filtering". Fails loudly wherever a below-floor hidefix installs.
         """
         pytest.importorskip("h5coro_hidefix")
+
+        from h5coro_hidefix.zagg_backend import SidecarIndex
+
+        assert "io_stats" in inspect.signature(SidecarIndex.read_group).parameters
 
 
 class TestFunctionBuild:
@@ -162,6 +174,41 @@ class TestLambdaHandlerSyntax:
         compile(invoker.read_text(), str(invoker), "exec")
 
 
+def _statement_resources(statement):
+    """A policy statement's Resource ARNs -- scalar or list, ``!Sub`` flattened.
+
+    Flattening the one-key intrinsic matters: several of the role's statements
+    build their ARN with ``!Sub``, which the loader below parses to
+    ``{"Sub": "arn:..."}``. Skipping those would let a parameterized ARN --
+    ``!Sub "arn:aws:s3:::${PublishBucket}/englacial/zagg/index/*"`` -- slip
+    past the "nothing outside demo/" guard the helper exists to feed.
+    """
+    resource = statement.get("Resource")
+    entries = resource if isinstance(resource, list) else [resource]
+    arns = []
+    for entry in entries:
+        if isinstance(entry, str):
+            arns.append(entry)
+        elif isinstance(entry, dict) and len(entry) == 1:
+            (body,) = entry.values()
+            if isinstance(body, str):
+                arns.append(body)
+    return arns
+
+
+def _statement_actions(statement):
+    """A policy statement's Action entries, whether scalar or list.
+
+    Normalizing first is load-bearing: ``"s3:Foo" in statement["Action"]`` is a
+    substring test rather than a membership test when Action is a scalar
+    string, and this template carries both shapes.
+    """
+    action = statement.get("Action")
+    if isinstance(action, list):
+        return action
+    return [action] if action is not None else []
+
+
 class TestTemplateEnvironment:
     """The CloudFormation template must wire the glibc allocator tunables (#143).
 
@@ -212,40 +259,197 @@ class TestTemplateEnvironment:
         # The shared execution role gets Get/Put/Delete on the whole public
         # sliderule-public-cors bucket -- deliberate scope (espg, PR #176):
         # virtual-index write-back + sidecar reads (zagg-index/*, issue #160)
-        # AND worker-written output zarr stores (e.g. zagg-examples/*) -- in
-        # BOTH copies of the role (inline ExecutionRole here, admin-created
-        # execution_role.yaml).
+        # AND worker-written output zarr stores (e.g. zagg-examples/*). This is
+        # the STAGING half of the identity model in issue #495; the published
+        # half is asserted in the next test.
         arn = "arn:aws:s3:::sliderule-public-cors/*"
-        actions = ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"]
-
-        def _index_statements(role_props):
-            stmts = role_props["Policies"][0]["PolicyDocument"]["Statement"]
-            return [s for s in stmts if s.get("Resource") == arn]
-
-        tpl_role = self._load_template()["Resources"]["ExecutionRole"]["Properties"]
-        matches = _index_statements(tpl_role)
+        role = self._load_template()["Resources"]["ExecutionRole"]["Properties"]
+        stmts = role["Policies"][0]["PolicyDocument"]["Statement"]
+        matches = [s for s in stmts if s.get("Resource") == arn]
         assert len(matches) == 1
-        assert sorted(matches[0]["Action"]) == actions
+        assert sorted(matches[0]["Action"]) == ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"]
 
-        import yaml
+    def test_execution_role_is_the_published_identity(self):
+        # Issue #495 (revised): the fleet publishes to Source Cooperative as
+        # ITSELF -- no assumable role, no injected credentials, no one-hour
+        # role-chaining ceiling. zagg's data model is communal (one datacube,
+        # appended by many), and staging vs published is a difference in store
+        # MATURITY, not identity, so this is the same policy shape as the
+        # sliderule-public-cors grant above pointed at a durable destination.
+        tpl = self._load_template()
+        stmts = tpl["Resources"]["ExecutionRole"]["Properties"]["Policies"][0]["PolicyDocument"][
+            "Statement"
+        ]
 
-        class _CfnLoader(yaml.SafeLoader):
-            pass
+        published = "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*"
+        objects = [s for s in stmts if s.get("Resource") == published]
+        assert len(objects) == 1, "the execution role must reach zagg's published prefix"
+        # DeleteObject is deliberate: store overwrite and manifest cleanup need
+        # it, and the bucket is versioned, so a delete leaves a marker rather
+        # than destroying bytes. PutObjectAcl is load-bearing: every write to
+        # this bucket carries x-amz-acl: bucket-owner-full-control, and S3
+        # evaluates that against s3:PutObjectAcl on PutObject AND on
+        # CreateMultipartUpload -- without it the first published PUT 403s.
+        # The multipart pair covers the failure path PutObject does not:
+        # obstore's own abort (it holds the UploadId) would otherwise 403 and
+        # leak parts billed to Source Cooperative.
+        assert sorted(objects[0]["Action"]) == [
+            "s3:AbortMultipartUpload",
+            "s3:DeleteObject",
+            "s3:GetObject",
+            "s3:ListMultipartUploadParts",
+            "s3:PutObject",
+            "s3:PutObjectAcl",
+        ]
+        # Scoped to englacial/zagg/demo/*, not englacial/zagg/* or englacial/*
+        # (espg, 2026-08-20): the fleet publishes demo stores, while
+        # englacial/zagg/lambda/* and englacial/zagg/benchmarks/* belong to the
+        # CI release role under issue #497.
+        assert not any(
+            s.get("Resource")
+            in (
+                "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/*",
+                "arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/*",
+            )
+            for s in stmts
+        )
+        # PutObjectAcl is granted on the published prefix ONLY: the canned ACL
+        # is not sent to buckets we own, and sliderule-public-cors' bucket
+        # policy is not ours to change, so granting it there would be
+        # unexplained privilege.
+        acl_grants = [s for s in stmts if "s3:PutObjectAcl" in _statement_actions(s)]
+        assert [s["Resource"] for s in acl_grants] == [published]
 
-        def _cfn_multi(loader, tag_suffix, node):
-            if isinstance(node, yaml.ScalarNode):
-                return {tag_suffix: loader.construct_scalar(node)}
-            if isinstance(node, yaml.SequenceNode):
-                return {tag_suffix: loader.construct_sequence(node)}
-            return {tag_suffix: loader.construct_mapping(node)}
+        # Nothing outside demo/ -- lambda/* and benchmarks/* belong to the CI
+        # release role under issue #497, not to the fleet, and the sidecar
+        # index cache is NOT moving here (espg, 2026-08-20: a different bucket
+        # under a different org, post-MVP).
+        reachable = {r for s in stmts for r in _statement_resources(s) if "source.coop/" in r}
+        assert reachable == {published}
 
-        _CfnLoader.add_multi_constructor("!", _cfn_multi)
-        role_tpl = REPO_ROOT / "deployment" / "aws" / "execution_role.yaml"
-        ext = yaml.load(role_tpl.read_text(), Loader=_CfnLoader)
-        ext_role = ext["Resources"]["ExecutionRole"]["Properties"]
-        ext_matches = _index_statements(ext_role)
-        assert len(ext_matches) == 1
-        assert sorted(ext_matches[0]["Action"]) == actions
+        bucket = [
+            s for s in stmts if s.get("Resource") == "arn:aws:s3:::us-west-2.opendata.source.coop"
+        ]
+        assert len(bucket) == 1
+        # s3:ListBucket ONLY. ListBucketMultipartUploads was dropped (espg,
+        # 2026-08-20): it lists in-progress uploads bucket-wide and s3:prefix
+        # cannot constrain it, so Source Cooperative's data-upload docs omit it
+        # and their bucket policy does not grant it -- holding it here would be
+        # denied cross-account anyway. Leaked parts age out on their 7-day
+        # lifecycle rule; obstore's own abort (AbortMultipartUpload, granted on
+        # the objects above) covers the failure path we can actually clean up.
+        # Normalized through the helper on purpose: the point is the ABSENCE of
+        # ListBucketMultipartUploads, so rewriting the grant as the
+        # IAM-identical one-element list must not fail this spuriously.
+        assert _statement_actions(bucket[0]) == ["s3:ListBucket"]
+        # Unconditional on purpose (PR #496 review): S3 answers 404 for an
+        # absent key only when the caller holds s3:ListBucket on the bucket,
+        # and a GetObject evaluation carries no s3:prefix context key -- so an
+        # s3:prefix condition would make every absent object 403, which zagg's
+        # 404-only absence checks do not catch.
+        assert "Condition" not in bucket[0], (
+            "an s3:prefix condition on ListBucket makes absent objects 403 "
+            "instead of 404, and zagg's absence checks catch 404 only"
+        )
+
+        # No assumable upload role survives from the first cut of phase 3.
+        assert not any("SourceCoop" in name for name in tpl["Resources"])
+        assert not any("SourceCoop" in name for name in tpl["Parameters"])
+
+    def test_execution_role_name_is_a_stable_parameter(self):
+        # The ARN becomes a cross-organization contract once Source Cooperative
+        # names it in their bucket policy, so the role cannot keep a
+        # CloudFormation-generated name. It must stay a PARAMETER, though:
+        # zagg-backend-test is a second stack from this same template and a
+        # hardcoded name would collide on CREATE.
+        tpl = self._load_template()
+        assert tpl["Parameters"]["ExecutionRoleName"]["Default"] == "zagg-lambda-execution"
+        role = tpl["Resources"]["ExecutionRole"]
+        assert role["Properties"]["RoleName"] == {"Ref": "ExecutionRoleName"}
+        standup = (REPO_ROOT / "deployment" / "aws" / "stand_up.sh").read_text()
+        # A named IAM role needs CAPABILITY_NAMED_IAM; tightening that back to
+        # CAPABILITY_IAM would fail only against live AWS.
+        assert "CAPABILITY_NAMED_IAM" in standup
+        # ...and the name must be reachable from the standup path, or a second
+        # stack in the same account cannot avoid the collision.
+        assert 'ExecutionRoleName="$EXECUTION_ROLE_NAME"' in standup
+
+    def test_execution_role_backdoor_is_gone(self):
+        # espg's ruling (issue #495): CreateExecutionRole/ExecutionRoleArn was
+        # a hatch for users without iam:CreateRole, it never worked, and
+        # nothing used it. The supported posture is "an admin stands up the
+        # template". Removal has to be complete -- a surviving !If or a stale
+        # env var in stand_up.sh would silently reintroduce an unnamed role,
+        # and an unnamed role breaks publishing on Source Cooperative's side.
+        tpl = self._load_template()
+        assert "CreateExecutionRole" not in tpl["Parameters"]
+        assert "ExecutionRoleArn" not in tpl["Parameters"]
+        assert "ShouldCreateRole" not in tpl["Conditions"]
+        assert "Condition" not in tpl["Resources"]["ExecutionRole"]
+        assert tpl["Outputs"]["RoleArn"]["Value"] == {"GetAtt": "ExecutionRole.Arn"}
+
+        raw = (REPO_ROOT / "deployment" / "aws" / "template.yaml").read_text()
+        for token in ("ShouldCreateRole", "ExecutionRoleArn", "CreateExecutionRole"):
+            assert token not in raw, f"{token} survives in template.yaml"
+        standup = (REPO_ROOT / "deployment" / "aws" / "stand_up.sh").read_text()
+        for token in ("CREATE_ROLE", "ROLE_ARN", "CreateExecutionRole", "ExecutionRoleArn"):
+            assert token not in standup, f"{token} survives in stand_up.sh"
+        for stale in (
+            REPO_ROOT / "deployment" / "aws" / "execution_role.yaml",
+            REPO_ROOT / "deployment" / "aws" / "EXECUTION_ROLE.md",
+            REPO_ROOT / "docs" / "deployment" / "execution-role.md",
+        ):
+            assert not stale.exists(), f"{stale.name} documents a path that no longer exists"
+        # A nav entry pointing at a deleted page breaks the docs build.
+        assert "execution-role.md" not in (REPO_ROOT / "mkdocs.yml").read_text()
+
+    def test_every_function_uses_the_stack_role_directly(self):
+        # The five !If [ShouldCreateRole, ...] sites are gone; each function
+        # (base, -extract, and the Fn::ForEach worker variants) must reference
+        # the role resource, not a parameter that no longer exists.
+        tpl = self._load_template()
+        roles = []
+        for key, val in tpl["Resources"].items():
+            if key.startswith("Fn::ForEach::"):
+                for resource in val[2].values():
+                    if resource.get("Type") == "AWS::Lambda::Function":
+                        roles.append(resource["Properties"]["Role"])
+            elif val.get("Type") == "AWS::Lambda::Function":
+                roles.append(val["Properties"]["Role"])
+        # Count, not just `all(...)`: a vacuous all() holds on a SUBSET, so
+        # deleting a whole worker variant would leave this green. Five is what
+        # the template yields -- base, -extract, and the three Fn::ForEach
+        # blocks -- and five is the number of Role: sites the comment names.
+        assert len(roles) == 5, roles
+        assert all(r == {"GetAtt": "ExecutionRole.Arn"} for r in roles), roles
+
+    def test_execution_role_permissions_are_fully_inline(self):
+        # Salvaged from the deleted test_execution_role_gains_no_source_coop_access
+        # (review finding): every assertion in this file reads the role's
+        # inline Policies, and that reasoning is sound ONLY while the role has
+        # no attached managed policy -- one could carry bucket access none of
+        # these tests can see.
+        role = self._load_template()["Resources"]["ExecutionRole"]
+        assert "ManagedPolicyArns" not in json.dumps(role), (
+            "the ExecutionRole attaches a managed policy -- its permissions are "
+            "no longer fully described inline, so the assertions in this file "
+            "can no longer see everything it grants"
+        )
+
+    def test_the_second_stack_command_overrides_the_role_name(self):
+        # IAM role names are ACCOUNT-scoped, so the one in-repo command that
+        # stands up a second stack must pass EXECUTION_ROLE_NAME or CREATE
+        # fails with EntityAlreadyExists (review finding). stand_up.sh refuses
+        # the combination up front; this pins that the documented command does
+        # not hit that refusal.
+        doc = (REPO_ROOT / "docs" / "deployment" / "benchmark-cicd.md").read_text()
+        block = doc.split("## 8. The `process-shard-test` stack", 1)[1]
+        block = block.split("```bash", 1)[1].split("```", 1)[0]
+        assert "STACK_NAME=zagg-backend-test" in block
+        assert "EXECUTION_ROLE_NAME=zagg-lambda-execution-test" in block
+        standup = (REPO_ROOT / "deployment" / "aws" / "stand_up.sh").read_text()
+        assert 'DEFAULT_EXECUTION_ROLE_NAME="zagg-lambda-execution"' in standup
+        assert '[ "$STACK_NAME" != "$DEFAULT_STACK_NAME" ]' in standup
 
     def test_metric_filters_publish_recycle_error_split(self):
         # issue #175: under RecycleMaxInvocations=1 every async invocation
@@ -581,39 +785,175 @@ class TestLayerExtraParity:
 
     # Distributions whose layer spec build_layer.sh *derives* from
     # ``[project.dependencies]`` instead of hard-coding (issue #322), keyed to the
-    # shell fragment that does the deriving. No literal ``"name==x.y.z"`` string
+    # shell fragment that does the deriving. No literal ``name==x.y.z`` string
     # exists for these, so the substring check below cannot apply — and the two
     # mechanisms are mutually exclusive: an exact pin added to the ``lambda`` extra
     # would not reach the layer, which the failure message has to say out loud.
     _DERIVED = {"mortie": "MORTIE_SPEC=$("}
 
+    @staticmethod
+    def _install_lines(script):
+        """The script's ``$PIP install`` invocations, backslash continuations joined.
+
+        Deriving a pin is only half the contract — it has to be handed to pip.
+        The installs span continuation lines (``build_layer.sh:93-96``), so a
+        raw per-line scan would miss most of them.
+        """
+        logical, buf = [], ""
+        for line in script.splitlines():
+            if line.endswith("\\"):
+                buf += line[:-1]
+                continue
+            logical.append(buf + line)
+            buf = ""
+        if buf:
+            logical.append(buf)
+        return [line for line in logical if "$PIP install" in line]
+
     def test_every_lambda_extra_pin_is_in_build_layer(self):
+        """Every exact ``lambda`` pin reaches the layer via ``lambda_pin`` derivation.
+
+        Since PR #436 the script derives each exact pin from the extra at build
+        time (extending issue #322's mortie pattern), so the contract inverts:
+        every pinned name must be *fetched* via ``$(lambda_pin name)``, and no
+        literal ``name==x.y.z`` may exist in the script in any quoting — a
+        literal is a second declaration site, exactly the drift this closes.
+
+        Deriving alone is not enough: the assignment block sits far from the
+        installs, so a pin can be fetched and never passed to pip — the issue
+        #218 async-tiff gap in a new costume. The name -> shell-var mapping is
+        parsed out of the script (not hard-coded) so renaming a var cannot
+        quietly drop its install check, and each var must appear quoted on a
+        ``$PIP install`` line.
+        """
         import tomllib
 
         pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
         pins = pyproject["project"]["optional-dependencies"]["lambda"]
         script = (REPO_ROOT / "deployment" / "aws" / "build_layer.sh").read_text()
+        pin_vars = {
+            name: var
+            for var, name in re.findall(
+                r"^([A-Z0-9_]+_PIN)=\$\(lambda_pin (.+)\)$", script, re.MULTILINE
+            )
+        }
+        installs = "\n".join(self._install_lines(script))
         missing = []
+        uninstalled = []
+        literal = []
         derived = []
         for pin in pins:
             m = re.match(r"([A-Za-z0-9._-]+)==([A-Za-z0-9.]+)$", pin)
             if not m:  # unpinned entries (cramjam, astropy) aren't layer-exact
                 continue
-            if m.group(1) in self._DERIVED:
+            name = m.group(1)
+            if name in self._DERIVED:
                 derived.append(pin)
                 continue
-            if f'"{pin}"' not in script:
-                missing.append(pin)
+            var = pin_vars.get(name)
+            if var is None:
+                missing.append(name)
+            elif f'"${var}"' not in installs:
+                uninstalled.append(f"{name} (${var})")
+            # Unquoted and single-quoted args are as common as double-quoted
+            # ones here (`fastparquet cramjam`, `obspec`), so anchor on a name
+            # boundary + a version-ish tail instead of a leading quote.
+            if re.search(rf"(?<![\w.-]){re.escape(name)}==\d", script):
+                literal.append(name)
         assert not missing, (
-            f"lambda-extra pins absent from deployment/aws/build_layer.sh: {missing} "
-            "(the layer would ship without them — see issue #218's async-tiff gap)"
+            f"lambda-extra pins not derived in deployment/aws/build_layer.sh: {missing} "
+            "(the layer would ship without them — see issue #218's async-tiff gap; "
+            "fetch each with NAME_PIN=$(lambda_pin <name>))"
+        )
+        assert not uninstalled, (
+            f"lambda-extra pins derived but never installed: {uninstalled} — the layer "
+            'ships without them (issue #218). Pass each as "$NAME_PIN" on a $PIP '
+            "install line."
+        )
+        assert not literal, (
+            f"build_layer.sh hard-codes {literal} — exact pins are single-sourced from "
+            "the lambda extra via lambda_pin (PR #436); a literal pin is a second "
+            "declaration site and will drift"
         )
         assert not derived, (
             f"{derived} is pinned in the lambda extra, but build_layer.sh derives that "
             "spec from [project.dependencies] (issue #322), so the exact pin never "
             "reaches the layer. Either move the pin to [project.dependencies], or "
-            "replace the derivation in build_layer.sh with a literal pin."
+            "derive it from the extra via lambda_pin instead."
         )
+
+    def test_lambda_pin_derivation_resolves_every_exact_pin(self):
+        """Execute the script's ``lambda_pin`` python: its output IS the extra's pin.
+
+        The parity test above matches text; this one runs the actual extraction
+        snippet out of build_layer.sh against the real pyproject.toml, so a
+        broken derivation (renamed table, quoting slip, a name it cannot find)
+        fails here instead of at layer-build time.
+        """
+        import subprocess
+        import sys
+        import tomllib
+
+        script = (REPO_ROOT / "deployment" / "aws" / "build_layer.sh").read_text()
+        m = re.search(r"lambda_pin\(\)\s*\{\s*\$PYTHON -c '(.*?)'", script, re.DOTALL)
+        assert m, "lambda_pin() helper missing from build_layer.sh"
+        code = m.group(1)
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        pins = [
+            p
+            for p in pyproject["project"]["optional-dependencies"]["lambda"]
+            if "==" in p and p.split("==")[0].strip() not in self._DERIVED
+        ]
+        assert pins  # the extra stopped pinning anything: the layer is unpinned
+        for pin in pins:
+            name = pin.split("==")[0].strip()
+            out = subprocess.run(
+                [sys.executable, "-c", code, str(REPO_ROOT / "pyproject.toml"), name],
+                capture_output=True,
+                text=True,
+            )
+            assert out.returncode == 0, f"lambda_pin({name}) failed: {out.stderr}"
+            assert out.stdout.strip() == pin, (
+                f"lambda_pin({name}) derived {out.stdout.strip()!r}, extra declares {pin!r}"
+            )
+
+    @staticmethod
+    def _release(version):
+        """``"0.3.10"`` -> ``(0, 3, 10)``, so pins order numerically not lexically."""
+        return tuple(int(part) for part in version.split("."))
+
+    def test_every_lambda_extra_pin_satisfies_its_core_floor(self):
+        """A ``lambda`` exact pin must not contradict the core floor for the same dist.
+
+        The parity check above compares the pin to build_layer.sh; nothing
+        compared it to ``[project.dependencies]``. A floor bumped past its pin
+        (core ``>=0.3.2`` against extra ``==0.3.1``) makes ``zagg[lambda]``
+        outright unresolvable — an extra carries the base requirements too, so
+        the two specs intersect to nothing — which is why a floor bump and its
+        pin are one atomic change and cannot be landed half each.
+        """
+        import tomllib
+
+        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+        floors = {}
+        for dep in pyproject["project"]["dependencies"]:
+            m = re.match(r"([A-Za-z0-9._-]+)>=([0-9][0-9.]*)$", dep)
+            if m:
+                floors[m.group(1)] = m.group(2)
+        checked = []
+        for pin in pyproject["project"]["optional-dependencies"]["lambda"]:
+            m = re.match(r"([A-Za-z0-9._-]+)==([0-9][0-9.]*)$", pin)
+            if not m or m.group(1) not in floors:
+                continue  # unpinned entries, or layer-only dists with no core floor
+            name, exact = m.group(1), m.group(2)
+            assert self._release(exact) >= self._release(floors[name]), (
+                f"lambda extra pins {name}=={exact}, below the [project.dependencies] "
+                f"floor >={floors[name]} — zagg[lambda] would be unresolvable"
+            )
+            checked.append(name)
+        # Guard the regexes above: a naming/spec drift that matched nothing
+        # would make this test vacuously green.
+        assert "h5coro-hidefix" in checked
 
     def test_derived_specs_still_come_from_project_dependencies(self):
         """The derivation the test above exempts must actually exist and resolve."""

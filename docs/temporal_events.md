@@ -62,7 +62,7 @@ inputs, keeping the async payload far under Lambda's 256 KB Event cap:
 - `s3_credentials`: optional; covers **only the source collections** it was
   fetched for. Events without it receive shared credentials fetched once from
   the `data_source.credentials_provider` registry name when the config sets
-  one (`nsidc` and `gesdisc` ship as built-ins).
+  one (`nsidc`, `gesdisc`, and `lpdaac` ship as built-ins).
 - `input_credentials`: optional; the channel for the **consumer-owned mask and
   statics** — an explicit creds dict, `"unsigned"` (anonymous requests: the
   correct mechanism for public buckets, since a request *signed* with scoped

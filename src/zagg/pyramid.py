@@ -158,7 +158,7 @@ def declared_fields(config) -> tuple[dict, list]:
     """
     from zagg.config import get_agg_fields
     from zagg.semantics import EXACT_MERGE_LAWS, _fold_function_name, composability_classes
-    from zagg.sweep_overview import EXACT_NAN_POLICY, TDIGEST_LAW
+    from zagg.sweep_overview import EXACT_NAN_POLICY, TDIGEST_LAW, overview_fold_delta
 
     agg = get_agg_fields(config)
     fields: dict = {}
@@ -175,13 +175,55 @@ def declared_fields(config) -> tuple[dict, list]:
             }
         elif cls == "approximate":
             inner = meta.get("inner_shape") or (2,)
+            delta = int((meta.get("params") or {}).get("delta", 512))
             fields[name] = {
                 "class": "approximate",
                 "method": TDIGEST_LAW,
                 "dtype": meta.get("dtype", "float32"),
                 "inner_shape": [int(inner)] if isinstance(inner, int) else [int(x) for x in inner],
-                "delta": int((meta.get("params") or {}).get("delta", 512)),
+                "delta": delta,
+                # The split pyramid-fold budget (issue #424), recorded RESOLVED
+                # so the manifest is self-describing: the sweep folds at this
+                # value. Pre-#424 manifests lack the key — the reader-side
+                # capped fallback in overview_fold_delta reproduces their
+                # historical fold-at-leaf-δ behavior exactly (all carried
+                # δ ≤ 512).
+                "overview_delta": overview_fold_delta(
+                    {"delta": delta, "overview_delta": meta.get("overview_delta")}
+                ),
             }
+            # The §9 located companion (ruling 4 on issue #410): a located field
+            # folds through the pyramid, so every overview level carries the
+            # ``{field}_locations`` sibling and the sweep folds it with the
+            # digest. Recorded because the manifest is the ONLY thing the
+            # overview writer reconstructs a field from
+            # (``sweep_overview._overview_config``) — without it the overview
+            # template would emit no sibling and the fold would have nowhere to
+            # write. Keyed only when set, so an unlocated field's manifest entry
+            # is byte-identical to pre-#410.
+            if meta.get("location") is not None:
+                fields[name]["location"] = str(meta["location"])
+            # The §8.3 temporal companion, on the same footing (espg-ruled
+            # 2026-08-17, amending ruling 3): per-centroid at every level, so
+            # the overview template needs the sibling and the fold needs to know
+            # to thread the channel. Recorded as the SHAPE, which is all a level
+            # above the leaf can act on — the leaf's ingest column is not
+            # re-read by any fold. Keyed only when set.
+            if meta.get("temporal") is not None:
+                fields[name]["temporal"] = str(meta["temporal"])
+            # The §2.0 weights declaration, keyed only when non-default so
+            # existing manifests stay byte-identical; the sweep's fold gate
+            # compares it against the stored arrays (issue #424). Its
+            # calibration provenance rides along, because the manifest is the
+            # ONLY thing the overview writer reconstructs a field from
+            # (``sweep_overview._overview_config``) and §2.0 makes ``gain``
+            # REQUIRED on every flux-declared array — without it the overview
+            # would be stamped flux with its calibration unrecoverable.
+            if meta.get("weights") not in (None, "counts"):
+                fields[name]["weights"] = meta["weights"]
+                gain = (meta.get("attrs") or {}).get("gain")
+                if gain is not None:
+                    fields[name]["gain"] = gain
         else:
             fields[name] = {"class": "none"}
             excluded.append(name)

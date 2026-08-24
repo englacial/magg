@@ -68,6 +68,39 @@
   "h_min": "exact",
   "h_mean": "none"
  },
+ "actuals": {
+  "3": {
+   "regime": "leaf-column",
+   "merges_from_raw": 1
+  },
+  "2": {
+   "regime": "stage-gather",
+   "merges_from_raw": 1,
+   "source_children": {
+    "folded": 4,
+    "missing": 0,
+    "unreadable": 0
+   }
+  },
+  "1": {
+   "regime": "stage-merge",
+   "merges_from_raw": 2,
+   "source_children": {
+    "folded": 4,
+    "missing": 0,
+    "unreadable": 0
+   }
+  },
+  "0": {
+   "regime": "stage-merge",
+   "merges_from_raw": 2,
+   "source_children": {
+    "folded": 4,
+    "missing": 0,
+    "unreadable": 0
+   }
+  }
+ },
  "default_overviews": [
   {
    "node": 3,

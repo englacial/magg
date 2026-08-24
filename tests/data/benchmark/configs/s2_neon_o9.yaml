@@ -6,12 +6,15 @@
 # the shipped src/zagg/configs/sentinel2_l2a.yaml except ``parent_order: 9`` --
 # the o9 dispatch shard matching the point-pipeline legs (~12.8 km shards, 4
 # over the SERC box, 4^10 order-19 cells each; the same override espg's
-# operational S2 SERC run pins).
+# operational S2 SERC run pins) -- and the harness-local ``pyramid: false``
+# opt-out below. Both are packaging: the semantic hash (D19) of this config
+# equals the shipped one, so the leg measures the shipped product.
 #
 # Layout notes: ``store_layout: hive`` -- the production default for HEALPix
 # raster since issues #247/#253 (issue #237 promoted, ratified by @espg on
-# issue #272; the flat interop profile is deprecated). ``sharded`` does not
-# apply to the (time, cells) slab writes (raster is never sharded, issue #247).
+# issue #272; the flat interop profile is deprecated), restated here, not a
+# divergence. ``sharded`` does not apply to the (time, cells) slab writes
+# (raster is never sharded, issue #247).
 data_source:
   reader: raster
   bands:
@@ -30,6 +33,10 @@ output:
   # ratified issue #272). One leaf zarr object per array per dispatch shard.
   store_layout: hive
   pyramid: false                 # overview sweep opted out pending Phase E fleet sizing (issue #201)
+  # Time axis as mortie toc words (spec §8, issue #443) -- output-defining, so
+  # it tracks the shipped config (issue #451): a store born on toc is a
+  # different product from a legacy-axis one.
+  time_encoding: toc
   grid:
     type: healpix
     indexing_scheme: nested

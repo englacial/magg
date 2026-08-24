@@ -38,6 +38,20 @@ import requests
 _ZAGG_META_KEY = b"zagg:catalog_meta"
 _CMR_STAC_ROOT = "https://cmr.earthdata.nasa.gov/stac"
 
+#: Column name of the per-granule morton MOC footprint index (issue #396).
+#: A **zagg-clone convention column**, not a stac-geoparquet upstream field: an
+#: indexed catalog is still a valid stac-geoparquet file that any other reader
+#: ignores. It cannot go stale against the geometry it describes, because it
+#: rides in the same file as that geometry -- there is no second artifact to
+#: re-sync, and a catalog subset (``filter_bbox``) takes the column along.
+FOOTPRINT_CELLS = "footprint_cells"
+
+#: Catalog-metadata key recording the HEALPix order the column was covered at.
+#: The order is the column's whole contract: a MOC answers any shard order
+#: **coarser than or equal to** it (``moc_to_order`` coarsens), and nothing
+#: finer (that would refine each cell onto all its descendants -- issue #92).
+FOOTPRINT_CELLS_ORDER = "footprint_cells_order"
+
 
 @dataclass
 class Query:
@@ -499,6 +513,264 @@ class Catalog:
             keep |= (lon0 <= b_lon1) & (lon1 >= b_lon0) & (lat0 <= b_lat1) & (lat1 >= b_lat0)
         return Catalog(self.table.take(np.flatnonzero(keep)), dict(self.metadata))
 
+    def granule_row_mask(self) -> np.ndarray:
+        """Boolean mask over table rows of the rows :meth:`granule_records` emits.
+
+        :meth:`granule_records` skips rows whose geometry is empty or not
+        polygonal, so record ``i`` is table row ``np.flatnonzero(mask)[i]`` and
+        ``mask.sum()`` is the record count -- both without decoding a single
+        record. Same predicate as the row-wise loop, applied with one batched
+        ``shapely.from_wkb`` instead of one call per row, and refusing on the one
+        input where "same predicate" would otherwise be false (see Raises).
+
+        Two callers need the alignment without the records:
+        :meth:`index_footprints`, which gives screened rows an empty MOC so the
+        column stays one entry per table row, and ``ShardMap.build``'s
+        stored-index fast path, which intersects on the column *before*
+        materializing anything (issues #396, #439).
+
+        Returns
+        -------
+        numpy.ndarray
+            ``bool``, length ``table.num_rows``.
+
+        Raises
+        ------
+        ValueError
+            When any row's ``geometry`` is **null**. ``shapely.from_wkb`` maps a
+            null to ``None``, whose ``get_type_id`` is ``-1`` -- so screening it
+            out here would be silent, while :meth:`granule_records`' row-wise
+            ``geom.is_empty`` raises ``AttributeError`` on the same row. A
+            granule that vanishes from an indexed build but crashes an
+            unindexed one is worse than either, so both paths refuse: this one
+            loudly, naming the count and the first offending row.
+
+        Notes
+        -----
+        Time is small (0.02 s over the 35,639-granule 88S catalog, ~0.3 s over
+        the 555,867-row ATL03 clone) but memory is not: the ``to_numpy`` WKB
+        copy plus the live shapely objects put the clone's RSS ~1 GB over the
+        parquet read. It is a peak, not a leak -- the objects die with the call.
+        """
+        import shapely
+
+        geoms = shapely.from_wkb(self.table.column("geometry").to_numpy(zero_copy_only=False))
+        # geom_type ids 3 and 6 are Polygon and MultiPolygon; -1 is a null WKB.
+        type_ids = shapely.get_type_id(geoms)
+        null = type_ids == -1
+        if null.any():
+            rows = np.flatnonzero(null)
+            raise ValueError(
+                f"catalog has {rows.size} row(s) with a null geometry (first at row "
+                f"{int(rows[0])}); a granule with no footprint can be neither covered nor "
+                f"assigned. Drop those rows from the catalog before indexing or building."
+            )
+        return ~shapely.is_empty(geoms) & np.isin(type_ids, (3, 6))
+
+    def cover_footprints(self, order: int) -> tuple:
+        """Cover every footprint at ``order`` and return the MOCs -- persisting nothing.
+
+        The shared core of :meth:`index_footprints` and of ``ShardMap.build``'s
+        **unindexed** mortie path (issue #445): one ``mortie.arrow.from_wkbs``
+        call over the geometry column, screened by :meth:`granule_row_mask`, in
+        the same row-aligned ragged layout :meth:`footprint_cells` returns. The
+        only difference between the two callers is what they do with it --
+        ``index_footprints`` writes it into a column, ``build`` intersects it and
+        drops it -- so they cannot drift on the cover itself. "Indexed" is
+        therefore a statement about persistence, not about how a build assigns.
+
+        Parameters
+        ----------
+        order : int
+            HEALPix order to cover at. Unvalidated here: callers own the bound
+            (``index_footprints`` refuses above ``MORTIE_MOC_ORDER_CAP``,
+            ``build`` covers at the grid's ``parent_order``).
+
+        Returns
+        -------
+        tuple
+            ``(values, offsets, rows)``. ``values`` is every covered row's
+            morton words concatenated (``uint64``); ``offsets`` are arrow list
+            offsets **over the whole table** (``int64``, length
+            ``table.num_rows + 1``), so row ``i``'s MOC is
+            ``values[offsets[i]:offsets[i + 1]]`` and a screened-out row carries
+            a zero-length run; ``rows`` is the covered table rows (``int64``,
+            ascending) -- ``np.flatnonzero`` of the screen, which is exactly the
+            order :meth:`granule_records` emits.
+
+        Notes
+        -----
+        Row-aligned rather than compact so both callers index it by table row:
+        the column ``index_footprints`` writes is one entry per row by contract,
+        and ``build``'s intersection is positional against the same table. The
+        empty runs cost 8 bytes each.
+
+        Memory is :meth:`index_footprints`' documented posture, because it is
+        this method: ``from_wkbs`` bounds its own peak at roughly the result
+        size, and the screen's WKB copy plus live shapely objects is the term it
+        does not bound (~1 GB over the parquet read on the 555,867-row ATL03
+        clone -- a peak, not a leak, issue #429).
+        """
+        from mortie.arrow import from_wkbs
+
+        column = self.table.column("geometry")
+        # The shapely objects the screen decodes die with the call, so its peak
+        # does not stack with the cover below (see ``granule_row_mask``).
+        keep = self.granule_row_mask()
+        if keep.all():
+            # The case that actually occurs (every catalog in the tree); taking
+            # the column whole avoids a second WKB copy.
+            values, kept_offsets = from_wkbs(column, order=int(order))
+        elif keep.any():
+            values, kept_offsets = from_wkbs(column.filter(pa.array(keep)), order=int(order))
+        else:
+            values, kept_offsets = np.empty(0, dtype=np.uint64), np.zeros(1, dtype=np.int64)
+        # Scatter the kept rows' MOC lengths back over every row: screened rows
+        # get a zero-length run, so ``values[offsets[i]:offsets[i + 1]]`` stays
+        # keyed by table row.
+        counts = np.zeros(len(keep), dtype=np.int64)
+        counts[keep] = np.diff(kept_offsets)
+        offsets = np.zeros(len(keep) + 1, dtype=np.int64)
+        np.cumsum(counts, out=offsets[1:])
+        rows = np.flatnonzero(keep).astype(np.int64, copy=False)
+        return np.asarray(values, dtype=np.uint64), offsets, rows
+
+    def index_footprints(self, order: int) -> "Catalog":
+        """Precompute the ``footprint_cells`` morton MOC column (issue #396).
+
+        Covers every row's ``geometry`` WKB once, at ``order``, and returns a new
+        catalog carrying the result as a ragged column plus the order in its
+        metadata. The per-granule footprint cover is identical for every
+        ``ShardMap.build`` against this catalog, so paying it once here turns
+        each later build into set intersection with no geometry work at all --
+        see ``ShardMap.build``'s fast path.
+
+        Parameters
+        ----------
+        order : int
+            HEALPix order to cover at. **Choose the shard order** (the grid's
+            ``parent_order``), not the finer chunk order: coverage words per
+            granule roughly double per order, so a full ATL03 clone indexes to
+            ~270-420 MB of parquet at order 9 but ~9-13 GB at order 13, and the
+            extra resolution is invisible to order-9 shard cells. The column
+            serves every grid whose ``parent_order`` is **at most** ``order``;
+            a finer grid is refused by ``build`` rather than answered coarsely.
+            Bounded above by ``MORTIE_MOC_ORDER_CAP`` (mortie's order-18 coverage
+            cap), the same bound ``ShardMap.build`` clamps its own MOC order to,
+            so the two paths agree on what "too fine" means. ``build`` clamps
+            because its order is derived; this one is the operator's own number,
+            so it raises rather than silently indexing at another order than the
+            one recorded in ``footprint_cells_order``.
+
+        Raises
+        ------
+        ValueError
+            When ``order`` is above ``MORTIE_MOC_ORDER_CAP``.
+
+        Returns
+        -------
+        Catalog
+            New catalog, same rows and metadata plus ``footprint_cells`` and
+            ``footprint_cells_order``. Re-indexing at another order replaces
+            the column rather than appending a second one.
+
+        Notes
+        -----
+        ``mortie.arrow.from_wkbs`` (mortie >= 0.9.5, espg/mortie#157/#163) takes
+        the geometry column across the Python/Rust boundary once, with the GIL
+        released and chunking that bounds peak at roughly the result size. It
+        covers the **union of the rings inside each blob**, where
+        :meth:`granule_records` reads the largest part's exterior ring only, so
+        the two agree exactly on single-part footprints (every CMR ATL03/06
+        granule) and the column is a superset for a MultiPolygon -- it keeps the
+        smaller parts ``granule_records`` drops.
+
+        Rows :meth:`granule_records` would skip -- empty or non-polygonal
+        geometry -- are screened out with the **same** shapely predicate it uses
+        and get an empty MOC, so the column stays one entry per table row and a
+        catalog carrying a stray ``Point`` indexes rather than raising (mortie's
+        coverage refuses a point outright, naming the blob). The screen is
+        :meth:`granule_row_mask` -- one vectorised ``shapely.from_wkb``, shared
+        with ``ShardMap.build``'s fast path; on the 35,639-granule 88S catalog
+        it is 0.02 s against 2.65 s for the order-9 cover, so it costs under 1%
+        of a pass that runs once per catalog. A **null** geometry is the one row
+        the screen refuses instead of skipping, so this method raises where it
+        would once have indexed -- see :meth:`granule_row_mask`'s Raises.
+
+        The screen is cheap in time but it is this pass's **peak in memory**, and
+        it is the term ``from_wkbs``'s chunking does not bound: on the
+        555,867-row ATL03 clone RSS goes 835 MB after the parquet read -> 1,169
+        MB after ``to_numpy`` (a full WKB copy) -> 1,794 MB with the shapely
+        objects live. They die with ``granule_row_mask``'s frame, so that stays
+        a peak rather than stacking with the cover, but a whole-clone index
+        wants headroom for it. :meth:`cover_footprints`' ``keep.all()``
+        short-circuit avoids a second ~334 MB WKB copy in the case that actually
+        occurs (nothing screened out -- every catalog in the tree). Reading the
+        geometry-type word straight out of the WKB, or chunking the
+        ``from_wkb`` call, would drop the screen's peak entirely; not done here
+        because it trades the shared shapely predicate for a hand-rolled one.
+        """
+        from mortie.arrow import from_morton_index
+
+        from zagg.catalog.shardmap import MORTIE_MOC_ORDER_CAP
+
+        if int(order) > MORTIE_MOC_ORDER_CAP:
+            raise ValueError(
+                f"footprint_cells order {int(order)} is above mortie's coverage cap "
+                f"{MORTIE_MOC_ORDER_CAP}; ShardMap.build clamps its own MOC order there, so a "
+                f"finer column could not be the cover any build asks for. Index at "
+                f"order <= {MORTIE_MOC_ORDER_CAP} (the grid's parent_order is the right choice)."
+            )
+        # The cover, the screen and the row-aligned scatter all live in
+        # :meth:`cover_footprints` -- shared with ``ShardMap.build``'s unindexed
+        # path (issue #445), which runs the identical cover and simply keeps it
+        # in memory. This method is that cover plus the column write.
+        values, offsets, _ = self.cover_footprints(int(order))
+        cells = pa.LargeListArray.from_arrays(
+            pa.array(offsets, pa.int64()), from_morton_index(values)
+        )
+        table = self.table
+        if FOOTPRINT_CELLS in table.column_names:
+            table = table.set_column(
+                table.column_names.index(FOOTPRINT_CELLS), FOOTPRINT_CELLS, cells
+            )
+        else:
+            table = table.append_column(FOOTPRINT_CELLS, cells)
+        meta = {**self.metadata, FOOTPRINT_CELLS_ORDER: int(order)}
+        return Catalog(_attach_meta(table, meta), meta)
+
+    def footprint_cells(self):
+        """The stored footprint index as ``(values, offsets, order)``, or ``None``.
+
+        ``None`` when the catalog was never indexed (:meth:`index_footprints`),
+        which is what keeps the ``build`` fast path opt-in: an ordinary catalog
+        simply has no column and takes the geometry path.
+
+        Returns
+        -------
+        tuple or None
+            ``(values, offsets, order)`` where ``values`` is the concatenated
+            ``uint64`` morton words of every **table row** (not every
+            ``granule_records`` entry -- ``build`` aligns the two by row position,
+            via ``np.flatnonzero(granule_row_mask())``, since the screened rows
+            carry a zero-length run rather than being absent) and ``offsets`` are
+            arrow list offsets into it, so row ``i``'s MOC is
+            ``values[offsets[i]:offsets[i + 1]]``.
+        """
+        order = (self.metadata or {}).get(FOOTPRINT_CELLS_ORDER)
+        if order is None or FOOTPRINT_CELLS not in self.table.column_names:
+            return None
+        arr = self.table.column(FOOTPRINT_CELLS).combine_chunks()
+        inner = arr.values
+        # The column is written with mortie's ``morton_index`` extension type, so
+        # the words arrive typed wherever mortie is importable; a reader without
+        # it (or a parquet writer that dropped the metadata) sees the uint64
+        # storage instead. Accept both -- the words are the same either way.
+        inner = inner.storage if isinstance(inner, pa.ExtensionArray) else inner
+        values = np.asarray(inner.to_numpy(zero_copy_only=False), dtype=np.uint64)
+        offsets = np.asarray(arr.offsets.to_numpy(zero_copy_only=False), dtype=np.int64)
+        return values, offsets, int(order)
+
     def granule_records(self) -> list[dict]:
         """Decode the table into per-granule dicts for ShardMap building.
 
@@ -601,4 +873,12 @@ class Catalog:
         return records
 
 
-__all__ = ["Query", "STACQuery", "CMRSource", "STACSource", "Catalog"]
+__all__ = [
+    "Query",
+    "STACQuery",
+    "CMRSource",
+    "STACSource",
+    "Catalog",
+    "FOOTPRINT_CELLS",
+    "FOOTPRINT_CELLS_ORDER",
+]

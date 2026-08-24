@@ -31,6 +31,14 @@ from urllib.parse import urlparse
 
 import numpy as np
 
+from zagg.time_axis import (
+    DEFAULT_TIME_ENCODING,
+    encode_time_axis,
+    time_axis_attrs,
+    time_axis_dtype,
+    time_encoding,
+)
+
 logger = logging.getLogger(__name__)
 
 # TIFF SampleFormat x BitsPerSample -> numpy dtype, for sizing the fill return
@@ -504,26 +512,50 @@ def _us_iso(us: int) -> str:
     )
 
 
-def raster_time_index(granules) -> tuple[dict, np.ndarray]:
+def raster_time_index(
+    granules, *, encoding: str = DEFAULT_TIME_ENCODING
+) -> tuple[dict, np.ndarray]:
     """Global timestep index from ShardMap granule lists.
 
     A timestep is an *acquisition group* — entries sharing a ``time_key``
     (e.g. the Sentinel-2 datatake id; adjacent MGRS tiles of one datatake are
     items seconds apart) — falling back to the entry datetime when no key was
-    configured. The group's coordinate value is its earliest datetime.
+    configured.
+
+    Under the default ``microseconds`` encoding the group's coordinate value
+    is its earliest datetime, as it always has been. Under ``toc`` (spec §8,
+    issue #443) it is the group's acquisition ENVELOPE — the earliest
+    ``time_start`` (or item datetime) to the latest ``time_end`` (or item
+    datetime) across its members — encoded as one toc word: an exact
+    timestamp where the envelope is a single instant, a conservative range
+    where it is not. A datatake's tiles are sensed seconds apart, which is
+    the range this encoding exists to state honestly.
+
+    Row ORDER is the group's earliest item datetime either way, so a leaf's
+    row assignment cannot drift with the encoding. That is *not* the same as
+    ascending stored words under ``toc``: the word encodes the ENVELOPE
+    start, which a declared ``time_start`` can push before an earlier row's
+    key, so the returned words may descend (§8.1 — a reader must use the
+    overlap predicate, never a bisect).
 
     Parameters
     ----------
     granules : list of list of dict
-        ``ShardMap.granules`` (raster entries carry ``assets`` + ``datetime``).
+        ``ShardMap.granules`` (raster entries carry ``assets`` + ``datetime``,
+        optionally ``time_start``/``time_end`` from the STAC item's
+        ``start_datetime``/``end_datetime``).
+    encoding : str
+        ``output.time_encoding`` (:func:`zagg.time_axis.time_encoding`).
 
     Returns
     -------
-    (time_index, times_us)
-        ``{group_key: t_idx}`` and the int64 microseconds-since-epoch time
-        coordinate, both in ascending time order.
+    (time_index, times)
+        ``{group_key: t_idx}`` and the encoded time coordinate (int64
+        microseconds, or uint64 toc words under ``toc``), both in row order
+        — ascending group earliest-item datetime.
     """
     earliest: dict = {}
+    span: dict = {}
     for shard_entries in granules:
         for e in shard_entries:
             if not e.get("assets"):
@@ -532,12 +564,22 @@ def raster_time_index(granules) -> tuple[dict, np.ndarray]:
                 raise ValueError(f"raster granule entry {e.get('id')!r} carries no datetime")
             key = e.get("time_key") or e["datetime"]
             us = _iso_us(e["datetime"])
-            if key not in earliest or us < earliest[key]:
-                earliest[key] = us
+            lo = _iso_us(e["time_start"]) if e.get("time_start") else us
+            hi = _iso_us(e["time_end"]) if e.get("time_end") else us
+            if key not in earliest:
+                earliest[key], span[key] = us, (lo, hi)
+            else:
+                earliest[key] = min(earliest[key], us)
+                span[key] = (min(span[key][0], lo), max(span[key][1], hi))
     ordered = sorted(earliest, key=lambda k: (earliest[k], k))
     time_index = {k: i for i, k in enumerate(ordered)}
-    times_us = np.array([earliest[k] for k in ordered], dtype=np.int64)
-    return time_index, times_us
+    if encoding == DEFAULT_TIME_ENCODING:
+        times = np.array([earliest[k] for k in ordered], dtype=np.int64)
+    else:
+        times = encode_time_axis(
+            [span[k][0] for k in ordered], [span[k][1] for k in ordered], encoding=encoding
+        )
+    return time_index, times
 
 
 def _chord2(lons, lats, lon0: float, lat0: float) -> np.ndarray:
@@ -832,8 +874,6 @@ def _combine_by_ownership(sampled, lonlat, bands):
 # resize-then-write-slab pattern and are single-writer (the runner owns the
 # resize, as it owns template emission).
 
-_TIME_ATTRS = {"units": "microseconds since 1970-01-01T00:00:00", "calendar": "proleptic_gregorian"}
-
 
 def _raster_array_spec(shape, chunks, dims, dtype, fill, attrs=None):
     """ArraySpec shared by the flat template and the hive leaf spec."""
@@ -880,12 +920,23 @@ def _raster_members(grid, config, n_time: int, n_cells: int) -> dict:
     review: one default cell coordinate everywhere). The legacy NESTED
     ``cell_ids`` array rides only the same ``emit_cell_ids`` transition
     hatch as the spatial path — never a separate schedule.
+
+    ``time``'s element type and attrs come from the config's declared
+    encoding (spec §8): int64 microseconds with CF ``units``/``calendar``
+    by default, uint64 toc words with the ``temporal`` declaration and no CF
+    pair under ``time_encoding: toc``.
     """
     from zagg.config import get_raster_bands
 
+    encoding = time_encoding(config)
     members = {
         "time": _raster_array_spec(
-            (n_time,), (max(n_time, 1),), ("time",), "int64", 0, dict(_TIME_ATTRS)
+            (n_time,),
+            (max(n_time, 1),),
+            ("time",),
+            time_axis_dtype(encoding),
+            0,
+            time_axis_attrs(encoding),
         ),
         "morton": _raster_array_spec((n_cells,), (grid.cells_per_chunk,), ("cells",), "uint64", 0),
     }
@@ -931,7 +982,7 @@ def emit_raster_template(store, grid, config, times_us: np.ndarray, *, overwrite
     from zarr import open_array
     from zarr.errors import ArrayNotFoundError, ContainsGroupError
 
-    times_us = np.asarray(times_us, dtype=np.int64)
+    times_us = np.asarray(times_us, dtype=time_axis_dtype(time_encoding(config)))
     spec = raster_group_spec(grid, config, int(len(times_us)))
     time_path = f"{grid.group_path}/time"
     with zarr_config.set({"async.concurrency": 128}):
@@ -1014,7 +1065,7 @@ def emit_raster_leaf_template(
     with zarr_config.set({"async.concurrency": 128}):
         spec.to_zarr(store, "", overwrite=overwrite)
         arr = open_array(store, path=f"{grid.group_path}/time", zarr_format=3, consolidated=False)
-        times = np.asarray(times_us, dtype=np.int64)
+        times = np.asarray(times_us, dtype=time_axis_dtype(time_encoding(config)))
         arr[:] = times
         arr = open_array(store, path=f"{grid.group_path}/morton", zarr_format=3, consolidated=False)
         arr[:] = children
@@ -1183,6 +1234,10 @@ def process_and_write_raster_hive(
     region: str | None = None,
     anonymous: bool = True,
     stage_stats: dict | None = None,
+    skip_if_current: bool = False,
+    allow_contraction: bool = False,
+    semantic_hash: str | None = None,
+    sidecar_spec: str | None = None,
 ):
     """Process one raster shard into its own hive leaf store (issue #247).
 
@@ -1211,11 +1266,12 @@ def process_and_write_raster_hive(
 
     The stamp is the leaf's FINAL write: dense slabs (streamed) -> coverage
     sidecar (edge shards only; interior shards stamp ``"full"`` with no
-    sidecar PUT) -> stamp. ``cells_with_data`` counts the occupied-cell
+    sidecar PUT) -> stamp -> granule-id sibling (issue #388).
+    ``cells_with_data`` counts the occupied-cell
     union; ``granule_count`` the unit's acquisitions (asset-carrying
     entries). Phase timings are always collected (issue #297):
     ``metadata["phase_timings"] = {"sample", "write", "hash"}`` with the leaf
-    write-out (template + slabs + sidecar + stamp) as ``write``; the
+    write-out (template + slabs + sidecar + stamp + sibling) as ``write``; the
     per-stage ``stages`` block (issue #249) stays gated on ``profile`` /
     a passed ``stage_stats`` (the local dispatcher's debug-logging flavor).
 
@@ -1228,26 +1284,98 @@ def process_and_write_raster_hive(
     to hashing the assembled array by construction — pinned against
     ``content_hash.hash_arrays`` over a store read-back in
     ``tests/test_content_hash.py``.
+
+    ``skip_if_current`` / ``allow_contraction`` / ``semantic_hash`` /
+    ``sidecar_spec`` (issue #388) arm the same worker-side leaf identity gate
+    the aggregation seam runs (:func:`zagg.hive.leaf_identity_gate` — see
+    ``process_and_write_hive``'s docstring for the full semantics), with the
+    raster id space (:func:`zagg.telemetry.raster_granule_ids`) as the
+    planned set. A skipped/refused unit returns early with ``timesteps: 0``
+    and ``leaf_written: False``, having written nothing. Default off keeps
+    this seam byte-identical for callers that have not opted in — except for
+    the granule-id SIBLING written after the stamp
+    (:func:`zagg.telemetry.write_granule_ids`), which is unconditional: it is
+    what a LATER run's contraction guard diffs against, so a leaf must record
+    it whether or not the run that wrote the leaf had the gate armed.
     """
     from zagg.hive import (
         COVERAGE_SIDECAR,
         build_coverage,
         encode_coverage_bitmap,
+        leaf_identity_gate,
         shard_leaf_path,
         stamp_commit,
         write_coverage_sidecar,
     )
     from zagg.store import open_store
+    from zagg.telemetry import raster_granule_ids
 
     t_start = time.time()
     if profile and stage_stats is None:
         stage_stats = new_stage_stats()
     label = window["label"] if window else None
     leaf_path = shard_leaf_path(store_root, int(shard_key), window=label)
+    # D19 identity half (issue #388): the run hash when the caller holds it,
+    # else this worker's own config hash (fail-open — an unresolved hash can
+    # only miss a skip, never fake one).
+    if semantic_hash is None:
+        try:
+            from zagg.semantics import semantic_hash as _semantic_hash
+
+            semantic_hash = _semantic_hash(config)
+        except Exception as e:
+            logger.warning(f"semantic hash unavailable (fail-open, issue #388): {e}")
+    # Leaf identity gate (issue #388): per (shard, window) unit, before any
+    # sampling. A skipped/refused unit returns here having written NOTHING.
+    identity = None
+    if skip_if_current:
+        identity, unit_meta = leaf_identity_gate(
+            leaf_path,
+            raster_granule_ids(granules),
+            semantic_hash=semantic_hash,
+            allow_contraction=allow_contraction,
+            sidecar_spec=sidecar_spec,
+            store_kwargs=store_kwargs,
+            shard_key=shard_key,
+            window=label,
+        )
+        if unit_meta is not None:
+            out = {**unit_meta, "timesteps": 0, "skipped": 0, "leaf_written": False}
+            if out.get("current"):
+                # Lifecycle touch (issue #388 phase 3): reset the purge clock
+                # on the skipped unit's footprint — leaf tree + sidecar and
+                # sub-map siblings (the raster seam writes no column).
+                # Fail-open: a failed touch logs and counts, never fails or
+                # un-skips the unit.
+                from zagg.config import get_touch_policy
+                from zagg.lifecycle import touch_current_unit
+
+                try:
+                    counts = touch_current_unit(
+                        leaf_path,
+                        sidecar_spec=sidecar_spec,
+                        store_kwargs=store_kwargs,
+                        policy=get_touch_policy(config),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"lifecycle touch failed for shard {shard_key} (fail-open, issue #388): {e}"
+                    )
+                    counts = {"touched": 0, "failed": 1}
+                out["touched_objects"] = counts["touched"]
+                out["touch_failed"] = counts["failed"]
+                # Not-applicable paths (issue #495 phase 4) — same posture as
+                # the aggregation seam: the pair above records a published
+                # skip as 0/0, indistinguishable from a touch that never ran
+                # (the exact ambiguity the comment at the bottom of this
+                # module names). Absent when zero.
+                if counts.get("skipped_paths"):
+                    out["touch_skipped_paths"] = counts["skipped_paths"]
+            return out
     # The leaf's own time axis, from the dispatched subset. Every group key in
     # the subset is in this index by construction, so the worker never trips
     # the foreign-manifest guard.
-    time_index, times_us = raster_time_index([granules])
+    time_index, times_us = raster_time_index([granules], encoding=time_encoding(config))
     box: dict = {}
     write_s = 0.0
     # O11 incremental hashing (issue #342 phase 5). The raster leaf never
@@ -1304,9 +1432,35 @@ def process_and_write_raster_hive(
         stage_stats=stage_stats,
         occupied_out=occupied,
     )
+    # The seam stamps the identity half (issue #388) so a caller that never
+    # resolved the hash itself can record it in the leaf sidecar via
+    # ``telemetry.build_record``'s validated metadata fallback; the
+    # classification lets run stats count ``unrecorded-ids`` rewrites apart
+    # from ordinary ones.
+    #
+    # That fallback fires on the LOCAL raster path only. The Lambda handler's
+    # raster branch does NOT return this dict: it rebuilds a fresh ``body``
+    # from an explicit key list and hands THAT to ``build_record``
+    # (``deployment/aws/lambda_handler.py``, the ``if hive:`` branch), so
+    # ``semantic_hash`` / ``identity`` / ``current`` / ``refused`` — and the
+    # phase-3 pair ``touched_objects`` / ``touch_failed`` stamped on the skip
+    # arm above — are dropped, and fleet raster sidecars keep recording
+    # ``null`` for the identity half. The aggregation handler returns the
+    # seam's own dict and does get all six. Enabling the gate fleet-side
+    # therefore needs those SIX keys carried through as well as the opt-in
+    # kwargs — the PR #397 body's question (1) lists it. Without the first
+    # four a raster leaf could never classify ``equal`` (the recorded ``null``
+    # can never match a resolved hash); without the last two the fleet rollup
+    # reports ``objects_touched: 0`` on a working touch, indistinguishable
+    # from a touch that never ran.
+    if semantic_hash is not None:
+        meta.setdefault("semantic_hash", semantic_hash)
+    if identity is not None:
+        meta["identity"] = identity["classification"]
     # Stamp ONLY a leaf that wrote slabs: a unit that streamed nothing has no
     # prefix, and a worker error raised out above, leaving debris (D4). Write
-    # order is pinned: dense slabs -> coverage sidecar -> stamp.
+    # order is pinned: dense slabs -> coverage sidecar -> stamp -> granule-id
+    # sibling (issue #388; after the stamp, inside the write bracket).
     meta["cells_with_data"] = 0
     # Accurate leaf-written signal for the stats-sidecar gate (issue #297): set
     # iff a slab streamed (``"store" in box``), so both dispatchers gate the
@@ -1345,6 +1499,16 @@ def process_and_write_raster_hive(
             ),
             window=label,
             time_range=time_range,
+        )
+        # The recorded granule-id list as this leaf's sibling object (issue
+        # #388), after the stamp and in the raster id space the gate plans
+        # against — the vector seam's posture, same rationale (one source for
+        # the recorded id space; fail-open inside; inside the write bracket,
+        # because the write phase must account for every PUT the seam makes).
+        from zagg.telemetry import write_granule_ids
+
+        write_granule_ids(
+            leaf_path, raster_granule_ids(granules), spec=sidecar_spec, **store_kwargs
         )
         write_s += time.time() - _t0
     # Phase split (issues #100/#249; always-on collection since issue #297 —
