@@ -2917,6 +2917,28 @@ class TestBasenameCollisions:
             {"backend": "mortie", "total_shards": 1},
         )
 
+    def test_the_unidentified_warning_blames_the_caller_not_shardmap(self, tmp_path):
+        # ``stacklevel`` counts from ``_basename_collision_message``, which sits
+        # two frames below every production entry point (build/reproject/merge
+        # via the refusal, from_json/from_parquet via the load warning), so the
+        # level the direct-call tests happen to need attributed the warning to
+        # shardmap.py's own source -- an operator pointer at zagg internals, and
+        # unmatchable by a module warning filter (PR #482 review).
+        sm = ShardMap(
+            {"type": "healpix", "indexing_scheme": "nested", "parent_order": 6},
+            [1050],
+            [[{"id": None, "s3": None, "https": None}]],
+            {"backend": "mortie", "total_shards": 1},
+        )
+        path = tmp_path / "sm.json"
+        sm.to_json(str(path))
+        with pytest.warns(RuntimeWarning, match="no recorded identity") as record:
+            ShardMap.from_json(str(path))
+        assert record[0].filename == __file__, "the load call site, not shardmap.py"
+        # The load path is the one where the operator has no other pointer to
+        # WHICH map is at fault -- the collision warning beside it carries one.
+        assert str(path) in str(record[0].message)
+
     def test_from_json_warns_on_a_loaded_collision_and_keeps_the_map(self, tmp_path):
         # A manifest built before the guard existed must stay readable -- the
         # warning makes the hazard visible without making the map unreachable.
