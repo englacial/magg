@@ -15,10 +15,18 @@ pin that drift before the admission changes it:
   BEFORE record no later phase edits;
 - today's classifier verdicts and the spill-gate admissions — the pins later
   phases flip deliberately, one per admission.
+
+Phase 2 — the ``build_tdigest_where`` admission (espg-ruled admit,
+2026-08-24): the strata builder joins ``_DIGEST_FAMILY_FUNCTIONS``, so strata
+fields classify ``approximate`` and fold through the pyramid by the k-way law
+with both companion channels; parity is asserted through the sweep's own fold
+seam (``fold_digests``).
 """
 
 import json
 from pathlib import Path
+
+import numpy as np
 
 from zagg.config import default_config
 from zagg.pyramid import declared_fields
@@ -102,11 +110,15 @@ class TestSpillGateAdmissions:
         validate_spill_fold(default_config("atl03_tdigest_strata_healpix"))
 
 
-class TestD24BeforeAdmission:
-    """Today's classifier verdicts — the drift itself. Phases 2–3 flip these
-    deliberately, one per admission (espg ruling 2026-08-24, issue #515)."""
+class TestD24Classification:
+    """The classifier verdicts, phase by phase: phase 1 pinned ``none`` for
+    all three; phase 2 admitted the strata builder (espg ruling 2026-08-24);
+    phase 3 gives composition its own class."""
 
     def test_composition_field_classifies_none_today(self):
+        # Flipped by phase 3: ``pack_composition`` has a fold law
+        # (``merge_composition_kway``, issues #321/#370) that neither D24 arm
+        # states yet, so today the classifier says ``none``.
         meta = {
             "function": "zagg.stats.composition.pack_composition",
             "source": "h_ph",
@@ -117,18 +129,141 @@ class TestD24BeforeAdmission:
         }
         assert field_composability(meta) == "none"
 
-    def test_strata_template_classes_today(self):
+    def test_strata_template_classes(self):
         classes = composability_classes(default_config("atl03_tdigest_strata_healpix"))
         assert classes["count"] == "exact"
-        assert classes["h_tdigest_signal"] == "none"
-        assert classes["h_tdigest_noise"] == "none"
+        # Phase 2: the strata builder is in the digest family (issue #515).
+        assert classes["h_tdigest_signal"] == "approximate"
+        assert classes["h_tdigest_noise"] == "approximate"
+        # Phase 3 flips this one.
         assert classes["composition"] == "none"
 
-    def test_declared_fields_reproduces_the_live_ca_declaration(self):
-        # The other half of the known-answer: today's classifier over the
-        # shipped strata template reproduces the live store's declaration
-        # EXACTLY — the manifest fixture above is what this code writes, so
-        # the before/after is pinned against reality, not a synthetic shape.
+    def test_declared_fields_no_longer_reproduce_the_live_ca_declaration(self):
+        # The before/after known-answer, after phase 2: phase 1 asserted
+        # ``fields == CA_FIELDS_BEFORE`` (today's classifier reproduced the
+        # live store's declaration exactly); the admission changes ONLY the
+        # strata entries — count is untouched and composition still declares
+        # its recorded absence until phase 3.
         fields, excluded = declared_fields(default_config("atl03_tdigest_strata_healpix"))
-        assert fields == CA_FIELDS_BEFORE
-        assert sorted(excluded) == ["composition", "h_tdigest_noise", "h_tdigest_signal"]
+        assert fields != CA_FIELDS_BEFORE
+        assert fields["count"] == CA_FIELDS_BEFORE["count"]
+        assert fields["composition"] == {"class": "none"}
+        assert excluded == ["composition"]
+        for name in ("h_tdigest_signal", "h_tdigest_noise"):
+            assert fields[name] == {
+                "class": "approximate",
+                "method": "tdigest_kway",
+                "dtype": "float32",
+                "inner_shape": [2],
+                # The template's leaf budget and its split pyramid-fold budget
+                # (issue #424), recorded RESOLVED.
+                "delta": 8192,
+                "overview_delta": 512,
+                # Located strata IS the default (espg ruling on PR #334); the
+                # manifest entry is the only description the overview writer
+                # has, so the channel must ride it (issue #410).
+                "location": "leaf_id",
+            }
+
+
+class TestWhereBuilderFoldParity:
+    """Phase 2: the admission's substance — a stratum payload built by
+    ``build_tdigest_where`` folds by the digest family's k-way law with BOTH
+    companion channels, matching the pooled build within the documented
+    bounds (weights exact, quantiles close, located words to the common
+    ancestor, temporal words to the toc envelope)."""
+
+    def _blocks(self, k=4, n=400, seed=515):
+        import mortie
+        from conftest import toc_words
+
+        from zagg.stats.tdigest import build_tdigest_where
+
+        rng = np.random.default_rng(seed)
+        values = rng.normal(30.0, 5.0, k * n)
+        signal = rng.random(k * n) < 0.6
+        lats = np.clip(37.0 + rng.uniform(-1e-4, 1e-4, k * n), -89.9, 89.9)
+        lons = -119.0 + rng.uniform(-1e-4, 1e-4, k * n)
+        locs = np.asarray(
+            mortie.MortonIndexArray.from_latlon(lats, lons, points=True), dtype=np.uint64
+        )
+        times = toc_words(k * n)
+        digests, words, tocs = [], [], []
+        for i in range(k):
+            sl = slice(i * n, (i + 1) * n)
+            d, w, t = build_tdigest_where(
+                values[sl],
+                delta=64,
+                where=signal[sl],
+                locations=locs[sl],
+                temporal=times[sl],
+            )
+            digests.append(d)
+            words.append(w)
+            tocs.append(t)
+        return values, signal, locs, times, digests, words, tocs
+
+    def test_payload_and_companions_through_the_fold(self):
+        import mortie
+        from mortie import common_ancestor
+
+        from zagg.stats.tdigest import build_tdigest_where, quantile_from_tdigest
+        from zagg.sweep_overview import decode_digest, encode_digest, fold_digests
+
+        values, signal, locs, times, digests, words, tocs = self._blocks()
+        # Through the SWEEP's fold seam, exactly as an overview cell folds its
+        # contributors (payload and channels in one call, spec §9.1/§8.3).
+        payload, loc_bytes, toc_bytes = fold_digests(
+            digests,
+            delta=64,
+            dtype="float32",
+            channels={"locations": list(words), "temporal": list(tocs)},
+        )
+        folded = decode_digest(payload, "float32", (2,))
+        out_locs = decode_digest(loc_bytes, "uint64", ())
+        out_tocs = decode_digest(toc_bytes, "uint64", ())
+        assert len(out_locs) == len(out_tocs) == len(folded)
+        # Weights are exact stratum counts, additive through the fold.
+        assert int(folded[:, 1].sum()) == int(signal.sum())
+        # Quantiles within the k-way law's documented closeness vs pooled.
+        pooled, _, _ = build_tdigest_where(
+            values, delta=64, where=signal, locations=locs, temporal=times
+        )
+        for q in (0.1, 0.5, 0.9):
+            assert abs(quantile_from_tdigest(folded, q) - quantile_from_tdigest(pooled, q)) < 1.0
+        # Located companion: every merged word contains the whole stratum's
+        # common ancestor's refinement — cheap strong form: each output word
+        # is an ancestor-or-equal of at least the stratum hull, so the join
+        # of output words equals the join of input words (spec §9.1).
+        assert int(common_ancestor(out_locs)) == int(common_ancestor(locs[signal]))
+        # Temporal companion: the outputs' envelope is the inputs' envelope
+        # (spec §8.3) — selected rows only, the WHERE mask masks the channel.
+        starts, ends = (np.asarray(b, dtype="int64") for b in mortie.toc2time(out_tocs))
+        m_starts, m_ends = (np.asarray(b, dtype="int64") for b in mortie.toc2time(times[signal]))
+        assert int(starts.min()) <= int(m_starts.min())
+        assert int(ends.max()) >= int(m_ends.max())
+        # Round-trip stability: encode/decode is the identity on the payload.
+        assert np.array_equal(
+            decode_digest(encode_digest(folded, "float32"), "float32", (2,)), folded
+        )
+
+    def test_fold_is_order_independent(self):
+        # The k-way law's defining property, on where-built payloads: a
+        # permutation of the contributors returns identical bytes.
+        from zagg.sweep_overview import fold_digests
+
+        _, _, _, _, digests, words, tocs = self._blocks(k=5)
+        a = fold_digests(
+            digests,
+            delta=64,
+            dtype="float32",
+            channels={"locations": list(words), "temporal": list(tocs)},
+        )
+        perm = [3, 0, 4, 2, 1]
+        b = fold_digests(
+            [digests[i] for i in perm],
+            delta=64,
+            dtype="float32",
+            channels={"locations": [words[i] for i in perm], "temporal": [tocs[i] for i in perm]},
+        )
+        assert a == b

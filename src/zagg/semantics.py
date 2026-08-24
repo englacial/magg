@@ -377,8 +377,10 @@ def field_composability(meta: dict) -> str:
       ``(2,)`` centroid inner shape, **located or not** (merge is
       order-dependent; ``np.isclose`` equality class, cf. D24). The family is
       :data:`zagg.processing.streaming._DIGEST_FAMILY_FUNCTIONS` — the
-      t-digest builders plus the waveform flux digest (issue #508), every
-      reducer whose stored payload folds by the k-way law;
+      t-digest builders, the waveform flux digest (issue #508), and the
+      ``build_tdigest_where`` strata builder (issue #515: row selection
+      precedes the build, so a stratum's payload is an ordinary centroid
+      array), every reducer whose stored payload folds by the k-way law;
     - ``none`` — everything else: expressions, vector fields, chunk-resolution
       companions, a ``temporal: per-cell`` dense companion (see below), and any
       scalar reducer without an exact law (mean, std, median, quantiles, ...).
