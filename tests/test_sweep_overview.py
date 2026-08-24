@@ -237,13 +237,13 @@ class TestComposabilityClasses:
         }
         assert field_composability(meta) == "none"
 
-    def test_a_temporal_waveform_field_is_still_none(self):
-        # The per-centroid SHAPE does not put a field in the pyramid: the class
-        # is decided by the reducer, and ``build_waveform_digest`` is outside
-        # ``_TDIGEST_FUNCTIONS`` by the issue #422 ruling (GEDI declares
-        # ``pyramid: false``). So a waveform field carrying the channel stays
-        # class ``none`` and never appears above native resolution — there is no
-        # ``rx_flux_times`` on any overview (review finding).
+    def test_a_temporal_waveform_field_is_approximate(self):
+        # Issue #508 (superseding the #422-era exclusion this test used to
+        # pin): ``build_waveform_digest`` is a member of the shared digest
+        # family — its stored payload is a §2 centroid array and the k-way law
+        # is weight-agnostic (flux weights fold like counts, issue #431 §2) —
+        # so a waveform field classifies ``approximate`` and folds through the
+        # pyramid, per-centroid companion at every level.
         meta = {
             "kind": "ragged",
             "function": "zagg.stats.waveform.build_waveform_digest",
@@ -251,25 +251,45 @@ class TestComposabilityClasses:
             "temporal": "per-centroid",
             "dtype": "float32",
         }
-        assert field_composability(meta) == "none"
-        # ... and the SAME declaration under the standard reducer does fold, so
-        # the class turns on the function, not on the channel.
-        assert (
-            field_composability({**meta, "function": "zagg.stats.tdigest.build_tdigest"})
-            == "approximate"
-        )
+        assert field_composability(meta) == "approximate"
+        # The inner-shape guard still applies to the family's new member.
+        assert field_composability({**meta, "inner_shape": [3]}) == "none"
 
-    def test_gedi_waveform_template_classifies_none_today(self):
-        # Issue #508 phase 1 baseline: the SHIPPED template's rx_flux —
-        # build_waveform_digest with a per-centroid clock — is D24 class
-        # ``none`` today, which is exactly what the SERC probe observed
-        # (manifest ``{"class": "none"}``, no ladder, even with pyramid on).
+    def test_gedi_waveform_template_classifies_approximate(self):
+        # Issue #508: the SHIPPED template's rx_flux — build_waveform_digest
+        # with a per-centroid clock — classifies ``approximate`` via the
+        # shared digest-family registry, which is what lets the SERC probe's
+        # ``pyramid = {}`` declare a ladder instead of ``{"class": "none"}``.
         # The meta-level pin above records the mechanism; this one records
         # that the template hits it.
         from zagg.config import default_config
 
         classes = composability_classes(default_config("gedi01b_waveform_healpix_hive"))
-        assert classes["rx_flux"] == "none"
+        assert classes["rx_flux"] == "approximate"
+
+    def test_digest_family_registry_members_pinned_by_value(self):
+        # The issue #508 contract: ONE new registry, existing tuples keep
+        # their exact members. Pinned by value so a drive-by addition to any
+        # of the three is a loud diff, not a silent gate widening (the mortie
+        # #194 lesson; the where-gate question is standing on issue #508).
+        from zagg.processing.streaming import (
+            _DIGEST_FAMILY_FUNCTIONS,
+            _TDIGEST_FUNCTIONS,
+            _TDIGEST_SPILL_FUNCTIONS,
+        )
+
+        assert _TDIGEST_FUNCTIONS == (
+            "zagg.stats.tdigest.build_tdigest",
+            "zagg.stats.tdigest.build_tdigest_pairwise",
+        )
+        assert _TDIGEST_SPILL_FUNCTIONS == (
+            *_TDIGEST_FUNCTIONS,
+            "zagg.stats.tdigest.build_tdigest_where",
+        )
+        assert _DIGEST_FAMILY_FUNCTIONS == (
+            *_TDIGEST_FUNCTIONS,
+            "zagg.stats.waveform.build_waveform_digest",
+        )
 
     def test_where_strata_template_classifies_none_today(self):
         # Issue #508 phase 1 baseline for the OTHER gate pair, and a pin the

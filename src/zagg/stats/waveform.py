@@ -203,13 +203,15 @@ def build_waveform_digest(
     the samples that survived into it
     (:func:`zagg.stats.tdigest._centroid_envelopes`). Given, the return is a
     ``(digest, words)`` pair. The per-centroid **shape** is the one the espg
-    ruling of 2026-08-17 makes universal, identical to the located channel's;
-    the ruling's *at every level* half does not describe this reducer's stores,
-    because ``build_waveform_digest`` is absent from
-    ``zagg.processing.streaming._TDIGEST_FUNCTIONS`` — so a waveform field is
-    D24 class ``none`` (issue #422, and the GEDI template's ``pyramid: false``)
-    and exists at native resolution only. There is no waveform overview to carry
-    a companion, and a reader must not expect one.
+    ruling of 2026-08-17 makes universal, identical to the located channel's,
+    and its *at every level* half describes this reducer's stores too:
+    ``build_waveform_digest`` is a member of the shared digest family
+    (``zagg.processing.streaming._DIGEST_FAMILY_FUNCTIONS``, issue #508), so a
+    waveform field is D24 class ``approximate`` and folds through the overview
+    pyramid when one is declared — each overview level carries the
+    per-centroid companion beside the folded payload. (The build-time gates
+    are unchanged: the merge/spill folds still refuse the builder, so a
+    waveform shard aggregates pooled or single-block-spill only.)
 
     What the words say is ruling 2's honesty property: a waveform record's
     samples share one instant, so a single-shot cell's centroids all carry that

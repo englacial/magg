@@ -267,7 +267,9 @@ output:
     sharded: true
     child_order: 18              # leaf cell resolution (~20 m, ~GEDI footprint)
   store_layout: hive
-  pyramid: false                 # composability none initially (issue #422)
+  pyramid: false                 # opt-in (runbook: CA builds pyramids-off on
+                                 # 0.49); rx_flux classifies approximate since
+                                 # issue #508, so pyramid: {} builds the ladder
 
 worker:
   memory: 4096                   # optimized probe (run 5d081b68, 4/4 green):
