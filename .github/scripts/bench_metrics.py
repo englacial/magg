@@ -1,12 +1,11 @@
 """Pure metric derivations for the Lambda benchmark CI (issue #110).
 
-Kept import-light and side-effect-free so the workflow CLIs (``run_benchmark``,
-``update_series``, ``plot_series``) and the unit tests can all call in. The live
-Lambda dispatch lives in ``run_benchmark.py``; everything here is arithmetic over
-the run summary ``zagg.runner.agg`` already returns plus the pinned target
-metadata, so it runs with no AWS/network access. (The one import-time read is
-the committed ``targets.json`` manifest, for the shard-map recipe section at the
-bottom -- a repo fixture, still no AWS/network.)
+Kept import-light and free of AWS/network access at import, so the workflow CLIs
+(``run_benchmark``, ``update_series``, ``plot_series``) and the unit tests can all
+call in. The one import-time read is the committed ``targets.json`` manifest, a
+repo fixture the shard-map recipe section at the bottom needs. The live Lambda
+dispatch lives in ``run_benchmark.py``; everything here is arithmetic over the run
+summary ``zagg.runner.agg`` already returns plus the pinned target metadata.
 
 The benchmark dispatches exactly ONE shard, so the summary's per-fan-out worker
 stats collapse to that single worker: ``worker_max_s`` is the shard's runtime and
