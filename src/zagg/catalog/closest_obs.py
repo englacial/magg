@@ -741,12 +741,31 @@ def closest_obs_shardmap(
             shard_keys.append(shard)
             granules.append([chosen[j] for j in sorted(chosen)])
 
+    coarse = {morton_decimal(k): o for k, o in ref.orders.items() if o < TEMPORAL_COVER_ORDER}
     if dropped:
         logger.warning(
             f"closest_obs_shardmap: {len(dropped)} epoch(s) selected nothing "
-            f"(max_time_offset={max_time_offset!r}, or no acquisitions in the shard); "
+            f"(max_time_offset={max_time_offset!r}, no acquisitions in the shard, or a "
+            f"cover block too coarse for the offset); "
             f"e.g. {dropped[:3]} — every drop is "
             f"recorded in metadata['closest_obs']['dropped']"
+        )
+    if low_resolution:
+        # The arm that DISCARDS epochs must be at least as loud as the no-cap
+        # arm below, which discards nothing and still gets a purpose-built
+        # line. The summary above cannot carry this: those rows never reached
+        # the selection, so its distance/catalog-gap causes are both wrong for
+        # them, and ``reference_epochs``' coarsening warning says only that the
+        # epochs are coarse — never that they were consequently dropped.
+        worst = min(coarse.values()) if coarse else None
+        logger.warning(
+            f"closest_obs_shardmap: {low_resolution} epoch(s) dropped as UNRESOLVABLE at "
+            f"max_time_offset={max_time_offset!r} — a coarsened cover, NOT distance to an "
+            f"acquisition: their block's bucket half-span exceeds the offset (coarsest "
+            f"temporal order {worst} across {len(coarse)} shard(s), e.g. "
+            f"{sorted(coarse)[:5]}) — every row is in metadata['closest_obs']['dropped'] "
+            f"with temporal_order/cover_half_span_ns, counted in "
+            f"metadata['closest_obs']['epochs_dropped_low_resolution']"
         )
     if no_acquisitions:
         logger.warning(
@@ -765,7 +784,6 @@ def closest_obs_shardmap(
         else []
     )
 
-    coarse = {morton_decimal(k): o for k, o in ref.orders.items() if o < TEMPORAL_COVER_ORDER}
     if coarse and cap_ns is None:
         worst = min(coarse.values())
         logger.warning(
