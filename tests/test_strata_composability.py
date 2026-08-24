@@ -27,8 +27,9 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from zagg.config import default_config
+from zagg.config import default_config, get_agg_fields
 from zagg.pyramid import declared_fields
 from zagg.semantics import composability_classes, field_composability
 
@@ -132,10 +133,23 @@ class TestSpillGateAdmissions:
     def test_composition_is_spill_admitted(self):
         # The composition spill law is ``merge_composition_kway`` over packed
         # ``(word, n_signal)`` pairs (issues #321/#370, option (a)); the gate
-        # admits the reducer by name in its scalar branch.
-        from zagg.processing.streaming import _COMPOSITION_FUNCTION
+        # admits the reducer BY NAME in its scalar branch. Asserted as a
+        # pass/raise pair on one config so the option (b) flip — the one-line
+        # removal of the name from that branch (``_COMPOSITION_FUNCTION``
+        # docstring) — fails this test instead of leaving it green.
+        from zagg.processing.streaming import _COMPOSITION_FUNCTION, validate_spill_fold
 
         assert _COMPOSITION_FUNCTION == "zagg.stats.composition.pack_composition"
+        config = default_config("atl03_tdigest_strata_healpix")
+        fields = get_agg_fields(config)
+        assert fields["composition"]["function"] == _COMPOSITION_FUNCTION
+        validate_spill_fold(config)
+        # Negative control: the same scalar field under any other function is
+        # refused by name, so the pass above is the admission itself and not a
+        # branch that waves every scalar through.
+        fields["composition"]["function"] = "zagg.stats.composition.pack_composition_v2"
+        with pytest.raises(ValueError, match="scalar function .* has no cross-block fold"):
+            validate_spill_fold(config)
 
     def test_strata_template_passes_the_spill_gate(self):
         # The CA config shape survives a block close: both strata AND the
