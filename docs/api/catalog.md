@@ -152,3 +152,82 @@ cannot see.
 ::: zagg.catalog.polygon_to_bbox
 
 ::: zagg.catalog.load_antarctic_basins
+
+## Closest-observation pairing (issue #509)
+
+One raster store (e.g. Sentinel-2 L2A) can serve several point-cloud
+reference stores (ATL03 + GEDI): for every reference *epoch* a shard's
+stores actually observed, ingest the single **nearest** acquisition from the
+raster catalog. The pairing is a property of the ingest *query*, not the
+store schema — the raster store stays a plain raster store, which granules
+were ingested *is* the pairing, and coincidence at read time is toc
+intersection.
+
+Epochs are **store-derived**, never catalog-derived: each reference store's
+`coverage.toc` sibling (spec §10.5) records per-shard word-set covers of the
+data that actually landed, quantized at temporal order 18 (2^45 ns ≈ 9.77 h
+buckets). The builder expands each cover word into its constituent buckets
+and takes one epoch per bucket midpoint — good to ±4.9 h against Sentinel-2's
+~4.3-day revisit. Granule catalogs would inherit the CMR-hull
+over-assignment (~70 assigned granules vs 49 contributing pass-days on a
+measured Californian shard); covers reflect contribution, not assignment.
+
+```python
+from zagg.catalog.closest_obs import closest_obs_shardmap
+from zagg.catalog.sources import Catalog
+from zagg.grids import HealpixGrid
+import numpy as np
+
+grid = HealpixGrid(9, 13)  # parent_order must equal the covers' shard order
+s2 = Catalog.from_geoparquet("catalog_s2_ca.parquet")
+
+# Size the run first — the dry-run builds nothing and prices the fan-out:
+est = closest_obs_shardmap(
+    s2,
+    ["s3://bucket/atl03_store", "s3://bucket/gedi_store"],
+    grid=grid,
+    aoi="california.geojson",
+    max_time_offset=np.timedelta64(3, "D"),
+    max_granules_per_shard=200,  # the same gate the build below applies
+    estimate=True,
+)
+# violations is [] unless the gate is passed here too -- estimate returns
+# before the build's raise, so this is the safe way to size it.
+est["histogram"], est["max_cost_usd"], est["violations"]
+
+# Then build the map; dispatch consumes it like any other ShardMap:
+sm = closest_obs_shardmap(
+    s2,
+    ["s3://bucket/atl03_store", "s3://bucket/gedi_store"],
+    grid=grid,
+    aoi="california.geojson",
+    max_time_offset=np.timedelta64(3, "D"),
+    max_granules_per_shard=200,
+)
+sm.to_json("s2_closest_obs.json")
+```
+
+Everything refuses or records **loudly**, never silently: a reference store
+with no readable `coverage.toc` raises (sweep the store first); an epoch
+whose nearest acquisition lies beyond `max_time_offset` selects nothing and
+is recorded per-epoch in `metadata["closest_obs"]["dropped"]` with its
+near-miss offset; a shard past `max_granules_per_shard` raises naming the
+worst shards (`estimate=True` reports the violations instead, so the gate
+can be sized first); a cover block coarsened below the §10.5 pin is warned
+about and reported in `coarsened_orders` — and under a `max_time_offset`,
+epochs whose coarse-bucket half-span exceeds the stated offset cannot be
+paired to that precision, so they drop into the ledger as their own category
+(`epochs_dropped_low_resolution`, rows naming the block's effective order;
+espg tolerance ruling 2026-08-24). Selected granule entries carry
+`paired_epochs` / `epoch_offsets_ns` provenance so the paired product is
+reconstructable from the manifest alone. Epochs are bucket midpoints —
+size `max_time_offset` with `ReferenceEpochs.tolerance()`'s half-bucket
+slack in mind.
+
+::: zagg.catalog.closest_obs.reference_epochs
+
+::: zagg.catalog.closest_obs.ReferenceEpochs
+
+::: zagg.catalog.closest_obs.nearest_acquisitions
+
+::: zagg.catalog.closest_obs.closest_obs_shardmap
