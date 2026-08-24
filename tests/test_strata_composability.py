@@ -567,3 +567,211 @@ class TestCompositionFoldParity:
         fields, excluded = declared_fields(cfg)
         assert fields["composition"] == {"class": "none"}
         assert sorted(excluded) == ["composition", "h_vec"]
+
+
+def _strata_leaf_cfg():
+    """The synthetic strata leaf config: the CA shape at test scale."""
+    from zagg.config import PipelineConfig
+
+    where = "(conf_land >= 2)"
+    return PipelineConfig(
+        aggregation={
+            "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+            "variables": {
+                "count": {"function": "len", "dtype": "int32", "fill_value": 0},
+                "h_sig": {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest_where",
+                    "inner_shape": [2],
+                    "params": {"delta": 64, "where": where},
+                    "dtype": "float32",
+                    "fill_value": 0,
+                },
+                "h_noise": {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest_where",
+                    "inner_shape": [2],
+                    "params": {"delta": 64, "where": f"~{where}"},
+                    "dtype": "float32",
+                    "fill_value": 0,
+                },
+                "composition": {
+                    "function": "zagg.stats.composition.pack_composition",
+                    "dtype": "uint64",
+                    "fill_value": 0,
+                    "params": {"threshold": 2},
+                    "attrs": {"composition": {"of": "h_sig", "threshold": 2}},
+                },
+            },
+        }
+    )
+
+
+class TestEndToEndStrataPyramid:
+    """Phase 4: template → build → overview fold on a synthetic strata store.
+
+    The ``/1`` cascade regime end to end (finest level exact-from-leaves via
+    ``_fold_node``, the coarser level a cascade via ``_cascade_node``), with
+    the shard geometry of the sweep test harness (shard order 2, cell order
+    4, one committed leaf at ``-311``). At EVERY level: both strata's
+    ``weight_total`` folds exactly, and the composition word is the k-way
+    merge of its contributors' ``(word, n)`` pairs — recomputed independently
+    here from the arrays one level finer."""
+
+    SHARD_ORDER, CELL_ORDER = 2, 4
+
+    def _build_store(self, root, per_cell):
+        import json as _json
+
+        import obstore
+        import zarr
+        from mortie import generate_morton_children
+
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.grids.morton import morton_word
+        from zagg.hive import MANIFEST_NAME, shard_leaf_path, stamp_commit
+        from zagg.store import open_object_store, open_store
+
+        grid = HealpixGrid(self.SHARD_ORDER, self.CELL_ORDER, config=_strata_leaf_cfg())
+        word = morton_word("-311")
+        store = open_store(shard_leaf_path(str(root), word))
+        grid.emit_shard_template(store, overwrite=True)
+        group = zarr.open_group(store, path=str(self.CELL_ORDER), mode="r+", zarr_format=3)
+        n = 4 ** (self.CELL_ORDER - self.SHARD_ORDER)
+        assert len(per_cell) == n
+        group["morton"][:] = np.asarray(
+            generate_morton_children(word, self.CELL_ORDER), dtype=np.uint64
+        )
+        group["count"][:] = np.array(
+            [c["n_signal"] + c["n_noise"] for c in per_cell], dtype=np.int32
+        )
+        for field, key in (("h_sig", "sig"), ("h_noise", "noise")):
+            slab = np.full(n, b"", dtype=object)
+            for i, c in enumerate(per_cell):
+                slab[i] = c[key]
+            group[field][:] = slab
+        group["composition"][:] = np.array([c["word"] for c in per_cell], dtype=np.uint64)
+        stamp_commit(store, cells_with_data=n, granule_count=1)
+        fields = {
+            "count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0},
+            **{k: dict(v) for k, v in _STRATA_FIELDS.items()},
+        }
+        fields["composition"]["threshold"] = 2
+        manifest = {
+            "spec": "morton-hive/1",
+            "dataset": {"short_name": "TEST", "version": "1"},
+            "cell_order": self.CELL_ORDER,
+            "shard_order": self.SHARD_ORDER,
+            "split_schedule": [1] * self.SHARD_ORDER,
+            "pyramid": {
+                "spec": "zagg-pyramid/1",
+                "overview": {
+                    "spacing": 2,
+                    "orders": [1, 0],
+                    "all_time": False,
+                    "fold_source": "cascade",
+                    "exact_levels": 1,
+                    "fields": fields,
+                },
+            },
+            "generated_at": "2026-01-01T00:00:00+00:00",
+        }
+        obstore.put(open_object_store(str(root)), MANIFEST_NAME, _json.dumps(manifest).encode())
+        return manifest
+
+    @staticmethod
+    def _group(root, node_rel, order):
+        import zarr
+
+        from zagg.store import open_store
+
+        store = open_store(f"{root}/{node_rel}/all.zarr")
+        return zarr.open_group(store, path=str(order), mode="r", zarr_format=3)
+
+    def test_strata_and_composition_fold_at_every_level(self, tmp_path):
+        from zagg.stats.composition import merge_composition_kway, unpack_composition
+        from zagg.sweep_overview import decode_digest, sweep_overviews
+
+        per_cell, (values, conf) = _strata_cells(k=16, n=60, seed=515)
+        manifest = self._build_store(tmp_path, per_cell)
+        counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
+        assert counts["failed"] == 0 and counts["written"] == 2
+
+        def weights(group, field, j):
+            payload = group[field][:][j]
+            if payload is None or not len(payload):
+                return 0
+            return int(decode_digest(payload, "float32", (2,))[:, 1].sum())
+
+        # Level 1 (node -31, cell order 3): exact-from-leaves. Leaf -311 is
+        # the node's rank-0 child (digits are 1-based), so it owns the span
+        # starting at 0; each output cell folds 4 leaf cells.
+        g1 = self._group(tmp_path, "-3/1", 3)
+        for j in range(4):
+            rows = per_cell[4 * j : 4 * (j + 1)]
+            cell = j
+            assert weights(g1, "h_sig", cell) == sum(c["n_signal"] for c in rows)
+            assert weights(g1, "h_noise", cell) == sum(c["n_noise"] for c in rows)
+            expected = merge_composition_kway(
+                [(c["word"], c["n_signal"]) for c in rows if c["n_signal"] > 0]
+            )
+            assert int(g1["composition"][cell]) == expected
+            assert int(g1["count"][cell]) == sum(c["n_signal"] + c["n_noise"] for c in rows)
+        # Cells outside the leaf's span hold the packed fill word 0.
+        assert int(g1["composition"][15]) == 0 and weights(g1, "h_sig", 15) == 0
+        # The overview's composition array is self-describing exactly as a
+        # leaf's: §3.3 block with the writer-stamped halves + the manifest's.
+        block = dict(g1["composition"].attrs["composition"])
+        assert block["spec"] == "zagg-composition/1"
+        assert block["of"] == "h_sig" and block["threshold"] == 2
+
+        # Level 0 (node -3, cell order 2): a cascade — its words must be the
+        # k-way merge of the LEVEL-1 arrays' (word, n) pairs, recomputed here
+        # independently, and its weights still leaf-exact.
+        g0 = self._group(tmp_path, "-3", 2)
+        whole = 0  # the whole leaf collapses into the node's rank-0 cell
+        assert weights(g0, "h_sig", whole) == sum(c["n_signal"] for c in per_cell)
+        assert weights(g0, "h_noise", whole) == sum(c["n_noise"] for c in per_cell)
+        parts = [
+            (int(g1["composition"][i]), weights(g1, "h_sig", i))
+            for i in range(4)
+            if weights(g1, "h_sig", i) > 0
+        ]
+        assert int(g0["composition"][whole]) == merge_composition_kway(parts)
+        # Presence is exact against DIRECT truth through both folds (§3.4);
+        # the whole leaf collapses into one level-0 cell, so compare against
+        # one pooled pack of every raw row.
+        from zagg.stats.composition import pack_composition_n
+
+        pooled, pooled_n = pack_composition_n(
+            values,
+            conf_land=conf[:, 0],
+            conf_ocean=conf[:, 1],
+            conf_sea_ice=conf[:, 2],
+            conf_land_ice=conf[:, 3],
+            conf_inland_water=conf[:, 4],
+            threshold=2,
+        )
+        assert pooled_n == weights(g0, "h_sig", whole)
+        assert np.array_equal(
+            unpack_composition(int(g0["composition"][whole])) > 0,
+            unpack_composition(pooled) > 0,
+        )
+
+    def test_overview_provenance_records_the_packed_law(self, tmp_path):
+        import zarr
+
+        from zagg.store import open_store
+        from zagg.sweep_overview import OVERVIEW_ATTR, sweep_overviews
+
+        per_cell, _ = _strata_cells(k=16, n=30, seed=516)
+        manifest = self._build_store(tmp_path, per_cell)
+        sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
+        for node_rel, source in (("-3/1", "leaves"), ("-3", "cascade")):
+            root = zarr.open_group(
+                open_store(f"{tmp_path}/{node_rel}/all.zarr"), mode="r", zarr_format=3
+            )
+            block = dict(root.attrs[OVERVIEW_ATTR])
+            assert block["fold_source"] == source
+            entry = dict(block["fields"]["composition"])
+            assert entry == {"class": "packed", "method": "composition_kway"}
