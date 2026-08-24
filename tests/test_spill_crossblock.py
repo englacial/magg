@@ -347,6 +347,128 @@ def _pooled_build(meta, n=8):
     return resolve_function(meta["function"])(cell_data["h_ph"], **params)
 
 
+_WAVEFORM_FUNCTION = "zagg.stats.waveform.build_waveform_digest"
+
+
+def _waveform_variables(temporal=True, delta=64):
+    """A ``rx_flux``-shaped field: the gedi01b template's reducer + channel.
+
+    Sources ``h_ph`` and reads the noise-model columns via the params-as-column
+    path, exactly as the shipped template wires ``rxwaveform``/``noise_mean``/
+    ``noise_stddev`` (issue #508 phase 1 harness).
+    """
+    field = {
+        "kind": "ragged",
+        "function": _WAVEFORM_FUNCTION,
+        "source": "h_ph",
+        "inner_shape": [2],
+        "dtype": "float32",
+        "fill_value": 0,
+        "params": {
+            "delta": delta,
+            "counts": "wf_counts",
+            "noise_mean": "wf_noise_mean",
+            "noise_stddev": "wf_noise_stddev",
+            "gain": 1.0,
+            "false_positive_rate": 1.0e-3,
+            "samples_per_record": 60,
+        },
+    }
+    if temporal:
+        field["temporal"] = "per-centroid"
+    return {
+        "count": {"function": "len", "source": "h_ph", "dtype": "int32", "fill_value": 0},
+        "rx_flux": field,
+    }
+
+
+def _with_waveform_columns(dfs, seed=0):
+    """Add the noise-model columns ``_waveform_variables`` declares.
+
+    Counts sit well above the zero-mean noise floor, so every row survives the
+    clip and ``sum(weights)`` over a cell is the sum of its rows' counts.
+    """
+    rng = np.random.default_rng(seed)
+    for df in dfs:
+        n = len(df)
+        df["wf_counts"] = rng.uniform(5.0, 50.0, n)
+        df["wf_noise_mean"] = np.zeros(n, dtype=np.float64)
+        df["wf_noise_stddev"] = np.full(n, 0.1, dtype=np.float64)
+    return dfs
+
+
+class TestWaveformSpillBaseline:
+    """How the spill path treats ``build_waveform_digest`` TODAY (issue #508).
+
+    Phase 1 characterization, recorded before any registry changes: the SERC
+    GEDI fleet runs (0.47–0.49) completed under ``{mode: spill}``, and the
+    mechanism that carried them is the NON-mergeable single-block regime —
+    ``validate_spill_fold`` refuses the builder (it is outside
+    ``_TDIGEST_SPILL_FUNCTIONS``), so ``SpillAggregator`` records the verdict,
+    replays the pooled machinery byte-identically while the shard fits in one
+    block, and raises ``SpillOverflowError`` naming the field on the first
+    block close. Issue #508 changes NONE of this: the shared digest-family
+    registry feeds the D24 pyramid classification (stored-payload folds), not
+    the build-time spill fold, which would need the noise-model columns
+    re-threaded per block.
+    """
+
+    def test_probe_refuses_the_waveform_builder(self):
+        # The per-centroid channel passes the temporal arm (issue #477); the
+        # refusal is the ragged function arm — no cross-block fold law.
+        cfg = _config(_waveform_variables(), streaming=_SPILL)
+        with pytest.raises(ValueError, match="'rx_flux'.*build_waveform_digest.*fold law"):
+            validate_spill_fold(cfg)
+
+    def test_spill_accepts_the_config_as_non_mergeable(self):
+        # Accepted — single-block exact — with the probe's verdict recorded so
+        # a block close can name the field (issue #474 message discipline).
+        cfg = _config(_waveform_variables(), streaming=_SPILL)
+        agg = SpillAggregator(cfg, _grid(cfg), "pandas", 1)
+        assert not agg._mergeable
+        assert agg._digest_fields == {}
+        assert "rx_flux" in agg._fold_problems and "fold law" in agg._fold_problems
+        agg.close()
+
+    def test_single_block_regime_is_byte_identical_to_pooled(self, monkeypatch):
+        # The SERC mechanism: one block -> the pooled replay, payload AND the
+        # per-centroid temporal channel byte-identical to the pooled path.
+        key = _shard_key()
+        pooled_cfg = _config(_waveform_variables())
+        spill_cfg = _config(_waveform_variables(), streaming=_SPILL)
+        grid = _grid(pooled_cfg)
+        dfs = _with_waveform_columns(
+            _granule_dfs(grid, key, _CELL_LISTS[:3], obs_per_cell=40, seed=6, times=True)
+        )
+        df_p, ragged_p, _ = _run(monkeypatch, pooled_cfg, grid, key, list(dfs))
+        df_s, ragged_s, _ = _run(monkeypatch, spill_cfg, _grid(spill_cfg), key, list(dfs))
+        pd.testing.assert_series_equal(df_p["count"], df_s["count"])
+        assert set(ragged_p) == set(ragged_s) == {"rx_flux"}
+        pay_p, idx_p, locs_p, times_p = _channels_of(ragged_p["rx_flux"])
+        pay_s, idx_s, locs_s, times_s = _channels_of(ragged_s["rx_flux"])
+        assert idx_p == idx_s and len(pay_p) > 0
+        assert locs_p is None and locs_s is None
+        for a, b in zip(pay_p, pay_s, strict=True):
+            np.testing.assert_array_equal(a, b)
+        for a, b in zip(times_p, times_s, strict=True):
+            np.testing.assert_array_equal(a, b)
+
+    def test_block_close_raises_overflow_naming_the_field(self, monkeypatch):
+        # The recorded boundary of the mechanism above: past one block there is
+        # no fold law, and the overflow splices the probe's verdict.
+        from zagg.processing.spill import SpillOverflowError
+
+        _force_tiny_blocks(monkeypatch)
+        key = _shard_key()
+        cfg = _config(_waveform_variables(), streaming=_SPILL)
+        grid = _grid(cfg)
+        dfs = _with_waveform_columns(
+            _granule_dfs(grid, key, _CELL_LISTS[:2], obs_per_cell=10, seed=1, times=True)
+        )
+        with pytest.raises(SpillOverflowError, match="'rx_flux'.*build_waveform_digest.*fold law"):
+            _run(monkeypatch, cfg, grid, key, dfs)
+
+
 class TestSpillFoldProbe:
     """The spill mergeability probe (validate_spill_fold) vs merge mode."""
 
