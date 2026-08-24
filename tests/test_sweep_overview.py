@@ -1793,16 +1793,53 @@ class TestWaveformOverviewFold:
     def test_weight_total_parity_and_times_at_every_level(self, tmp_path):
         # 300 samples at δ64 force genuine k-way merges at the fine level and
         # a fold-of-merges at the coarse one; the mass must survive both.
-        leaf_total, _ = self._sweep(tmp_path, {0: 300, 3: 80, 7: 41})
-        for node_rel, order in (("-3/1", 3), ("-3", 2)):
+        from zagg.stats.toc import cell_envelope
+
+        leaf_total, truth = self._sweep(tmp_path, {0: 300, 3: 80, 7: 41})
+        for node_rel, order, partitioned in (("-3/1", 3, True), ("-3", 2, False)):
             g = _overview_group(tmp_path, node_rel, "all.zarr", order)
             rows = [decode_digest(bytes(b), "float32") for b in g["rx_flux"][:]]
             level_total = sum(float(d[:, 1].sum()) for d in rows if d.size)
             assert level_total == leaf_total, f"mass lost/invented at {node_rel}"
             words = [decode_digest(bytes(b), "uint64", ()) for b in g["rx_flux_times"][:]]
+            # Leaf rows fold into contiguous runs of the coarser level, so its
+            # row ``j`` is fed exactly by leaf rows ``j * per_row ...`` (the
+            # slots past the level's own cell count stay empty). Every
+            # ``_make_waveform_leaf`` row sits an hour off its neighbour, so the
+            # words below are pinned to the CONTRIBUTORS' instants rather than
+            # to some merely well-formed word: a column carried forward from
+            # another row widens the envelope out of the hour and fails here.
+            per_row = LEAF_CELLS // 4 ** (order - SHARD_ORDER)
             populated = 0
-            for d, w in zip(rows, words, strict=True):
+            for j, (d, w) in enumerate(zip(rows, words, strict=True)):
                 assert w.shape == (d.shape[0],), "§1.1 row alignment"
+                members = [truth[i] for i in range(j * per_row, (j + 1) * per_row) if i in truth]
+                if not members:
+                    assert w.size == 0, f"words in an unfed row of {node_rel}"
+                    continue
+                take = np.argsort(np.concatenate([t[0][:, 0] for t in members]), kind="stable")
+                weights = np.concatenate([t[0][:, 1] for t in members])[take]
+                instants = np.concatenate([t[1] for t in members])[take]
+                if partitioned:
+                    # The fine level merges the leaf centroids themselves, whole
+                    # and value-ordered, so the leaf's own words index it: cut
+                    # by cumulative FLUX (these weights are photoelectron
+                    # counts, not observation counts) and each merged word must
+                    # cover its contributors' instants — §8.3 over the §9.1
+                    # partition, as in ``TestBothChannelsOverviewFold``.
+                    fed = np.cumsum(weights)
+                    got = np.concatenate([[0.0], np.cumsum(d[:, 1].astype(np.float64))])
+                    for k, (lo, hi) in enumerate(zip(got[:-1], got[1:], strict=True)):
+                        lo_i = int(np.searchsorted(fed, lo, side="right"))
+                        hi_i = int(np.searchsorted(fed, hi, side="right"))
+                        assert hi_i > lo_i, "a centroid folded no contributor whole"
+                        assert _toc_contains(w[k], instants[lo_i:hi_i])
+                # The coarse level folds the FINE level's centroids, whose
+                # values are weighted means and so no longer interleave in leaf
+                # order — the claim that survives the re-partition is the
+                # cell-level identity, exactly as ``test_cascade_folds_both_
+                # siblings`` states it: nothing invented, nothing dropped.
+                assert int(cell_envelope(w)) == int(cell_envelope(instants))
                 populated += len(w)
             assert populated > 0
 
