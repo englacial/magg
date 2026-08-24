@@ -181,8 +181,10 @@ places the panel.
 
    > **Re-pinning a map that already exists** is one command:
    > `tools/repin_benchmark_shardmaps.py` (issue #444) rebuilds through the
-   > drift check's own recipe, selects the pin (nested rule included), prunes
-   > the ring maps, and writes the map plus its `targets.json`
+   > shared recipe in `.github/scripts/bench_metrics.py` — `rebuild_shardmap`
+   > and `select_pin`, which the drift check and this driver both call —
+   > selects the pin (nested rule included), prunes the ring maps, and writes
+   > the map plus its `targets.json`
    > `shard_key`/`n_granules`. It re-pins **deliberately** — the drift check
    > stays the accident detector — so run it only when a convention or grammar
    > change makes the committed words wrong. `--check` rebuilds and reports the
