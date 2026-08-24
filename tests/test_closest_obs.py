@@ -303,15 +303,42 @@ class TestCoarsenedBlock:
 class TestGoldenFixture:
     """The committed §7 ``temporal/`` fixture pins the frozen grammar bytes."""
 
-    def test_the_golden_cover_decodes_to_epochs(self):
+    #: The two epochs the committed fixture decodes to, pinned as literals
+    #: rather than recomputed with the function under test. Verified by hand:
+    #: each is the midpoint of an order-18 bucket (internal ns congruent to
+    #: 2^44 - 1 mod 2^45, buckets 151903 and 151915 — twelve apart, the
+    #: fixture's five-day gap), and each sits within half a bucket of the
+    #: generator's two campaign clusters (``TEMPORAL_BASE`` and +5 days).
+    GOLDEN = np.array(
+        ["2019-05-14T03:14:07.595891711", "2019-05-19T00:31:00.060957695"],
+        dtype="datetime64[ns]",
+    )
+
+    def test_the_golden_cover_decodes_to_the_pinned_epochs(self):
         out = reference_epochs(str(SPEC_DATA / "temporal"))
         assert out.order == 4
         assert list(out.epochs) == [SHARD_KEY]
-        epochs = out.epochs[SHARD_KEY]
-        assert epochs.size > 0
-        # Every epoch is one committed cover word's midpoint, exactly.
-        words = cover_words(read_cover(str(SPEC_DATA / "temporal")))[SHARD]
-        assert np.array_equal(epochs, np.unique(_word_midpoints(words)))
+        assert np.array_equal(out.epochs[SHARD_KEY], self.GOLDEN)
+        assert out.orders == {SHARD_KEY: TEMPORAL_COVER_ORDER}
+
+    def test_the_golden_epochs_are_order_18_bucket_midpoints(self):
+        """The arithmetic the ±4.9 h claim rests on, checked independently."""
+        k = 63 - TEMPORAL_COVER_ORDER
+        internal = np.asarray(from_datetime64(self.GOLDEN), dtype=np.uint64)
+        assert [int(t) % 2**k for t in internal] == [2 ** (k - 1) - 1] * 2
+        assert [int(t) >> k for t in internal] == [151903, 151915]
+
+    def test_every_fixture_observation_has_an_epoch_within_half_a_bucket(self):
+        """The property the ruling actually claims, against the generator's
+        own recorded instants (``temporal.expected.json``), not against
+        anything :mod:`zagg.catalog.closest_obs` computed."""
+        expected = json.loads((SPEC_DATA / "temporal.expected.json").read_text())
+        true = np.array(
+            sorted({int(ns) for c in expected["cells"] for ns in c["obs_span_ns"]}),
+            dtype="datetime64[ns]",
+        )
+        epochs = reference_epochs(str(SPEC_DATA / "temporal")).epochs[SHARD_KEY]
+        assert _nearest_gap(epochs, true) <= HALF_BUCKET
 
     def test_the_golden_epochs_sit_inside_the_fixture_campaign(self):
         """Midpoints land inside the leaf's synthetic campaign window."""
