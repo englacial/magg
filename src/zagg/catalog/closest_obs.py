@@ -155,12 +155,20 @@ def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> Reference
 
     For each store root: fetch the §10.5 sibling
     (:func:`zagg.coverage_toc.read_cover`), strict-decode its per-shard word
-    sets (:func:`zagg.coverage_toc.cover_words`), and decode each word's
-    envelope midpoint (mortie). Per shard the result is the **union** across
-    stores, deduplicated — two stores quantized on the same order-18 grid
-    yield the same word for the same pass window, so the union is exact,
-    never doubled (espg ruling: one raster store serves both sensors, epochs
-    are the union across the reference stores).
+    sets (:func:`zagg.coverage_toc.cover_words`), and expand each word into
+    its constituent buckets' midpoints (:func:`_word_midpoints`). Per shard
+    the result is the **union** across stores, deduplicated (espg ruling: one
+    raster store serves both sensors, epochs are the union across the
+    reference stores).
+
+    The union is canonical at the **bucket** level, not the word level. Words
+    are post-``toc_normalize`` runs whose extent depends on that store's
+    *other* data, so two stores sharing one pass routinely emit
+    overlapping-but-**unequal** range words — a raw ``np.unique`` over words
+    would keep both and represent the shared pass twice, at two displaced
+    midpoints. Expanding to buckets first removes that degree of freedom:
+    the bucket grid is fixed by the order alone, so a shared pass contributes
+    the same bucket midpoint from every store and dedupes exactly.
 
     A store that carries **no readable cover refuses loudly** — this builder
     is cover-driven by design (store-derived epochs, never the granule
