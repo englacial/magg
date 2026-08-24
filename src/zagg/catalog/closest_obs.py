@@ -342,8 +342,10 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
     Notes
     -----
     A tie — an epoch exactly equidistant between two acquisitions — selects
-    the EARLIER acquisition, deterministically. Equal acquisition times are
-    broken by catalog record order (stable sort).
+    the EARLIER acquisition, deterministically. Equal acquisition times (one
+    Sentinel-2 datatake stamps many granules with the same instant) are
+    broken by catalog record order: the FIRST record of the equal-time run,
+    whichever flank the epoch approaches it from.
     """
     epochs = np.asarray(epochs, dtype="datetime64[ns]")
     times = np.asarray(times, dtype="datetime64[ns]")
@@ -369,6 +371,11 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
     # to an acquisition has ``right == 0`` and selects it exactly.
     take_right = right < left
     nearest = np.where(take_right, np.minimum(pos, ts.size - 1), np.maximum(pos - 1, 0))
+    # Equal acquisition times form one run in ``ts``; the left flank lands on
+    # its END and the right flank on its START, so snap to the run start —
+    # with a stable ``argsort`` that is the run's first catalog record, from
+    # either side.
+    nearest = np.searchsorted(ts, ts[nearest], side="left")
     selection = order[nearest].astype(np.int64)
     signed = np.where(take_right, right, -left)
     offsets = signed.astype("timedelta64[ns]")
