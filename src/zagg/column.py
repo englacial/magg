@@ -193,10 +193,11 @@ def leaf_slabs(staged: dict, fields: dict, *, group_path: str, n_cells: int) -> 
 
     ``fields`` is filtered to the composable classes first
     (:func:`composable_fields`), which is what makes the ``(n_cells,)`` extent
-    check sound: those two classes admit nothing but cell-resolution scalars
-    and ragged payloads, both of which are one row per cell, so a staged slab
-    of any other extent really is a sink that disagrees with the grid — and
-    folding it would write a wrong column, so it raises.
+    check sound: those classes admit nothing but cell-resolution scalars
+    (including the §3 composition word) and ragged payloads, both of which are
+    one row per cell, so a staged slab of any other extent really is a sink
+    that disagrees with the grid — and folding it would write a wrong column,
+    so it raises.
 
     A field's companion siblings — ``{field}_locations`` (§9) and
     ``{field}_times`` (§8.3) — are picked up under the same rule and the same
