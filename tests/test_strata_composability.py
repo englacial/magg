@@ -724,6 +724,42 @@ def _strata_leaf_cfg():
     )
 
 
+def _write_strata_leaf(root, dec, per_cell, *, shard_order, cell_order):
+    """Write one committed strata leaf at ``dec``; return its cell-order group path.
+
+    The whole leaf-writing half of both fixtures below (the half-pair fold and
+    the end-to-end pyramid): template, morton, ``count``, the two ragged strata
+    slabs, the packed word, commit stamp. Shared so a geometry fix — the
+    ``where`` cut on ``_strata_leaf_cfg``, say — cannot land on one copy and
+    miss the other; the e2e fixture keeps only its manifest half.
+    """
+    import zarr
+    from mortie import generate_morton_children
+
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.grids.morton import morton_word
+    from zagg.hive import shard_leaf_path, stamp_commit
+    from zagg.store import open_store
+
+    grid = HealpixGrid(shard_order, cell_order, config=_strata_leaf_cfg())
+    word = morton_word(dec)
+    store = open_store(shard_leaf_path(str(root), word))
+    grid.emit_shard_template(store, overwrite=True)
+    group = zarr.open_group(store, path=str(cell_order), mode="r+", zarr_format=3)
+    n = 4 ** (cell_order - shard_order)
+    assert len(per_cell) == n
+    group["morton"][:] = np.asarray(generate_morton_children(word, cell_order), dtype=np.uint64)
+    group["count"][:] = np.array([c["n_signal"] + c["n_noise"] for c in per_cell], dtype=np.int32)
+    for field, key in (("h_sig", "sig"), ("h_noise", "noise")):
+        slab = np.full(n, b"", dtype=object)
+        for i, c in enumerate(per_cell):
+            slab[i] = c[key]
+        group[field][:] = slab
+    group["composition"][:] = np.array([c["word"] for c in per_cell], dtype=np.uint64)
+    stamp_commit(store, cells_with_data=n, granule_count=1)
+    return f"{shard_leaf_path(str(root), word)}/{cell_order}"
+
+
 class TestLeafFoldHalfPair:
     """``_fold_node``'s packed arm when ONE leaf of an output cell is half-paired.
 
@@ -737,35 +773,9 @@ class TestLeafFoldHalfPair:
     SHARD_ORDER, CELL_ORDER, K = 3, 4, 1
 
     def _leaf(self, root, dec, per_cell):
-        import zarr
-        from mortie import generate_morton_children
-
-        from zagg.grids.healpix import HealpixGrid
-        from zagg.grids.morton import morton_word
-        from zagg.hive import shard_leaf_path, stamp_commit
-        from zagg.store import open_store
-
-        grid = HealpixGrid(self.SHARD_ORDER, self.CELL_ORDER, config=_strata_leaf_cfg())
-        word = morton_word(dec)
-        store = open_store(shard_leaf_path(str(root), word))
-        grid.emit_shard_template(store, overwrite=True)
-        group = zarr.open_group(store, path=str(self.CELL_ORDER), mode="r+", zarr_format=3)
-        n = 4 ** (self.CELL_ORDER - self.SHARD_ORDER)
-        assert len(per_cell) == n
-        group["morton"][:] = np.asarray(
-            generate_morton_children(word, self.CELL_ORDER), dtype=np.uint64
+        return _write_strata_leaf(
+            root, dec, per_cell, shard_order=self.SHARD_ORDER, cell_order=self.CELL_ORDER
         )
-        group["count"][:] = np.array(
-            [c["n_signal"] + c["n_noise"] for c in per_cell], dtype=np.int32
-        )
-        for field, key in (("h_sig", "sig"), ("h_noise", "noise")):
-            slab = np.full(n, b"", dtype=object)
-            for i, c in enumerate(per_cell):
-                slab[i] = c[key]
-            group[field][:] = slab
-        group["composition"][:] = np.array([c["word"] for c in per_cell], dtype=np.uint64)
-        stamp_commit(store, cells_with_data=n, granule_count=1)
-        return f"{shard_leaf_path(str(root), word)}/{self.CELL_ORDER}"
 
     def _fold(self, root):
         from zagg.sweep_overview import _fold_node
@@ -1019,34 +1029,13 @@ class TestEndToEndStrataPyramid:
         import json as _json
 
         import obstore
-        import zarr
-        from mortie import generate_morton_children
 
-        from zagg.grids.healpix import HealpixGrid
-        from zagg.grids.morton import morton_word
-        from zagg.hive import MANIFEST_NAME, shard_leaf_path, stamp_commit
-        from zagg.store import open_object_store, open_store
+        from zagg.hive import MANIFEST_NAME
+        from zagg.store import open_object_store
 
-        grid = HealpixGrid(self.SHARD_ORDER, self.CELL_ORDER, config=_strata_leaf_cfg())
-        word = morton_word("-311")
-        store = open_store(shard_leaf_path(str(root), word))
-        grid.emit_shard_template(store, overwrite=True)
-        group = zarr.open_group(store, path=str(self.CELL_ORDER), mode="r+", zarr_format=3)
-        n = 4 ** (self.CELL_ORDER - self.SHARD_ORDER)
-        assert len(per_cell) == n
-        group["morton"][:] = np.asarray(
-            generate_morton_children(word, self.CELL_ORDER), dtype=np.uint64
+        _write_strata_leaf(
+            root, "-311", per_cell, shard_order=self.SHARD_ORDER, cell_order=self.CELL_ORDER
         )
-        group["count"][:] = np.array(
-            [c["n_signal"] + c["n_noise"] for c in per_cell], dtype=np.int32
-        )
-        for field, key in (("h_sig", "sig"), ("h_noise", "noise")):
-            slab = np.full(n, b"", dtype=object)
-            for i, c in enumerate(per_cell):
-                slab[i] = c[key]
-            group[field][:] = slab
-        group["composition"][:] = np.array([c["word"] for c in per_cell], dtype=np.uint64)
-        stamp_commit(store, cells_with_data=n, granule_count=1)
         fields = {
             "count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0},
             **{k: dict(v) for k, v in _STRATA_FIELDS.items()},
