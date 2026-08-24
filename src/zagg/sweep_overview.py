@@ -1681,6 +1681,19 @@ def _fold_node(
                         # in but its word is not. (Divisor absent is the packed
                         # arm below: harmless, and never poisoned.)
                         if meta["class"] == "packed" and (meta.get("of") or "") in group:
+                            # WARNING, not debug: the poisoned cells are
+                            # byte-indistinguishable from genuine emptiness
+                            # (the fill word 0 makes no §3.2 claim either way),
+                            # and ``_fold_node`` returns no ``source_children``
+                            # analog to record it — so this line is the only
+                            # trace the under-coverage leaves. Naming the node,
+                            # field, leaf and span makes it reconstructable
+                            # (review finding).
+                            logger.warning(
+                                f"sweep[overview]: node {node} field {name!r}: leaf {leaf} "
+                                f"carries {meta.get('of')!r} but not the word; output cells "
+                                f"[{start}, {start + span}) keep the fill word (spec §3.3)"
+                            )
                             leaf_poison.add(name)
                         continue
                     if meta["class"] == "exact":
