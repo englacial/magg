@@ -26,8 +26,8 @@ from zagg.coverage_toc import (
     COVER_NAME,
     COVER_SPEC,
     ROOT_TOC_DELTA,
+    TEMPORAL_COVER_ORDER,
     TEMPORAL_COVERAGE_SPEC,
-    TEMPORAL_DAY_ORDER,
     build_cover_section,
     build_temporal_section,
     cover_unchanged,
@@ -418,7 +418,7 @@ class TestCoverPruning:
         from zagg.coverage_toc import _encode_cover_block
 
         envelope, cover = self._two_campaign_shard()
-        block = _encode_cover_block(np.asarray([], np.uint64), TEMPORAL_DAY_ORDER)
+        block = _encode_cover_block(np.asarray([], np.uint64), TEMPORAL_COVER_ORDER)
         empty = {**cover, "shards": {"11213": block}}
         assert empty["shards"]["11213"]["count"] == 0
         gap0, gap1 = BASE_NS + 400 * DAY_NS, BASE_NS + 401 * DAY_NS
@@ -449,9 +449,9 @@ class TestCoverPruning:
             block["count"] = 99
         elif damage == "above_pin":
             block = _encode_cover_block(
-                cover_words(cover)["11213"], TEMPORAL_DAY_ORDER, TEMPORAL_DAY_ORDER
+                cover_words(cover)["11213"], TEMPORAL_COVER_ORDER, TEMPORAL_COVER_ORDER
             )
-            block["temporal_order"] = TEMPORAL_DAY_ORDER + 1
+            block["temporal_order"] = TEMPORAL_COVER_ORDER + 1
         elif damage == "not_a_block":
             block = "words"
         broken = {**cover, "shards": {"11213": block}}
@@ -515,7 +515,7 @@ class TestCoverPruning:
         cover = build_cover_section(contributions, ["h"], 4)
         cover["shards"] = dict(cover["shards"])
         # 11213/11214 keep their real word sets; the rest are the seams.
-        empty = _encode_cover_block(np.asarray([], np.uint64), TEMPORAL_DAY_ORDER)
+        empty = _encode_cover_block(np.asarray([], np.uint64), TEMPORAL_COVER_ORDER)
         cover["shards"]["11215"] = empty
         cover["shards"]["11216"] = {**cover["shards"]["11216"], "count": 99}
         envelope["temporal"]["shards"]["11217"] = str(_leaf(5)[0])
@@ -1029,8 +1029,8 @@ class TestOnCommittedStores:
         assert not (Path(root) / COVER_NAME).exists()
 
 
-#: One §10.5 day-order bucket, in internal ns (order 16 -> span 2^47).
-BUCKET_NS = 1 << (63 - TEMPORAL_DAY_ORDER)
+#: One §10.5 cover-order bucket, in internal ns (order 18 -> span 2^45).
+BUCKET_NS = 1 << (63 - TEMPORAL_COVER_ORDER)
 
 
 class TestQuantization:
@@ -1081,7 +1081,7 @@ class TestQuantization:
         # well past the two-span floor the law above pins exactly.
         days, ts = self._instants()
         cover = quantize_words(time2toc(ts))
-        far = [int(d) for d in range(2_700) if np.abs(days - d).min() >= 3][:60]
+        far = [int(d) for d in range(2_700) if np.abs(days - d).min() >= 2][:60]
         assert far
         for d in far:
             q0, q1 = BASE_NS + d * DAY_NS, BASE_NS + (d + 1) * DAY_NS
@@ -1100,7 +1100,7 @@ class TestQuantization:
     )
     def test_a_gap_survives_iff_it_holds_a_whole_aligned_bucket(self, frac, spans, survives):
         # §10.5's only resolution promise, pinned as bytes in both directions:
-        # the guaranteed floor is TWO bucket spans (2 * 2^47 ns ~ 78 h), not one.
+        # the guaranteed floor is TWO bucket spans (2 * 2^45 ns ~ 19.5 h), not one.
         t0 = (BASE_NS // BUCKET_NS) * BUCKET_NS + int(frac * BUCKET_NS)
         t1 = t0 + int(spans * BUCKET_NS)
         cover = quantize_words(time2toc(np.array([t0, t1], dtype=np.uint64)))
@@ -1155,7 +1155,7 @@ class TestCoverSection:
         section = build_cover_section(contributions, ["h_tdigest"], 4)
         assert section["spec"] == COVER_SPEC
         assert section["order"] == 4
-        assert section["temporal_order"] == TEMPORAL_DAY_ORDER
+        assert section["temporal_order"] == TEMPORAL_COVER_ORDER
         assert section["cap"] == COVER_CAP
         assert section["element"] == {"dtype": "uint64", "shape": [-1]}
         decoded = cover_words(section)
@@ -1185,7 +1185,7 @@ class TestCoverSection:
         with caplog.at_level("WARNING"):
             section = build_cover_section(contributions, ["h"], 4)
         block = section["shards"]["11213"]
-        assert block["temporal_order"] == TEMPORAL_DAY_ORDER - 1
+        assert block["temporal_order"] == TEMPORAL_COVER_ORDER - 1
         assert block["count"] <= COVER_CAP
         assert "coarsened" in caplog.text
         effective = block["temporal_order"]
@@ -1206,7 +1206,7 @@ class TestCoverSection:
         section = build_temporal_section(contributions, ["h"], source="sweep")
         cover = build_cover_section(contributions, ["h"], 4)
         for decimal, block in cover["shards"].items():
-            order = block.get("temporal_order", TEMPORAL_DAY_ORDER)
+            order = block.get("temporal_order", TEMPORAL_COVER_ORDER)
             words = cover_words(cover)[decimal]
             tier1 = int(section["shards"][decimal])
             assert int(toc_reduce(words)) == int(toc_reduce(quantize_words([tier1], order)))
@@ -1271,7 +1271,7 @@ class TestCoverComposition:
     def test_a_block_decodes_at_the_objects_pin_not_the_modules(self):
         # §10.5 defines an absent block `temporal_order` against the OBJECT's
         # declaration. A conforming order-14 object leaves its at-the-pin
-        # blocks unmarked, and a reader must not read them as order 16.
+        # blocks unmarked, and a reader must not read them as order 18.
         from zagg.coverage_toc import _encode_cover_block
 
         section = build_cover_section({"11213": [_leaf(1)]}, ["h"], 4)
@@ -1292,7 +1292,7 @@ class TestCoverComposition:
         merged = merge_cover_sections(coarse, fine)
         # The composed object pins at the finer of the two, so every block's
         # own order is still <= it; this shard coarsened to 14 and says so.
-        assert merged["temporal_order"] == TEMPORAL_DAY_ORDER
+        assert merged["temporal_order"] == TEMPORAL_COVER_ORDER
         assert merged["shards"]["11213"]["temporal_order"] == 14
         expect = quantize_words(np.concatenate([words14, cover_words(fine)["11213"]]), 14)
         assert np.array_equal(cover_words(merged)["11213"], expect)
@@ -1307,7 +1307,7 @@ class TestCoverComposition:
         section = build_cover_section({"11213": [_leaf(1)]}, ["h"], 4)
         section["temporal_order"] = 14
         section["shards"]["11213"] = _encode_cover_block(
-            cover_words(section)["11213"], 20, TEMPORAL_DAY_ORDER
+            cover_words(section)["11213"], 20, TEMPORAL_COVER_ORDER
         )
         with pytest.raises(ValueError, match="above the object's pinned"):
             cover_words(section)
@@ -1551,9 +1551,11 @@ class TestCaliforniaShape:
         for d in day_set:
             assert shards_overlapping(envelope, *self._day_window(d), cover=cover) == ["11213"]
         # INTERIOR gaps only: tier 1's one envelope word spans first..last
-        # pass, so it prunes nothing between them — the cover must.
+        # pass, so it prunes nothing between them — the cover must. At the
+        # order-18 pin a bucket reaches < 0.41 day past an instant, so day
+        # distance >= 2 from every pass is guaranteed gap.
         far = [
-            d for d in range(min(day_set), max(day_set)) if min(abs(p - d) for p in day_set) >= 3
+            d for d in range(min(day_set), max(day_set)) if min(abs(p - d) for p in day_set) >= 2
         ]
         assert len(far) > 2_000  # the store is overwhelmingly gap
         for d in far[:: max(1, len(far) // 200)]:
@@ -1577,9 +1579,9 @@ class TestCaliforniaShape:
         # ...it never misses an observed day...
         assert day_set <= set(selected)
         # ...and it over-claims by at most the bucket geometry: every
-        # selected day is within 2 days of a real pass (span 2^47 ns ≈ 1.63
-        # days, so a bucket touching an instant reaches at most 2 days out).
-        assert all(min(abs(p - d) for p in day_set) <= 2 for d in selected)
+        # selected day is within 1 day of a real pass (span 2^45 ns ≈ 0.41
+        # days, so a bucket touching an instant reaches at most 1 day out).
+        assert all(min(abs(p - d) for p in day_set) <= 1 for d in selected)
 
     def test_parity_holds_at_ca_shape(self):
         _days, words, envelope, cover = self._shard()

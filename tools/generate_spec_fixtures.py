@@ -925,7 +925,7 @@ TEMPORAL_STEP_S = 3
 #: falsifiable for an external reader.
 TEMPORAL_GAP_CELL = 3
 #: How far, in whole days. §10.5's guaranteed floor for a surviving gap is
-#: TWO bucket spans (2 × 2^47 ns ≈ 78 h at the pinned day order); five days
+#: TWO bucket spans (2 × 2^45 ns ≈ 19.5 h at the pinned cover order); five days
 #: clears three, so a whole ALIGNED bucket stays uncovered wherever the base
 #: instant falls on the grid. Whole days keep the fixture's clock on the same
 #: fractional second, which is what lets the kernel-parity test drive these
@@ -936,10 +936,10 @@ TEMPORAL_GAP_DAYS = 5
 
 def _temporal_gap_offset_ns() -> int:
     """The gap cell's clock offset, checked against §10.5's two-span floor."""
-    from zagg.coverage_toc import TEMPORAL_DAY_ORDER
+    from zagg.coverage_toc import TEMPORAL_COVER_ORDER
 
     offset = TEMPORAL_GAP_DAYS * 86_400 * 10**9
-    assert offset >= 2 * (1 << (63 - TEMPORAL_DAY_ORDER)), "gap below §10.5's survival floor"
+    assert offset >= 2 * (1 << (63 - TEMPORAL_COVER_ORDER)), "gap below §10.5's survival floor"
     return offset
 
 
@@ -954,7 +954,7 @@ def _temporal_gap(words: np.ndarray) -> tuple[int, int]:
     """
     from mortie import toc2time
 
-    from zagg.coverage_toc import TEMPORAL_DAY_ORDER
+    from zagg.coverage_toc import TEMPORAL_COVER_ORDER
 
     lo, hi = (np.atleast_1d(np.asarray(x, dtype=np.uint64)) for x in toc2time(words))
     # A timestamp decodes to (t, t); a range's decoded end is exclusive.
@@ -964,7 +964,7 @@ def _temporal_gap(words: np.ndarray) -> tuple[int, int]:
         if start > reach and start - reach > hole[1] - hole[0]:
             hole = (reach, start)
         reach = max(reach, end)
-    span = 1 << (63 - TEMPORAL_DAY_ORDER)
+    span = 1 << (63 - TEMPORAL_COVER_ORDER)
     gap = (-(-hole[0] // span) * span, (hole[1] // span) * span)
     assert gap[1] > gap[0], f"no whole aligned bucket inside {hole} — raise TEMPORAL_GAP_SPANS"
     return gap
@@ -1239,7 +1239,7 @@ def build_temporal(out: Path) -> None:
         COVER_CAP,
         COVER_KEY,
         COVER_SPEC,
-        TEMPORAL_DAY_ORDER,
+        TEMPORAL_COVER_ORDER,
         cover_words,
         coverage_toc,
         coverage_toc_digest,
@@ -1279,7 +1279,7 @@ def build_temporal(out: Path) -> None:
     expect_cover = quantize_words(every_word)
     cover_obj = read_cover(root)
     assert cover_obj["spec"] == COVER_SPEC == envelope["temporal"][COVER_KEY]
-    assert cover_obj["order"] == 4 and cover_obj["temporal_order"] == TEMPORAL_DAY_ORDER
+    assert cover_obj["order"] == 4 and cover_obj["temporal_order"] == TEMPORAL_COVER_ORDER
     decoded_cover = cover_words(cover_obj)
     assert set(decoded_cover) == {SHARD_KEY}
     assert np.array_equal(decoded_cover[SHARD_KEY], expect_cover), decoded_cover
@@ -1329,7 +1329,7 @@ def build_temporal(out: Path) -> None:
         "cover": {
             "object": "coverage.toc",
             "spec": COVER_SPEC,
-            "temporal_order": TEMPORAL_DAY_ORDER,
+            "temporal_order": TEMPORAL_COVER_ORDER,
             "cap": COVER_CAP,
             "fields": ["h_tdigest"],
             "element": {"dtype": "uint64", "shape": [-1]},

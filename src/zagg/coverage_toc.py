@@ -82,12 +82,16 @@ COVER_NAME = "coverage.toc"
 #: the sidecar staleness posture, never a promise.
 COVER_KEY = "cover"
 
-#: The §10.5 day order: temporal order ``o`` partitions the toc scale into
-#: ``2**o`` aligned buckets of ``2**(63 - o)`` ns. Order 16 (span 2^47 ns
-#: ≈ 39.1 h) is the FINEST order whose bucket span is at least one day —
-#: the spec-pinned quantization for the cover, chosen so bucket bounds are
-#: exactly representable on the grammar's own encoding grids (§10.5).
-TEMPORAL_DAY_ORDER = 16
+#: The §10.5 cover order: temporal order ``o`` partitions the toc scale into
+#: ``2**o`` aligned buckets of ``2**(63 - o)`` ns. The pin is order 18 (span
+#: 2^45 ns ≈ 9.77 h; espg ruling on issue #489, 2026-08-24): correctness is
+#: order-independent (quantization only widens) and storage is flat at ~one
+#: word per pass, so the pin is chosen for the CONSUMER — it resolves
+#: consecutive-day revisits and holds the cover-midpoint epoch error to
+#: ±half a span ≈ ±4.9 h against the closest-observation Sentinel-2
+#: consumer's ~4.3-day cadence. Bucket bounds stay exactly representable on
+#: the grammar's own encoding grids for every order ≤ 31 (§10.5).
+TEMPORAL_COVER_ORDER = 18
 
 #: The §10.5 overflow cap: a shard's cover holds at most this many words.
 #: A cover that lands above it coarsens by order (each step halves the
@@ -167,7 +171,7 @@ def read_leaf_temporal(leaf_root: str, cell_order: int, fields: dict, **store_kw
     weighted by the payload's own centroid weights, so its total weight is
     the leaf's temporal observation count. ``cover`` is the leaf's §10.5
     word-set cover — :func:`quantize_words` over every sibling word the leaf
-    holds, at the pinned day order — reduced here (a few dozen words per
+    holds, at the pinned cover order — reduced here (a few dozen words per
     leaf) so the accumulator never holds the raw word multiset: a CA-scale
     shard carries millions of words, and the cover of a union is the
     normalize of the union of covers, exactly. ``None`` when the leaf holds
@@ -478,11 +482,11 @@ def _preserved(section) -> dict | None:
 # The word-set cover sibling — `zagg-coverage-toc-cover/1` (§10.5, issue
 # #489). A root object BESIDE the bootstrap sidecar, GET-on-demand by
 # temporal consumers only: per shard, the canonical gap-preserving cover of
-# its companion words, quantized to the pinned day order.
+# its companion words, quantized to the pinned cover order.
 # ---------------------------------------------------------------------------
 
 
-def quantize_words(words, order: int = TEMPORAL_DAY_ORDER) -> np.ndarray:
+def quantize_words(words, order: int = TEMPORAL_COVER_ORDER) -> np.ndarray:
     """The §10.5 quantization: toc words, widened to aligned order-``o`` buckets.
 
     Temporal order ``o`` partitions the toc scale (2^63 ns from the grammar's
@@ -501,7 +505,7 @@ def quantize_words(words, order: int = TEMPORAL_DAY_ORDER) -> np.ndarray:
     buckets, and ``toc_normalize`` coalesces ranges that merely abut, so a
     gap of one bucket span never survives (its two buckets abut) and only a
     gap that leaves an entire bucket uncovered does. The guaranteed floor is
-    therefore TWO bucket spans — at the pinned day order, 2 × 2^47 ns ≈ 78 h
+    therefore TWO bucket spans — at the pinned cover order, 2 × 2^45 ns ≈ 19.5 h
     — with the ``[1, 2)``-span band decided by where the data falls on the
     grid, not by the gap's length. The one clamp is the scale ceiling:
     the top bucket's end exceeds the grammar's maximum encodable end
@@ -556,12 +560,12 @@ def build_cover_section(contributions: dict, fields, shard_order: int, *, source
 
     Same ``contributions`` mapping :func:`build_temporal_section` folds —
     this consumes the tuples' ``cover`` element: per shard, the union of its
-    window leaves' covers, requantized at the pinned day order (canonical,
+    window leaves' covers, requantized at the pinned cover order (canonical,
     and exact: quantization commutes with union) and coarsened to the cap.
     ``None`` for an empty map — the standing absence rule, so a store with
     no temporal channel gets no sibling object at all.
 
-    A shard that had to coarsen below :data:`TEMPORAL_DAY_ORDER` records the
+    A shard that had to coarsen below :data:`TEMPORAL_COVER_ORDER` records the
     order it landed at in its own block (``temporal_order``), and the
     coarsening is logged — §10.5's "widening only, loudly recorded".
     """
@@ -572,9 +576,9 @@ def build_cover_section(contributions: dict, fields, shard_order: int, *, source
     shards: dict[str, dict] = {}
     for decimal in sorted(contributions):
         cover = np.concatenate([np.asarray(p[3], dtype=np.uint64) for p in contributions[decimal]])
-        cover = quantize_words(cover, TEMPORAL_DAY_ORDER)
-        cover, order = _cap_cover(cover, TEMPORAL_DAY_ORDER)
-        if order != TEMPORAL_DAY_ORDER:
+        cover = quantize_words(cover, TEMPORAL_COVER_ORDER)
+        cover, order = _cap_cover(cover, TEMPORAL_COVER_ORDER)
+        if order != TEMPORAL_COVER_ORDER:
             logger.warning(
                 f"coverage[toc]: shard {decimal} cover coarsened to temporal order {order} "
                 f"(span 2^{63 - order} ns) to fit the {COVER_CAP}-word cap (spec §10.5)"
@@ -585,7 +589,7 @@ def build_cover_section(contributions: dict, fields, shard_order: int, *, source
         "source": source,
         "generated_at": _utcnow(),
         "order": int(shard_order),
-        "temporal_order": TEMPORAL_DAY_ORDER,
+        "temporal_order": TEMPORAL_COVER_ORDER,
         "cap": COVER_CAP,
         "fields": sorted(fields),
         "element": {"dtype": "uint64", "shape": [-1]},
@@ -594,7 +598,7 @@ def build_cover_section(contributions: dict, fields, shard_order: int, *, source
     }
 
 
-def _encode_cover_block(cover: np.ndarray, order: int, pinned: int = TEMPORAL_DAY_ORDER) -> dict:
+def _encode_cover_block(cover: np.ndarray, order: int, pinned: int = TEMPORAL_COVER_ORDER) -> dict:
     """One shard's block: base64 of the §1.4 element bytes, plus its k.
 
     ``count`` is the §10.5 MUST-check (the §10.3 ``centroids`` rule, one
@@ -623,7 +627,7 @@ def _object_pin(section) -> int:
     ("absence means the pinned order"), not to whatever this build happens to
     pin, so every decode resolves through here.
     """
-    pinned = (section or {}).get("temporal_order", TEMPORAL_DAY_ORDER)
+    pinned = (section or {}).get("temporal_order", TEMPORAL_COVER_ORDER)
     try:
         return int(pinned)
     except (TypeError, ValueError) as e:
@@ -632,7 +636,7 @@ def _object_pin(section) -> int:
         ) from e
 
 
-def _decode_cover_block(decimal: str, block, pinned: int = TEMPORAL_DAY_ORDER):
+def _decode_cover_block(decimal: str, block, pinned: int = TEMPORAL_COVER_ORDER):
     """One shard's ``(words, temporal_order)``, MUST-checked against ``count``.
 
     ``pinned`` is the enclosing object's declared order: it supplies the
@@ -1136,8 +1140,8 @@ __all__ = [
     "COVER_SPEC",
     "PER_CENTROID",
     "ROOT_TOC_DELTA",
+    "TEMPORAL_COVER_ORDER",
     "TEMPORAL_COVERAGE_SPEC",
-    "TEMPORAL_DAY_ORDER",
     "TEMPORAL_KEY",
     "build_cover_section",
     "build_temporal_section",
