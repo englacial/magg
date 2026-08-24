@@ -302,4 +302,79 @@ def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> Reference
     )
 
 
-__all__ = ["ReferenceEpochs", "reference_epochs"]
+def nearest_acquisitions(epochs, times, *, max_time_offset=None):
+    """Nearest acquisition per epoch — the vectorized closest-1 core.
+
+    The phase-2 selection of the closest-observation join (issue #509): for
+    each reference epoch, the single nearest acquisition — closest-1, never a
+    two-sided bracket (espg ruling); several epochs bracketing one
+    acquisition each select it, and the builder dedupes granules downstream.
+
+    Parameters
+    ----------
+    epochs : array-like of datetime64[ns]
+        One shard's reference epochs (:func:`reference_epochs`). Any order.
+    times : array-like of datetime64[ns]
+        The shard's acquisition times, in catalog record order. Any order —
+        the returned selection indexes THIS array's positions.
+    max_time_offset : np.timedelta64 or int, optional
+        An epoch whose nearest acquisition lies further than this selects
+        nothing. Exactly-at selects; one ns past does not. A bare int means
+        nanoseconds. ``None`` (default) always selects the nearest, however
+        far. Negative refuses. Callers gating against the epochs' own
+        precision should widen by :meth:`ReferenceEpochs.tolerance` — a
+        cover epoch is a bucket midpoint, good to half a bucket, not exact.
+
+    Returns
+    -------
+    selection : np.ndarray of int64
+        Per epoch, the index into ``times`` of the selected acquisition, or
+        ``-1`` where the epoch selects nothing (no acquisitions at all, or
+        nearest beyond ``max_time_offset``).
+    offsets : np.ndarray of timedelta64[ns]
+        Per epoch, the SIGNED offset ``times[nearest] - epoch`` of the
+        nearest acquisition — positive when the acquisition follows the
+        epoch. Reported for every epoch, dropped ones included (the loud
+        record a drop rides — the builder's report needs the near-miss
+        distance, not just the fact of the drop); ``NaT`` only when
+        ``times`` is empty.
+
+    Notes
+    -----
+    A tie — an epoch exactly equidistant between two acquisitions — selects
+    the EARLIER acquisition, deterministically. Equal acquisition times are
+    broken by catalog record order (stable sort).
+    """
+    epochs = np.asarray(epochs, dtype="datetime64[ns]")
+    times = np.asarray(times, dtype="datetime64[ns]")
+    cap = None
+    if max_time_offset is not None:
+        cap = int(np.timedelta64(max_time_offset).astype("timedelta64[ns]").astype("int64"))
+        if cap < 0:
+            raise ValueError(f"max_time_offset must be non-negative (got {max_time_offset!r})")
+    selection = np.full(epochs.shape, -1, dtype=np.int64)
+    offsets = np.full(epochs.shape, np.timedelta64("NaT"), dtype="timedelta64[ns]")
+    if epochs.size == 0 or times.size == 0:
+        return selection, offsets
+    order = np.argsort(times, kind="stable")
+    ts = times[order].astype("int64")
+    e = epochs.astype("int64")
+    pos = np.searchsorted(ts, e)  # left insertion point
+    far = np.iinfo(np.int64).max
+    # Distances to the flanking acquisitions; ``far`` marks a missing flank
+    # (epoch before the first / after the last acquisition).
+    left = np.where(pos > 0, e - ts[np.maximum(pos - 1, 0)], far)
+    right = np.where(pos < ts.size, ts[np.minimum(pos, ts.size - 1)] - e, far)
+    # Strict ``<`` keeps a tie on the LEFT (earlier) neighbor; an epoch equal
+    # to an acquisition has ``right == 0`` and selects it exactly.
+    take_right = right < left
+    nearest = np.where(take_right, np.minimum(pos, ts.size - 1), np.maximum(pos - 1, 0))
+    selection = order[nearest].astype(np.int64)
+    signed = np.where(take_right, right, -left)
+    offsets = signed.astype("timedelta64[ns]")
+    if cap is not None:
+        selection = np.where(np.abs(signed) <= cap, selection, np.int64(-1))
+    return selection, offsets
+
+
+__all__ = ["ReferenceEpochs", "nearest_acquisitions", "reference_epochs"]
