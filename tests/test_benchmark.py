@@ -1058,13 +1058,11 @@ def test_targets_manifest_consistent():
 def test_every_live_shardmap_resolves_to_a_config():
     # The drift test parametrizes over manifest["shardmaps"], and the consistency
     # test over manifest["targets"]; both rely on every LIVE shardmap resolving to
-    # a referencing config (the drift test's _config_for_shardmap lookup). This
+    # a referencing config (the shared _config_for_shardmap lookup). This
     # guards that wiring -- the invariant that made o9 drop-in coverage automatic
     # the moment its entry landed, and that keeps any future order covered too.
-    import test_benchmark_shardmap as drift
-
-    for sm_key in drift.MANIFEST["shardmaps"]:
-        cfg = drift._config_for_shardmap(sm_key)  # raises if no target references it
+    for sm_key in bench_metrics.MANIFEST["shardmaps"]:
+        cfg = bench_metrics._config_for_shardmap(sm_key)  # raises if no target references it
         assert cfg.exists()
 
 
@@ -1254,17 +1252,13 @@ def test_scalar_config_is_genuinely_scalar():
 def test_override_resolution_falls_back_to_defaults():
     # A shard map with no override inherits the top-level aoi/temporal/cmr
     # *by identity* -- existing NEON entries resolve byte-identically to today.
-    import test_benchmark_shardmap as drift
-
-    aoi, temporal, cmr = drift.resolve_aoi_temporal_cmr({"path": "x", "shard_key": 0})
-    assert aoi is drift.MANIFEST["aoi"]
-    assert temporal is drift.MANIFEST["temporal"]
-    assert cmr is drift.MANIFEST["cmr"]
+    aoi, temporal, cmr = bench_metrics.resolve_aoi_temporal_cmr({"path": "x", "shard_key": 0})
+    assert aoi is bench_metrics.MANIFEST["aoi"]
+    assert temporal is bench_metrics.MANIFEST["temporal"]
+    assert cmr is bench_metrics.MANIFEST["cmr"]
 
 
 def test_override_resolution_uses_overrides():
-    import test_benchmark_shardmap as drift
-
     sm_meta = {
         "path": "x",
         "shard_key": 0,
@@ -1272,7 +1266,7 @@ def test_override_resolution_uses_overrides():
         "temporal": {"start": "2019-01-01", "end": "2020-01-01"},
         "cmr": {"short_name": "ATL03", "version": "007", "provider": "P", "footprint": "swath"},
     }
-    aoi, temporal, cmr = drift.resolve_aoi_temporal_cmr(sm_meta)
+    aoi, temporal, cmr = bench_metrics.resolve_aoi_temporal_cmr(sm_meta)
     assert aoi == sm_meta["aoi"]
     assert temporal == sm_meta["temporal"]
     assert cmr == sm_meta["cmr"]
@@ -1280,13 +1274,11 @@ def test_override_resolution_uses_overrides():
 
 def test_override_resolution_partial_override():
     # aoi overridden, temporal/cmr omitted -> override wins, rest falls back.
-    import test_benchmark_shardmap as drift
-
     sm_meta = {"path": "x", "shard_key": 0, "aoi": {"file": "f.geojson", "name": "n"}}
-    aoi, temporal, cmr = drift.resolve_aoi_temporal_cmr(sm_meta)
+    aoi, temporal, cmr = bench_metrics.resolve_aoi_temporal_cmr(sm_meta)
     assert aoi == sm_meta["aoi"]
-    assert temporal is drift.MANIFEST["temporal"]
-    assert cmr is drift.MANIFEST["cmr"]
+    assert temporal is bench_metrics.MANIFEST["temporal"]
+    assert cmr is bench_metrics.MANIFEST["cmr"]
 
 
 def test_antarctic_88s_aoi_fixture_loads_near_turning_latitude():
@@ -2150,8 +2142,6 @@ def test_88s_nested_pin_invariant():
     # o9 extraction pass covers both orders, issue #148). This runs offline in
     # milliseconds — the gated weekly drift job must not be the only guard on
     # the nesting or on the nested_in reference itself.
-    import test_benchmark_shardmap as drift
-
     from zagg.config import load_config
     from zagg.grids import from_config
 
@@ -2162,9 +2152,9 @@ def test_88s_nested_pin_invariant():
         parent_meta = manifest["shardmaps"].get(sm_meta["nested_in"])
         assert parent_meta is not None, f"{sm_key}: nested_in references a missing entry"
         parent_grid = from_config(
-            load_config(str(drift._config_for_shardmap(sm_meta["nested_in"])))
+            load_config(str(bench_metrics._config_for_shardmap(sm_meta["nested_in"])))
         )
-        containing = drift._containing_shard(parent_grid, int(sm_meta["shard_key"]))
+        containing = bench_metrics._containing_shard(parent_grid, int(sm_meta["shard_key"]))
         assert containing == int(parent_meta["shard_key"]), (
             f"{sm_key}: pinned shard {sm_meta['shard_key']} is not inside its "
             f"nested_in parent {parent_meta['shard_key']} (got {containing})"

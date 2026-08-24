@@ -151,6 +151,49 @@ class TestColumnResolutions:
         assert leaf_column_plan(cfg, grid) is None
 
 
+class TestWaveformEntersTheColumn:
+    """Issue #508 review pin: the D24 class flip is not confined to the sweep.
+
+    ``leaf_column_plan`` filters the declaration through the same
+    ``composable_fields``, so an ``approximate`` rx_flux now enters the
+    WORKER-side fold (:func:`zagg.column.fold_column` at the tail of
+    ``hive.process_and_write_hive``) the moment the shipped GEDI template
+    declares a pyramid — a consequence recorded here rather than discovered on
+    a fleet run. The memory envelope of that fold at GEDI scale is unvalidated
+    (see ``write_leaf_column``'s memory note), which is why the runbook builds
+    CA pyramids-off and retrofits the ladder sweep-only (``declare_pyramid``).
+    """
+
+    def _cfg(self):
+        from zagg.config import default_config
+
+        return default_config("gedi01b_waveform_healpix_hive")
+
+    def test_shipped_template_declares_no_column(self):
+        from zagg.column import leaf_column_plan
+        from zagg.grids import from_config
+
+        # ``pyramid: false`` as shipped: no declaration, so no column at all.
+        cfg = self._cfg()
+        assert leaf_column_plan(cfg, from_config(cfg)) is None
+
+    def test_pyramid_knob_folds_rx_flux_worker_side(self):
+        from zagg.column import leaf_column_plan
+        from zagg.grids import from_config
+
+        cfg = self._cfg()
+        cfg.output["pyramid"] = {}  # the /2 default flip at chunk_inner 12
+        plan = leaf_column_plan(cfg, from_config(cfg))
+        assert plan is not None
+        resolutions, fields = plan
+        assert resolutions == [12, 11, 10, 9]
+        # Pre-#508 this was ``{"count"}`` — the digest-family membership is
+        # what adds the second entry, and rx_flux is the ragged one.
+        assert set(fields) == {"count", "rx_flux"}
+        assert fields["rx_flux"]["class"] == "approximate"
+        assert fields["rx_flux"]["temporal"] == "per-centroid"
+
+
 class TestLeafSlabs:
     def test_staged_refs_pass_through(self):
         slabs = _cell_slabs({0: [1.0, 2.0]})

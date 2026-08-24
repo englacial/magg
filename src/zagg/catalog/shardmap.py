@@ -162,6 +162,186 @@ def _granule_entry(rec: dict) -> dict:
     return entry
 
 
+def _recorded_identity(entry: dict, canonicalize=None) -> tuple[tuple[tuple[str, str], ...], tuple]:
+    """``(canonicals, distinguishing)`` for one shard entry.
+
+    ``canonicals`` are the granule ids a run can record for the entry, each
+    tagged with the spelling that yields it — the basename of **each** href
+    (:func:`zagg.telemetry.canonical_granule_id` over ``s3`` and ``https``,
+    because ``runner._resolve_urls`` picks one by driver and the invariant must
+    hold under either choice) — falling back to the id, then the datetime, for
+    the raster entries that carry no href. The tag matters because a run reads
+    ONE spelling: ids are comparable within a spelling, never across.
+    Empty when there is nothing to canonicalize.
+
+    ``distinguishing`` is what separates one granule from another. ``datetime``
+    counts because :func:`zagg.telemetry.raster_granule_ids` records two
+    acquisitions sharing an item id as one id; the sibling ``assets`` do not,
+    because a record's identity is the primary alone (issue #425).
+
+    ``canonicalize`` lets a hot loop hoist the import out of the per-entry path.
+    """
+    if canonicalize is None:
+        from zagg.telemetry import canonical_granule_id as canonicalize
+
+    named = [("s3", entry.get("s3")), ("https", entry.get("https"))]
+    if not any(n for _, n in named):
+        named = [("id", entry.get("id") or entry.get("datetime"))]
+    canonicals: list = []
+    for slot, n in named:
+        c = canonicalize(n) if n else ""
+        # Empty as well as absent: an href of ``s3://b/`` canonicalizes to
+        # ``""``, which is no identity at all, not an identity of ``''``.
+        if c:
+            canonicals.append((slot, c))
+    return tuple(canonicals), (
+        entry.get("id"),
+        entry.get("s3"),
+        entry.get("https"),
+        entry.get("datetime"),
+    )
+
+
+def _collision_label(entry: dict) -> str:
+    """Name one colliding entry by what tells it apart from its partner.
+
+    The href when there is one — the prefix is what differs and what the remedy
+    acts on. A raster pair has no href and both members carry the same id (that
+    IS the collapse), so the datetime is the only thing left that separates them.
+
+    The unidentified entries :func:`_basename_collision_message` warns about carry
+    none of the three, and ``str(None)`` names nothing — say so instead.
+    """
+    href = entry.get("s3") or entry.get("https")
+    if href:
+        return str(href)
+    if entry.get("id") and entry.get("datetime"):
+        return f"{entry['id']} @ {entry['datetime']}"
+    named = entry.get("id") or entry.get("datetime")
+    return str(named) if named else "<entry with no id, href, or datetime>"
+
+
+def _refuse_basename_collisions(shard_keys, granules) -> None:
+    """Refuse a map whose recorded granule identity is not per-shard unique (#468).
+
+    Two granules of one shard whose recorded ids collapse onto one make the
+    shard's catalog identity name fewer granules than it reads. PR #420 question
+    (6) ruled the leaf-gate consequence acceptable *because* every catalog zagg
+    reads names granules globally uniquely; this enforces that "because" where
+    the invariant is owned rather than assuming it.
+
+    Entries agreeing on every distinguishing field (:func:`_recorded_identity`)
+    are one granule listed twice and pass — coarsen unions sibling shards, where
+    a granule spanning several children legitimately arrives more than once.
+    """
+    message = _basename_collision_message(shard_keys, granules, stacklevel=4)
+    if message is not None:
+        raise ValueError(message)
+
+
+def _basename_collision_message(
+    shard_keys, granules, *, stacklevel: int = 3, source: str | None = None
+) -> str | None:
+    """The :func:`_refuse_basename_collisions` report, or ``None`` when clean.
+
+    Split from the refusal so ``from_json`` / ``from_parquet`` can WARN with it
+    instead: refusing at load would make a pre-#468 manifest unreadable (PR #482
+    question (2) ruling — historical maps stay readable, the hazard visible).
+
+    An entry with NO recorded identity — nothing canonicalizes to a granule id —
+    warns rather than being skipped silently (PR #482 question (6) ruling): it
+    contributes nothing to ``granules_sha256`` and the guard cannot see it, but
+    ``_resolve_urls`` drops href-less records by design, so it is not refused.
+
+    ``stacklevel`` counts from HERE, so each caller passes its own depth — the
+    warning must land on whoever asked for the map, not on the wrapper. ``source``
+    names the manifest on the load path, where the operator has no other pointer.
+    """
+    n_collisions = 0
+    n_unidentified = 0
+    first_unidentified = None
+    shown: list = []
+    # Imported once rather than per entry: this runs over every granule of every
+    # shard, 555,867 of them at clone scale.
+    from zagg.telemetry import canonical_granule_id
+
+    for key, entries in zip(shard_keys, granules):
+        by_canonical: dict = {}
+        for entry in entries:
+            canonicals, distinguishing = _recorded_identity(entry, canonical_granule_id)
+            if not canonicals:
+                n_unidentified += 1
+                if first_unidentified is None:
+                    first_unidentified = (key, _collision_label(entry))
+                continue
+            label = _collision_label(entry)
+            # Registered under EVERY spelling's canonical, but keyed WITH the
+            # spelling: a collision in the spelling the run's driver picks is a
+            # collision whichever it is, while two ids from different spellings
+            # never meet -- no run records both, so they cannot collapse.
+            for slot_canonical in canonicals:
+                by_canonical.setdefault(slot_canonical, {})[distinguishing] = label
+        # Filtered before sorting -- on every catalog zagg reads the filter
+        # discards all of them, so sorting first is a per-shard sort of nothing.
+        # Only the first few groups are retained: the message prints three, and a
+        # wholly mis-scoped catalog has one group per granule.
+        found: list = []
+        pairs: set = set()
+        for (_slot, canonical), named in sorted(by_canonical.items()):
+            # One pair of entries is ONE collision however many spellings show
+            # it: a pair colliding under both spellings registers in both slots
+            # and would otherwise be counted -- and printed -- twice.
+            if len(named) > 1 and frozenset(named) not in pairs:
+                pairs.add(frozenset(named))
+                found.append((canonical, sorted(named.values())))
+        n_collisions += len(found)
+        shown += [(key, c, named) for c, named in found[: max(0, 4 - len(shown))]]
+    if n_unidentified:
+        key, label = first_unidentified
+        warnings.warn(
+            f"{source + ': ' if source else ''}"
+            f"ShardMap: {n_unidentified} shard entry(s) carry no recorded identity — "
+            f"nothing on them canonicalizes to a granule id, so they contribute nothing "
+            f"to the shard's catalog identity (granules_sha256) and the collision guard "
+            f"cannot see them (issue #468). First: shard {key} {label!r}.",
+            RuntimeWarning,
+            stacklevel=stacklevel,
+        )
+    if not n_collisions:
+        return None
+    listed = "; ".join(f"shard {k} {c!r} <- {named}" for k, c, named in shown[:3])
+    return (
+        f"ShardMap: {n_collisions} per-shard granule identity collision(s) — granules "
+        f"assigned to one shard record as ONE granule id, so the shard's catalog identity "
+        f"names fewer granules than it reads (issue #468). Usually one basename under two "
+        f"key prefixes, in which case re-scope the catalog query so each granule appears "
+        f"once, or de-collide the basenames; the entries below are named by whatever "
+        f"separates them: {listed}{' ...' if n_collisions > 3 else ''}"
+    )
+
+
+def _warn_loaded_collisions(sm: "ShardMap", path: str) -> "ShardMap":
+    """Warn — never refuse — when a LOADED manifest carries an identity collision.
+
+    ``from_json`` / ``from_parquet`` read manifests built before the #468 guard
+    existed; refusing would make a historical map unreadable (PR #482 question
+    (2) ruling). The hazard the warning names: a leaf gate reading this map
+    records fewer granules than it reads, and ``refine`` silently drops one
+    collided member (issue #512).
+    """
+    message = _basename_collision_message(sm.shard_keys, sm.granules, stacklevel=4, source=path)
+    if message is not None:
+        warnings.warn(
+            f"{path}: this manifest predates the construction-time identity guard "
+            f"and would be refused by it; loading anyway (historical maps stay "
+            f"readable), but note refine silently drops a collided member "
+            f"(issue #512). {message}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return sm
+
+
 #: Granule-id core for the catalog-time sibling join (issue #425): the
 #: datetime / orbit / sub-orbit-granule / track fields shared between the
 #: products of one acquisition (GEDI01_B_* and GEDI02_A_* of the same
@@ -1503,6 +1683,10 @@ class ShardMap:
 
         shard_keys = sorted(shard_to_idx)
         granules = [[_granule_entry(records[i]) for i in shard_to_idx[k]] for k in shard_keys]
+        # The per-shard identity invariant is owned here (issue #468): refuse a
+        # build whose shards name two granules the same, rather than leaving it
+        # to be discovered as duplicate drift at the leaf gate.
+        _refuse_basename_collisions(shard_keys, granules)
         meta = {
             **(catalog.metadata or {}),
             "backend": chosen,
@@ -1660,10 +1844,17 @@ class ShardMap:
             new_keys = sorted(groups)
             new_granules = []
             for k in new_keys:
+                # Keyed on what distinguishes one granule from another, not on
+                # the id alone: coarsening merges sibling shards, so a basename
+                # collision that was cross-shard at the source order lands
+                # in-shard here, and an id-keyed dedup would drop one of the two
+                # rather than let the check below name it (issue #468). A
+                # granule spanning several children still counts once.
                 seen: dict = {}
                 for i in groups[k]:
                     for g in self.granules[i]:
-                        seen[g["id"]] = _granule_entry(g)
+                        entry = _granule_entry(g)
+                        seen[_recorded_identity(entry)[1]] = entry
                 new_granules.append(list(seen.values()))
             method = "coarsen"
         else:
@@ -1712,11 +1903,16 @@ class ShardMap:
                     bucket = new_granules_map.setdefault(int(k), {})
                     for i in idxs:
                         entry = _granule_entry(sub_records[i])
-                        bucket[entry["id"]] = entry
+                        bucket[_recorded_identity(entry)[1]] = entry
 
             new_keys = sorted(new_granules_map)
             new_granules = [list(new_granules_map[k].values()) for k in new_keys]
             method = "refine"
+
+        # Reproject mints NEW shard membership, so it can mint a collision the
+        # source map did not have -- coarsen by merging sibling shards, refine
+        # by re-intersecting -- and owns the same invariant ``build`` does (#468).
+        _refuse_basename_collisions(new_keys, new_granules)
 
         meta = dict(self.metadata or {})
         meta["reproject"] = {
@@ -1775,13 +1971,14 @@ class ShardMap:
         for key in ("grid_signature", "shard_keys", "granules"):
             if key not in d:
                 raise ValueError(f"{path}: missing required key {key!r}")
-        return cls(
+        sm = cls(
             d["grid_signature"],
             d["shard_keys"],
             d["granules"],
             d.get("metadata", {}),
             d.get("aoi_mask"),
         )
+        return _warn_loaded_collisions(sm, path)
 
     # Schema-metadata key for the manifest's non-columnar payload (parquet form).
     _PARQUET_META_KEY = b"zagg:shardmap_meta"
@@ -1840,7 +2037,8 @@ class ShardMap:
             if "aoi_mask" in table.column_names
             else None
         )
-        return cls(d["grid_signature"], shard_keys, granules, d.get("metadata", {}), aoi_mask)
+        sm = cls(d["grid_signature"], shard_keys, granules, d.get("metadata", {}), aoi_mask)
+        return _warn_loaded_collisions(sm, path)
 
 
 __all__ = ["ShardMap", "sibling_join_key"]

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import types
+import warnings
 
 import numpy as np
 import pyarrow as pa
@@ -2589,3 +2590,387 @@ class TestPairedAssetBuild:
         sm2 = ShardMap.from_json(path)
         assert sm2.granules == sm.granules
         assert sm2.metadata["pairless"] == sm.metadata["pairless"]
+
+
+def _item_under(gid, prefix, lon0, lon1, lat0=38.85, lat1=38.93):
+    """``_item`` with the hrefs moved under ``prefix`` -- the shape a per-shard
+    basename collision takes: one basename, two key prefixes (issue #468)."""
+    item = _item(gid, lon0, lon1, lat0, lat1)
+    item["assets"] = {
+        "data": {"href": f"https://h/{prefix}/{gid}.h5", "roles": ["data"]},
+        "data_s3": {"href": f"s3://b/{prefix}/{gid}.h5", "roles": ["data"]},
+    }
+    return item
+
+
+class TestBasenameCollisions:
+    """Per-shard granule identity is refused at construction (issue #468).
+
+    Post-#420 a granule is recorded by its driver-stripped basename, so two
+    granules of one shard differing only in href prefix collapse onto one
+    recorded id. PR #420 question (6) ruled that acceptable *because* the state
+    is impossible in every catalog zagg reads; these pin that the impossibility
+    is enforced where it is owned rather than assumed.
+    """
+
+    @pytest.fixture
+    def hp_grid(self):
+        return HealpixGrid(11, 17, layout="fullsphere")
+
+    @pytest.fixture
+    def fine_grid(self):
+        return HealpixGrid(12, 14, layout="fullsphere")
+
+    @pytest.fixture
+    def coarse_grid(self):
+        return HealpixGrid(11, 14, layout="fullsphere")
+
+    def test_build_refuses_one_basename_under_two_prefixes(self, hp_grid):
+        # Same footprint, so both land in every shard the granule touches.
+        cat = _catalog(
+            [
+                _item_under("Gdup", "p1", -76.62, -76.57),
+                _item_under("Gdup", "p2", -76.62, -76.57),
+            ]
+        )
+        with pytest.raises(ValueError, match="identity collision"):
+            ShardMap.build(cat, hp_grid, backend="mortie")
+
+    def test_refusal_names_the_shard_and_both_hrefs(self, hp_grid):
+        cat = _catalog(
+            [
+                _item_under("Gdup", "p1", -76.62, -76.57),
+                _item_under("Gdup", "p2", -76.62, -76.57),
+            ]
+        )
+        with pytest.raises(ValueError) as excinfo:
+            ShardMap.build(cat, hp_grid, backend="mortie")
+        message = str(excinfo.value)
+        assert "s3://b/p1/Gdup.h5" in message and "s3://b/p2/Gdup.h5" in message
+        assert "'Gdup.h5'" in message
+        # The shard the pair collided in, not just a count of them.
+        shards = ShardMap.build(
+            _catalog([_item("Gdup", -76.62, -76.57)]), hp_grid, backend="mortie"
+        )
+        assert f"shard {shards.shard_keys[0]} " in message
+
+    def test_build_refuses_ids_colliding_only_in_basename(self, hp_grid):
+        # The other spelling of the same collapse: the catalog ids themselves
+        # carry the prefix, so they differ while their basenames do not.
+        cat = _catalog(
+            [
+                _item_under("p1/Gdup", "p1", -76.62, -76.57),
+                _item_under("p2/Gdup", "p2", -76.62, -76.57),
+            ]
+        )
+        with pytest.raises(ValueError, match="identity collision"):
+            ShardMap.build(cat, hp_grid, backend="mortie")
+
+    def test_https_collision_under_distinct_s3_basenames_is_refused(self):
+        # The guard used to canonicalize ONE spelling (``s3 or https``) while
+        # ``runner._resolve_urls`` picks by driver, so an https-driver run whose
+        # https basenames collide while its s3 basenames do not was caught by
+        # neither the guard nor anything downstream (PR #482 question (1)
+        # ruling: canonicalize both spellings). The fixture pins the hole shape:
+        # the s3 canonicals MUST differ, so the old single-spelling guard --
+        # replayed over these entries -- sees nothing.
+        from zagg.telemetry import canonical_granule_id
+
+        a = {"id": "GA.h5", "s3": "s3://b/p1/GA.h5", "https": "https://h/x/Gdup.h5"}
+        b = {"id": "GB.h5", "s3": "s3://b/p2/GB.h5", "https": "https://h/y/Gdup.h5"}
+        assert canonical_granule_id(a["s3"]) != canonical_granule_id(b["s3"]), (
+            "the s3 spellings must NOT collide -- the https spelling is the hole"
+        )
+        with pytest.raises(ValueError, match="identity collision") as excinfo:
+            shardmap._refuse_basename_collisions([7], [[a, b]])
+        message = str(excinfo.value)
+        assert "'Gdup.h5'" in message
+        # Named by the s3 hrefs: for THIS pair they are what separates them.
+        assert "s3://b/p1/GA.h5" in message and "s3://b/p2/GB.h5" in message
+
+    def test_a_basename_shared_across_spellings_is_not_a_collision(self):
+        # A run reads ONE spelling (``runner._resolve_urls`` picks s3 or https
+        # by driver), so ids are comparable within a spelling and never across.
+        # Pooling both into one namespace refused pairs no driver can collapse
+        # (PR #482 review): here the s3 ids differ AND the https ids differ, yet
+        # ``a``'s https basename equals ``b``'s s3 basename -- an id no single
+        # run ever records.
+        from zagg.telemetry import canonical_granule_id
+
+        a = {"id": "A", "s3": "s3://b/p/X.h5", "https": "https://h/p/Y.h5"}
+        b = {"id": "B", "s3": "s3://b/p/Y.h5", "https": "https://h/p/Z.h5"}
+        for spelling in ("s3", "https"):
+            assert canonical_granule_id(a[spelling]) != canonical_granule_id(b[spelling]), (
+                "neither spelling may collide on its own -- the cross-match is the fixture"
+            )
+        shardmap._refuse_basename_collisions([7], [[a, b]])
+
+    def test_a_pair_colliding_under_both_spellings_is_reported_once(self):
+        # The same two entries collide under s3 AND under https, with a
+        # different basename each time. That is one collision, not two: keying
+        # by spelling registers it in both slots, so the report dedups on the
+        # pair it names (PR #482 review).
+        a = {"id": "C", "s3": "s3://b/p1/G.h5", "https": "https://h/p1/G.nc"}
+        b = {"id": "D", "s3": "s3://b/p2/G.h5", "https": "https://h/p2/G.nc"}
+        with pytest.raises(ValueError, match="identity collision") as excinfo:
+            shardmap._refuse_basename_collisions([7], [[a, b]])
+        message = str(excinfo.value)
+        assert "1 per-shard granule identity collision(s)" in message
+        assert message.count("s3://b/p1/G.h5") == 1, "one entry-pair, one group"
+
+    def test_build_refuses_an_https_only_basename_collision(self, hp_grid):
+        # The same hole wired through ``build``: two catalog items whose https
+        # basenames collapse while their s3 basenames stay distinct.
+        a = _item("GA", -76.62, -76.57)
+        b = _item("GB", -76.62, -76.57)
+        for item, host in ((a, "hx"), (b, "hy")):
+            item["assets"]["data"]["href"] = f"https://{host}/Gdup.h5"
+        with pytest.raises(ValueError, match="identity collision"):
+            ShardMap.build(_catalog([a, b]), hp_grid, backend="mortie")
+
+    def test_distinct_basenames_under_one_prefix_build(self, catalog, hp_grid):
+        # Control: the ordinary catalog is unaffected -- the check must refuse
+        # a collision, not a shard holding several granules.
+        sm = ShardMap.build(catalog, hp_grid, backend="mortie")
+        assert max(len(g) for g in sm.granules) > 1
+        assert sm.metadata["granules_assigned"] == 3
+
+    def test_the_same_granule_listed_twice_is_not_a_collision(self):
+        entry = {"id": "G.h5", "s3": "s3://b/p1/G.h5", "https": "https://h/p1/G.h5"}
+        shardmap._refuse_basename_collisions([7], [[entry, dict(entry)]])
+
+    def test_an_entry_with_nothing_to_canonicalize_warns_and_is_skipped(self):
+        # Nothing to name is nothing to collide, so no refusal -- but silence
+        # was hiding an entry with NO recorded identity, arguably worse than a
+        # collision (PR #482 question (6) ruling: warn, never refuse). The two
+        # entries must DIFFER in their distinguishing fields, else the skip
+        # branch could be deleted and this would still pass -- they would dedup
+        # rather than collide (issue #468 review finding (3)).
+        with pytest.warns(RuntimeWarning, match="no recorded identity") as record:
+            shardmap._refuse_basename_collisions(
+                [7],
+                [[{"id": None, "s3": None, "https": None}, {"id": "", "s3": None, "https": None}]],
+            )
+        # One warning carrying the count, not one warning per entry.
+        assert len(record) == 1
+        message = str(record[0].message)
+        assert "2 shard entry(s)" in message
+        # The pointer must name the entry it points at: the all-None shape has
+        # nothing to label, and ``str(None)`` pointed the operator at 'None'
+        # (PR #482 review).
+        assert "'None'" not in message
+        assert "<entry with no id, href, or datetime>" in message
+
+    def _colliding_fine_map(self, catalog, fine_grid):
+        """A fine map whose two sibling shards each hold one of a colliding
+        pair -- legal at the fine order, a collapse once coarsened."""
+        from mortie import clip2order
+
+        sm_fine = ShardMap.build(catalog, fine_grid, backend="mortie")
+        by_parent: dict = {}
+        for k in sm_fine.shard_keys:
+            parent = clip2order(11, np.asarray([k], dtype=np.uint64))
+            by_parent.setdefault(int(parent[0]), []).append(k)
+        siblings = next(ks for ks in by_parent.values() if len(ks) >= 2)[:2]
+        granules = [
+            [{"id": "Gdup.h5", "s3": f"s3://b/{p}/Gdup.h5", "https": f"https://h/{p}/Gdup.h5"}]
+            for p in ("p1", "p2")
+        ]
+        return ShardMap(sm_fine.grid_signature, siblings, granules, dict(sm_fine.metadata))
+
+    def test_coarsen_refuses_a_collision_the_source_order_did_not_have(
+        self, catalog, fine_grid, coarse_grid
+    ):
+        sm_fine = self._colliding_fine_map(catalog, fine_grid)
+        # Legal where it stands: one granule per shard, nothing to collide.
+        shardmap._refuse_basename_collisions(sm_fine.shard_keys, sm_fine.granules)
+        with pytest.raises(ValueError, match="identity collision"):
+            sm_fine.reproject(coarse_grid)
+
+    def test_coarsen_names_both_members_of_the_collided_pair(self, catalog, fine_grid, coarse_grid):
+        # The pre-#468 dedup keyed on the id alone, so the second granule
+        # overwrote the first and the collapse was unobservable. Both hrefs
+        # reaching the message is the observable consequence of the merge
+        # keeping both; the keeping itself is pinned directly by
+        # test_the_union_keeps_both_members_of_a_collided_pair over in
+        # tests/test_sweep.py, on the one union the guard does not raise on.
+        sm_fine = self._colliding_fine_map(catalog, fine_grid)
+        try:
+            sm_fine.reproject(coarse_grid)
+        except ValueError as e:
+            assert "s3://b/p1/Gdup.h5" in str(e) and "s3://b/p2/Gdup.h5" in str(e)
+        else:
+            pytest.fail("coarsen must refuse the collided pair")
+
+    def test_two_acquisitions_sharing_an_item_id_collide(self):
+        # A raster entry carries no href, and its recorded identity is the item
+        # id or the acquisition datetime (``raster_granule_ids``). Two
+        # acquisitions sharing an item id record as ONE id, so the datetime is
+        # what distinguishes them -- without it this pair read as one granule
+        # listed twice and slipped through (issue #468 review finding (1)).
+        from zagg.telemetry import raster_granule_ids
+
+        a = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-01T00:00:00Z"}
+        b = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-02T00:00:00Z"}
+        assert raster_granule_ids([a, b]) == ["SCENE", "SCENE"], "the collapse must be real"
+        with pytest.raises(ValueError, match="identity collision"):
+            shardmap._refuse_basename_collisions([7], [[a, b]])
+
+    def test_one_acquisition_listed_twice_is_still_not_a_collision(self):
+        a = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-01T00:00:00Z"}
+        shardmap._refuse_basename_collisions([7], [[a, dict(a)]])
+
+    def test_refine_rebuilds_hrefs_from_the_catalog_so_it_cannot_collide(
+        self, catalog, fine_grid, coarse_grid
+    ):
+        # The refine arm looks each entry up in the catalog by id and rebuilds
+        # the entry from THAT record, so a source map's per-entry hrefs never
+        # reach the new map: a collided pair arrives as one identical entry and
+        # the check has nothing left to see. Pinning it because it bounds what
+        # the guard can promise -- only ``build`` and coarsen can surface an
+        # href collision (issue #468 review finding (2)).
+        sm = ShardMap.build(
+            _catalog([_item("Gdup", -76.62, -76.57)]), coarse_grid, backend="mortie"
+        )
+        cat = _catalog([_item("Gdup", -76.62, -76.57)])
+        collided = [
+            {"id": "Gdup", "s3": f"s3://b/{p}/Gdup.h5", "https": f"https://h/{p}/Gdup.h5"}
+            for p in ("p1", "p2")
+        ]
+        source = ShardMap(
+            sm.grid_signature,
+            list(sm.shard_keys),
+            [collided] + [list(g) for g in sm.granules[1:]],
+            dict(sm.metadata),
+        )
+        refined = source.reproject(fine_grid, catalog=cat)
+        entries = [g for shard in refined.granules for g in shard]
+        assert all(g["s3"] == "s3://b/Gdup.h5" for g in entries), "hrefs come from the catalog"
+        # One granule out, not two: the prefixes -- and with them the collision
+        # -- were discarded upstream of the check, not by it.
+        assert {g["id"] for g in entries} == {"Gdup"}
+
+    def test_an_id_that_canonicalizes_to_empty_warns_and_is_skipped(self):
+        # ``canonical_granule_id("/")`` strips the separator down to "", which
+        # is falsy but not None -- an ``is None`` guard let it through as a
+        # live bucket key and would report ``''`` as the collapsed granule id
+        # (issue #468 review finding (3)). Post-question-(6) the skip is loud.
+        from zagg.telemetry import canonical_granule_id
+
+        assert canonical_granule_id("/") == "" and canonical_granule_id("//") == ""
+        # BOTH must canonicalize to "" and differ in their distinguishing
+        # fields: with an ``is None`` guard they share the "" bucket and this
+        # raises, which is what makes the test fail against the unfixed code.
+        with pytest.warns(RuntimeWarning, match="no recorded identity"):
+            shardmap._refuse_basename_collisions(
+                [7],
+                [[{"id": "/", "s3": None, "https": None}, {"id": "//", "s3": None, "https": None}]],
+            )
+
+    def test_more_than_three_collisions_are_counted_and_truncated(self):
+        # The operator-facing message shows the first three groups and says so;
+        # a badly mis-scoped catalog hits this branch, not the single-pair one
+        # (issue #468 review finding (4)).
+        entries = [
+            {"id": f"G{n}.h5", "s3": f"s3://b/{p}/G{n}.h5", "https": None}
+            for n in range(4)
+            for p in ("p1", "p2")
+        ]
+        with pytest.raises(ValueError) as excinfo:
+            shardmap._refuse_basename_collisions([7], [entries])
+        message = str(excinfo.value)
+        assert "4 per-shard granule identity collision(s)" in message
+        assert message.rstrip().endswith("...")
+        # Three groups shown, the fourth only counted.
+        assert "'G2.h5'" in message and "'G3.h5'" not in message
+
+    def test_a_collision_with_no_href_is_named_by_what_separates_it(self):
+        # The label fallback chain reached the id before the datetime, so a
+        # raster pair printed as ['SCENE', 'SCENE'] -- the same string twice,
+        # naming nothing -- under a message that asserted a prefix cause the
+        # raster path does not have (issue #468 review finding (2)).
+        a = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-01T00:00:00Z"}
+        b = {"id": "SCENE", "s3": None, "https": None, "datetime": "2025-06-02T00:00:00Z"}
+        with pytest.raises(ValueError) as excinfo:
+            shardmap._refuse_basename_collisions([7], [[a, b]])
+        message = str(excinfo.value)
+        assert "SCENE @ 2025-06-01T00:00:00Z" in message
+        assert "SCENE @ 2025-06-02T00:00:00Z" in message
+        # The prefix cause is offered as the usual case, not asserted as the only one.
+        assert "Usually one basename under two key prefixes" in message
+
+    def test_an_href_collision_is_still_named_by_its_hrefs(self):
+        a = {"id": "G.h5", "s3": "s3://b/p1/G.h5", "https": "https://h/p1/G.h5"}
+        b = {"id": "G.h5", "s3": "s3://b/p2/G.h5", "https": "https://h/p2/G.h5"}
+        with pytest.raises(ValueError) as excinfo:
+            shardmap._refuse_basename_collisions([7], [[a, b]])
+        assert "['s3://b/p1/G.h5', 's3://b/p2/G.h5']" in str(excinfo.value)
+
+    # -- loading warns, never refuses (PR #482 question (2) ruling) ---------
+
+    @staticmethod
+    def _collided_manifest():
+        # The constructor does not guard -- only build/reproject/sweep mint
+        # membership -- so a pre-#468 manifest is representable directly.
+        collided = [
+            {"id": "Gdup.h5", "s3": f"s3://b/{p}/Gdup.h5", "https": f"https://h/{p}/Gdup.h5"}
+            for p in ("p1", "p2")
+        ]
+        return ShardMap(
+            {"type": "healpix", "indexing_scheme": "nested", "parent_order": 6},
+            [1050],
+            [collided],
+            {"backend": "mortie", "total_shards": 1},
+        )
+
+    def test_the_unidentified_warning_blames_the_caller_not_shardmap(self, tmp_path):
+        # ``stacklevel`` counts from ``_basename_collision_message``, which sits
+        # two frames below every production entry point (build/reproject/merge
+        # via the refusal, from_json/from_parquet via the load warning), so the
+        # level the direct-call tests happen to need attributed the warning to
+        # shardmap.py's own source -- an operator pointer at zagg internals, and
+        # unmatchable by a module warning filter (PR #482 review).
+        sm = ShardMap(
+            {"type": "healpix", "indexing_scheme": "nested", "parent_order": 6},
+            [1050],
+            [[{"id": None, "s3": None, "https": None}]],
+            {"backend": "mortie", "total_shards": 1},
+        )
+        path = tmp_path / "sm.json"
+        sm.to_json(str(path))
+        with pytest.warns(RuntimeWarning, match="no recorded identity") as record:
+            ShardMap.from_json(str(path))
+        assert record[0].filename == __file__, "the load call site, not shardmap.py"
+        # The load path is the one where the operator has no other pointer to
+        # WHICH map is at fault -- the collision warning beside it carries one.
+        assert str(path) in str(record[0].message)
+
+    def test_from_json_warns_on_a_loaded_collision_and_keeps_the_map(self, tmp_path):
+        # A manifest built before the guard existed must stay readable -- the
+        # warning makes the hazard visible without making the map unreachable.
+        sm = self._collided_manifest()
+        path = tmp_path / "sm.json"
+        sm.to_json(str(path))
+        with pytest.warns(RuntimeWarning, match="identity collision") as record:
+            loaded = ShardMap.from_json(str(path))
+        assert loaded.granules == sm.granules, "warned, not refused or thinned"
+        # The warning points at the live consequence of keeping it (issue #512).
+        assert "issue #512" in str(record[0].message)
+
+    def test_from_parquet_warns_on_a_loaded_collision_and_keeps_the_map(self, tmp_path):
+        pytest.importorskip("pyarrow")
+        sm = self._collided_manifest()
+        path = tmp_path / "sm.parquet"
+        sm.to_parquet(str(path))
+        with pytest.warns(RuntimeWarning, match="identity collision"):
+            loaded = ShardMap.from_parquet(str(path))
+        assert loaded.granules == sm.granules, "warned, not refused or thinned"
+
+    def test_loading_a_clean_manifest_does_not_warn(self, catalog, hp_grid, tmp_path):
+        sm = ShardMap.build(catalog, hp_grid, backend="mortie")
+        path = tmp_path / "sm.json"
+        sm.to_json(str(path))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            loaded = ShardMap.from_json(str(path))
+        assert loaded.granules == sm.granules

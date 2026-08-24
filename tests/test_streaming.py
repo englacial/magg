@@ -177,6 +177,29 @@ class TestStreamingConfig:
         with pytest.raises(ValueError, match="merge law"):
             validate_streaming(cfg)
 
+    def test_waveform_digest_ragged_rejected(self):
+        # Issue #508 phase 1 baseline: build_waveform_digest is outside
+        # _TDIGEST_FUNCTIONS, so merge mode refuses it through the same
+        # no-merge-law arm as any other non-tdigest ragged reducer.
+        cfg = _config()
+        cfg.aggregation["variables"]["h_tdigest"]["function"] = (
+            "zagg.stats.waveform.build_waveform_digest"
+        )
+        with pytest.raises(ValueError, match="h_tdigest.*build_waveform_digest.*merge law"):
+            validate_streaming(cfg)
+
+    def test_waveform_temporal_field_refused_via_the_temporal_arm(self):
+        # The shipped template shape (rx_flux carries temporal: per-centroid):
+        # the companion refusal fires before the function arm ever sees the
+        # builder, and routes to mode: spill (issue #508 phase 1 baseline).
+        cfg = _config()
+        cfg.aggregation["variables"]["h_tdigest"]["function"] = (
+            "zagg.stats.waveform.build_waveform_digest"
+        )
+        cfg.aggregation["variables"]["h_tdigest"]["temporal"] = "per-centroid"
+        with pytest.raises(ValueError, match="temporal companions.*cannot stream.*mode: spill"):
+            validate_streaming(cfg)
+
     def test_pairwise_tdigest_reducer_is_streamable(self):
         # build_tdigest_pairwise carries the pairwise merge law (issue #279),
         # so it must validate as a mergeable ragged reducer just like the

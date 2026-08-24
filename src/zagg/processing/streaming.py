@@ -61,6 +61,32 @@ _TDIGEST_FUNCTIONS = (_TDIGEST_FUNCTION, _TDIGEST_PAIRWISE_FUNCTION)
 _TDIGEST_WHERE_FUNCTION = "zagg.stats.tdigest.build_tdigest_where"
 _TDIGEST_SPILL_FUNCTIONS = (*_TDIGEST_FUNCTIONS, _TDIGEST_WHERE_FUNCTION)
 
+#: The digest FAMILY (issue #508): reducers whose STORED payloads are spec-§2
+#: weights-sorted ``(k, 2)`` centroid arrays and therefore fold by the
+#: order-independent k-way t-digest law (``merge_tdigests_kway``) wherever a
+#: fold operates on stored payloads rather than raw rows — the D24
+#: composability arm (:func:`zagg.semantics.field_composability`) and BOTH
+#: stored-payload fold sites it licenses: the sweep's overview fold
+#: (:func:`zagg.sweep_overview.fold_digests`) and the worker-side leaf column
+#: (:func:`zagg.column.fold_column`, gated by
+#: :func:`zagg.column.leaf_column_plan`, which filters the same declaration
+#: through :func:`zagg.column.composable_fields`). Membership here is
+#: therefore not free at build time — see ``build_waveform_digest``'s
+#: docstring for why a GEDI-scale store declares its ladder sweep-only.
+#: The k-way law is weight-agnostic — flux weights fold like counts (spec
+#: §2.0, issue #431) — which is what admits ``build_waveform_digest``: its
+#: build is waveform-specific, but its stored payload is a standard §2
+#: centroid array whose companions ride the same channel overloads.
+#: Deliberately NOT consumed by :func:`validate_streaming` /
+#: :func:`validate_spill_fold`: those gates re-run BUILDERS over raw rows (per
+#: flush / per block), and the waveform builder's noise-model columns are not
+#: threaded there — the tuples above keep their exact members (the issue #508
+#: phase-1 characterization pins that posture). ``build_tdigest_where`` is
+#: likewise NOT here: its D24 class stays ``none`` pending the gate-drift
+#: ruling raised on issue #508.
+_WAVEFORM_DIGEST_FUNCTION = "zagg.stats.waveform.build_waveform_digest"
+_DIGEST_FAMILY_FUNCTIONS = (*_TDIGEST_FUNCTIONS, _WAVEFORM_DIGEST_FUNCTION)
+
 #: The packed composition reducer (issue #321): the SPILL fold collapses its
 #: per-block ``(word, n_signal)`` pairs in one pass via
 #: ``merge_composition_kway`` — issue #370 option (a), accepting the documented

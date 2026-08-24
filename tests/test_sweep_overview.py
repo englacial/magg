@@ -237,13 +237,13 @@ class TestComposabilityClasses:
         }
         assert field_composability(meta) == "none"
 
-    def test_a_temporal_waveform_field_is_still_none(self):
-        # The per-centroid SHAPE does not put a field in the pyramid: the class
-        # is decided by the reducer, and ``build_waveform_digest`` is outside
-        # ``_TDIGEST_FUNCTIONS`` by the issue #422 ruling (GEDI declares
-        # ``pyramid: false``). So a waveform field carrying the channel stays
-        # class ``none`` and never appears above native resolution — there is no
-        # ``rx_flux_times`` on any overview (review finding).
+    def test_a_temporal_waveform_field_is_approximate(self):
+        # Issue #508 (superseding the #422-era exclusion this test used to
+        # pin): ``build_waveform_digest`` is a member of the shared digest
+        # family — its stored payload is a §2 centroid array and the k-way law
+        # is weight-agnostic (flux weights fold like counts, issue #431 §2) —
+        # so a waveform field classifies ``approximate`` and folds through the
+        # pyramid, per-centroid companion at every level.
         meta = {
             "kind": "ragged",
             "function": "zagg.stats.waveform.build_waveform_digest",
@@ -251,12 +251,76 @@ class TestComposabilityClasses:
             "temporal": "per-centroid",
             "dtype": "float32",
         }
-        assert field_composability(meta) == "none"
-        # ... and the SAME declaration under the standard reducer does fold, so
-        # the class turns on the function, not on the channel.
+        assert field_composability(meta) == "approximate"
+        # The inner-shape guard still applies to the family's new member.
+        assert field_composability({**meta, "inner_shape": [3]}) == "none"
+
+    def test_gedi_waveform_template_classifies_approximate(self):
+        # Issue #508: the SHIPPED template's rx_flux — build_waveform_digest
+        # with a per-centroid clock — classifies ``approximate`` via the
+        # shared digest-family registry, which is what lets the SERC probe's
+        # ``pyramid = {}`` declare a ladder instead of ``{"class": "none"}``.
+        # The meta-level pin above records the mechanism; this one records
+        # that the template hits it.
+        from zagg.config import default_config
+
+        classes = composability_classes(default_config("gedi01b_waveform_healpix_hive"))
+        assert classes["rx_flux"] == "approximate"
+
+    def test_digest_family_registry_members_pinned_by_value(self):
+        # The issue #508 contract: ONE new registry, existing tuples keep
+        # their exact members. Pinned by value so a drive-by addition to any
+        # of the three is a loud diff, not a silent gate widening (the mortie
+        # #194 lesson; the where-gate question is standing on issue #508).
+        from zagg.processing.streaming import (
+            _DIGEST_FAMILY_FUNCTIONS,
+            _TDIGEST_FUNCTIONS,
+            _TDIGEST_SPILL_FUNCTIONS,
+        )
+
+        assert _TDIGEST_FUNCTIONS == (
+            "zagg.stats.tdigest.build_tdigest",
+            "zagg.stats.tdigest.build_tdigest_pairwise",
+        )
+        assert _TDIGEST_SPILL_FUNCTIONS == (
+            *_TDIGEST_FUNCTIONS,
+            "zagg.stats.tdigest.build_tdigest_where",
+        )
+        assert _DIGEST_FAMILY_FUNCTIONS == (
+            *_TDIGEST_FUNCTIONS,
+            "zagg.stats.waveform.build_waveform_digest",
+        )
+
+    def test_where_strata_template_classifies_none_today(self):
+        # Issue #508 phase 1 baseline for the OTHER gate pair, and a pin the
+        # phase-2 registry must not flip. ``build_tdigest_where`` is already
+        # inconsistent across the two gates: ``_TDIGEST_SPILL_FUNCTIONS``
+        # admits it ("It folds k-way, like the ``build_tdigest`` it delegates
+        # to"), yet D24 tests ``_TDIGEST_FUNCTIONS`` and so classifies a
+        # where-stratum field ``none`` even though its stored payload is an
+        # ordinary (k, 2) centroid array. Per the plan (issue #508), a gate
+        # found already inconsistent is RAISED rather than silently unified:
+        # the divergence is on the issue, and the phase-2 shared registry is
+        # scoped to ``build_waveform_digest`` only -- it deliberately does NOT
+        # admit ``build_tdigest_where``, so these stay ``none`` until espg
+        # rules otherwise.
+        from zagg.config import default_config
+
+        classes = composability_classes(default_config("atl03_tdigest_strata_healpix"))
+        assert classes["h_tdigest_signal"] == "none"
+        assert classes["h_tdigest_noise"] == "none"
+        # The meta-level mechanism behind that template result.
         assert (
-            field_composability({**meta, "function": "zagg.stats.tdigest.build_tdigest"})
-            == "approximate"
+            field_composability(
+                {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest_where",
+                    "inner_shape": [2],
+                    "params": {"where": "h_ph > 0"},
+                    "dtype": "float32",
+                }
+            )
+            == "none"
         )
 
     def test_located_declaration_rides_the_manifest_entry(self):
@@ -651,6 +715,127 @@ class TestWeightsGate:
         # And the fold gate now accepts the overview as a cascade source.
         check_weights_match(dict(group["flux_d"].attrs), fields["flux_d"], "flux_d")
         check_weights_match(dict(group["counts_d"].attrs), fields["counts_d"], "counts_d")
+
+
+class TestWaveformPyramidDeclaration:
+    """Template-time classification for the waveform digest (issue #508).
+
+    The SERC probe shape: ``gedi01b_waveform_healpix_hive`` + ``output.pyramid
+    = {}`` + ``rx_flux.overview_delta = 512`` under the probe's uniform-δ4096
+    override (the packaged template ships δ8192). Classification runs
+    worker-side at template time, so this IS the deployed surface the 0.50
+    fleet re-runs the probe against.
+    """
+
+    def _probe_cfg(self):
+        from zagg.config import default_config
+
+        cfg = default_config("gedi01b_waveform_healpix_hive")
+        cfg.output["pyramid"] = {}
+        rx = cfg.aggregation["variables"]["rx_flux"]
+        # 512 is the SERC probe's literal declaration, and it coincides with
+        # the OVERVIEW_DELTA_CAP fallback under δ4096 — so this value alone
+        # cannot prove the declaration is read. The δ128 variant below does.
+        rx["overview_delta"] = 512
+        rx["params"]["delta"] = 4096  # the probe's uniform-δ override
+        return cfg
+
+    def test_probe_config_declares_the_ladder(self):
+        from zagg.pyramid import declared_fields
+
+        fields, excluded = declared_fields(self._probe_cfg())
+        # The exact manifest entry the 0.49 probe SHOULD have produced instead
+        # of {"class": "none"} — delta as the test config declares it (#424
+        # records the split budget resolved), companion shape included.
+        assert fields["rx_flux"] == {
+            "class": "approximate",
+            "method": "tdigest_kway",
+            "dtype": "float32",
+            "inner_shape": [2],
+            "delta": 4096,
+            "overview_delta": 512,
+            "temporal": "per-centroid",
+        }
+        assert "rx_flux" not in excluded
+        # Non-vacuous pin on the SAME probe config: the capped fallback can
+        # only ever yield min(4096, 512) = 512, so a budget the cap cannot
+        # produce shows the DECLARED value wins here too (the generic law is
+        # test_declared_fields_records_the_resolved_budget).
+        capped = self._probe_cfg()
+        capped.aggregation["variables"]["rx_flux"]["overview_delta"] = 128
+        assert declared_fields(capped)[0]["rx_flux"]["overview_delta"] == 128
+        assert fields["count"]["class"] == "exact"
+        # The per-record companions keep the ruled option-A absence: scalar
+        # reducers without an exact law declare class only, at native
+        # resolution only (issue #201).
+        for name in (
+            "shot_count",
+            "shot_number",
+            "noise_mean",
+            "noise_stddev",
+            "rx_energy",
+            "elevation_bin0",
+            "elevation_lastbin",
+        ):
+            assert fields[name] == {"class": "none"}
+            assert name in excluded
+
+    def test_manifest_block_covers_every_level(self):
+        # pyramid = {} on the gedi grid (9 -> chunk 12 -> 18) takes the ruled
+        # /2 default: the leaf entry plus the fixed ladder to 0, ONE fields map
+        # covering every level — rx_flux is declared at each of them.
+        from zagg.sweep_overview import build_pyramid_block
+
+        block = build_pyramid_block(self._probe_cfg(), 9, 12)
+        assert block["spec"] == "zagg-pyramid/2"
+        assert [e["node"] for e in block["overviews"]] == list(range(9, -1, -1))
+        assert block["overviews"][0]["cells"] == [12]
+        # The manifest entry is what the /2 writers reconstruct the field
+        # from, so the block must carry the whole declaration — not just the
+        # class: the §8.3 companion shape and the resolved fold budget travel
+        # in it or the overview template loses the sibling.
+        rx = block["overview"]["fields"]["rx_flux"]
+        assert rx["class"] == "approximate"
+        assert rx["temporal"] == "per-centroid"
+        assert rx["overview_delta"] == 512
+
+    def test_overview_template_emits_the_times_sibling(self, tmp_path):
+        # The companion path at overview levels (issue #410, per-centroid at
+        # EVERY level): the manifest entry is the only description the
+        # overview writer has, and _overview_config must turn its temporal key
+        # into the ``rx_flux_times`` sibling + §8.3 declaration, exactly as a
+        # leaf template does.
+        from zagg.column import composable_fields
+        from zagg.grids.healpix import HealpixGrid
+        from zagg.sweep_overview import _overview_config, build_pyramid_block
+        from zagg.time_axis import temporal_declaration
+
+        # Sourced from the MANIFEST block, not from declared_fields directly,
+        # because that is the seam production walks: the staged sweep lifts
+        # pyramid.overview.fields out of the manifest and hands it on. A
+        # regression that dropped the temporal key on the way into the block
+        # fails here.
+        fields = build_pyramid_block(self._probe_cfg(), 9, 12)["overview"]["fields"]
+        # The production writers template only the composable classes — on the
+        # /2 path, which is the one this store declares: run_stage_sweep
+        # filters the manifest map before _write_stage_overview, and the
+        # worker column filters in leaf_column_plan. The class-none companions
+        # never reach the template, which is what the last assertion pins.
+        grid = HealpixGrid(2, 4, config=_overview_config(composable_fields(fields)), sharded=True)
+        grid.emit_shard_template(open_store(str(tmp_path / "ov.zarr")), overwrite=True)
+        group = zarr.open_group(
+            open_store(str(tmp_path / "ov.zarr")), path="4", mode="r", zarr_format=3
+        )
+        assert "rx_flux_times" in group
+        assert temporal_declaration(dict(group["rx_flux_times"].attrs)) == {
+            "spec": "zagg-toc/1",
+            "shape": "per-centroid",
+            "grammar": "mortie-toc/1",
+        }
+        # The payload binds the sibling by name (§1.2).
+        assert dict(group["rx_flux"].attrs)["times"] == "rx_flux_times"
+        # And the excluded per-record companions are absent from the template.
+        assert "shot_number" not in group
 
 
 class TestPyramidBlock:
@@ -1490,6 +1675,192 @@ class TestBothChannelsOverviewFold:
         bounds = np.concatenate([[0], np.cumsum(payload[:, 1]).astype(np.int64)])
         for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
             assert _toc_contains(times[i], times_truth[0][lo:hi])
+
+
+#: The waveform-store declaration for the harness above (issue #508): the
+#: digest family's new member, per-centroid companion, no located channel —
+#: the gedi01b shape reduced to the fold-relevant keys.
+WAVEFORM_FIELDS_DECL = {
+    "count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0},
+    "rx_flux": {
+        "class": "approximate",
+        "method": "tdigest_kway",
+        "dtype": "float32",
+        "inner_shape": [2],
+        "delta": 64,
+        "overview_delta": 64,
+        "temporal": "per-centroid",
+    },
+}
+
+
+def _waveform_leaf_cfg():
+    from zagg.config import PipelineConfig
+
+    return PipelineConfig(
+        aggregation={
+            "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+            "variables": {
+                "count": {"function": "len", "dtype": "int32", "fill_value": 0},
+                "rx_flux": {
+                    "kind": "ragged",
+                    "function": "zagg.stats.waveform.build_waveform_digest",
+                    "inner_shape": [2],
+                    "temporal": "per-centroid",
+                    "dtype": "float32",
+                    "fill_value": 0,
+                },
+            },
+        }
+    )
+
+
+def _make_waveform_leaf(root, decimal, cells, *, seed=11):
+    """A committed leaf whose payloads come from ``build_waveform_digest``.
+
+    ``cells`` maps leaf row -> sample count; every sample carries an INTEGER
+    photoelectron count over a zero noise floor, so each cell's flux (the sum
+    of its centroid weights) is exactly its integer count total — sums of
+    small ints are exact in float32, which is what lets the per-level parity
+    assertions below demand equality, not closeness. Returns ``(flux_total,
+    {row: (digest, words)})``.
+    """
+    from conftest import TOC_BASE, toc_words
+    from mortie import generate_morton_children
+
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.stats.waveform import build_waveform_digest
+
+    grid = HealpixGrid(SHARD_ORDER, CELL_ORDER, config=_waveform_leaf_cfg())
+    word = morton_word(decimal)
+    store = open_store(shard_leaf_path(str(root), word))
+    grid.emit_shard_template(store, overwrite=True)
+    group = zarr.open_group(store, path=str(CELL_ORDER), mode="r+", zarr_format=3)
+    n_cells = 4 ** (CELL_ORDER - SHARD_ORDER)
+    group["morton"][:] = np.asarray(generate_morton_children(word, CELL_ORDER), dtype=np.uint64)
+    rng = np.random.default_rng(seed)
+    count = np.zeros(n_cells, np.int32)
+    digest = np.full(n_cells, b"", dtype=object)
+    times = np.full(n_cells, b"", dtype=object)
+    flux_total = 0.0
+    truth = {}
+    for i, n in cells.items():
+        values = rng.normal(0.0, 10.0, n)
+        counts = rng.integers(2, 30, n).astype(np.float64)
+        base = str(np.datetime64(TOC_BASE, "ns") + np.timedelta64(3600 * (i + 1), "s"))
+        d, w = build_waveform_digest(
+            values,
+            64,
+            counts=counts,
+            noise_mean=np.zeros(n),
+            noise_stddev=np.full(n, 0.25),
+            temporal=toc_words(n, base=base),
+        )
+        # Zero noise floor + counts >= 2 clear the clip threshold (0.77 at the
+        # reducer's default operating point, n_σ = 3.09 against σ = 0.25; the
+        # margin holds at the shipped gedi01b point too, n_σ = 4.49 → 1.12), so
+        # nothing is dropped and the digest mass IS the count total.
+        assert float(d[:, 1].sum()) == float(counts.sum())
+        count[i] = n
+        digest[i] = encode_digest(d, "float32")
+        times[i] = encode_digest(w, "uint64")
+        flux_total += float(counts.sum())
+        truth[i] = (d, w)
+    group["count"][:] = count
+    group["rx_flux"][:] = digest
+    group["rx_flux_times"][:] = times
+    stamp_commit(store, cells_with_data=len(cells), granule_count=1)
+    return flux_total, truth
+
+
+class TestWaveformOverviewFold:
+    """The runbook step-2 fold gates, in-repo (issue #508 phase 4).
+
+    A synthetic waveform store — leaves built by ``build_waveform_digest``
+    itself — swept through the production overview fold: per-level flux
+    ``weight_total`` equals the leaf total through the k-way law at EVERY
+    declared level (the weight-agnostic licensing fact, issue #431 §2), the
+    ``rx_flux_times`` sibling rides every level row-aligned, and the ragged
+    ``(2,)`` element round-trips.
+    """
+
+    def _sweep(self, tmp_path, cells, orders=(1, 0)):
+        _write_manifest(tmp_path, orders=orders, fields=WAVEFORM_FIELDS_DECL)
+        leaf_total, truth = _make_waveform_leaf(tmp_path, "-311", cells)
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["failed"] == 0
+        return leaf_total, truth
+
+    def test_weight_total_parity_and_times_at_every_level(self, tmp_path):
+        # 300 samples at δ64 force genuine k-way merges at the fine level and
+        # a fold-of-merges at the coarse one; the mass must survive both.
+        from zagg.stats.toc import cell_envelope
+
+        leaf_total, truth = self._sweep(tmp_path, {0: 300, 3: 80, 7: 41})
+        for node_rel, order, partitioned in (("-3/1", 3, True), ("-3", 2, False)):
+            g = _overview_group(tmp_path, node_rel, "all.zarr", order)
+            rows = [decode_digest(bytes(b), "float32") for b in g["rx_flux"][:]]
+            level_total = sum(float(d[:, 1].sum()) for d in rows if d.size)
+            assert level_total == leaf_total, f"mass lost/invented at {node_rel}"
+            words = [decode_digest(bytes(b), "uint64", ()) for b in g["rx_flux_times"][:]]
+            # Leaf rows fold into contiguous runs of the coarser level, so its
+            # row ``j`` is fed exactly by leaf rows ``j * per_row ...`` (the
+            # slots past the level's own cell count stay empty). Every
+            # ``_make_waveform_leaf`` row sits an hour off its neighbour, so the
+            # words below are pinned to the CONTRIBUTORS' instants rather than
+            # to some merely well-formed word: a column carried forward from
+            # another row widens the envelope out of the hour and fails here.
+            per_row = LEAF_CELLS // 4 ** (order - SHARD_ORDER)
+            populated = 0
+            for j, (d, w) in enumerate(zip(rows, words, strict=True)):
+                assert w.shape == (d.shape[0],), "§1.1 row alignment"
+                members = [truth[i] for i in range(j * per_row, (j + 1) * per_row) if i in truth]
+                if not members:
+                    assert w.size == 0, f"words in an unfed row of {node_rel}"
+                    continue
+                take = np.argsort(np.concatenate([t[0][:, 0] for t in members]), kind="stable")
+                weights = np.concatenate([t[0][:, 1] for t in members])[take]
+                instants = np.concatenate([t[1] for t in members])[take]
+                if partitioned:
+                    # The fine level merges the leaf centroids themselves, whole
+                    # and value-ordered, so the leaf's own words index it: cut
+                    # by cumulative FLUX (these weights are photoelectron
+                    # counts, not observation counts) and each merged word must
+                    # cover its contributors' instants — §8.3 over the §9.1
+                    # partition, as in ``TestBothChannelsOverviewFold``.
+                    fed = np.cumsum(weights)
+                    got = np.concatenate([[0.0], np.cumsum(d[:, 1].astype(np.float64))])
+                    for k, (lo, hi) in enumerate(zip(got[:-1], got[1:], strict=True)):
+                        lo_i = int(np.searchsorted(fed, lo, side="right"))
+                        hi_i = int(np.searchsorted(fed, hi, side="right"))
+                        assert hi_i > lo_i, "a centroid folded no contributor whole"
+                        assert _toc_contains(w[k], instants[lo_i:hi_i])
+                # The coarse level folds the FINE level's centroids, whose
+                # values are weighted means and so no longer interleave in leaf
+                # order — the claim that survives the re-partition is the
+                # cell-level identity, exactly as ``test_cascade_folds_both_
+                # siblings`` states it: nothing invented, nothing dropped.
+                assert int(cell_envelope(w)) == int(cell_envelope(instants))
+                populated += len(w)
+            assert populated > 0
+
+    def test_single_contributor_row_round_trips_byte_identical(self, tmp_path):
+        # One populated leaf row under the coarse cell: whichever arm serves it
+        # (the k-way merge is byte-idempotent on one digest, so the two are
+        # indistinguishable here — ``TestBothChannelsOverviewFold`` parametrizes
+        # them apart), the overview element must be the leaf's EXACT bytes and
+        # words. The ragged (2,) element of a builder-origin payload survives
+        # the fold and re-encodes byte-identically.
+        _, truth = self._sweep(tmp_path, {0: 25}, orders=(1,))
+        g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        raw = bytes(g["rx_flux"][:][0])
+        d = decode_digest(raw, "float32")
+        assert d.ndim == 2 and d.shape[1] == 2
+        np.testing.assert_array_equal(d, truth[0][0].astype(np.float32))
+        assert encode_digest(d, "float32") == raw
+        np.testing.assert_array_equal(
+            decode_digest(bytes(g["rx_flux_times"][:][0]), "uint64", ()), truth[0][1]
+        )
 
 
 class TestLocatedDeclarationGate:

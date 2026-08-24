@@ -373,9 +373,12 @@ def field_composability(meta: dict) -> str:
     ``validate_streaming`` accepts, widened by the exact sum/min/max laws):
 
     - ``exact`` — scalar ``function`` in :data:`EXACT_MERGE_LAWS`;
-    - ``approximate`` — a ragged t-digest field with the standard ``(2,)``
-      centroid inner shape, **located or not** (merge is order-dependent;
-      ``np.isclose`` equality class, cf. D24);
+    - ``approximate`` — a ragged digest-family field with the standard
+      ``(2,)`` centroid inner shape, **located or not** (merge is
+      order-dependent; ``np.isclose`` equality class, cf. D24). The family is
+      :data:`zagg.processing.streaming._DIGEST_FAMILY_FUNCTIONS` — the
+      t-digest builders plus the waveform flux digest (issue #508), every
+      reducer whose stored payload folds by the k-way law;
     - ``none`` — everything else: expressions, vector fields, chunk-resolution
       companions, a ``temporal: per-cell`` dense companion (see below), and any
       scalar reducer without an exact law (mean, std, median, quantiles, ...).
@@ -403,8 +406,8 @@ def field_composability(meta: dict) -> str:
     word grammar's join over a cell group, not its own reducer, so classifying
     it by ``function`` would fold e.g. ``nanmax`` over toc words and emit a word
     whose conservative-envelope claim is false. Wiring a dense toc law is not
-    what the ruling asked for, and no shipped config needs it (the GEDI template
-    declares ``pyramid: false``), so it is left out rather than guessed at.
+    what the ruling asked for, and no shipped config pairs a per-cell
+    companion with a pyramid, so it is left out rather than guessed at.
     """
     from zagg.config import get_output_signature
     from zagg.time_axis import TOC_SHAPE_PER_CELL
@@ -416,9 +419,9 @@ def field_composability(meta: dict) -> str:
         return "none"
     function = _fold_function_name(meta.get("function"))
     if sig["kind"] == "ragged":
-        from zagg.processing.streaming import _TDIGEST_FUNCTIONS
+        from zagg.processing.streaming import _DIGEST_FAMILY_FUNCTIONS
 
-        if meta.get("function") in _TDIGEST_FUNCTIONS and tuple(sig["inner_shape"]) == (2,):
+        if meta.get("function") in _DIGEST_FAMILY_FUNCTIONS and tuple(sig["inner_shape"]) == (2,):
             return "approximate"
         return "none"
     if sig["kind"] == "scalar" and function in EXACT_MERGE_LAWS:
