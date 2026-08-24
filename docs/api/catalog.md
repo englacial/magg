@@ -188,9 +188,12 @@ est = closest_obs_shardmap(
     grid=grid,
     aoi="california.geojson",
     max_time_offset=np.timedelta64(3, "D"),
+    max_granules_per_shard=200,  # the same gate the build below applies
     estimate=True,
 )
-est["histogram"], est["max_cost_usd"]
+# violations is [] unless the gate is passed here too -- estimate returns
+# before the build's raise, so this is the safe way to size it.
+est["histogram"], est["max_cost_usd"], est["violations"]
 
 # Then build the map; dispatch consumes it like any other ShardMap:
 sm = closest_obs_shardmap(
