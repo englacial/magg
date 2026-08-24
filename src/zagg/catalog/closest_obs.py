@@ -652,20 +652,6 @@ def closest_obs_shardmap(
     low_resolution = 0
     for shard, epoch_arr in sorted(ref.epochs.items()):
         decimal = morton_decimal(shard)
-        i = spatial_idx.get(shard)
-        if i is None:
-            no_acquisitions.append(decimal)
-            # Ledger the epochs too: a shard the catalog never reaches is the
-            # largest drop class in practice, and leaving it out of ``dropped``
-            # made the numbers an operator reconciles read "nothing dropped".
-            # ``nearest_offset_ns`` is None -- no acquisition to measure
-            # against, the meaning the key already carries.
-            dropped.extend(
-                {"shard": decimal, "epoch": np.datetime_as_string(t), "nearest_offset_ns": None}
-                for t in epoch_arr
-            )
-            continue
-        entries = spatial.granules[i]
         # Cover-resolution gate (espg tolerance ruling, 2026-08-24, thread
         # r3845481805): an epoch whose bucket HALF-SPAN exceeds the caller's
         # stated ``max_time_offset`` cannot be paired to that precision — the
@@ -676,6 +662,13 @@ def closest_obs_shardmap(
         # stays pairable, the same side the selection gate's exactly-at rule
         # pins. With no cap the caller declared no precision bar — the build
         # warns once (below) and proceeds; widening is lawful (§10.5).
+        #
+        # It runs AHEAD of the spatial lookup on purpose: unresolvability is a
+        # property of the epoch and its own cover block, so which category an
+        # epoch lands in must not flip on whether the raster catalog happens to
+        # reach the shard. Gating after the lookup made an unreached shard's
+        # coarse epochs ledger as no-acquisition rows and read
+        # ``epochs_dropped_low_resolution == 0``.
         eo = ref.epoch_orders.get(shard)
         if cap_ns is not None and eo is not None:
             half_span = np.int64(1) << (np.int64(62) - eo)
@@ -694,8 +687,24 @@ def closest_obs_shardmap(
                 )
                 low_resolution += int(unresolvable.sum())
                 epoch_arr = epoch_arr[~unresolvable]
-                if epoch_arr.size == 0:
-                    continue
+        i = spatial_idx.get(shard)
+        if i is None:
+            no_acquisitions.append(decimal)
+            # The shard is named even when the gate took every epoch: this row
+            # is about the SHARD, not its epochs. Ledger the SURVIVING epochs
+            # too — a shard the catalog never reaches is the largest drop class
+            # in practice, and leaving it out of ``dropped`` made the numbers an
+            # operator reconciles read "nothing dropped". ``nearest_offset_ns``
+            # is None -- no acquisition to measure against, the meaning the key
+            # already carries.
+            dropped.extend(
+                {"shard": decimal, "epoch": np.datetime_as_string(t), "nearest_offset_ns": None}
+                for t in epoch_arr
+            )
+            continue
+        if epoch_arr.size == 0:
+            continue
+        entries = spatial.granules[i]
         times = _acquisition_times(entries, decimal)
         sel, off = nearest_acquisitions(epoch_arr, times, max_time_offset=max_time_offset)
         off_ns = off.astype("int64")
