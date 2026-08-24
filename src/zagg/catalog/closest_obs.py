@@ -9,8 +9,11 @@ naturally (espg design ruling, 2026-08-23/24).
 
 Epochs are **store-derived**: each reference store's ``coverage.toc`` sibling
 (spec §10.5) carries per-shard word-set covers quantized at order 18
-(2^45 ns ≈ 9.77 h buckets), so a word midpoint names its pass epoch to
-±4.9 h against Sentinel-2's ~4.3-day revisit. Granule catalogs are *not* an
+(2^45 ns ≈ 9.77 h buckets). A cover *word* is a maximal RUN of those buckets
+(``toc_normalize`` coalesces ranges that merely abut), so the epochs are the
+midpoints of a word's **constituent buckets**, one per bucket — each within
+±4.9 h of every instant its bucket covers, against Sentinel-2's ~4.3-day
+revisit. Granule catalogs are *not* an
 epoch source — the leaf sub-maps record the dispatched assignment verbatim
 and inherit the CMR-hull over-assignment (~70 assigned vs 49 contributing
 pass-days on shard ``3231422244``-class cases); covers reflect only data
@@ -33,31 +36,62 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from zagg.coverage_toc import TEMPORAL_COVER_ORDER
+
 logger = logging.getLogger(__name__)
 
 
-def _word_midpoints(words: np.ndarray) -> np.ndarray:
-    """Cover words -> UTC ``datetime64[ns]`` midpoints of their envelopes.
+def _word_midpoints(words: np.ndarray, order: int = TEMPORAL_COVER_ORDER) -> np.ndarray:
+    """Cover words -> UTC ``datetime64[ns]`` midpoints of their *buckets*.
+
+    A cover word is not one bucket. :func:`zagg.coverage_toc.quantize_words`
+    widens each instant to an aligned order-``order`` bucket and then
+    canonicalizes with ``toc_normalize``, which "coalesces ranges that merely
+    abut" (§10.5) — so a word is a maximal RUN of contiguous buckets and its
+    envelope midpoint would name one epoch per *campaign*, not per pass. This
+    expands every word back into its constituent buckets and emits one
+    midpoint each, which is what restores the ±4.9 h bound: a bucket spans
+    ``2**(63 - order)`` ns, so its midpoint is within half a bucket of every
+    instant the bucket covers.
 
     ``toc2time`` decodes a word's conservative envelope ``(start, end)`` on
     the internal-ns scale — ``end`` exclusive for a range, ``end == start``
-    for an exact timestamp — so the midpoint of the *covered* instants is
-    ``start + (last - start) // 2`` with ``last = max(end, start + 1) - 1``,
-    the same uniform last-covered-instant rule
-    :func:`zagg.coverage_toc.quantize_words` applies. At the pinned cover
-    order (:data:`zagg.coverage_toc.TEMPORAL_COVER_ORDER`) a bucket spans
-    2^45 ns, so a midpoint is within ±4.9 h of every instant its word covers.
+    for an exact timestamp — so the last covered instant is
+    ``max(end, start + 1) - 1``, the same uniform rule ``quantize_words``
+    applies, and the covered buckets are ``start >> k`` through ``last >> k``
+    inclusive with ``k = 63 - order``. Bucket midpoints use that same rule
+    within the bucket: ``(b << k) + 2**(k - 1) - 1``.
+
+    One pass that straddles a bucket edge (its word's envelope reaches into
+    the neighbouring bucket) yields **two** epochs rather than one. That is
+    benign over-selection, not error: both epochs sit within half a bucket of
+    the pass, both pick the same nearest acquisition, and the builder dedupes
+    granule ids per shard.
+
+    ``order`` is the block's *effective* temporal order (§10.5 lets a block
+    coarsen below the object's pin), defaulting to
+    :data:`zagg.coverage_toc.TEMPORAL_COVER_ORDER`.
     """
     import mortie
 
     words = np.asarray(words, dtype=np.uint64)
     if words.size == 0:
         return np.empty(0, dtype="datetime64[ns]")
+    k = int(63 - int(order))
     start, end = mortie.toc2time(words)
     start = np.atleast_1d(np.asarray(start, dtype=np.uint64))
     end = np.atleast_1d(np.asarray(end, dtype=np.uint64))
     last = np.maximum(end, start + np.uint64(1)) - np.uint64(1)
-    mid = start + (last - start) // np.uint64(2)
+    # Bucket index run [b0, b1] per word; expanded with repeat/arange
+    # arithmetic rather than a Python loop over words.
+    b0 = (start >> np.uint64(k)).astype(np.int64)
+    b1 = (last >> np.uint64(k)).astype(np.int64)
+    counts = b1 - b0 + 1
+    offsets = np.cumsum(counts) - counts
+    within = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(offsets, counts)
+    buckets = np.unique(np.repeat(b0, counts) + within).astype(np.uint64)
+    half = np.uint64((1 << k) // 2 - 1)
+    mid = np.minimum((buckets << np.uint64(k)) + half, np.uint64(mortie.TOC_MAX_NS))
     return np.asarray(mortie.to_datetime64(mid), dtype="datetime64[ns]")
 
 
