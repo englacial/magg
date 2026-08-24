@@ -678,7 +678,19 @@ def _strata_leaf_cfg():
     """The synthetic strata leaf config: the CA shape at test scale."""
     from zagg.config import PipelineConfig
 
-    where = "(conf_land >= 2)"
+    # The SAME cut the word packs: ``_strata_cells`` (and
+    # ``pack_composition_n``) call a row signal when ANY of the five §3.1
+    # surfaces clears ``threshold: 2``, so the divisor digest's predicate must
+    # be that five-column union — a land-only ``where`` would give
+    # ``weight(h_sig) < N_signal`` at every cell and break §3.3's recovery.
+    # Nothing here executes it (``_build_store`` writes the slabs by hand, so
+    # the reducers never run) — but the fixture is what gets copied into the
+    # next product template, and ``zagg.config`` deliberately does not validate
+    # this coupling (``src/zagg/config.py``, the third coupling).
+    where = (
+        "((conf_land >= 2) | (conf_ocean >= 2) | (conf_sea_ice >= 2) "
+        "| (conf_land_ice >= 2) | (conf_inland_water >= 2))"
+    )
     return PipelineConfig(
         aggregation={
             "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
