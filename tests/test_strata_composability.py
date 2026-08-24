@@ -1025,7 +1025,7 @@ class TestEndToEndStrataPyramid:
 
     SHARD_ORDER, CELL_ORDER = 2, 4
 
-    def _build_store(self, root, per_cell):
+    def _build_store(self, root, per_cell, second=None):
         import json as _json
 
         import obstore
@@ -1033,9 +1033,11 @@ class TestEndToEndStrataPyramid:
         from zagg.hive import MANIFEST_NAME
         from zagg.store import open_object_store
 
-        _write_strata_leaf(
-            root, "-311", per_cell, shard_order=self.SHARD_ORDER, cell_order=self.CELL_ORDER
-        )
+        for dec, cells in (("-311", per_cell), ("-312", second)):
+            if cells is not None:
+                _write_strata_leaf(
+                    root, dec, cells, shard_order=self.SHARD_ORDER, cell_order=self.CELL_ORDER
+                )
         fields = {
             "count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0},
             **{k: dict(v) for k, v in _STRATA_FIELDS.items()},
@@ -1073,12 +1075,23 @@ class TestEndToEndStrataPyramid:
         return zarr.open_group(store, path=str(order), mode="r", zarr_format=3)
 
     def test_strata_and_composition_fold_at_every_level(self, tmp_path):
-        from zagg.stats.composition import merge_composition_kway, unpack_composition
+        from zagg.stats.composition import (
+            merge_composition_kway,
+            pack_composition_n,
+            unpack_composition,
+        )
         from zagg.sweep_overview import decode_digest, sweep_overviews
 
-        per_cell, (values, conf) = _strata_cells(k=16, n=60, seed=515)
-        manifest = self._build_store(tmp_path, per_cell)
-        counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}})
+        # TWO committed leaves under node -31, at ranks 0 and 1. One leaf would
+        # leave every populated level-1 cell inside a SINGLE level-0 fold
+        # window, so a cascade window over-reaching by one cell would only ever
+        # pick up an empty cell (dropped by the ``n > 0`` guard) and no
+        # assertion here could see it (review finding). With two, level 1 is
+        # populated at cells 0..7 and level 0 at cells 0 AND 1, so the window
+        # boundary at ``j * factor`` separates two POPULATED spans.
+        leaves = [_strata_cells(k=16, n=60, seed=515), _strata_cells(k=16, n=60, seed=518)]
+        manifest = self._build_store(tmp_path, leaves[0][0], second=leaves[1][0])
+        counts = sweep_overviews(str(tmp_path), manifest, {"-311": {None}, "-312": {None}})
         assert counts["failed"] == 0 and counts["written"] == 2
 
         def weights(group, field, j):
@@ -1087,21 +1100,22 @@ class TestEndToEndStrataPyramid:
                 return 0
             return int(decode_digest(payload, "float32", (2,))[:, 1].sum())
 
-        # Level 1 (node -31, cell order 3): exact-from-leaves. Leaf -311 is
-        # the node's rank-0 child (digits are 1-based), so it owns the span
-        # starting at 0; each output cell folds 4 leaf cells.
+        # Level 1 (node -31, cell order 3): exact-from-leaves. Leaf -311 is the
+        # node's rank-0 child (digits are 1-based) and -312 its rank-1, so they
+        # own the spans starting at 0 and 4; each output cell folds 4 leaf cells.
         g1 = self._group(tmp_path, "-3/1", 3)
-        for j in range(4):
-            rows = per_cell[4 * j : 4 * (j + 1)]
-            cell = j
-            assert weights(g1, "h_sig", cell) == sum(c["n_signal"] for c in rows)
-            assert weights(g1, "h_noise", cell) == sum(c["n_noise"] for c in rows)
-            expected = merge_composition_kway(
-                [(c["word"], c["n_signal"]) for c in rows if c["n_signal"] > 0]
-            )
-            assert int(g1["composition"][cell]) == expected
-            assert int(g1["count"][cell]) == sum(c["n_signal"] + c["n_noise"] for c in rows)
-        # Cells outside the leaf's span hold the packed fill word 0.
+        for rank, (per_cell, _truth) in enumerate(leaves):
+            for j in range(4):
+                rows = per_cell[4 * j : 4 * (j + 1)]
+                cell = 4 * rank + j
+                assert weights(g1, "h_sig", cell) == sum(c["n_signal"] for c in rows)
+                assert weights(g1, "h_noise", cell) == sum(c["n_noise"] for c in rows)
+                expected = merge_composition_kway(
+                    [(c["word"], c["n_signal"]) for c in rows if c["n_signal"] > 0]
+                )
+                assert int(g1["composition"][cell]) == expected
+                assert int(g1["count"][cell]) == sum(c["n_signal"] + c["n_noise"] for c in rows)
+        # Cells outside both leaves' spans hold the packed fill word 0.
         assert int(g1["composition"][15]) == 0 and weights(g1, "h_sig", 15) == 0
         # The overview's composition array is self-describing exactly as a
         # leaf's: §3.3 block with the writer-stamped halves + the manifest's.
@@ -1111,36 +1125,36 @@ class TestEndToEndStrataPyramid:
 
         # Level 0 (node -3, cell order 2): a cascade — its words must be the
         # k-way merge of the LEVEL-1 arrays' (word, n) pairs, recomputed here
-        # independently, and its weights still leaf-exact.
+        # independently, and its weights still leaf-exact. Each leaf collapses
+        # whole into ONE level-0 cell, at its own rank, so a fold window that
+        # crossed the boundary would mix the two.
         g0 = self._group(tmp_path, "-3", 2)
-        whole = 0  # the whole leaf collapses into the node's rank-0 cell
-        assert weights(g0, "h_sig", whole) == sum(c["n_signal"] for c in per_cell)
-        assert weights(g0, "h_noise", whole) == sum(c["n_noise"] for c in per_cell)
-        parts = [
-            (int(g1["composition"][i]), weights(g1, "h_sig", i))
-            for i in range(4)
-            if weights(g1, "h_sig", i) > 0
-        ]
-        assert int(g0["composition"][whole]) == merge_composition_kway(parts)
-        # Presence is exact against DIRECT truth through both folds (§3.4);
-        # the whole leaf collapses into one level-0 cell, so compare against
-        # one pooled pack of every raw row.
-        from zagg.stats.composition import pack_composition_n
-
-        pooled, pooled_n = pack_composition_n(
-            values,
-            conf_land=conf[:, 0],
-            conf_ocean=conf[:, 1],
-            conf_sea_ice=conf[:, 2],
-            conf_land_ice=conf[:, 3],
-            conf_inland_water=conf[:, 4],
-            threshold=2,
-        )
-        assert pooled_n == weights(g0, "h_sig", whole)
-        assert np.array_equal(
-            unpack_composition(int(g0["composition"][whole])) > 0,
-            unpack_composition(pooled) > 0,
-        )
+        for rank, (per_cell, (values, conf)) in enumerate(leaves):
+            assert weights(g0, "h_sig", rank) == sum(c["n_signal"] for c in per_cell)
+            assert weights(g0, "h_noise", rank) == sum(c["n_noise"] for c in per_cell)
+            parts = [
+                (int(g1["composition"][i]), weights(g1, "h_sig", i))
+                for i in range(4 * rank, 4 * (rank + 1))
+                if weights(g1, "h_sig", i) > 0
+            ]
+            assert int(g0["composition"][rank]) == merge_composition_kway(parts)
+            # Presence is exact against DIRECT truth through both folds (§3.4);
+            # this leaf collapses into one level-0 cell, so compare against one
+            # pooled pack of its every raw row.
+            pooled, pooled_n = pack_composition_n(
+                values,
+                conf_land=conf[:, 0],
+                conf_ocean=conf[:, 1],
+                conf_sea_ice=conf[:, 2],
+                conf_land_ice=conf[:, 3],
+                conf_inland_water=conf[:, 4],
+                threshold=2,
+            )
+            assert pooled_n == weights(g0, "h_sig", rank)
+            assert np.array_equal(
+                unpack_composition(int(g0["composition"][rank])) > 0,
+                unpack_composition(pooled) > 0,
+            )
 
     def test_overview_provenance_records_the_packed_law(self, tmp_path):
         import zarr
