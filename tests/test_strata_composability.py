@@ -24,6 +24,7 @@ seam (``fold_digests``).
 """
 
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -568,7 +569,7 @@ class TestCompositionFoldParity:
         assert fields["composition"] == {"class": "none"}
         assert sorted(excluded) == ["composition", "h_vec"]
 
-    def test_declaration_demotes_packed_over_a_flux_weighted_divisor(self):
+    def test_declaration_demotes_packed_over_a_flux_weighted_divisor(self, caplog):
         # Same demotion for a divisor that IS approximate but declares §2.0
         # ``weights: flux``: the law divides by that digest's summed weights
         # and ``N_signal`` is a photon count, so a flux sum is the wrong n —
@@ -605,7 +606,13 @@ class TestCompositionFoldParity:
         assert excluded == []
         # And the flux divisor demotes, while the digest itself still folds.
         flux = cfg(weights="flux", attrs={"gain": {"name": "g", "version": "1"}})
-        fields, excluded = declared_fields(flux)
+        with caplog.at_level(logging.WARNING, logger="zagg.pyramid"):
+            fields, excluded = declared_fields(flux)
+        # The demotion states its own cause: ``warn_excluded``'s generic line
+        # would send an operator to the composition reducer, not to ``of``.
+        [line] = [r.message for r in caplog.records if "composition" in r.message]
+        assert "attrs.composition.of 'h_sig'" in line
+        assert "weights='flux'" in line
         assert fields["h_sig"]["class"] == "approximate"
         assert fields["h_sig"]["weights"] == "flux"
         assert fields["composition"] == {"class": "none"}
