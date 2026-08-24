@@ -858,9 +858,11 @@ class TestTwoStoreScenarios:
         # spatially assigned.
         gap = {f"S2_{i}" for i, d in enumerate(d / 10 for d in range(0, 600, 43)) if 13 < d < 47}
         assert gap and not (ids & gap)
-        # And the near-gap acquisitions ARE selected (the epochs at the gap's
-        # shoulders reach them).
-        assert ids
+        # And the near-gap acquisitions ARE selected -- pinned by name, since
+        # a bare `assert ids` passes on any non-empty selection and so cannot
+        # fail when the shoulders stop reaching. S2_2 (day 8.6) is reached by
+        # the epochs at days 8.098/10.134, S2_12 (day 51.6) by 50.042/52.078.
+        assert {"S2_2", "S2_12"} <= ids  # the gap's shoulder epochs reach across
 
     def test_union_parity_across_stores(self, tmp_path):
         """map(A ∪ B) selects exactly union(map(A), map(B)) per shard.
