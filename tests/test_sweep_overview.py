@@ -1677,6 +1677,151 @@ class TestBothChannelsOverviewFold:
             assert _toc_contains(times[i], times_truth[0][lo:hi])
 
 
+#: The waveform-store declaration for the harness above (issue #508): the
+#: digest family's new member, per-centroid companion, no located channel —
+#: the gedi01b shape reduced to the fold-relevant keys.
+WAVEFORM_FIELDS_DECL = {
+    "count": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0},
+    "rx_flux": {
+        "class": "approximate",
+        "method": "tdigest_kway",
+        "dtype": "float32",
+        "inner_shape": [2],
+        "delta": 64,
+        "overview_delta": 64,
+        "temporal": "per-centroid",
+    },
+}
+
+
+def _waveform_leaf_cfg():
+    from zagg.config import PipelineConfig
+
+    return PipelineConfig(
+        aggregation={
+            "coordinates": {"morton": {"dtype": "uint64", "fill_value": 0}},
+            "variables": {
+                "count": {"function": "len", "dtype": "int32", "fill_value": 0},
+                "rx_flux": {
+                    "kind": "ragged",
+                    "function": "zagg.stats.waveform.build_waveform_digest",
+                    "inner_shape": [2],
+                    "temporal": "per-centroid",
+                    "dtype": "float32",
+                    "fill_value": 0,
+                },
+            },
+        }
+    )
+
+
+def _make_waveform_leaf(root, decimal, cells, *, seed=11):
+    """A committed leaf whose payloads come from ``build_waveform_digest``.
+
+    ``cells`` maps leaf row -> sample count; every sample carries an INTEGER
+    photoelectron count over a zero noise floor, so each cell's flux (the sum
+    of its centroid weights) is exactly its integer count total — sums of
+    small ints are exact in float32, which is what lets the per-level parity
+    assertions below demand equality, not closeness. Returns ``(flux_total,
+    {row: (digest, words)})``.
+    """
+    from conftest import TOC_BASE, toc_words
+    from mortie import generate_morton_children
+
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.stats.waveform import build_waveform_digest
+
+    grid = HealpixGrid(SHARD_ORDER, CELL_ORDER, config=_waveform_leaf_cfg())
+    word = morton_word(decimal)
+    store = open_store(shard_leaf_path(str(root), word))
+    grid.emit_shard_template(store, overwrite=True)
+    group = zarr.open_group(store, path=str(CELL_ORDER), mode="r+", zarr_format=3)
+    n_cells = 4 ** (CELL_ORDER - SHARD_ORDER)
+    group["morton"][:] = np.asarray(generate_morton_children(word, CELL_ORDER), dtype=np.uint64)
+    rng = np.random.default_rng(seed)
+    count = np.zeros(n_cells, np.int32)
+    digest = np.full(n_cells, b"", dtype=object)
+    times = np.full(n_cells, b"", dtype=object)
+    flux_total = 0.0
+    truth = {}
+    for i, n in cells.items():
+        values = rng.normal(0.0, 10.0, n)
+        counts = rng.integers(2, 30, n).astype(np.float64)
+        base = str(np.datetime64(TOC_BASE, "ns") + np.timedelta64(3600 * (i + 1), "s"))
+        d, w = build_waveform_digest(
+            values,
+            64,
+            counts=counts,
+            noise_mean=np.zeros(n),
+            noise_stddev=np.full(n, 0.25),
+            temporal=toc_words(n, base=base),
+        )
+        # Zero noise floor + counts >= 2 clear the clip threshold (~1.04 at
+        # the default operating point), so nothing is dropped and the digest
+        # mass IS the count total.
+        assert float(d[:, 1].sum()) == float(counts.sum())
+        count[i] = n
+        digest[i] = encode_digest(d, "float32")
+        times[i] = encode_digest(w, "uint64")
+        flux_total += float(counts.sum())
+        truth[i] = (d, w)
+    group["count"][:] = count
+    group["rx_flux"][:] = digest
+    group["rx_flux_times"][:] = times
+    stamp_commit(store, cells_with_data=len(cells), granule_count=1)
+    return flux_total, truth
+
+
+class TestWaveformOverviewFold:
+    """The runbook step-2 fold gates, in-repo (issue #508 phase 4).
+
+    A synthetic waveform store — leaves built by ``build_waveform_digest``
+    itself — swept through the production overview fold: per-level flux
+    ``weight_total`` equals the leaf total through the k-way law at EVERY
+    declared level (the weight-agnostic licensing fact, issue #431 §2), the
+    ``rx_flux_times`` sibling rides every level row-aligned, and the ragged
+    ``(2,)`` element round-trips.
+    """
+
+    def _sweep(self, tmp_path, cells, orders=(1, 0)):
+        _write_manifest(tmp_path, orders=orders, fields=WAVEFORM_FIELDS_DECL)
+        leaf_total, truth = _make_waveform_leaf(tmp_path, "-311", cells)
+        result = run_sweep(str(tmp_path), [(morton_word("-311"), None)], families=("overview",))
+        assert result["families"]["overview"]["failed"] == 0
+        return leaf_total, truth
+
+    def test_weight_total_parity_and_times_at_every_level(self, tmp_path):
+        # 300 samples at δ64 force genuine k-way merges at the fine level and
+        # a fold-of-merges at the coarse one; the mass must survive both.
+        leaf_total, _ = self._sweep(tmp_path, {0: 300, 3: 80, 7: 41})
+        for node_rel, order in (("-3/1", 3), ("-3", 2)):
+            g = _overview_group(tmp_path, node_rel, "all.zarr", order)
+            rows = [decode_digest(bytes(b), "float32") for b in g["rx_flux"][:]]
+            level_total = sum(float(d[:, 1].sum()) for d in rows if d.size)
+            assert level_total == leaf_total, f"mass lost/invented at {node_rel}"
+            words = [decode_digest(bytes(b), "uint64", ()) for b in g["rx_flux_times"][:]]
+            populated = 0
+            for d, w in zip(rows, words, strict=True):
+                assert w.shape == (d.shape[0],), "§1.1 row alignment"
+                populated += len(w)
+            assert populated > 0
+
+    def test_single_contributor_row_round_trips_byte_identical(self, tmp_path):
+        # One populated leaf row under the coarse cell: fold_digests' single-
+        # contributor arm re-encodes what it decoded, so the overview element
+        # must be the leaf's exact bytes — the (2,) element round-trip.
+        _, truth = self._sweep(tmp_path, {0: 25}, orders=(1,))
+        g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
+        raw = bytes(g["rx_flux"][:][0])
+        d = decode_digest(raw, "float32")
+        assert d.dtype == np.float32 and d.ndim == 2 and d.shape[1] == 2
+        np.testing.assert_array_equal(d, truth[0][0].astype(np.float32))
+        assert encode_digest(d, "float32") == raw
+        np.testing.assert_array_equal(
+            decode_digest(bytes(g["rx_flux_times"][:][0]), "uint64", ()), truth[0][1]
+        )
+
+
 class TestLocatedDeclarationGate:
     """The §9 declaration is checked at retrofit time AND at fold time.
 
