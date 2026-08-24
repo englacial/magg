@@ -1756,9 +1756,10 @@ def _make_waveform_leaf(root, decimal, cells, *, seed=11):
             noise_stddev=np.full(n, 0.25),
             temporal=toc_words(n, base=base),
         )
-        # Zero noise floor + counts >= 2 clear the clip threshold (~1.04 at
-        # the default operating point), so nothing is dropped and the digest
-        # mass IS the count total.
+        # Zero noise floor + counts >= 2 clear the clip threshold (0.77 at the
+        # reducer's default operating point, n_σ = 3.09 against σ = 0.25; the
+        # margin holds at the shipped gedi01b point too, n_σ = 4.49 → 1.12), so
+        # nothing is dropped and the digest mass IS the count total.
         assert float(d[:, 1].sum()) == float(counts.sum())
         count[i] = n
         digest[i] = encode_digest(d, "float32")
