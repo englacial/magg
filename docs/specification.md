@@ -944,9 +944,9 @@ staged sweep's finisher.
   anything. A `none` entry carries **`class` only** — no `method`, no
   dtype/shape metadata: there is no fold to name, and stamping a default fold
   method on an excluded field would declare a t-digest array that does not
-  exist. `exact`/`approximate` entries carry the fold `method`, any further
-  fold provenance (an `exact` fold's `nan_policy`), and enough dtype/shape
-  metadata to know the overview array's form up front. An `approximate`
+  exist. `exact`/`approximate`/`packed` entries carry the fold `method`, any
+  further fold provenance (an `exact` fold's `nan_policy`), and enough
+  dtype/shape metadata to know the overview array's form up front. An `approximate`
   entry MAY additionally carry `overview_delta` — the compression budget
   overview folds run at when it is split from the leaf `delta`
   ([issue #424](https://github.com/englacial/zagg/issues/424); both budgets
