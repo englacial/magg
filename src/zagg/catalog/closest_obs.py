@@ -130,8 +130,8 @@ def _shard_order(cover: dict, root: str) -> int:
     """
     value = cover.get("order")
     try:
-        return int(value)
-    except (TypeError, ValueError) as e:
+        return int(cover["order"])
+    except (KeyError, TypeError, ValueError) as e:
         raise ValueError(
             f"reference_epochs: store {root!r} declares a non-integer cover shard order "
             f"{value!r} — §10.5 requires it, and shard keys are parsed against it"
@@ -266,7 +266,7 @@ def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> Reference
             )
         # cover_words strict-decodes (and validates the object's pin); the
         # per-block order it drops is read back off the same grammar.
-        decoded = cover_words(obj)
+        decoded = cover_words(obj) or {}
         pinned = int(cover.get("temporal_order", TEMPORAL_COVER_ORDER))
         blocks = cover.get("shards") or {}
         for decimal, words in decoded.items():
