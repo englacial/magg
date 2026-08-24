@@ -2665,6 +2665,38 @@ class TestBasenameCollisions:
         with pytest.raises(ValueError, match="identity collision"):
             ShardMap.build(cat, hp_grid, backend="mortie")
 
+    def test_https_collision_under_distinct_s3_basenames_is_refused(self):
+        # The guard used to canonicalize ONE spelling (``s3 or https``) while
+        # ``runner._resolve_urls`` picks by driver, so an https-driver run whose
+        # https basenames collide while its s3 basenames do not was caught by
+        # neither the guard nor anything downstream (PR #482 question (1)
+        # ruling: canonicalize both spellings). The fixture pins the hole shape:
+        # the s3 canonicals MUST differ, so the old single-spelling guard --
+        # replayed over these entries -- sees nothing.
+        from zagg.telemetry import canonical_granule_id
+
+        a = {"id": "GA.h5", "s3": "s3://b/p1/GA.h5", "https": "https://h/x/Gdup.h5"}
+        b = {"id": "GB.h5", "s3": "s3://b/p2/GB.h5", "https": "https://h/y/Gdup.h5"}
+        assert canonical_granule_id(a["s3"]) != canonical_granule_id(b["s3"]), (
+            "the s3 spellings must NOT collide -- the https spelling is the hole"
+        )
+        with pytest.raises(ValueError, match="identity collision") as excinfo:
+            shardmap._refuse_basename_collisions([7], [[a, b]])
+        message = str(excinfo.value)
+        assert "'Gdup.h5'" in message
+        # Named by the s3 hrefs: for THIS pair they are what separates them.
+        assert "s3://b/p1/GA.h5" in message and "s3://b/p2/GB.h5" in message
+
+    def test_build_refuses_an_https_only_basename_collision(self, hp_grid):
+        # The same hole wired through ``build``: two catalog items whose https
+        # basenames collapse while their s3 basenames stay distinct.
+        a = _item("GA", -76.62, -76.57)
+        b = _item("GB", -76.62, -76.57)
+        for item, host in ((a, "hx"), (b, "hy")):
+            item["assets"]["data"]["href"] = f"https://{host}/Gdup.h5"
+        with pytest.raises(ValueError, match="identity collision"):
+            ShardMap.build(_catalog([a, b]), hp_grid, backend="mortie")
+
     def test_distinct_basenames_under_one_prefix_build(self, catalog, hp_grid):
         # Control: the ordinary catalog is unaffected -- the check must refuse
         # a collision, not a shard holding several granules.

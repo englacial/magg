@@ -162,13 +162,15 @@ def _granule_entry(rec: dict) -> dict:
     return entry
 
 
-def _recorded_identity(entry: dict, canonicalize=None) -> tuple[str | None, tuple]:
-    """``(canonical, distinguishing)`` for one shard entry.
+def _recorded_identity(entry: dict, canonicalize=None) -> tuple[tuple[str, ...], tuple]:
+    """``(canonicals, distinguishing)`` for one shard entry.
 
-    ``canonical`` is the granule id the leaf's D20 sidecar will carry — the
-    basename of the href the runner resolves (:func:`zagg.telemetry.canonical_granule_id`),
-    falling back to the id, then the datetime, for the raster entries that carry
-    no href. ``None`` when there is nothing to canonicalize.
+    ``canonicals`` are the granule ids a run can record for the entry — the
+    basename of **each** href spelling (:func:`zagg.telemetry.canonical_granule_id`
+    over ``s3`` and ``https``, because ``runner._resolve_urls`` picks one by
+    driver and the invariant must hold under either choice) — falling back to
+    the id, then the datetime, for the raster entries that carry no href.
+    Empty when there is nothing to canonicalize.
 
     ``distinguishing`` is what separates one granule from another. ``datetime``
     counts because :func:`zagg.telemetry.raster_granule_ids` records two
@@ -180,10 +182,17 @@ def _recorded_identity(entry: dict, canonicalize=None) -> tuple[str | None, tupl
     if canonicalize is None:
         from zagg.telemetry import canonical_granule_id as canonicalize
 
-    href = entry.get("s3") or entry.get("https")
-    named = href or entry.get("id") or entry.get("datetime")
-    canonical = canonicalize(named) if named else None
-    return canonical, (
+    named = [entry.get("s3"), entry.get("https")]
+    if not any(named):
+        named = [entry.get("id") or entry.get("datetime")]
+    canonicals: list = []
+    for n in named:
+        c = canonicalize(n) if n else ""
+        # Empty as well as absent: an href of ``s3://b/`` canonicalizes to
+        # ``""``, which is no identity at all, not an identity of ``''``.
+        if c and c not in canonicals:
+            canonicals.append(c)
+    return tuple(canonicals), (
         entry.get("id"),
         entry.get("s3"),
         entry.get("https"),
@@ -228,13 +237,14 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
     for key, entries in zip(shard_keys, granules):
         by_canonical: dict = {}
         for entry in entries:
-            canonical, distinguishing = _recorded_identity(entry, canonical_granule_id)
-            # Empty as well as absent: an id of ``"/"`` canonicalizes to ``""``,
-            # and reporting ``''`` as the collapsed id is exactly the
-            # silently-wrong identity ``canonical_granule_id`` refuses to mint.
-            if not canonical:
+            canonicals, distinguishing = _recorded_identity(entry, canonical_granule_id)
+            if not canonicals:
                 continue
-            by_canonical.setdefault(canonical, {})[distinguishing] = _collision_label(entry)
+            label = _collision_label(entry)
+            # Registered under EVERY spelling's canonical: a collision in the
+            # spelling the run's driver picks is a collision, whichever it is.
+            for canonical in canonicals:
+                by_canonical.setdefault(canonical, {})[distinguishing] = label
         # Filtered before sorting -- on every catalog zagg reads the filter
         # discards all of them, so sorting first is a per-shard sort of nothing.
         # Only the first few groups are retained: the message prints three, and a
