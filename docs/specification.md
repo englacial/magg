@@ -532,7 +532,12 @@ under D24 class **`packed`**, method **`composition_kway`** — the k-way form,
 with each contributor's `n` taken from its `of` digest's weight at the same
 cell. An overview's composition array carries the same §3.3 attrs block a
 leaf does, and its `N_signal` at every level is the folded `of` digest's
-total weight at that level (digest weights fold exactly, §2). One
+total weight at that level — exact up to §2.1's float32 bound: past `2^24`
+pooled observations that sum is the nearest float32 to the true count (§4.6),
+and the fold's divisor rounds that float to an integer. The residual is
+relative ~1e-7, orders below one lane step of 1/255, so it never moves a
+published lane; it is stated because a reader recovering counts from
+`N_signal` is entitled to the same bound §2.1 gives the digest itself. One
 consequence a reader must hold: each fold re-quantizes once, so a cascaded
 level's counts drift by at most one quantization **per level** while
 presence stays exact through the whole chain — deterministic, but not
