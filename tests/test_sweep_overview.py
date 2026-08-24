@@ -790,7 +790,14 @@ class TestWaveformPyramidDeclaration:
         assert block["spec"] == "zagg-pyramid/2"
         assert [e["node"] for e in block["overviews"]] == list(range(9, -1, -1))
         assert block["overviews"][0]["cells"] == [12]
-        assert block["overview"]["fields"]["rx_flux"]["class"] == "approximate"
+        # The manifest entry is what the /2 writers reconstruct the field
+        # from, so the block must carry the whole declaration — not just the
+        # class: the §8.3 companion shape and the resolved fold budget travel
+        # in it or the overview template loses the sibling.
+        rx = block["overview"]["fields"]["rx_flux"]
+        assert rx["class"] == "approximate"
+        assert rx["temporal"] == "per-centroid"
+        assert rx["overview_delta"] == 512
 
     def test_overview_template_emits_the_times_sibling(self, tmp_path):
         # The companion path at overview levels (issue #410, per-centroid at
@@ -800,11 +807,15 @@ class TestWaveformPyramidDeclaration:
         # leaf template does.
         from zagg.column import composable_fields
         from zagg.grids.healpix import HealpixGrid
-        from zagg.pyramid import declared_fields
-        from zagg.sweep_overview import _overview_config
+        from zagg.sweep_overview import _overview_config, build_pyramid_block
         from zagg.time_axis import temporal_declaration
 
-        fields, _ = declared_fields(self._probe_cfg())
+        # Sourced from the MANIFEST block, not from declared_fields directly,
+        # because that is the seam production walks: the staged sweep lifts
+        # pyramid.overview.fields out of the manifest and hands it on. A
+        # regression that dropped the temporal key on the way into the block
+        # fails here.
+        fields = build_pyramid_block(self._probe_cfg(), 9, 12)["overview"]["fields"]
         # The production writers template only the composable classes (the
         # sweep filters before _fold_node; the column fold filters in
         # leaf_column_plan) — the class-none companions never reach the
