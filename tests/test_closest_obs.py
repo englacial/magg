@@ -1079,3 +1079,55 @@ class TestCoarsenedCoverTolerance:
         assert rec["epochs_total"] == rec["epochs_paired"] + rec["epochs_dropped"]
         ids = {g["id"] for g in sm.granules[0]}
         assert ids == {"S2_0", "S2_1"}
+
+    def test_an_unreached_shard_still_counts_its_resolution_drops(self, tmp_path):
+        """The category is a property of the epoch, not of the catalog's reach.
+
+        Unresolvability follows from the epoch's own cover block, so it must
+        not flip to a no-acquisition row just because the raster catalog
+        never reaches the shard — an operator sizing ``max_time_offset`` off
+        ``epochs_dropped_low_resolution == 0`` would fix the catalog gap and
+        watch the same epochs reappear as resolution drops.
+        """
+        store = self._coarse_store(tmp_path)
+        cat = _s2_catalog(
+            [_s2_item("S2_far", _epoch_iso(40.0), lat=-40.0, lon=-120.0)],
+            bbox=(-121.0, -41.0, -119.0, -39.0),
+        )
+        sm = closest_obs_shardmap(
+            cat, store, grid=_grid(), backend="mortie", max_time_offset=np.timedelta64(3, "D")
+        )
+        rec = sm.metadata["closest_obs"]
+        assert rec["epochs_dropped_low_resolution"] == rec["epochs_total"] > 0
+        assert all("temporal_order" in d for d in rec["dropped"])
+        # The shard is still named: that row is about the SHARD, not its epochs.
+        assert rec["shards_without_acquisitions"] == [SHARD]
+        assert rec["epochs_total"] == rec["epochs_paired"] + rec["epochs_dropped"]
+
+    def test_an_unreached_shard_splits_coarse_from_surviving_epochs(self, tmp_path):
+        """Mixed orders + no acquisitions: each epoch lands in exactly one class."""
+        fine = _write_store(tmp_path / "fine", {SHARD: _instants(0, 5)})
+        coarse = self._coarse_store(tmp_path)
+        ref = reference_epochs([fine, coarse])
+        n_coarse = int((ref.epoch_orders[SHARD_KEY] == 12).sum())
+        n_fine = int(ref.epoch_orders[SHARD_KEY].size - n_coarse)
+        assert n_coarse > 0 and n_fine > 0
+        cat = _s2_catalog(
+            [_s2_item("S2_far", _epoch_iso(0.1), lat=-40.0, lon=-120.0)],
+            bbox=(-121.0, -41.0, -119.0, -39.0),
+        )
+        sm = closest_obs_shardmap(
+            cat,
+            [fine, coarse],
+            grid=_grid(),
+            backend="mortie",
+            max_time_offset=np.timedelta64(3, "D"),
+        )
+        rec = sm.metadata["closest_obs"]
+        assert rec["epochs_dropped_low_resolution"] == n_coarse
+        # The survivors of the precision bar become no-acquisition rows.
+        gap_rows = [d for d in rec["dropped"] if "nearest_offset_ns" in d]
+        assert len(gap_rows) == n_fine
+        assert all(d["nearest_offset_ns"] is None for d in gap_rows)
+        assert rec["shards_without_acquisitions"] == [SHARD]
+        assert rec["epochs_total"] == rec["epochs_paired"] + rec["epochs_dropped"]
