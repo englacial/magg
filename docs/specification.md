@@ -1018,9 +1018,11 @@ staged sweep's finisher.
   reconstructs a level's arrays from this entry alone, so without it the fold
   has no divisor and the overview array's §3.3 attrs block could not be
   written. A writer MUST declare a composition field `packed` only when the
-  digest `of` names is itself declared `approximate` in the same map — the
-  law divides by that digest's weight at every level, so a composition whose
-  divisor is excluded from the pyramid is declared `{"class": "none"}`
+  digest `of` names is itself declared `approximate` in the same map **and
+  carries the default §2.0 `weights: counts`** — the law divides by that
+  digest's weight at every level and `N_signal` is a photon COUNT, so a
+  composition whose divisor is excluded from the pyramid, or whose divisor is
+  flux-weighted (a different quantity), is declared `{"class": "none"}`
   instead. Readers of an older declaration finding an unknown class token
   MUST treat the field as non-composable for their purposes (fold nothing,
   read native resolution) rather than erroring — which is exactly how
