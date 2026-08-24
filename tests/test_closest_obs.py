@@ -825,7 +825,12 @@ class TestClosestObsShardmap:
 
 
 class TestTwoStoreScenarios:
-    A_DAYS = (0, 55)  # sparse, nothing near the middle
+    # Sparse, nothing near the middle. Day 13 is what makes A's selection
+    # NOT a subset of B's (it reaches S2_3, which no B epoch does), so the
+    # union-parity test below can actually fail on a dropped store; it is
+    # still clear of the gap set (its S2_3 sits at day 12.9, and the first
+    # gap acquisition at 17.2 d is 4.2 d away, past the 3 d cap).
+    A_DAYS = (0, 13, 55)
     B_DAYS = (0, 2, 4, 6, 8, 10, 50, 52, 54, 56, 58, 60)  # dense, gap 10..50
 
     def _stores(self, tmp_path):
@@ -877,9 +882,14 @@ class TestTwoStoreScenarios:
         def _pairs(sm):
             return {(k, g["id"]) for k, gr in zip(sm.shard_keys, sm.granules) for g in gr}
 
-        assert _pairs(closest_obs_shardmap(cat, [a, b], **kw)) == _pairs(
-            closest_obs_shardmap(cat, a, **kw)
-        ) | _pairs(closest_obs_shardmap(cat, b, **kw))
+        both = _pairs(closest_obs_shardmap(cat, [a, b], **kw))
+        only_a = _pairs(closest_obs_shardmap(cat, a, **kw))
+        only_b = _pairs(closest_obs_shardmap(cat, b, **kw))
+        assert both == only_a | only_b
+        # Both stores must CONTRIBUTE, or parity is satisfied by a builder that
+        # keeps only one of them: pin each side as a proper subset of the union
+        # so neither store's epochs can be silently dropped.
+        assert only_a < both and only_b < both
 
     def test_the_filtered_map_is_a_subset_of_the_spatial_map(self, tmp_path):
         from zagg.catalog.shardmap import ShardMap
@@ -900,6 +910,14 @@ class TestTwoStoreScenarios:
         sm = closest_obs_shardmap(cat, [a, b], grid=_grid(), backend="mortie")
         rec = sm.metadata["closest_obs"]
         assert "11212" in rec["shards_without_acquisitions"]
+        # Membership alone would pass while the epochs went unledgered; the
+        # shard's two cover epochs (days 1 and 3) must each show up in
+        # ``dropped`` with no offset -- there is no acquisition to measure.
+        rows = [d for d in rec["dropped"] if d["shard"] == "11212"]
+        assert len(rows) == 2
+        assert all(d["nearest_offset_ns"] is None for d in rows)
+        got = np.sort(np.array([d["epoch"] for d in rows], dtype="datetime64[ns]"))
+        assert _nearest_gap(got, _utc(_instants(1, 3))) <= HALF_BUCKET
         assert morton_word("11212") not in sm.shard_keys
 
     def test_offset_boundary_exactly_at_selects_one_ns_past_drops(self, tmp_path):
