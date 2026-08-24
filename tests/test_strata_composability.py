@@ -80,6 +80,35 @@ class TestLiveCaManifestFixture:
         assert pyramid["overview"]["fold_source"] == "cascade"
         assert pyramid["overview"]["exact_levels"] == 1
 
+    def test_declaration_writer_rebuilds_the_published_block(self):
+        # The known-answer proper: today's declaration writer, handed the CA
+        # store's grid (parent 9 / chunk_inner 13 / cell 19), rebuilds the
+        # published block — so the fixture is checked against CODE, not only
+        # against itself, and a ``build_pyramid_block`` regression fails here
+        # as loudly as a ``declared_fields`` one.
+        from zagg.sweep_overview import build_pyramid_block
+
+        config = default_config("atl03_tdigest_strata_healpix")
+        config.output["pyramid"] = {}  # the template ships ``pyramid: false``
+        config.output["grid"]["parent_order"] = 9  # the CA store's shard order
+        block = build_pyramid_block(config, 9, chunk_order=13)
+        published = json.loads(CA_MANIFEST.read_text())["pyramid"]
+        assert block["spec"] == published["spec"]
+        assert block["overviews"] == published["overviews"]  # the 9..0 ladder + cells
+        assert {k: v for k, v in block["overview"].items() if k != "fields"} == {
+            k: v for k, v in published["overview"].items() if k != "fields"
+        }
+        # The per-field map is the ONLY divergence, and only in the ruled
+        # entries: count byte-identical, composition still the recorded
+        # absence until phase 3, the two strata fields the phase-2 admission.
+        fields = block["overview"]["fields"]
+        assert set(fields) == set(CA_FIELDS_BEFORE)
+        assert [n for n in CA_FIELDS_BEFORE if fields[n] != CA_FIELDS_BEFORE[n]] == [
+            "h_tdigest_signal",
+            "h_tdigest_noise",
+        ]
+        assert fields["h_tdigest_signal"]["class"] == "approximate"
+
 
 class TestSpillGateAdmissions:
     """The spill fold already carries both laws the D24 gate declines to state."""
