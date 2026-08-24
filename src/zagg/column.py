@@ -247,7 +247,8 @@ def fold_column(slabs: dict, fields: dict, *, cell_order: int, resolutions: list
     — a D24 ``none`` field has no coarser fold and never becomes a group. A
     resolution FINER than ``cell_order`` is refused by name: it would ask for
     a fractional fold factor, which no guard downstream can read as a divisor
-    (both classes would surface it as an opaque numpy failure instead).
+    (every composable class would surface it as an opaque numpy failure
+    instead).
 
     A **located** field folds its ``{field}_locations`` sibling in the SAME
     k-way call as its payload and returns it as its own group member (ruling 4
