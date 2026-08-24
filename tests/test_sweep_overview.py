@@ -271,6 +271,38 @@ class TestComposabilityClasses:
         classes = composability_classes(default_config("gedi01b_waveform_healpix_hive"))
         assert classes["rx_flux"] == "none"
 
+    def test_where_strata_template_classifies_none_today(self):
+        # Issue #508 phase 1 baseline for the OTHER gate pair, and a pin the
+        # phase-2 registry must not flip. ``build_tdigest_where`` is already
+        # inconsistent across the two gates: ``_TDIGEST_SPILL_FUNCTIONS``
+        # admits it ("It folds k-way, like the ``build_tdigest`` it delegates
+        # to"), yet D24 tests ``_TDIGEST_FUNCTIONS`` and so classifies a
+        # where-stratum field ``none`` even though its stored payload is an
+        # ordinary (k, 2) centroid array. Per the plan (issue #508), a gate
+        # found already inconsistent is RAISED rather than silently unified:
+        # the divergence is on the issue, and the phase-2 shared registry is
+        # scoped to ``build_waveform_digest`` only -- it deliberately does NOT
+        # admit ``build_tdigest_where``, so these stay ``none`` until espg
+        # rules otherwise.
+        from zagg.config import default_config
+
+        classes = composability_classes(default_config("atl03_tdigest_strata_healpix"))
+        assert classes["h_tdigest_signal"] == "none"
+        assert classes["h_tdigest_noise"] == "none"
+        # The meta-level mechanism behind that template result.
+        assert (
+            field_composability(
+                {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest_where",
+                    "inner_shape": [2],
+                    "params": {"where": "h_ph > 0"},
+                    "dtype": "float32",
+                }
+            )
+            == "none"
+        )
+
     def test_located_declaration_rides_the_manifest_entry(self):
         # The manifest is the only description the overview WRITER has of a
         # field (``_overview_config``), so the channel has to be recorded there
