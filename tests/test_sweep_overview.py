@@ -733,11 +733,14 @@ class TestWaveformPyramidDeclaration:
         cfg = default_config("gedi01b_waveform_healpix_hive")
         cfg.output["pyramid"] = {}
         rx = cfg.aggregation["variables"]["rx_flux"]
+        # 512 is the SERC probe's literal declaration, and it coincides with
+        # the OVERVIEW_DELTA_CAP fallback under δ4096 — so this value alone
+        # cannot prove the declaration is read. The δ128 variant below does.
         rx["overview_delta"] = 512
         rx["params"]["delta"] = 4096  # the probe's uniform-δ override
         return cfg
 
-    def test_probe_config_declares_the_ladder(self, caplog):
+    def test_probe_config_declares_the_ladder(self):
         from zagg.pyramid import declared_fields
 
         fields, excluded = declared_fields(self._probe_cfg())
@@ -754,6 +757,13 @@ class TestWaveformPyramidDeclaration:
             "temporal": "per-centroid",
         }
         assert "rx_flux" not in excluded
+        # Non-vacuous pin on the SAME probe config: the capped fallback can
+        # only ever yield min(4096, 512) = 512, so a budget the cap cannot
+        # produce shows the DECLARED value wins here too (the generic law is
+        # test_declared_fields_records_the_resolved_budget).
+        capped = self._probe_cfg()
+        capped.aggregation["variables"]["rx_flux"]["overview_delta"] = 128
+        assert declared_fields(capped)[0]["rx_flux"]["overview_delta"] == 128
         assert fields["count"]["class"] == "exact"
         # The per-record companions keep the ruled option-A absence: scalar
         # reducers without an exact law declare class only, at native
