@@ -239,8 +239,15 @@ def _basename_collision_message(shard_keys, granules) -> str | None:
     Split from the refusal so ``from_json`` / ``from_parquet`` can WARN with it
     instead: refusing at load would make a pre-#468 manifest unreadable (PR #482
     question (2) ruling — historical maps stay readable, the hazard visible).
+
+    An entry with NO recorded identity — nothing canonicalizes to a granule id —
+    warns rather than being skipped silently (PR #482 question (6) ruling): it
+    contributes nothing to ``granules_sha256`` and the guard cannot see it, but
+    ``_resolve_urls`` drops href-less records by design, so it is not refused.
     """
     n_collisions = 0
+    n_unidentified = 0
+    first_unidentified = None
     shown: list = []
     # Imported once rather than per entry: this runs over every granule of every
     # shard, 555,867 of them at clone scale.
@@ -251,6 +258,9 @@ def _basename_collision_message(shard_keys, granules) -> str | None:
         for entry in entries:
             canonicals, distinguishing = _recorded_identity(entry, canonical_granule_id)
             if not canonicals:
+                n_unidentified += 1
+                if first_unidentified is None:
+                    first_unidentified = (key, _collision_label(entry))
                 continue
             label = _collision_label(entry)
             # Registered under EVERY spelling's canonical: a collision in the
@@ -264,6 +274,16 @@ def _basename_collision_message(shard_keys, granules) -> str | None:
         found = sorted((c, sorted(n.values())) for c, n in by_canonical.items() if len(n) > 1)
         n_collisions += len(found)
         shown += [(key, c, named) for c, named in found[: max(0, 4 - len(shown))]]
+    if n_unidentified:
+        key, label = first_unidentified
+        warnings.warn(
+            f"ShardMap: {n_unidentified} shard entry(s) carry no recorded identity — "
+            f"nothing on them canonicalizes to a granule id, so they contribute nothing "
+            f"to the shard's catalog identity (granules_sha256) and the collision guard "
+            f"cannot see them (issue #468). First: shard {key} {label!r}.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
     if not n_collisions:
         return None
     listed = "; ".join(f"shard {k} {c!r} <- {named}" for k, c, named in shown[:3])
