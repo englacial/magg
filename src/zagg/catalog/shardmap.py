@@ -228,6 +228,18 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
     are one granule listed twice and pass — coarsen unions sibling shards, where
     a granule spanning several children legitimately arrives more than once.
     """
+    message = _basename_collision_message(shard_keys, granules)
+    if message is not None:
+        raise ValueError(message)
+
+
+def _basename_collision_message(shard_keys, granules) -> str | None:
+    """The :func:`_refuse_basename_collisions` report, or ``None`` when clean.
+
+    Split from the refusal so ``from_json`` / ``from_parquet`` can WARN with it
+    instead: refusing at load would make a pre-#468 manifest unreadable (PR #482
+    question (2) ruling — historical maps stay readable, the hazard visible).
+    """
     n_collisions = 0
     shown: list = []
     # Imported once rather than per entry: this runs over every granule of every
@@ -253,9 +265,9 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
         n_collisions += len(found)
         shown += [(key, c, named) for c, named in found[: max(0, 4 - len(shown))]]
     if not n_collisions:
-        return
+        return None
     listed = "; ".join(f"shard {k} {c!r} <- {named}" for k, c, named in shown[:3])
-    raise ValueError(
+    return (
         f"ShardMap: {n_collisions} per-shard granule identity collision(s) — granules "
         f"assigned to one shard record as ONE granule id, so the shard's catalog identity "
         f"names fewer granules than it reads (issue #468). Usually one basename under two "
@@ -263,6 +275,28 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
         f"once, or de-collide the basenames; the entries below are named by whatever "
         f"separates them: {listed}{' ...' if n_collisions > 3 else ''}"
     )
+
+
+def _warn_loaded_collisions(sm: "ShardMap", path: str) -> "ShardMap":
+    """Warn — never refuse — when a LOADED manifest carries an identity collision.
+
+    ``from_json`` / ``from_parquet`` read manifests built before the #468 guard
+    existed; refusing would make a historical map unreadable (PR #482 question
+    (2) ruling). The hazard the warning names: a leaf gate reading this map
+    records fewer granules than it reads, and ``refine`` silently drops one
+    collided member (issue #512).
+    """
+    message = _basename_collision_message(sm.shard_keys, sm.granules)
+    if message is not None:
+        warnings.warn(
+            f"{path}: this manifest predates the construction-time identity guard "
+            f"and would be refused by it; loading anyway (historical maps stay "
+            f"readable), but note refine silently drops a collided member "
+            f"(issue #512). {message}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return sm
 
 
 #: Granule-id core for the catalog-time sibling join (issue #425): the
@@ -1894,13 +1928,14 @@ class ShardMap:
         for key in ("grid_signature", "shard_keys", "granules"):
             if key not in d:
                 raise ValueError(f"{path}: missing required key {key!r}")
-        return cls(
+        sm = cls(
             d["grid_signature"],
             d["shard_keys"],
             d["granules"],
             d.get("metadata", {}),
             d.get("aoi_mask"),
         )
+        return _warn_loaded_collisions(sm, path)
 
     # Schema-metadata key for the manifest's non-columnar payload (parquet form).
     _PARQUET_META_KEY = b"zagg:shardmap_meta"
@@ -1959,7 +1994,8 @@ class ShardMap:
             if "aoi_mask" in table.column_names
             else None
         )
-        return cls(d["grid_signature"], shard_keys, granules, d.get("metadata", {}), aoi_mask)
+        sm = cls(d["grid_signature"], shard_keys, granules, d.get("metadata", {}), aoi_mask)
+        return _warn_loaded_collisions(sm, path)
 
 
 __all__ = ["ShardMap", "sibling_join_key"]
