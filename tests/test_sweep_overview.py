@@ -816,10 +816,11 @@ class TestWaveformPyramidDeclaration:
         # regression that dropped the temporal key on the way into the block
         # fails here.
         fields = build_pyramid_block(self._probe_cfg(), 9, 12)["overview"]["fields"]
-        # The production writers template only the composable classes (the
-        # sweep filters before _fold_node; the column fold filters in
-        # leaf_column_plan) — the class-none companions never reach the
-        # template, which is what the last assertion pins.
+        # The production writers template only the composable classes — on the
+        # /2 path, which is the one this store declares: run_stage_sweep
+        # filters the manifest map before _write_stage_overview, and the
+        # worker column filters in leaf_column_plan. The class-none companions
+        # never reach the template, which is what the last assertion pins.
         grid = HealpixGrid(2, 4, config=_overview_config(composable_fields(fields)), sharded=True)
         grid.emit_shard_template(open_store(str(tmp_path / "ov.zarr")), overwrite=True)
         group = zarr.open_group(
