@@ -2709,15 +2709,21 @@ class TestBasenameCollisions:
         entry = {"id": "G.h5", "s3": "s3://b/p1/G.h5", "https": "https://h/p1/G.h5"}
         shardmap._refuse_basename_collisions([7], [[entry, dict(entry)]])
 
-    def test_an_entry_with_nothing_to_canonicalize_is_skipped(self):
-        # Raster entries carry no href and may carry no id (their identity is
-        # the acquisition datetime); nothing to name is nothing to collide.
-        # The two entries must DIFFER in their distinguishing fields, else the
-        # skip branch could be deleted and this would still pass -- they would
-        # dedup rather than collide (issue #468 review finding (3)).
-        shardmap._refuse_basename_collisions(
-            [7], [[{"id": None, "s3": None, "https": None}, {"id": "", "s3": None, "https": None}]]
-        )
+    def test_an_entry_with_nothing_to_canonicalize_warns_and_is_skipped(self):
+        # Nothing to name is nothing to collide, so no refusal -- but silence
+        # was hiding an entry with NO recorded identity, arguably worse than a
+        # collision (PR #482 question (6) ruling: warn, never refuse). The two
+        # entries must DIFFER in their distinguishing fields, else the skip
+        # branch could be deleted and this would still pass -- they would dedup
+        # rather than collide (issue #468 review finding (3)).
+        with pytest.warns(RuntimeWarning, match="no recorded identity") as record:
+            shardmap._refuse_basename_collisions(
+                [7],
+                [[{"id": None, "s3": None, "https": None}, {"id": "", "s3": None, "https": None}]],
+            )
+        # One warning carrying the count, not one warning per entry.
+        assert len(record) == 1
+        assert "2 shard entry(s)" in str(record[0].message)
 
     def _colliding_fine_map(self, catalog, fine_grid):
         """A fine map whose two sibling shards each hold one of a colliding
@@ -2808,20 +2814,22 @@ class TestBasenameCollisions:
         # -- were discarded upstream of the check, not by it.
         assert {g["id"] for g in entries} == {"Gdup"}
 
-    def test_an_id_that_canonicalizes_to_empty_is_skipped(self):
+    def test_an_id_that_canonicalizes_to_empty_warns_and_is_skipped(self):
         # ``canonical_granule_id("/")`` strips the separator down to "", which
         # is falsy but not None -- an ``is None`` guard let it through as a
         # live bucket key and would report ``''`` as the collapsed granule id
-        # (issue #468 review finding (3)).
+        # (issue #468 review finding (3)). Post-question-(6) the skip is loud.
         from zagg.telemetry import canonical_granule_id
 
         assert canonical_granule_id("/") == "" and canonical_granule_id("//") == ""
         # BOTH must canonicalize to "" and differ in their distinguishing
         # fields: with an ``is None`` guard they share the "" bucket and this
         # raises, which is what makes the test fail against the unfixed code.
-        shardmap._refuse_basename_collisions(
-            [7], [[{"id": "/", "s3": None, "https": None}, {"id": "//", "s3": None, "https": None}]]
-        )
+        with pytest.warns(RuntimeWarning, match="no recorded identity"):
+            shardmap._refuse_basename_collisions(
+                [7],
+                [[{"id": "/", "s3": None, "https": None}, {"id": "//", "s3": None, "https": None}]],
+            )
 
     def test_more_than_three_collisions_are_counted_and_truncated(self):
         # The operator-facing message shows the first three groups and says so;
