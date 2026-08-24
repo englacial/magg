@@ -49,6 +49,10 @@ HALF_BUCKET = np.timedelta64(BUCKET_NS // 2, "ns")
 #: AOI tests use (order 4; centre from ``mortie.mort2geo``).
 SHARD = "11213"
 SHARD_KEY = morton_word(SHARD)
+#: The shard next door (centre lat 14.54, lon 59.06) — the cross-shard join
+#: tests need a second shard the single-shard fixture never exercised.
+SHARD_B = "11212"
+SHARD_B_KEY = morton_word(SHARD_B)
 
 
 def _ring(lat, lon, half=2.0):
@@ -617,6 +621,7 @@ class TestClosestObsShardmap:
             )
         rec = sm.metadata["closest_obs"]
         assert rec["epochs_dropped"] == 1 and len(rec["dropped"]) == 1
+        assert rec["epochs_total"] == rec["epochs_paired"] + rec["epochs_dropped"]
         assert rec["dropped"][0]["shard"] == SHARD
         assert rec["dropped"][0]["nearest_offset_ns"] is not None
         assert any("selected nothing" in m for m in caplog.messages)
@@ -693,3 +698,22 @@ class TestClosestObsShardmap:
         sm = closest_obs_shardmap(cat, store, grid=grid, backend="mortie")
         assert sm.aoi_mask is None
         assert "aoi_mask" not in sm.metadata
+
+    def test_a_shard_the_catalog_never_reaches_ledgers_its_epochs(self, tmp_path, caplog):
+        # Two-shard cover, one-shard catalog: the unreached shard's epochs are
+        # dropped ROWS, not silence — epochs_total reconciles by construction.
+        store = _write_store(
+            tmp_path / "ref", {SHARD: _instants(0, 5, 11), SHARD_B: _instants(0, 5, 11, 17)}
+        )
+        items = [_s2_item(f"S2_{i}", _epoch_iso(d)) for i, d in enumerate((0.1, 5.2, 20.0))]
+        with caplog.at_level(logging.WARNING, logger="zagg.catalog.closest_obs"):
+            sm = closest_obs_shardmap(_s2_catalog(items), store, grid=_grid(), backend="mortie")
+        rec = sm.metadata["closest_obs"]
+        assert sm.shard_keys == [SHARD_KEY]
+        assert rec["shards_without_acquisitions"] == [SHARD_B]
+        assert rec["epochs_paired"] == 3
+        assert rec["epochs_total"] == rec["epochs_paired"] + rec["epochs_dropped"]
+        rows = [d for d in rec["dropped"] if d["shard"] == SHARD_B]
+        assert len(rows) == rec["epochs_dropped"] > 0
+        assert all(d["nearest_offset_ns"] is None for d in rows)
+        assert any("NO spatially-assigned acquisitions" in m for m in caplog.messages)

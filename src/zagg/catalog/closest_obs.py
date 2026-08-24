@@ -532,7 +532,9 @@ def closest_obs_shardmap(
     (ISO instants of every epoch that selected the granule) and
     ``epoch_offsets_ns`` (row-aligned SIGNED ``acquisition - epoch`` ns).
     ``metadata["closest_obs"]`` records the query: the reference stores, the
-    epoch totals, every dropped epoch with its near-miss offset, shards
+    epoch totals, every dropped epoch with its near-miss offset (``None``
+    where there was no acquisition to measure against, so
+    ``epochs_total == epochs_paired + epochs_dropped`` holds), shards
     whose epochs found no acquisition at all, and any cover blocks coarsened
     below the §10.5 pin. Epochs are bucket midpoints, good to half a bucket
     (:meth:`ReferenceEpochs.tolerance`) — size ``max_time_offset`` with that
@@ -579,6 +581,15 @@ def closest_obs_shardmap(
         i = spatial_idx.get(shard)
         if i is None:
             no_acquisitions.append(decimal)
+            # Ledger the epochs too: a shard the catalog never reaches is the
+            # largest drop class in practice, and leaving it out of ``dropped``
+            # made the numbers an operator reconciles read "nothing dropped".
+            # ``nearest_offset_ns`` is None -- no acquisition to measure
+            # against, the meaning the key already carries.
+            dropped.extend(
+                {"shard": decimal, "epoch": np.datetime_as_string(t), "nearest_offset_ns": None}
+                for t in epoch_arr
+            )
             continue
         entries = spatial.granules[i]
         times = _acquisition_times(entries, decimal)
@@ -610,7 +621,8 @@ def closest_obs_shardmap(
     if dropped:
         logger.warning(
             f"closest_obs_shardmap: {len(dropped)} epoch(s) selected nothing "
-            f"(max_time_offset={max_time_offset!r}); e.g. {dropped[:3]} — every drop is "
+            f"(max_time_offset={max_time_offset!r}, or no acquisitions in the shard); "
+            f"e.g. {dropped[:3]} — every drop is "
             f"recorded in metadata['closest_obs']['dropped']"
         )
     if no_acquisitions:
