@@ -676,3 +676,20 @@ class TestClosestObsShardmap:
         cat = _s2_catalog([item])
         with pytest.raises(ValueError, match="acquisition time"):
             closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+
+    def test_the_spatial_aoi_mask_is_neither_carried_nor_claimed(self, tmp_path):
+        # The strict-AOI payload (#101) belongs to the spatial map; the derived
+        # map carries none, so its metadata must not advertise one either.
+        from zagg.catalog.shardmap import ShardMap
+        from zagg.config import default_config
+        from zagg.grids import HealpixGrid
+
+        cfg = default_config("atl06")
+        cfg.output = {**cfg.output, "aoi_mask": True}
+        grid = HealpixGrid(4, 6, config=cfg)
+        store, cat = self._setup(tmp_path)
+        spatial = ShardMap.build(cat, grid, backend="mortie")
+        assert spatial.aoi_mask is not None and spatial.metadata["aoi_mask"] is True
+        sm = closest_obs_shardmap(cat, store, grid=grid, backend="mortie")
+        assert sm.aoi_mask is None
+        assert "aoi_mask" not in sm.metadata

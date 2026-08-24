@@ -537,6 +537,12 @@ def closest_obs_shardmap(
     below the §10.5 pin. Epochs are bucket midpoints, good to half a bucket
     (:meth:`ReferenceEpochs.tolerance`) — size ``max_time_offset`` with that
     slack in mind.
+
+    The strict-AOI per-shard mask (``output.aoi_mask``, issue #101) is the
+    SPATIAL map's payload and is not carried onto the emitted map, so the
+    ``aoi_mask`` metadata claim is dropped with it: an ``output.aoi_mask``
+    ingest run must compute its mask at run time rather than read one off
+    this manifest.
     """
     from zagg.catalog.shardmap import ShardMap
     from zagg.grids.morton import morton_decimal
@@ -680,6 +686,11 @@ def closest_obs_shardmap(
         "granules_assigned": len({g["id"] for shard in granules for g in shard}),
         "closest_obs": closest_meta,
     }
+    # The spatial build's per-shard strict-AOI mask is NOT carried onto this
+    # derived map (``aoi_mask=None`` below), so the metadata must stop
+    # advertising one -- the same guard ``reproject`` applies to a derived map
+    # (``shardmap.py:1738``).
+    meta.pop("aoi_mask", None)
     return ShardMap(spatial.grid_signature, shard_keys, granules, meta, None)
 
 
