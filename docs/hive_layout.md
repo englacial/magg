@@ -637,7 +637,10 @@ millisecond-bearing STAC `datetime` on the raster path
 (`processing/raster._us_iso`). The narrowing is recorded rather than fixed
 (ruled on [PR #398](https://github.com/englacial/zagg/pull/398)): no in-tree
 consumer prunes on `time_range` — every use is a union into the regenerable
-root `coverage.moc` summary or the overview rollup — and rendering the range
+root `coverage.moc` summary or the overview rollup, or a skip-if-current
+comparison between two identically-rendered values (`sweep.MocFamily.finish`,
+which rewrites the root object only when the union widens what is already
+recorded) — and rendering the range
 outward instead would change the bytes of a stamp field external readers
 decode.
 
