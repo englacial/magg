@@ -163,10 +163,18 @@ def sweep_stage_pass(
     cell_order = int(manifest["cell_order"])
     levels = ladder_entries(pyramid, shard_order)
     decl = pyramid.get("overview") if isinstance(pyramid.get("overview"), dict) else {}
+    # THE shared admission predicate (:func:`zagg.column._is_composable`), not a
+    # literal class list: this map goes to ``stage_node`` unfiltered and reaches
+    # ``_merge_slabs``/``_gather_slabs`` directly, so a ``packed`` entry without
+    # its ``of`` linkage would read ``group[None]`` inside ``_ColumnReader.read``
+    # — a ``TypeError`` that guard does not catch, aborting the whole pass. Every
+    # admission site routes through the one predicate (review finding).
+    from zagg.column import _is_composable
+
     fields = {
         n: dict(m)
         for n, m in (decl.get("fields") or {}).items()
-        if isinstance(m, dict) and m.get("class") in ("exact", "approximate", "packed")
+        if isinstance(m, dict) and _is_composable(m)
     }
     summary: dict = {"run_id": run_id, "tuple_width": int(tuple_width), "stages": []}
     if not fields:
