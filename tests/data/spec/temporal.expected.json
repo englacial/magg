@@ -205,7 +205,7 @@
  "cover": {
   "object": "coverage.toc",
   "spec": "zagg-coverage-toc-cover/1",
-  "temporal_order": 16,
+  "temporal_order": 18,
   "cap": 512,
   "fields": [
    "h_tdigest"
@@ -219,12 +219,12 @@
   "encoding": "base64",
   "count": 2,
   "words": [
-   "10689012241831559168",
-   "10689856666761789440"
+   "10689223348064092160",
+   "10690067772994322432"
   ],
   "gap_ns": [
    "5344646857781936128",
-   "5344928332758646784"
+   "5345033885874913280"
   ]
  },
  "declarations": {

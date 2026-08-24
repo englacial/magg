@@ -1947,13 +1947,13 @@ class TestRootCoverageTemporalSection:
         # at the shard's effective order — the cross-object consistency claim.
         from mortie import toc_reduce
 
-        from zagg.coverage_toc import TEMPORAL_DAY_ORDER, cover_words, quantize_words
+        from zagg.coverage_toc import TEMPORAL_COVER_ORDER, cover_words, quantize_words
 
         obj = self._cover()
         shard = _expected("temporal")["shard"]
         words = cover_words(obj)[shard]
         order = obj["shards"][shard].get("temporal_order", obj["temporal_order"])
-        assert order == TEMPORAL_DAY_ORDER
+        assert order == TEMPORAL_COVER_ORDER
         tier1 = coverage_toc(self._envelope())[shard]
         assert int(toc_reduce(words)) == int(toc_reduce(quantize_words([tier1], order)))
 

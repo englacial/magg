@@ -2531,7 +2531,7 @@ is *unknown*, a candidate — never *empty*.
   "source": "sweep",
   "generated_at": "2026-08-23T02:41:00+00:00",
   "order": 4,
-  "temporal_order": 16,
+  "temporal_order": 18,
   "cap": 512,
   "fields": ["h_tdigest"],
   "element": {"dtype": "uint64", "shape": [-1]},
@@ -2554,7 +2554,7 @@ is *unknown*, a candidate — never *empty*.
   the carrier's `order` is; keys are D1 decimal shard ids at that order,
   exactly as §10.2's are.
 - **`temporal_order`** (required) — the object's pinned quantization order,
-  below. This revision's producers write **16**.
+  below. This revision's producers write **18**.
 - **`cap`** (required) — the overflow cap the producer enforced, below. This
   revision's producers write **512**.
 - **`fields`** (required) — provenance, with §10.1 `fields` semantics
@@ -2592,14 +2592,21 @@ rounding of its own; the one exception is the scale ceiling, where the top
 bucket's end clamps to the grammar's maximum encodable end (`TOC_MAX_NS`) —
 still containing every encodable input word.
 
-The pinned **day order is 16**: bucket span `2^47` ns ≈ 39.1 h, the finest
-order whose span is at least one day (order 17's `2^46` ns ≈ 19.5 h is
-shorter than a day). Derived, not chosen freely: the ladder is the grammar's
-own power-of-two structure, and "≥ 1 day" is the resolution floor this
-surface promises (campaign/pass structure, not sub-orbit timing). Note the
-bucket span is not the *gap* promise: a surviving gap needs a whole aligned
-bucket to itself (below), so the **guaranteed gap floor is two spans**,
-`2 × 2^47` ns ≈ 78.2 h ≈ 3.26 days.
+The pinned **cover order is 18**: bucket span `2^45` ns ≈ 9.77 h
+(espg-ruled on [issue #489](https://github.com/englacial/zagg/issues/489),
+2026-08-24). The ladder is the grammar's own power-of-two structure; the
+rung on it is chosen for the *consumer*, because nothing else constrains
+it: correctness is order-independent (quantization only widens at any
+order), and storage is flat (a pass is ~one word at any rung near this
+one). Order 18 resolves consecutive-day revisits that ≥-day spans fuse,
+and holds the epoch error of a cover-bucket midpoint to ±half a span
+≈ ±4.9 h — small against the closest-observation Sentinel-2 consumer's
+~4.3-day revisit cadence, where a ±19.5 h midpoint error (the ≥-1-day
+rung, order 16) would not be. A future time-dense source is absorbed by
+the cap below, never by re-pinning. Note the bucket span is not the *gap*
+promise: a surviving gap needs a whole aligned bucket to itself (below),
+so the **guaranteed gap floor is two spans**, `2 × 2^45` ns ≈ 19.5 h ≈
+0.81 days.
 
 Three consequences, all normative:
 
@@ -2619,7 +2626,7 @@ Three consequences, all normative:
   survives only when it happens to straddle a bucket boundary the right
   way — alignment, i.e. data-dependent, so a consumer MUST NOT reason on it.
   The guaranteed floor a consumer may rely on is therefore `2 × 2^(63 − o)`
-  ns — at the pinned order 16, ≈ 78.2 h. "Is there data in `[t0, t1)`"
+  ns — at the pinned order 18, ≈ 19.5 h. "Is there data in `[t0, t1)`"
   answers per shard from this object alone, down to that floor.
 - **Quantization commutes with union and with the envelope join**, which is
   what makes the per-leaf fold exact (the cover of a union of leaves is the
