@@ -801,3 +801,17 @@ class TestClosestObsShardmap:
         # Resolved to ring parts before it reaches the build, never the path.
         assert isinstance(calls[0]["region"], list)
         assert sm.shard_keys == [SHARD_KEY]
+
+    def test_reprojecting_a_paired_map_drops_the_provenance(self, tmp_path):
+        # Pins the documented trap: ShardMap._granule_entry does not know the
+        # two provenance keys, so even the same-order noop branch strips them
+        # while metadata["closest_obs"] rides through describing the SOURCE
+        # map. Carrying them through reproject is a shardmap.py change left
+        # standing for review — until then, rebuild, never reproject.
+        store, cat = self._setup(tmp_path)
+        sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+        assert "paired_epochs" in sm.granules[0][0]
+        noop = sm.reproject(_grid())
+        assert "paired_epochs" not in noop.granules[0][0]
+        assert "epoch_offsets_ns" not in noop.granules[0][0]
+        assert noop.metadata["closest_obs"] == sm.metadata["closest_obs"]
