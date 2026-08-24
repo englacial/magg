@@ -717,3 +717,17 @@ class TestClosestObsShardmap:
         assert len(rows) == rec["epochs_dropped"] > 0
         assert all(d["nearest_offset_ns"] is None for d in rows)
         assert any("NO spatially-assigned acquisitions" in m for m in caplog.messages)
+
+    def test_a_start_datetime_only_record_still_emits_a_datetime(self, tmp_path):
+        # STAC's null-datetime + start/end_datetime form pairs on ``time_start``;
+        # the emitted entry must carry the ``datetime`` raster dispatch reads.
+        store, _ = self._setup(tmp_path)
+        item = _s2_item("S2_range", _epoch_iso(0))
+        item["properties"]["datetime"] = None
+        item["properties"]["start_datetime"] = _epoch_iso(0)
+        item["properties"]["end_datetime"] = _epoch_iso(1)
+        cat = _s2_catalog([item])
+        assert "datetime" not in cat.granule_records()[0]  # the fixture really lacks it
+        sm = closest_obs_shardmap(cat, store, grid=_grid(), backend="mortie")
+        entry = sm.granules[0][0]
+        assert entry["datetime"] == entry["time_start"]
