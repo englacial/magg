@@ -568,6 +568,49 @@ class TestCompositionFoldParity:
         assert fields["composition"] == {"class": "none"}
         assert sorted(excluded) == ["composition", "h_vec"]
 
+    def test_declaration_demotes_packed_over_a_flux_weighted_divisor(self):
+        # Same demotion for a divisor that IS approximate but declares §2.0
+        # ``weights: flux``: the law divides by that digest's summed weights
+        # and ``N_signal`` is a photon count, so a flux sum is the wrong n —
+        # the packed fold arms never reach ``check_weights_match``, so the
+        # declaration is the only place this pairing can be refused.
+        from zagg.config import PipelineConfig
+
+        def cfg(**digest):
+            return PipelineConfig(
+                aggregation={
+                    "variables": {
+                        "h_sig": {
+                            "kind": "ragged",
+                            "function": "zagg.stats.tdigest.build_tdigest",
+                            "inner_shape": [2],
+                            "dtype": "float32",
+                            **digest,
+                        },
+                        "composition": {
+                            "function": "zagg.stats.composition.pack_composition",
+                            "dtype": "uint64",
+                            "fill_value": 0,
+                            "params": {"threshold": 2},
+                            "attrs": {"composition": {"of": "h_sig", "threshold": 2}},
+                        },
+                    }
+                }
+            )
+
+        # The counts control: the same pairing folds.
+        fields, excluded = declared_fields(cfg())
+        assert fields["composition"]["class"] == "packed"
+        assert fields["composition"]["of"] == "h_sig"
+        assert excluded == []
+        # And the flux divisor demotes, while the digest itself still folds.
+        flux = cfg(weights="flux", attrs={"gain": {"name": "g", "version": "1"}})
+        fields, excluded = declared_fields(flux)
+        assert fields["h_sig"]["class"] == "approximate"
+        assert fields["h_sig"]["weights"] == "flux"
+        assert fields["composition"] == {"class": "none"}
+        assert excluded == ["composition"]
+
 
 def _strata_leaf_cfg():
     """The synthetic strata leaf config: the CA shape at test scale."""

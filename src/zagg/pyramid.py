@@ -160,10 +160,12 @@ def declared_fields(config) -> tuple[dict, list]:
 
     A ``packed`` field is demoted to ``none`` (and excluded) when the digest
     its ``attrs.composition.of`` names is not itself declared ``approximate``
-    here: the law divides by that digest's per-cell weight at every level
-    (spec §3.3/§3.4), so composition folds only where its divisor does —
-    declaring a fold whose ``n`` no overview carries would be the same
-    dishonesty the class exists to end.
+    here, or when that digest declares non-default §2.0 ``weights``: the law
+    divides by that digest's per-cell weight at every level (spec §3.3/§3.4),
+    so composition folds only where its divisor does *and* only where that
+    divisor is a count — declaring a fold whose ``n`` no overview carries, or
+    whose ``n`` is a flux sum, would be the same dishonesty the class exists
+    to end.
     """
     from zagg.config import get_agg_fields
     from zagg.semantics import EXACT_MERGE_LAWS, _fold_function_name, composability_classes
@@ -242,7 +244,15 @@ def declared_fields(config) -> tuple[dict, list]:
         elif cls == "packed":
             block = (meta.get("attrs") or {}).get("composition") or {}
             of = block.get("of")
-            if classes.get(of) != "approximate":
+            # The divisor must ALSO be a §2.0 counts digest: the law divides by
+            # that digest's summed centroid weights (``payload_weight`` rounds
+            # them to an int) and ``N_signal`` is a photon COUNT, so a
+            # flux-weighted digest is the wrong ``n`` — wrong-but-plausible
+            # lanes, which is the failure mode the issue #424 weights gate
+            # exists to stop and which the packed fold arms never reach (they
+            # never call ``check_weights_match``). Demoted here instead.
+            of_weights = (agg.get(of) or {}).get("weights") if of else None
+            if classes.get(of) != "approximate" or of_weights not in (None, "counts"):
                 fields[name] = {"class": "none"}
                 excluded.append(name)
                 continue
