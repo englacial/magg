@@ -230,12 +230,14 @@ def _refuse_basename_collisions(shard_keys, granules) -> None:
     are one granule listed twice and pass — coarsen unions sibling shards, where
     a granule spanning several children legitimately arrives more than once.
     """
-    message = _basename_collision_message(shard_keys, granules)
+    message = _basename_collision_message(shard_keys, granules, stacklevel=4)
     if message is not None:
         raise ValueError(message)
 
 
-def _basename_collision_message(shard_keys, granules) -> str | None:
+def _basename_collision_message(
+    shard_keys, granules, *, stacklevel: int = 3, source: str | None = None
+) -> str | None:
     """The :func:`_refuse_basename_collisions` report, or ``None`` when clean.
 
     Split from the refusal so ``from_json`` / ``from_parquet`` can WARN with it
@@ -246,6 +248,10 @@ def _basename_collision_message(shard_keys, granules) -> str | None:
     warns rather than being skipped silently (PR #482 question (6) ruling): it
     contributes nothing to ``granules_sha256`` and the guard cannot see it, but
     ``_resolve_urls`` drops href-less records by design, so it is not refused.
+
+    ``stacklevel`` counts from HERE, so each caller passes its own depth — the
+    warning must land on whoever asked for the map, not on the wrapper. ``source``
+    names the manifest on the load path, where the operator has no other pointer.
     """
     n_collisions = 0
     n_unidentified = 0
@@ -289,12 +295,13 @@ def _basename_collision_message(shard_keys, granules) -> str | None:
     if n_unidentified:
         key, label = first_unidentified
         warnings.warn(
+            f"{source + ': ' if source else ''}"
             f"ShardMap: {n_unidentified} shard entry(s) carry no recorded identity — "
             f"nothing on them canonicalizes to a granule id, so they contribute nothing "
             f"to the shard's catalog identity (granules_sha256) and the collision guard "
             f"cannot see them (issue #468). First: shard {key} {label!r}.",
             RuntimeWarning,
-            stacklevel=3,
+            stacklevel=stacklevel,
         )
     if not n_collisions:
         return None
@@ -318,7 +325,7 @@ def _warn_loaded_collisions(sm: "ShardMap", path: str) -> "ShardMap":
     records fewer granules than it reads, and ``refine`` silently drops one
     collided member (issue #512).
     """
-    message = _basename_collision_message(sm.shard_keys, sm.granules)
+    message = _basename_collision_message(sm.shard_keys, sm.granules, stacklevel=4, source=path)
     if message is not None:
         warnings.warn(
             f"{path}: this manifest predates the construction-time identity guard "
