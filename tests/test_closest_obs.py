@@ -418,21 +418,40 @@ class TestNearestAcquisitions:
         with pytest.raises(ValueError, match="non-negative"):
             nearest_acquisitions(self._dt(1), self._dt(0), max_time_offset=-np.timedelta64(1, "h"))
 
-    def test_matches_a_brute_force_oracle(self):
-        rng = np.random.default_rng(7)
-        base = np.datetime64("2025-01-01").astype("datetime64[ns]").astype("int64")
-        times = (base + rng.integers(0, 400 * 86_400, 60) * 10**9).astype("datetime64[ns]")
-        epochs = (base + rng.integers(0, 400 * 86_400, 45) * 10**9).astype("datetime64[ns]")
-        cap = np.timedelta64(2, "D")
+    def test_duplicate_acquisition_times_select_the_first_record(self):
+        # One datatake, three granules at the same instant, plus a far one.
+        times = self._dt(0, 0, 0, 96)
+        for epoch in (self._dt(-1), self._dt(0), self._dt(1)):
+            sel, _ = nearest_acquisitions(epoch, times)
+            assert sel.tolist() == [0]
+
+    def _check_oracle(self, epochs, times, cap):
+        """Brute force: nearest, ties to the earlier, then the lowest index."""
         sel, off = nearest_acquisitions(epochs, times, max_time_offset=cap)
         t = times.astype("int64")
         for k, e in enumerate(epochs.astype("int64")):
             d = np.abs(t - e)
             best = np.flatnonzero(d == d.min())
-            # tie -> earlier acquisition
+            # tie -> earlier acquisition; equal times -> lowest catalog index
             want = best[np.argmin(t[best])] if best.size > 1 else best[0]
             assert off[k] == np.timedelta64(int(t[want] - e), "ns")
             if d.min() <= cap.astype("timedelta64[ns]").astype("int64"):
                 assert sel[k] == want
             else:
                 assert sel[k] == -1
+
+    def test_matches_a_brute_force_oracle(self):
+        rng = np.random.default_rng(7)
+        base = np.datetime64("2025-01-01").astype("datetime64[ns]").astype("int64")
+        times = (base + rng.integers(0, 400 * 86_400, 60) * 10**9).astype("datetime64[ns]")
+        epochs = (base + rng.integers(0, 400 * 86_400, 45) * 10**9).astype("datetime64[ns]")
+        self._check_oracle(epochs, times, np.timedelta64(2, "D"))
+
+    def test_matches_the_oracle_with_every_acquisition_time_duplicated(self):
+        rng = np.random.default_rng(7)
+        base = np.datetime64("2025-01-01").astype("datetime64[ns]").astype("int64")
+        raw = base + rng.integers(0, 400 * 86_400, 20) * 10**9
+        # Every instant carried by two catalog records, interleaved out of order.
+        times = np.concatenate([raw, raw]).astype("datetime64[ns]")
+        epochs = (base + rng.integers(0, 400 * 86_400, 30) * 10**9).astype("datetime64[ns]")
+        self._check_oracle(epochs, times, np.timedelta64(2, "D"))
