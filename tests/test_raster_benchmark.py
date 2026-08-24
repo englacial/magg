@@ -47,8 +47,10 @@ def test_s2_neon_o9_tracks_the_shipped_sentinel2_config():
     # The leg's config claims to be the shipped src/zagg/configs/sentinel2_l2a.yaml
     # with the o9 dispatch shard (issue #451); hold it to that mechanically so a
     # knob added to one and not the other (as time_encoding was, issue #443)
-    # cannot drift silently. Divergence budget: parent_order and the harness's
-    # pyramid opt-out -- both packaging, so the semantic hash (D19) matches.
+    # cannot drift silently. Divergence budget: parent_order -- packaging, so
+    # the semantic hash (D19) matches. (The pyramid opt-out left the budget when
+    # issue #459 restated it on the shipped config too: both sides declare
+    # ``pyramid: false`` and the dict comparison below now covers it.)
     from zagg.config import get_store_layout, load_config
     from zagg.semantics import semantic_hash
 
@@ -63,7 +65,7 @@ def test_s2_neon_o9_tracks_the_shipped_sentinel2_config():
     def normalized(cfg):
         # store is a run-local output path (the harness overrides it); grid
         # indexing_scheme is descriptive-only (config.py rejects any other value).
-        out = {k: v for k, v in cfg.output.items() if k not in ("store", "grid", "pyramid")}
+        out = {k: v for k, v in cfg.output.items() if k not in ("store", "grid")}
         out["store_layout"] = get_store_layout(cfg)
         out["grid"] = {k: v for k, v in cfg.output["grid"].items() if k != "indexing_scheme"}
         return out
@@ -72,13 +74,10 @@ def test_s2_neon_o9_tracks_the_shipped_sentinel2_config():
     assert b["grid"].pop("parent_order") == 9
     assert s["grid"].pop("parent_order") == 11
     assert b == s
-    # pyramid is dropped from the dict comparison above, so pin both sides of it
-    # explicitly: the shipped config growing an overview declaration (the issue
-    # #382 grammar) would otherwise turn the family on for the product while the
-    # leg keeps measuring it off, at an unchanged semantic hash -- output.pyramid
-    # is not in semantic_core, so the D19 assertion cannot see it either.
+    # ``pyramid`` rides the b == s comparison (semantic_hash cannot see it --
+    # output.pyramid is not in semantic_core), so also pin the VALUE the pair
+    # agrees on: both configs declare the overview family off (issue #459).
     assert bench.output["pyramid"] is False
-    assert "pyramid" not in shipped.output
 
 
 def test_pinned_s2_catalog_carries_raster_entries():
