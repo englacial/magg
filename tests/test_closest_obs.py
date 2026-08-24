@@ -440,6 +440,36 @@ class TestNearestAcquisitions:
             else:
                 assert sel[k] == -1
 
+    def test_an_unconvertible_max_time_offset_refuses_by_name(self):
+        with pytest.raises(ValueError, match="does not convert exactly to nanoseconds"):
+            nearest_acquisitions(
+                self._dt(1), self._dt(0), max_time_offset=np.timedelta64(1000, "Y")
+            )
+
+    def test_a_nat_max_time_offset_refuses(self):
+        with pytest.raises(ValueError, match="must be a real duration"):
+            nearest_acquisitions(self._dt(1), self._dt(0), max_time_offset=np.timedelta64("NaT"))
+
+    def test_a_gap_past_int64_nanoseconds_never_pairs_under_a_cap(self):
+        # 584 years apart — a real distance that timedelta64[ns] cannot carry.
+        times = np.array(["1677-09-22T00:12:44"], dtype="datetime64[ns]")
+        epochs = np.array(["2262-04-11T23:47:16"], dtype="datetime64[ns]")
+        for cap in (np.timedelta64(1, "D"), np.timedelta64(120, "D")):
+            sel, off = nearest_acquisitions(epochs, times, max_time_offset=cap)
+            assert sel.tolist() == [-1]
+            assert np.isnat(off).all()
+        # Uncapped, the nearest is still the nearest; the offset saturates to NaT.
+        sel, off = nearest_acquisitions(epochs, times)
+        assert sel.tolist() == [0]
+        assert np.isnat(off).all()
+
+    def test_a_two_century_gap_still_reports_an_exact_offset(self):
+        times = np.array(["1800-01-01", "2150-01-01"], dtype="datetime64[ns]")
+        epochs = np.array(["2000-01-01"], dtype="datetime64[ns]")
+        sel, off = nearest_acquisitions(epochs, times)
+        assert sel.tolist() == [1]
+        assert off[0] == times[1] - epochs[0]
+
     def test_a_nat_acquisition_time_refuses(self):
         times = np.array(["2025-06-01T00", "NaT", "2025-06-01T10"], dtype="datetime64[ns]")
         with pytest.raises(ValueError, match="times carries NaT"):

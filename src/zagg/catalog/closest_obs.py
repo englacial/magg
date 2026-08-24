@@ -323,7 +323,8 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
         An epoch whose nearest acquisition lies further than this selects
         nothing. Exactly-at selects; one ns past does not. A bare int means
         nanoseconds. ``None`` (default) always selects the nearest, however
-        far. Negative refuses. Callers gating against the epochs' own
+        far. Negative refuses, and so does a duration that will not convert
+        to nanoseconds (``np.timedelta64(1000, "Y")`` overflows int64 ns). Callers gating against the epochs' own
         precision should widen by :meth:`ReferenceEpochs.tolerance` — a
         cover epoch is a bucket midpoint, good to half a bucket, not exact.
 
@@ -338,8 +339,13 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
         nearest acquisition — positive when the acquisition follows the
         epoch. Reported for every epoch, dropped ones included (the loud
         record a drop rides — the builder's report needs the near-miss
-        distance, not just the fact of the drop); ``NaT`` only when
-        ``times`` is empty.
+        distance, not just the fact of the drop). ``NaT`` when ``times`` is
+        empty, and for the offset that will not fit ``timedelta64[ns]`` —
+        selection is exact over the whole ``datetime64[ns]`` span (~584
+        years), but a *difference* past ~292 years is unrepresentable, so it
+        saturates to ``NaT`` rather than reporting a wrapped duration. Such
+        an epoch selects nothing under any cap (no finite tolerance reaches
+        it) and still selects its nearest with ``max_time_offset=None``.
 
     Raises
     ------
@@ -367,7 +373,16 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
             raise ValueError(f"{name} carries NaT ({int(np.isnat(arr).sum())} of {arr.size})")
     cap = None
     if max_time_offset is not None:
-        cap = int(np.timedelta64(max_time_offset).astype("timedelta64[ns]").astype("int64"))
+        offset = np.timedelta64(max_time_offset)
+        if np.isnat(offset):
+            raise ValueError(f"max_time_offset must be a real duration (got {max_time_offset!r})")
+        as_ns = offset.astype("timedelta64[ns]")
+        if as_ns.astype(offset.dtype) != offset:
+            raise ValueError(
+                "max_time_offset does not convert exactly to nanoseconds "
+                f"(got {max_time_offset!r}; timedelta64[ns] spans ~292 years)"
+            )
+        cap = int(as_ns.astype("int64"))
         if cap < 0:
             raise ValueError(f"max_time_offset must be non-negative (got {max_time_offset!r})")
     selection = np.full(epochs.shape, -1, dtype=np.int64)
@@ -378,11 +393,15 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
     ts = times[order].astype("int64")
     e = epochs.astype("int64")
     pos = np.searchsorted(ts, e)  # left insertion point
-    far = np.iinfo(np.int64).max
-    # Distances to the flanking acquisitions; ``far`` marks a missing flank
-    # (epoch before the first / after the last acquisition).
-    left = np.where(pos > 0, e - ts[np.maximum(pos - 1, 0)], far)
-    right = np.where(pos < ts.size, ts[np.minimum(pos, ts.size - 1)] - e, far)
+    # Flank distances as UNSIGNED magnitudes. Both are non-negative by
+    # construction (``e >= ts[pos - 1]`` and ``ts[pos] >= e``), and mod-2^64
+    # subtraction of the int64 bit patterns is exact across the whole
+    # datetime64[ns] span — an int64 ``e - ts`` wraps silently for a pair
+    # more than ~292 years apart, which then passes the cap gate.
+    tsu, eu = ts.view(np.uint64), e.view(np.uint64)
+    far = np.uint64(2**64 - 1)  # a missing flank, wider than any real span
+    left = np.where(pos > 0, eu - tsu[np.maximum(pos - 1, 0)], far)
+    right = np.where(pos < ts.size, tsu[np.minimum(pos, ts.size - 1)] - eu, far)
     # Strict ``<`` keeps a tie on the LEFT (earlier) neighbor; an epoch equal
     # to an acquisition has ``right == 0`` and selects it exactly.
     take_right = right < left
@@ -393,10 +412,15 @@ def nearest_acquisitions(epochs, times, *, max_time_offset=None):
     # either side.
     nearest = np.searchsorted(ts, ts[nearest], side="left")
     selection = order[nearest].astype(np.int64)
-    signed = np.where(take_right, right, -left)
-    offsets = signed.astype("timedelta64[ns]")
+    magnitude = np.where(take_right, right, left)
+    # A magnitude past int64 ns is a real distance the report cannot carry:
+    # saturate it to NaT rather than wrap it into a plausible-looking day.
+    fits = magnitude <= np.uint64(np.iinfo(np.int64).max)
+    signed = np.minimum(magnitude, np.uint64(np.iinfo(np.int64).max)).astype(np.int64)
+    offsets = np.where(take_right, signed, -signed).astype("timedelta64[ns]")
+    offsets = np.where(fits, offsets, np.timedelta64("NaT"))
     if cap is not None:
-        selection = np.where(np.abs(signed) <= cap, selection, np.int64(-1))
+        selection = np.where(magnitude <= np.uint64(cap), selection, np.int64(-1))
     return selection, offsets
 
 
