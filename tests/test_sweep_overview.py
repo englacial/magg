@@ -1845,14 +1845,17 @@ class TestWaveformOverviewFold:
             assert populated > 0
 
     def test_single_contributor_row_round_trips_byte_identical(self, tmp_path):
-        # One populated leaf row under the coarse cell: fold_digests' single-
-        # contributor arm re-encodes what it decoded, so the overview element
-        # must be the leaf's exact bytes — the (2,) element round-trip.
+        # One populated leaf row under the coarse cell: whichever arm serves it
+        # (the k-way merge is byte-idempotent on one digest, so the two are
+        # indistinguishable here — ``TestBothChannelsOverviewFold`` parametrizes
+        # them apart), the overview element must be the leaf's EXACT bytes and
+        # words. The ragged (2,) element of a builder-origin payload survives
+        # the fold and re-encodes byte-identically.
         _, truth = self._sweep(tmp_path, {0: 25}, orders=(1,))
         g = _overview_group(tmp_path, "-3/1", "all.zarr", 3)
         raw = bytes(g["rx_flux"][:][0])
         d = decode_digest(raw, "float32")
-        assert d.dtype == np.float32 and d.ndim == 2 and d.shape[1] == 2
+        assert d.ndim == 2 and d.shape[1] == 2
         np.testing.assert_array_equal(d, truth[0][0].astype(np.float32))
         assert encode_digest(d, "float32") == raw
         np.testing.assert_array_equal(
