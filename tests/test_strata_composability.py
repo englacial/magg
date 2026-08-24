@@ -825,3 +825,18 @@ class TestEndToEndStrataPyramid:
             assert block["fold_source"] == source
             entry = dict(block["fields"]["composition"])
             assert entry == {"class": "packed", "method": "composition_kway"}
+
+    def test_provenance_defaults_the_method_by_class(self):
+        # A manifest entry with no ``method`` — never written by
+        # ``declared_fields``, but manifests outlive their writer and may come
+        # from an external one (spec §4.5) — must not have a packed field's
+        # provenance claim the digest law over a dense composition word.
+        from zagg.sweep_overview import COMPOSITION_LAW, TDIGEST_LAW, _field_provenance
+
+        assert _field_provenance({"class": "packed"}) == {
+            "class": "packed",
+            "method": COMPOSITION_LAW,
+        }
+        assert _field_provenance({"class": "approximate"})["method"] == TDIGEST_LAW
+        # An explicit method still wins over the class default.
+        assert _field_provenance({"class": "packed", "method": "x"})["method"] == "x"
