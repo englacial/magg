@@ -527,8 +527,11 @@ def closest_obs_shardmap(
 
     Notes
     -----
-    Selected granule entries gain two provenance keys so the eventual paired
-    product is reconstructable from the manifest alone: ``paired_epochs``
+    A selected entry whose record carries no ``datetime`` (STAC's null-datetime
+    + ``start_datetime`` form) is emitted with ``datetime`` backfilled from
+    ``time_start`` — the same instant the pairing used, and the key raster
+    dispatch requires. Selected granule entries also gain two provenance keys
+    so the eventual paired product is reconstructable from the manifest alone: ``paired_epochs``
     (ISO instants of every epoch that selected the granule) and
     ``epoch_offsets_ns`` (row-aligned SIGNED ``acquisition - epoch`` ns).
     ``metadata["closest_obs"]`` records the query: the reference stores, the
@@ -607,9 +610,19 @@ def closest_obs_shardmap(
                     }
                 )
                 continue
+            src = entries[sel[j]]
             entry = chosen.setdefault(
                 int(sel[j]),
-                {**entries[sel[j]], "paired_epochs": [], "epoch_offsets_ns": []},
+                {
+                    **src,
+                    # STAC allows ``datetime: null`` beside start/end_datetime,
+                    # but raster dispatch keys off ``datetime``
+                    # (``runner._raster_windowed_units``). Emit the instant the
+                    # pairing actually used so the map dispatches as built.
+                    "datetime": src.get("datetime") or src.get("time_start"),
+                    "paired_epochs": [],
+                    "epoch_offsets_ns": [],
+                },
             )
             entry["paired_epochs"].append(iso)
             entry["epoch_offsets_ns"].append(None if np.isnat(off[j]) else int(off_ns[j]))
