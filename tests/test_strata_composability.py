@@ -61,8 +61,15 @@ class TestLiveCaManifestFixture:
         assert manifest["spec"] == "morton-hive/1"
         assert manifest["shard_order"] == 9
         assert manifest["cell_order"] == 19
-        # Identity of the record: this is the store the issue names, not a
-        # synthetic reconstruction.
+        # Identity of the RECORD, not of a config: this hash names the store
+        # the issue is about, and no config in the tree reproduces it — the
+        # shipped template hashes 0ac7d33b..., the benchmark strata config
+        # 5ebf740f.... So the before/after below is pinned against reality
+        # for the per-field DECLARATION only; the store's semantic core is
+        # not rebuildable from here. It is also a FROZEN manifest key
+        # (``hive._FROZEN_MANIFEST_KEYS``), so the retrofit write the PR body
+        # plans against this root needs ``overwrite=True`` or ``ensure_manifest``
+        # refuses it.
         assert (
             manifest["semantic_hash"]
             == "b9b15fdde78f147c15c929da8ca93de21930ad5c552ae082c5d8998fb83ada21"
