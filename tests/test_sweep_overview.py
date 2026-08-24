@@ -259,6 +259,18 @@ class TestComposabilityClasses:
             == "approximate"
         )
 
+    def test_gedi_waveform_template_classifies_none_today(self):
+        # Issue #508 phase 1 baseline: the SHIPPED template's rx_flux —
+        # build_waveform_digest with a per-centroid clock — is D24 class
+        # ``none`` today, which is exactly what the SERC probe observed
+        # (manifest ``{"class": "none"}``, no ladder, even with pyramid on).
+        # The meta-level pin above records the mechanism; this one records
+        # that the template hits it.
+        from zagg.config import default_config
+
+        classes = composability_classes(default_config("gedi01b_waveform_healpix_hive"))
+        assert classes["rx_flux"] == "none"
+
     def test_located_declaration_rides_the_manifest_entry(self):
         # The manifest is the only description the overview WRITER has of a
         # field (``_overview_config``), so the channel has to be recorded there
