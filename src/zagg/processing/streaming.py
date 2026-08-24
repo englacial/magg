@@ -81,11 +81,18 @@ _TDIGEST_SPILL_FUNCTIONS = (*_TDIGEST_FUNCTIONS, _TDIGEST_WHERE_FUNCTION)
 #: :func:`validate_spill_fold`: those gates re-run BUILDERS over raw rows (per
 #: flush / per block), and the waveform builder's noise-model columns are not
 #: threaded there — the tuples above keep their exact members (the issue #508
-#: phase-1 characterization pins that posture). ``build_tdigest_where`` is
-#: likewise NOT here: its D24 class stays ``none`` pending the gate-drift
-#: ruling raised on issue #508.
+#: phase-1 characterization pins that posture). ``build_tdigest_where`` IS
+#: here (espg-ruled admit, 2026-08-24, issue #515, resolving the gate drift
+#: raised on issue #508): stratum membership is row selection *before* the
+#: build, so its stored payload is an ordinary §2 centroid array that folds by
+#: the same k-way law — the spill gate had said so since issue #370 while D24
+#: still classified strata fields ``none``.
 _WAVEFORM_DIGEST_FUNCTION = "zagg.stats.waveform.build_waveform_digest"
-_DIGEST_FAMILY_FUNCTIONS = (*_TDIGEST_FUNCTIONS, _WAVEFORM_DIGEST_FUNCTION)
+_DIGEST_FAMILY_FUNCTIONS = (
+    *_TDIGEST_FUNCTIONS,
+    _WAVEFORM_DIGEST_FUNCTION,
+    _TDIGEST_WHERE_FUNCTION,
+)
 
 #: The packed composition reducer (issue #321): the SPILL fold collapses its
 #: per-block ``(word, n_signal)`` pairs in one pass via

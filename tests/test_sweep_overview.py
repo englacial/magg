@@ -268,10 +268,12 @@ class TestComposabilityClasses:
         assert classes["rx_flux"] == "approximate"
 
     def test_digest_family_registry_members_pinned_by_value(self):
-        # The issue #508 contract: ONE new registry, existing tuples keep
-        # their exact members. Pinned by value so a drive-by addition to any
-        # of the three is a loud diff, not a silent gate widening (the mortie
-        # #194 lesson; the where-gate question is standing on issue #508).
+        # The issue #508 contract: ONE registry, existing tuples keep their
+        # exact members. Pinned by value so a drive-by addition to any of the
+        # three is a loud diff, not a silent gate widening (the mortie #194
+        # lesson). ``build_tdigest_where`` joined the family by espg ruling
+        # (admit, 2026-08-24, issue #515) — the one deliberate widening; the
+        # streaming/spill gate tuples are unchanged by it.
         from zagg.processing.streaming import (
             _DIGEST_FAMILY_FUNCTIONS,
             _TDIGEST_FUNCTIONS,
@@ -289,26 +291,21 @@ class TestComposabilityClasses:
         assert _DIGEST_FAMILY_FUNCTIONS == (
             *_TDIGEST_FUNCTIONS,
             "zagg.stats.waveform.build_waveform_digest",
+            "zagg.stats.tdigest.build_tdigest_where",
         )
 
-    def test_where_strata_template_classifies_none_today(self):
-        # Issue #508 phase 1 baseline for the OTHER gate pair, and a pin the
-        # phase-2 registry must not flip. ``build_tdigest_where`` is already
-        # inconsistent across the two gates: ``_TDIGEST_SPILL_FUNCTIONS``
-        # admits it ("It folds k-way, like the ``build_tdigest`` it delegates
-        # to"), yet D24 tests ``_TDIGEST_FUNCTIONS`` and so classifies a
-        # where-stratum field ``none`` even though its stored payload is an
-        # ordinary (k, 2) centroid array. Per the plan (issue #508), a gate
-        # found already inconsistent is RAISED rather than silently unified:
-        # the divergence is on the issue, and the phase-2 shared registry is
-        # scoped to ``build_waveform_digest`` only -- it deliberately does NOT
-        # admit ``build_tdigest_where``, so these stay ``none`` until espg
-        # rules otherwise.
+    def test_where_strata_template_classifies_approximate(self):
+        # The issue #508 gate drift, resolved by espg's ruling on issue #515
+        # (admit, 2026-08-24): ``build_tdigest_where`` is in the digest-family
+        # registry, so the shipped strata template's fields classify
+        # ``approximate`` — the same k-way law the spill gate had admitted
+        # since issue #370 (its stored payload is an ordinary (k, 2) centroid
+        # array; row selection precedes the build).
         from zagg.config import default_config
 
         classes = composability_classes(default_config("atl03_tdigest_strata_healpix"))
-        assert classes["h_tdigest_signal"] == "none"
-        assert classes["h_tdigest_noise"] == "none"
+        assert classes["h_tdigest_signal"] == "approximate"
+        assert classes["h_tdigest_noise"] == "approximate"
         # The meta-level mechanism behind that template result.
         assert (
             field_composability(
@@ -316,6 +313,20 @@ class TestComposabilityClasses:
                     "kind": "ragged",
                     "function": "zagg.stats.tdigest.build_tdigest_where",
                     "inner_shape": [2],
+                    "params": {"where": "h_ph > 0"},
+                    "dtype": "float32",
+                }
+            )
+            == "approximate"
+        )
+        # The inner-shape guard applies to the strata builder like every
+        # family member.
+        assert (
+            field_composability(
+                {
+                    "kind": "ragged",
+                    "function": "zagg.stats.tdigest.build_tdigest_where",
+                    "inner_shape": [3],
                     "params": {"where": "h_ph > 0"},
                     "dtype": "float32",
                 }
