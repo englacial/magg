@@ -15,7 +15,12 @@ import numpy as np
 import pytest
 from mortie import from_datetime64, time2toc, to_datetime64
 
-from zagg.catalog.closest_obs import ReferenceEpochs, _word_midpoints, reference_epochs
+from zagg.catalog.closest_obs import (
+    ReferenceEpochs,
+    _word_midpoints,
+    nearest_acquisitions,
+    reference_epochs,
+)
 from zagg.coverage_toc import (
     COVER_CAP,
     COVER_NAME,
@@ -347,3 +352,87 @@ class TestGoldenFixture:
         hi = np.datetime64("2020-01-01")
         e = out.epochs[SHARD_KEY]
         assert ((e > lo) & (e < hi)).all()
+
+
+class TestNearestAcquisitions:
+    """Phase 2 — the vectorized closest-1 selection core."""
+
+    def _dt(self, *hours):
+        return np.array(
+            [np.datetime64("2025-06-01T00:00") + np.timedelta64(h, "h") for h in hours]
+        ).astype("datetime64[ns]")
+
+    def test_each_epoch_selects_its_nearest_acquisition(self):
+        times = self._dt(0, 10, 24)
+        epochs = self._dt(1, 9, 23)
+        sel, off = nearest_acquisitions(epochs, times)
+        assert sel.tolist() == [0, 1, 2]
+        assert off.astype("timedelta64[h]").astype(int).tolist() == [-1, 1, 1]
+
+    def test_offsets_are_signed_acquisition_minus_epoch(self):
+        times = self._dt(12)
+        epochs = self._dt(10, 14)
+        sel, off = nearest_acquisitions(epochs, times)
+        assert sel.tolist() == [0, 0]
+        assert off[0] == np.timedelta64(2, "h") and off[1] == -np.timedelta64(2, "h")
+
+    def test_an_exact_match_has_zero_offset(self):
+        times = self._dt(5, 7)
+        sel, off = nearest_acquisitions(self._dt(7), times)
+        assert sel.tolist() == [1] and off[0] == np.timedelta64(0, "ns")
+
+    def test_a_tie_selects_the_earlier_acquisition(self):
+        times = self._dt(0, 10)
+        sel, off = nearest_acquisitions(self._dt(5), times)
+        assert sel.tolist() == [0]
+        assert off[0] == -np.timedelta64(5, "h")
+
+    def test_selection_indices_refer_to_the_input_order(self):
+        times = self._dt(24, 0, 10)  # unsorted catalog order
+        sel, _ = nearest_acquisitions(self._dt(23, 1), times)
+        assert sel.tolist() == [0, 1]
+
+    def test_max_time_offset_boundary_exactly_at_selects(self):
+        times = self._dt(0)
+        sel, off = nearest_acquisitions(self._dt(6), times, max_time_offset=np.timedelta64(6, "h"))
+        assert sel.tolist() == [0]
+
+    def test_max_time_offset_one_ns_past_drops_but_still_reports(self):
+        times = self._dt(0)
+        cap = np.timedelta64(6, "h") - np.timedelta64(1, "ns")
+        sel, off = nearest_acquisitions(self._dt(6), times, max_time_offset=cap)
+        assert sel.tolist() == [-1]
+        # The nearest offset is still reported — the loud record the drop rides.
+        assert off[0] == -np.timedelta64(6, "h")
+
+    def test_no_acquisitions_selects_nothing_and_reports_nat(self):
+        sel, off = nearest_acquisitions(self._dt(1, 2), np.array([], dtype="datetime64[ns]"))
+        assert sel.tolist() == [-1, -1]
+        assert np.isnat(off).all()
+
+    def test_no_epochs_is_empty(self):
+        sel, off = nearest_acquisitions(np.array([], dtype="datetime64[ns]"), self._dt(0))
+        assert sel.size == 0 and off.size == 0
+
+    def test_a_negative_max_time_offset_refuses(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            nearest_acquisitions(self._dt(1), self._dt(0), max_time_offset=-np.timedelta64(1, "h"))
+
+    def test_matches_a_brute_force_oracle(self):
+        rng = np.random.default_rng(7)
+        base = np.datetime64("2025-01-01").astype("datetime64[ns]").astype("int64")
+        times = (base + rng.integers(0, 400 * 86_400, 60) * 10**9).astype("datetime64[ns]")
+        epochs = (base + rng.integers(0, 400 * 86_400, 45) * 10**9).astype("datetime64[ns]")
+        cap = np.timedelta64(2, "D")
+        sel, off = nearest_acquisitions(epochs, times, max_time_offset=cap)
+        t = times.astype("int64")
+        for k, e in enumerate(epochs.astype("int64")):
+            d = np.abs(t - e)
+            best = np.flatnonzero(d == d.min())
+            # tie -> earlier acquisition
+            want = best[np.argmin(t[best])] if best.size > 1 else best[0]
+            assert off[k] == np.timedelta64(int(t[want] - e), "ns")
+            if d.min() <= cap.astype("timedelta64[ns]").astype("int64"):
+                assert sel[k] == want
+            else:
+                assert sel[k] == -1
