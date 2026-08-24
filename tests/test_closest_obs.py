@@ -32,8 +32,10 @@ DAY_NS = 86_400 * 10**9
 #: An arbitrary but realistic base instant on the §8 internal-ns scale
 #: (mirrors ``test_coverage_toc``'s convention).
 BASE_NS = 5_344_000_000_000_000_000
-#: Half an order-18 cover bucket (2^45 ns) — the epoch-midpoint error bound.
-HALF_BUCKET = np.timedelta64(2 ** (63 - TEMPORAL_COVER_ORDER) // 2, "ns")
+#: One order-18 cover bucket (2^45 ns) and half of it — the epoch-midpoint
+#: error bound is half a BUCKET, not half a word (a word is a run of buckets).
+BUCKET_NS = 2 ** (63 - TEMPORAL_COVER_ORDER)
+HALF_BUCKET = np.timedelta64(BUCKET_NS // 2, "ns")
 
 #: The golden fixture's one shard, and the cell centre / far-away rings the
 #: AOI tests use (order 4; centre from ``mortie.mort2geo``).
@@ -67,6 +69,15 @@ def _instants(*day_offsets) -> np.ndarray:
     return np.array([BASE_NS + d * DAY_NS for d in day_offsets], dtype=np.uint64)
 
 
+def _utc(instants) -> np.ndarray:
+    return np.sort(np.asarray(to_datetime64(np.asarray(instants, np.uint64)), "datetime64[ns]"))
+
+
+def _nearest_gap(mids: np.ndarray, true: np.ndarray) -> np.timedelta64:
+    """Largest distance from a true instant to its nearest epoch."""
+    return np.abs(true[:, None] - mids[None, :]).min(axis=1).max()
+
+
 class TestWordMidpoints:
     def test_empty_words_decode_to_no_epochs(self):
         out = _word_midpoints(np.empty(0, dtype=np.uint64))
@@ -80,10 +91,49 @@ class TestWordMidpoints:
         assert mids.size == true.size
         assert (np.abs(mids - true) <= HALF_BUCKET).all()
 
-    def test_an_exact_timestamp_word_decodes_to_its_own_instant(self):
+    def test_an_exact_timestamp_word_decodes_to_its_bucket_midpoint(self):
+        """An unquantized word still resolves to the bucket it falls in."""
         inst = _instants(3)
         mids = _word_midpoints(np.asarray(time2toc(inst), dtype=np.uint64))
-        assert mids[0] == np.asarray(to_datetime64(inst), dtype="datetime64[ns]")[0]
+        assert mids.size == 1
+        assert abs(mids[0] - _utc(inst)[0]) <= HALF_BUCKET
+
+    def test_two_passes_one_bucket_apart_yield_two_epochs(self):
+        """``toc_normalize`` coalesces the abutting buckets into ONE word."""
+        inst = np.array([BASE_NS, BASE_NS + BUCKET_NS], dtype=np.uint64)
+        words = quantize_words(time2toc(inst))
+        assert len(words) == 1  # the coalescing that motivates the expansion
+        mids = np.sort(_word_midpoints(words))
+        assert mids.size == 2
+        assert _nearest_gap(mids, _utc(inst)) <= HALF_BUCKET
+
+    def test_a_contiguous_campaign_yields_one_epoch_per_covered_bucket(self):
+        """A 10-day, 6-hourly campaign is one word — and 25 covered buckets."""
+        inst = np.array([BASE_NS + i * 6 * 3600 * 10**9 for i in range(40)], dtype=np.uint64)
+        words = quantize_words(time2toc(inst))
+        assert len(words) == 1
+        covered = {int(t) >> (63 - TEMPORAL_COVER_ORDER) for t in inst}
+        mids = np.sort(_word_midpoints(words))
+        assert mids.size == len(covered) == 25
+        assert _nearest_gap(mids, _utc(inst)) <= HALF_BUCKET
+
+    def test_a_pass_straddling_a_bucket_edge_yields_two_epochs(self):
+        """Benign over-selection: both epochs pick the same nearest granule."""
+        edge = ((BASE_NS >> (63 - TEMPORAL_COVER_ORDER)) + 1) << (63 - TEMPORAL_COVER_ORDER)
+        inst = np.array([edge - 60 * 10**9, edge + 60 * 10**9], dtype=np.uint64)
+        words = quantize_words(time2toc(inst))
+        assert len(words) == 1
+        mids = np.sort(_word_midpoints(words))
+        assert mids.size == 2
+        assert _nearest_gap(mids, _utc(inst)) <= HALF_BUCKET
+
+    def test_a_coarser_order_widens_the_buckets(self):
+        """The block's effective order drives the expansion, not the pin."""
+        inst = np.array([BASE_NS, BASE_NS + BUCKET_NS], dtype=np.uint64)
+        coarse = quantize_words(time2toc(inst), TEMPORAL_COVER_ORDER - 2)
+        mids = _word_midpoints(coarse, TEMPORAL_COVER_ORDER - 2)
+        assert mids.size == 1  # both passes now share one 39 h bucket
+        assert _nearest_gap(mids, _utc(inst)) <= 4 * HALF_BUCKET
 
 
 class TestReferenceEpochs:
