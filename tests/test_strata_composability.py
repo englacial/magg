@@ -826,6 +826,37 @@ class TestEndToEndStrataPyramid:
             entry = dict(block["fields"]["composition"])
             assert entry == {"class": "packed", "method": "composition_kway"}
 
+    def test_packed_drift_checks_the_stored_composition_block(self, tmp_path):
+        # The retrofit gate's packed arm: a leaf whose §3.3 block declares
+        # another spec, another lane order, or nothing at all is a store this
+        # declaration does not describe — the words are merged lane-wise BY
+        # POSITION under this writer's constants, so folding through it would
+        # produce a well-formed wrong word.
+        import zarr
+
+        from zagg.grids.morton import morton_word
+        from zagg.hive import shard_leaf_path
+        from zagg.store import open_store
+        from zagg.sweep_overview import _field_drift
+
+        per_cell, _ = _strata_cells(k=16, n=20, seed=517)
+        manifest = self._build_store(tmp_path, per_cell)
+        meta = manifest["pyramid"]["overview"]["fields"]["composition"]
+        store = open_store(shard_leaf_path(str(tmp_path), morton_word("-311")))
+        group = zarr.open_group(store, path=str(self.CELL_ORDER), mode="r+", zarr_format=3)
+        arr = group["composition"]
+        assert _field_drift(group, "composition", meta) is None
+
+        block = dict(arr.attrs["composition"])
+        arr.attrs["composition"] = {**block, "spec": "zagg-composition/2"}
+        assert "composition spec" in _field_drift(group, "composition", meta)
+        arr.attrs["composition"] = {**block, "lanes": list(reversed(block["lanes"]))}
+        assert "lanes" in _field_drift(group, "composition", meta)
+        arr.attrs["composition"] = {**block, "of": "h_noise"}
+        assert "binds of='h_noise'" in _field_drift(group, "composition", meta)
+        del arr.attrs["composition"]
+        assert "attrs block" in _field_drift(group, "composition", meta)
+
     def test_provenance_defaults_the_method_by_class(self):
         # A manifest entry with no ``method`` — never written by
         # ``declared_fields``, but manifests outlive their writer and may come

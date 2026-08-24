@@ -1031,14 +1031,41 @@ def _field_drift(group, name, meta) -> str | None:
                     f"word per centroid row (spec §8.3/§9, §1.1)"
                 )
     elif meta["class"] == "packed":
+        from zagg.stats.composition import COMPOSITION_ATTR, COMPOSITION_SPEC, LANES
+
         declared_dt = np.dtype(meta.get("dtype") or "uint64")
         if arr.dtype != declared_dt:
             return f"field {name!r}: dtype {arr.dtype} != declared {declared_dt}"
+        stored = dict(arr.attrs.get(COMPOSITION_ATTR) or {})
+        # A packed declaration over an UNSTAMPED array has no reader contract
+        # at all — the same posture the approximate arm takes on a missing
+        # ragged element block.
+        if not stored:
+            return (
+                f"field {name!r}: declared packed but the stored array carries no "
+                f"{COMPOSITION_ATTR!r} attrs block (spec §3.3)"
+            )
+        # The word's lanes are unpacked BY POSITION under this writer's
+        # constants, so a store declaring another spec or another lane order
+        # would fold into a well-formed and wrong word — the store-contradicts-
+        # the-declaration class this gate exists for, guarded on the read side
+        # exactly as ``config`` guards it on the write side.
+        if stored.get("spec") != COMPOSITION_SPEC:
+            return (
+                f"field {name!r}: the stored array declares composition spec "
+                f"{stored.get('spec')!r}; this zagg folds {COMPOSITION_SPEC!r} only "
+                f"(lanes are merged by position)"
+            )
+        if [str(lane) for lane in stored.get("lanes") or ()] != list(LANES):
+            return (
+                f"field {name!r}: the stored composition lanes {stored.get('lanes')!r} "
+                f"are not the {COMPOSITION_SPEC} order (spec §3.1)"
+            )
         # The §3.3 linkage is what the fold's ``n`` inputs come from, so a
         # store whose stored block binds a DIFFERENT digest than the
         # declaration would fold every word against the wrong divisor —
         # checked on the same array this probe already opened.
-        stored_of = dict(arr.attrs.get("composition") or {}).get("of")
+        stored_of = stored.get("of")
         if stored_of is not None and meta.get("of") is not None and stored_of != meta["of"]:
             return (
                 f"field {name!r}: the stored composition block binds of={stored_of!r}, "
