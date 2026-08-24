@@ -161,6 +161,27 @@ class TestReferenceEpochs:
         eb = reference_epochs(b).epochs[SHARD_KEY]
         assert np.array_equal(out.epochs[SHARD_KEY], np.union1d(ea, eb))
 
+    def test_partially_overlapping_covers_union_at_the_bucket_grid(self, tmp_path):
+        """Unequal words for a shared pass must not double it (bucket union).
+
+        Three passes one bucket apart; store A saw passes 1+2 and store B
+        saw 2+3, so each store's cover carries a *different* two-bucket range
+        word for the shared pass. Word-level ``np.unique`` keeps both and
+        yields two displaced epochs for three passes; bucket-level union
+        yields exactly one epoch per covered bucket.
+        """
+        passes = np.array([BASE_NS, BASE_NS + BUCKET_NS, BASE_NS + 2 * BUCKET_NS], np.uint64)
+        a = _write_store(tmp_path / "a", {SHARD: passes[:2]})
+        b = _write_store(tmp_path / "b", {SHARD: passes[1:]})
+        # Each store really does emit one coalesced (and unequal) word.
+        wa = cover_words(read_cover(a))[SHARD]
+        wb = cover_words(read_cover(b))[SHARD]
+        assert len(wa) == len(wb) == 1 and wa[0] != wb[0]
+        out = reference_epochs([a, b])
+        e = out.epochs[SHARD_KEY]
+        assert e.size == 3
+        assert _nearest_gap(e, _utc(passes)) <= HALF_BUCKET
+
     def test_a_shard_only_one_store_covers_still_contributes(self, tmp_path):
         a = _write_store(tmp_path / "a", {SHARD: _instants(0)})
         b = _write_store(tmp_path / "b", {SHARD: _instants(40), "11212": _instants(7)})
