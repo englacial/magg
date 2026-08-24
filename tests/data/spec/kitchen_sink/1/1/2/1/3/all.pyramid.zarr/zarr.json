@@ -12,6 +12,32 @@
           "class": "exact",
           "method": "sum",
           "nan_policy": "skip"
+        },
+        "h_tdigest_signal": {
+          "class": "approximate",
+          "method": "tdigest_kway",
+          "delta": 16,
+          "overview_delta": 16,
+          "dtype": "float32",
+          "inner_shape": [
+            2
+          ]
+        },
+        "h_tdigest_noise": {
+          "class": "approximate",
+          "method": "tdigest_kway",
+          "delta": 16,
+          "overview_delta": 16,
+          "dtype": "float32",
+          "inner_shape": [
+            2
+          ]
+        },
+        "composition": {
+          "class": "packed",
+          "method": "composition_kway",
+          "dtype": "uint64",
+          "of": "h_tdigest_signal"
         }
       },
       "groups": {
@@ -27,14 +53,14 @@
         }
       },
       "cells_with_data_order": 5,
-      "generated_at": "2026-08-16T23:20:02+00:00"
+      "generated_at": "2026-08-24T21:24:55+00:00"
     },
     "morton_hive_commit": {
       "spec": "morton-hive/1",
       "complete": true,
       "cells_with_data": 3,
       "granule_count": 1,
-      "written_at": "2026-08-16T23:20:02+00:00"
+      "written_at": "2026-08-24T21:24:55+00:00"
     }
   },
   "zarr_format": 3,

@@ -61,16 +61,37 @@
      "fill_value": 0
     },
     "h_tdigest_signal": {
-     "class": "none"
+     "class": "approximate",
+     "method": "tdigest_kway",
+     "dtype": "float32",
+     "inner_shape": [
+      2
+     ],
+     "delta": 16,
+     "overview_delta": 16,
+     "location": "leaf_id"
     },
     "h_tdigest_noise": {
-     "class": "none"
+     "class": "approximate",
+     "method": "tdigest_kway",
+     "dtype": "float32",
+     "inner_shape": [
+      2
+     ],
+     "delta": 16,
+     "overview_delta": 16,
+     "location": "leaf_id"
     },
     "composition": {
-     "class": "none"
+     "class": "packed",
+     "method": "composition_kway",
+     "dtype": "uint64",
+     "fill_value": 0,
+     "of": "h_tdigest_signal",
+     "threshold": 2
     }
    }
   }
  },
- "generated_at": "2026-08-16T23:20:01+00:00"
+ "generated_at": "2026-08-24T21:24:54+00:00"
 }

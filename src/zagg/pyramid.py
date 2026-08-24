@@ -149,21 +149,36 @@ def declared_fields(config) -> tuple[dict, list]:
     """Per-field D24 composability declarations for the manifest pyramid block.
 
     The ``fields`` map is identical under both spec revisions: ``exact``
-    entries carry the fold method + nan policy + dense dtype/fill, and
-    ``approximate`` entries the k-way t-digest law + ragged element typing;
-    ``none`` fields are declared with their **class only** — the recorded
-    absence that gives readers zero-open filtering (option A, the ruled D24
-    default) — and returned in the excluded list for the caller's loud
-    template-time warning (:func:`warn_excluded`).
+    entries carry the fold method + nan policy + dense dtype/fill,
+    ``approximate`` entries the k-way t-digest law + ragged element typing,
+    and ``packed`` entries (issue #515) the composition k-way law + the §3.3
+    ``of`` linkage the fold's ``n`` inputs come from; ``none`` fields are
+    declared with their **class only** — the recorded absence that gives
+    readers zero-open filtering (option A, the ruled D24 default) — and
+    returned in the excluded list for the caller's loud template-time warning
+    (:func:`warn_excluded`).
+
+    A ``packed`` field is demoted to ``none`` (and excluded) when the digest
+    its ``attrs.composition.of`` names is not itself declared ``approximate``
+    here: the law divides by that digest's per-cell weight at every level
+    (spec §3.3/§3.4), so composition folds only where its divisor does —
+    declaring a fold whose ``n`` no overview carries would be the same
+    dishonesty the class exists to end.
     """
     from zagg.config import get_agg_fields
     from zagg.semantics import EXACT_MERGE_LAWS, _fold_function_name, composability_classes
-    from zagg.sweep_overview import EXACT_NAN_POLICY, TDIGEST_LAW, overview_fold_delta
+    from zagg.sweep_overview import (
+        COMPOSITION_LAW,
+        EXACT_NAN_POLICY,
+        TDIGEST_LAW,
+        overview_fold_delta,
+    )
 
     agg = get_agg_fields(config)
     fields: dict = {}
     excluded: list = []
-    for name, cls in composability_classes(config).items():
+    classes = composability_classes(config)
+    for name, cls in classes.items():
         meta = agg[name]
         if cls == "exact":
             fields[name] = {
@@ -224,6 +239,29 @@ def declared_fields(config) -> tuple[dict, list]:
                 gain = (meta.get("attrs") or {}).get("gain")
                 if gain is not None:
                     fields[name]["gain"] = gain
+        elif cls == "packed":
+            block = (meta.get("attrs") or {}).get("composition") or {}
+            of = block.get("of")
+            if classes.get(of) != "approximate":
+                fields[name] = {"class": "none"}
+                excluded.append(name)
+                continue
+            fields[name] = {
+                "class": "packed",
+                "method": COMPOSITION_LAW,
+                "dtype": meta.get("dtype", "uint64"),
+                "fill_value": _json_fill(meta.get("fill_value", 0)),
+                # Load-bearing exactly as ``location`` is below: the overview
+                # writer reconstructs a level's arrays from this entry alone,
+                # and the fold pairs each contributor's word with THIS
+                # digest's per-cell weight (spec §3.3/§3.4).
+                "of": str(of),
+            }
+            # The committed cut rides along so the overview array's §3.3 attrs
+            # block can carry it (keyed only when declared, like the digest
+            # entries' optional keys).
+            if block.get("threshold") is not None:
+                fields[name]["threshold"] = block["threshold"]
         else:
             fields[name] = {"class": "none"}
             excluded.append(name)

@@ -81,8 +81,10 @@ conformance tests assert decoded values, never object bytes.
   multi-observation cell and merged centroid a conservative RANGE. The words
   are computed here from the generator's inputs and handed to the write path
   — the aggregation kernel that will produce them is #410's next PR — so the
-  expectations stay input-derived. ``kitchen_sink/``, committed before §9
-  and not regenerated, is the absent-``located`` ⇒ §2.2 pin.
+  expectations stay input-derived. ``kitchen_sink/``'s two
+  ``*_locations/zarr.json`` siblings, committed before §9 and deliberately
+  NOT refreshed (``git checkout --`` them after a regen), are the
+  absent-``located`` ⇒ §2.2 pin.
   ``temporal/`` is ALSO the only fixture carrying a **root ``coverage.moc``**
   (issue #480): the §10 ``zagg-coverage-toc/1`` section, written here by the
   production sweep writer (``MocFamily``'s leaf read + finisher) — and, from
@@ -92,13 +94,16 @@ conformance tests assert decoded values, never object bytes.
   leaving them without either root object IS §10's absence rule, and keeps
   those trees byte-identical.
 
-STALE BY DESIGN: ``minimal/`` and ``kitchen_sink/`` were committed before
-issue #382 and their ``morton_hive.json`` still carries the pre-#382
-``pyramid`` block (``{"orders": [], "aggregation": {}}``). Running this
-script refreshes them to the current block shape — real churn in files no
-test asserts. When regenerating for one fixture only, ``git checkout --``
-the others; a deliberate refresh of the older-era manifests is its own
-commit.
+STALE BY DESIGN: some committed bytes deliberately pin an older writer era
+and must NOT be refreshed by a regen — currently ``kitchen_sink/``'s two
+``*_locations/zarr.json`` siblings (the pre-§9 absent-``located`` pin
+above). Running this script rewrites them; ``git checkout --`` those files
+after a targeted regen. ``kitchen_sink/`` was otherwise refreshed for issue
+#515 (its manifest now declares the strata ``approximate`` + ``composition``
+``packed``, and its ``all.pyramid.zarr`` column carries the strata,
+locations and composition groups through the real fold). When regenerating
+for one fixture only, ``git checkout --`` the others; a deliberate refresh
+of an older-era fixture is its own commit.
 """
 
 from __future__ import annotations

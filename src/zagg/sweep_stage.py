@@ -557,6 +557,7 @@ def _merge_slabs(
     read succeeded, so the loss is known per field, and the per-child
     ``unreadable`` count is what says the artifact folded short.
     """
+    from zagg.stats.composition import merge_composition_kway
     from zagg.sweep_overview import (
         _empty_slab,
         combine_dense,
@@ -565,6 +566,7 @@ def _merge_slabs(
         fold_dense,
         fold_digests,
         overview_fold_delta,
+        payload_weight,
     )
 
     windows = next((len(row) for row in rows if row is not None), 1)
@@ -593,7 +595,7 @@ def _merge_slabs(
             out = part if out is None else combine_dense(out, part, law, fill)
         slabs[name] = out
     for name, meta in fields.items():
-        if meta["class"] == "exact":
+        if meta["class"] != "approximate":
             continue
         dtype = meta.get("dtype") or "float32"
         inner = tuple(meta.get("inner_shape") or (2,))
@@ -660,6 +662,45 @@ def _merge_slabs(
         slabs[name] = out
         for kwarg, sibling in declared:
             slabs[sibling] = sibling_slabs[kwarg]
+    for name, meta in fields.items():
+        if meta["class"] != "packed":
+            continue
+        # The packed composition fold (issue #515, spec §3.4): each source
+        # cell contributes its ``(word, n)`` pair, ``n`` being the ``of``
+        # digest's weight at the same cell, and every output cell collapses in
+        # ONE k-way call (single quantization). A contributor carrying one
+        # half of the pair is SKIPPED and counted unreadable — the
+        # ``_companion_group`` posture: the word is uninterpretable without
+        # its divisor digest, and a divisor without its word says nothing.
+        of_name = meta.get("of")
+        of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
+        out = _empty_slab(meta, n_out)
+        parts_by_cell: dict[int, list] = {}
+        for i, row in enumerate(rows):
+            base = i * src_per_child
+            for w, reader in enumerate(row or ()):
+                if not _is_reader(reader):
+                    continue
+                words = reader.read(res_src, name)
+                of_values = reader.read(res_src, of_name)
+                if words is None or of_values is None:
+                    if (words is None) != (of_values is None):
+                        logger.warning(
+                            f"stage sweep: column {reader.path} carries only one of "
+                            f"{name!r}/{of_name!r} at resolution {res_src}; counting the "
+                            f"contributor unreadable (spec §3.3, §1.1)"
+                        )
+                        broken.add((i, w))
+                    continue
+                for pos in range(len(words)):
+                    n = payload_weight(of_values[pos], of_dtype)
+                    if n > 0:
+                        parts_by_cell.setdefault((base + pos) // factor, []).append(
+                            (int(words[pos]), n)
+                        )
+        for j, parts in parts_by_cell.items():
+            out[j] = merge_composition_kway(parts)
+        slabs[name] = out
     return (slabs, *_source_counts(rows, broken))
 
 
