@@ -817,6 +817,30 @@ class TestLeafFoldHalfPair:
         assert int(slabs["composition"][0]) == 0, "the covered cell keeps the fill word"
         assert self._weight(slabs["h_sig"], 0) == pooled, "the divisor still folds both"
 
+    def test_a_leaf_missing_the_divisor_drops_without_poisoning(self, tmp_path):
+        import shutil
+
+        from zagg.stats.composition import merge_composition_kway
+
+        a, _ = _strata_cells(k=4, n=40, seed=620)
+        b, _ = _strata_cells(k=4, n=40, seed=621)
+        self._leaf(tmp_path, "-3111", a)
+        path_b = self._leaf(tmp_path, "-3112", b)
+
+        # The REVERSE direction: leaf -3112 keeps its word but loses the ``of``
+        # digest. The digest arm reads that same array for ``h_sig`` itself and
+        # hits the same absence, so BOTH halves drop — the cell's N_signal is
+        # -3111's alone and -3111's word describes exactly those rows. Nothing
+        # to skew, so poisoning here would only destroy a correct word.
+        shutil.rmtree(f"{path_b}/h_sig")
+        slabs, counts = self._fold(tmp_path)
+        assert counts["failed"] == 0
+        expected = merge_composition_kway(
+            [(c["word"], c["n_signal"]) for c in a if c["n_signal"] > 0]
+        )
+        assert int(slabs["composition"][0]) == expected, "the surviving leaf's word stands"
+        assert self._weight(slabs["h_sig"], 0) == sum(c["n_signal"] for c in a)
+
 
 class TestStageMergeHalfPair:
     """``_merge_slabs``' packed arm when a contributor carries half the pair.

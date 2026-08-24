@@ -1674,10 +1674,12 @@ def _fold_node(
                         # Schema evolution: the field postdates this leaf — it
                         # contributes fill, exactly what re-running would write.
                         logger.debug(f"sweep[overview]: leaf {leaf} lacks field {name!r}")
-                        # Unless it is HALF a packed pair: the divisor digest is
-                        # here and the digest arm will fold it, so the word must
-                        # not be reconstructed over a denominator this leaf's
-                        # rows are in but its word is not.
+                        # Unless it is HALF a packed pair in the ONE skew
+                        # direction — word absent, divisor PRESENT: the digest
+                        # arm will fold that divisor, so the word must not be
+                        # reconstructed over a denominator this leaf's rows are
+                        # in but its word is not. (Divisor absent is the packed
+                        # arm below: harmless, and never poisoned.)
                         if meta["class"] == "packed" and (meta.get("of") or "") in group:
                             leaf_poison.add(name)
                         continue
@@ -1691,6 +1693,15 @@ def _fold_node(
                         # the word without its divisor digest contributes
                         # nothing — never a part with a guessed ``n``; that is
                         # the schema-evolution under-coverage posture above.
+                        #
+                        # Skipped WITHOUT poisoning, unlike the reverse
+                        # direction above: the ``of`` field is itself a declared
+                        # entry, and the digest arm reading it hits the same
+                        # absence in the same leaf, so BOTH halves drop together
+                        # and the level's ``N_signal`` already excludes this
+                        # leaf's rows. Nothing to skew — and poisoning here
+                        # would delete SIBLING leaves' correct words from the
+                        # shared output cells (review finding).
                         of_name = meta.get("of")
                         try:
                             of_values = group[of_name][:]
@@ -1699,7 +1710,6 @@ def _fold_node(
                                 f"sweep[overview]: leaf {leaf} lacks {of_name!r} for "
                                 f"packed field {name!r}"
                             )
-                            leaf_poison.add(name)
                             continue
                         of_dtype = (fields.get(of_name) or {}).get("dtype") or "float32"
                         words_arr = arr[:]
