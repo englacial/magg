@@ -280,7 +280,23 @@ def reference_epochs(reference_stores, *, aoi=None, **store_kwargs) -> Reference
             if not len(words):
                 continue
             block = blocks.get(decimal) or {}
-            effective = int(block.get("temporal_order", pinned))
+            raw = block.get("temporal_order", pinned)
+            # Boundary REFUSAL, not a clip. §10.5's order check in
+            # ``coverage_toc._decode_cover_block`` is one-sided (ceiling only),
+            # so a corrupt block declaring a negative order decodes fine — and
+            # then ``62 - order`` overflows the int64 shift to a huge NEGATIVE
+            # half-span that silently PASSES the caller's precision bar, on
+            # midpoints ``_word_midpoints`` computed from a shift it cannot
+            # express either. Refuse at this read boundary; the durable
+            # one-line lower bound belongs beside that ceiling check.
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+                raise ValueError(
+                    f"reference_epochs: store {root!r} shard {decimal} cover block declares "
+                    f"temporal_order {raw!r} — a block only ever coarsens BELOW the object's "
+                    f"pin and never below 0 (spec §10.5); this block is corrupt, and decoding "
+                    f"it would yield epochs no precision bar can hold"
+                )
+            effective = int(raw)
             if effective < TEMPORAL_COVER_ORDER:
                 logger.warning(
                     f"reference_epochs: store {root!r} shard {decimal} cover sits at "

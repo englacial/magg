@@ -1159,3 +1159,46 @@ class TestCoarsenedCoverTolerance:
         assert all(d["nearest_offset_ns"] is None for d in gap_rows)
         assert rec["shards_without_acquisitions"] == [SHARD]
         assert rec["epochs_total"] == rec["epochs_paired"] + rec["epochs_dropped"]
+
+    def test_a_negative_block_order_refuses_by_name(self, tmp_path):
+        """Fail-CLOSED on a corrupt block order, rather than through the bar.
+
+        ``coverage_toc._decode_cover_block``'s §10.5 order check is one-sided
+        (ceiling only), so ``temporal_order: -1`` decodes; the half-span shift
+        then overflows int64 to a huge NEGATIVE, which passes any cap, on a
+        midpoint ``_word_midpoints`` invents (2142-04-11 for this block). The
+        durable lower bound belongs beside that ceiling check; this is the
+        read-boundary refusal on the builder's side.
+        """
+        root = Path(tmp_path / "corrupt")
+        root.mkdir(parents=True, exist_ok=True)
+        words = quantize_words(time2toc(_instants(40.0)), 12)
+        block = _encode_cover_block(np.asarray(words, np.uint64), 12)
+        block["temporal_order"] = -1
+        (root / COVER_NAME).write_text(
+            json.dumps(
+                {
+                    "spec": COVER_SPEC,
+                    "source": "test",
+                    "order": 4,
+                    "temporal_order": TEMPORAL_COVER_ORDER,
+                    "cap": COVER_CAP,
+                    "fields": ["h"],
+                    "element": {"dtype": "uint64", "shape": [-1]},
+                    "encoding": "base64",
+                    "shards": {SHARD: block},
+                }
+            )
+        )
+        for call in (
+            lambda: reference_epochs(str(root)),
+            lambda: closest_obs_shardmap(
+                _s2_catalog([_s2_item("S2_0", _epoch_iso(40.0))]),
+                str(root),
+                grid=_grid(),
+                backend="mortie",
+                max_time_offset=np.timedelta64(3, "D"),
+            ),
+        ):
+            with pytest.raises(ValueError, match="temporal_order -1"):
+                call()
