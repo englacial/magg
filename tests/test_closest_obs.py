@@ -815,3 +815,109 @@ class TestClosestObsShardmap:
         assert "paired_epochs" not in noop.granules[0][0]
         assert "epoch_offsets_ns" not in noop.granules[0][0]
         assert noop.metadata["closest_obs"] == sm.metadata["closest_obs"]
+
+
+# ── phase 4: two-store scenarios ─────────────────────────────────────────────
+#
+# An ATL03-like sparse cover beside a GEDI-like denser cover with an interior
+# gap, both over shard 11213; the GEDI-like store also claims 11212, where the
+# S2 catalog has no acquisitions at all. S2 revisit ~4.3 days across the span.
+
+
+class TestTwoStoreScenarios:
+    A_DAYS = (0, 55)  # sparse, nothing near the middle
+    B_DAYS = (0, 2, 4, 6, 8, 10, 50, 52, 54, 56, 58, 60)  # dense, gap 10..50
+
+    def _stores(self, tmp_path):
+        a = _write_store(tmp_path / "atl03", {SHARD: _instants(*self.A_DAYS)})
+        b = _write_store(
+            tmp_path / "gedi",
+            {SHARD: _instants(*self.B_DAYS), "11212": _instants(1, 3)},
+        )
+        return a, b
+
+    def _catalog(self, days=None):
+        days = days if days is not None else [d / 10 for d in range(0, 600, 43)]
+        return _s2_catalog([_s2_item(f"S2_{i}", _epoch_iso(d)) for i, d in enumerate(days)])
+
+    def test_an_acquisition_in_the_cover_gap_is_never_selected(self, tmp_path):
+        """Days 10..50 are a gap in BOTH stores: no epoch reaches into it."""
+        a, b = self._stores(tmp_path)
+        cat = self._catalog()
+        sm = closest_obs_shardmap(
+            cat,
+            [a, b],
+            grid=_grid(),
+            backend="mortie",
+            max_time_offset=np.timedelta64(3, "D"),
+        )
+        ids = {g["id"] for g in sm.granules[sm.shard_keys.index(SHARD_KEY)]}
+        # Acquisitions land every 4.3 d; those in (13, 47) days sit >3 d from
+        # every epoch (epochs live at passes 0..10 and 50..60) so none of them
+        # may appear -- the cover gap prunes them even though they are
+        # spatially assigned.
+        gap = {f"S2_{i}" for i, d in enumerate(d / 10 for d in range(0, 600, 43)) if 13 < d < 47}
+        assert gap and not (ids & gap)
+        # And the near-gap acquisitions ARE selected (the epochs at the gap's
+        # shoulders reach them).
+        assert ids
+
+    def test_union_parity_across_stores(self, tmp_path):
+        """map(A ∪ B) selects exactly union(map(A), map(B)) per shard.
+
+        Closest-1 is per-epoch independent and epochs are the union across
+        stores, so the selection commutes with the union.
+        """
+        a, b = self._stores(tmp_path)
+        cat = self._catalog()
+        kw = dict(grid=_grid(), backend="mortie", max_time_offset=np.timedelta64(3, "D"))
+
+        def _pairs(sm):
+            return {(k, g["id"]) for k, gr in zip(sm.shard_keys, sm.granules) for g in gr}
+
+        assert _pairs(closest_obs_shardmap(cat, [a, b], **kw)) == _pairs(
+            closest_obs_shardmap(cat, a, **kw)
+        ) | _pairs(closest_obs_shardmap(cat, b, **kw))
+
+    def test_the_filtered_map_is_a_subset_of_the_spatial_map(self, tmp_path):
+        from zagg.catalog.shardmap import ShardMap
+
+        a, b = self._stores(tmp_path)
+        cat = self._catalog()
+        spatial = ShardMap.build(cat, _grid(), backend="mortie")
+        sm = closest_obs_shardmap(cat, [a, b], grid=_grid(), backend="mortie")
+        spatial_pairs = {
+            (k, g["id"]) for k, gr in zip(spatial.shard_keys, spatial.granules) for g in gr
+        }
+        got = {(k, g["id"]) for k, gr in zip(sm.shard_keys, sm.granules) for g in gr}
+        assert got and got <= spatial_pairs
+
+    def test_a_covered_shard_with_no_acquisitions_is_recorded(self, tmp_path):
+        a, b = self._stores(tmp_path)
+        cat = self._catalog()  # items only around shard 11213's centre
+        sm = closest_obs_shardmap(cat, [a, b], grid=_grid(), backend="mortie")
+        rec = sm.metadata["closest_obs"]
+        assert "11212" in rec["shards_without_acquisitions"]
+        assert morton_word("11212") not in sm.shard_keys
+
+    def test_offset_boundary_exactly_at_selects_one_ns_past_drops(self, tmp_path):
+        """The cap boundary at BUILDER level, against a cover-derived epoch."""
+        store = _write_store(tmp_path / "ref", {SHARD: _instants(0)})
+        epochs = reference_epochs(store).epochs[SHARD_KEY]
+        assert epochs.size == 1
+        acq_iso = _epoch_iso(2.0)
+        cat = _s2_catalog([_s2_item("S2_only", acq_iso)])
+        acq = np.datetime64(acq_iso.rstrip("Z")).astype("datetime64[ns]")
+        exact = acq - epochs[0]  # signed timedelta64[ns], acquisition - epoch
+        assert exact > np.timedelta64(0, "ns")
+        kw = dict(grid=_grid(), backend="mortie")
+        at = closest_obs_shardmap(cat, store, max_time_offset=exact, **kw)
+        assert [g["id"] for g in at.granules[0]] == ["S2_only"]
+        assert at.granules[0][0]["epoch_offsets_ns"] == [int(exact.astype("int64"))]
+        past = closest_obs_shardmap(
+            cat, store, max_time_offset=exact - np.timedelta64(1, "ns"), **kw
+        )
+        assert past.shard_keys == []
+        rec = past.metadata["closest_obs"]
+        assert rec["epochs_dropped"] == 1
+        assert rec["dropped"][0]["nearest_offset_ns"] == int(exact.astype("int64"))
