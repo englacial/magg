@@ -23,16 +23,20 @@
 # The script echoes the resolved bucket/keys/version and asks for confirmation
 # before deploying; pass --yes to skip the prompt (unattended runs).
 #
-# By default the stack creates its own Lambda execution role (needs
-# iam:CreateRole — fine if you admin your own account). In IAM-constrained
-# accounts (e.g. an SSO power-user), set CREATE_ROLE=false and pass ROLE_ARN, an
-# execution role an admin made once (see execution_role.yaml / EXECUTION_ROLE.md).
+# The stack always creates its own Lambda execution role, so standing it up
+# needs iam:CreateRole. In an IAM-constrained account (e.g. an SSO power-user)
+# the supported path is to have an admin run this script — the ask is "install
+# zagg", not "mint a role ARN and hand it back" (issue #495). The role is named
+# explicitly (EXECUTION_ROLE_NAME) because it is zagg's published identity:
+# Source Cooperative names its ARN in their bucket policy. A SECOND stack in the
+# same account must override the name or CREATE fails on the collision.
 #
 # Usage:
-#   OUTPUT_BUCKET=my-results ./stand_up.sh                              # us-west-2, stack makes the role
+#   OUTPUT_BUCKET=my-results ./stand_up.sh                              # us-west-2
 #   OUTPUT_BUCKET=my-results ./stand_up.sh --yes                        # no confirm prompt
 #   REGION=us-east-1 OUTPUT_BUCKET=my-results STAGING_BUCKET=my-stage ./stand_up.sh
-#   CREATE_ROLE=false ROLE_ARN=arn:aws:iam::123:role/zagg-exec OUTPUT_BUCKET=my-results ./stand_up.sh
+#   STACK_NAME=zagg-backend-test EXECUTION_ROLE_NAME=zagg-lambda-execution-test \
+#     FUNCTION_NAME=process-shard-test OUTPUT_BUCKET=my-results ./stand_up.sh
 #
 # Requires: aws CLI (configured).
 
@@ -50,25 +54,32 @@ done
 # The command runs in the foreground, so its stdout/stderr stream straight to you.
 run() { echo "+ $(printf '%q ' "$@")"; "$@"; }
 
+DEFAULT_STACK_NAME="zagg-backend"
+DEFAULT_EXECUTION_ROLE_NAME="zagg-lambda-execution"
+
 ARCH="${ARCH:-arm64}"                                # arm64 | x86_64
-STACK_NAME="${STACK_NAME:-zagg-backend}"
+STACK_NAME="${STACK_NAME:-$DEFAULT_STACK_NAME}"
 FUNCTION_NAME="${FUNCTION_NAME:-process-shard}"      # e.g. process-shard-test for a test stack
 REGION="${REGION:-us-west-2}"
 OUTPUT_BUCKET="${OUTPUT_BUCKET:?Set OUTPUT_BUCKET to the bucket where results go}"
 CREATE_BUCKET="${CREATE_BUCKET:-false}"              # true => the stack creates OUTPUT_BUCKET
-CREATE_ROLE="${CREATE_ROLE:-true}"                   # true => the stack creates the exec role
-ROLE_ARN="${ROLE_ARN:-}"                             # required only when CREATE_ROLE=false
-STAGING_BUCKET="${STAGING_BUCKET:-}"                 # required only outside the mirror region
+EXECUTION_ROLE_NAME="${EXECUTION_ROLE_NAME:-$DEFAULT_EXECUTION_ROLE_NAME}"  # published identity (issue #495)
 
-# When the stack can't create IAM roles (e.g. an SSO power-user without
-# iam:CreateRole), set CREATE_ROLE=false and pass ROLE_ARN — an execution role
-# an account admin created once (see execution_role.yaml / EXECUTION_ROLE.md).
-if [ "$CREATE_ROLE" != "true" ] && [ -z "$ROLE_ARN" ]; then
-    echo "ERROR: CREATE_ROLE=$CREATE_ROLE but ROLE_ARN is empty."
-    echo "       Set ROLE_ARN to a pre-existing Lambda execution role ARN, or set"
-    echo "       CREATE_ROLE=true to have the stack create one (needs iam:CreateRole)."
-    exit 1
+# IAM role names are ACCOUNT-scoped, so a second stack that keeps the default
+# role name asks CloudFormation to create a role the first stack already owns:
+# EntityAlreadyExists, then ROLLBACK. That failure is live-AWS-only and lands
+# minutes in, which is the class this script exists to pre-empt (review finding
+# on PR #496) -- the bring-your-own-role pair the named role replaced carried a
+# guard for the same mistake. Being explicit is what satisfies it: name the role.
+if [ "$STACK_NAME" != "$DEFAULT_STACK_NAME" ] && \
+   [ "$EXECUTION_ROLE_NAME" = "$DEFAULT_EXECUTION_ROLE_NAME" ]; then
+    echo "ERROR: STACK_NAME='$STACK_NAME' is a second stack, but EXECUTION_ROLE_NAME is"
+    echo "       still the default '$DEFAULT_EXECUTION_ROLE_NAME', which the '$DEFAULT_STACK_NAME'"
+    echo "       stack already owns -- CREATE would fail with EntityAlreadyExists."
+    echo "       Pass a distinct name, e.g. EXECUTION_ROLE_NAME=${DEFAULT_EXECUTION_ROLE_NAME}-test"
+    exit 2
 fi
+STAGING_BUCKET="${STAGING_BUCKET:-}"                 # required only outside the mirror region
 
 # Distribution source (issue #25; source.coop mirror retired in issue #174).
 # The public CORS bucket the release pipeline stages to: listable (a
@@ -209,8 +220,7 @@ run aws cloudformation deploy \
         FunctionS3Key="$FUNC_S3KEY" \
         OutputBucketName="$OUTPUT_BUCKET" \
         CreateOutputBucket="$CREATE_BUCKET" \
-        CreateExecutionRole="$CREATE_ROLE" \
-        ExecutionRoleArn="$ROLE_ARN"
+        ExecutionRoleName="$EXECUTION_ROLE_NAME"
 
 echo ""
 run aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \

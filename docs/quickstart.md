@@ -166,6 +166,41 @@ grid-keyed, not pipeline-keyed: HEALPix raster output writes hive leaves too
 ([issue #247](https://github.com/englacial/zagg/issues/247)); rectilinear
 grids keep the flat shared store.
 
+### Where the run writes, and whether it touches what it finds
+
+`output.store` declares the destination, and `output.touch` declares what the
+skip path does to it:
+
+```yaml
+output:
+  store: s3://us-west-2.opendata.source.coop/englacial/zagg/demo/atl06.zarr
+  touch: auto        # auto (default) | always | never
+```
+
+A run that skips a unit — everything already current — writes nothing for it.
+That is correct for the store but invisible to a bucket **expiration** rule, so
+zagg refreshes `LastModified` across the skipped unit's footprint
+([issue #388](https://github.com/englacial/zagg/issues/388)). S3 has no touch
+API, so the refresh is a server-side self-copy, and on a **versioned** bucket a
+self-copy writes a new full-size version rather than updating a timestamp in
+place.
+
+Whether that is worth paying depends on whether the destination expires
+objects, which zagg cannot read cross-account
+(`s3:GetLifecycleConfiguration` is bucket-owner only) and which no bucket name
+encodes. So it is declarable:
+
+| value | behaviour |
+|-------|-----------|
+| `auto` *(default)* | Touch, **unless** the destination is a known published bucket (`zagg.store._PUBLISHED_BUCKETS`, Source Cooperative today). Those are archival — no expiration rule to defeat — and versioned, so touching them only mints noncurrent versions ([issue #495](https://github.com/englacial/zagg/issues/495) phase 4). |
+| `always` | Touch regardless of destination. For an un-negotiated external target whose expiry rule you know about but whose name says nothing. |
+| `never` | Never touch, local paths included. For an archival destination, or any store where version churn outweighs the protection. |
+
+`auto` infers; the other two override the inference
+([issue #501](https://github.com/englacial/zagg/issues/501)). A path the policy
+excludes is reported as **not applicable** — `touch_skipped_paths` in the run
+record — never as a failure.
+
 See `src/zagg/configs/atl06.yaml` for a complete example and the
 [custom aggregations notebook](https://github.com/englacial/zagg/blob/main/notebooks/custom_aggregations.ipynb)
 for customization examples.

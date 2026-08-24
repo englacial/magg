@@ -6,6 +6,7 @@ retry semantics (D4), and the local runner's hive write path.
 """
 
 import json
+import logging
 import os
 import time
 from dataclasses import asdict
@@ -1151,6 +1152,34 @@ class TestLeafSkipIfCurrent:
         assert set(after) == set(before)
         assert all(mtime > aged_ns for mtime in after.values())
         assert meta["touched_objects"] == len(after) and meta["touch_failed"] == 0
+        # A touch that RAN carries no not-applicable key: the issue #495
+        # phase-4 field is conditional, so an unpublished record is
+        # byte-identical to what it was before that phase.
+        assert "touch_skipped_paths" not in meta
+
+    def test_a_published_skip_is_recorded_not_silently_zero(self, monkeypatch, cfg, tmp_path):
+        # Issue #495 phase 4 (review finding on PR #496). The touch is NOT
+        # APPLICABLE on a published bucket, but touched_objects: 0 /
+        # touch_failed: 0 is byte-identical to a touch that never ran -- so
+        # the not-applicable path count has to reach the durable record, or
+        # an operator auditing a published campaign cannot tell the two
+        # apart. The touch itself is pinned in tests/test_lifecycle.py; this
+        # pins the seam that WRITES the record.
+        import zagg.lifecycle as lifecycle_mod
+
+        grid, shard, root, _record = self._write_leaf(monkeypatch, cfg, tmp_path)
+        self._arm_boom(monkeypatch)
+        monkeypatch.setattr(
+            lifecycle_mod,
+            "touch_current_unit",
+            lambda *_a, **_k: {"touched": 0, "failed": 0, "skipped_paths": 4},
+        )
+        meta = hive.process_and_write_hive(
+            shard, list(self.URLS), grid, {}, root, cfg, store_kwargs={}, skip_if_current=True
+        )
+        assert meta["current"] is True
+        assert meta["touched_objects"] == 0 and meta["touch_failed"] == 0
+        assert meta["touch_skipped_paths"] == 4
 
     def test_gate_is_off_by_default(self, monkeypatch, cfg, tmp_path):
         # Byte-identical default: without skip_if_current the seam rewrites
@@ -2738,6 +2767,65 @@ class TestInvokeLambdaPingEvent:
                 asdict(cfg),
                 parent_order=6,
             )
+
+    def test_write_probe_refusal_names_the_grant_not_the_store(self, cfg):
+        # Issue #495: a read-only-but-valid grant fails the ping's write probe.
+        # The 500 carries check="write_probe", and the dispatcher must NOT
+        # reuse the store-contents remedy -- clearing a store root that is not
+        # the problem is the wrong instruction, and the run has to stop before
+        # the fan-out spends compute it will fail to write.
+        cfg.output["store_layout"] = "hive"
+        with pytest.raises(RuntimeError, match="could not WRITE") as excinfo:
+            self._invoke(
+                _wire_client(
+                    {"error": "Access Denied", "mode": "ping", "check": "write_probe"},
+                    status_code=500,
+                ),
+                asdict(cfg),
+                parent_order=6,
+            )
+        assert "clear the store root" not in str(excinfo.value)
+        assert "grant" in str(excinfo.value)
+
+    def test_probe_delete_failure_warns_the_operator(self, cfg, caplog):
+        # Issue #495 fold: the DELETE half is fail-open, but its outcome has to
+        # REACH the operator. A Put-but-no-Delete grant returns 200 with
+        # probe_delete=false; the dispatcher names the stranded key and the
+        # missing action, because s3:DeleteObject is not optional for zagg's
+        # real writes (store overwrite, manifest cleanup) and the function's own
+        # log group is not where the dispatching operator is looking.
+        cfg.output["store_layout"] = "hive"
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            self._invoke(
+                _wire_client(
+                    {
+                        "ok": True,
+                        "mode": "ping",
+                        "zagg_version": "1.2.3",
+                        "write_probe": True,
+                        "probe_delete": False,
+                        "probe_key": "s3://out/product.status/probe-abc",
+                    }
+                ),
+                asdict(cfg),
+                parent_order=6,
+            )
+        warned = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "s3://out/product.status/probe-abc" in warned
+        assert "s3:DeleteObject" in warned
+
+    def test_probe_delete_success_is_silent(self, cfg, caplog):
+        # The happy path stays quiet: no warning when the round trip completed.
+        cfg.output["store_layout"] = "hive"
+        with caplog.at_level(logging.WARNING, logger="zagg.runner"):
+            self._invoke(
+                _wire_client(
+                    {"ok": True, "mode": "ping", "write_probe": True, "probe_delete": True}
+                ),
+                asdict(cfg),
+                parent_order=6,
+            )
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
     def test_validate_refusal_fails_fast(self, cfg):
         # The handler's read-only validate_manifest refusal (frozen-key

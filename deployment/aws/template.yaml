@@ -9,11 +9,12 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::LanguageExtensions
 Description: >-
   zagg serverless backend — Lambda execution role, dependency layer, and the
-  process-shard Lambda function. By default the stack creates its own execution
-  role (self-contained, clean teardown — the path for self-hosters who admin
-  their own account). In IAM-constrained accounts (e.g. an SSO power-user that
-  lacks iam:CreateRole), set CreateExecutionRole=false and pass an admin-created
-  role via ExecutionRoleArn — see execution_role.yaml / EXECUTION_ROLE.md.
+  process-shard Lambda function. The stack always creates its own execution
+  role (self-contained, clean teardown): standing the template up needs
+  iam:CreateRole, so the supported posture in an IAM-constrained account is to
+  have an admin deploy this template rather than to hand a pre-made role back
+  (issue #495). That role is zagg's PUBLISHED identity — Source Cooperative
+  names it in their bucket policy — so it carries a stable ExecutionRoleName.
   Layer and function code are pulled from a same-region S3 bucket
   (ArtifactBucket); use stand_up.sh to populate it from a GitHub Release, or
   point it at your own copy of the zips.
@@ -60,23 +61,25 @@ Parameters:
     AllowedValues: ["true", "false"]
     Description: Whether to create OutputBucketName as part of this stack.
 
-  CreateExecutionRole:
+  ExecutionRoleName:
     Type: String
-    Default: "true"
-    AllowedValues: ["true", "false"]
+    Default: zagg-lambda-execution
     Description: >-
-      Whether the stack creates the Lambda execution role (needs iam:CreateRole).
-      Set to false in IAM-constrained accounts and supply ExecutionRoleArn
-      instead.
+      Name of the Lambda execution role (issue #495). Explicit rather than
+      CloudFormation-generated because this role is the fleet's PUBLISHED
+      identity: Source Cooperative names its ARN in the bucket policy on
+      us-west-2.opendata.source.coop, which makes the name a cross-organization
+      contract — a generated name (zagg-backend-ExecutionRole-Bh9A4eBsB1Nq)
+      would silently break publishing on their side if the stack were ever
+      replaced. A parameter, not a literal: zagg-backend-test is a second stack
+      from this same template and a fixed name would collide. Mirrors how
+      benchmark_cicd.yaml parameterizes ReleaseRoleName / BenchmarkInvokeRoleName.
+      A named IAM role needs CAPABILITY_NAMED_IAM, which stand_up.sh passes.
 
-  ExecutionRoleArn:
-    Type: String
-    Default: ""
-    Description: >-
-      ARN of a pre-existing Lambda execution role to use when
-      CreateExecutionRole=false. Must trust lambda.amazonaws.com and allow
-      CloudWatch Logs + write to OutputBucketName. Ignored when
-      CreateExecutionRole=true.
+      Setting or changing this on a DEPLOYED stack REPLACES the role (create,
+      re-point the five Role: references, delete the old during cleanup), which
+      invalidates credentials held by warm sandboxes mid-shard: run that update
+      with an idle fleet. See docs/deployment/standup.md.
 
   MemorySize:
     Type: Number
@@ -183,7 +186,6 @@ Mappings:
 
 Conditions:
   ShouldCreateBucket: !Equals [!Ref CreateOutputBucket, "true"]
-  ShouldCreateRole: !Equals [!Ref CreateExecutionRole, "true"]
   ShouldCreateMetricFilters: !Equals [!Ref CreateLogMetricFilters, "true"]
 
 Resources:
@@ -193,10 +195,16 @@ Resources:
     Properties:
       BucketName: !Ref OutputBucketName
 
+  # zagg's published identity (issue #495). Levels 2 and 3 of the identity
+  # model are the SAME principal: the fleet writes staging stores to
+  # sliderule-public* and published stores to source.coop, and the divide
+  # between them is store MATURITY, not who is writing. That is the communal
+  # data model — one datacube, appended by many — which is also why the
+  # sliderule-public-cors grant below is whole-bucket by intent.
   ExecutionRole:
     Type: AWS::IAM::Role
-    Condition: ShouldCreateRole
     Properties:
+      RoleName: !Ref ExecutionRoleName
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -235,6 +243,70 @@ Resources:
                   - s3:PutObject
                   - s3:DeleteObject
                 Resource: arn:aws:s3:::sliderule-public-cors/*
+              # Published destination (issue #495): the same policy shape as
+              # the staging grant above, pointed at Source Cooperative. This
+              # retires the data.source.coop proxy hop and the egress it paid
+              # ($31.22 for 346.85 GiB on the CA campaign, more than the run's
+              # $29.00 of compute). Scoped to englacial/zagg/demo/* (espg,
+              # 2026-08-20): englacial is a personal org today, and the fleet
+              # publishes demo stores only — englacial/zagg/lambda/* and
+              # englacial/zagg/benchmarks/* belong to the CI release role
+              # (issue #497). Source Cooperative granted englacial/* to both
+              # ARNs, so tightening or widening later is a reviewed change to
+              # this file rather than another email to them. DeleteObject is
+              # deliberate — store overwrite and manifest cleanup need it, and
+              # the bucket is versioned, so a delete leaves a marker rather
+              # than destroying bytes.
+              #
+              # PutObjectAcl is load-bearing, not incidental: every write to
+              # this bucket carries x-amz-acl: bucket-owner-full-control
+              # (zagg.store._PUBLISHED_BUCKETS), which S3 evaluates against
+              # s3:PutObjectAcl on both PutObject and CreateMultipartUpload —
+              # without it the first published PUT is AccessDenied. It is
+              # granted HERE ONLY: the header is not sent to our own output
+              # bucket or to sliderule-public-cors, whose bucket policy is not
+              # ours to change, so granting it there would be unexplained
+              # privilege.
+              #
+              # The multipart actions cover the FAILURE path, which PutObject
+              # does not: obstore aborts its own in-flight upload (it holds the
+              # UploadId), and without AbortMultipartUpload that cleanup 403s,
+              # leaving parts invisible to ListObjects and billed to Source
+              # Cooperative — a failed abort can also mask the error the worker
+              # reports. ListMultipartUploadParts stays as belt-and-braces:
+              # object_store keeps its part list in memory and issues no
+              # ListParts today, but the action is object-scoped and
+              # prefix-constrainable, so it stays grantable cross-account if
+              # that ever changes. The multipart pair is the whole of the
+              # remedy: uploads leaked by a worker killed at the 900 s ceiling
+              # never reach obstore's abort, and they are not discoverable from
+              # here. Listing them would need s3:ListBucketMultipartUploads,
+              # which is bucket-wide (s3:prefix cannot constrain it) — which is
+              # why Source Cooperative's data-upload docs omit it and their
+              # bucket policy does not grant it, so holding it on our side
+              # would be denied cross-account anyway (espg, 2026-08-20). Leaked
+              # parts age out on their 7-day lifecycle rule instead.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: arn:aws:s3:::us-west-2.opendata.source.coop/englacial/zagg/demo/*
+              # Unconditional by intent -- do NOT add an s3:prefix condition.
+              # S3 answers a GET on a missing key with 404 NoSuchKey only when
+              # the caller holds s3:ListBucket on the bucket; otherwise it
+              # answers 403 AccessDenied. A GetObject request carries no
+              # s3:prefix context key, so a StringLike on it never matches
+              # during a GET evaluation and every absent object would come back
+              # 403 -- and zagg's "is it written yet?" checks (hive manifests,
+              # sweep leases, the fan-out result poll) catch 404 only, turning
+              # "not there yet" into a hard error mid-campaign.
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: arn:aws:s3:::us-west-2.opendata.source.coop
 
   DepsLayer:
     Type: AWS::Lambda::LayerVersion
@@ -264,7 +336,7 @@ Resources:
       # the WorkerDiskTmp 4096 entry if the base memory default changes.
       EphemeralStorage:
         Size: 6144
-      Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+      Role: !GetAtt ExecutionRole.Arn
       Layers: [!Ref DepsLayer]
       Environment:
         Variables:
@@ -310,7 +382,7 @@ Resources:
       Architectures: [!Ref Architecture]
       MemorySize: !Ref MemorySize
       Timeout: !Ref Timeout
-      Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+      Role: !GetAtt ExecutionRole.Arn
       Layers: [!Ref DepsLayer]
       Environment:
         Variables:
@@ -430,7 +502,7 @@ Resources:
           Architectures: [!Ref Architecture]
           MemorySize: !Ref WorkerMemory
           Timeout: !Ref Timeout
-          Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+          Role: !GetAtt ExecutionRole.Arn
           Layers: [!Ref DepsLayer]
           Environment:
             Variables:
@@ -505,7 +577,7 @@ Resources:
           Architectures: [!Ref Architecture]
           MemorySize: !Ref WorkerMemory
           Timeout: !Ref Timeout
-          Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+          Role: !GetAtt ExecutionRole.Arn
           Layers: [!Ref DepsLayer]
           EphemeralStorage:
             Size: !FindInMap [WorkerDiskTmp, !Ref WorkerMemory, SizeMb]
@@ -579,7 +651,7 @@ Resources:
           Architectures: [!Ref Architecture]
           MemorySize: !Ref WorkerMemory
           Timeout: !Ref Timeout
-          Role: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+          Role: !GetAtt ExecutionRole.Arn
           Layers: [!Ref DepsLayer]
           EphemeralStorage:
             Size: !FindInMap [WorkerDiskTmp, !Ref WorkerMemory, SizeMb]
@@ -637,7 +709,7 @@ Outputs:
     Description: ARN of the deployed Lambda function.
     Value: !GetAtt ProcessFn.Arn
   ExtractFunctionArn:
-    Description: ARN of the dedicated extraction Lambda function (issue #148).
+    Description: "ARN of the dedicated extraction Lambda function (issue #148)."
     Value: !GetAtt ExtractFn.Arn
   FunctionName:
     Description: Name of the deployed Lambda function.
@@ -646,8 +718,10 @@ Outputs:
     Description: ARN of the published dependency layer version.
     Value: !Ref DepsLayer
   RoleArn:
-    Description: ARN of the Lambda execution role (created or supplied).
-    Value: !If [ShouldCreateRole, !GetAtt ExecutionRole.Arn, !Ref ExecutionRoleArn]
+    Description: >-
+      ARN of the Lambda execution role — zagg's published identity, the ARN
+      Source Cooperative names in their bucket policy (issue #495).
+    Value: !GetAtt ExecutionRole.Arn
   OutputBucket:
     Description: Bucket where results are written.
     Value: !Ref OutputBucketName

@@ -1588,6 +1588,69 @@ class TestProcessAndWriteHiveWindowed:
         leaf = hive.shard_leaf_path(root, shard, window="2019")
         assert hive.read_commit(open_store(leaf))["complete"] is True
 
+    def test_declared_touch_policy_reaches_the_skip_seam(self, monkeypatch, cfg, tmp_path):
+        # Issue #501 END TO END: the operator's `output.touch` declaration must
+        # reach the touch through the real worker seam. Every lifecycle test
+        # calls touch_current_unit directly, so without this the
+        # `policy=get_touch_policy(config)` kwarg in process_and_write_hive
+        # could be deleted with the suite green -- and the store would be
+        # touched against the operator's instruction (review finding on PR
+        # #496). `never` on a LOCAL store also pins that the policy is a
+        # statement about the run, not about S3.
+        import os
+
+        import zagg.processing as processing
+        from zagg.telemetry import build_record, write_sidecar
+
+        grid, shard, root, meta, _seen = self._run(
+            monkeypatch, cfg, tmp_path, occupied=self._grid(cfg).children(_shard_word())[:3]
+        )
+        leaf = hive.shard_leaf_path(root, shard, window="2019")
+        write_sidecar(
+            leaf,
+            build_record(
+                shard_key=int(shard),
+                metadata=meta,
+                granule_ids=["s3://b/g1.h5"],
+                run_id="r1",
+                window="2019",
+                semantic_hash=meta["semantic_hash"],
+            ),
+        )
+        node = os.path.dirname(leaf)
+        for dirpath, _dirs, files in os.walk(node):
+            for name in files:
+                os.utime(os.path.join(dirpath, name), (10_000, 10_000))
+        aged_ns = 10_000 * 10**9
+
+        def boom(*_a, **_k):
+            raise AssertionError("fold ran on a current windowed unit")
+
+        monkeypatch.setattr(processing, "process_shard", boom)
+        window = {"label": "2019", "start": 365 * 86400.0, "end": 730 * 86400.0}
+        cfg.output["touch"] = "never"
+        skipped = hive.process_and_write_hive(
+            shard,
+            ["s3://b/g1.h5"],
+            grid,
+            {},
+            root,
+            cfg,
+            store_kwargs={},
+            window=window,
+            skip_if_current=True,
+        )
+        assert skipped["current"] is True
+        # Declared `never`: nothing touched, and the skip is NOT APPLICABLE
+        # rather than a silent 0/0 that reads like a touch that never ran.
+        assert skipped["touched_objects"] == 0 and skipped["touch_failed"] == 0
+        assert skipped["touch_skipped_paths"] > 0
+        assert all(
+            os.stat(os.path.join(d, n)).st_mtime_ns == aged_ns
+            for d, _s, files in os.walk(node)
+            for n in files
+        )
+
     def test_skip_if_current_is_per_window(self, monkeypatch, cfg, tmp_path):
         # Issue #388: the identity gate reads the (shard, window) unit's OWN
         # sidecar — window "2019" being current never skips window "2020".

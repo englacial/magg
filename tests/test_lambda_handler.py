@@ -1755,8 +1755,138 @@ class TestPingMode:
         body = json.loads(resp["body"])
         assert body["mode"] == "ping"
         assert body["zagg_version"] == zagg.__version__
-        # Read-only: the preflight never writes the manifest (or anything).
+        # Read-only against the store itself: the preflight never writes the
+        # manifest. The issue #495 write probe is s3-only, so a local store is
+        # never probed -- the body says so, and reports no delete outcome to
+        # warn about.
         assert not os.path.exists(os.path.join(event["store_path"], hive.MANIFEST_NAME))
+        assert body["write_probe"] is False
+        assert "probe_delete" not in body
+
+    def test_ping_probes_write_permission_on_s3_stores(self, handler_mod, monkeypatch):
+        # Issue #495: reachability is not permission. The probe PUTs a
+        # zero-byte object and DELETEs it again, under the run's own .status
+        # sibling (never the store root -- a denied DELETE would strand a key
+        # inside a published dataset, and spec 5.2 makes that a KEY-SET
+        # difference that reports an intact leaf as tampered) and with the
+        # run's own output credentials. .status specifically, not a .probe
+        # prefix of its own: the async transport already requires it writable,
+        # so a fail-closed probe there adds no new grant surface.
+        calls = self._patch_probe(handler_mod, monkeypatch)
+        event = {
+            "mode": "ping",
+            "store_path": "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr",
+            "output_credentials": {"accessKeyId": "ASIA", "secretAccessKey": "s"},
+        }
+        resp = handler_mod._handle_ping(event)
+        assert resp["statusCode"] == 200, resp["body"]
+        assert json.loads(resp["body"])["write_probe"] is True
+        assert calls["prefix"] == "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr.status"
+        assert calls["key"].startswith("probe-")
+        # The docstring's canned-ACL claim, pinned by proxy at this seam: the
+        # ACL-bearing branch in zagg.store is exactly "credentials present and
+        # endpoint_url absent" (src/zagg/store.py), and _open stubs
+        # open_object_store wholesale, so the argument SHAPE is all that stands
+        # between the docstring and reality. A refactor routing the probe
+        # through a constructor that skips the ACL would change it.
+        assert calls["store_kwargs"]["credentials"] == event["output_credentials"]
+        assert calls["store_kwargs"]["region"]
+        assert "endpoint_url" not in calls["store_kwargs"]
+        assert calls["put"] == [(calls["key"], b"")]
+        assert calls["deleted"] == [calls["key"]]
+        # The round trip's outcome rides back out in the body, not only into
+        # the function's log group (issue #495 fold).
+        assert json.loads(resp["body"])["probe_delete"] is True
+
+    def test_ping_bad_credentials_on_non_hive_is_not_a_grant_failure(
+        self, handler_mod, monkeypatch
+    ):
+        # A malformed output_credentials block is an EVENT typo, not a denied
+        # grant. It is first touched by _output_store_kwargs, which the read
+        # half calls only on the hive branch -- so on a raster/flat ping (issue
+        # #264) the ValueError used to escape through the probe and get tagged
+        # write_probe, sending the operator to rewrite a bucket policy. The
+        # kwargs are now resolved in the read-side try, so the tag stays off.
+        self._patch_probe(handler_mod, monkeypatch)
+        resp = handler_mod._handle_ping(
+            {
+                "mode": "ping",
+                "store_path": "s3://bucket/out.zarr",
+                "output_credentials": {"accessKeyId": "ASIA"},  # no secretAccessKey
+            }
+        )
+        assert resp["statusCode"] == 500
+        body = json.loads(resp["body"])
+        assert "output_credentials missing keys" in body["error"]
+        assert "check" not in body
+
+    def test_ping_probe_keys_are_unique_per_run(self, handler_mod, monkeypatch):
+        # Concurrent runs must not collide on a shared probe key.
+        event = {"mode": "ping", "store_path": "s3://bucket/out.zarr"}
+        first = self._patch_probe(handler_mod, monkeypatch)
+        handler_mod._handle_ping(event)
+        second = self._patch_probe(handler_mod, monkeypatch)
+        handler_mod._handle_ping(event)
+        assert first["key"] != second["key"]
+
+    def test_ping_write_denied_is_500_tagged_write_probe(self, handler_mod, monkeypatch):
+        # The failure this whole phase exists for: a grant that reads but does
+        # not write must refuse the run BEFORE the fan-out, and must be
+        # distinguishable from the store-contents refusal so the dispatcher can
+        # name the right remedy.
+        self._patch_probe(handler_mod, monkeypatch, put_error=PermissionError("Access Denied"))
+        resp = handler_mod._handle_ping({"mode": "ping", "store_path": "s3://bucket/out.zarr"})
+        assert resp["statusCode"] == 500
+        body = json.loads(resp["body"])
+        assert body["check"] == "write_probe"
+        assert "Access Denied" in body["error"]
+
+    def test_ping_probe_delete_failure_does_not_fail_the_run(self, handler_mod, monkeypatch):
+        # The PUT is the load-bearing half: write permission is proven. A
+        # failed cleanup strands one zero-byte object outside the store root
+        # (under .status, so no leaf hash is perturbed) -- a warning, not a
+        # refused run.
+        calls = self._patch_probe(handler_mod, monkeypatch, delete_error=RuntimeError("no delete"))
+        resp = handler_mod._handle_ping({"mode": "ping", "store_path": "s3://bucket/out.zarr"})
+        assert resp["statusCode"] == 200, resp["body"]
+        body = json.loads(resp["body"])
+        assert body["write_probe"] is True
+        # ... but the operator has to be TOLD: a Put-but-no-Delete grant would
+        # otherwise pass this preflight silently and fail later at store
+        # overwrite / manifest cleanup. The body carries the outcome AND the
+        # stranded key so the dispatcher can name both.
+        assert body["probe_delete"] is False
+        assert body["probe_key"] == f"s3://bucket/out.zarr.status/{calls['key']}"
+
+    @staticmethod
+    def _patch_probe(handler_mod, monkeypatch, put_error=None, delete_error=None):
+        """Capture the probe's obstore traffic without touching S3."""
+        import obstore
+
+        import zagg.store as zagg_store
+
+        calls: dict = {"put": [], "deleted": []}
+
+        def _open(prefix, **kwargs):
+            calls["prefix"] = prefix
+            calls["store_kwargs"] = kwargs
+            return MagicMock(name="probe_store")
+
+        def _put(store, key, payload):
+            calls["key"] = key
+            if put_error is not None:
+                raise put_error
+            calls["put"].append((key, payload))
+
+        def _delete(store, key):
+            if delete_error is not None:
+                raise delete_error
+            calls["deleted"].append(key)
+
+        monkeypatch.setattr(zagg_store, "open_object_store", _open)
+        monkeypatch.setattr(obstore, "put", _put)
+        monkeypatch.setattr(obstore, "delete", _delete)
+        return calls
 
     def test_ping_matching_existing_store_resumes(self, handler_mod, tmp_path):
         cfg = TestProcessHive._hive_config_dict()
@@ -1772,7 +1902,13 @@ class TestPingMode:
         other["output"]["grid"]["parent_order"] = 5
         resp = handler_mod._handle_ping(self._event(tmp_path, other))
         assert resp["statusCode"] == 500
-        assert "does not match this run" in json.loads(resp["body"])["error"]
+        body = json.loads(resp["body"])
+        assert "does not match this run" in body["error"]
+        # The read-side refusal must NOT carry the write-probe tag: the
+        # dispatcher branches on `check` FIRST, so a handler change that tagged
+        # every 500 write_probe would send every store-contents refusal to the
+        # grant remedy (issue #495).
+        assert "check" not in body
 
     def test_ping_routes_from_lambda_handler(self, handler_mod):
         # The dispatch seam: mode="ping" answers 200 with no store touched —
@@ -1953,6 +2089,42 @@ class TestProcessEventModeGate:
         resp = handler_mod._handle_process_event(event)
         assert resp["statusCode"] == 400
         assert "store_path" in json.loads(resp["body"])["error"]
+
+
+class TestOutputStoreAcl:
+    """Issue #495: the external-target canned ACL must actually reach the store
+    the worker opens from an event, and must NOT appear on in-account writes."""
+
+    @staticmethod
+    def _s3_kwargs(handler_mod, monkeypatch, event):
+        s3_cls = MagicMock(name="S3Store")
+        monkeypatch.setattr("obstore.store.S3Store", s3_cls)
+        monkeypatch.setattr("zarr.storage.ObjectStore", MagicMock(name="ObjectStore"))
+        monkeypatch.setattr("obstore.auth.boto3.Boto3CredentialProvider", MagicMock())
+        from zagg.store import open_store
+
+        open_store(event["store_path"], **handler_mod._output_store_kwargs(event))
+        _, kwargs = s3_cls.call_args
+        return kwargs
+
+    def test_output_credentials_event_sets_the_canned_acl(self, handler_mod, monkeypatch):
+        event = {
+            "store_path": "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr",
+            "output_credentials": {
+                "accessKeyId": "ASIA",
+                "secretAccessKey": "secret",
+                "sessionToken": "tok",
+            },
+        }
+        kwargs = self._s3_kwargs(handler_mod, monkeypatch, event)
+        assert kwargs["client_options"]["default_headers"] == {
+            "x-amz-acl": "bucket-owner-full-control"
+        }
+
+    def test_execution_role_event_sends_no_acl(self, handler_mod, monkeypatch):
+        event = {"store_path": "s3://our-bucket/out.zarr"}
+        kwargs = self._s3_kwargs(handler_mod, monkeypatch, event)
+        assert "client_options" not in kwargs
 
 
 class TestProcessEventMode:

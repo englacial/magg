@@ -284,6 +284,237 @@ class TestTouchS3:
         assert client.head_object.call_count == 3  # named objects only
         assert counts == {"touched": 5, "failed": 0}
 
+    def test_external_target_copies_carry_the_bucket_owner_acl(self, monkeypatch):
+        # CopyObject CREATES the object, so on a cross-account target a touch
+        # without x-amz-acl re-creates it owned by US, stripping the ownership
+        # the writing PUT handed over (issue #495 review finding). Same
+        # predicate and value as the store seam, which the touch bypasses.
+        from zagg.store import _BUCKET_OWNER_ACL
+
+        client = self._client(monkeypatch)
+        lifecycle.touch_current_unit(
+            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
+            store_kwargs={
+                "region": "us-west-2",
+                "credentials": {"accessKeyId": "ASIA", "secretAccessKey": "s"},
+                "endpoint_url": None,
+            },
+        )
+        calls = client.copy_object.call_args_list
+        assert calls
+        assert {c.kwargs["ACL"] for c in calls} == {_BUCKET_OWNER_ACL}
+
+    def test_published_target_is_not_touched_at_all(self, monkeypatch):
+        # Issue #495 phase 4. The touch exists to defeat an expiration rule;
+        # an archival published bucket has none, and it IS versioned, so a
+        # self-copy would not refresh a timestamp in place -- it writes a new
+        # full-size version and demotes the old one to noncurrent, where it
+        # keeps consuming storage on a bucket AWS pays for as an Open Data
+        # sponsor. One full-skip run over the CA store would add ~332 GB that
+        # ListObjectsV2 does not even show. So: no LIST, no HEAD, no copy.
+        client = self._client(monkeypatch)
+        counts = lifecycle.touch_current_unit(
+            f"s3://us-west-2.opendata.source.coop/englacial/zagg/demo/store/-5/1/{LEAF}",
+            store_kwargs={"region": "us-west-2", "credentials": None, "endpoint_url": None},
+        )
+        assert client.copy_object.call_args_list == []
+        assert client.head_object.call_args_list == []
+        assert client.get_paginator.call_args_list == []
+        # Not applicable, NOT failed: a published run must not read as an error
+        # in the run parquet or the status objects.
+        assert counts["failed"] == 0
+        assert counts["touched"] == 0
+        # PATHS, not objects (review finding on PR #496): the four inputs are
+        # the leaf tree plus the three named siblings. A successful touch of
+        # the same footprint reports touched: 6, because the tree contributes
+        # one per listed key -- the keys are not summable, hence the name.
+        assert counts["skipped_paths"] == 4
+
+    PUBLISHED = "us-west-2.opendata.source.coop"
+
+    def _leaf(self, bucket):
+        return f"s3://{bucket}/englacial/zagg/demo/store/-5/1/{LEAF}"
+
+    def _kw(self):
+        return {"region": "us-west-2", "credentials": None, "endpoint_url": None}
+
+    def test_policy_auto_matches_the_inference_on_both_destinations(self, monkeypatch):
+        # issue #501: `auto` IS issue #495 phase 4, verbatim -- the default, so
+        # every config that predates the knob is byte-identical.
+        client = self._client(monkeypatch)
+        pub = lifecycle.touch_current_unit(
+            self._leaf(self.PUBLISHED), store_kwargs=self._kw(), policy="auto"
+        )
+        assert client.copy_object.call_args_list == []
+        assert pub["skipped_paths"] > 0 and pub["failed"] == 0
+
+        # _CLIENTS is process-wide and the autouse reset runs once per test, so
+        # a second install inside one test needs the cache cleared or the first
+        # client is handed back and the new mock records nothing.
+        lifecycle._CLIENTS.clear()
+        client = self._client(monkeypatch)
+        ours = lifecycle.touch_current_unit(
+            self._leaf(self.BUCKET), store_kwargs=self._kw(), policy="auto"
+        )
+        assert client.copy_object.call_args_list
+        assert ours["touched"] > 0 and "skipped_paths" not in ours
+
+    def test_policy_always_touches_the_published_destination_too(self, monkeypatch):
+        # The override the inference cannot express: an un-negotiated external
+        # target whose expiry rule we know about but whose name says nothing.
+        # It must reach the COPY, not just the call-site guard -- the seam
+        # carries a second check, and a policy-blind seam would silently make
+        # `always` a no-op on exactly the destination it was set for.
+        from zagg.store import _BUCKET_OWNER_ACL
+
+        client = self._client(monkeypatch)
+        pub = lifecycle.touch_current_unit(
+            self._leaf(self.PUBLISHED), store_kwargs=self._kw(), policy="always"
+        )
+        assert client.copy_object.call_args_list, "always must reach the copy seam"
+        assert pub["touched"] > 0 and "skipped_paths" not in pub
+        # The copy must CARRY the bucket-owner ACL. `always` is the only route
+        # that reaches _copy_acl with a published bucket, and under the ambient
+        # execution role the bucket arm of _external_target is the only arm that
+        # can fire -- so this pins the `bucket` argument that keeps an `always`
+        # run from silently stripping ownership on every object it self-copies
+        # to Source Cooperative (review finding on PR #496).
+        assert {c.kwargs["ACL"] for c in client.copy_object.call_args_list} == {_BUCKET_OWNER_ACL}
+
+        # _CLIENTS is process-wide and the autouse reset runs once per test, so
+        # a second install inside one test needs the cache cleared or the first
+        # client is handed back and the new mock records nothing.
+        lifecycle._CLIENTS.clear()
+        client = self._client(monkeypatch)
+        ours = lifecycle.touch_current_unit(
+            self._leaf(self.BUCKET), store_kwargs=self._kw(), policy="always"
+        )
+        assert client.copy_object.call_args_list
+        assert ours["touched"] > 0
+
+    def test_policy_never_touches_neither_destination(self, monkeypatch):
+        client = self._client(monkeypatch)
+        pub = lifecycle.touch_current_unit(
+            self._leaf(self.PUBLISHED), store_kwargs=self._kw(), policy="never"
+        )
+        assert client.copy_object.call_args_list == []
+        assert pub["skipped_paths"] > 0 and pub["failed"] == 0
+
+        # _CLIENTS is process-wide and the autouse reset runs once per test, so
+        # a second install inside one test needs the cache cleared or the first
+        # client is handed back and the new mock records nothing.
+        lifecycle._CLIENTS.clear()
+        client = self._client(monkeypatch)
+        ours = lifecycle.touch_current_unit(
+            self._leaf(self.BUCKET), store_kwargs=self._kw(), policy="never"
+        )
+        assert client.copy_object.call_args_list == []
+        assert ours["skipped_paths"] > 0 and ours["failed"] == 0 and ours["touched"] == 0
+
+    def test_policy_never_covers_local_paths_too(self, tmp_path):
+        # "never touch" is a statement about the RUN, not about S3. A local
+        # store under `never` must not have its mtimes rewritten either.
+        root = tmp_path / "store" / "-5" / "1" / LEAF
+        root.mkdir(parents=True)
+        target = root / "zarr.json"
+        target.write_text("{}")
+        os.utime(target, (1, 1))
+        counts = lifecycle.touch_current_unit(str(root), policy="never")
+        assert target.stat().st_mtime == 1
+        assert counts["touched"] == 0 and counts["failed"] == 0
+        assert counts["skipped_paths"] > 0
+
+    def test_not_applicable_log_names_the_policy_not_the_inference(self, tmp_path, caplog):
+        # The line an operator reads at 3 a.m. A policy skip is not a
+        # publication skip: under `never` on a LOCAL store there is no bucket at
+        # all, and the old wording reported an empty published-bucket list and
+        # pointed at a predicate that was never consulted (review finding on
+        # PR #496).
+        import logging
+
+        root = tmp_path / "store" / "-5" / "1" / LEAF
+        root.mkdir(parents=True)
+        (root / "zarr.json").write_text("{}")
+        with caplog.at_level(logging.INFO, logger="zagg.lifecycle"):
+            lifecycle.touch_current_unit(str(root), policy="never")
+        line = next(r.message for r in caplog.records if "not applicable" in r.message)
+        assert "policy='never'" in line
+        assert "bucket(s)" not in line  # no bucket to name on a local path
+        assert "_touch_applies" in line
+
+    def test_published_skip_is_keyed_on_the_bucket_not_the_credentials(self, monkeypatch):
+        # The guard is `bucket in _PUBLISHED_BUCKETS`, never
+        # `_external_target(...)`. The two differ, and the difference is
+        # load-bearing: _external_target is also true for injected-credential
+        # targets, whose lifecycle and versioning config we do not know.
+        # Skipping those could let a collaborator's data EXPIRE -- the exact
+        # failure the touch exists to prevent. Only the published set is known
+        # not to expire.
+        from zagg.store import _external_target
+
+        creds = {"accessKeyId": "ASIA", "secretAccessKey": "s"}
+        assert _external_target(creds, None, self.BUCKET), "premise: external but not published"
+        client = self._client(monkeypatch)
+        counts = lifecycle.touch_current_unit(
+            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
+            store_kwargs={"region": "us-west-2", "credentials": creds, "endpoint_url": None},
+        )
+        assert client.copy_object.call_args_list, "an un-negotiated target must still be touched"
+        assert counts["touched"] > 0
+        assert "skipped_paths" not in counts
+
+    def test_the_copy_seam_itself_refuses_a_published_bucket(self, monkeypatch):
+        # Belt and braces (review finding on PR #496): the counting guard is
+        # in touch_unit_footprint, but the invariant belongs to the one
+        # function that issues CopyObject, so no future entry point can
+        # bypass it. Unreachable through the public surface today -- this
+        # calls the private seam directly, which is the point.
+        client = self._client(monkeypatch)
+        counts = {"touched": 0, "failed": 0}
+        lifecycle._touch_s3_object(
+            client, "us-west-2.opendata.source.coop", "englacial/zagg/demo/store/x.json", counts
+        )
+        assert client.copy_object.call_args_list == []
+        assert client.head_object.call_args_list == []
+        # Counts NOTHING: the path-based accounting lives at the call site,
+        # and counting here as well would double it.
+        assert counts == {"touched": 0, "failed": 0}
+
+    def test_in_account_copies_carry_no_acl(self, monkeypatch):
+        # Ambient execution-role touch of our own bucket: nothing to hand over,
+        # and an ACL would be a change the touch has no business making.
+        client = self._client(monkeypatch)
+        lifecycle.touch_current_unit(
+            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
+            store_kwargs={"region": "us-west-2", "credentials": None, "endpoint_url": None},
+        )
+        calls = client.copy_object.call_args_list
+        assert calls
+        assert all("ACL" not in c.kwargs for c in calls)
+
+    def test_custom_endpoint_copies_carry_no_acl(self, monkeypatch):
+        # Excluded exactly as in the store seam: canned ACLs are an AWS-S3
+        # concept the stores behind endpoint_url do not implement.
+        client = self._client(monkeypatch)
+        lifecycle.touch_current_unit(
+            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
+            store_kwargs={
+                "credentials": {"accessKeyId": "ASIA", "secretAccessKey": "s"},
+                "endpoint_url": "https://acct.r2.cloudflarestorage.com",
+            },
+        )
+        assert all("ACL" not in c.kwargs for c in client.copy_object.call_args_list)
+
+    def test_a_failing_copy_on_an_external_target_stays_fail_open(self, monkeypatch):
+        # The ACL rides a best-effort request: a rejection still only counts.
+        err = ClientError({"Error": {"Code": "AccessDenied"}}, "CopyObject")
+        self._client(monkeypatch, copy_error=err)
+        counts = lifecycle.touch_current_unit(
+            f"s3://{self.BUCKET}/store/-5/1/{LEAF}",
+            store_kwargs={"credentials": {"accessKeyId": "ASIA", "secretAccessKey": "s"}},
+        )
+        assert counts == {"touched": 0, "failed": 6}
+
     def test_absent_sibling_is_neither_touched_nor_failed(self, monkeypatch):
         # copy of a missing key (e.g. no sub-map was ever written) NoSuchKey-s;
         # absence is not a failure.

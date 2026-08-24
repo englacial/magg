@@ -1241,6 +1241,16 @@ def _validate_store_layout_keys(config: PipelineConfig) -> None:
     store_layout = config.output.get("store_layout")
     if store_layout is not None and store_layout not in ("flat", "hive"):
         raise ValueError(f"output.store_layout must be 'flat' or 'hive' (got {store_layout!r})")
+    # Lifecycle-touch policy (issue #501): validated at load so a typo fails at
+    # submission rather than silently resolving to the default deep inside a
+    # worker's skip path, where the wrong answer is either version churn on a
+    # published store or a collaborator's data expiring.
+    touch = config.output.get("touch")
+    if touch is not None and touch not in TOUCH_POLICIES:
+        raise ValueError(
+            f"output.touch must be one of {', '.join(repr(t) for t in TOUCH_POLICIES)} "
+            f"(got {touch!r})"
+        )
     # D19 product name (issue #299): validated at load so a bad name fails
     # before any store I/O. The grammar lives in hive.py (one source).
     name = config.output.get("product_name")
@@ -1960,6 +1970,7 @@ def _validate_temporal_producer(name: str, meta: dict, config=None) -> None:
     ``validate_config`` path passes it.
     """
     from zagg.time_axis import (
+        TOC_NO_CLOCK_ERROR,
         TOC_PER_CELL_FUNCTIONS,
         TOC_PRODUCING_FUNCTIONS,
         TOC_SHAPE_PER_CELL,
@@ -1983,13 +1994,26 @@ def _validate_temporal_producer(name: str, meta: dict, config=None) -> None:
             f"sibling, and a digest kernel's channel is not a dense per-cell array "
             f"(spec §8.2/§8.3)"
         )
+    # The clock cross-check runs through the same resolver the worker encodes
+    # with (``toc_source``: ``output.time_source``, falling back to a
+    # continuous-scale ``output.windowing`` block), and raises the worker's
+    # exact message so the two seams read identically (issue #472) — the
+    # worker's copy stays as defense in depth. Two limits on that parity, both
+    # named here because this is where a reader will look (fold review):
+    #   * this seam is reachable only from ``validate_config``'s spatial,
+    #     non-raster branch (the aggregation-variable loop, after both early
+    #     returns), while ``_toc_word_column`` is ungated. Benign today —
+    #     ``calculate_cell_statistics`` is only reached from the spatial point
+    #     path, so no other branch can produce toc words — but a raster or
+    #     event toc path would inherit the gap silently.
+    #   * the resolver is shared, but the two clock declarations validate their
+    #     COLUMN against different sets: ``_validate_time_source`` accepts a
+    #     broadcast/segment-level column (GEDI's shot-rate clock) where
+    #     ``_validate_windowing`` refuses one (segment-rate window membership
+    #     is unsupported), so the fallback is not interchangeable with the
+    #     explicit block.
     if config is not None and toc_source(config) is None:
-        raise ValueError(
-            f"Variable '{name}': 'temporal' requires the store's per-observation clock — "
-            f"declare output.time_source {{field, epoch, scale, units}} (or an "
-            f"output.windowing block on a continuous scale, which it falls back to). "
-            f"Without it there is no column to encode toc words from (issue #410)"
-        )
+        raise ValueError(f"Variable '{name}': {TOC_NO_CLOCK_ERROR}")
 
 
 def _validate_output_kind(name: str, meta: dict, config=None) -> None:
@@ -3167,6 +3191,51 @@ def get_store_path(config: PipelineConfig) -> str | None:
     str or None
     """
     return config.output.get("store")
+
+
+#: Legal ``output.touch`` values (issue #501). ``auto`` is the issue #495
+#: phase 4 inference; the other two are the operator's override of it.
+TOUCH_POLICIES = ("auto", "always", "never")
+
+
+def get_touch_policy(config: PipelineConfig) -> str:
+    """Return the skip-run lifecycle-touch policy (issue #501).
+
+    The touch (issue #388) defeats a bucket EXPIRATION rule, so whether to run
+    it is a property of the destination — one we cannot read cross-account
+    (``s3:GetLifecycleConfiguration`` is bucket-owner only) and that no bucket
+    name reliably encodes. The operator knows, so it is declarable:
+
+    ``auto`` (default)
+        The issue #495 phase 4 inference, verbatim: touch unless the
+        destination is in :data:`zagg.store._PUBLISHED_BUCKETS`. A pure no-op
+        for every config that predates this knob.
+    ``always``
+        Touch regardless of destination — an un-negotiated external target
+        whose expiry rule we know about but whose name says nothing.
+    ``never``
+        Never touch, local paths included — an archival destination, or one
+        where version churn outweighs the protection.
+
+    An override layered ON TOP of the inference, not a replacement.
+
+    An unrecognized value falls through to ``auto`` (:func:`zagg.lifecycle.
+    _touch_applies`) but WARNS first: :func:`validate_config` rejects a typo at
+    submission, but the worker's own funnel — :func:`load_config_from_dict` on
+    a hand-built invoke event — does not validate, so ``touch: "nevr"`` would
+    otherwise touch an archival destination against the operator's stated
+    intent with nothing in the log. One greppable line instead (review finding
+    on PR #496).
+    """
+    touch = config.output.get("touch", "auto")
+    if touch not in TOUCH_POLICIES:
+        logger.warning(
+            f"output.touch={touch!r} is not one of "
+            f"{', '.join(repr(t) for t in TOUCH_POLICIES)} — falling through to 'auto' "
+            "(the issue #495 phase 4 inference); this config was not validated at "
+            "submission (issue #501)"
+        )
+    return touch
 
 
 def get_store_layout(config: PipelineConfig) -> str:

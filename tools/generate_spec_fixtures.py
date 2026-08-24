@@ -83,6 +83,14 @@ conformance tests assert decoded values, never object bytes.
   — the aggregation kernel that will produce them is #410's next PR — so the
   expectations stay input-derived. ``kitchen_sink/``, committed before §9
   and not regenerated, is the absent-``located`` ⇒ §2.2 pin.
+  ``temporal/`` is ALSO the only fixture carrying a **root ``coverage.moc``**
+  (issue #480): the §10 ``zagg-coverage-toc/1`` section, written here by the
+  production sweep writer (``MocFamily``'s leaf read + finisher) — and, from
+  issue #489, the only one with the §10.5 ``coverage.toc`` word-set cover
+  sibling that same finisher PUTs beside it. The other six declare no
+  temporal field, so a sweep of one produces no section (and no sibling) —
+  leaving them without either root object IS §10's absence rule, and keeps
+  those trees byte-identical.
 
 STALE BY DESIGN: ``minimal/`` and ``kitchen_sink/`` were committed before
 issue #382 and their ``morton_hive.json`` still carries the pre-#382
@@ -910,6 +918,56 @@ TEMPORAL_BASE = "2019-05-14T02:11:07.250000000"
 #: merged centroid's envelope is a genuine range rather than a rounding
 #: artifact, narrow enough that a cell's whole span stays sub-hour.
 TEMPORAL_STEP_S = 3
+#: The cell whose clock is pushed forward to build §10.5's GAP (issue #489).
+#: The last cell of the plan, so the fixture's cover is TWO words with a hole
+#: between them rather than one bucket that swallows the whole ~30-minute
+#: fixture — which is what makes the §7 parity and containment claims
+#: falsifiable for an external reader.
+TEMPORAL_GAP_CELL = 3
+#: How far, in whole days. §10.5's guaranteed floor for a surviving gap is
+#: TWO bucket spans (2 × 2^45 ns ≈ 19.5 h at the pinned cover order); five days
+#: clears three, so a whole ALIGNED bucket stays uncovered wherever the base
+#: instant falls on the grid. Whole days keep the fixture's clock on the same
+#: fractional second, which is what lets the kernel-parity test drive these
+#: instants through a float-seconds axis and still land on the committed
+#: words to the nanosecond.
+TEMPORAL_GAP_DAYS = 5
+
+
+def _temporal_gap_offset_ns() -> int:
+    """The gap cell's clock offset, checked against §10.5's two-span floor."""
+    from zagg.coverage_toc import TEMPORAL_COVER_ORDER
+
+    offset = TEMPORAL_GAP_DAYS * 86_400 * 10**9
+    assert offset >= 2 * (1 << (63 - TEMPORAL_COVER_ORDER)), "gap below §10.5's survival floor"
+    return offset
+
+
+def _temporal_gap(words: np.ndarray) -> tuple[int, int]:
+    """An aligned interval no §10.5 cover of ``words`` may claim.
+
+    The widest hole between the input envelopes (internal-ns scale, the one
+    ``toc2time`` speaks), narrowed to the bucket grid at the pinned order:
+    the buckets wholly inside the hole are exactly the ones quantization
+    cannot widen into, so the interval is uncovered by construction rather
+    than by inspection of the object under test.
+    """
+    from mortie import toc2time
+
+    from zagg.coverage_toc import TEMPORAL_COVER_ORDER
+
+    lo, hi = (np.atleast_1d(np.asarray(x, dtype=np.uint64)) for x in toc2time(words))
+    # A timestamp decodes to (t, t); a range's decoded end is exclusive.
+    spans = sorted((int(a), max(int(b), int(a) + 1)) for a, b in zip(lo, hi, strict=True))
+    reach, hole = spans[0][1], (0, 0)
+    for start, end in spans[1:]:
+        if start > reach and start - reach > hole[1] - hole[0]:
+            hole = (reach, start)
+        reach = max(reach, end)
+    span = 1 << (63 - TEMPORAL_COVER_ORDER)
+    gap = (-(-hole[0] // span) * span, (hole[1] // span) * span)
+    assert gap[1] > gap[0], f"no whole aligned bucket inside {hole} — raise TEMPORAL_GAP_SPANS"
+    return gap
 
 
 def _obs_times_ns(n: int, cell_ordinal: int) -> np.ndarray:
@@ -1110,6 +1168,13 @@ def build_temporal(out: Path) -> None:
         order = np.argsort(h, kind="stable")
         h, words = h[order], words[order]
         times_ns = _obs_times_ns(n, ordinal)
+        if ordinal == TEMPORAL_GAP_CELL:
+            # The §10.5 gap, built into the INPUTS (issue #489): this cell's
+            # clock sits whole buckets past the rest of the plan, so the
+            # committed coverage.toc carries a real hole. Done here rather
+            # than in `_obs_times_ns`, whose clock the other §8 expectations
+            # (and the frozen digests over the other cells) ride unchanged.
+            times_ns = times_ns + _temporal_gap_offset_ns()
         digest, locs = build_tdigest(h, DELTA, locations=words)
         runs = _centroid_runs(digest, n)
         per_centroid = _toc_words(
@@ -1161,6 +1226,75 @@ def build_temporal(out: Path) -> None:
         processing.process_shard = original
     assert meta.get("error") is None, meta
 
+    # The §10 root coverage sidecar, through the PRODUCTION writer: the MOC
+    # family's own leaf read plus its finisher, which is exactly what a sweep
+    # runs. This is the only fixture that gets a root coverage.moc — every
+    # other fixture store declares no temporal field, so a sweep of one would
+    # produce no section at all, and writing a bare carrier there would churn
+    # four committed trees for nothing (§10's absence rule, pinned as byte
+    # identity by the conformance suite).
+    from mortie import toc_overlaps, toc_reduce
+
+    from zagg.coverage_toc import (
+        COVER_CAP,
+        COVER_KEY,
+        COVER_SPEC,
+        TEMPORAL_COVER_ORDER,
+        cover_words,
+        coverage_toc,
+        coverage_toc_digest,
+        quantize_words,
+        read_cover,
+    )
+    from zagg.sweep import MocFamily
+
+    family = MocFamily()
+    contribution, _written_at = family.read_leaf(root, SHARD_KEY, None, "morton-hive/1", {})
+    family.finish(root, [{"payload": contribution}], 4, {})
+    envelope = hive.read_root_coverage(root)
+    root_digest, root_words = coverage_toc_digest(envelope)
+    # The shard envelope word is DERIVED from the generator's inputs — the
+    # join over every per-centroid word it handed the writer — so a writer
+    # that folds the wrong thing fails here instead of certifying itself. The
+    # digest rows are the writer's committed output read back (pinned the way
+    # column/'s group values are); the claims that matter over them — weight
+    # conservation and per-centroid containment — are derived, from the cell
+    # plan's own observation counts and the instants recorded per cell.
+    shard_word = int(
+        toc_reduce(
+            np.concatenate(
+                [cell["h_tdigest"][2] for cells in by_chunk.values() for cell in cells.values()]
+            ).astype(np.uint64)
+        )
+    )
+    assert coverage_toc(envelope) == {SHARD_KEY: shard_word}, coverage_toc(envelope)
+
+    # The §10.5 word-set cover sibling (issue #489), through the same
+    # production writer: derived from the identical inputs — the quantized
+    # normalize over every per-centroid word handed to the writer — so the
+    # committed object is pinned against the generator, never against itself.
+    every_word = np.concatenate(
+        [cell["h_tdigest"][2] for cells in by_chunk.values() for cell in cells.values()]
+    ).astype(np.uint64)
+    expect_cover = quantize_words(every_word)
+    cover_obj = read_cover(root)
+    assert cover_obj["spec"] == COVER_SPEC == envelope["temporal"][COVER_KEY]
+    assert cover_obj["order"] == 4 and cover_obj["temporal_order"] == TEMPORAL_COVER_ORDER
+    decoded_cover = cover_words(cover_obj)
+    assert set(decoded_cover) == {SHARD_KEY}
+    assert np.array_equal(decoded_cover[SHARD_KEY], expect_cover), decoded_cover
+    # The §10.5 parity invariant, on the committed pair.
+    assert int(toc_reduce(expect_cover)) == int(toc_reduce(quantize_words([shard_word])))
+    # The gap `TEMPORAL_GAP_CELL` bought, DERIVED from the same inputs: the
+    # widest hole between consecutive input envelopes, pulled IN to the
+    # bucket grid, so what is left is whole aligned bucket(s) no widening law
+    # may claim. A cover that swallowed the hole (or a single-word one, the
+    # shape this fixture had before issue #489) fails right here, in the
+    # generator, rather than certifying itself downstream.
+    gap_start, gap_end = _temporal_gap(every_word)
+    assert len(expect_cover) >= 2, expect_cover
+    assert not bool(np.any(np.atleast_1d(toc_overlaps(expect_cover, gap_start, gap_end))))
+
     leaf_rel = hive.shard_leaf_path("", shard).lstrip("/")
     expected = {
         "shard": SHARD_KEY,
@@ -1173,6 +1307,42 @@ def build_temporal(out: Path) -> None:
         "chunks_per_shard": grid.chunks_per_shard,
         "empty_chunk": EMPTY_CHUNK,
         "delta": DELTA,
+        # The §10 root coverage temporal section: the tier-1 word (derived),
+        # the tier-2 digest (the writer's, read back) and the weight total the
+        # cell plan says it must carry.
+        "root_coverage": {
+            "object": "coverage.moc",
+            "spec": "zagg-coverage-toc/1",
+            "fields": ["h_tdigest"],
+            "shards": {SHARD_KEY: str(shard_word)},
+            "obs_total": sum(c["count"] for c in expected_cells),
+            "digest": {
+                "delta": envelope["temporal"]["digest"]["delta"],
+                "centroids": [[float(m), float(w)] for m, w in root_digest],
+                "times": [str(int(w)) for w in root_words],
+            },
+        },
+        # The §10.5 sibling: the object name, its markers, and the DERIVED
+        # word set (quantized from the same inputs as the tier-1 word above),
+        # so the conformance suite pins the committed coverage.toc without
+        # the object certifying itself.
+        "cover": {
+            "object": "coverage.toc",
+            "spec": COVER_SPEC,
+            "temporal_order": TEMPORAL_COVER_ORDER,
+            "cap": COVER_CAP,
+            "fields": ["h_tdigest"],
+            "element": {"dtype": "uint64", "shape": [-1]},
+            "encoding": "base64",
+            "count": len(expect_cover),
+            "words": [str(int(w)) for w in expect_cover],
+            # An interval on the §8 INTERNAL scale that the committed cover
+            # must not claim — derived above from the member instants, never
+            # transcribed. It is what makes the parity and containment claims
+            # discriminating: a cover that bridges the fixture's two clusters
+            # over-claims here (§10.5's never-bridge law).
+            "gap_ns": [str(int(gap_start)), str(int(gap_end))],
+        },
         # The declarations the conformance tests assert against the committed
         # attrs — each on the array that HOLDS the words (§8/§9), and the
         # payload's binding, which is a sibling key of the ragged block.
@@ -1194,7 +1364,10 @@ def build_temporal(out: Path) -> None:
         "content_hashes": _o11_hashes(str(out / leaf_rel)),
     }
     (out.parent / f"{out.name}.expected.json").write_text(json.dumps(expected, indent=1) + "\n")
-    print(f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells, both toc variants")
+    print(
+        f"{out.name}: leaf {leaf_rel}, {len(expected_cells)} populated cells, both toc "
+        f"variants, root coverage.moc with {len(root_digest)} digest centroids"
+    )
 
 
 def main() -> None:

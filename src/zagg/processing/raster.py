@@ -1347,11 +1347,15 @@ def process_and_write_raster_hive(
                 # sub-map siblings (the raster seam writes no column).
                 # Fail-open: a failed touch logs and counts, never fails or
                 # un-skips the unit.
+                from zagg.config import get_touch_policy
                 from zagg.lifecycle import touch_current_unit
 
                 try:
                     counts = touch_current_unit(
-                        leaf_path, sidecar_spec=sidecar_spec, store_kwargs=store_kwargs
+                        leaf_path,
+                        sidecar_spec=sidecar_spec,
+                        store_kwargs=store_kwargs,
+                        policy=get_touch_policy(config),
                     )
                 except Exception as e:
                     logger.warning(
@@ -1360,6 +1364,13 @@ def process_and_write_raster_hive(
                     counts = {"touched": 0, "failed": 1}
                 out["touched_objects"] = counts["touched"]
                 out["touch_failed"] = counts["failed"]
+                # Not-applicable paths (issue #495 phase 4) — same posture as
+                # the aggregation seam: the pair above records a published
+                # skip as 0/0, indistinguishable from a touch that never ran
+                # (the exact ambiguity the comment at the bottom of this
+                # module names). Absent when zero.
+                if counts.get("skipped_paths"):
+                    out["touch_skipped_paths"] = counts["skipped_paths"]
             return out
     # The leaf's own time axis, from the dispatched subset. Every group key in
     # the subset is in this index by construction, so the worker never trips

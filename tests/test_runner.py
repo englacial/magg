@@ -1,6 +1,8 @@
 """Tests for the runner module (Python API)."""
 
+import copy
 import json
+import re
 import warnings
 from datetime import datetime, timezone
 
@@ -72,6 +74,84 @@ class TestRunValidation:
     def test_lambda_requires_s3_store(self, atl06_config, catalog_file):
         with pytest.raises(ValueError, match="s3://"):
             agg(atl06_config, catalog=catalog_file, store="./local.zarr", backend="lambda")
+
+
+class TestAggValidatesConfig:
+    """``agg`` is the single ``validate_config`` choke point (issue #485).
+
+    ``Run.from_config`` closed the facade seam (issue #472); a mutated
+    ``PipelineConfig`` handed to ``agg`` directly — the local backend and the
+    raster/temporal branches the facade's v1 gates refuse — still reached the
+    workers unvalidated. The refusal must land before catalog/store
+    resolution, so these tests pass neither.
+    """
+
+    def _graft(self):
+        # The issue #472 shape: temporal variables grafted onto a validated
+        # base after default_config's own validation already ran.
+        base = default_config("atl03_tdigest_healpix_hive")
+        located = default_config("atl03_tdigest_located_healpix")
+        base.aggregation["variables"] = copy.deepcopy(located.aggregation["variables"])
+        return base
+
+    def test_grafted_config_refused_before_catalog_resolution(self):
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            agg(self._graft())  # no catalog, no store: validation must win
+
+    def test_notebook_run_shares_the_choke_point(self):
+        from zagg.notebook import run as notebook_run
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            notebook_run(self._graft())
+
+    def test_notebook_run_refuses_before_the_cost_preview(self, tmp_path):
+        # The wrapper's own ordering (issue #485): with a catalog= the run
+        # would preview first, and max_cost_preview loads the shardmap — so
+        # without notebook.run's pre-preview call this raises FileNotFoundError
+        # and the config refusal never surfaces.
+        from zagg.notebook import run as notebook_run
+        from zagg.time_axis import TOC_NO_CLOCK_ERROR
+
+        missing = str(tmp_path / "no_such_shardmap.json")
+        with pytest.raises(ValueError, match=re.escape(TOC_NO_CLOCK_ERROR)):
+            notebook_run(self._graft(), catalog=missing)
+
+    def test_valid_config_reaches_catalog_resolution(self, atl06_config):
+        # Positive control: a conformant config passes validation and fails on
+        # the *next* check (TestRunValidation's missing-catalog refusal), so
+        # the new call refuses nothing that ran before.
+        with pytest.raises(ValueError, match="No catalog"):
+            agg(atl06_config)
+
+    # The next two pin the seam at ``agg`` rather than inside SpatialStrategy:
+    # each drives a non-spatial kind and asserts the *validator's* message, not
+    # the strategy's own first refusal. Move the call down into
+    # SpatialStrategy.run and temporal raises its "requires events=" error /
+    # raster its "No catalog specified" instead, and both fail.
+
+    def test_temporal_config_validated_at_the_same_seam(self):
+        cfg = _temporal_config()
+        del cfg.aggregation["variables"]["max_t2m"]["temporal_reducer"]
+        with pytest.raises(ValueError, match="missing required key.*temporal_reducer"):
+            agg(cfg)
+
+    def test_raster_config_validated_at_the_same_seam(self):
+        from zagg.config import load_config_from_dict
+
+        cfg = load_config_from_dict(
+            {
+                "data_source": {"reader": "raster", "bands": {"red": {"asset": "red"}}},
+                "output": {
+                    "grid": {"type": "healpix", "parent_order": 10, "child_order": 16},
+                    "store": "memory://",
+                },
+            }
+        )
+        with pytest.raises(ValueError, match="requires a string 'dtype'"):
+            agg(cfg)
 
 
 class TestDryRun:
@@ -1554,6 +1634,144 @@ class TestClampedDataSource:
         assert ds == {"shard_workers": 4}  # never mutated in place
         # Legacy-key configs keep the legacy name (no canonical key injected).
         assert _clamped_data_source({"granule_workers": 4}, 1) == {"granule_workers": 1}
+
+
+class TestIdentityCountsNotApplicableRollup:
+    """The issue #495 phase-4 not-applicable count reaches the run summary.
+
+    A published store's touch is skipped, and ``objects_touched: 0`` /
+    ``touch_failures: 0`` is byte-identical to a touch that never ran -- so
+    the skip has to be visible in the durable record, not only in a
+    CloudWatch INFO line (review finding on PR #496).
+    """
+
+    def test_skipped_paths_roll_up_from_the_unit_records(self):
+        from zagg.runner import _identity_counts
+
+        metas = [
+            {"current": True, "touched_objects": 0, "touch_failed": 0, "touch_skipped_paths": 4},
+            {"current": True, "touched_objects": 0, "touch_failed": 0, "touch_skipped_paths": 4},
+        ]
+        counts = _identity_counts(metas)
+        assert counts["objects_touched"] == 0 and counts["touch_failures"] == 0
+        assert counts["touch_skipped_paths"] == 8
+
+    def test_the_key_is_absent_when_nothing_was_skipped(self):
+        # Conditional by design: a run that touches nothing published keeps
+        # exactly the key set it had before phase 4 (pinned as a SET by
+        # TestSummaryKeysByteIdentical._IDENTITY_KEYS below).
+        from zagg.runner import _identity_counts
+
+        counts = _identity_counts([{"current": True, "touched_objects": 6, "touch_failed": 0}])
+        assert counts["objects_touched"] == 6
+        assert "touch_skipped_paths" not in counts
+
+    def test_the_store_root_touch_adds_to_the_same_key(self):
+        # The root objects belong to no unit, so they never arrive through
+        # ``metas`` -- the local paths add them after the fact.
+        from zagg.runner import _add_skipped_paths, _identity_counts
+
+        identity = _identity_counts([{"current": True, "touch_skipped_paths": 4}])
+        _add_skipped_paths(identity, {"touched": 0, "failed": 0, "skipped_paths": 3})
+        assert identity["touch_skipped_paths"] == 7
+        # ...and adds nothing when the root touch actually ran.
+        clean = _identity_counts([{"current": True, "touched_objects": 6, "touch_failed": 0}])
+        _add_skipped_paths(clean, {"touched": 3, "failed": 0})
+        assert "touch_skipped_paths" not in clean
+
+
+class TestDeclaredTouchPolicyReachesTheRootTouch:
+    """Issue #501 END TO END through the local runner's store-root touch.
+
+    Every lifecycle test calls ``touch_store_root`` directly, so without this
+    the ``policy=get_touch_policy(config)`` kwarg at the ``_run_local`` root
+    seam could be deleted with the suite green — and an operator who declared
+    ``output.touch: never`` on an archival destination would still get the D6
+    manifest and the aggregation core self-copied on every all-skip run
+    (review finding on PR #496).
+    """
+
+    def _run(self, monkeypatch, atl06_config, tmp_path, *, touch):
+        import zagg.grids as grids_mod
+        import zagg.hive as hive_mod
+        from zagg import runner
+
+        monkeypatch.setattr(
+            runner,
+            "get_nsidc_s3_credentials",
+            lambda: {"accessKeyId": "a", "secretAccessKey": "s", "sessionToken": "t"},
+        )
+        monkeypatch.setattr(grids_mod, "from_config", lambda *a, **k: _stub_grid())
+        monkeypatch.setattr(runner, "open_store", lambda *a, **k: object())
+        # Every unit is CURRENT: the run writes nothing, which is exactly when
+        # the root objects would otherwise age out from under fresh leaves.
+        monkeypatch.setattr(
+            hive_mod,
+            "process_and_write_hive",
+            lambda shard_key, *a, **k: {
+                "shard_key": shard_key,
+                "current": True,
+                "identity": "equal",
+                "touched_objects": 0,
+                "touch_failed": 0,
+                "error": None,
+            },
+        )
+        atl06_config.output["store_layout"] = "hive"
+        atl06_config.output["coverage_moc"] = False
+        atl06_config.output.setdefault("sweep", False)
+        if touch is not None:
+            atl06_config.output["touch"] = touch
+        return runner._run_local(
+            atl06_config,
+            _run_catalog(),
+            str(tmp_path / "store"),
+            12,
+            max_cells=None,
+            morton_cell=None,
+            max_workers=1,
+            overwrite=False,
+            dry_run=False,
+            region="us-west-2",
+        )
+
+    def test_never_leaves_the_root_objects_alone(self, monkeypatch, atl06_config, tmp_path):
+        summary = self._run(monkeypatch, atl06_config, tmp_path, touch="never")
+        assert summary["cells_current"] == 4  # premise: the root touch seam ran
+        assert summary["objects_touched"] == 0 and summary["touch_failures"] == 0
+        # Not applicable, recorded — three root paths, none of them touched.
+        assert summary["touch_skipped_paths"] == 3
+
+    def test_the_staged_sweep_chaining_carries_the_policy(
+        self, monkeypatch, atl06_config, tmp_path
+    ):
+        # The staged sweep's finisher self-copies the root aggregation core, so
+        # the ONE sweep caller that holds a config must hand it the policy —
+        # otherwise `never` on an archival destination still pays one full-size
+        # root-core version per staged sweep (review finding on PR #496).
+        import zagg.sweep as sweep_mod
+        import zagg.sweep_stages as stages_mod
+
+        monkeypatch.setattr(sweep_mod, "leaves_from_stats_records", lambda *a, **k: [(1, None)])
+        monkeypatch.setattr(sweep_mod, "sweep_after_run", lambda *a, **k: None)
+        seen = {}
+        monkeypatch.setattr(
+            stages_mod,
+            "stage_sweep_after_run",
+            lambda *a, **k: seen.update(k),
+        )
+        atl06_config.output["sweep"] = "stages"
+        self._run(monkeypatch, atl06_config, tmp_path, touch="never")
+        assert seen["touch_policy"] == "never"
+
+    def test_absent_still_touches_the_root(self, monkeypatch, atl06_config, tmp_path):
+        # `auto` is the default and the issue #495 phase 4 inference: a local
+        # store is not published, so the root objects that exist are touched
+        # and the conditional not-applicable key stays absent.
+        summary = self._run(monkeypatch, atl06_config, tmp_path, touch=None)
+        assert summary["cells_current"] == 4
+        assert summary["objects_touched"] > 0 and summary["touch_failures"] == 0
+        assert "touch_skipped_paths" not in summary
 
 
 class TestSummaryKeysByteIdentical:

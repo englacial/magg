@@ -57,8 +57,9 @@ the same per-shard write path (see [Status](#status)).
 - **Node invariant** (D5): below the root, a node contains *only* digit
   children (`[1-4]/`) and `*.zarr` objects — zero zarr metadata above the
   leaf, no shared mutable state across workers. The root alone also carries
-  the manifest (and, in a follow-on, `coverage.moc`). `zagg.hive`
-  re-checks every computed leaf path against this invariant before writing.
+  the manifest and the coverage sidecars — `coverage.moc`, plus `coverage.toc`
+  on a temporal store. `zagg.hive` re-checks every computed leaf path against
+  this invariant before writing.
 
 ## Config
 
@@ -219,7 +220,13 @@ Otherwise never touched during a run (D6); the read-only frozen-key precheck
 (`zagg.hive.validate_manifest`) still runs before the fan-out so an
 incompatible existing store refuses up front on reruns (two concurrent first
 writes into a fresh root now collide within seconds of init, not at the
-losing run's finalize).
+losing run's finalize). That precheck is a *read*, so the same preflight also
+runs a **write probe** ([issue
+#495](https://github.com/englacial/zagg/issues/495)); it is not hive-specific
+(it runs on every `s3://` ping, raster included), so it is documented with the
+other operator-facing credential material in
+[`docs/deployment/lambda.md`](deployment/lambda.md#write-probe).
+
 With the manifest, every shard
 path is computable arithmetically with zero requests:
 
@@ -611,7 +618,7 @@ actual `[t_min, t_max]` written, as ISO-8601 UTC strings.
 Where the data is, declared hierarchically
 ([issue #200](https://github.com/englacial/zagg/issues/200), design §4 as
 amended by PR #206; O8/O9 resolved on the issue thread). Three tiers per
-shard plus one store-root object:
+shard plus two store-root objects:
 
 | tier | what | where | cost to read |
 |---|---|---|---|
@@ -619,6 +626,7 @@ shard plus one store-root object:
 | 1 — exact bitmap | zstd-compressed bit field over the shard subtree at `cell_order` | `{full_id}.zarr/coverage.moc` sidecar | one opt-in GET |
 | 2 — exact truth | the leaf's `morton` coordinate array | the leaf's data plane | array read; the tiers above are indexes, never truth (D9) |
 | root | shard-order ranges MOC over all completed shards | `{store_root}/coverage.moc` | one GET — the discovery bootstrap |
+| root sibling | [§10.5](specification.md) word-set cover: a per-shard toc word SET (temporal stores only) | `{store_root}/coverage.toc` | one opt-in GET, temporal consumers only, on demand |
 
 **Leaf envelope** (on the stamp, `zagg.hive.read_coverage`; strict
 `spec: morton-moc/1` gate — unknown specs read as absent):
@@ -667,11 +675,31 @@ The example above is `zagg.hive.build_root_coverage` output for the shards
 `root_coverage_words`; the test suite parses it straight out of this file so
 the reference example can never drift from the implementation.
 
+A temporal-declaring store adds one more key here: `temporal`, the
+`zagg-coverage-toc/1` section (per-shard toc envelope words plus an optional
+root time-digest) whose grammar is normative in
+[`specification.md`](specification.md) §10 — one metadata GET then answers
+"which shards hold data DURING my window" before any leaf is opened. A store
+with no temporal channel carries no such key and its root object is
+byte-identical to a pre-#480 one; absence is never a refusal.
+
 A range is an inclusive run of same-order cells within one base cell,
 consecutive in digit-tail rank; endpoints are decimal **strings** (packed
 u64 words exceed 2^53 and raw JSON numbers get mangled by float-based
 parsers). `source` is `"dispatcher"` (end-of-run write) or `"refresh"` (the
 explicit walk rebuild); the sweep will add its own.
+
+The same store may carry one more **root sibling**, `{store_root}/coverage.toc`
+([issue #489](https://github.com/englacial/zagg/issues/489)): the §10.5
+word-set cover — per shard, a small canonical toc word SET instead of the
+section's single envelope word, so a window that falls in a gap *between* a
+shard's observation campaigns prunes that shard too. It is GET-on-demand by
+temporal consumers only (at CA scale ~1.5 MB against the ~0.1 MB
+tier-1-carrying bootstrap object it sits beside — ~15×, and ~300× a
+spatial-only pre-#480 root — which is why it is not inline), discovered
+through the section's `cover` marker, and carries the same
+regenerable-accelerator staleness posture as everything else on this page.
+Grammar: [`specification.md`](specification.md) §10.5.
 
 **Reader flow** (`zagg.coverage`): `load_coverage` → `root_coverage_and`
 against the AOI to pick candidate shards (one GET, no walk); per leaf,
@@ -1048,11 +1076,12 @@ counters and worker logs, not in a durable object.
 
 ### The lifecycle touch
 
-A skipped unit still resets the purge clock: every object in its footprint
-gets a fresh `LastModified` (lifecycle rules act per object) — the leaf
-`.zarr` tree (stamp, arrays, in-leaf `coverage.moc`), the stats sidecar, its
-granule-id sibling and the sub-map sibling, and the declared column tree plus
-its own sidecar.
+A skipped unit still resets the purge clock (except on a **published**
+bucket — see below): every object in its footprint gets a fresh
+`LastModified` (lifecycle rules act per object) — the leaf `.zarr` tree
+(stamp, arrays, in-leaf `coverage.moc`), the stats sidecar, its granule-id
+sibling and the sub-map sibling, and the declared column tree plus its own
+sidecar.
 Local stores use `os.utime`; S3 uses a server-side self-copy (`CopyObject`
 onto itself, `MetadataDirective: REPLACE`) that preserves content, the ETag
 of non-multipart objects, and the object's storage class. A local run's
@@ -1067,13 +1096,34 @@ and degrades to today's behavior — it never fails the unit and never
 un-skips it. Watch the counters: `objects_touched` / `touch_failures` ride
 the run summary, and the CLI warns explicitly when touches failed, because
 those objects **did not** get their purge clock reset (the run still exits
-0). S3 caveats, documented rather than solved: a versioned bucket mints a
-new object version per touch; an object already transitioned to
+0).
+
+**A published store is not touched at all.** A path on a bucket in
+`zagg.store._PUBLISHED_BUCKETS` — Source Cooperative's
+`us-west-2.opendata.source.coop` today — is **not applicable** rather than
+touched or failed. The touch exists to defeat an expiration rule and an
+archival published bucket has none; worse, that bucket is **versioned**, so
+the self-copy does not refresh a timestamp in place — it writes a new
+full-size version and demotes the old one to noncurrent, where it keeps
+consuming storage. A single full-skip run over the CA store would add
+roughly **332 GB** of noncurrent versions, invisible to `ListObjectsV2`, on
+a bucket AWS pays for as an Open Data sponsor. So a published store reports
+`objects_touched: 0` with **no failures**, plus a `touch_skipped_paths`
+count naming how many footprint *paths* (not objects) were skipped — that
+key is present only when something was skipped, and is what tells a
+published run apart from a touch that never ran. The guard keys on the
+published set specifically, **not** on "external target": an
+injected-credential collaborator bucket has unknown lifecycle configuration
+and must still be touched, or the touch's whole purpose fails there.
+
+S3 caveats, documented rather than solved: an object already transitioned to
 `GLACIER`/`DEEP_ARCHIVE` cannot be self-copied (counts as failed); ACLs are
 not preserved (moot under `BucketOwnerEnforced`, the modern default, but a
 public-read-**by-ACL** bucket would see touched objects go private); under
 SSE-KMS the copy re-encrypts with the bucket-default key and needs
-`kms:Decrypt` + `kms:GenerateDataKey`.
+`kms:Decrypt` + `kms:GenerateDataKey`. Versioning is no longer on this list:
+a versioned bucket mints a new object version per touch, and that is the
+*reason for the published skip* above rather than a cost accepted.
 
 **Known gaps** — plan lifecycle rules around them, they are not promised
 away: the [design §7](design/sparse_coverage.md) sweep's **ancestor-node

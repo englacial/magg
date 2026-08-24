@@ -92,6 +92,16 @@ class TestCanonicalization:
             _cfg(output__consolidate_metadata=True),
             _cfg(output__coverage_moc=False),
             _cfg(output__sweep=False),
+            # issue #501: output.touch declares a LIFECYCLE policy for the
+            # destination -- when to refresh LastModified on a skip run. It
+            # cannot change a byte of any leaf, so it must never move the
+            # hash. This holds by CONSTRUCTION, not by an exclusion: `output`
+            # is allowlist-shaped (OUTPUT_LEAF_SHAPING_KEYS + output.grid), so
+            # a new key is out unless someone adds it. That is exactly why it
+            # needs a regression guard -- the property is currently true only
+            # because nobody added it to the allowlist.
+            _cfg(output__touch="never"),
+            _cfg(output__touch="always"),
             _cfg(aggregation__handoff="pandas"),
             _cfg(data_source__reader="xarray"),
             _cfg(data_source__driver="https"),
@@ -102,6 +112,27 @@ class TestCanonicalization:
         cfg = _cfg()
         cfg.worker = {"memory": 8192, "extra_disk": True}
         assert semantic_hash(cfg) == base
+
+    def test_streaming_block_is_packaging_in_every_spelling(self):
+        # espg-ruled 2026-08-17 (the PR #475 D19 question, option (b)): the
+        # whole aggregation.streaming block is packaging, on condition of the
+        # law-equivalence contract (docs/design/sparse_coverage.md, D19) —
+        # every streaming regime lands within the documented approximation
+        # law of the pooled path, so all spellings share one identity. The
+        # design record stated this twice while the code hashed the block as
+        # spelled; this pin is the drift-proofing.
+        base = semantic_hash(_cfg())
+        spellings = [
+            {},
+            {"mode": "spill"},
+            {"mode": "merge", "buffer_granules": 7},
+            {"mode": "spill", "block_bytes": 1 << 26},
+            {"buffer_granules": 20},
+        ]
+        for block in spellings:
+            cfg = _cfg(aggregation__streaming=block)
+            assert semantic_hash(cfg) == base
+            assert "streaming" not in semantic_core(cfg)["aggregation"]
 
     def test_emit_cell_ids_is_packaging(self):
         # The issue #304 D16 transition hatch. It DOES add a `cell_ids` array
