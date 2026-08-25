@@ -931,14 +931,62 @@ def column_from_leaf(
     )
 
 
+def column_structure(fields: dict, *, node_order: int, resolutions: list) -> dict:
+    """``{group: [array names]}`` a column of this declaration MUST carry.
+
+    Derived from the SAME template machinery :func:`write_column` writes with
+    (:func:`zagg.sweep_overview._overview_config` -> ``HealpixGrid.shard_spec``),
+    so this is not a second description of the column's shape that could drift
+    from the writer's — it IS the writer's, projected to member names.
+
+    :func:`column_is_current` compares it against the stored column because
+    the recorded ``zagg_column`` attrs cannot: :func:`_column_provenance`
+    records neither ``location`` nor ``temporal``, yet
+    :func:`zagg.sweep_overview.field_companions` reads exactly those, and each
+    one adds a ``{field}_locations`` / ``{field}_times`` member to EVERY
+    resolution group (spec §4.6, "plus every channel sibling that field's
+    §4.5 entry declares"). A digest field re-declared with a ``location``
+    channel — ruling 4 on issue #410, the expected ``/1`` -> ``/2`` retrofit —
+    is invisible to the provenance compare and obvious here (review finding,
+    issue #520).
+    """
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.sweep_overview import _overview_config
+
+    cfg = _overview_config(composable_fields(fields))
+    return {
+        str(int(res)): sorted(
+            HealpixGrid(int(node_order), int(res), config=cfg, sharded=True).shard_spec().members
+        )
+        for res in resolutions
+    }
+
+
+def stored_column_structure(group) -> dict:
+    """:func:`column_structure`'s twin, read off an OPEN column root group.
+
+    One listing per group — the cheapest read that can see a member set, and
+    the whole cost the structure term adds to a skip.
+    """
+    return {str(name): sorted(dict(sub.arrays())) for name, sub in group.groups()}
+
+
 def column_is_current(
-    leaf_stamp: dict, column_stamp, column_attrs, *, node_order, cell_order, resolutions, fields
+    leaf_stamp: dict,
+    column_stamp,
+    column_attrs,
+    structure,
+    *,
+    node_order,
+    cell_order,
+    resolutions,
+    fields,
 ) -> tuple[bool, str]:
     """Is this ``(leaf, window)``'s stored column current? ``(verdict, reason)``.
 
     The backfill's skip-if-current gate (issue #520; the #397/#417 discipline
     read off the artifacts, since a column records no ``generation`` block of
-    its own — it has exactly one source, its leaf). Four terms, in cost order:
+    its own — it has exactly one source, its leaf). Five terms, in cost order:
 
     1. **Committed** — no stamp is absent-or-torn debris, never current.
     2. **Declaration** — the recorded ``zagg_column`` block's node/cell orders,
@@ -947,12 +995,21 @@ def column_is_current(
        the ones this run would write. A narrowed, widened or re-classed
        declaration is exactly the #383 case where the artifact must not
        outlive the declaration that made it.
-    3. **Order** — the column's ``written_at`` may not PRECEDE its leaf's: a
+    3. **Structure** — the column's REALIZED members
+       (:func:`stored_column_structure`) must be the ones the template this
+       run would write declares (:func:`column_structure`). This is the term
+       that covers what the recorded grammar cannot say: ``location`` and
+       ``temporal`` are not in :func:`_column_provenance`, so a digest field
+       re-declared with a companion channel passes term 2 while its stored
+       column is a sibling short in every group (review finding, issue #520).
+       ``structure`` is what the caller read off the store; an unreadable one
+       (``None``) is drift, which rewrites.
+    4. **Order** — the column's ``written_at`` may not PRECEDE its leaf's: a
        leaf re-run after its column leaves the column folded from cells that
        are gone.
-    4. **Granules** — the column's stamp copies the LEAF's ``granule_count``
+    5. **Granules** — the column's stamp copies the LEAF's ``granule_count``
        (§4.6), so a re-run that changed the leaf's granule set fails the gate
-       even inside the one-second stamp resolution that defeats term 3.
+       even inside the one-second stamp resolution that defeats term 4.
 
     Residual, disclosed rather than papered over: both stamps resolve to whole
     seconds (the issue #417 term), and a column records no ``run_id`` for its
@@ -985,6 +1042,9 @@ def column_is_current(
     # cannot read as drift and re-fold the whole store for nothing.
     if json.dumps(recorded, sort_keys=True) != json.dumps(expected, sort_keys=True):
         return False, "declaration-drift"
+    wanted = column_structure(fields, node_order=node_order, resolutions=resolutions)
+    if json.dumps(structure or {}, sort_keys=True) != json.dumps(wanted, sort_keys=True):
+        return False, "structure-drift"
     leaf_at, column_at = leaf_stamp.get("written_at"), column_stamp.get("written_at")
     if leaf_at is None or column_at is None or str(column_at) < str(leaf_at):
         return False, "stale"

@@ -138,6 +138,31 @@ def _plan(root):
     return manifest_column_plan(read_manifest(str(root)))
 
 
+def _verdict(root, decimal, window=None, **over):
+    """``column_is_current`` against a store's own state, with overrides.
+
+    The four artifact-side arguments come from the backfill's own readers, so
+    a verdict here is the one the pass would reach; ``over`` moves whichever
+    declaration term the test is exercising.
+    """
+    from zagg.column import COLUMN_ATTR, column_is_current
+    from zagg.column_backfill import _column_state, _leaf_stamp
+
+    shard, plan = morton_word(decimal), _plan(root)
+    stamp, attrs, structure = _column_state(str(root), shard, window, {})
+    args = {
+        "leaf_stamp": _leaf_stamp(str(root), shard, window, {}),
+        "column_stamp": stamp,
+        "column_attrs": attrs.get(COLUMN_ATTR),
+        "structure": structure,
+        "node_order": plan.node_order,
+        "cell_order": plan.cell_order,
+        "resolutions": plan.resolutions,
+        "fields": plan.fields,
+    }
+    return column_is_current(**{**args, **over})
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: the recipe recomputed from stored bytes IS the build-time column.
 # ---------------------------------------------------------------------------
@@ -419,6 +444,31 @@ class TestBackfill:
             zarr_format=3,
         )
         assert "h_tdigest" not in dict(column.arrays())
+
+    def test_an_added_companion_channel_is_not_current(self, tmp_path, monkeypatch):
+        """The retrofit the recorded provenance cannot see (ruling 4 on issue #410)."""
+        from zagg.column import _column_provenance
+
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        assert _verdict(off, SHARDS[0]) == (True, "current")
+        fields = {n: dict(m) for n, m in _plan(off).fields.items()}
+        fields["h_tdigest"]["location"] = "leaf_id"
+        # Term 2 is blind to it — the stored `zagg_column` grammar records
+        # neither `location` nor `temporal` — so term 3 is the only one that
+        # can see the column is a `h_tdigest_locations` short in every group.
+        assert _column_provenance(fields["h_tdigest"]) == _column_provenance(
+            _plan(off).fields["h_tdigest"]
+        )
+        assert _verdict(off, SHARDS[0], fields=fields) == (False, "structure-drift")
+
+    def test_a_dropped_companion_channel_is_not_current(self, tmp_path, monkeypatch):
+        """And the other direction: a located store re-declared without the channel."""
+        off, _on = self._upgraded(tmp_path, monkeypatch, kitchen_sink=True)
+        _backfill(off)
+        fields = {n: dict(m) for n, m in _plan(off).fields.items()}
+        assert fields["h_tdigest_signal"].pop("location", None) == "leaf_id"
+        assert _verdict(off, SHARDS[0], fields=fields) == (False, "structure-drift")
 
     def test_a_re_run_leaf_is_not_current(self, tmp_path, monkeypatch):
         from zagg.hive import COMMIT_ATTR, shard_leaf_path

@@ -129,8 +129,8 @@ def _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, *, f
     leaf and nothing else — the ``failed`` count the families sweep reports.
     The read order is cheapest-first: the leaf's commit stamp (a leaf that is
     not committed has no column to write, and unstamped debris is invisible
-    exactly as the walk treats it), then the column's own stamp and attrs for
-    the skip test, and only then the leaf's arrays.
+    exactly as the walk treats it), then the column's own stamp, attrs and
+    member listing for the skip test, and only then the leaf's arrays.
     """
     from zagg.column import COLUMN_ATTR, column_from_leaf, column_is_current, write_column
     from zagg.grids.morton import morton_word
@@ -141,12 +141,13 @@ def _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, *, f
         if leaf_stamp is None:
             counts["empty"] += 1
             return
-        stamp, attrs = _column_state(store_root, shard_key, window, store_kwargs)
+        stamp, attrs, structure = _column_state(store_root, shard_key, window, store_kwargs)
         if not force:
             current, reason = column_is_current(
                 leaf_stamp,
                 stamp,
                 attrs.get(COLUMN_ATTR),
+                structure,
                 node_order=plan.node_order,
                 cell_order=plan.cell_order,
                 resolutions=plan.resolutions,
@@ -194,15 +195,22 @@ def _leaf_stamp(store_root, shard_key, window, store_kwargs):
 
 
 def _column_state(store_root, shard_key, window, store_kwargs) -> tuple:
-    """This ``(leaf, window)``'s stored column as ``(commit stamp, root attrs)``.
+    """The stored column as ``(commit stamp, root attrs, realized structure)``.
 
-    ``(None, {})`` when nothing is there — the ordinary pre-column case this
-    whole module exists for, and the same answer an unreadable prefix gives:
-    the verdict either way is "not current", which rewrites.
+    The three things :func:`zagg.column.column_is_current` gates on. The
+    structure — one member listing per resolution group
+    (:func:`zagg.column.stored_column_structure`) — is read here rather than
+    derived from the attrs because the attrs cannot carry it: a companion
+    channel added at re-declaration leaves the recorded provenance identical
+    and the member set a sibling short (review finding, issue #520).
+
+    ``(None, {}, {})`` when nothing is there — the ordinary pre-column case
+    this whole module exists for, and the same answer an unreadable prefix
+    gives: the verdict either way is "not current", which rewrites.
     """
     import zarr
 
-    from zagg.column import column_name
+    from zagg.column import column_name, stored_column_structure
     from zagg.hive import COMMIT_ATTR, shard_leaf_path
     from zagg.store import open_store
 
@@ -212,8 +220,9 @@ def _column_state(store_root, shard_key, window, store_kwargs) -> tuple:
         group = zarr.open_group(
             open_store(path, read_only=True, **store_kwargs), path="", mode="r", zarr_format=3
         )
+        attrs = dict(group.attrs)
+        structure = stored_column_structure(group)
     except Exception:
-        return None, {}
-    attrs = dict(group.attrs)
+        return None, {}, {}
     stamp = attrs.get(COMMIT_ATTR)
-    return (dict(stamp) if isinstance(stamp, dict) else None), attrs
+    return (dict(stamp) if isinstance(stamp, dict) else None), attrs, structure
