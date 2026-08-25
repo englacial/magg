@@ -140,7 +140,7 @@ class FakeS3:
                 self.end_headers()
 
             def do_POST(self):
-                # The two verbs obstore sends as POST. Dispatching them here
+                # The three sub-resources obstore POSTs. Dispatching them here
                 # (rather than letting BaseHTTPRequestHandler answer a stdlib
                 # 501, which obstore retries ten times over ~4s) keeps the
                 # stand-in fast and legible about what it does not model.
