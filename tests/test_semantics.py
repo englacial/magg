@@ -723,7 +723,13 @@ class TestGediTemplateFluxDeclaration:
     # The shipped template, weights: flux + attrs.gain mapping (this change).
     FLUX_HASH = "7e0bf1818efa9259194bb43d0d1eaf7f23b5d9122d00b14797e28f1a5d9d02dd"
     # The prior counts-defaulting form: no weights key, flat gain_name /
-    # gain_version / gain attrs — the config the existing SERC stores froze.
+    # gain_version / gain attrs. This is what the SERC stores were built from,
+    # but `_prior_form()` only RECONSTRUCTS it — from HEAD's template, so it
+    # tracks "this template minus this PR's flip", not a frozen snapshot. The
+    # LITERAL below is the freeze: a later semantic edit to the template (a
+    # `delta` change, a filter, `time_source`) moves the reconstruction, this
+    # constant fails, and whoever makes the edit has to decide deliberately
+    # rather than drift past it.
     COUNTS_HASH = "c812c910f86057f9899aef3128a685d2ef78c5cbe26e7c90ae044f4d77feb4bd"
 
     def _prior_form(self) -> PipelineConfig:
