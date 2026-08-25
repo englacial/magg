@@ -66,9 +66,14 @@ class _Recorded:
 class FakeS3:
     """A path-style S3 stand-in that records every request it serves.
 
-    Enough of the API for a real zarr write to complete (PUT/GET/HEAD/DELETE
-    plus ListObjectsV2 with a delimiter), which is the point: the write path
-    under test is zarr's obstore adapter, not a hand-rolled PUT.
+    It models exactly what the tests in this file drive through BARE obstore
+    (no zarr in the loop): single PUT, the multipart flow
+    (CreateMultipartUpload / UploadPart / CompleteMultipartUpload), GET, HEAD,
+    ListObjectsV2, and the bucket-level bulk delete. Anything else gets a fast
+    501 rather than the stdlib error page obstore retries ten times over.
+
+    Storage fidelity is incidental -- the object under test is the WIRE, i.e.
+    the header set each request carries, captured in :class:`_Recorded`.
     """
 
     def __init__(self):
@@ -162,28 +167,20 @@ class FakeS3:
         self._thread.start()
 
     def _list_xml(self, query: dict) -> bytes:
+        # Flat listing only -- obstore.list sends no delimiter, so there is no
+        # CommonPrefixes branch to model.
         prefix = (query.get("prefix") or [""])[0]
-        delimiter = (query.get("delimiter") or [""])[0]
         with self._lock:
-            keys = sorted(k for k in self.objects if k.startswith(prefix))
-        contents, common = [], set()
-        for key in keys:
-            rest = key[len(prefix) :]
-            if delimiter and delimiter in rest:
-                common.add(prefix + rest.split(delimiter, 1)[0] + delimiter)
-            else:
-                contents.append(key)
+            contents = sorted(k for k in self.objects if k.startswith(prefix))
         root = ET.Element("ListBucketResult", xmlns=_S3_XMLNS)
         ET.SubElement(root, "IsTruncated").text = "false"
-        ET.SubElement(root, "KeyCount").text = str(len(contents) + len(common))
+        ET.SubElement(root, "KeyCount").text = str(len(contents))
         for key in contents:
             node = ET.SubElement(root, "Contents")
             ET.SubElement(node, "Key").text = key
             ET.SubElement(node, "Size").text = str(len(self.objects[key]))
             ET.SubElement(node, "LastModified").text = "2026-08-25T00:00:00.000Z"
             ET.SubElement(node, "ETag").text = '"fake"'
-        for pfx in sorted(common):
-            ET.SubElement(ET.SubElement(root, "CommonPrefixes"), "Prefix").text = pfx
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     def _initiate_upload_xml(self, key: str) -> bytes:
