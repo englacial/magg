@@ -295,6 +295,36 @@ class TestBucketOwnerAcl:
         _, kwargs = s3_cls.call_args
         assert kwargs["client_options"]["default_headers"] == {"x-custom": "1"}
 
+    def test_the_escape_hatch_leaves_the_read_handle_option_free(self):
+        # The branch the split has to get right: with no ACL to send there is
+        # no twin, and the surviving handle must be built byte-identically to
+        # an in-account one -- ``None``, not ``{"default_headers": {}}``. The
+        # difference is invisible to obstore today, and byte-identity is the
+        # property the whole issue #522 fix rests on.
+        from zagg.store import _acl_client_options
+
+        assert _acl_client_options({"default_headers": {"x-amz-acl": None}}) == (None, None)
+        # A caller's unrelated options still ride the read handle.
+        assert _acl_client_options(
+            {"default_headers": {"x-amz-acl": None}, "allow_http": True}
+        ) == ({"allow_http": True}, None)
+
+    def test_the_escape_hatch_builds_one_clean_store(self):
+        # Same branch through _s3_store_pair, deliberately UNMOCKED (no
+        # network: construction only) -- a MagicMock would auto-create the twin
+        # attribute and the assertion would be vacuous. One handle, no
+        # client_options, no twin.
+        from zagg.store import _ACL_WRITE_STORE_ATTR, _s3_object_store, acl_write_store
+
+        s3 = _s3_object_store(
+            "s3://external/foo.zarr",
+            credentials=self.CREDS,
+            client_options={"default_headers": {"x-amz-acl": None}},
+        )
+        assert s3.client_options is None
+        assert not hasattr(s3, _ACL_WRITE_STORE_ATTR)
+        assert acl_write_store(s3) is s3
+
     def test_a_real_obstore_store_accepts_and_normalizes_the_header(self):
         # Deliberately UNMOCKED (no network: construction only). Every other
         # test here mocks S3Store, so they pin what zagg passes and never what

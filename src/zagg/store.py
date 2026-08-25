@@ -519,9 +519,6 @@ def _acl_client_options(client_options):
     ``{"x-amz-acl": None}`` escape hatch -- in which case there is no second
     handle to build and the read handle is the whole story.
     """
-    write = _with_bucket_owner_acl(client_options)
-    if "x-amz-acl" not in write["default_headers"]:
-        return (write or None), None
     read = dict(client_options or {})
     headers = {str(k).lower(): v for k, v in (read.get("default_headers") or {}).items()}
     headers.pop("x-amz-acl", None)
@@ -529,6 +526,13 @@ def _acl_client_options(client_options):
         read["default_headers"] = headers
     else:
         read.pop("default_headers", None)
+    write = _with_bucket_owner_acl(client_options)
+    if "x-amz-acl" not in write["default_headers"]:
+        # The escape hatch: nothing to send, so no twin -- and the read handle
+        # takes the SAME cleaned options as any other branch, which is what
+        # collapses an empty ``default_headers`` to no ``client_options`` at
+        # all rather than to ``{"default_headers": {}}``.
+        return (read or None), None
     return (read or None), write
 
 
