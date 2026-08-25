@@ -72,12 +72,30 @@ the config, not the store.
 python -m zagg.sweep s3://bucket/prefix/product --families columns
 ```
 
-`columns` is a registered sweep family, so this rides the already-wired
-`mode: "sweep"` transport: `--partitions 2^n` bounds peak memory (or fans the
-work out worker-side) exactly as it does for the other families, discovery is
-the same run-record scan, and there is no handler change. It is deliberately
-**not** in the default family set — a backfill is an explicit upgrade of a
-quiesced store, never a routine rollup's side effect, so it must be spelled.
+`columns` is a registered sweep family, so it needs no new transport and no
+new mode: the work-set normalization and discovery (the same run-record scan,
+never a recursive LIST) are inherited whole. It is deliberately **not** in the
+default family set — a backfill is an explicit upgrade of a quiesced store,
+never a routine rollup's side effect, so it must be spelled.
+
+**This runs in-process, on the machine you type it on.** The two entry points
+are this CLI and `run_sweep(root, leaves, families=["columns"])`; there is no
+fleet arm. The Lambda handler's `mode: "sweep"` branch forwards no `families`
+(or `partition`) key from the event, so a worker falls to the default family
+set — which excludes this one. Adding that forwarding is
+[#519](https://github.com/englacial/zagg/issues/519)'s change, not this
+page's, and until it lands a store too large for one machine has no fan-out
+for this step.
+
+**`--partitions 2^n` bounds peak memory, but is not free here.** Unlike
+`--stages`, which sweeps every partition under ONE lease, `--partitions`
+gives this family one `run_sweep` per partition and the lease is acquired and
+released *per partition* — so a `--partitions 64` pass leaves 63 unleased
+windows in the middle of the very pass §4.6 sanctions as the second writer of
+a leaf artifact. On a genuinely quiesced store (the precondition above) that
+is harmless, since nothing else is admitted anyway; if you cannot guarantee
+quiescence, run the backfill unpartitioned so the whole pass sits under a
+single lease.
 
 Per `(leaf, window)` the pass reads the leaf's commit stamp, skips the leaf if
 its column is already current, and otherwise recomputes the column from the
