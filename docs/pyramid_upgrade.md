@@ -127,8 +127,13 @@ are cache, never truth — and there is no automated arm for it yet.
 A column records no `generation` block and no `run_id` for its source leaf, so
 the backfill's skip-if-current test keys on what the artifacts already carry:
 the recorded declaration (node/cell orders, group set, per-field provenance),
-`written_at` ordering, and the column stamp's copy of the **leaf's**
-`granule_count`. Both stamps resolve to whole seconds, so a leaf rewritten in
+the column's **realized structure** — every group's members and each member's
+dtype, fill value and attrs, compared against the template the run would write
+— then `written_at` ordering and the column stamp's copy of the **leaf's**
+`granule_count`. The structure term is what catches the two drifts the
+recorded `zagg_column` grammar cannot carry, both of which a re-declaration
+really can move: a companion channel added or dropped (`location` /
+`temporal`, neither recorded), and an exact field's `dtype` / `fill_value`. Both stamps resolve to whole seconds, so a leaf rewritten in
 the same second as its column, at an unchanged granule count, reads as
 current. On a quiesced store — the precondition above — that window is not
 reachable; `backfill_columns(..., force=True)` is the unconditional rewrite if
