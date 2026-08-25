@@ -579,6 +579,51 @@ class TestBackfill:
         summary = _backfill(off, force=True)
         assert summary["written"] == len(SHARDS) and summary["current"] == 0
 
+    def test_the_gate_template_is_derived_once_per_pass(self, tmp_path, monkeypatch):
+        """`column_structure` is a function of the DECLARATION, not the leaf.
+
+        ~35 pydantic dumps and JSON round-trips a call, against 2,721 leaves
+        on the CA o9 target — so the pass derives it once and threads it
+        (review finding, issue #520).
+        """
+        import zagg.column_backfill as backfill_mod
+
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        calls = []
+        real = backfill_mod.column_structure
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(backfill_mod, "column_structure", counting)
+        assert _backfill(off)["current"] == len(SHARDS)
+        assert len(calls) == 1
+
+    def test_force_skips_the_stored_column_read(self, tmp_path, monkeypatch):
+        """`force` rewrites the prefix wholesale, so the skip gate's read is waste.
+
+        ``_column_state`` walks the column's groups and arrays — a LIST plus a
+        ``zarr.json`` GET per member on a store with no consolidated metadata
+        — and every value it returns is consumed only by the gate ``force``
+        discards (review finding, issue #520).
+        """
+        import zagg.column_backfill as backfill_mod
+
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        reads = []
+        real = backfill_mod._column_state
+
+        def counting(*args, **kwargs):
+            reads.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(backfill_mod, "_column_state", counting)
+        assert _backfill(off, force=True)["written"] == len(SHARDS)
+        assert reads == []
+
     def test_declaration_drift_is_not_current(self, tmp_path, monkeypatch):
         """A narrowed declaration must not leave the wider column standing."""
         off, on = self._upgraded(tmp_path, monkeypatch)

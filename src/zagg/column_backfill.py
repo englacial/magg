@@ -155,6 +155,13 @@ def backfill_columns(
     # BEFORE admission: a store that must be re-declared should say so without
     # first taking (and having to release) the store's sweep lease.
     plan = manifest_column_plan(manifest)
+    # Loop-invariant by construction — its three arguments are the plan's, and
+    # a plan does not move inside a pass — but ~35 pydantic dumps and JSON
+    # round-trips per call, so it is derived ONCE here rather than per leaf
+    # inside the gate (review finding, issue #520).
+    template = column_structure(
+        plan.fields, node_order=plan.node_order, resolutions=plan.resolutions
+    )
     counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
     run_id = run_id or f"backfill-{uuid.uuid4().hex[:12]}"
     held = None
@@ -167,7 +174,14 @@ def backfill_columns(
         for decimal in sorted(by_shard):
             for window in sorted(by_shard[decimal], key=lambda w: (w is not None, w or "")):
                 failure = _backfill_leaf(
-                    store_root, decimal, window, plan, counts, store_kwargs, force=force
+                    store_root,
+                    decimal,
+                    window,
+                    plan,
+                    counts,
+                    store_kwargs,
+                    force=force,
+                    template=template,
                 )
                 last_error = failure or last_error
                 if held is not None and time.monotonic() - last_beat >= beat_after:
@@ -202,7 +216,9 @@ def backfill_columns(
     }
 
 
-def _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, *, force) -> str | None:
+def _backfill_leaf(
+    store_root, decimal, window, plan, counts, store_kwargs, *, force, template=None
+) -> str | None:
     """One ``(leaf, window)``: gate, fold from stored bytes, write. Never raises.
 
     Returns the failure's text (``None`` on any other outcome) so the driver
@@ -225,8 +241,12 @@ def _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, *, f
         if leaf_stamp is None:
             counts["empty"] += 1
             return
-        stamp, attrs, structure = _column_state(store_root, shard_key, window, store_kwargs)
         if not force:
+            # Inside the gate, never above it: ``_column_state``'s member walk
+            # is a LIST plus one ``zarr.json`` GET per member, and ``force``
+            # rewrites the prefix wholesale — the read would buy nothing
+            # (review finding, issue #520).
+            stamp, attrs, structure = _column_state(store_root, shard_key, window, store_kwargs)
             current, reason = column_is_current(
                 leaf_stamp,
                 stamp,
@@ -236,6 +256,7 @@ def _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, *, f
                 cell_order=plan.cell_order,
                 resolutions=plan.resolutions,
                 fields=plan.fields,
+                template=template,
             )
             if current:
                 counts["current"] += 1
@@ -550,6 +571,7 @@ def column_is_current(
     cell_order,
     resolutions,
     fields,
+    template=None,
 ) -> tuple[bool, str]:
     """Is this ``(leaf, window)``'s stored column current? ``(verdict, reason)``.
 
@@ -571,7 +593,10 @@ def column_is_current(
     3. **Structure** — the column's REALIZED arrays
        (:func:`stored_column_structure`) must be the ones the template this
        run would write declares (:func:`column_structure`), member for member
-       and metadata for metadata. This is the term that covers what the
+       and metadata for metadata. ``template`` is that projection, passed in
+       by a PASS that derived it ONCE for its whole work set (it is a function
+       of the declaration alone, so it cannot move inside a pass); ``None``
+       recomputes it, which is the direct-call form. This is the term that covers what the
        recorded grammar cannot say, and there are two such things: ``location``
        / ``temporal`` are not in :func:`zagg.column._column_provenance`, so a digest field
        re-declared with a companion channel passes term 2 while its stored
@@ -625,7 +650,11 @@ def column_is_current(
     # cannot read as drift and re-fold the whole store for nothing.
     if json.dumps(recorded, sort_keys=True) != json.dumps(expected, sort_keys=True):
         return False, "declaration-drift"
-    wanted = column_structure(fields, node_order=node_order, resolutions=resolutions)
+    wanted = (
+        column_structure(fields, node_order=node_order, resolutions=resolutions)
+        if template is None
+        else template
+    )
     if json.dumps(structure or {}, sort_keys=True) != json.dumps(wanted, sort_keys=True):
         return False, "structure-drift"
     leaf_at, column_at = leaf_stamp.get("written_at"), column_stamp.get("written_at")
