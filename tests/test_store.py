@@ -18,6 +18,10 @@ def mock_s3(monkeypatch):
     target builds TWO stores (issue #522: a clean handle and its ACL-bearing
     twin), so ``call_args`` there is the twin's and ``call_args_list`` holds
     both, clean first.
+
+    ``_AclWriteObjectStore`` is mocked out too, so a ``mock_s3`` test pins how
+    the handles are CONSTRUCTED and can no longer catch a write-routing
+    regression; routing is covered by ``tests/test_store_acl_seam.py``.
     """
     s3_cls = mock.MagicMock(name="S3Store")
     prov_cls = mock.MagicMock(name="Boto3CredentialProvider")

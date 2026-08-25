@@ -2121,7 +2121,23 @@ class TestOutputStoreAcl:
     the worker opens from an event, and must NOT appear on in-account writes."""
 
     @staticmethod
-    def _s3_kwargs(handler_mod, monkeypatch, event):
+    def _s3_calls(handler_mod, monkeypatch, event):
+        """Every ``S3Store`` construction ``open_store`` makes for ``event``.
+
+        Indexed by ROLE rather than by recency: ``_s3_store_pair`` ends in
+        ``return build(read_options), build(write_options)`` and tuple elements
+        evaluate left to right, so ``[0]`` is the clean handle the worker is
+        handed back and ``[-1]`` is the ACL-bearing twin. An in-account target
+        builds one handle and the two indices coincide. Returning the list
+        rather than ``call_args`` keeps a reshaped return from silently
+        inverting which handle a test is asserting about.
+
+        ``_AclWriteObjectStore`` is mocked out (as in
+        ``tests/test_store.py::mock_s3``), so no test in this class exercises
+        the real subclass: what is pinned here is which headers each handle is
+        CONSTRUCTED with. Write routing -- that ``set``/``set_if_not_exists``
+        reach the twin -- lives in ``tests/test_store_acl_seam.py``.
+        """
         s3_cls = MagicMock(name="S3Store")
         monkeypatch.setattr("obstore.store.S3Store", s3_cls)
         # Both zarr adapters are bound as module globals in zagg.store.
@@ -2131,8 +2147,7 @@ class TestOutputStoreAcl:
         from zagg.store import open_store
 
         open_store(event["store_path"], **handler_mod._output_store_kwargs(event))
-        _, kwargs = s3_cls.call_args
-        return kwargs
+        return s3_cls.call_args_list
 
     def test_output_credentials_event_sets_the_canned_acl(self, handler_mod, monkeypatch):
         event = {
@@ -2143,17 +2158,22 @@ class TestOutputStoreAcl:
                 "sessionToken": "tok",
             },
         }
-        # An external target builds two handles (issue #522); ``call_args`` is
-        # the last, which is the ACL-bearing twin the writes go through.
-        kwargs = self._s3_kwargs(handler_mod, monkeypatch, event)
-        assert kwargs["client_options"]["default_headers"] == {
+        # An external target builds two handles (issue #522).
+        calls = self._s3_calls(handler_mod, monkeypatch, event)
+        assert len(calls) == 2
+        # The handle the worker HOLDS is the clean one. This is the half issue
+        # #522 is about: it is the handle that LISTs, and an unsigned
+        # x-amz-acl on ListObjectsV2 is the 403 that killed the worker.
+        assert calls[0].kwargs.get("client_options") is None
+        assert calls[-1].kwargs["client_options"]["default_headers"] == {
             "x-amz-acl": "bucket-owner-full-control"
         }
 
     def test_execution_role_event_sends_no_acl(self, handler_mod, monkeypatch):
         event = {"store_path": "s3://our-bucket/out.zarr"}
-        kwargs = self._s3_kwargs(handler_mod, monkeypatch, event)
-        assert "client_options" not in kwargs
+        calls = self._s3_calls(handler_mod, monkeypatch, event)
+        assert len(calls) == 1
+        assert "client_options" not in calls[0].kwargs
 
 
 class TestWriteResultAcl:
