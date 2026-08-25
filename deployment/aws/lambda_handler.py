@@ -1174,6 +1174,24 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
     (4^4, ~639 s/worker — fits, no headroom) or **1024** (4^5, ~160 s/worker —
     the width to actually use). The 16 that died was ~10,222 s/worker, 11x over
     the wall; forwarding the block does not change that, only the width does.
+
+    **A partitioned pass writes NOTHING above the split order, and the root
+    singletons are still owed.** Orders below the split are never walked
+    (``range(shard_order - 1, min_order - 1, -1)`` in
+    :func:`zagg.sweep._sweep_family`); ``MocFamily.finish`` — the only writer of
+    the store-root ``coverage.moc`` and its sibling ``coverage.toc`` — is
+    skipped and reported as ``finish_deferred``; and :mod:`zagg.sweep_overview`
+    likewise defers the manifest ``pyramid.materialized`` RMW. That deferral is
+    exactly what keeps concurrent partitions disjoint, but nothing on this
+    transport picks it back up: a **subsequent partition-less pass** over the
+    same work set is what writes the coarse levels, ``coverage.moc``,
+    ``coverage.toc``, and the manifest update. It is cheap — every rollup the
+    partitions already wrote is skip-if-current, so the follow-up only pays the
+    orders above the split. Note there is no finisher arm in the mode table
+    above: :func:`zagg.sweep_stages.run_finisher` is called from exactly one
+    place, ``run_stage_sweep`` (the ``--stages`` CLI), so on the fleet **the
+    partition-less follow-up invoke IS the finisher**. A partitioned "toc
+    sweep" that stops after the fan-out produces no toc.
     """
     from zagg.sweep import discover_leaves, run_sweep
 
