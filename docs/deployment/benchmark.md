@@ -215,6 +215,11 @@ rather than memory. Those figures are a property of that code point, not of the
 bands: the same sweep on 0.35.0 timed out everywhere, and the store-cache fix
 (issue #287 / PR #288) is what moved it.
 
+Unlike every series above, these figures are **not** derived from a rendered
+artifact — there is no recorded series for an on-demand sweep, so they are
+transcribed. The manifest's own `description` is the record of truth and the
+thing to update when the sweep is next run; treat this section as a copy of it.
+
 Only the 88°S row is pinned today — it reuses the committed stress map and pin
 verbatim. The six equatorward bands need catalog snapshots they do not have yet;
 their rows sit in `pending_targets` with the pinning recipe beside them. See
