@@ -1363,3 +1363,89 @@ class TestUpgradeEndToEnd:
         )
         assert backfill["families"]["columns"]["current"] == len(SHARDS)
         assert {d: _objects(_column_path(on, d)) for d in SHARDS} == before
+
+
+class TestInFlightWarning:
+    """The status-channel smoke alarm (espg ruling 2026-08-25 on PR #524 Q1).
+
+    Advisory only: it warns, it never refuses, and it is fail-open — a status
+    channel that cannot be listed is not a reason to block an upgrade.
+    """
+
+    def _status_object(self, root, run_id, *, age_s=0.0):
+        """One ``{store}.status/run-<id>/shard-*.json`` object, aged in place."""
+        import os
+        import time
+
+        prefix = pathlib.Path(f"{str(root).rstrip('/')}.status") / f"run-{run_id}"
+        prefix.mkdir(parents=True, exist_ok=True)
+        obj = prefix / "shard-1.json"
+        obj.write_text(json.dumps({"status": "ok"}))
+        if age_s:
+            stamped = time.time() - age_s
+            os.utime(obj, (stamped, stamped))
+        return obj
+
+    def _upgraded(self, tmp_path, monkeypatch):
+        off, on = tmp_path / "off", tmp_path / "on"
+        _build_store(off, monkeypatch, pyramid=False, shards=SHARDS[:1])
+        _build_store(on, monkeypatch, shards=SHARDS[:1])
+        _install_pyramid(off, _twin_block(on))
+        return off
+
+    def test_a_recent_status_object_warns_and_the_pass_still_completes(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        off = self._upgraded(tmp_path, monkeypatch)
+        self._status_object(off, "live-fleet-run")
+        with caplog.at_level("WARNING", logger="zagg.column_backfill"):
+            summary = _backfill(off, shards=SHARDS[:1])
+        assert "live-fleet-run" in caplog.text
+        assert "never a refusal" in caplog.text
+        # Advisory ONLY: the upgrade ran to completion and wrote the column.
+        assert summary["written"] == 1 and summary["failed"] == 0
+        assert summary["runs_in_flight"] == ["live-fleet-run"]
+        assert _column_path(off, SHARDS[0]).exists()
+
+    def test_an_old_status_object_is_silent(self, tmp_path, monkeypatch, caplog):
+        """Older than one worker wall: its writer is gone either way."""
+        from zagg.column_backfill import IN_FLIGHT_WINDOW_S
+
+        off = self._upgraded(tmp_path, monkeypatch)
+        self._status_object(off, "finished-run", age_s=IN_FLIGHT_WINDOW_S + 60)
+        with caplog.at_level("WARNING", logger="zagg.column_backfill"):
+            summary = _backfill(off, shards=SHARDS[:1])
+        assert "finished-run" not in caplog.text
+        assert summary["runs_in_flight"] == [] and summary["written"] == 1
+
+    def test_no_status_channel_is_silent(self, tmp_path, monkeypatch, caplog):
+        off = self._upgraded(tmp_path, monkeypatch)
+        assert not pathlib.Path(f"{off}.status").exists()
+        with caplog.at_level("WARNING", logger="zagg.column_backfill"):
+            summary = _backfill(off, shards=SHARDS[:1])
+        assert "status channel" not in caplog.text
+        assert summary["runs_in_flight"] == [] and summary["written"] == 1
+
+    def test_a_listing_that_raises_is_silent_and_the_pass_completes(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Fail-open: an unreadable channel must not block an upgrade."""
+        import obstore
+
+        off = self._upgraded(tmp_path, monkeypatch)
+        self._status_object(off, "unreadable-run")
+
+        def boom(*args, **kwargs):
+            raise PermissionError("status channel is credential-scoped away")
+
+        monkeypatch.setattr(obstore, "list", boom)
+        with caplog.at_level("WARNING", logger="zagg.column_backfill"):
+            summary = _backfill(off, shards=SHARDS[:1])
+        assert "unreadable-run" not in caplog.text
+        assert summary["runs_in_flight"] == [] and summary["written"] == 1
+        assert _column_path(off, SHARDS[0]).exists()
+
+    def test_the_probe_never_raises_on_a_nonsense_root(self):
+        from zagg.column_backfill import warn_if_runs_in_flight
+
+        assert warn_if_runs_in_flight("s3://no-such-bucket-zagg-520/x", {}) == []

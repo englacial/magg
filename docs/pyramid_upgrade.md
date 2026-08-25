@@ -18,7 +18,18 @@ leaf.
   writer of a leaf artifact, so it is the one pass for which the spec's
   fleet ∥ sweep disjointness does not hold (§4.6). The sweep-admission lease
   (§4.8) serializes it against other *sweeps*; nothing can serialize it
-  against a fleet.
+  against a fleet — proving quiescence would need a global run registry zagg
+  deliberately does not have.
+
+  As a smoke alarm the pass lists the store's status channel
+  (`{store}.status/run-*/`, the per-run objects the event transport writes) and
+  logs a loud **WARNING** naming any run with activity in the last 900 s — one
+  Lambda worker wall, so an older object cannot belong to a unit still running.
+  It never refuses and never fails the pass, and it is fail-open: a status
+  channel that is absent, unreadable, or scoped away is silent. **Silence is
+  not proof.** A store written by a pre-#327 dispatcher, or one whose status
+  prefix was lifecycled away, looks exactly like a quiesced one — the
+  precondition is still yours to confirm.
 - **You have the config the store was built with.** `declare_pyramid` refuses
   a config whose `semantic_hash` the store's frozen one denies. `output.*` is
   not in the semantic core, so adding or changing `output.pyramid` on the

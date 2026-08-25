@@ -55,7 +55,12 @@ sanctioned exception, and it inherits the law rather than repealing it —
 run against a store **no aggregation run is writing**. That second half is an
 operator precondition, not something the lease can enforce: the lease's ruled
 concurrency matrix allows fleet ∥ sweep precisely because their object sets
-are disjoint, and this is the one pass for which they are not.
+are disjoint, and this is the one pass for which they are not. Quiescence
+cannot be PROVEN from inside a run — that needs a global run registry zagg
+deliberately lacks (D8) — so the pass ships a best-effort smoke alarm instead:
+:func:`warn_if_runs_in_flight` reads the issue #327 status channel and names
+any recently active run in a WARNING before the first write. It never refuses,
+and its silence is not evidence of quiescence (espg ruling 2026-08-25).
 """
 
 from __future__ import annotations
@@ -85,6 +90,81 @@ logger = logging.getLogger(__name__)
 #: issue #520). A ``time.monotonic()`` per leaf costs nothing; a PUT per leaf
 #: against the intent object would not.
 HEARTBEAT_FRACTION = 3
+
+#: How recent a §4.6-relevant status object must be to read as a run possibly
+#: still in flight. The fleet's worker wall is the natural unit: a Lambda unit
+#: is killed at 900 s, so a status object older than that cannot belong to a
+#: unit still executing — its writer is gone either way. Deliberately the WHOLE
+#: wall rather than a fraction: this probe's only job is to be loud before a
+#: precondition is risked, and a false alarm costs a log line while a missed
+#: one costs a chimera column.
+IN_FLIGHT_WINDOW_S = 900
+
+
+def warn_if_runs_in_flight(store_root: str, store_kwargs: dict, *, window_s=None) -> list[str]:
+    """Warn — never refuse — when the status channel shows a recent run.
+
+    The backfill's one enforceable-ish half of §4.6's operator precondition
+    (espg ruling 2026-08-25 on the PR #524 Q1 thread). Quiescence cannot be
+    PROVEN: doing so needs a global run registry zagg deliberately lacks (D8 —
+    the dispatcher is not a control plane), and the failure mode is bounded and
+    self-healing anyway (a column folded beside a concurrent leaf write is a
+    regenerable cache, D9; the skip gate usually catches it, and the next
+    backfill + sweep heals it). So this is a best-effort smoke alarm, not a
+    gate.
+
+    What it reads: the issue #327 status channel, a SIBLING of the store
+    (``{store}.status/run-{run_id}/shard-*.json``,
+    :func:`zagg.client_transport.run_status_prefix`) — the one place a fleet run
+    leaves a per-unit trace this pass can see without a control plane. A run id
+    with any object newer than ``window_s`` (:data:`IN_FLIGHT_WINDOW_S`) is
+    named in a WARNING; the return is those run ids, for the summary and the
+    tests.
+
+    Three things it deliberately is NOT. It never refuses and never fails the
+    pass — an operator who knows the run is finished (the channel is not pruned
+    in band, espg ruling on #327: accumulation hygiene is the prefix delete
+    policy) must be able to proceed. It is FAIL-OPEN on the listing itself: a
+    status channel that is absent, unreadable, or credential-scoped away is not
+    a reason to block an upgrade, so any exception is swallowed to a debug line.
+    And it proves nothing when SILENT — a store written by a dispatcher that
+    predates the channel, or one whose status prefix was lifecycled away, looks
+    exactly like a quiesced one. Absence of a warning is not evidence of
+    quiescence; the operator precondition stands either way.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    window_s = IN_FLIGHT_WINDOW_S if window_s is None else int(window_s)
+    try:
+        import obstore
+
+        from zagg.store import open_object_store
+
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_s)
+        store = open_object_store(f"{store_root.rstrip('/')}.status", **store_kwargs)
+        recent: set = set()
+        for batch in obstore.list(store):
+            for meta in batch:
+                modified = meta.get("last_modified")
+                if modified is None or modified < cutoff:
+                    continue
+                head = str(meta["path"]).lstrip("/").split("/", 1)[0]
+                if head.startswith("run-"):
+                    recent.add(head.removeprefix("run-"))
+    except Exception as e:
+        logger.debug(f"backfill: status-channel in-flight probe skipped at {store_root}: {e}")
+        return []
+    if recent:
+        logger.warning(
+            f"backfill: the status channel at {store_root}.status shows {len(recent)} run(s) "
+            f"with activity in the last {window_s}s — {sorted(recent)}. A backfill is the one "
+            f"pass for which the fleet and a sweep are NOT write-disjoint (spec §4.6): if any "
+            f"of these is still writing leaves, a column may be folded from cells that are "
+            f"about to move, or interleave with the leaf worker's own column write. Proceeding "
+            f"anyway (this is a warning, never a refusal) — confirm the runs are finished, or "
+            f"re-run the backfill afterwards; it is idempotent."
+        )
+    return sorted(recent)
 
 
 def backfill_columns(
@@ -132,6 +212,13 @@ def backfill_columns(
     sweeping. Either way the repair is the same, because the pass is
     idempotent: fix the fault and re-run it.
 
+    Before the first write (and before the lease, which cannot see a fleet) the
+    pass runs :func:`warn_if_runs_in_flight` over the issue #327 status channel
+    and logs a loud WARNING naming any run active within
+    :data:`IN_FLIGHT_WINDOW_S`. It is advisory only — never a refusal, never a
+    failure, fail-open on the listing — and the flagged ids ride the summary as
+    ``runs_in_flight``.
+
     ``lease=False`` skips admission — for callers that already hold the store's
     sweep lease. Otherwise the pass takes it for its whole duration
     (:mod:`zagg.sweep_lease`), beating on the WALL CLOCK — once a leaf lands
@@ -163,6 +250,9 @@ def backfill_columns(
         plan.fields, node_order=plan.node_order, resolutions=plan.resolutions
     )
     counts = {"written": 0, "current": 0, "empty": 0, "failed": 0}
+    # Best-effort, before the lease: a run in flight is an operator problem to
+    # know about, and the lease cannot see it (it serializes sweeps, not fleets).
+    in_flight = warn_if_runs_in_flight(store_root, store_kwargs)
     run_id = run_id or f"backfill-{uuid.uuid4().hex[:12]}"
     held = None
     if lease:
@@ -213,6 +303,9 @@ def backfill_columns(
         "min_order": int(min_order),
         "resolutions": list(plan.resolutions),
         "fields": sorted(plan.fields),
+        # The run ids the status-channel probe flagged, recorded so the sweep's
+        # own run record carries the warning an operator may have scrolled past.
+        "runs_in_flight": in_flight,
     }
 
 
