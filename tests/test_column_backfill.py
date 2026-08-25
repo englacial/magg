@@ -1153,19 +1153,46 @@ class TestRetrofitDeclaration:
 # ---------------------------------------------------------------------------
 
 
-def _ladder(root) -> dict:
-    """Every overview artifact's arrays, keyed by store-relative path."""
-    out = {}
+#: The artifact roles the acceptance compares, and the attrs block each one
+#: records its provenance in. Overviews alone left SEVEN of the sixteen
+#: artifacts this recipe produces compared by nothing — the four backfilled
+#: LEAF columns (this PR's whole output) and the three §4.6 stage columns the
+#: staged sweep gathers, each with its own ``regime``, ``generation``,
+#: ``source_children`` and ``run_id`` (review finding, issue #520).
+COMPARED_ROLES = {"overview": "zagg_overview", "column": "zagg_column"}
+
+
+def _compared(root):
+    """``(relative path, role, provenance block, open group)`` per artifact."""
     for path in sorted(pathlib.Path(root).rglob("*.zarr"), key=str):
         group = zarr.open_group(
             open_store(str(path), read_only=True), path="", mode="r", zarr_format=3
         )
         attrs = dict(group.attrs)
-        if attrs.get("role") != "overview":
+        block = COMPARED_ROLES.get(attrs.get("role"))
+        if block is None:
             continue
-        res = str(attrs["zagg_overview"]["cell_order"])
-        out[str(path.relative_to(root))] = {
-            name: ([bytes(p or b"") for p in arr[:]] if arr.dtype == object else arr[:].tobytes())
+        yield str(path.relative_to(root)), attrs["role"], attrs[block], group
+
+
+def _resolution_groups(role, block, group) -> list:
+    """Which resolution groups this artifact's arrays live under.
+
+    Keyed off the ROLE, not assumed: an overview carries exactly one group
+    (its own ``cell_order``), a column one per declared resolution.
+    """
+    return [str(block["cell_order"])] if role == "overview" else sorted(dict(group.groups()))
+
+
+def _ladder(root) -> dict:
+    """Every compared artifact's arrays, keyed by store-relative path."""
+    out = {}
+    for path, role, block, group in _compared(root):
+        out[path] = {
+            (res, name): (
+                [bytes(p or b"") for p in arr[:]] if arr.dtype == object else arr[:].tobytes()
+            )
+            for res in _resolution_groups(role, block, group)
             for name, arr in group[res].arrays()
         }
     return out
@@ -1181,22 +1208,20 @@ RUN_LOCAL_GENERATION = ("max_leaf_timestamp", "run_ids")
 
 
 def _overview_attrs(root) -> dict:
-    """Every overview's ``zagg_overview`` block, minus the run-local terms."""
+    """Every compared artifact's provenance block, minus the run-local terms.
+
+    The same terms for a column as for an overview: two runs over the same
+    bytes differ in the wall clock and the run id, and in nothing else.
+    """
     out = {}
-    for path in sorted(pathlib.Path(root).rglob("*.zarr"), key=str):
-        group = zarr.open_group(
-            open_store(str(path), read_only=True), path="", mode="r", zarr_format=3
-        )
-        attrs = dict(group.attrs)
-        if attrs.get("role") != "overview":
-            continue
-        block = {k: v for k, v in attrs["zagg_overview"].items() if k not in RUN_LOCAL}
+    for path, _role, raw, _group in _compared(root):
+        block = {k: v for k, v in raw.items() if k not in RUN_LOCAL}
         generation = block.get("generation")
         if isinstance(generation, dict):
             block["generation"] = {
                 k: v for k, v in generation.items() if k not in RUN_LOCAL_GENERATION
             }
-        out[str(path.relative_to(root))] = block
+        out[path] = block
     return out
 
 
@@ -1218,7 +1243,9 @@ class TestUpgradeEndToEnd:
 
     The whole ``/1 -> /2`` recipe, on local-backend stores, with no fleet and
     no #519: the staged sweep's transport is the only thing #519 changes, and
-    the ladder it builds is what this pins.
+    the ladder it builds is what this pins — every artifact of it, the
+    backfilled leaf columns and the stage columns included, not the overviews
+    alone (``COMPARED_ROLES``).
     """
 
     def _twins(self, tmp_path, monkeypatch, *, kitchen_sink=False):
@@ -1264,9 +1291,13 @@ class TestUpgradeEndToEnd:
         # 4. the ladders agree, byte for byte
         upgraded, native = _ladder(off), _ladder(on)
         assert set(upgraded) == set(native) and upgraded
-        # One overview per above-shard ladder node the leaves reach: the fixed
-        # every-order ladder from order 3 down to 0 over two base cells.
-        assert len(upgraded) == 9, sorted(upgraded)
+        # Every artifact the recipe produces, not just the ladder: 9 overviews
+        # (one per above-shard node the leaves reach — the fixed every-order
+        # ladder from order 3 down to 0 over two base cells), the 4 backfilled
+        # LEAF columns, and the 3 §4.6 stage columns the staged sweep gathers.
+        assert len(upgraded) == 16, sorted(upgraded)
+        roles = [role for _p, role, _b, _g in _compared(off)]
+        assert (roles.count("overview"), roles.count("column")) == (9, 7)
         assert upgraded == native
         assert _overview_attrs(off) == _overview_attrs(on)
         # ...and so does the declaration's materialization inventory.
