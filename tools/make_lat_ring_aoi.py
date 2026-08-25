@@ -36,7 +36,10 @@ Run from a zagg checkout::
 
 ``--check`` compares the generated geometry against the committed file and
 writes nothing — which is how the committed 88S ring stays the reference the
-rest of the family is generated to match.
+rest of the family is generated to match. A plain run refuses to replace a
+committed band whose bytes differ (``--force`` is the way through): the shipped
+88S ring's prose is not what this script writes, and its geometry is, so an
+overwrite would pass every test while deleting the note issue #148 leans on.
 """
 
 from __future__ import annotations
@@ -183,6 +186,11 @@ def main(argv=None) -> int:
         default=BENCH,
         help="where the geojsons land (default: tests/data/benchmark).",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="replace a committed band whose bytes differ (it loses that file's prose).",
+    )
     args = parser.parse_args(argv)
 
     failed = False
@@ -199,7 +207,19 @@ def main(argv=None) -> int:
                 print(f"{path.name}: GEOMETRY DIFFERS from the generator")
                 failed = True
             continue
-        path.write_text(dumps(doc))
+        text = dumps(doc)
+        # Refuse to clobber a committed band. The shipped 88S ring is the
+        # reference this whole family is generated to match, and its prose is
+        # NOT what the generator writes -- it names the turning-latitude stress
+        # rationale, which the generic sweep-band note does not. Since the
+        # geometry is identical, an overwrite would pass every test in the suite
+        # while quietly deleting that. Silence on an unchanged file keeps the
+        # writer idempotent; --force is the deliberate way through.
+        if path.exists() and path.read_text() != text and not args.force:
+            print(f"{path.name}: EXISTS and differs -- re-run with --force to replace it")
+            failed = True
+            continue
+        path.write_text(text)
         print(
             f"wrote {path.name} ({N_SECTORS} sectors, band [{-abs(lat):g}, "
             f"{-abs(lat) + BAND_DEG:g}])"

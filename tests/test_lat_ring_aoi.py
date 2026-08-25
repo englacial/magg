@@ -132,6 +132,33 @@ def test_regenerating_a_band_is_byte_stable(tmp_path):
     ).read_text()
 
 
+def test_writing_88_leaves_the_shipped_ring_alone():
+    """The documented latitude list includes 88, and must not rewrite its prose.
+
+    The generator's note is the generic sweep-band one; the shipped ring's names
+    the turning-latitude stress rationale. Geometry is identical either way, so
+    an overwrite would pass every other test here while deleting the prose issue
+    #148 leans on -- which is why the writer refuses instead.
+    """
+    shipped = BENCH / "antarctic_88s.geojson"
+    before = shipped.read_text()
+    assert ring.main(["85", "85.5", "86", "86.5", "87", "87.5", "88"]) == 1
+    assert shipped.read_text() == before
+    assert "turning-latitude stress target" in before
+
+
+def test_force_replaces_a_committed_band(tmp_path):
+    """``--force`` is the deliberate way through the guard, and an unchanged band is not blocked."""
+    path = tmp_path / ring.aoi_filename(87.0)
+    path.write_text("not a ring")
+    assert ring.main(["--out-dir", str(tmp_path), "87"]) == 1
+    assert path.read_text() == "not a ring"
+    assert ring.main(["--out-dir", str(tmp_path), "--force", "87"]) == 0
+    assert ring.geometry_of(path) == ring.ring_geometry(87.0)
+    # Rewriting an identical band is idempotent, not an "EXISTS and differs".
+    assert ring.main(["--out-dir", str(tmp_path), "87"]) == 0
+
+
 def test_cli_entrypoint_runs():
     """The documented invocation works as a script, not only as an import."""
     proc = subprocess.run(
