@@ -676,3 +676,144 @@ class TestRetrofitDeclaration:
         assert main([str(root), "--declare-pyramid", str(config_yaml), "--overviews", "5"]) == 0
         assert json.loads(capsys.readouterr().out)["declared_via"] == "overviews=[5]"
         assert read_manifest(str(root))["pyramid"]["spec"] == PYRAMID_SPEC_V2
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: the /1 -> /2 upgrade, end to end and offline (the acceptance).
+# ---------------------------------------------------------------------------
+
+
+def _ladder(root) -> dict:
+    """Every overview artifact's arrays, keyed by store-relative path."""
+    out = {}
+    for path in sorted(pathlib.Path(root).rglob("*.zarr"), key=str):
+        group = zarr.open_group(
+            open_store(str(path), read_only=True), path="", mode="r", zarr_format=3
+        )
+        attrs = dict(group.attrs)
+        if attrs.get("role") != "overview":
+            continue
+        res = str(attrs["zagg_overview"]["cell_order"])
+        out[str(path.relative_to(root))] = {
+            name: ([bytes(p or b"") for p in arr[:]] if arr.dtype == object else arr[:].tobytes())
+            for name, arr in group[res].arrays()
+        }
+    return out
+
+
+#: Overview provenance keys that are run-local by construction: the wall clock
+#: and the sweep run's own id (and, inside ``generation``, the leaf clock and
+#: the run-id set the #417 skip key carries). Two runs of the same sweep over
+#: the same bytes differ in exactly these and nothing else — which is the
+#: phase 4 claim, so they are named here rather than compared away wholesale.
+RUN_LOCAL = ("generated_at", "run_id")
+RUN_LOCAL_GENERATION = ("max_leaf_timestamp", "run_ids")
+
+
+def _overview_attrs(root) -> dict:
+    """Every overview's ``zagg_overview`` block, minus the run-local terms."""
+    out = {}
+    for path in sorted(pathlib.Path(root).rglob("*.zarr"), key=str):
+        group = zarr.open_group(
+            open_store(str(path), read_only=True), path="", mode="r", zarr_format=3
+        )
+        attrs = dict(group.attrs)
+        if attrs.get("role") != "overview":
+            continue
+        block = {k: v for k, v in attrs["zagg_overview"].items() if k not in RUN_LOCAL}
+        generation = block.get("generation")
+        if isinstance(generation, dict):
+            block["generation"] = {
+                k: v for k, v in generation.items() if k not in RUN_LOCAL_GENERATION
+            }
+        out[str(path.relative_to(root))] = block
+    return out
+
+
+def _manifest_overviews(root) -> list:
+    """The manifest's ``overviews`` list, actuals minus their run-local terms."""
+    from zagg.hive import read_manifest
+
+    out = []
+    for entry in read_manifest(str(root))["pyramid"]["overviews"]:
+        entry = dict(entry)
+        if isinstance(entry.get("actuals"), dict):
+            entry["actuals"] = {k: v for k, v in entry["actuals"].items() if k not in RUN_LOCAL}
+        out.append(entry)
+    return out
+
+
+class TestUpgradeEndToEnd:
+    """pyramid-OFF -> declare -> backfill -> CLI staged sweep == pyramid-ON twin.
+
+    The whole ``/1 -> /2`` recipe, on local-backend stores, with no fleet and
+    no #519: the staged sweep's transport is the only thing #519 changes, and
+    the ladder it builds is what this pins.
+    """
+
+    def _twins(self, tmp_path, monkeypatch, *, kitchen_sink=False):
+        off, on = tmp_path / "off", tmp_path / "on"
+        _build_store(off, monkeypatch, pyramid=False, kitchen_sink=kitchen_sink)
+        cfg, _grid = _build_store(on, monkeypatch, kitchen_sink=kitchen_sink)
+        for root in (off, on):
+            _write_run_record(root)
+        return off, on, cfg
+
+    @staticmethod
+    def _staged_sweep(root):
+        """The EXISTING CLI staged sweep — `python -m zagg.sweep <root> --stages`."""
+        from zagg.sweep import main
+
+        assert main([str(root), "--stages"]) == 0
+
+    @pytest.mark.parametrize("kitchen_sink", [False, True])
+    def test_upgraded_store_matches_the_pyramid_on_twin(self, tmp_path, monkeypatch, kitchen_sink):
+        from zagg.hive import read_manifest
+        from zagg.sweep import run_sweep
+
+        off, on, cfg = self._twins(tmp_path, monkeypatch, kitchen_sink=kitchen_sink)
+
+        # 1. re-declare the /2 grammar (phase 3's lever)
+        summary = _declare(off, cfg, overviews=5)
+        assert summary["declared_via"] == "overviews=[5]"
+        assert (
+            read_manifest(str(off))["pyramid"]["overviews"]
+            == read_manifest(str(on))["pyramid"]["overviews"]
+        )
+
+        # 2. backfill the columns the pre-column build never wrote
+        backfill = run_sweep(
+            str(off), [(morton_word(d), None) for d in SHARDS], families=["columns"], record=False
+        )
+        assert backfill["families"]["columns"]["written"] == len(SHARDS)
+
+        # 3. the SAME staged sweep over both stores
+        self._staged_sweep(off)
+        self._staged_sweep(on)
+
+        # 4. the ladders agree, byte for byte
+        upgraded, native = _ladder(off), _ladder(on)
+        assert set(upgraded) == set(native) and upgraded
+        # One overview per above-shard ladder node the leaves reach: the fixed
+        # every-order ladder from order 3 down to 0 over two base cells.
+        assert len(upgraded) == 9, sorted(upgraded)
+        assert upgraded == native
+        assert _overview_attrs(off) == _overview_attrs(on)
+        # ...and so does the declaration's materialization inventory.
+        assert _manifest_overviews(off) == _manifest_overviews(on)
+
+    def test_the_upgrade_is_a_no_op_on_a_store_that_never_needed_it(self, tmp_path, monkeypatch):
+        """A pyramid-ON store re-declared + backfilled writes no new column."""
+        from zagg.sweep import run_sweep
+
+        on = tmp_path / "on"
+        cfg, _grid = _build_store(on, monkeypatch)
+        _write_run_record(on)
+        before = {d: _objects(_column_path(on, d)) for d in SHARDS}
+        summary = _declare(on, cfg, overviews=5)
+        assert summary["previous"] == "identical" and not summary["updated"]
+        backfill = run_sweep(
+            str(on), [(morton_word(d), None) for d in SHARDS], families=["columns"], record=False
+        )
+        assert backfill["families"]["columns"]["current"] == len(SHARDS)
+        assert {d: _objects(_column_path(on, d)) for d in SHARDS} == before
