@@ -931,33 +931,57 @@ def column_from_leaf(
     )
 
 
+def _member_metadata(raw) -> dict:
+    """One array's zarr metadata, normalized so the two projections compare.
+
+    ``node_type`` is dropped because a ``pydantic_zarr`` ``ArraySpec`` dump
+    carries it and ``ArrayMetadata.to_dict()`` does not; everything else
+    round-trips key for key through the template write.
+    """
+    return {
+        k: v for k, v in json.loads(json.dumps(dict(raw), default=str)).items() if k != "node_type"
+    }
+
+
 def column_structure(fields: dict, *, node_order: int, resolutions: list) -> dict:
-    """``{group: [array names]}`` a column of this declaration MUST carry.
+    """``{group: {array: metadata}}`` a column of this declaration MUST have.
 
     Derived from the SAME template machinery :func:`write_column` writes with
     (:func:`zagg.sweep_overview._overview_config` -> ``HealpixGrid.shard_spec``),
     so this is not a second description of the column's shape that could drift
-    from the writer's — it IS the writer's, projected to member names.
+    from the writer's — it IS the writer's, projected member by member.
 
     :func:`column_is_current` compares it against the stored column because
-    the recorded ``zagg_column`` attrs cannot: :func:`_column_provenance`
-    records neither ``location`` nor ``temporal``, yet
-    :func:`zagg.sweep_overview.field_companions` reads exactly those, and each
-    one adds a ``{field}_locations`` / ``{field}_times`` member to EVERY
-    resolution group (spec §4.6, "plus every channel sibling that field's
-    §4.5 entry declares"). A digest field re-declared with a ``location``
-    channel — ruling 4 on issue #410, the expected ``/1`` -> ``/2`` retrofit —
-    is invisible to the provenance compare and obvious here (review finding,
-    issue #520).
+    the recorded ``zagg_column`` attrs cannot say either half of it (review
+    finding, issue #520):
+
+    - the **member set** — :func:`_column_provenance` records neither
+      ``location`` nor ``temporal``, yet
+      :func:`zagg.sweep_overview.field_companions` reads exactly those and each
+      one adds a ``{field}_locations`` / ``{field}_times`` member to EVERY
+      resolution group (spec §4.6, "plus every channel sibling that field's
+      §4.5 entry declares"). A digest field re-declared with a ``location``
+      channel — ruling 4 on issue #410, the expected ``/1`` -> ``/2`` retrofit
+      — is invisible to the provenance compare;
+    - each member's **dtype, fill value and array attrs** — an exact field's
+      ``dtype`` and ``fill_value`` are absent from the recorded provenance by
+      construction (:func:`zagg.sweep_overview._field_provenance` records
+      ``class``/``method``/``nan_policy`` and nothing else for that class),
+      yet ``fill_value`` is what :func:`zagg.sweep_overview.fold_dense`
+      reduces to and ``dtype`` is the stored element type. Moving either moves
+      the column's bytes.
     """
     from zagg.grids.healpix import HealpixGrid
     from zagg.sweep_overview import _overview_config
 
     cfg = _overview_config(composable_fields(fields))
     return {
-        str(int(res)): sorted(
-            HealpixGrid(int(node_order), int(res), config=cfg, sharded=True).shard_spec().members
-        )
+        str(int(res)): {
+            name: _member_metadata(member.model_dump())
+            for name, member in HealpixGrid(int(node_order), int(res), config=cfg, sharded=True)
+            .shard_spec()
+            .members.items()
+        }
         for res in resolutions
     }
 
@@ -965,10 +989,16 @@ def column_structure(fields: dict, *, node_order: int, resolutions: list) -> dic
 def stored_column_structure(group) -> dict:
     """:func:`column_structure`'s twin, read off an OPEN column root group.
 
-    One listing per group — the cheapest read that can see a member set, and
-    the whole cost the structure term adds to a skip.
+    One member listing per resolution group, and the metadata each listing
+    already carries — the cheapest read that can see the structure, and the
+    whole cost the term adds to a skip.
     """
-    return {str(name): sorted(dict(sub.arrays())) for name, sub in group.groups()}
+    return {
+        str(name): {
+            member: _member_metadata(arr.metadata.to_dict()) for member, arr in sub.arrays()
+        }
+        for name, sub in group.groups()
+    }
 
 
 def column_is_current(
@@ -995,21 +1025,30 @@ def column_is_current(
        the ones this run would write. A narrowed, widened or re-classed
        declaration is exactly the #383 case where the artifact must not
        outlive the declaration that made it.
-    3. **Structure** — the column's REALIZED members
+    3. **Structure** — the column's REALIZED arrays
        (:func:`stored_column_structure`) must be the ones the template this
-       run would write declares (:func:`column_structure`). This is the term
-       that covers what the recorded grammar cannot say: ``location`` and
-       ``temporal`` are not in :func:`_column_provenance`, so a digest field
+       run would write declares (:func:`column_structure`), member for member
+       and metadata for metadata. This is the term that covers what the
+       recorded grammar cannot say, and there are two such things: ``location``
+       / ``temporal`` are not in :func:`_column_provenance`, so a digest field
        re-declared with a companion channel passes term 2 while its stored
-       column is a sibling short in every group (review finding, issue #520).
-       ``structure`` is what the caller read off the store; an unreadable one
-       (``None``) is drift, which rewrites.
+       column is a sibling short in every group; and an exact field's
+       ``dtype`` / ``fill_value`` are not there either, so a re-declaration
+       that moves the element type or what folds to missing passes it too
+       (review finding, issue #520). ``structure`` is what the caller read off
+       the store; an unreadable one (``None``) is drift, which rewrites.
     4. **Order** — the column's ``written_at`` may not PRECEDE its leaf's: a
        leaf re-run after its column leaves the column folded from cells that
        are gone.
     5. **Granules** — the column's stamp copies the LEAF's ``granule_count``
        (§4.6), so a re-run that changed the leaf's granule set fails the gate
        even inside the one-second stamp resolution that defeats term 4.
+
+    Between them terms 2 and 3 cover every key the fold and the template
+    consume. What NO term covers is the leaf's BYTES: nothing here reads a
+    cell, so a leaf whose arrays moved without moving its stamp or its
+    granule count reads as current — terms 4 and 5's business, and their
+    residual below.
 
     Residual, disclosed rather than papered over: both stamps resolve to whole
     seconds (the issue #417 term), and a column records no ``run_id`` for its

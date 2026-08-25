@@ -470,6 +470,23 @@ class TestBackfill:
         assert fields["h_tdigest_signal"].pop("location", None) == "leaf_id"
         assert _verdict(off, SHARDS[0], fields=fields) == (False, "structure-drift")
 
+    def test_a_moved_exact_dtype_or_fill_is_not_current(self, tmp_path, monkeypatch):
+        """The second blind spot: `dtype`/`fill_value` are not in the provenance."""
+        from zagg.column import _column_provenance
+
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        assert _verdict(off, SHARDS[0]) == (True, "current")
+        for moved in ({"dtype": "float64", "fill_value": "NaN"}, {"fill_value": -1}):
+            fields = {n: dict(m) for n, m in _plan(off).fields.items()}
+            assert fields["count"]["class"] == "exact"
+            assert fields["count"] | moved != fields["count"]
+            fields["count"].update(moved)
+            assert _column_provenance(fields["count"]) == _column_provenance(
+                _plan(off).fields["count"]
+            )
+            assert _verdict(off, SHARDS[0], fields=fields) == (False, "structure-drift"), moved
+
     def test_a_re_run_leaf_is_not_current(self, tmp_path, monkeypatch):
         from zagg.hive import COMMIT_ATTR, shard_leaf_path
 
