@@ -812,10 +812,13 @@ def stored_leaf_slabs(
     """``{field: cell slab}`` fold inputs read back from a COMMITTED leaf.
 
     The read-back twin of :func:`leaf_slabs` (issue #520): same filter
-    (:func:`composable_fields`), same absent-field rule, same
-    ``(n_cells,)`` extent refusal, same companion pickup — but the values
-    come from the leaf's stored arrays instead of the writer's in-memory
-    #342 sink. That equality is the whole bridge: a store built before the
+    (:func:`composable_fields`), same ``(n_cells,)`` extent refusal, same
+    companion pickup — but the values come from the leaf's stored arrays
+    instead of the writer's in-memory #342 sink. The absent-key rule is the
+    one place the twins part, and only because a sink cannot reach the case:
+    an absent PAYLOAD folds as fill (schema evolution — a field the leaf
+    predates), while an absent declared COMPANION refuses the leaf by name,
+    since folding a payload apart from its channel is not defined. That equality is the whole bridge: a store built before the
     0.50 classifiers has no column, and the only surviving record of what
     the leaf worker would have folded is the leaf itself. Feeding this map
     to :func:`fold_column` therefore reproduces the build-time column
@@ -873,6 +876,22 @@ def stored_leaf_slabs(
         try:
             arr = group[key]
         except KeyError:
+            if channel is not None:
+                # NOT the fill arm: a synthesized all-empty sibling satisfies
+                # ``fold_column``'s required-by-name pairing guard, so the pair
+                # would be folded APART and surface from the kernel as a §1.1
+                # row-alignment error that reads as data corruption. The true
+                # diagnosis is a declaration the leaves predate — the expected
+                # ``/1`` -> ``/2`` retrofit, since ruling 4 on issue #410 is
+                # what made a located digest field ``approximate`` at all — so
+                # refuse the leaf here, the way ``_fold_node`` does at the read
+                # (review finding, issue #520).
+                raise ValueError(
+                    f"field {channel[0]!r} declares a {channel[1]} channel but leaf "
+                    f"{leaf_path} carries no {key!r} array — these leaves predate the "
+                    f"declaration. Re-declare without the channel, or rebuild the leaf; "
+                    f"no fold of the payload alone is defined (spec §1.1)"
+                ) from None
             # Schema evolution, and the ragged writer's all-empty skip: the
             # stored cells are the fill either way, which is exactly what the
             # staged sink synthesizes for an absent key.

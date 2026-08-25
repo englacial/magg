@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shutil
 
 import numpy as np
 import pytest
@@ -287,6 +288,34 @@ class TestStoredLeafParity:
             n_cells=4 ** (plan.cell_order - plan.node_order),
         )
         assert stored["later"].tolist() == [0] * 4 ** (plan.cell_order - plan.node_order)
+
+    def test_a_leaf_missing_a_declared_companion_refuses(self, tmp_path, monkeypatch):
+        """A channel the leaves predate is a DECLARATION fault, named as one."""
+        from zagg.column import column_from_leaf, stored_leaf_slabs
+        from zagg.hive import shard_leaf_path
+        from zagg.sweep_overview import field_companions
+
+        root = tmp_path / "on"
+        _build_store(root, monkeypatch, shards=SHARDS[:1], kitchen_sink=True)
+        plan = _plan(root)
+        name = next(n for n, m in plan.fields.items() if field_companions(n, m))
+        sibling = field_companions(name, plan.fields[name])[0][1]
+        leaf = shard_leaf_path(str(root), morton_word(SHARDS[0]))
+        shutil.rmtree(pathlib.Path(leaf) / str(plan.cell_order) / sibling)
+        n_cells = 4 ** (plan.cell_order - plan.node_order)
+        with pytest.raises(ValueError, match=f"carries no '{sibling}' array"):
+            stored_leaf_slabs(leaf, plan.fields, cell_order=plan.cell_order, n_cells=n_cells)
+        # And it lands at the READ, not downstream as a §1.1 row-alignment
+        # error from the kernel folding the pair apart.
+        with pytest.raises(ValueError, match="predate the declaration"):
+            column_from_leaf(
+                str(root),
+                morton_word(SHARDS[0]),
+                plan.fields,
+                node_order=plan.node_order,
+                cell_order=plan.cell_order,
+                resolutions=plan.resolutions,
+            )
 
     def test_mismatched_weights_declaration_refuses(self, tmp_path, monkeypatch):
         from zagg.column import stored_leaf_slabs
