@@ -315,6 +315,11 @@ class TestObstoreDefaultHeaderSigning:
         # signature. Real S3 answers this shape with
         # 403 AccessDenied / HeadersNotSigned: x-amz-acl.
         assert listing.acl == ACL
+        # The LIST is otherwise a fully signed request -- assert that too, or
+        # `not acl_signed` would also hold for an obstore that stopped signing
+        # LIST altogether (`signed_headers` would just be empty), which is the
+        # opposite failure and 403s in the fleet just the same.
+        assert "x-amz-content-sha256" in listing.signed_headers
         assert not listing.acl_signed, f"unexpectedly signed: {listing.signed_headers}"
 
     def test_only_the_list_path_leaves_the_acl_unsigned(self, fake_s3):
@@ -339,6 +344,7 @@ class TestObstoreDefaultHeaderSigning:
         assert signed["GET"].acl_signed
         assert signed["HEAD"].acl_signed
         assert signed["GET-list"].acl == ACL
+        assert "x-amz-content-sha256" in signed["GET-list"].signed_headers
         assert not signed["GET-list"].acl_signed
 
     def test_a_handle_without_the_header_signs_a_clean_list(self, fake_s3):
