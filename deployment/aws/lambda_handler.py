@@ -1194,10 +1194,17 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
     sweep" that stops after the fan-out produces no toc.
     """
     from zagg.sweep import discover_leaves, run_sweep
+    from zagg.sweep_partition import normalize_partition
 
     logger.info(f"Sweep mode: folding rollups at {event.get('store_path')}")
     try:
         store_kwargs = _output_store_kwargs(event)
+        # Validate the block BEFORE anything touches the store: on the
+        # ``discover`` transport the next statement is a store-root LIST plus a
+        # parquet read per run record, and a malformed partition should not
+        # cost that. run_sweep re-validates (it is the authority); this is the
+        # same guard ``python -m zagg.sweep`` carries for argv, issue #377.
+        normalize_partition(event.get("partition"))
         t0 = time.perf_counter()
         if event.get("leaves") is not None:
             leaves = [(int(key), window) for key, window in event["leaves"]]
