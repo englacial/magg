@@ -59,7 +59,17 @@ def _generator():
     return mod
 
 
-def _build_store(root, monkeypatch, *, pyramid=None, shards=SHARDS, kitchen_sink=False):
+def _build_store(
+    root,
+    monkeypatch,
+    *,
+    pyramid=None,
+    shards=SHARDS,
+    kitchen_sink=False,
+    window=None,
+    windowing=None,
+    time_range=None,
+):
     """A real hive store: every shard through ``process_and_write_hive``.
 
     ``pyramid=None`` takes the issue #384 default flip (``/2`` at the grid's
@@ -68,6 +78,13 @@ def _build_store(root, monkeypatch, *, pyramid=None, shards=SHARDS, kitchen_sink
     identical either way — ``output.pyramid`` changes only which sibling
     artifacts the unit writes — which is what makes the phase 4 twins
     comparable.
+
+    ``window``/``windowing``/``time_range`` drive the D23 windowed arm (the
+    ``tests/test_column.py::_run_unit`` shape): the unit writes
+    ``{shard}_{label}.zarr`` beside a ``{label}.pyramid.zarr`` column, and
+    ``time_range`` is the D15 observed extent in DATASET units the fake
+    reports — which the leaf's stamp carries as an ISO pair and the backfill
+    recovers from there rather than computing.
     """
     from dataclasses import replace
 
@@ -83,6 +100,15 @@ def _build_store(root, monkeypatch, *, pyramid=None, shards=SHARDS, kitchen_sink
     # semantic core — so the store must be BUILT with them for a retrofit
     # config to hash identically.
     cfg = replace(cfg, data_source={**cfg.data_source, "variables": {"h": "g/h"}})
+    if windowing is not None:
+        # The window filter injection (windowed_cell_config) needs the
+        # time_field's base-rate dataset path; the fake reader ignores it.
+        variables = {**cfg.data_source["variables"], windowing["time_field"]: "g/t"}
+        cfg = replace(
+            cfg,
+            data_source={**cfg.data_source, "variables": variables},
+            output={**cfg.output, "windowing": windowing},
+        )
     grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
     root.mkdir(parents=True, exist_ok=True)
     hive.ensure_manifest(
@@ -98,11 +124,13 @@ def _build_store(root, monkeypatch, *, pyramid=None, shards=SHARDS, kitchen_sink
                 kwargs["chunk_results"] = []
             df, meta = _inner(*args, **kwargs)
             meta["phase_timings"] = {"read": 0.0, "index": 0.0, "aggregate": 0.0}
+            if time_range is not None:
+                meta["time_range"] = list(time_range)
             return df, meta
 
         monkeypatch.setattr(processing, "process_shard", fake)
         meta = hive.process_and_write_hive(
-            shard, ["s3://fixture/a.h5"], grid, {}, str(root), cfg, store_kwargs={}
+            shard, ["s3://fixture/a.h5"], grid, {}, str(root), cfg, store_kwargs={}, window=window
         )
         assert meta.get("error") is None, meta.get("error")
     return cfg, grid
@@ -415,12 +443,12 @@ def _twin_block(on_root):
     return read_manifest(str(on_root))["pyramid"]
 
 
-def _backfill(root, *, shards=SHARDS, **kwargs):
+def _backfill(root, *, shards=SHARDS, windows=(None,), **kwargs):
     from zagg.column_backfill import backfill_columns
     from zagg.hive import read_manifest
 
     return backfill_columns(
-        str(root), read_manifest(str(root)), {d: {None} for d in shards}, **kwargs
+        str(root), read_manifest(str(root)), {d: set(windows) for d in shards}, **kwargs
     )
 
 
@@ -683,6 +711,98 @@ class TestBackfill:
         (leaf / "6" / "count" / "zarr.json").write_text("{ not json")
         summary = _backfill(off)
         assert summary["failed"] == 1 and summary["written"] == len(SHARDS) - 1
+
+
+class TestWindowedBackfill:
+    """The `(leaf, window)` arm: the ONE place `time_range` is RECOVERED.
+
+    Every other column writer computes the D15 extent from the run it is part
+    of; here it comes back out of the leaf's own commit stamp
+    (``leaf_stamp.get("time_range")``), where ``stamp_commit`` put it as an
+    ISO pair — and ``stamp_commit`` fails closed around it (a ``time_range``
+    without a ``window`` raises, a reversed pair raises), so a backfill that
+    dropped or mistyped it would fail the leaf silently into ``failed``.
+    Untested with it before this: ``column_name(window)``, the
+    ``shard_leaf_path(window=)`` legs in ``_leaf_stamp`` / ``_column_state``,
+    and the driver's multi-window ordering (review finding, issue #520).
+    """
+
+    WINDOWING = {"schedule": "yearly", "time_field": "t", "epoch": "2018-01-01T00:00:00Z"}
+    WINDOW = {"label": "2019", "start": 0.0, "end": 1.0}
+    #: Dataset-unit seconds the fake reports; the ISO pair below is what the
+    #: leaf stamp carries and therefore what the backfill must hand on.
+    TIME_RANGE = [31536000.0, 31536060.0]
+    ISO_RANGE = ["2019-01-01T00:00:00+00:00", "2019-01-01T00:01:00+00:00"]
+
+    def _twins(self, tmp_path, monkeypatch, windows=(("2019", 0.0, 1.0),)):
+        off, on = tmp_path / "off", tmp_path / "on"
+        for label, start, end in windows:
+            common = dict(
+                shards=SHARDS[:2],
+                window={"label": label, "start": start, "end": end},
+                windowing=self.WINDOWING,
+                time_range=self.TIME_RANGE,
+            )
+            _build_store(off, monkeypatch, pyramid=False, **common)
+            _build_store(on, monkeypatch, **common)
+        _install_pyramid(off, _twin_block(on))
+        return off, on
+
+    def test_a_windowed_column_is_backfilled_byte_for_byte(self, tmp_path, monkeypatch):
+        off, on = self._twins(tmp_path, monkeypatch)
+        for decimal in SHARDS[:2]:
+            assert _column_path(on, decimal, "2019").name == "2019.pyramid.zarr"
+            assert not _column_path(off, decimal, "2019").exists()
+        summary = _backfill(off, shards=SHARDS[:2], windows=("2019",))
+        assert summary["written"] == 2 and summary["failed"] == 0
+        for decimal in SHARDS[:2]:
+            a = _objects(_column_path(on, decimal, "2019"))
+            b = _objects(_column_path(off, decimal, "2019"))
+            assert set(a) == set(b)
+            for key in a:
+                if key == "zarr.json":
+                    assert _sans_timestamps(a[key]) == _sans_timestamps(b[key])
+                else:
+                    assert a[key] == b[key], (decimal, key)
+
+    def test_the_window_and_the_recovered_time_range_reach_the_stamp(self, tmp_path, monkeypatch):
+        """`morton-hive/2` + the label + the leaf's OWN observed extent."""
+        from zagg.column import COLUMN_ATTR
+        from zagg.hive import HIVE_SPEC_V2, read_commit, shard_leaf_path
+
+        off, on = self._twins(tmp_path, monkeypatch)
+        _backfill(off, shards=SHARDS[:2], windows=("2019",))
+        for decimal in SHARDS[:2]:
+            column = _column_path(off, decimal, "2019")
+            stamp = read_commit(open_store(str(column), read_only=True))
+            assert stamp["spec"] == HIVE_SPEC_V2 == "morton-hive/2"
+            assert stamp["window"] == "2019"
+            assert stamp["time_range"] == self.ISO_RANGE
+            # RECOVERED, not recomputed: it is the leaf's own stamped pair.
+            leaf = shard_leaf_path(str(off), morton_word(decimal), window="2019")
+            assert (
+                stamp["time_range"] == read_commit(open_store(leaf, read_only=True))["time_range"]
+            )
+            # ...and the same value the pyramid-ON twin's worker wrote.
+            twin = read_commit(open_store(str(_column_path(on, decimal, "2019")), read_only=True))
+            assert (stamp["window"], stamp["time_range"]) == (twin["window"], twin["time_range"])
+            root = zarr.open_group(
+                open_store(str(column), read_only=True), path="", mode="r", zarr_format=3
+            )
+            assert dict(root.attrs)[COLUMN_ATTR]["window"] == "2019"
+
+    def test_a_leaf_with_several_windows_gets_one_column_each(self, tmp_path, monkeypatch):
+        """The driver's window ordering — the only multi-window path there is."""
+        off, on = self._twins(
+            tmp_path, monkeypatch, windows=(("2019", 0.0, 1.0), ("2020", 1.0, 2.0))
+        )
+        summary = _backfill(off, shards=SHARDS[:2], windows=("2020", "2019"))
+        assert summary["written"] == 4
+        for decimal in SHARDS[:2]:
+            for label in ("2019", "2020"):
+                assert _objects(_column_path(off, decimal, label))
+        # Idempotent per window, not just per leaf.
+        assert _backfill(off, shards=SHARDS[:2], windows=("2019", "2020"))["current"] == 4
 
 
 class TestFamilyRegistration:
