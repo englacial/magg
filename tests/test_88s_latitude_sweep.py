@@ -207,7 +207,12 @@ def test_pinned_rows_dispatch_dry(manifest, monkeypatch):
             dry_run=True,
         )
         assert record["target"] == name
-        assert record["shard_key"] == manifest["shardmaps"]["healpix_o9_88s"]["shard_key"]
+        # Each row's OWN band, looked up through the row: a pinned band moves
+        # its two rows into ``targets`` (_pin_recipe step 4), so an expectation
+        # hard-coded to one band would go red on the next band pinned and read
+        # as a dispatch bug in the row someone just added.
+        band = manifest["shardmaps"][manifest["targets"][name]["shardmap"]]
+        assert record["shard_key"] == band["shard_key"]
         assert record["streaming_mode"] == "spill"
         assert record["index_backend"] == "sidecar"
         assert record["store_layout"] == "hive"
