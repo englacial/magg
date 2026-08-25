@@ -89,14 +89,15 @@ never a recursive LIST) are inherited whole. It is deliberately **not** in the
 default family set — a backfill is an explicit upgrade of a quiesced store,
 never a routine rollup's side effect, so it must be spelled.
 
-**This runs in-process, on the machine you type it on.** The two entry points
-are this CLI and `run_sweep(root, leaves, families=["columns"])`; there is no
-fleet arm. The Lambda handler's `mode: "sweep"` branch forwards no `families`
-(or `partition`) key from the event, so a worker falls to the default family
-set — which excludes this one. Adding that forwarding is
-[#519](https://github.com/englacial/zagg/issues/519)'s change, not this
-page's, and until it lands a store too large for one machine has no fan-out
-for this step.
+**Three entry points, all the same pass.** This CLI,
+`run_sweep(root, leaves, families=["columns"])`, and a fleet `mode: "sweep"`
+invoke naming the family — the handler's sweep arm forwards the event's
+`families` and `partition` blocks as of
+[#528](https://github.com/englacial/zagg/pull/528). A fleet-scale
+**partitioned** backfill is the one combination still gated: the runner fires
+partitions as concurrent `Event` invokes and the sweep lease is store-granular,
+so it admits exactly one of them. Until that is ruled, fan a fleet backfill out
+as a single unpartitioned invoke, or partition it sequentially in-process.
 
 **`--partitions 2^n` bounds peak memory, but is not free here.** Unlike
 `--stages`, which sweeps every partition under ONE lease, `--partitions`

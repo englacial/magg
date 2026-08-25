@@ -19,22 +19,21 @@ the cost of one leaf-reading pass, paid once.
 It is a **sweep family** (``columns``, registered in :mod:`zagg.sweep`), not
 a mode of its own: a registry entry needs no NEW transport and no new mode,
 so the work-set normalization, partitioning (issue #377) and the discovery
-seam are inherited whole rather than rebuilt. The supported entry points
-today are both IN-PROCESS: the CLI
-(``python -m zagg.sweep <root> --families columns``) and
-``zagg.sweep.run_sweep(..., families=["columns"])``.
+seam are inherited whole rather than rebuilt. Three entry points, all
+reaching the same :func:`backfill_columns`: the CLI
+(``python -m zagg.sweep <root> --families columns``),
+``zagg.sweep.run_sweep(..., families=["columns"])``, and — since the handler's
+``mode: "sweep"`` arm began forwarding the event's ``families``/``partition``
+blocks (issue #527, PR #528) — a fleet invoke naming the family.
 
-FLEET execution is not one of them yet, and the reason is one line worker-side:
-``deployment/aws/lambda_handler.py``'s ``mode: "sweep"`` arm calls
-``run_sweep(event["store_path"], leaves, store_kwargs=...)`` and reads neither
-``families`` nor ``partition`` off the event, so no invoke payload can select
-this family — it falls to :data:`zagg.sweep.DEFAULT_FAMILIES`, which this one
-is deliberately not in. Forwarding those two keys is the handler's change,
-issue #519's territory, and deliberately NOT in this PR (review finding,
-issue #520). Partitioning inherits the same seam: ``--partitions`` is real
-in-process (:func:`zagg.sweep_partition.sweep_partitions` runs them
-sequentially), while the runner fires fleet partitions as CONCURRENT ``Event``
-invokes, which one store-granular lease admits exactly one of.
+One caveat on the fleet arm, and it is about PARTITIONING, not the family:
+``--partitions`` is genuinely sequential in-process
+(:func:`zagg.sweep_partition.sweep_partitions` runs one at a time), while the
+runner fires fleet partitions as CONCURRENT ``Event`` invokes — and the
+sweep-admission lease is store-granular by correctness, so it admits exactly
+one of them. A fleet-scale PARTITIONED backfill therefore wants either a single
+unpartitioned invoke or a scoped lease; that is an open espg design call, and
+this module deliberately keeps the store-granular behavior until it is ruled.
 
 It is deliberately NOT in :data:`zagg.sweep.DEFAULT_FAMILIES` — a backfill is
 an explicit upgrade operation, never something a routine rollup sweep does
