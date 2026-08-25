@@ -736,14 +736,23 @@ def declare_pyramid(
     )
     block = build_pyramid_block(config, shard_order, default_chunk)
     if (overviews is not None or chunk_order is not None) and "overviews" not in block:
-        # Both levers exist to produce a /2 block; anything that swallowed one
-        # (a `reader: raster` config, which build_pyramid_block exempts from
-        # the flip by ruling) must say so rather than install the /1 fallback
-        # the caller explicitly reached past.
+        # Both levers exist to produce a /2 block; anything that swallowed one must
+        # say so rather than install the /1 fallback the caller explicitly reached
+        # past. Raster is refused by name upstream now (``retrofit_declaration``,
+        # both arms), so what survives to here is the ``chunk_order=`` arm on a
+        # NON-raster config: the lever was validated against the MANIFEST's
+        # ``cell_order`` while the #384 flip gates on the CONFIG's own
+        # ``output.grid.child_order``, and orders are packaging — excluded from
+        # the semantic core — so ``_semantic_guard`` cannot catch a config whose
+        # grid disagrees with the store (review finding, issue #520).
         raise ValueError(
-            f"declare_pyramid({declared_via}) did not produce a zagg-pyramid/2 block — "
-            f"this config is exempt from the /2 declaration (raster configs are, issue "
-            f"#399); nothing was written"
+            f"declare_pyramid({declared_via}) did not produce a zagg-pyramid/2 block: the "
+            f"issue #384 default flip needs the order strictly inside this CONFIG's own "
+            f"`output.grid.child_order` "
+            f"({(config.output.get('grid') or {}).get('child_order')!r}), which is not where "
+            f"the store's manifest puts its cells (cell_order {int(manifest['cell_order'])}) "
+            f"— the config's grid does not describe this store. Pass overviews= to spell the "
+            f"schedule outright; nothing was written"
         )
     # Compare (and write) canonical JSON: ``prior`` came back through
     # ``json.loads``, so any non-JSON-primitive surviving the derivation (a tuple

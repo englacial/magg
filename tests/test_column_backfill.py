@@ -887,6 +887,50 @@ class TestRetrofitDeclaration:
         with pytest.raises(ValueError, match="not both"):
             _declare(root, cfg, overviews=5, chunk_order=5)
 
+    def test_a_raster_config_is_refused_by_name_on_both_levers(self, tmp_path, monkeypatch):
+        """§4.6 does not apply to raster hive stores — so no lever may declare /2.
+
+        The #384 default flip already exempts them, but the ``overviews=`` arm
+        never goes through the flip: it writes the knob and takes
+        ``build_pyramid_block``'s explicit branch, which has no reader check,
+        so before this it installed a ``/2`` block on a raster store and the
+        backfill would chase leaf columns that cannot exist (review finding,
+        issue #520).
+        """
+        from dataclasses import replace
+
+        from zagg.hive import read_manifest
+
+        root, cfg = self._off(tmp_path, monkeypatch, pyramid={})
+        raster = replace(cfg, data_source={**cfg.data_source, "reader": "raster"})
+        before = read_manifest(str(root))
+        for lever in ({"overviews": 5}, {"chunk_order": 5}):
+            with pytest.raises(ValueError, match="`reader: raster`"):
+                _declare(root, raster, **lever)
+        assert read_manifest(str(root)) == before
+
+    def test_chunk_order_refuses_a_config_grid_the_store_contradicts(self, tmp_path, monkeypatch):
+        """The one raise the /2 guard still catches, and what it must now say.
+
+        ``retrofit_declaration`` validates the lever against the MANIFEST's
+        ``cell_order`` (6 here); the #384 flip gates on the CONFIG's
+        ``output.grid.child_order``. Orders are packaging, outside the
+        semantic core, so ``_semantic_guard`` cannot catch a config whose grid
+        disagrees with the store — this guard is the only thing that does.
+        """
+        from dataclasses import replace
+
+        from zagg.hive import read_manifest
+
+        root, cfg = self._off(tmp_path, monkeypatch, pyramid={})
+        narrowed = replace(
+            cfg, output={**cfg.output, "grid": {**cfg.output["grid"], "child_order": 5}}
+        )
+        before = read_manifest(str(root))
+        with pytest.raises(ValueError, match="does not describe this store"):
+            _declare(root, narrowed, chunk_order=5)
+        assert read_manifest(str(root)) == before
+
     def test_no_lever_keeps_todays_behaviour(self, tmp_path, monkeypatch):
         root, cfg = self._off(tmp_path, monkeypatch, pyramid={"orders": [3, 2]})
         summary = _declare(root, cfg)

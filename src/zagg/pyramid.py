@@ -388,6 +388,14 @@ def retrofit_declaration(config, *, overviews, chunk_order, parent_order: int, c
     default flip to complete. ``overviews=`` DOES override a config's own
     pyramid knob, including ``false``: that is the whole point of the lever
     on a store whose build declared no pyramid, and the override is logged.
+
+    A ``reader: raster`` config is refused HERE, on **both** arms. The #384
+    default flip's raster exemption lives inside the flip condition
+    (:func:`zagg.sweep_overview.build_pyramid_block`), which the ``overviews=``
+    arm does not go through — it writes the knob and takes the explicit
+    branch, which has no reader check — so without this an ``--overviews`` on
+    a raster store would install a ``/2`` block declaring leaf columns spec
+    §4.6 places entirely out of scope (review finding, issue #520).
     """
     from dataclasses import replace
 
@@ -398,6 +406,15 @@ def retrofit_declaration(config, *, overviews, chunk_order, parent_order: int, c
             "declare_pyramid takes overviews= or chunk_order=, not both: chunk_order= only "
             "supplies the issue #384 default flip, which an explicit overviews= schedule "
             "replaces wholesale — passing both would silently ignore one of them"
+        )
+    if (config.data_source or {}).get("reader") == "raster":
+        raise ValueError(
+            "declare_pyramid(overviews=/chunk_order=) refuses a `reader: raster` config: "
+            "raster hive stores are column-less by construction and spec §4.6 does not apply "
+            "to them (issue #399 owns their overview regime). The #384 default flip already "
+            "exempts them, but `overviews=` bypasses the flip entirely — it would install a "
+            "zagg-pyramid/2 block declaring leaf columns nothing writes, which the column "
+            "backfill would then chase into raster leaves. Nothing was written"
         )
     knob = get_pyramid(config)
     if overviews is not None:
