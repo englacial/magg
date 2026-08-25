@@ -189,14 +189,13 @@ def test_the_pinned_map_still_selects_its_pin(manifest):
     assert (shard_key, n_granules) == (meta["shard_key"], meta["n_granules"])
 
 
-def test_pinned_rows_dispatch_dry(manifest, monkeypatch):
+def test_pinned_rows_dispatch_dry(manifest):
     """``run_target --dry-run`` resolves every pinned row end to end, touching no AWS.
 
     The wiring check the manifest most needs: config load, grid construction,
     backend/streaming/worker injection and record building all run, and a real
     dispatch would be the only remaining step.
     """
-    monkeypatch.chdir(REPO)
     for name in manifest["targets"]:
         record = run_benchmark.run_target(
             name,
