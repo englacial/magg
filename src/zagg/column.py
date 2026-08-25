@@ -824,16 +824,25 @@ def stored_leaf_slabs(
 
     Two guards the staged sink cannot need but a read-back must, both
     borrowed from the sweep's own from-leaves fold
-    (:func:`zagg.sweep_overview._fold_node`) so the two read paths refuse the
-    same stores: the leaf's ``morton`` extent pins the geometry (a leaf at
-    another cell order is not this declaration's leaf — mixed-order sources
-    are unsupported, issue #347), and every digest field's stored §2.0
-    ``weights`` / §8.4 companion declaration is checked against the manifest's
-    (:func:`zagg.sweep_overview.check_weights_match`,
+    (:func:`zagg.sweep_overview._fold_node`): the leaf's ``morton`` extent pins
+    the geometry (a leaf at another cell order is not this declaration's leaf
+    — mixed-order sources are unsupported, issue #347), and every digest
+    field's stored §2.0 ``weights`` / §8.4 companion declaration is checked
+    against the manifest's (:func:`zagg.sweep_overview.check_weights_match`,
     :func:`zagg.sweep_overview.check_companion_match`). All three raise: a
     backfill folding across a declaration mismatch would publish a column
     whose weight column means neither thing, and the caller turns the raise
     into one loudly skipped leaf.
+
+    ``_fold_node`` carries a THIRD guard this does not: the D4 commit stamp,
+    which is what separates a leaf from an interrupted writer's prefix. Here
+    it is the CALLER's, not because it matters less but because the caller has
+    already paid for it — :func:`zagg.column_backfill._backfill_leaf` reads
+    ``hive.read_commit`` first, cheapest-first, and an unstamped leaf is
+    counted ``empty`` and never reaches this function
+    (``test_uncommitted_leaf_contributes_nothing``). Hence the COMMITTED in
+    the summary line: it is a precondition of calling this, and a caller that
+    skips it folds whatever bytes are there (review finding, issue #520).
     """
     import zarr
 
@@ -912,8 +921,9 @@ def column_from_leaf(
     the fold ever had.
 
     Pure compute: nothing is written and no gate is consulted. The caller
-    (:func:`zagg.column_backfill.backfill_columns`) owns the declaration gate,
-    the skip-if-current test, and the write.
+    (:func:`zagg.column_backfill.backfill_columns`) owns the D4 commit gate,
+    the declaration gate, the skip-if-current test, and the write — this
+    inherits :func:`stored_leaf_slabs`' COMMITTED-leaf precondition unchanged.
     """
     from zagg.hive import shard_leaf_path
 
