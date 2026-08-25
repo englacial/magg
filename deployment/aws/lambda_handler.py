@@ -1162,6 +1162,18 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
     above the split from partial data. ``families`` scopes the pass to a
     subset of :data:`zagg.sweep.DEFAULT_FAMILIES` (the issue #520 ``columns``
     backfill is the first caller that needs it).
+
+    **Pick a width that fits the wall.** A partition does 1/N-th of the work
+    but faces the same 900 s timeout, so a width that is merely *narrower* than
+    the whole store still dies — N ways instead of one, each having done 1/N-th
+    of the fold. The width must satisfy ``leaves x s_per_leaf / N < 900`` AND be
+    a power of four (``partition_split_order`` splits on whole morton digits).
+    For the CA ATL03 store that is 2,726 leaves x ~60 s/leaf (the SERC probe's
+    measured rate) = 163,560 s of fold work, so ``ceil(163560 / 900) = 182``
+    partitions minimum, rounded up to the first legal power of four: **256**
+    (4^4, ~639 s/worker — fits, no headroom) or **1024** (4^5, ~160 s/worker —
+    the width to actually use). The 16 that died was ~10,222 s/worker, 11x over
+    the wall; forwarding the block does not change that, only the width does.
     """
     from zagg.sweep import discover_leaves, run_sweep
 
