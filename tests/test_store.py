@@ -364,6 +364,50 @@ class TestBucketOwnerAcl:
         assert options == {"default_headers": {"x-custom": "1"}}
 
 
+class TestAclWriteObjectStoreEquality:
+    """Issue #522: the twin-bearing store must not be substitutable by equality.
+
+    The inherited ``ObjectStore.__eq__`` looks only at ``read_only`` and
+    ``self.store``, which is the CLEAN handle both kinds can hold -- so without
+    an override a plain store compares equal to this one and an
+    equality-keyed dedupe/cache can drop the ACL twin with no error and no log.
+    """
+
+    CREDS = TestBucketOwnerAcl.CREDS
+
+    def _store(self):
+        # Unmocked: real obstore handles, construction only, no network.
+        from zagg.store import _AclWriteObjectStore, _open_s3_store
+
+        zstore = _open_s3_store("s3://external/foo.zarr", credentials=self.CREDS)
+        assert isinstance(zstore, _AclWriteObjectStore)
+        return zstore
+
+    def test_a_plain_store_over_the_clean_handle_is_not_equal(self):
+        import zarr.storage
+
+        zstore = self._store()
+        plain = zarr.storage.ObjectStore(zstore.store)
+        assert zstore != plain
+        assert plain != zstore  # reflected: the subclass override runs first
+
+    def test_it_still_equals_itself_and_its_read_only_view(self):
+        zstore = self._store()
+        assert zstore == zstore
+        assert zstore == zstore.with_read_only(False)
+        assert zstore != zstore.with_read_only(True)
+
+    def test_an_in_account_store_is_a_plain_object_store(self):
+        # No twin, no subclass, and the inherited equality is untouched.
+        import zarr.storage
+
+        from zagg.store import _AclWriteObjectStore, _open_s3_store
+
+        zstore = _open_s3_store("s3://our-bucket/foo.zarr", skip_signature=True)
+        assert not isinstance(zstore, _AclWriteObjectStore)
+        assert zstore == zarr.storage.ObjectStore(zstore.store)
+
+
 class TestPutObjectRouting:
     """Issue #522: object-creating requests, and only those, take the ACL twin."""
 

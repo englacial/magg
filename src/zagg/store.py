@@ -339,6 +339,21 @@ class _AclWriteObjectStore(ObjectStore):
         # docstring inherited
         return type(self)(self.store, self._acl_writer.store, read_only=read_only)
 
+    def __eq__(self, other: object) -> bool:
+        # The inherited __eq__ compares only ``read_only`` and ``self.store``
+        # -- and ``self.store`` is the CLEAN handle, which a plain ObjectStore
+        # can hold too. So a plain store compares equal to this one while
+        # writing owner-less objects, and any dedupe/cache/normalization keyed
+        # on equality (zarr's StorePath, a future "we already hold this store"
+        # check) can swap the twin away with no error and no log -- the silent
+        # shape, not the 403 shape. The two are not interchangeable, so both
+        # handles have to match (issue #522).
+        return (
+            isinstance(other, _AclWriteObjectStore)
+            and super().__eq__(other)
+            and self._acl_writer.store == other._acl_writer.store
+        )
+
     async def set(self, key, value):
         # docstring inherited
         self._check_writable()
