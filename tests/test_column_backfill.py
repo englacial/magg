@@ -445,6 +445,13 @@ class TestBackfill:
         )
         assert "h_tdigest" not in dict(column.arrays())
 
+    def test_an_unstamped_leaf_or_column_is_not_current(self, tmp_path, monkeypatch):
+        """`read_commit` returns None for D4 debris — a verdict, never a crash."""
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        for absent in ({"leaf_stamp": None}, {"column_stamp": None}, {"leaf_stamp": "junk"}):
+            assert _verdict(off, SHARDS[0], **absent) == (False, "absent-or-unstamped"), absent
+
     def test_an_added_companion_channel_is_not_current(self, tmp_path, monkeypatch):
         """The retrofit the recorded provenance cannot see (ruling 4 on issue #410)."""
         from zagg.column import _column_provenance

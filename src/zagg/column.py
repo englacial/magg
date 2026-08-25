@@ -1002,7 +1002,7 @@ def stored_column_structure(group) -> dict:
 
 
 def column_is_current(
-    leaf_stamp: dict,
+    leaf_stamp,
     column_stamp,
     column_attrs,
     structure,
@@ -1018,7 +1018,11 @@ def column_is_current(
     read off the artifacts, since a column records no ``generation`` block of
     its own — it has exactly one source, its leaf). Five terms, in cost order:
 
-    1. **Committed** — no stamp is absent-or-torn debris, never current.
+    1. **Committed** — neither stamp may be missing. An unstamped COLUMN is
+       an interrupted writer's prefix; an unstamped LEAF is D4 debris whose
+       column can be current only by accident. ``hive.read_commit`` returns
+       ``None`` for both, so both are taken by value and neither is
+       dereferenced before the guard (review finding, issue #520).
     2. **Declaration** — the recorded ``zagg_column`` block's node/cell orders,
        group set, and per-field provenance (:func:`_column_provenance`, which
        carries the fold law, the digest budget and the §3.3 linkage) must be
@@ -1058,7 +1062,7 @@ def column_is_current(
     to the backfill; see the module docstring) — and ``force=True`` on the
     backfill is the unconditional rewrite.
     """
-    if not isinstance(column_stamp, dict):
+    if not isinstance(leaf_stamp, dict) or not isinstance(column_stamp, dict):
         return False, "absent-or-unstamped"
     block = column_attrs if isinstance(column_attrs, dict) else {}
     expected = {
