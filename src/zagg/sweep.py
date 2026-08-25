@@ -1359,7 +1359,21 @@ def main(argv=None) -> int:
         "(issue #358), print the summary, and exit — declaration-only: no sweep "
         "pass runs in the same invocation (--families and --partitions are ignored)",
     )
+    parser.add_argument(
+        "--overviews",
+        default=None,
+        metavar="RESOLUTIONS",
+        help="With --declare-pyramid: declare the zagg-pyramid/2 grammar outright, as a "
+        "comma-separated list of leaf cell resolutions finest-first (issue #520). The "
+        "grid-less retrofit path otherwise falls back to /1, which a store being upgraded "
+        "to /2 must not get. Validated against the manifest's own shard/cell orders",
+    )
     args = parser.parse_args(argv)
+    if args.overviews is not None and args.declare_pyramid is None:
+        # --overviews rides the declaration, and a sweep pass would silently
+        # ignore it — refuse rather than run something the operator did not ask
+        # for (the --declare-pyramid precedent two lines down).
+        parser.error("--overviews only applies to --declare-pyramid")
     # Validate the fan-out width from argv alone, BEFORE anything touches the
     # store: discover_leaves is a LIST plus a parquet read per run record, and
     # a mistyped width should not cost that (review finding, issue #377).
@@ -1383,8 +1397,14 @@ def main(argv=None) -> int:
         from zagg.config import load_config
         from zagg.sweep_overview import declare_pyramid
 
+        resolutions = None
+        if args.overviews is not None:
+            resolutions = [int(r) for r in args.overviews.split(",") if r.strip()]
         summary = declare_pyramid(
-            args.store_root, load_config(args.declare_pyramid), store_kwargs=store_kwargs
+            args.store_root,
+            load_config(args.declare_pyramid),
+            overviews=resolutions,
+            store_kwargs=store_kwargs,
         )
         print(json.dumps(summary, indent=2))
         return 0

@@ -173,10 +173,13 @@ places the panel.
    Then find the densest shard to pin:
 
    ```python
-   import json, sys; sys.path.insert(0, ".github/scripts")
+   import json, sys
+
+   sys.path.insert(0, ".github/scripts")
    import bench_metrics
+
    sm = json.load(open("tests/data/benchmark/shardmaps/sm_<grid>.json"))
-   print(bench_metrics.select_densest_shard(sm))   # -> (shard_key, n_granules)
+   print(bench_metrics.select_densest_shard(sm))  # -> (shard_key, n_granules)
    ```
 
    > **Re-pinning a map that already exists** is one command:

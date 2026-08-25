@@ -528,3 +528,151 @@ class TestFamilyRegistration:
         _install_pyramid(off, _twin_block(on))
         _backfill(off)
         assert read_lease(str(off)) is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: the /2 retrofit declaration (declare_pyramid's explicit levers).
+# ---------------------------------------------------------------------------
+
+
+def _write_run_record(root, shards=SHARDS):
+    """A minimal stats parquet the listing-based discovery reads."""
+    import pandas as pd
+
+    pd.DataFrame(
+        {
+            "shard_key": pd.array([morton_word(d) for d in shards], dtype="UInt64"),
+            "success": [True] * len(shards),
+            "window": [None] * len(shards),
+        }
+    ).to_parquet(root / "stats_20260825T000000Z_test.parquet", engine="fastparquet")
+
+
+def _declare(root, cfg, **kwargs):
+    from zagg.sweep_overview import declare_pyramid
+
+    return declare_pyramid(str(root), cfg, **kwargs)
+
+
+class TestRetrofitDeclaration:
+    def _off(self, tmp_path, monkeypatch, *, pyramid=False):
+        root = tmp_path / "off"
+        cfg, _grid = _build_store(root, monkeypatch, pyramid=pyramid, shards=SHARDS[:2])
+        _write_run_record(root, SHARDS[:2])
+        return root, cfg
+
+    def test_overviews_declares_v2_on_a_pyramid_off_store(self, tmp_path, monkeypatch):
+        from zagg.hive import read_manifest
+        from zagg.pyramid import PYRAMID_SPEC_V2, expand_overviews
+
+        root, cfg = self._off(tmp_path, monkeypatch)
+        assert read_manifest(str(root))["pyramid"]["spec"] != PYRAMID_SPEC_V2
+        summary = _declare(root, cfg, overviews=5)
+        assert summary["declared_via"] == "overviews=[5]"
+        assert summary["updated"] and summary["previous"] == "replaced"
+        assert "orders" not in summary
+        block = read_manifest(str(root))["pyramid"]
+        assert block["spec"] == PYRAMID_SPEC_V2
+        assert block["overviews"] == expand_overviews([5], parent_order=4)
+        assert set(block["overview"]["fields"]) == {"count", "h_tdigest"}
+
+    def test_the_declaration_makes_the_store_backfillable(self, tmp_path, monkeypatch):
+        from zagg.column import manifest_column_plan
+        from zagg.hive import read_manifest
+
+        root, cfg = self._off(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="RE-DECLARE FIRST"):
+            manifest_column_plan(read_manifest(str(root)))
+        _declare(root, cfg, overviews=5)
+        plan = manifest_column_plan(read_manifest(str(root)))
+        assert plan.resolutions == [5, 4] and set(plan.fields) == {"count", "h_tdigest"}
+
+    def test_overviews_is_validated_against_the_manifest_orders(self, tmp_path, monkeypatch):
+        root, cfg = self._off(tmp_path, monkeypatch)
+        for bad in (4, 6, 9):
+            with pytest.raises(ValueError, match="strictly between"):
+                _declare(root, cfg, overviews=bad)
+
+    def test_overviews_overrides_pyramid_false_loudly(self, tmp_path, monkeypatch, caplog):
+        root, cfg = self._off(tmp_path, monkeypatch)
+        with caplog.at_level("WARNING"):
+            _declare(root, cfg, overviews=5)
+        assert "OVERRIDES" in caplog.text
+
+    def test_chunk_order_fires_the_default_flip(self, tmp_path, monkeypatch):
+        from zagg.hive import read_manifest
+        from zagg.pyramid import PYRAMID_SPEC_V2
+
+        # A config with a pyramid knob that spells NO schedule: the shape the
+        # #384 flip completes, and the one the grid-less retrofit cannot.
+        root, cfg = self._off(tmp_path, monkeypatch, pyramid={})
+        summary = _declare(root, cfg, chunk_order=5)
+        assert summary["declared_via"] == "chunk_order=5"
+        block = read_manifest(str(root))["pyramid"]
+        assert block["spec"] == PYRAMID_SPEC_V2
+        assert block["overviews"][0] == {"node": 4, "cells": [5]}
+
+    def test_chunk_order_is_validated_against_the_manifest_orders(self, tmp_path, monkeypatch):
+        root, cfg = self._off(tmp_path, monkeypatch, pyramid={})
+        for bad in (4, 6, 9):
+            with pytest.raises(ValueError, match="not strictly between"):
+                _declare(root, cfg, chunk_order=bad)
+
+    def test_chunk_order_refuses_a_declared_off_config(self, tmp_path, monkeypatch):
+        root, cfg = self._off(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="no pyramid to default"):
+            _declare(root, cfg, chunk_order=5)
+
+    def test_chunk_order_refuses_a_spelled_schedule(self, tmp_path, monkeypatch):
+        root, cfg = self._off(tmp_path, monkeypatch, pyramid={"orders": [3, 2]})
+        with pytest.raises(ValueError, match="is inert"):
+            _declare(root, cfg, chunk_order=5)
+
+    def test_both_levers_refuse(self, tmp_path, monkeypatch):
+        root, cfg = self._off(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="not both"):
+            _declare(root, cfg, overviews=5, chunk_order=5)
+
+    def test_no_lever_keeps_todays_behaviour(self, tmp_path, monkeypatch):
+        root, cfg = self._off(tmp_path, monkeypatch, pyramid={"orders": [3, 2]})
+        summary = _declare(root, cfg)
+        assert summary["declared_via"] == "config"
+        assert summary["orders"] == [3, 2] and "overviews" not in summary
+
+    def test_nothing_is_written_when_a_lever_refuses(self, tmp_path, monkeypatch):
+        from zagg.hive import read_manifest
+
+        root, cfg = self._off(tmp_path, monkeypatch)
+        before = read_manifest(str(root))
+        with pytest.raises(ValueError):
+            _declare(root, cfg, overviews=6)
+        assert read_manifest(str(root)) == before
+
+    def test_cli_overviews_requires_declare_pyramid(self):
+        from zagg.sweep import main
+
+        with pytest.raises(SystemExit) as e:
+            main(["/nonexistent", "--overviews", "5"])
+        assert e.value.code == 2
+
+    def test_cli_declares_v2(self, tmp_path, monkeypatch, capsys):
+        import yaml
+
+        from zagg.hive import read_manifest
+        from zagg.pyramid import PYRAMID_SPEC_V2
+        from zagg.sweep import main
+
+        root, cfg = self._off(tmp_path, monkeypatch)
+        config_yaml = tmp_path / "retrofit.yaml"
+        config_yaml.write_text(
+            yaml.safe_dump(
+                {
+                    "data_source": cfg.data_source,
+                    "aggregation": cfg.aggregation,
+                    "output": {**cfg.output, "pyramid": False},
+                }
+            )
+        )
+        assert main([str(root), "--declare-pyramid", str(config_yaml), "--overviews", "5"]) == 0
+        assert json.loads(capsys.readouterr().out)["declared_via"] == "overviews=[5]"
+        assert read_manifest(str(root))["pyramid"]["spec"] == PYRAMID_SPEC_V2
