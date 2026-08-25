@@ -34,7 +34,14 @@ from zagg.store import open_store
 GENERATOR = pathlib.Path(__file__).parent.parent / "tools" / "generate_spec_fixtures.py"
 
 #: Four leaves under one order-4 shard tree, spread over two base cells so the
-#: ladder above them has something to k-way merge rather than relay.
+#: ladder above them has something to k-way merge rather than relay — which is
+#: what phase 4 needs. They are NOT four independent parity witnesses:
+#: ``_build_cells`` re-seeds ``default_rng(340)`` on every call and its plan is
+#: shard-independent, so in the ``kitchen_sink=False`` arm — whose declared
+#: fields are functions of ``h`` alone — all four leaves fold to identical
+#: bytes and differ only in the ``morton`` words ``write_column`` regenerates
+#: from ``shard_key`` rather than folds. The ``kitchen_sink=True`` arm does
+#: vary, through ``_point_words`` in the ``_locations`` channel.
 SHARDS = ("11213", "11214", "11223", "21213")
 
 
@@ -319,6 +326,45 @@ class TestStoredLeafParity:
                 cell_order=plan.cell_order,
                 resolutions=plan.resolutions,
             )
+
+    def test_an_absent_declared_field_folds_as_the_staged_fill(self, tmp_path, monkeypatch):
+        """The retrofit's own arm, FOLDED — a slab assertion pins only half of it."""
+        from zagg.column import fold_column, leaf_slabs, stored_leaf_slabs
+        from zagg.hive import shard_leaf_path
+
+        root = tmp_path / "on"
+        _build_store(root, monkeypatch, shards=SHARDS[:1])
+        plan = _plan(root)
+        n_cells = 4 ** (plan.cell_order - plan.node_order)
+        fields = {
+            **plan.fields,
+            "later": {"class": "exact", "method": "sum", "dtype": "int32", "fill_value": 0},
+        }
+        leaf = shard_leaf_path(str(root), morton_word(SHARDS[0]))
+        stored = stored_leaf_slabs(leaf, fields, cell_order=plan.cell_order, n_cells=n_cells)
+        # The staged sink's answer to the same declaration, over a sink that
+        # never heard of the field — the build-time half of the same claim.
+        staged = leaf_slabs(
+            {f"{plan.cell_order}/{n}": v for n, v in stored.items() if n != "later"},
+            fields,
+            group_path=str(plan.cell_order),
+            n_cells=n_cells,
+        )
+        a, b = (
+            fold_column(m, fields, cell_order=plan.cell_order, resolutions=plan.resolutions)
+            for m in (stored, staged)
+        )
+        assert set(a) == set(b)
+        for res in a:
+            assert set(a[res]) == set(b[res]) and "later" in a[res]
+            for name, x in a[res].items():
+                y = b[res][name]
+                if x.dtype == object:
+                    assert [bytes(p or b"") for p in x] == [bytes(p or b"") for p in y], name
+                else:
+                    assert np.array_equal(x, y, equal_nan=x.dtype.kind == "f"), name
+            # A field nothing ever wrote folds to its declared fill, everywhere.
+            assert a[res]["later"].tolist() == [0] * 4 ** (res - plan.node_order)
 
     def test_mismatched_weights_declaration_refuses(self, tmp_path, monkeypatch):
         from zagg.column import stored_leaf_slabs
