@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- published-bucket store handles no longer 403 on reads: the canned ACL rides a
+  separate write handle (#522) ([#523](https://github.com/englacial/zagg/pull/523))
+  - The `x-amz-acl: bucket-owner-full-control` header that issue #495 attached
+    to Source Cooperative handles rode obstore's `client_options.default_headers`,
+    and obstore signs default headers on object-creating and per-key requests but
+    not on `ListObjectsV2`. S3 rejects an unsigned `x-amz-acl` outright, so every
+    handle that both published and listed died on its first LIST — the per-leaf
+    template guard and the client status poller included, which blocked all
+    source.coop fleet builds and sweeps.
+  - `zagg.store` now opens two handles for such a target: the one callers hold is
+    clean, and an ACL-bearing twin takes the object-creating requests.
+    `open_store` returns a Zarr store that routes its own writes; raw-obstore
+    writes go through the new `zagg.store.put_object`. Ownership semantics are
+    unchanged — every write still carries `bucket-owner-full-control`, signed.
+  - Reads through `open_object_store` with explicit credentials (the issue #223
+    consumer-input channel, e.g. `temporal.open_dataset`'s NetCDF branch) now
+    send no ACL header at all rather than an inert one.
+
 - rename parent_morton event field to shard_key (#24) ([#42](https://github.com/englacial/zagg/pull/42)) by @espg
 - Concurrency-aware Lambda orchestrator: pre-flight probe + FD-exhaustion guard ([#41](https://github.com/englacial/zagg/pull/41)) by @espg
 - drop shapely as an intersection backend (#36) ([#39](https://github.com/englacial/zagg/pull/39)) by @espg
