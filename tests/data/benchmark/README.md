@@ -262,9 +262,14 @@ NEON tdigest configs and temporal window; only the AOI override differs.
   deterministic, offline guard on the shardmap build + pin). Regenerate the
   snapshot only to deliberately re-pin.
 - **Run on demand** via explicit `--target` (they are provisional so a red
-  stress run never fails the every-merge matrix): OOM/timeout at 2 GB / 900 s
-  is the *expected* baseline result until the issue #148 streaming/cached-read
-  work lands.
+  stress run never fails the every-merge matrix). OOM/timeout at 2 GB / 900 s
+  was the expected baseline result for these two targets, and it still is —
+  they predate the streaming work and dispatch the *hierarchical* and *cached*
+  read paths on the base worker. The streaming half of issue #148 has since
+  landed (spill on a `-disk` worker is now the shipped per-merge
+  configuration), so the current polar picture is the **latitude sweep** below,
+  not these two rows: as of 0.36.0 memory is no longer the wall anywhere —
+  read is.
 
 ## The 88°S latitude sweep (issue #148 reassessment)
 
