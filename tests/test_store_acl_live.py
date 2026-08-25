@@ -181,7 +181,16 @@ class TestFixedSeamAgainstRealS3:
         store = open_object_store(published_live)
         # The handle really is treated as external -- otherwise this test would
         # pass by never having an ACL in play at all.
-        assert acl_write_store(store) is not store
+        twin = acl_write_store(store)
+        assert twin is not store
+        # ...and the twin really carries the header, which "a twin exists" does
+        # not say. Construction only: against an IN-ACCOUNT bucket S3 cannot
+        # confirm it from the other side, because a same-account
+        # ``bucket-owner-full-control`` grant is indistinguishable from the
+        # default owner grant in ``GetObjectAcl``. Bytes because obstore
+        # normalizes header values (``tests/test_store.py`` pins the same form).
+        assert twin.client_options["default_headers"]["x-amz-acl"] == b"bucket-owner-full-control"
+        assert store.client_options is None
 
         put_object(store, "probe.txt", b"issue 522 fixed seam")
         keys = [entry["path"] for batch in obstore.list(store) for entry in batch]
