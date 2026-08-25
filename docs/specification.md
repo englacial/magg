@@ -1298,13 +1298,27 @@ guessed at.
   the stamp, fail-open: absence reads unverifiable, never tampered.
 - **Failure identity.** A column-write failure fails the worker unit; the
   retry rewrites leaf and column wholesale. A committed leaf whose column
-  is absent or unstamped therefore reads as **either** a torn worker
-  **or** a leaf whose writing declaration carried no column (the gate and
-  the clear above) — and the manifest cannot always separate the two,
-  since its `pyramid` block MAY lag. Readers never require a column, so
-  absence is never an error state; where the **writing** declaration is
-  known to carry leaf-node levels, absence is the torn-worker signature
-  and the repair is re-invoking the idempotent leaf.
+  is absent or unstamped therefore reads as **one of three** things: a torn
+  worker; a leaf whose writing declaration carried no column (the gate and
+  the clear above); or — since the backfill sanctioned above — a leaf that
+  a `/1 -> /2` upgrade pass has not reached, or failed on. The manifest
+  cannot always separate them, since its `pyramid` block MAY lag, and after
+  a re-declaration it necessarily leads the leaves. Readers never require a
+  column, so absence is never an error state; the three differ only in
+  their **repair**:
+  - where the **writing** declaration is known to carry leaf-node levels,
+    absence is the torn-worker signature and the repair is re-invoking the
+    idempotent leaf;
+  - where the leaf-node levels arrived by RE-DECLARATION — the `/1 -> /2`
+    upgrade, whose whole point is that the leaf is not rewritten — absence
+    is the backfill's signature instead, and the repair is re-running the
+    idempotent backfill. Re-invoking the leaf would re-aggregate from
+    source granules, the one cost the upgrade exists to avoid;
+  - and a leaf that predates any column declaration needs no repair at all.
+
+  A backfill counts a leaf it cannot read or fold and carries on, so a
+  partially-completed pass leaves exactly this state on the store; what
+  distinguishes it is the pass's own summary (`failed`), not the artifacts.
 
 **Stage columns (issue #384).** The staged sweep writes the SAME artifact
 shape at its dispatch nodes (`{window}.pyramid.zarr` under an ancestor
