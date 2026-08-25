@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
 - published-bucket store handles no longer 403 on reads: the canned ACL rides a
   separate write handle (#522) ([#523](https://github.com/englacial/zagg/pull/523))
   - The `x-amz-acl: bucket-owner-full-control` header that issue #495 attached
