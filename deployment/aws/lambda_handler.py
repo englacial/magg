@@ -621,10 +621,15 @@ def _probe_output_write(
     The key carries a uuid, so concurrent runs -- into different stores or the
     same one -- cannot collide on it, nor with the transport's ``run-<run_id>``
     objects. The prefix rides the same credentials, endpoint and external-target
-    canned ACL as the real writes (issue #495), so a bucket that rejects the ACL
-    fails here too. Two requests, added to the ping, for ``s3://`` stores only.
+    canned ACL as the real writes -- the PUT goes through
+    ``zagg.store.put_object``, which is what lands a request on the ACL-bearing
+    handle now that ``open_object_store`` returns the clean one (issues #495,
+    #522) -- so a bucket that rejects the ACL fails here too. Two requests,
+    added to the ping, for ``s3://`` stores only.
 
-    Coverage is ``s3:PutObject`` plus ``s3:DeleteObject``, and no more. One
+    Coverage is ``s3:PutObject`` plus ``s3:DeleteObject`` -- and, on an external
+    target, ``s3:PutObjectAcl``, since the PUT carries the canned ACL -- and no
+    more. One
     small PUT IS representative of the multipart path -- obstore's
     ``CreateMultipartUpload``/``UploadPart``/``CompleteMultipartUpload`` are all
     authorized by ``s3:PutObject``, so no multipart probe is needed -- but it
@@ -654,12 +659,15 @@ def _probe_output_write(
 
     import obstore
 
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     prefix = f"{store_path.rstrip('/')}.status"
     key = f"probe-{uuid.uuid4().hex}"
     store = open_object_store(prefix, **store_kwargs)
-    obstore.put(store, key, b"")
+    # put_object, not obstore.put: open_object_store hands back the CLEAN
+    # handle and the canned ACL rides its twin (issue #522), so a direct put
+    # here would prove a permission the real writes do not use.
+    put_object(store, key, b"")
     deleted = True
     try:
         obstore.delete(store, key)
@@ -804,14 +812,14 @@ def _write_result(result_url: str, response: Dict[str, Any], event: Dict[str, An
     as failed, and the cause lands here in CloudWatch. Returns True only when
     the write landed -- the self-recycle gate (issue #171) keys on it.
     """
-    import obstore
-
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     try:
         prefix, key = result_url.rsplit("/", 1)
         store = open_object_store(prefix, **_output_store_kwargs(event))
-        obstore.put(store, key, json.dumps(response).encode())
+        # One envelope per shard on the published bucket -- through put_object
+        # so every one of them carries the canned ACL (issue #522).
+        put_object(store, key, json.dumps(response).encode())
         logger.info(f"Wrote async result to {result_url}")
         return True
     except Exception as e:

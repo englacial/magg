@@ -158,11 +158,11 @@ names (e.g. `us-west-2.opendata.source.coop`) and custom endpoints use
 path-style addressing automatically.
 
 A write target this account does not own carries
-`x-amz-acl: bucket-owner-full-control` on every request (issue #495). S3 object
-ownership follows the *writing* account, so without that canned ACL a
-cross-account PUT under the `ObjectWriter` setting leaves objects the bucket
-owner cannot manage or delete — Source Cooperative's in-region upload path
-requires it. Two shapes qualify, and the second is the one phase 3 added:
+`x-amz-acl: bucket-owner-full-control` on the requests that **create objects**
+(issue #495). S3 object ownership follows the *writing* account, so without that
+canned ACL a cross-account PUT under the `ObjectWriter` setting leaves objects
+the bucket owner cannot manage or delete — Source Cooperative's in-region upload
+path requires it. Two shapes qualify, and the second is the one phase 3 added:
 
 - `output_credentials` **without** an `endpointUrl` — an un-negotiated target;
 - an **ambient** (execution-role) write to a bucket zagg publishes to but does
@@ -170,6 +170,34 @@ requires it. Two shapes qualify, and the second is the one phase 3 added:
   `zagg.store._PUBLISHED_BUCKETS`. Since the fleet now reaches it with the
   execution role and no injected credentials, keying the header on credentials
   alone would publish owner-less objects silently.
+
+Reads and lists carry no ACL header at all, and that split is not cosmetic
+(issue #522). obstore has no ACL config key, so the header rides as a default
+request header — and obstore puts default headers into the SigV4 signature on
+every request *except* `ListObjectsV2`. Not just the keyed ones: the bucket-level
+`POST ?delete` bulk delete signs it too
+(`tests/test_store_acl_signing.py::test_only_the_list_path_leaves_the_acl_unsigned`),
+so the list is the single miss, which is why splitting the handle is the shape
+of the fix. On a `ListObjectsV2` the header is on the wire but outside
+`SignedHeaders`, which S3 rejects outright:
+
+```
+403 AccessDenied: There were headers present in the request which were not signed
+<HeadersNotSigned>x-amz-acl</HeadersNotSigned>
+```
+
+A single handle therefore cannot both publish and list, and listing is not
+optional — the per-leaf template guard lists the digit tree and the client
+status poller lists its `.status/` channel. So `zagg.store` opens **two** handles
+for such a target: the one callers hold is clean, and an ACL-bearing twin hangs
+off it for object-creating requests. `open_store` returns a Zarr store that
+routes its own writes to the twin; raw-obstore writes go through
+`zagg.store.put_object`, which does the same. Callers do not choose: the seam is
+enforced by test, and a direct call to an object-creating obstore API — `put`,
+`put_async`, `open_writer`, `copy` or `rename` — anywhere under `src/zagg` or in
+`deployment/aws/*.py` fails the suite. The guard parses the AST rather than
+grepping, so aliasing the import (`import obstore as obs`, `from obstore import
+put`) does not get past it.
 
 It is derived, not configured: there is no ACL knob to set. Writes to buckets we
 *do* own — the output bucket, `sliderule-public-cors` — still send no header;

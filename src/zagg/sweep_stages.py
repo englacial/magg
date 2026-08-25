@@ -324,7 +324,6 @@ def run_finisher(
     Failures in steps 1-2 RAISE (the orchestrator records the incomplete
     finish and leaves the lease for recovery); step 3 is fail-open telemetry.
     """
-    import obstore
 
     from zagg.grids.morton import morton_word
     from zagg.hive import (
@@ -336,7 +335,7 @@ def run_finisher(
         write_root_coverage,
     )
     from zagg.lifecycle import touch_unit_footprint
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     store_kwargs = dict(store_kwargs or {})
     out = {
@@ -377,7 +376,7 @@ def run_finisher(
             entry["actuals"] = actuals
             changed = True
     if changed or level_actuals:
-        obstore.put(
+        put_object(
             open_object_store(store_root, **store_kwargs),
             MANIFEST_NAME,
             json.dumps(fresh, indent=1).encode(),
@@ -594,15 +593,13 @@ def _write_stage_record(store_root: str, summary: dict, store_kwargs: dict) -> s
     """
     from datetime import datetime, timezone
 
-    import obstore
-
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
     from zagg.sweep import SWEEP_SPEC
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     key = f"sweep_stats_{ts}_stages.json"
     try:
-        obstore.put(
+        put_object(
             open_object_store(store_root, **store_kwargs),
             key,
             json.dumps({"spec": SWEEP_SPEC, "mode": "stages", **summary}, indent=1).encode(),

@@ -1260,9 +1260,9 @@ def stage_node(
                 "windows": entries,
             }
             if fresh != envelope:
-                import obstore
+                from zagg.store import put_object
 
-                obstore.put(
+                put_object(
                     store,
                     f"{_node_rel(target)}/{ENVELOPE_NAME}",
                     json.dumps(fresh, indent=1).encode(),

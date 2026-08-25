@@ -6,7 +6,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from zarr.abc.store import Store
-from zarr.storage import LocalStore
+from zarr.storage import LocalStore, ObjectStore
 
 # S3 retry pacing (issue #186). obstore's default policy retries 5xx/connection
 # errors up to 10 times with jittered exponential backoff from 100 ms — under a
@@ -67,25 +67,47 @@ _S3_READONLY_RETRY_CONFIG = {
 # target's configuration.
 #
 # obstore exposes no ACL config key (``aws_acl``/``acl``/``x-amz-acl`` all raise
-# ``UnknownConfigurationKeyError``), so it rides as a default request header --
-# verified end-to-end against a real ACL-enabled bucket, and traced per-request
-# against a local endpoint. obstore applies ``default_headers`` on the reqwest
-# client, i.e. AFTER object_store signs, so the header rides OUTSIDE the
-# signature: ``x-amz-acl`` never appears in ``SignedHeaders``, and AWS accepts it
-# because S3 ignores unsigned non-required ``x-amz-*`` on header-auth requests --
-# it would NOT survive a presigned-URL path, which rejects unsigned ``x-amz-*``.
-# The header rides ``CreateMultipartUpload`` (``POST ?uploads``) as well as a
-# single-shot ``PUT``, and that is the load-bearing half: the create request is
-# what sets a multipart object's ACL (``UploadPart``/``CompleteMultipartUpload``
-# ignore it), and at ~131 MB/shard multipart is the normal write path. S3
-# interprets ``x-amz-acl`` only on object-creating requests, so a GET/LIST issued
-# by the same store carries the header inertly. That inertness is what makes the
-# one route that cannot tell reads from writes safe: ``open_object_store`` has no
-# read-only concept, so its credentialed callers -- including
-# ``temporal.open_dataset``'s NetCDF branch, a pure GET of a consumer INPUT
-# bucket (issue #223) -- still send the header. ``open_store(read_only=True)``
-# does not: it knows, so it is gated (see ``_s3_object_store``).
+# ``UnknownConfigurationKeyError``) and no per-request one either -- an
+# ``x-amz-acl`` passed through ``put(attributes=...)`` is not recognised, so it
+# lands as USER METADATA (``x-amz-meta-x-amz-acl``) and sets no ACL at all. The
+# header therefore rides as an obstore ``default_headers`` entry. It reaches the
+# wire on every request the handle makes, but it only reaches the SIGNATURE on
+# some of them, and issue #522 is that difference:
+#
+# * every request EXCEPT ``ListObjectsV2`` carries ``x-amz-acl`` inside
+#   ``SignedHeaders`` -- the keyed ones (``PUT``, ``CreateMultipartUpload``,
+#   ``GET``, ``HEAD``) and the bucket-level ``POST ?delete`` bulk delete alike;
+# * ``ListObjectsV2`` picks the default headers up after object_store has
+#   signed, so the header is present-but-unsigned.
+#
+# S3 rejects the second shape outright -- ``403 AccessDenied``, "There were
+# headers present in the request which were not signed",
+# ``<HeadersNotSigned>x-amz-acl</HeadersNotSigned>`` -- so a handle that carries
+# the ACL cannot list. That is not a corner: the per-leaf template guard lists
+# the digit tree and the status poller lists its channel, which is how 2,726/2,726
+# fleet workers died on the first source.coop build. The signed half is
+# load-bearing and must not be given up: ``CreateMultipartUpload`` is what sets a
+# multipart object's ACL (``UploadPart``/``CompleteMultipartUpload`` ignore it),
+# and at ~131 MB/shard multipart is the normal write path.
+#
+# So the header rides a SEPARATE handle from the one that reads (issue #522):
+# :func:`_s3_object_store` returns a clean store and hangs an ACL-bearing twin
+# off it (:data:`_ACL_WRITE_STORE_ATTR`), and object-creating requests -- and
+# only those -- are routed to the twin by :func:`put_object` and
+# :class:`_AclWriteObjectStore`. Reads and lists never see an ACL header, which
+# also retires the old inert-header exception: ``open_object_store`` has no
+# read-only concept, so ``temporal.open_dataset``'s NetCDF branch (a pure GET of
+# a consumer INPUT bucket, issue #223) used to send the header and now does not.
+# The asymmetry above is pinned by ``tests/test_store_acl_signing.py`` against
+# captured wire bytes, so an obstore change to it fails there rather than in a
+# fleet run.
 _BUCKET_OWNER_ACL = "bucket-owner-full-control"
+
+# Where the ACL-bearing twin hangs off the clean handle. An attribute rather
+# than a registry so the pairing travels with the store -- including through
+# ``pickle``, which zarr's ``ObjectStore`` uses to ship a store to a worker
+# process, and which preserves an obstore store's Python attributes.
+_ACL_WRITE_STORE_ATTR = "_zagg_acl_write_store"
 
 # Buckets this account writes to but does not OWN, reached with the ambient
 # execution role (issue #495). Since phase 3 the fleet publishes to Source
@@ -159,14 +181,21 @@ def open_store(
     Notes
     -----
     A write target this account does not own makes the store send
-    ``x-amz-acl: bucket-owner-full-control`` on every request, so the bucket
-    owner owns what it writes (issue #495; see :data:`_BUCKET_OWNER_ACL`). Two
-    shapes qualify: explicit ``credentials`` without an ``endpoint_url``, and an
-    ambient write to a bucket in :data:`_PUBLISHED_BUCKETS` (Source Cooperative,
-    which the execution role now reaches directly). ``read_only=True``
-    suppresses it: a read opened with explicit credentials is the issue #223
-    consumer-INPUT channel (somebody else's input bucket, as
-    ``temporal.open_dataset`` opens it), not a write target of ours.
+    ``x-amz-acl: bucket-owner-full-control`` on the requests that CREATE
+    objects, so the bucket owner owns what it writes (issue #495; see
+    :data:`_BUCKET_OWNER_ACL`). Two shapes qualify: explicit ``credentials``
+    without an ``endpoint_url``, and an ambient write to a bucket in
+    :data:`_PUBLISHED_BUCKETS` (Source Cooperative, which the execution role now
+    reaches directly). ``read_only=True`` suppresses it: a read opened with
+    explicit credentials is the issue #223 consumer-INPUT channel (somebody
+    else's input bucket, as ``temporal.open_dataset`` opens it), not a write
+    target of ours.
+
+    Reads and lists never carry the header -- S3 rejects an unsigned
+    ``x-amz-acl`` on a ``ListObjectsV2``, and obstore cannot sign a default
+    header there (issue #522) -- so such a target returns a
+    :class:`_AclWriteObjectStore`, which reads through a clean handle and writes
+    through an ACL-bearing twin. Callers see an ordinary Zarr ``Store``.
 
     Returns
     -------
@@ -226,14 +255,17 @@ def open_object_store(
     hive manifests, stats sidecars, the temporal tabular object), so the
     external-target canned ACL applies here exactly as it does to
     :func:`open_store` -- both routes share :func:`_s3_object_store`, so an
-    ambient write to a published bucket carries the header here too, cached
+    ambient write to a published bucket gets the ACL handle here too, cached
     store included (the cache is keyed by path, and the path is what decides)
-    (issue #495). Known exception: this route has no ``read_only`` concept, so a
-    credentialed READER built through it sends the header too -- notably
-    ``temporal.open_dataset``'s NetCDF branch, a pure GET of a consumer-input
-    bucket (issue #223). It is inert there (S3 interprets ``x-amz-acl`` only on
-    object-creating requests); ``open_store(read_only=True)``, which can tell,
-    suppresses it.
+    (issue #495).
+
+    The store RETURNED is always the clean one, because this route has no
+    ``read_only`` concept and its reads must work (issue #522): write through
+    :func:`put_object`, which routes to the ACL twin, and read through the
+    returned store directly. That also settles the old exception -- a
+    credentialed READER built here, notably ``temporal.open_dataset``'s NetCDF
+    branch (a pure GET of a consumer-input bucket, issue #223), now sends no ACL
+    header at all rather than an inert one.
     """
     if path.startswith("s3://"):
         if credentials is None and endpoint_url is None and not kwargs:
@@ -272,21 +304,70 @@ def _open_s3_store(
     path-style addressing is enabled (so dotted bucket names and
     S3-compatible endpoints work over TLS).
     """
-    from zarr.storage import ObjectStore
-
     if read_only and kwargs.get("retry_config") is None:
         # Interactive read population: fail fast on a dead endpoint (comment
         # on the constant). Set here so _s3_object_store's write-policy
         # default doesn't kick in; an explicit caller retry_config still wins.
         kwargs["retry_config"] = _S3_READONLY_RETRY_CONFIG
-    s3 = _s3_object_store(
-        path,
-        credentials=credentials,
-        endpoint_url=endpoint_url,
-        read_only=read_only,
-        **kwargs,
-    )
-    return ObjectStore(store=s3, read_only=read_only)
+    s3, acl_s3 = _s3_store_pair(path, credentials, endpoint_url, read_only, kwargs)
+    if acl_s3 is None:
+        return ObjectStore(store=s3, read_only=read_only)
+    setattr(s3, _ACL_WRITE_STORE_ATTR, acl_s3)
+    return _AclWriteObjectStore(s3, acl_s3, read_only=read_only)
+
+
+class _AclWriteObjectStore(ObjectStore):
+    """Zarr store whose writes carry the canned ACL and whose reads do not.
+
+    zarr's obstore adapter drives every operation off a single ``self.store``,
+    and an ACL-bearing handle cannot list (issue #522), so the two roles are
+    split: ``self.store`` is the clean handle the inherited read, list and
+    delete paths use unchanged, and the object-creating methods are re-pointed
+    at a second adapter wrapping the ACL twin. Deletes stay on the clean handle
+    deliberately: an ACL means nothing on a delete, and ``delete_dir`` LISTs
+    before it deletes (``await obs.list(self.store, prefix).collect_async()``),
+    so moving the delete surface to the twin would put a ``ListObjectsV2`` back
+    on the ACL handle -- the one request that 403s. The bulk delete itself is
+    not the hazard: ``tests/test_store_acl_signing.py`` measures ``POST
+    ?delete`` signing the header fine.
+
+    Overriding the two write methods rather than reimplementing them keeps the
+    adapter's own semantics (the ``mode="create"`` conditional put, its
+    ``AlreadyExistsError`` suppression) as the single source of truth.
+    """
+
+    def __init__(self, store, acl_store, *, read_only: bool = False) -> None:
+        super().__init__(store, read_only=read_only)
+        self._acl_writer = ObjectStore(store=acl_store, read_only=read_only)
+
+    def with_read_only(self, read_only: bool = False):
+        # docstring inherited
+        return type(self)(self.store, self._acl_writer.store, read_only=read_only)
+
+    def __eq__(self, other: object) -> bool:
+        # The inherited __eq__ compares only ``read_only`` and ``self.store``
+        # -- and ``self.store`` is the CLEAN handle, which a plain ObjectStore
+        # can hold too. So a plain store compares equal to this one while
+        # writing owner-less objects, and any dedupe/cache/normalization keyed
+        # on equality (zarr's StorePath, a future "we already hold this store"
+        # check) can swap the twin away with no error and no log -- the silent
+        # shape, not the 403 shape. The two are not interchangeable, so both
+        # handles have to match (issue #522).
+        return (
+            isinstance(other, _AclWriteObjectStore)
+            and super().__eq__(other)
+            and self._acl_writer.store == other._acl_writer.store
+        )
+
+    async def set(self, key, value):
+        # docstring inherited
+        self._check_writable()
+        await self._acl_writer.set(key, value)
+
+    async def set_if_not_exists(self, key, value):
+        # docstring inherited
+        self._check_writable()
+        await self._acl_writer.set_if_not_exists(key, value)
 
 
 def _s3_object_store(
@@ -301,6 +382,24 @@ def _s3_object_store(
     ``read_only`` is consumed here, never forwarded to ``S3Store`` (obstore has
     no such option): it only gates the issue #495 canned ACL, since a read
     opened with explicit credentials is an input we do not write.
+
+    The returned store is the CLEAN handle; when the target needs the canned
+    ACL its twin is attached as :data:`_ACL_WRITE_STORE_ATTR`, and
+    :func:`put_object` is what routes an object-creating request to it
+    (issue #522).
+    """
+    store, acl_store = _s3_store_pair(path, credentials, endpoint_url, read_only, kwargs)
+    if acl_store is not None:
+        setattr(store, _ACL_WRITE_STORE_ATTR, acl_store)
+    return store
+
+
+def _s3_store_pair(path, credentials, endpoint_url, read_only, kwargs):
+    """Build ``(read_store, acl_write_store)`` for ``path``.
+
+    ``acl_write_store`` is ``None`` unless the target needs the issue #495
+    canned ACL, and ``kwargs`` is consumed (not copied) -- both callers pass
+    their own dict.
     """
     from obstore.store import S3Store
 
@@ -315,68 +414,91 @@ def _s3_object_store(
     # future mutation of one store's config must not edit a shared global.
     kwargs["retry_config"] = copy.deepcopy(kwargs["retry_config"])
 
-    if (
+    provider = None
+    if not (credentials or endpoint_url or kwargs.get("skip_signature")):
+        from obstore.auth.boto3 import Boto3CredentialProvider
+
+        # Built once and shared by both handles: its ``__init__`` eagerly walks
+        # the botocore credential chain (~300 ms), and the twin below must not
+        # pay it a second time (issue #287).
+        provider = Boto3CredentialProvider()
+
+    def build(client_options):
+        opts = dict(kwargs)
+        # ...and re-copy the one nested value, because ``dict()`` is shallow:
+        # without this both handles hold the SAME retry_config object, which
+        # is a smaller instance of the aliasing the deepcopy above exists to
+        # prevent. Runs twice per external store open, not per request.
+        opts["retry_config"] = copy.deepcopy(opts["retry_config"])
+        if client_options is None:
+            opts.pop("client_options", None)
+        else:
+            opts["client_options"] = client_options
+        if credentials or endpoint_url:
+            named = {
+                "bucket": bucket,
+                "prefix": prefix,
+                "region": region,
+                # Path-style addressing: required for dotted bucket names (TLS)
+                # and for non-AWS S3-compatible endpoints.
+                "virtual_hosted_style_request": False,
+            }
+            if credentials:
+                named["access_key_id"] = credentials["accessKeyId"]
+                named["secret_access_key"] = credentials["secretAccessKey"]
+                if credentials.get("sessionToken"):
+                    named["session_token"] = credentials["sessionToken"]
+            if endpoint_url:
+                named["endpoint"] = endpoint_url
+            return S3Store(**named, **opts)
+        if provider is None:
+            # Anonymous read of a public bucket: no credential provider —
+            # Boto3CredentialProvider raises without ambient AWS credentials,
+            # which anonymous environments (e.g. binder) lack by definition.
+            # Addressing style is deliberately left to obstore's default, exactly
+            # matching the construction the example notebooks used directly
+            # (unlike the credentialed branch, which pins path-style above).
+            return S3Store(bucket, prefix=prefix, region=region, **opts)
+        return S3Store(
+            bucket,
+            prefix=prefix,
+            region=region,
+            credential_provider=provider,
+            **opts,
+        )
+
+    if not (
         _external_target(credentials, endpoint_url, bucket)
         and not read_only
         and not kwargs.get("skip_signature")
     ):
-        # A WRITE target this account does not own (issue #495), reached either
-        # way: injected credentials against the AWS endpoint (the ambient
-        # execution role covers every in-account store, so injected write
-        # credentials exist precisely to write somewhere else), or an ambient
-        # write to a published bucket -- which is how the fleet reaches Source
-        # Cooperative since phase 3, and is why this gate reads the BUCKET and
-        # not just the credential shape.
-        #
-        # ``read_only`` is the other shape of injected credentials -- the issue
-        # #223 consumer-INPUT channel reading somebody else's bucket -- and is
-        # excluded, as is ``skip_signature`` (an anonymous public read). A
-        # custom ``endpoint_url`` is excluded deliberately, and that exclusion
-        # covers TWO shapes: the S3-compatible stores behind that knob (R2,
-        # MinIO) do not implement canned ACLs at all, so the header would be
-        # noise at best there; and an endpoint-routed AWS target (the retired
-        # ``data.source.coop`` proxy hop was reached exactly that way) is
-        # excluded with them. Retiring that hop -- and the egress it paid -- is
-        # what this header buys, so the exclusion costs nothing under the
-        # no-egress rule.
-        kwargs["client_options"] = _with_bucket_owner_acl(kwargs.get("client_options"))
+        return build(kwargs.get("client_options")), None
 
-    if credentials or endpoint_url:
-        opts = {
-            "bucket": bucket,
-            "prefix": prefix,
-            "region": region,
-            # Path-style addressing: required for dotted bucket names (TLS) and
-            # for non-AWS S3-compatible endpoints.
-            "virtual_hosted_style_request": False,
-        }
-        if credentials:
-            opts["access_key_id"] = credentials["accessKeyId"]
-            opts["secret_access_key"] = credentials["secretAccessKey"]
-            if credentials.get("sessionToken"):
-                opts["session_token"] = credentials["sessionToken"]
-        if endpoint_url:
-            opts["endpoint"] = endpoint_url
-        s3 = S3Store(**opts, **kwargs)
-    elif kwargs.get("skip_signature"):
-        # Anonymous read of a public bucket: no credential provider —
-        # Boto3CredentialProvider raises without ambient AWS credentials,
-        # which anonymous environments (e.g. binder) lack by definition.
-        # Addressing style is deliberately left to obstore's default, exactly
-        # matching the construction the example notebooks used directly
-        # (unlike the credentialed branch, which pins path-style above).
-        s3 = S3Store(bucket, prefix=prefix, region=region, **kwargs)
-    else:
-        from obstore.auth.boto3 import Boto3CredentialProvider
-
-        s3 = S3Store(
-            bucket,
-            prefix=prefix,
-            region=region,
-            credential_provider=Boto3CredentialProvider(),
-            **kwargs,
-        )
-    return s3
+    # A WRITE target this account does not own (issue #495), reached either
+    # way: injected credentials against the AWS endpoint (the ambient
+    # execution role covers every in-account store, so injected write
+    # credentials exist precisely to write somewhere else), or an ambient
+    # write to a published bucket -- which is how the fleet reaches Source
+    # Cooperative since phase 3, and is why this gate reads the BUCKET and
+    # not just the credential shape.
+    #
+    # ``read_only`` is the other shape of injected credentials -- the issue
+    # #223 consumer-INPUT channel reading somebody else's bucket -- and is
+    # excluded, as is ``skip_signature`` (an anonymous public read). A
+    # custom ``endpoint_url`` is excluded deliberately, and that exclusion
+    # covers TWO shapes: the S3-compatible stores behind that knob (R2,
+    # MinIO) do not implement canned ACLs at all, so the header would be
+    # noise at best there; and an endpoint-routed AWS target (the retired
+    # ``data.source.coop`` proxy hop was reached exactly that way) is
+    # excluded with them. Retiring that hop -- and the egress it paid -- is
+    # what this header buys, so the exclusion costs nothing under the
+    # no-egress rule.
+    #
+    # TWO handles, not one (issue #522): the returned store is clean, so its
+    # reads and lists are ordinary signed requests, and the ACL rides a twin
+    # used for object-creating requests only.
+    read_options, write_options = _acl_client_options(kwargs.get("client_options"))
+    return build(read_options), (None if write_options is None else build(write_options))
 
 
 def _with_bucket_owner_acl(client_options):
@@ -407,6 +529,64 @@ def _with_bucket_owner_acl(client_options):
     return options
 
 
+def _acl_client_options(client_options):
+    """Split ``client_options`` into a read pair and a write pair (issue #522).
+
+    The write options are exactly what issue #495 has always produced; the read
+    options are the caller's own, with any ``x-amz-acl`` removed -- because that
+    is the header S3 refuses to accept unsigned on a ``ListObjectsV2``, and the
+    handle that lists is the one that must not carry it.
+
+    Returns ``(read_options, write_options)``. ``read_options`` is ``None`` when
+    nothing is left, so an external target's READ handle is constructed
+    byte-identically to an in-account one (no ``client_options`` kwarg at all).
+    ``write_options`` is ``None`` when the merge leaves no ACL to send -- the
+    ``{"x-amz-acl": None}`` escape hatch -- in which case there is no second
+    handle to build and the read handle is the whole story.
+    """
+    read = dict(client_options or {})
+    headers = {str(k).lower(): v for k, v in (read.get("default_headers") or {}).items()}
+    headers.pop("x-amz-acl", None)
+    if headers:
+        read["default_headers"] = headers
+    else:
+        read.pop("default_headers", None)
+    write = _with_bucket_owner_acl(client_options)
+    if "x-amz-acl" not in write["default_headers"]:
+        # The escape hatch: nothing to send, so no twin -- and the read handle
+        # takes the SAME cleaned options as any other branch, which is what
+        # collapses an empty ``default_headers`` to no ``client_options`` at
+        # all rather than to ``{"default_headers": {}}``.
+        return (read or None), None
+    return (read or None), write
+
+
+def acl_write_store(store):
+    """The handle an object-creating request must use (issue #522).
+
+    The ACL-bearing twin when ``store`` has one, else ``store`` itself -- so
+    every caller can route writes through this unconditionally without knowing
+    whether its target is external.
+    """
+    return getattr(store, _ACL_WRITE_STORE_ATTR, store)
+
+
+def put_object(store, key, value, **kwargs):
+    """``obstore.put`` onto the handle that carries the canned ACL (issue #522).
+
+    Every raw-obstore write in zagg goes through here rather than calling
+    ``obstore.put`` directly -- status envelopes, hive manifests, coverage and
+    stats sidecars, sweep rollups, leases, the temporal tabular object. Reads
+    keep using the store the caller already holds, which is the clean one.
+    ``tests/test_store.py`` fails the build if a direct ``obstore.put`` is
+    reintroduced, because a missed site publishes an object Source Cooperative
+    cannot manage and says nothing about it.
+    """
+    import obstore
+
+    return obstore.put(acl_write_store(store), key, value, **kwargs)
+
+
 def parse_s3_path(path: str) -> tuple[str, str]:
     """Parse an ``s3://bucket/prefix`` path into bucket and prefix.
 
@@ -432,4 +612,4 @@ def parse_s3_path(path: str) -> tuple[str, str]:
     return bucket, prefix
 
 
-__all__ = ["open_object_store", "open_store", "parse_s3_path"]
+__all__ = ["acl_write_store", "open_object_store", "open_store", "parse_s3_path", "put_object"]
