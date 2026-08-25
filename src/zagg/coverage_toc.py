@@ -819,9 +819,8 @@ def write_cover(store_root: str, section: dict | None, *, replace: bool = False,
     """
     import json
 
-    import obstore
-
     from zagg.hive import _read_json, open_object_store
+    from zagg.store import put_object
 
     store = open_object_store(store_root, **store_kwargs)
     try:
@@ -857,7 +856,7 @@ def write_cover(store_root: str, section: dict | None, *, replace: bool = False,
             merged = dict(section)
     if merged is None:
         return None
-    obstore.put(store, COVER_NAME, json.dumps(merged, indent=1).encode())
+    put_object(store, COVER_NAME, json.dumps(merged, indent=1).encode())
     return merged
 
 

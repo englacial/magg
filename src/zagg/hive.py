@@ -58,7 +58,7 @@ import numpy as np
 import zarr
 from zarr.errors import GroupNotFoundError
 
-from zagg.store import open_object_store
+from zagg.store import open_object_store, put_object
 from zagg.windows import leaf_name, split_leaf_name, union_time_range
 
 logger = logging.getLogger(__name__)
@@ -494,13 +494,12 @@ def ensure_manifest(
     when the digit tree already has children (one delimiter-LIST); clear the
     store root first. Returns the manifest now in effect.
     """
-    import obstore
 
     store = open_object_store(store_root, **store_kwargs)
     existing = validate_manifest(store_root, manifest, overwrite=overwrite, **store_kwargs)
     if existing is not None and not overwrite:
         return existing
-    obstore.put(store, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
+    put_object(store, MANIFEST_NAME, json.dumps(manifest, indent=1).encode())
     if config is not None:
         write_semantic_core(store_root, config, **store_kwargs)
     return manifest
@@ -517,14 +516,13 @@ def write_semantic_core(store_root: str, config, **store_kwargs) -> None:
     a failed PUT must not fail the run. The D22 pyramid sweep is the intended
     owner of the rewrite once it lands; there is no regenerator today.
     """
-    import obstore
     import yaml
 
     from zagg.semantics import semantic_core
 
     try:
         payload = yaml.safe_dump(semantic_core(config), sort_keys=True)
-        obstore.put(
+        put_object(
             open_object_store(store_root, **store_kwargs),
             AGGREGATION_CORE_NAME,
             payload.encode(),
@@ -769,9 +767,8 @@ def write_coverage_sidecar(leaf_root: str, payload: bytes, **store_kwargs) -> No
     prefix the sidecar is debris like everything else, and the wholesale
     retry re-template clears it.
     """
-    import obstore
 
-    obstore.put(open_object_store(leaf_root, **store_kwargs), COVERAGE_SIDECAR, payload)
+    put_object(open_object_store(leaf_root, **store_kwargs), COVERAGE_SIDECAR, payload)
 
 
 def read_coverage_bitmap(
@@ -1079,7 +1076,6 @@ def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict
     section leaves an existing one standing. Two stores with no temporal
     channel at all still write byte-identical bytes to a pre-#480 zagg.
     """
-    import obstore
 
     store = open_object_store(store_root, **store_kwargs)
     try:
@@ -1131,7 +1127,7 @@ def write_root_coverage(store_root: str, envelope: dict, **store_kwargs) -> dict
     )
     if section is not None:
         merged[TEMPORAL_KEY] = section
-    obstore.put(store, ROOT_COVERAGE_NAME, json.dumps(merged, indent=1).encode())
+    put_object(store, ROOT_COVERAGE_NAME, json.dumps(merged, indent=1).encode())
     return merged
 
 

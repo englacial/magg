@@ -184,7 +184,7 @@ def write_tabular(
         local_fmt = None if (output_format in (None, "tabular")) else output_format
         return str(writer.write(rows, store_path, output_format=local_fmt))
 
-    import obstore
+    from zagg.store import put_object
 
     from ..store import open_object_store, parse_s3_path
 
@@ -199,5 +199,5 @@ def write_tabular(
     store = open_object_store(
         f"s3://{bucket}", credentials=credentials, endpoint_url=endpoint_url, region=region
     )
-    obstore.put(store, key, payload)
+    put_object(store, key, payload)
     return store_path

@@ -2099,7 +2099,9 @@ class TestOutputStoreAcl:
     def _s3_kwargs(handler_mod, monkeypatch, event):
         s3_cls = MagicMock(name="S3Store")
         monkeypatch.setattr("obstore.store.S3Store", s3_cls)
-        monkeypatch.setattr("zarr.storage.ObjectStore", MagicMock(name="ObjectStore"))
+        # Both zarr adapters are bound as module globals in zagg.store.
+        monkeypatch.setattr("zagg.store.ObjectStore", MagicMock(name="ObjectStore"))
+        monkeypatch.setattr("zagg.store._AclWriteObjectStore", MagicMock(name="AclObjectStore"))
         monkeypatch.setattr("obstore.auth.boto3.Boto3CredentialProvider", MagicMock())
         from zagg.store import open_store
 
@@ -2116,6 +2118,8 @@ class TestOutputStoreAcl:
                 "sessionToken": "tok",
             },
         }
+        # An external target builds two handles (issue #522); ``call_args`` is
+        # the last, which is the ACL-bearing twin the writes go through.
         kwargs = self._s3_kwargs(handler_mod, monkeypatch, event)
         assert kwargs["client_options"]["default_headers"] == {
             "x-amz-acl": "bucket-owner-full-control"

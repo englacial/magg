@@ -1,5 +1,7 @@
 """Tests for the output writer abstraction (issue #12 Phase 6)."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -214,7 +216,9 @@ class TestWriteTabular:
         def _fake_s3store(bucket, **opts):
             captured["bucket"] = bucket
             captured["opts"] = opts
-            return object()
+            # SimpleNamespace, not object(): zagg.store hangs the ACL twin off
+            # the store it builds (issue #522), which needs a __dict__.
+            return SimpleNamespace()
 
         def _fake_put(store, key, payload):
             captured["key"] = key

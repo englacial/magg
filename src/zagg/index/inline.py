@@ -588,15 +588,14 @@ def write_manifest(df: pd.DataFrame, store_path: str, granule_id: str) -> str:
     written with fastparquet (core dep, layer-safe — no pyarrow), serialized
     in memory. Returns the object key.
     """
-    import obstore
 
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     store = open_object_store(store_path)
     key = f"{granule_id}.parquet"
     buf = io.BytesIO()
     df.to_parquet(buf, engine="fastparquet", index=False)
-    obstore.put(store, key, buf.getvalue())
+    put_object(store, key, buf.getvalue())
     return key
 
 

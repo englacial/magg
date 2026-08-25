@@ -241,13 +241,12 @@ def write_dispatch_manifest(event: dict, store_kwargs: dict[str, Any]) -> None:
             **block,
             "config": event.get("config"),
         }
-        import obstore
 
-        from zagg.store import open_object_store
+        from zagg.store import open_object_store, put_object
 
         prefix = run_status_prefix(event["store_path"], block["run_id"])
         store = open_object_store(prefix, **store_kwargs)
-        obstore.put(store, MANIFEST_NAME, json.dumps(manifest).encode())
+        put_object(store, MANIFEST_NAME, json.dumps(manifest).encode())
         logger.info(f"Wrote dispatch manifest to {prefix}/{MANIFEST_NAME}")
     except Exception as e:
         logger.warning(f"dispatch manifest write failed (fail-open, issue #327): {e}")
@@ -269,12 +268,11 @@ def write_shard_status(event: dict, response: dict, store_kwargs: dict[str, Any]
         if built is None:
             return
         key, obj = built
-        import obstore
 
-        from zagg.store import open_object_store
+        from zagg.store import open_object_store, put_object
 
         prefix = run_status_prefix(event["store_path"], event["run_id"])
-        obstore.put(open_object_store(prefix, **store_kwargs), key, json.dumps(obj).encode())
+        put_object(open_object_store(prefix, **store_kwargs), key, json.dumps(obj).encode())
         logger.info(f"Wrote shard status ({obj['status']}) to {prefix}/{key}")
     except Exception as e:
         logger.warning(f"shard status write failed (fail-open, issue #327): {e}")
@@ -306,9 +304,8 @@ def write_tail_status(event: dict, store_kwargs: dict[str, Any]) -> None:
                 "handle must re-run the (idempotent) tail (issues #327/#335)"
             )
             return
-        import obstore
 
-        from zagg.store import open_object_store
+        from zagg.store import open_object_store, put_object
 
         prefix, _, key = url.rpartition("/")
         marker = {
@@ -316,7 +313,7 @@ def write_tail_status(event: dict, store_kwargs: dict[str, Any]) -> None:
             "status": "tail_done",
             "run_id": event.get("run_id"),
         }
-        obstore.put(open_object_store(prefix, **store_kwargs), key, json.dumps(marker).encode())
+        put_object(open_object_store(prefix, **store_kwargs), key, json.dumps(marker).encode())
         logger.info(f"Wrote tail status to {url}")
     except Exception as e:
         logger.warning(f"tail status write failed (fail-open, issue #327): {e}")
