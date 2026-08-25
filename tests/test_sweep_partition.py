@@ -915,7 +915,7 @@ class TestHandlerForwardsThePartitionContract:
         # -- the coarse nodes above the split, from one partition's leaves.
         refs = _store(tmp_path)
         keys = _written(monkeypatch)
-        self._handler()._handle_sweep(
+        response = self._handler()._handle_sweep(
             {
                 "mode": "sweep",
                 "store_path": str(tmp_path),
@@ -924,6 +924,10 @@ class TestHandlerForwardsThePartitionContract:
                 "families": ["stats"],
             }
         )
+        # _handle_sweep swallows every exception into a 500, so without this
+        # the key set alone would go green on an invoke that raised after the
+        # last rollup PUT (review finding, issue #527).
+        assert response["statusCode"] == 200
         assert sorted(keys) == [
             "-3/1/1/stats.rollup.json",
             "-3/1/2/stats.rollup.json",
