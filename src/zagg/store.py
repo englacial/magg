@@ -74,8 +74,9 @@ _S3_READONLY_RETRY_CONFIG = {
 # wire on every request the handle makes, but it only reaches the SIGNATURE on
 # some of them, and issue #522 is that difference:
 #
-# * object-creating and per-key requests (``PUT``, ``CreateMultipartUpload``,
-#   ``GET``, ``HEAD``) carry ``x-amz-acl`` inside ``SignedHeaders``;
+# * every request EXCEPT ``ListObjectsV2`` carries ``x-amz-acl`` inside
+#   ``SignedHeaders`` -- the keyed ones (``PUT``, ``CreateMultipartUpload``,
+#   ``GET``, ``HEAD``) and the bucket-level ``POST ?delete`` bulk delete alike;
 # * ``ListObjectsV2`` picks the default headers up after object_store has
 #   signed, so the header is present-but-unsigned.
 #
