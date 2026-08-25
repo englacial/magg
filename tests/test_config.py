@@ -3589,6 +3589,14 @@ class TestPackagedConfigsAreDispatchable:
             cfg = default_config(name)
             json.dumps(asdict(cfg), allow_nan=False)  # must not raise
 
+    def test_every_packaged_config_validates_as_shipped(self):
+        # A packaged template must pass validate_config verbatim — the class
+        # of bug this catches: a declaration whose validator demands a shape
+        # the template does not ship (e.g. `weights: flux` requires the
+        # attrs.gain provenance MAPPING, spec §2.0 / issue #424).
+        for name in self._packaged_names():
+            validate_config(default_config(name, validate=False))
+
     def test_gedi_companions_declare_the_string_form(self):
         cfg = default_config("gedi01b_waveform_healpix_hive")
         companions = [
