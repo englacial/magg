@@ -107,9 +107,16 @@ class TestForcedAclDefaultHeader:
 
     def test_list_403s_with_headers_not_signed(self, live_prefix):
         import obstore
+        import obstore.exceptions
 
+        # The concrete type, not a bare ``Exception``: a credential-chain
+        # failure, a region redirect or a bucket typo would otherwise reach the
+        # substring assertions below and fail there, pointing at the wrong
+        # thing. obstore wraps the LIST 403 as ``GenericError`` (measured
+        # offline in ``test_store_acl_signing.py``'s stand-in by answering the
+        # ListObjectsV2 with the real 403 body).
         store = _forced_acl_store(live_prefix)
-        with pytest.raises(Exception) as excinfo:  # noqa: PT011 - obstore GenericError
+        with pytest.raises(obstore.exceptions.GenericError) as excinfo:
             list(obstore.list(store))
         message = str(excinfo.value)
         # The exact shape 2,726/2,726 fleet workers died on.
