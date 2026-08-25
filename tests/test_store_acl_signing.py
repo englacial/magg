@@ -379,8 +379,10 @@ class TestPerPutAttributesCannotCarryTheAcl:
     obstore's per-request ``attributes=`` surface maps any key it does not
     recognise to S3 USER METADATA, so ``{"x-amz-acl": ...}`` arrives as
     ``x-amz-meta-x-amz-acl`` -- a metadata field, not the canned ACL. Even if
-    it did work, zarr's obstore adapter calls ``put_async(store, key, buf)``
-    with no attributes, so the zarr write path could not carry it.
+    it did work, both write seams of zarr's obstore adapter
+    (``ObjectStore.set`` and ``ObjectStore.set_if_not_exists``) call
+    ``put_async(store, key, buf)`` with no attributes, so the zarr write path
+    could not carry it.
     """
 
     def test_attributes_become_user_metadata_not_a_canned_acl(self, fake_s3):
@@ -391,13 +393,26 @@ class TestPerPutAttributesCannotCarryTheAcl:
         assert put.acl is None
         assert put.headers["x-amz-meta-x-amz-acl"] == ACL
 
-    def test_zarr_adapter_put_carries_no_attributes(self):
+    @pytest.mark.parametrize("method", ["set", "set_if_not_exists"])
+    def test_zarr_adapter_writes_carry_no_attributes(self, method):
         # The trap issue #495 hit and the reason direction (b) is closed at the
-        # zarr seam too: the adapter's write is a bare three-argument put.
+        # zarr seam too: BOTH adapter writes are bare three-argument puts.
+        # Checked structurally, on the call's own arguments, rather than by
+        # matching zarr's current formatting of the line -- an upstream reflow
+        # must not read here as "the issue #522 fix regressed".
+        import ast
         import inspect
+        import textwrap
 
         import zarr.storage._obstore as adapter
 
-        source = inspect.getsource(adapter.ObjectStore.set)
-        assert "attributes" not in source
-        assert "put_async(self.store, key, buf)" in source
+        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(adapter.ObjectStore, method))))
+        (put,) = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"put", "put_async"}
+        ]
+        assert len(put.args) == 3  # (store, key, buf)
+        assert "attributes" not in {keyword.arg for keyword in put.keywords}
