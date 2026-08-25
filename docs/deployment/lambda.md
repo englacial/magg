@@ -188,8 +188,12 @@ status poller lists its `.status/` channel. So `zagg.store` opens **two** handle
 for such a target: the one callers hold is clean, and an ACL-bearing twin hangs
 off it for object-creating requests. `open_store` returns a Zarr store that
 routes its own writes to the twin; raw-obstore writes go through
-`zagg.store.put_object`, which does the same. Callers do not choose, and a
-direct `obstore.put` in `src/zagg` fails the test suite.
+`zagg.store.put_object`, which does the same. Callers do not choose: the seam is
+enforced by test, and a direct call to an object-creating obstore API — `put`,
+`put_async`, `open_writer`, `copy` or `rename` — anywhere under `src/zagg` or in
+`deployment/aws/*.py` fails the suite. The guard parses the AST rather than
+grepping, so aliasing the import (`import obstore as obs`, `from obstore import
+put`) does not get past it.
 
 It is derived, not configured: there is no ACL knob to set. Writes to buckets we
 *do* own — the output bucket, `sliderule-public-cors` — still send no header;
