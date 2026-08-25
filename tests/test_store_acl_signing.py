@@ -338,14 +338,18 @@ class TestObstoreDefaultHeaderSigning:
         obstore.head(store, "k")
         list(obstore.list(store))
 
-        signed = {
-            r.method + ("-list" if "list-type" in r.path else ""): r for r in fake_s3.requests
-        }
-        assert signed["GET"].acl_signed
-        assert signed["HEAD"].acl_signed
-        assert signed["GET-list"].acl == ACL
-        assert "x-amz-content-sha256" in signed["GET-list"].signed_headers
-        assert not signed["GET-list"].acl_signed
+        # Select by unpacking rather than keying a dict: a dict keeps only the
+        # last request per verb, so a retry or a stray extra HEAD would vanish
+        # from a harness whose whole job is recording what went on the wire.
+        assert len(fake_s3.requests) == 3, fake_s3.requests
+        (keyed_get,) = [r for r in fake_s3.of("GET") if "list-type" not in r.query]
+        (listing,) = [r for r in fake_s3.of("GET") if "list-type" in r.query]
+        (head,) = fake_s3.of("HEAD")
+        assert keyed_get.acl_signed
+        assert head.acl_signed
+        assert listing.acl == ACL
+        assert "x-amz-content-sha256" in listing.signed_headers
+        assert not listing.acl_signed
 
     def test_a_handle_without_the_header_signs_a_clean_list(self, fake_s3):
         # The other half of the fix's premise: strip the header and the LIST is
