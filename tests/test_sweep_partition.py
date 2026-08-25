@@ -906,7 +906,8 @@ class TestHandlerForwardsThePartitionContract:
                 "leaves": [[int(word), window] for word, window in refs],
             }
         )
-        assert seen["partition"] is None and seen["families"] is None
+        assert seen["partition"] is None
+        assert seen["families"] is None
 
     def test_a_partitioned_invoke_writes_only_its_own_subtree(self, tmp_path, monkeypatch):
         # The behavioural proof, end to end through the transport: partition 0
