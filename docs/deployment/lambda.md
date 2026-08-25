@@ -174,8 +174,12 @@ path requires it. Two shapes qualify, and the second is the one phase 3 added:
 Reads and lists carry no ACL header at all, and that split is not cosmetic
 (issue #522). obstore has no ACL config key, so the header rides as a default
 request header — and obstore puts default headers into the SigV4 signature on
-object-creating and per-key requests only. On a `ListObjectsV2` the header is on
-the wire but outside `SignedHeaders`, which S3 rejects outright:
+every request *except* `ListObjectsV2`. Not just the keyed ones: the bucket-level
+`POST ?delete` bulk delete signs it too
+(`tests/test_store_acl_signing.py::test_only_the_list_path_leaves_the_acl_unsigned`),
+so the list is the single miss, which is why splitting the handle is the shape
+of the fix. On a `ListObjectsV2` the header is on the wire but outside
+`SignedHeaders`, which S3 rejects outright:
 
 ```
 403 AccessDenied: There were headers present in the request which were not signed

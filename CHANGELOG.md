@@ -11,11 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separate write handle (#522) ([#523](https://github.com/englacial/zagg/pull/523))
   - The `x-amz-acl: bucket-owner-full-control` header that issue #495 attached
     to Source Cooperative handles rode obstore's `client_options.default_headers`,
-    and obstore signs default headers on object-creating and per-key requests but
-    not on `ListObjectsV2`. S3 rejects an unsigned `x-amz-acl` outright, so every
-    handle that both published and listed died on its first LIST — the per-leaf
-    template guard and the client status poller included, which blocked all
-    source.coop fleet builds and sweeps.
+    and obstore signs default headers on every request except `ListObjectsV2`.
+    S3 rejects an unsigned `x-amz-acl` outright, so every handle that both
+    published and listed died on its first LIST — the per-leaf template guard
+    and the client status poller included, which blocked all source.coop fleet
+    builds and sweeps.
   - `zagg.store` now opens two handles for such a target: the one callers hold is
     clean, and an ACL-bearing twin takes the object-creating requests.
     `open_store` returns a Zarr store that routes its own writes; raw-obstore
