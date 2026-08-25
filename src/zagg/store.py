@@ -323,8 +323,12 @@ class _AclWriteObjectStore(ObjectStore):
     split: ``self.store`` is the clean handle the inherited read, list and
     delete paths use unchanged, and the object-creating methods are re-pointed
     at a second adapter wrapping the ACL twin. Deletes stay on the clean handle
-    deliberately -- an ACL means nothing on a delete, and S3's bulk-delete
-    ``POST ?delete`` is another request shape that would carry the header.
+    deliberately: an ACL means nothing on a delete, and ``delete_dir`` LISTs
+    before it deletes (``await obs.list(self.store, prefix).collect_async()``),
+    so moving the delete surface to the twin would put a ``ListObjectsV2`` back
+    on the ACL handle -- the one request that 403s. The bulk delete itself is
+    not the hazard: ``tests/test_store_acl_signing.py`` measures ``POST
+    ?delete`` signing the header fine.
 
     Overriding the two write methods rather than reimplementing them keeps the
     adapter's own semantics (the ``mode="create"`` conditional put, its
