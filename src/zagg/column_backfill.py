@@ -17,13 +17,29 @@ them, an existing published store is upgraded **without re-aggregation**, at
 the cost of one leaf-reading pass, paid once.
 
 It is a **sweep family** (``columns``, registered in :mod:`zagg.sweep`), not
-a mode of its own: the family registry is the already-Lambda-wired
-``mode: "sweep"`` transport, so partitioning (issue #377), the work-set
-normalization and the discovery seam come for free, with no handler change
-and no dependency on #519. It is deliberately NOT in
-:data:`zagg.sweep.DEFAULT_FAMILIES` — a backfill is an explicit upgrade
-operation, never something a routine rollup sweep does behind an operator's
-back. Spell it: ``python -m zagg.sweep <root> --families columns``.
+a mode of its own: a registry entry needs no NEW transport and no new mode,
+so the work-set normalization, partitioning (issue #377) and the discovery
+seam are inherited whole rather than rebuilt. The supported entry points
+today are both IN-PROCESS: the CLI
+(``python -m zagg.sweep <root> --families columns``) and
+``zagg.sweep.run_sweep(..., families=["columns"])``.
+
+FLEET execution is not one of them yet, and the reason is one line worker-side:
+``deployment/aws/lambda_handler.py``'s ``mode: "sweep"`` arm calls
+``run_sweep(event["store_path"], leaves, store_kwargs=...)`` and reads neither
+``families`` nor ``partition`` off the event, so no invoke payload can select
+this family — it falls to :data:`zagg.sweep.DEFAULT_FAMILIES`, which this one
+is deliberately not in. Forwarding those two keys is the handler's change,
+issue #519's territory, and deliberately NOT in this PR (review finding,
+issue #520). Partitioning inherits the same seam: ``--partitions`` is real
+in-process (:func:`zagg.sweep_partition.sweep_partitions` runs them
+sequentially), while the runner fires fleet partitions as CONCURRENT ``Event``
+invokes, which one store-granular lease admits exactly one of.
+
+It is deliberately NOT in :data:`zagg.sweep.DEFAULT_FAMILIES` — a backfill is
+an explicit upgrade operation, never something a routine rollup sweep does
+behind an operator's back. Spell it:
+``python -m zagg.sweep <root> --families columns``.
 
 **Declaration-driven, never guessed.** The gate is the manifest's own
 ``zagg-pyramid/2`` declaration (:func:`manifest_column_plan`) —

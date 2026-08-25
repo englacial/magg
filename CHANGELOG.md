@@ -12,9 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     leaf columns, so it cannot take the `zagg-pyramid/2` staged sweep. A new
     `columns` sweep family recomputes each committed leaf's column from that
     leaf's own **stored** arrays and writes it — upgrading a published store
-    **without re-aggregation**, at the cost of one leaf-reading pass. It rides
-    the existing `mode: "sweep"` transport (partitioning and discovery for
-    free), is declaration-driven (a store still declaring `/1`, declared off,
+    **without re-aggregation**, at the cost of one leaf-reading pass. Being a
+    registry entry it needs no new transport or mode — the work-set
+    normalization, `--partitions` and discovery are inherited — and it runs
+    in-process today, from the CLI or `run_sweep(families=["columns"])`;
+    fleet execution additionally needs the Lambda handler's sweep arm to
+    forward `families`/`partition` from the event, which is
+    [#519](https://github.com/englacial/zagg/issues/519)'s change. It is
+    declaration-driven (a store still declaring `/1`, declared off,
     or `class: "none"` on every field is refused by name and must be
     re-declared first), idempotent, and takes the sweep-admission lease.
     Spell it: `python -m zagg.sweep <root> --families columns`.

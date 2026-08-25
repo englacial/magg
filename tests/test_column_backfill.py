@@ -7,8 +7,12 @@ Standing claims:
   per array (phase 1); and the whole ``/1 -> /2`` upgrade of a pyramid-OFF
   store lands a ladder byte-equal to a twin built pyramid-ON from identical
   inputs (phase 4);
-- the backfill is a **sweep family**, so it rides the already-wired
-  ``mode: "sweep"`` transport with partitioning and the lease for free;
+- the backfill is a **sweep family**, so the in-process entry points (the
+  CLI's ``--families columns`` and ``run_sweep(families=["columns"])``)
+  inherit the work-set normalization, ``--partitions`` and the lease for
+  free. Fleet execution is NOT wired: the Lambda handler's sweep arm forwards
+  no ``families``/``partition`` from the event, which is issue #519's change,
+  not this one's;
 - it is **declaration-driven**: a store still declaring ``/1``, declared-off,
   or ``class: none`` on every field refuses loudly and says re-declare first;
 - **idempotent**: a second pass writes nothing, and a moved declaration or a
