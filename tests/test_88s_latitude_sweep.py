@@ -25,9 +25,14 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 BENCH = REPO / "tests" / "data" / "benchmark"
+# Neither ``.github/scripts`` nor ``tools`` is an installed package, so both go
+# on the path ONCE here rather than inside the tests that use them -- an insert
+# in a test body stacks an identical entry per call.
 sys.path.insert(0, str(REPO / ".github" / "scripts"))
+sys.path.insert(0, str(REPO / "tools"))
 
 import bench_metrics  # noqa: E402
+import make_lat_ring_aoi as ring  # noqa: E402
 import run_benchmark  # noqa: E402
 
 SWEEP = BENCH / "targets_88s_latitude_sweep.json"
@@ -73,9 +78,6 @@ def test_every_band_carries_its_own_committed_aoi(manifest):
     ``bench_metrics.resolve_aoi_temporal_cmr``'s NEON fallback). That only holds
     while every entry actually carries one.
     """
-    sys.path.insert(0, str(REPO / "tools"))
-    import make_lat_ring_aoi as ring
-
     assert "aoi" not in manifest
     for sm_key, lat in BANDS.items():
         aoi = manifest["shardmaps"][sm_key]["aoi"]
