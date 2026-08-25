@@ -48,6 +48,10 @@ class _Recorded:
         return frozenset(match.group(1).split(";")) if match else frozenset()
 
     @property
+    def query(self) -> dict[str, list[str]]:
+        return parse_qs(urlparse(self.path).query, keep_blank_values=True)
+
+    @property
     def acl(self) -> str | None:
         return self.headers.get("x-amz-acl")
 
@@ -69,6 +73,7 @@ class FakeS3:
 
     def __init__(self):
         self.objects: dict[str, bytes] = {}
+        self.uploads: dict[str, dict[int, bytes]] = {}
         self.requests: list[_Recorded] = []
         server = self
         self._lock = threading.Lock()
@@ -116,8 +121,13 @@ class FakeS3:
                 length = int(self.headers.get("Content-Length") or 0)
                 payload = self.rfile.read(length)
                 self._record()
+                query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
                 with server._lock:
-                    server.objects[self._key()] = payload
+                    if "uploadId" in query:  # UploadPart
+                        upload = server.uploads.setdefault(query["uploadId"][0], {})
+                        upload[int(query["partNumber"][0])] = payload
+                    else:
+                        server.objects[self._key()] = payload
                 self.send_response(200)
                 self.send_header("ETag", '"fake"')
                 self.send_header("Content-Length", "0")
@@ -134,6 +144,10 @@ class FakeS3:
                 query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
                 if "uploads" in query:  # CreateMultipartUpload
                     return self._send(200, server._initiate_upload_xml(self._key()))
+                if "uploadId" in query:  # CompleteMultipartUpload
+                    return self._send(
+                        200, server._complete_upload_xml(self._key(), query["uploadId"][0])
+                    )
                 if "delete" in query:  # DeleteObjects (bucket-level bulk delete)
                     return self._send(200, server._bulk_delete_xml(body))
                 return self._send(501, b"<Error><Code>NotImplemented</Code></Error>")
@@ -183,6 +197,17 @@ class FakeS3:
         ET.SubElement(root, "Bucket").text = "bkt"
         ET.SubElement(root, "Key").text = key
         ET.SubElement(root, "UploadId").text = upload_id
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def _complete_upload_xml(self, key: str, upload_id: str) -> bytes:
+        """Serve ``POST /{bucket}/{key}?uploadId=`` -- CompleteMultipartUpload."""
+        with self._lock:
+            parts = self.uploads.pop(upload_id, {})
+            self.objects[key] = b"".join(parts[n] for n in sorted(parts))
+        root = ET.Element("CompleteMultipartUploadResult", xmlns=_S3_XMLNS)
+        ET.SubElement(root, "Bucket").text = "bkt"
+        ET.SubElement(root, "Key").text = key
+        ET.SubElement(root, "ETag").text = '"fake"'
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     def _bulk_delete_xml(self, body: bytes) -> bytes:
@@ -256,6 +281,30 @@ class TestObstoreDefaultHeaderSigning:
         (put,) = fake_s3.of("PUT")
         assert put.acl == ACL
         assert put.acl_signed, f"expected x-amz-acl in SignedHeaders, got {put.signed_headers}"
+
+    def test_acl_default_header_is_signed_on_create_multipart_upload(self, fake_s3):
+        # The write that actually matters at fleet scale. At ~131 MB/shard a
+        # published write is a MULTIPART upload, and CreateMultipartUpload is
+        # the one request in that flow that applies a canned ACL
+        # (UploadPart/CompleteMultipartUpload ignore ``x-amz-acl``). If obstore
+        # ever stopped signing the default header there, every published shard
+        # would land owner-less -- no 403, nothing to notice -- which is a
+        # worse failure than the LIST bug this PR fixes. So pin it.
+        import obstore
+
+        store = _raw_store(fake_s3, default_headers=ACL_HEADERS)
+        payload = b"x" * (3 * 1024 * 1024)
+        with obstore.open_writer(
+            store, "big", buffer_size=1024 * 1024, max_concurrency=1
+        ) as writer:
+            writer.write(payload)
+        (create,) = [r for r in fake_s3.of("POST") if "uploads" in r.query]
+        assert create.acl == ACL
+        assert create.acl_signed, (
+            f"expected x-amz-acl in SignedHeaders, got {create.signed_headers}"
+        )
+        # The whole flow completed, so the capture above is the real one.
+        assert fake_s3.objects["p/big"] == payload
 
     def test_acl_default_header_is_unsigned_on_list(self, fake_s3):
         import obstore
