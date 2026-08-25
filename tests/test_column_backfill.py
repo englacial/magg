@@ -372,6 +372,47 @@ class TestDeclarationGate:
         with pytest.raises(ValueError, match="RE-DECLARE FIRST"):
             _backfill(root)
 
+    def _malformed(self, tmp_path, monkeypatch, block):
+        """A pyramid-ON store whose manifest block is then hand-mangled."""
+        root, on = tmp_path / "off", tmp_path / "twin"
+        _build_store(root, monkeypatch, pyramid=False, shards=SHARDS[:1])
+        _build_store(on, monkeypatch, shards=SHARDS[:1])
+        good = _twin_block(on)
+        _install_pyramid(root, block(good) if callable(block) else block)
+        return root
+
+    def test_a_knob_shaped_overviews_list_refuses(self, tmp_path, monkeypatch):
+        """`[5, 4]` is the un-normalized knob, not an expanded manifest ladder."""
+        root = self._malformed(
+            tmp_path, monkeypatch, lambda b: {**b, "overviews": [{"node": 4, "cells": [5]}, 4]}
+        )
+        with pytest.raises(ValueError, match="RE-DECLARE FIRST") as e:
+            _backfill(root)
+        assert "KNOB" in str(e.value) and "4" in str(e.value)
+
+    def test_a_level_without_cells_refuses(self, tmp_path, monkeypatch):
+        root = self._malformed(tmp_path, monkeypatch, lambda b: {**b, "overviews": [{"node": 4}]})
+        with pytest.raises(ValueError, match="not an expanded"):
+            _backfill(root)
+
+    def test_a_non_dict_block_refuses(self, tmp_path, monkeypatch):
+        root = self._malformed(tmp_path, monkeypatch, "junk")
+        with pytest.raises(ValueError, match="this store declares 'junk'"):
+            _backfill(root)
+
+    def test_a_non_dict_overview_refuses(self, tmp_path, monkeypatch):
+        root = self._malformed(tmp_path, monkeypatch, lambda b: {**b, "overview": "junk"})
+        with pytest.raises(ValueError, match="`overview.fields` is 'junk'"):
+            _backfill(root)
+
+    def test_a_ladder_that_misses_the_shard_order_names_every_rung(self, tmp_path, monkeypatch):
+        """The refusal quotes the whole schedule, not just its first rung."""
+        rungs = [{"node": 3, "cells": [5]}, {"node": 2, "cells": [4]}]
+        root = self._malformed(tmp_path, monkeypatch, lambda b: {**b, "overviews": rungs})
+        with pytest.raises(ValueError, match="no member at the shard order 4") as e:
+            _backfill(root)
+        assert "'node': 3" in str(e.value) and "'node': 2" in str(e.value)
+
     def test_gate_refuses_before_taking_the_lease(self, tmp_path, monkeypatch):
         from zagg.sweep_lease import read_lease
 

@@ -1096,6 +1096,15 @@ def column_is_current(
     return True, "current"
 
 
+#: The one instruction every :func:`manifest_column_plan` refusal ends on: a
+#: backfill upgrades a store somebody else declared, so a malformed or absent
+#: declaration is always the operator's to fix, never the pass's to guess at.
+_RE_DECLARE = (
+    "RE-DECLARE FIRST: `python -m zagg.sweep <root> --declare-pyramid <config.yaml> "
+    "--overviews <chunk order>`, then re-run the backfill"
+)
+
+
 class ColumnPlan(NamedTuple):
     """What one store's manifest says every leaf column must be (issue #520)."""
 
@@ -1118,14 +1127,23 @@ def manifest_column_plan(manifest) -> ColumnPlan:
     :func:`column_resolutions`, and ``overview.fields`` through
     :func:`composable_fields`.
 
-    Every refusal is BY NAME and says re-declare first, never guesses. The
-    three the ``/1`` -> ``/2`` upgrade actually meets are the point of the
+    Every refusal is BY NAME and ends on :data:`_RE_DECLARE`, never guesses.
+    The three the ``/1`` -> ``/2`` upgrade actually meets are the point of the
     issue: a ``/1`` block (an ``orders``/``spacing`` schedule, or the empty
     ``orders`` that spells declared-off), and a ``/2`` block whose fields are
     all D24 ``class: "none"`` — the CA ATL03 store's 0.48 build, whose every
     t-digest field classified ``none``. Under the collapsed grammar those are
     declaration bugs a backfill must not paper over: it would write a
     morton-only column, or none at all, and publish it as an upgrade.
+
+    "By name" holds for a MALFORMED block too, which a backfill meets as
+    readily: a manifest is a store's own object and this pass is the first
+    thing to read one nobody validated (review finding, issue #520). So the
+    block, each ``overviews`` level and ``overview.fields`` are shape-checked
+    before they are used — a bare ``[5, 4]`` (the un-normalized
+    ``output.pyramid.overviews`` knob, the likeliest paste into a hand-edited
+    block) refuses here rather than as a ``TypeError`` from
+    :func:`column_resolutions` with no store path in it.
     """
     from zagg.pyramid import PYRAMID_SPEC_V2
 
@@ -1140,25 +1158,41 @@ def manifest_column_plan(manifest) -> ColumnPlan:
     block = manifest.get("pyramid")
     if not isinstance(block, dict) or block.get("spec") != PYRAMID_SPEC_V2:
         raise ValueError(
-            f"this store declares {(block or {}).get('spec')!r}, not {PYRAMID_SPEC_V2!r} — "
-            f"leaf columns exist only under the /2 grammar (spec §4.6). RE-DECLARE FIRST: "
-            f"`python -m zagg.sweep <root> --declare-pyramid <config.yaml> --overviews "
-            f"<chunk order>`, then re-run the backfill"
+            f"this store declares {(block.get('spec') if isinstance(block, dict) else block)!r}, "
+            f"not {PYRAMID_SPEC_V2!r} — leaf columns exist only under the /2 grammar (spec "
+            f"§4.6). {_RE_DECLARE}"
         )
     levels = block.get("overviews")
     if not isinstance(levels, list) or not levels:
         raise ValueError(
-            "the /2 pyramid block carries no `overviews` list — nothing declares which "
-            "resolutions a leaf column holds; re-declare the store before backfilling"
+            f"the /2 pyramid block carries no `overviews` list — nothing declares which "
+            f"resolutions a leaf column holds. {_RE_DECLARE}"
         )
+    for level in levels:
+        if not (isinstance(level, dict) and level.get("node") is not None) or not isinstance(
+            level.get("cells"), list
+        ):
+            raise ValueError(
+                f"the /2 pyramid block's `overviews` carries {level!r}, not an expanded "
+                f"`{{'node': ..., 'cells': [...]}}` level — a bare order is the "
+                f"`output.pyramid.overviews` KNOB, which `normalize_overviews` expands "
+                f"before it reaches a manifest (spec §4.5). {_RE_DECLARE}"
+            )
     resolutions = column_resolutions(levels, node_order)
     if not resolutions:
         raise ValueError(
-            f"the declared overviews {levels[0]!r} place no member at the shard order "
-            f"{node_order}, so this declaration asks for no leaf column at all; "
-            f"re-declare the store before backfilling"
+            f"the declared overviews {levels!r} place no member at the shard order "
+            f"{node_order}, so this declaration asks for no leaf column at all. "
+            f"{_RE_DECLARE}"
         )
-    declared = (block.get("overview") or {}).get("fields") or {}
+    overview = block.get("overview")
+    declared = overview.get("fields") if isinstance(overview, dict) else overview
+    declared = {} if declared is None else declared
+    if not isinstance(declared, dict):
+        raise ValueError(
+            f"the /2 pyramid block's `overview.fields` is {declared!r}, not a declaration "
+            f"map — nothing here says which fields a leaf column carries. {_RE_DECLARE}"
+        )
     fields = composable_fields(declared)
     if not fields:
         raise ValueError(
