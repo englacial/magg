@@ -1087,9 +1087,10 @@ def column_is_current(
     seconds (the issue #417 term), and a column records no ``run_id`` for its
     source leaf, so a same-second leaf rewrite at an unchanged granule count
     reads as current. That is a narrower window than #417's — a backfill runs
-    against a store the fleet is not writing (§4.6's single-writer law extends
-    to the backfill; see the module docstring) — and ``force=True`` on the
-    backfill is the unconditional rewrite.
+    against a store the fleet is not writing: spec §4.6 names this pass the
+    ONE sanctioned second writer and makes "no aggregation run in flight" an
+    operator precondition of it (:mod:`zagg.column_backfill`, "Who may write a
+    column") — and ``force=True`` is the unconditional rewrite.
     """
     if not isinstance(leaf_stamp, dict) or not isinstance(column_stamp, dict):
         return False, "absent-or-unstamped"
