@@ -366,22 +366,81 @@ class TestPutObjectRouting:
         assert seen["store"] is store
         assert seen["kw"] == {"mode": "create"}
 
-    def test_no_module_calls_obstore_put_directly(self):
+    # Every obstore call that CREATES an object, so a write cannot slip past
+    # put_object by picking a different API: the async twin of ``put``, the
+    # multipart writer (``CreateMultipartUpload`` is where a canned ACL applies
+    # on a multipart object), and the two CopyObject spellings.
+    _OBSTORE_WRITE_APIS = frozenset({"put", "put_async", "open_writer", "copy", "rename"})
+
+    @classmethod
+    def _obstore_write_calls(cls, path):
+        """Line numbers in ``path`` calling an object-creating obstore API.
+
+        AST rather than substring: it follows ``import obstore as obs`` and
+        ``from obstore import put`` (both of which reach the same wire request
+        while spelling nothing like ``obstore.put(``), and it does not fire on
+        the word appearing in a comment or docstring.
+        """
+        import ast
+
+        tree = ast.parse(path.read_text())
+        modules = set()  # names bound to the obstore module itself
+        direct = set()  # names bound to a write API imported from obstore
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules |= {a.asname or a.name for a in node.names if a.name == "obstore"}
+            elif isinstance(node, ast.ImportFrom) and node.module == "obstore":
+                direct |= {
+                    a.asname or a.name for a in node.names if a.name in cls._OBSTORE_WRITE_APIS
+                }
+        lines = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            hit = (
+                isinstance(fn, ast.Attribute)
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id in modules
+                and fn.attr in cls._OBSTORE_WRITE_APIS
+            ) or (isinstance(fn, ast.Name) and fn.id in direct)
+            if hit:
+                lines.append(node.lineno)
+        return lines
+
+    def test_no_module_calls_an_obstore_write_api_directly(self):
         # The routing only holds if every write goes through put_object. A
         # direct ``obstore.put`` on a published-bucket handle succeeds and
         # publishes an object Source Cooperative cannot manage -- silently --
         # so the seam is enforced here rather than by review.
+        #
+        # ``deployment/aws/lambda_handler.py`` is in the sweep because it ships
+        # in the same zip as the package and is where the fleet's writes come
+        # from, but it is not under ``src/zagg`` (issue #522 fold).
         import zagg
 
-        root = Path(zagg.__file__).parent
+        pkg = Path(zagg.__file__).parent
+        repo = Path(__file__).parent.parent
+        files = sorted(pkg.rglob("*.py")) + sorted((repo / "deployment" / "aws").glob("*.py"))
+        seam = pkg / "store.py"  # by path: any other store.py is not the seam
         offenders = [
-            f"{path.relative_to(root)}:{n}"
-            for path in sorted(root.rglob("*.py"))
-            if path.name != "store.py"
-            for n, line in enumerate(path.read_text().splitlines(), 1)
-            if "obstore.put(" in line
+            f"{path}:{n}" for path in files if path != seam for n in self._obstore_write_calls(path)
         ]
         assert offenders == [], f"use zagg.store.put_object instead: {offenders}"
+
+    def test_the_guard_catches_an_aliased_write(self, tmp_path):
+        # The scan is only worth its docstring if it fires; pin the two shapes
+        # a substring match used to miss.
+        sneaky = tmp_path / "sneaky.py"
+        sneaky.write_text(
+            "import obstore as obs\n"
+            "from obstore import open_writer\n"
+            "def f(store):\n"
+            "    obs.put_async(store, 'k', b'v')\n"
+            "    open_writer(store, 'k')\n"
+            "    # obstore.put(store, 'k', b'v') in a comment is not a call\n"
+        )
+        assert self._obstore_write_calls(sneaky) == [4, 5]
 
 
 class TestS3RetryConfig:
