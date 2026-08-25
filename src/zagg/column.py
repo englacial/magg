@@ -645,11 +645,10 @@ def _write_sidecar(
     try:
         import json
 
-        import obstore
         import zarr
 
         from zagg.content_hash import content_hashes_record, hash_arrays
-        from zagg.store import open_object_store
+        from zagg.store import open_object_store, put_object
         from zagg.telemetry import build_record
 
         group = zarr.open_group(store, path="", mode="r", zarr_format=3)
@@ -663,7 +662,7 @@ def _write_sidecar(
             window=window,
         )
         prefix, _, name = path.rstrip("/").rpartition("/")
-        obstore.put(
+        put_object(
             open_object_store(prefix, **store_kwargs),
             _sidecar_name(name),
             json.dumps(record).encode(),

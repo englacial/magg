@@ -713,12 +713,10 @@ def write_refusal_manifest(
             "units": units,
         }
 
-        import obstore
-
-        from zagg.store import open_object_store
+        from zagg.store import open_object_store, put_object
 
         key = refusal_manifest_key(run_id, timestamp)
-        obstore.put(
+        put_object(
             open_object_store(store_root, **(store_kwargs or {})),
             key,
             json.dumps(body, indent=1).encode(),
@@ -763,10 +761,9 @@ def write_run_parquet(
     """
     import tempfile
 
-    import obstore
     import pandas as pd
 
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     if not rows:
         raise ValueError("write_run_parquet requires at least one row")
@@ -791,7 +788,7 @@ def write_run_parquet(
         df.to_parquet(local, engine="fastparquet", index=False, object_encoding="utf8")
         with open(local, "rb") as fh:
             data = fh.read()
-    obstore.put(open_object_store(store_root, **(store_kwargs or {})), key, data)
+    put_object(open_object_store(store_root, **(store_kwargs or {})), key, data)
     return f"{store_root.rstrip('/')}/{key}"
 
 
@@ -950,12 +947,11 @@ def sidecar_path(leaf_path: str, spec: str | None = None) -> str:
 
 def write_sidecar(leaf_path: str, record: dict, spec: str | None = None, **store_kwargs) -> None:
     """PUT ``record`` as the leaf's stats sidecar (success path only, #297)."""
-    import obstore
 
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     prefix, _, name = leaf_path.rstrip("/").rpartition("/")
-    obstore.put(
+    put_object(
         open_object_store(prefix, **store_kwargs),
         sidecar_key(name, spec),
         json.dumps(record).encode(),
@@ -998,16 +994,14 @@ def write_granule_ids(leaf_path: str, granule_ids, spec: str | None = None, **st
     import logging
 
     try:
-        import obstore
-
-        from zagg.store import open_object_store
+        from zagg.store import open_object_store, put_object
 
         prefix, _, name = leaf_path.rstrip("/").rpartition("/")
         # Recorded in the CANONICAL id space (espg-ruled 2026-08-17): the same
         # driver-stripped bare ids the hash beside them is taken over, and the
         # same space ``dedup.classify_leaf_identity`` diffs the planned set in.
         ids = sorted(canonical_granule_ids(granule_ids) or [])
-        obstore.put(
+        put_object(
             open_object_store(prefix, **store_kwargs),
             granule_ids_key(name, spec),
             json.dumps(
