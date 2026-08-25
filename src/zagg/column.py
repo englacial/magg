@@ -814,11 +814,10 @@ def stored_leaf_slabs(
     The read-back twin of :func:`leaf_slabs` (issue #520): same filter
     (:func:`composable_fields`), same ``(n_cells,)`` extent refusal, same
     companion pickup — but the values come from the leaf's stored arrays
-    instead of the writer's in-memory #342 sink. The absent-key rule is the
-    one place the twins part, and only because a sink cannot reach the case:
-    an absent PAYLOAD folds as fill (schema evolution — a field the leaf
-    predates), while an absent declared COMPANION refuses the leaf by name,
-    since folding a payload apart from its channel is not defined. That equality is the whole bridge: a store built before the
+    instead of the writer's in-memory #342 sink. The absent-key rule is where
+    the twins part, only because a sink cannot reach the case: an absent
+    PAYLOAD folds as fill (schema evolution), an absent declared COMPANION
+    refuses the leaf by name (no fold of a payload alone is defined). That equality is the whole bridge: a store built before the
     0.50 classifiers has no column, and the only surviving record of what
     the leaf worker would have folded is the leaf itself. Feeding this map
     to :func:`fold_column` therefore reproduces the build-time column
@@ -837,15 +836,14 @@ def stored_leaf_slabs(
     whose weight column means neither thing, and the caller turns the raise
     into one loudly skipped leaf.
 
-    ``_fold_node`` carries a THIRD guard this does not: the D4 commit stamp,
-    which is what separates a leaf from an interrupted writer's prefix. Here
-    it is the CALLER's, not because it matters less but because the caller has
-    already paid for it — :func:`zagg.column_backfill._backfill_leaf` reads
-    ``hive.read_commit`` first, cheapest-first, and an unstamped leaf is
-    counted ``empty`` and never reaches this function
-    (``test_uncommitted_leaf_contributes_nothing``). Hence the COMMITTED in
-    the summary line: it is a precondition of calling this, and a caller that
-    skips it folds whatever bytes are there (review finding, issue #520).
+    ``_fold_node`` carries a THIRD guard this does not — the D4 commit stamp,
+    which separates a leaf from an interrupted writer's prefix. Here it is the
+    CALLER's, only because the caller has already paid for it:
+    :func:`zagg.column_backfill._backfill_leaf` reads ``hive.read_commit``
+    first, and an unstamped leaf is counted ``empty`` and never arrives
+    (``test_uncommitted_leaf_contributes_nothing``). Hence the COMMITTED above
+    — a precondition, and a caller skipping it folds whatever bytes are there
+    (review finding, issue #520).
     """
     import zarr
 
@@ -878,19 +876,14 @@ def stored_leaf_slabs(
         except KeyError:
             if channel is not None:
                 # NOT the fill arm: a synthesized all-empty sibling satisfies
-                # ``fold_column``'s required-by-name pairing guard, so the pair
-                # would be folded APART and surface from the kernel as a §1.1
-                # row-alignment error that reads as data corruption. The true
-                # diagnosis is a declaration the leaves predate — the expected
-                # ``/1`` -> ``/2`` retrofit, since ruling 4 on issue #410 is
-                # what made a located digest field ``approximate`` at all — so
-                # refuse the leaf here, the way ``_fold_node`` does at the read
-                # (review finding, issue #520).
+                # ``fold_column``'s pairing guard, so the pair folds APART and
+                # surfaces as a §1.1 alignment error reading as corruption.
+                # Refuse at the read, as ``_fold_node`` does (finding, #520).
                 raise ValueError(
                     f"field {channel[0]!r} declares a {channel[1]} channel but leaf "
                     f"{leaf_path} carries no {key!r} array — these leaves predate the "
-                    f"declaration. Re-declare without the channel, or rebuild the leaf; "
-                    f"no fold of the payload alone is defined (spec §1.1)"
+                    f"declaration; re-declare without the channel or rebuild the leaf "
+                    f"(no fold of the payload alone is defined, spec §1.1)"
                 ) from None
             # Schema evolution, and the ragged writer's all-empty skip: the
             # stored cells are the fill either way, which is exactly what the
@@ -941,8 +934,8 @@ def column_from_leaf(
 
     Pure compute: nothing is written and no gate is consulted. The caller
     (:func:`zagg.column_backfill.backfill_columns`) owns the D4 commit gate,
-    the declaration gate, the skip-if-current test, and the write — this
-    inherits :func:`stored_leaf_slabs`' COMMITTED-leaf precondition unchanged.
+    the declaration gate, the skip-if-current test and the write; this
+    inherits :func:`stored_leaf_slabs`' COMMITTED-leaf precondition.
     """
     from zagg.hive import shard_leaf_path
 
@@ -961,11 +954,9 @@ def column_from_leaf(
 
 
 def _member_metadata(raw) -> dict:
-    """One array's zarr metadata, normalized so the two projections compare.
-
-    ``node_type`` is dropped because a ``pydantic_zarr`` ``ArraySpec`` dump
-    carries it and ``ArrayMetadata.to_dict()`` does not; everything else
-    round-trips key for key through the template write.
+    """One array's zarr metadata, normalized so the two projections compare —
+    only ``node_type`` differs by construction (an ``ArraySpec`` dump has it,
+    ``ArrayMetadata.to_dict()`` does not); the rest round-trips key for key.
     """
     return {
         k: v for k, v in json.loads(json.dumps(dict(raw), default=str)).items() if k != "node_type"
@@ -977,28 +968,20 @@ def column_structure(fields: dict, *, node_order: int, resolutions: list) -> dic
 
     Derived from the SAME template machinery :func:`write_column` writes with
     (:func:`zagg.sweep_overview._overview_config` -> ``HealpixGrid.shard_spec``),
-    so this is not a second description of the column's shape that could drift
-    from the writer's — it IS the writer's, projected member by member.
+    so it cannot drift from the writer's own shape — it IS the writer's.
 
-    :func:`column_is_current` compares it against the stored column because
-    the recorded ``zagg_column`` attrs cannot say either half of it (review
-    finding, issue #520):
-
-    - the **member set** — :func:`_column_provenance` records neither
-      ``location`` nor ``temporal``, yet
-      :func:`zagg.sweep_overview.field_companions` reads exactly those and each
-      one adds a ``{field}_locations`` / ``{field}_times`` member to EVERY
-      resolution group (spec §4.6, "plus every channel sibling that field's
-      §4.5 entry declares"). A digest field re-declared with a ``location``
-      channel — ruling 4 on issue #410, the expected ``/1`` -> ``/2`` retrofit
-      — is invisible to the provenance compare;
-    - each member's **dtype, fill value and array attrs** — an exact field's
-      ``dtype`` and ``fill_value`` are absent from the recorded provenance by
-      construction (:func:`zagg.sweep_overview._field_provenance` records
-      ``class``/``method``/``nan_policy`` and nothing else for that class),
-      yet ``fill_value`` is what :func:`zagg.sweep_overview.fold_dense`
-      reduces to and ``dtype`` is the stored element type. Moving either moves
-      the column's bytes.
+    :func:`column_is_current` compares it against the stored column because the
+    recorded ``zagg_column`` attrs cannot say either half of it (review
+    finding, issue #520). **Member set**: :func:`_column_provenance` records
+    neither ``location`` nor ``temporal``, yet
+    :func:`zagg.sweep_overview.field_companions` reads exactly those and each
+    adds a ``{field}_locations`` / ``{field}_times`` member to EVERY group
+    (§4.6) — so a digest re-declared with a ``location`` channel (ruling 4 on
+    issue #410, the expected ``/1`` -> ``/2`` retrofit) is invisible to it.
+    **Per-member dtype, fill and attrs**: an exact field records only class,
+    method and ``nan_policy``, yet ``fill_value`` is what
+    :func:`zagg.sweep_overview.fold_dense` reduces to and ``dtype`` is the
+    element type.
     """
     from zagg.grids.healpix import HealpixGrid
     from zagg.sweep_overview import _overview_config
@@ -1016,11 +999,8 @@ def column_structure(fields: dict, *, node_order: int, resolutions: list) -> dic
 
 
 def stored_column_structure(group) -> dict:
-    """:func:`column_structure`'s twin, read off an OPEN column root group.
-
-    One member listing per resolution group, and the metadata each listing
-    already carries — the cheapest read that can see the structure, and the
-    whole cost the term adds to a skip.
+    """:func:`column_structure`'s twin, read off an OPEN column root group —
+    one member listing per group, all a skip pays for the structure term.
     """
     return {
         str(name): {
@@ -1047,10 +1027,9 @@ def column_is_current(
     read off the artifacts, since a column records no ``generation`` block of
     its own — it has exactly one source, its leaf). Five terms, in cost order:
 
-    1. **Committed** — neither stamp may be missing. An unstamped COLUMN is
-       an interrupted writer's prefix; an unstamped LEAF is D4 debris whose
-       column can be current only by accident. ``hive.read_commit`` returns
-       ``None`` for both, so both are taken by value and neither is
+    1. **Committed** — neither stamp may be missing: an unstamped COLUMN is an
+       interrupted writer's prefix, an unstamped LEAF is D4 debris, and
+       ``hive.read_commit`` returns ``None`` for both, so neither is
        dereferenced before the guard (review finding, issue #520).
     2. **Declaration** — the recorded ``zagg_column`` block's node/cell orders,
        group set, and per-field provenance (:func:`_column_provenance`, which
@@ -1059,17 +1038,11 @@ def column_is_current(
        declaration is exactly the #383 case where the artifact must not
        outlive the declaration that made it.
     3. **Structure** — the column's REALIZED arrays
-       (:func:`stored_column_structure`) must be the ones the template this
-       run would write declares (:func:`column_structure`), member for member
-       and metadata for metadata. This is the term that covers what the
-       recorded grammar cannot say, and there are two such things: ``location``
-       / ``temporal`` are not in :func:`_column_provenance`, so a digest field
-       re-declared with a companion channel passes term 2 while its stored
-       column is a sibling short in every group; and an exact field's
-       ``dtype`` / ``fill_value`` are not there either, so a re-declaration
-       that moves the element type or what folds to missing passes it too
-       (review finding, issue #520). ``structure`` is what the caller read off
-       the store; an unreadable one (``None``) is drift, which rewrites.
+       (:func:`stored_column_structure`) must be the template this run would
+       write (:func:`column_structure`), member for member and metadata for
+       metadata: the term for the two drifts term 2's grammar cannot carry, a
+       companion channel and an exact field's ``dtype``/``fill_value``. A
+       ``None`` structure is drift, which rewrites (review finding, #520).
     4. **Order** — the column's ``written_at`` may not PRECEDE its leaf's: a
        leaf re-run after its column leaves the column folded from cells that
        are gone.
@@ -1077,20 +1050,15 @@ def column_is_current(
        (§4.6), so a re-run that changed the leaf's granule set fails the gate
        even inside the one-second stamp resolution that defeats term 4.
 
-    Between them terms 2 and 3 cover every key the fold and the template
-    consume. What NO term covers is the leaf's BYTES: nothing here reads a
-    cell, so a leaf whose arrays moved without moving its stamp or its
-    granule count reads as current — terms 4 and 5's business, and their
-    residual below.
-
-    Residual, disclosed rather than papered over: both stamps resolve to whole
-    seconds (the issue #417 term), and a column records no ``run_id`` for its
-    source leaf, so a same-second leaf rewrite at an unchanged granule count
-    reads as current. That is a narrower window than #417's — a backfill runs
-    against a store the fleet is not writing: spec §4.6 names this pass the
-    ONE sanctioned second writer and makes "no aggregation run in flight" an
-    operator precondition of it (:mod:`zagg.column_backfill`, "Who may write a
-    column") — and ``force=True`` is the unconditional rewrite.
+    Terms 2 and 3 cover every key the fold and the template consume; no term
+    reads a CELL, which is terms 4 and 5' business — and theirs is the
+    residual, disclosed rather than papered over: both stamps resolve to whole
+    seconds (the #417 term) and a column records no ``run_id`` for its source
+    leaf, so a same-second leaf rewrite at an unchanged granule count reads as
+    current. Narrower than #417's window — a backfill runs against a store the
+    fleet is not writing, spec §4.6 naming this pass the ONE sanctioned second
+    writer and "no aggregation run in flight" an operator precondition of it
+    (:mod:`zagg.column_backfill`) — and ``force=True`` rewrites regardless.
     """
     if not isinstance(leaf_stamp, dict) or not isinstance(column_stamp, dict):
         return False, "absent-or-unstamped"
@@ -1126,9 +1094,9 @@ def column_is_current(
     return True, "current"
 
 
-#: The one instruction every :func:`manifest_column_plan` refusal ends on: a
-#: backfill upgrades a store somebody else declared, so a malformed or absent
-#: declaration is always the operator's to fix, never the pass's to guess at.
+#: The instruction every :func:`manifest_column_plan` refusal ends on: a
+#: backfill upgrades a store somebody else declared, so a bad declaration is
+#: the operator's to fix, never this pass's to guess at (issue #520).
 _RE_DECLARE = (
     "RE-DECLARE FIRST: `python -m zagg.sweep <root> --declare-pyramid <config.yaml> "
     "--overviews <chunk order>`, then re-run the backfill"
@@ -1166,14 +1134,12 @@ def manifest_column_plan(manifest) -> ColumnPlan:
     declaration bugs a backfill must not paper over: it would write a
     morton-only column, or none at all, and publish it as an upgrade.
 
-    "By name" holds for a MALFORMED block too, which a backfill meets as
-    readily: a manifest is a store's own object and this pass is the first
-    thing to read one nobody validated (review finding, issue #520). So the
-    block, each ``overviews`` level and ``overview.fields`` are shape-checked
-    before they are used — a bare ``[5, 4]`` (the un-normalized
+    "By name" holds for a MALFORMED block too (review finding, issue #520):
+    the block, every ``overviews`` level and ``overview.fields`` are
+    shape-checked before use, so a bare ``[5, 4]`` — the un-normalized
     ``output.pyramid.overviews`` knob, the likeliest paste into a hand-edited
-    block) refuses here rather than as a ``TypeError`` from
-    :func:`column_resolutions` with no store path in it.
+    block — refuses here, not as a store-path-less ``TypeError`` out of
+    :func:`column_resolutions`.
     """
     from zagg.pyramid import PYRAMID_SPEC_V2
 
@@ -1199,14 +1165,13 @@ def manifest_column_plan(manifest) -> ColumnPlan:
             f"resolutions a leaf column holds. {_RE_DECLARE}"
         )
     for level in levels:
-        if not (isinstance(level, dict) and level.get("node") is not None) or not isinstance(
-            level.get("cells"), list
-        ):
+        cells = level.get("cells") if isinstance(level, dict) else None
+        if not isinstance(cells, list) or level.get("node") is None:
             raise ValueError(
                 f"the /2 pyramid block's `overviews` carries {level!r}, not an expanded "
                 f"`{{'node': ..., 'cells': [...]}}` level — a bare order is the "
-                f"`output.pyramid.overviews` KNOB, which `normalize_overviews` expands "
-                f"before it reaches a manifest (spec §4.5). {_RE_DECLARE}"
+                f"`output.pyramid.overviews` KNOB, expanded by `normalize_overviews` "
+                f"before it ever reaches a manifest (spec §4.5). {_RE_DECLARE}"
             )
     resolutions = column_resolutions(levels, node_order)
     if not resolutions:
