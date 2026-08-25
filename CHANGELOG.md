@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- the sweep Lambda handler forwards the `partition` and `families` blocks (#527)
+  ([#528](https://github.com/englacial/zagg/pull/528))
+  - `_handle_sweep` dropped both blocks on the floor, so a fleet `mode="sweep"`
+    invoke could never be partitioned and could never be scoped to a family
+    subset — `run_sweep` has accepted both since #377/#520, but nothing
+    worker-side ever received them. On the `discover` transport every
+    "partition" worker therefore derived and swept the WHOLE store; the CA
+    ATL03 toc/overview sweep died at the 900 s wall in all 16 workers with
+    nothing written. On the inline transport a partitioned pass walked to the
+    root with only its own subset, so nodes above the split order were written
+    from partial data by racing workers.
+  - Absent keys forward as `None`, so an unpartitioned invoke is behaviourally
+    unchanged. This adds reach, not new behaviour.
+  - Operator note: a partitioned pass writes nothing below the split order and
+    defers `finish()`, so the root `coverage.moc`/`coverage.toc` and the
+    manifest `pyramid.materialized` update are still owed by a subsequent
+    partition-less pass. Pick the width so that
+    `leaves x s_per_leaf / partitions < 900 s`, rounded up to a power of four.
+
 - rename parent_morton event field to shard_key (#24) ([#42](https://github.com/englacial/zagg/pull/42)) by @espg
 - Concurrency-aware Lambda orchestrator: pre-flight probe + FD-exhaustion guard ([#41](https://github.com/englacial/zagg/pull/41)) by @espg
 - drop shapely as an intersection backend (#36) ([#39](https://github.com/englacial/zagg/pull/39)) by @espg
