@@ -109,6 +109,44 @@ class TestOwnershipSemanticsUnchanged:
             assert put.acl == ACL, f"{put.path} published with no canned ACL"
             assert put.acl_signed, f"{put.path} carries an unsigned ACL: {put.signed_headers}"
 
+    def test_a_multipart_chunk_signs_the_acl_on_create_multipart_upload(self, published, fake_s3):
+        # ``CreateMultipartUpload`` is the request that applies a multipart
+        # object's ACL -- ``UploadPart``/``CompleteMultipartUpload`` ignore
+        # ``x-amz-acl`` -- and at ~131 MB/shard multipart is the fleet's NORMAL
+        # write path, so the seam has to route THAT request to the twin and not
+        # merely the simple PUT. The test above cannot see it: ``_puts()``
+        # filters on ``method == "PUT"`` and this one is a ``POST ?uploads``,
+        # so a chunk that crossed the multipart threshold would leave it green
+        # while the object landed owner-less. ``test_store_acl_signing``'s
+        # ``test_acl_default_header_is_signed_on_create_multipart_upload`` pins
+        # the same request through bare obstore; this is it through zagg.
+        import numpy as np
+        import zarr
+
+        from zagg.store import open_store
+
+        # 12 MiB in one uncompressed chunk: over obstore's multipart threshold,
+        # small enough to stay fast.
+        n = 3 * 1024 * 1024
+        array = zarr.create_array(
+            store=published(open_store),
+            name="big",
+            shape=(n,),
+            chunks=(n,),
+            dtype="i4",
+            compressors=None,
+            zarr_format=3,
+        )
+        array[:] = np.arange(n, dtype="i4")
+
+        creates = [r for r in fake_s3.requests if r.method == "POST" and "uploads" in r.query]
+        assert len(creates) == 1, f"expected one CreateMultipartUpload, got {creates}"
+        (create,) = creates
+        assert create.acl == ACL, "the multipart chunk was created with no canned ACL"
+        assert create.acl_signed, (
+            f"CreateMultipartUpload carries an unsigned ACL: {create.signed_headers}"
+        )
+
     def test_put_object_signs_the_acl_on_a_side_channel_write(self, published, fake_s3):
         # Status envelopes, hive manifests and stats sidecars are real objects
         # in the published bucket, so they hand over ownership too.
