@@ -114,3 +114,76 @@ class TestOwnershipSemanticsUnchanged:
         assert fake_s3.requests
         for request in fake_s3.requests:
             assert request.acl is None, f"{request.method} {request.path} still carries the ACL"
+
+
+class TestTheRequestsThatDied:
+    """Phase 4 of issue #522: the exact shapes the fleet failed on, pinned."""
+
+    def test_a_published_bucket_handle_lists_the_digit_tree(self, published, fake_s3):
+        # The per-leaf template guard's ``list_with_delimiter`` of the hive
+        # digit tree -- the request 2,726/2,726 workers 500'd on. Against real
+        # S3 the pre-fix handle answers 403 AccessDenied / HeadersNotSigned;
+        # here the pin is that the request goes out clean and signed, which is
+        # the same statement one layer down.
+        import obstore
+
+        from zagg.store import open_object_store, put_object
+
+        store = published(open_object_store)
+        put_object(store, "0/1/leaf.zarr/zarr.json", b"{}")
+        fake_s3.clear()
+
+        listing = obstore.list_with_delimiter(store)
+        assert [str(p) for p in listing["common_prefixes"]] == ["0"]
+
+        (request,) = _lists(fake_s3)
+        assert request.acl is None
+        # Signed, not merely header-free: an unsigned LIST would fail for a
+        # different reason and this test would still be green.
+        assert "x-amz-content-sha256" in request.signed_headers
+
+    def test_the_status_poller_lists_its_channel(self, published, fake_s3):
+        # The client-side half of the same failure: the event transport's
+        # poller listing a run's ``.status/`` channel on a published bucket.
+        from zagg.client_transport import StatusPoller
+        from zagg.store import open_object_store, put_object
+
+        prefix = f"{STORE_PATH}.status/run-e1ebd1c0"
+        put_object(published(open_object_store, path=prefix), "shard-0.json", b"{}")
+        fake_s3.clear()
+
+        poller = StatusPoller(
+            store_factory=lambda: published(open_object_store, path=prefix),
+            drop_timeout_s=1.0,
+        )
+        assert poller._list_keys() == {"shard-0.json"}
+        assert all(request.acl is None for request in fake_s3.requests)
+
+    def test_an_in_account_handle_is_unchanged(self, monkeypatch):
+        # The fix must be invisible to every target that never needed the ACL:
+        # one handle, no twin, no client_options, and the plain zarr adapter.
+        from zarr.storage import ObjectStore
+
+        from zagg.store import (
+            _ACL_WRITE_STORE_ATTR,
+            _s3_object_store,
+            acl_write_store,
+            open_store,
+        )
+
+        raw = _s3_object_store("s3://our-bucket/out.zarr")
+        assert raw.client_options is None
+        assert not hasattr(raw, _ACL_WRITE_STORE_ATTR)
+        assert acl_write_store(raw) is raw
+
+        zstore = open_store("s3://our-bucket/out.zarr")
+        assert type(zstore) is ObjectStore
+
+    def test_a_read_only_published_handle_is_unchanged(self):
+        # ``read_only=True`` was already excluded from the ACL (issue #223), so
+        # it must not grow a twin now either.
+        from zagg.store import _ACL_WRITE_STORE_ATTR, _s3_object_store
+
+        raw = _s3_object_store(STORE_PATH, read_only=True)
+        assert raw.client_options is None
+        assert not hasattr(raw, _ACL_WRITE_STORE_ATTR)
