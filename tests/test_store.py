@@ -364,6 +364,25 @@ class TestBucketOwnerAcl:
         assert options == {"default_headers": {"x-custom": "1"}}
 
 
+class TestRetryConfigIsNotShared:
+    def test_the_two_handles_do_not_alias_one_retry_config(self, mock_s3):
+        # Issue #522 split: ``dict(kwargs)`` per handle is shallow, so without
+        # a nested copy the clean handle and its ACL twin hold the SAME
+        # retry_config dict -- the aliasing the unconditional deepcopy in
+        # _s3_store_pair exists to prevent, one level down.
+        from zagg.store import _S3_RETRY_CONFIG
+
+        s3_cls, _ = mock_s3
+        open_store(
+            "s3://us-west-2.opendata.source.coop/englacial/zagg/d.zarr",
+            credentials=TestBucketOwnerAcl.CREDS,
+        )
+        clean, twin = (c.kwargs["retry_config"] for c in s3_cls.call_args_list)
+        assert clean == twin == _S3_RETRY_CONFIG
+        assert clean is not twin
+        assert clean is not _S3_RETRY_CONFIG
+
+
 class TestAclWriteObjectStoreEquality:
     """Issue #522: the twin-bearing store must not be substitutable by equality.
 
