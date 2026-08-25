@@ -424,6 +424,11 @@ def _s3_store_pair(path, credentials, endpoint_url, read_only, kwargs):
 
     def build(client_options):
         opts = dict(kwargs)
+        # ...and re-copy the one nested value, because ``dict()`` is shallow:
+        # without this both handles hold the SAME retry_config object, which
+        # is a smaller instance of the aliasing the deepcopy above exists to
+        # prevent. Runs twice per external store open, not per request.
+        opts["retry_config"] = copy.deepcopy(opts["retry_config"])
         if client_options is None:
             opts.pop("client_options", None)
         else:
