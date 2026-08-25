@@ -4,11 +4,17 @@ Leaf columns (:mod:`zagg.column`, issues #383/#391 — the gen-1 partials the
 staged sweep folds) are written only by pyramid-ON builds whose D24
 classifiers admit the fields. Every store built before the 0.50 classifiers
 is column-less, and a column-less store cannot take the ``/2`` staged sweep
-at any transport. This module is the missing bridge: one pass that visits
-each committed leaf, recomputes its column from the leaf's own STORED bytes
-(:func:`zagg.column.column_from_leaf`) and writes it — so an existing
-published store is upgraded **without re-aggregation**, at the cost of one
-leaf-reading pass, paid once.
+at any transport.
+
+This module is the missing bridge, and it owns both halves. The READ-BACK
+path is :mod:`zagg.column`'s build-time fold recipe re-run against a leaf's
+own stored arrays instead of the writer's resident #342 sink
+(:func:`stored_leaf_slabs` -> :func:`column_from_leaf`), with the gates that
+decide whether a column is owed at all (:func:`manifest_column_plan`) and
+whether one already there is current (:func:`column_is_current`). The PASS
+(:func:`backfill_columns`) drives it: one visit per committed leaf. Between
+them, an existing published store is upgraded **without re-aggregation**, at
+the cost of one leaf-reading pass, paid once.
 
 It is a **sweep family** (``columns``, registered in :mod:`zagg.sweep`), not
 a mode of its own: the family registry is the already-Lambda-wired
@@ -20,7 +26,7 @@ operation, never something a routine rollup sweep does behind an operator's
 back. Spell it: ``python -m zagg.sweep <root> --families columns``.
 
 **Declaration-driven, never guessed.** The gate is the manifest's own
-``zagg-pyramid/2`` declaration (:func:`zagg.column.manifest_column_plan`) —
+``zagg-pyramid/2`` declaration (:func:`manifest_column_plan`) —
 a ``/1`` schedule, a declared-off block, or a block whose every field is D24
 ``class: "none"`` refuses BY NAME and says re-declare first. Those are
 declaration bugs, and backfilling one would publish a morton-only column (or
@@ -38,7 +44,17 @@ are disjoint, and this is the one pass for which they are not.
 
 from __future__ import annotations
 
+import json
 import logging
+from typing import NamedTuple
+
+from zagg.column import (
+    COLUMN_SPEC,
+    _column_provenance,
+    column_resolutions,
+    composable_fields,
+    fold_column,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +88,7 @@ def backfill_columns(
 
     Per ``(leaf, window)``: an uncommitted leaf contributes nothing
     (``empty``); a column already current under
-    :func:`zagg.column.column_is_current` is left alone (``current``, unless
+    :func:`column_is_current` is left alone (``current``, unless
     ``force``); anything else is recomputed from the leaf's stored bytes and
     written wholesale (``written``). A leaf that cannot be read or folded is
     logged and counted (``failed``), never fatal — the families sweep's
@@ -90,7 +106,6 @@ def backfill_columns(
     """
     import uuid
 
-    from zagg.column import manifest_column_plan
     from zagg.sweep_lease import acquire_lease, heartbeat_lease, release_lease
 
     store_kwargs = dict(store_kwargs or {})
@@ -132,7 +147,7 @@ def _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, *, f
     exactly as the walk treats it), then the column's own stamp, attrs and
     member listing for the skip test, and only then the leaf's arrays.
     """
-    from zagg.column import COLUMN_ATTR, column_from_leaf, column_is_current, write_column
+    from zagg.column import COLUMN_ATTR, write_column
     from zagg.grids.morton import morton_word
 
     try:
@@ -197,9 +212,9 @@ def _leaf_stamp(store_root, shard_key, window, store_kwargs):
 def _column_state(store_root, shard_key, window, store_kwargs) -> tuple:
     """The stored column as ``(commit stamp, root attrs, realized structure)``.
 
-    The three things :func:`zagg.column.column_is_current` gates on. The
+    The three things :func:`column_is_current` gates on. The
     structure — one member listing per resolution group
-    (:func:`zagg.column.stored_column_structure`) — is read here rather than
+    (:func:`stored_column_structure`) — is read here rather than
     derived from the attrs because the attrs cannot carry it: a companion
     channel added at re-declaration leaves the recorded provenance identical
     and the member set a sibling short (review finding, issue #520).
@@ -210,7 +225,7 @@ def _column_state(store_root, shard_key, window, store_kwargs) -> tuple:
     """
     import zarr
 
-    from zagg.column import column_name, stored_column_structure
+    from zagg.column import column_name
     from zagg.hive import COMMIT_ATTR, shard_leaf_path
     from zagg.store import open_store
 
@@ -226,3 +241,433 @@ def _column_state(store_root, shard_key, window, store_kwargs) -> tuple:
         return None, {}, {}
     stamp = attrs.get(COMMIT_ATTR)
     return (dict(stamp) if isinstance(stamp, dict) else None), attrs, structure
+
+
+def stored_leaf_slabs(
+    leaf_path: str, fields: dict, *, cell_order: int, n_cells: int, store_kwargs: dict | None = None
+) -> dict:
+    """``{field: cell slab}`` fold inputs read back from a COMMITTED leaf.
+
+    The read-back twin of :func:`zagg.column.leaf_slabs` (issue #520): same filter
+    (:func:`zagg.column.composable_fields`), same ``(n_cells,)`` extent refusal, same
+    companion pickup — but the values come from the leaf's stored arrays
+    instead of the writer's in-memory #342 sink. That equality is the whole
+    bridge: a store built before the 0.50 classifiers has no column, and the
+    only surviving record of what the leaf worker would have folded is the
+    leaf itself. Feeding this map to :func:`zagg.column.fold_column` therefore
+    reproduces the build-time column exactly — the byte-identity
+    characterization pinned in ``tests/test_column_backfill.py``.
+
+    The absent-key rule is the one place the twins part, and only because a
+    sink cannot reach the case: an absent PAYLOAD folds as fill (schema
+    evolution — a field the leaf predates), while an absent declared COMPANION
+    refuses the leaf by name, since folding a payload apart from its channel is
+    not defined.
+
+    Two guards the staged sink cannot need but a read-back must, both
+    borrowed from the sweep's own from-leaves fold
+    (:func:`zagg.sweep_overview._fold_node`): the leaf's ``morton`` extent pins
+    the geometry (a leaf at another cell order is not this declaration's leaf
+    — mixed-order sources are unsupported, issue #347), and every digest
+    field's stored §2.0 ``weights`` / §8.4 companion declaration is checked
+    against the manifest's (:func:`zagg.sweep_overview.check_weights_match`,
+    :func:`zagg.sweep_overview.check_companion_match`). All three raise: a
+    backfill folding across a declaration mismatch would publish a column
+    whose weight column means neither thing, and the caller turns the raise
+    into one loudly skipped leaf.
+
+    ``_fold_node`` carries a THIRD guard this does not: the D4 commit stamp,
+    which is what separates a leaf from an interrupted writer's prefix. Here
+    it is the CALLER's, not because it matters less but because the caller has
+    already paid for it — :func:`_backfill_leaf` reads
+    ``hive.read_commit`` first, cheapest-first, and an unstamped leaf is
+    counted ``empty`` and never reaches this function
+    (``test_uncommitted_leaf_contributes_nothing``). Hence the COMMITTED in
+    the summary line: it is a precondition of calling this, and a caller that
+    skips it folds whatever bytes are there (review finding, issue #520).
+    """
+    import zarr
+
+    from zagg.store import open_store
+    from zagg.sweep_overview import (
+        _empty_slab,
+        check_companion_match,
+        check_weights_match,
+        field_companions,
+    )
+
+    cell_order, n_cells = int(cell_order), int(n_cells)
+    group = zarr.open_group(
+        open_store(leaf_path, read_only=True, **dict(store_kwargs or {})),
+        path=str(cell_order),
+        mode="r",
+        zarr_format=3,
+    )
+    morton = group["morton"]
+    if morton.shape != (n_cells,):
+        raise ValueError(
+            f"leaf {leaf_path} carries {morton.shape} morton words, not the declared "
+            f"cell_order {cell_order} subtree ({n_cells} cells) — mixed-order source "
+            f"leaves are unsupported (issue #347)"
+        )
+
+    def _slab(key: str, meta: dict, *, channel: tuple | None = None):
+        try:
+            arr = group[key]
+        except KeyError:
+            if channel is not None:
+                # NOT the fill arm: a synthesized all-empty sibling satisfies
+                # ``fold_column``'s required-by-name pairing guard, so the pair
+                # would be folded APART and surface from the kernel as a §1.1
+                # row-alignment error that reads as data corruption. The true
+                # diagnosis is a declaration the leaves predate — the expected
+                # ``/1`` -> ``/2`` retrofit, since ruling 4 on issue #410 is
+                # what made a located digest field ``approximate`` at all — so
+                # refuse the leaf here, the way ``_fold_node`` does at the read
+                # (review finding, issue #520).
+                raise ValueError(
+                    f"field {channel[0]!r} declares a {channel[1]} channel but leaf "
+                    f"{leaf_path} carries no {key!r} array — these leaves predate the "
+                    f"declaration. Re-declare without the channel, or rebuild the leaf; "
+                    f"no fold of the payload alone is defined (spec §1.1)"
+                ) from None
+            # Schema evolution, and the ragged writer's all-empty skip: the
+            # stored cells are the fill either way, which is exactly what the
+            # staged sink synthesizes for an absent key.
+            return _empty_slab(meta, n_cells)
+        if channel is None:
+            if meta["class"] == "approximate":
+                check_weights_match(dict(arr.attrs), meta, key)
+        else:
+            check_companion_match(dict(arr.attrs), channel[0], channel[1])
+        values = arr[:]
+        if values.shape != (n_cells,):
+            raise ValueError(
+                f"stored slab for field {key!r} has shape {values.shape}, not the leaf's "
+                f"({n_cells},) cell extent — refusing to fold a column from a leaf that "
+                f"disagrees with the grid"
+            )
+        return values
+
+    slabs: dict = {}
+    for name, meta in composable_fields(fields).items():
+        slabs[name] = _slab(name, meta)
+        for kwarg, sibling in field_companions(name, meta):
+            slabs[sibling] = _slab(sibling, meta, channel=(name, kwarg))
+    return slabs
+
+
+def column_from_leaf(
+    store_root: str,
+    shard_key,
+    fields: dict,
+    *,
+    node_order: int,
+    cell_order: int,
+    resolutions: list,
+    window: str | None = None,
+    store_kwargs: dict | None = None,
+) -> dict:
+    """Recompute one leaf's column fold from its STORED bytes (issue #520).
+
+    :func:`stored_leaf_slabs` -> :func:`zagg.column.fold_column`, the same two calls
+    :func:`zagg.column.write_leaf_column` makes against the resident staged sink — so the
+    result is the build-time column's ``folded`` map, byte for byte, for any
+    leaf whose stored arrays are what that worker PUT. That equality is the
+    issue #520 phase 1 characterization and the whole basis of the ``/1``
+    -> ``/2`` upgrade: a pre-column store's leaves still carry every input
+    the fold ever had.
+
+    Pure compute: nothing is written and no gate is consulted. The caller
+    (:func:`backfill_columns`) owns the D4 commit gate,
+    the declaration gate, the skip-if-current test, and the write — this
+    inherits :func:`stored_leaf_slabs`' COMMITTED-leaf precondition unchanged.
+    """
+    from zagg.hive import shard_leaf_path
+
+    return fold_column(
+        stored_leaf_slabs(
+            shard_leaf_path(store_root, shard_key, window=window),
+            fields,
+            cell_order=cell_order,
+            n_cells=4 ** (int(cell_order) - int(node_order)),
+            store_kwargs=store_kwargs,
+        ),
+        fields,
+        cell_order=int(cell_order),
+        resolutions=resolutions,
+    )
+
+
+def _member_metadata(raw) -> dict:
+    """One array's zarr metadata, normalized so the two projections compare.
+
+    ``node_type`` is dropped because a ``pydantic_zarr`` ``ArraySpec`` dump
+    carries it and ``ArrayMetadata.to_dict()`` does not; everything else
+    round-trips key for key through the template write.
+    """
+    return {
+        k: v for k, v in json.loads(json.dumps(dict(raw), default=str)).items() if k != "node_type"
+    }
+
+
+def column_structure(fields: dict, *, node_order: int, resolutions: list) -> dict:
+    """``{group: {array: metadata}}`` a column of this declaration MUST have.
+
+    Derived from the SAME template machinery :func:`zagg.column.write_column` writes with
+    (:func:`zagg.sweep_overview._overview_config` -> ``HealpixGrid.shard_spec``),
+    so this is not a second description of the column's shape that could drift
+    from the writer's — it IS the writer's, projected member by member.
+
+    :func:`column_is_current` compares it against the stored column because
+    the recorded ``zagg_column`` attrs cannot say either half of it (review
+    finding, issue #520):
+
+    - the **member set** — :func:`zagg.column._column_provenance` records neither
+      ``location`` nor ``temporal``, yet
+      :func:`zagg.sweep_overview.field_companions` reads exactly those and each
+      one adds a ``{field}_locations`` / ``{field}_times`` member to EVERY
+      resolution group (spec §4.6, "plus every channel sibling that field's
+      §4.5 entry declares"). A digest field re-declared with a ``location``
+      channel — ruling 4 on issue #410, the expected ``/1`` -> ``/2`` retrofit
+      — is invisible to the provenance compare;
+    - each member's **dtype, fill value and array attrs** — an exact field's
+      ``dtype`` and ``fill_value`` are absent from the recorded provenance by
+      construction (:func:`zagg.sweep_overview._field_provenance` records
+      ``class``/``method``/``nan_policy`` and nothing else for that class),
+      yet ``fill_value`` is what :func:`zagg.sweep_overview.fold_dense`
+      reduces to and ``dtype`` is the stored element type. Moving either moves
+      the column's bytes.
+    """
+    from zagg.grids.healpix import HealpixGrid
+    from zagg.sweep_overview import _overview_config
+
+    cfg = _overview_config(composable_fields(fields))
+    return {
+        str(int(res)): {
+            name: _member_metadata(member.model_dump())
+            for name, member in HealpixGrid(int(node_order), int(res), config=cfg, sharded=True)
+            .shard_spec()
+            .members.items()
+        }
+        for res in resolutions
+    }
+
+
+def stored_column_structure(group) -> dict:
+    """:func:`column_structure`'s twin, read off an OPEN column root group.
+
+    One member listing per resolution group, and the metadata each listing
+    already carries — the cheapest read that can see the structure, and the
+    whole cost the term adds to a skip.
+    """
+    return {
+        str(name): {
+            member: _member_metadata(arr.metadata.to_dict()) for member, arr in sub.arrays()
+        }
+        for name, sub in group.groups()
+    }
+
+
+def column_is_current(
+    leaf_stamp,
+    column_stamp,
+    column_attrs,
+    structure,
+    *,
+    node_order,
+    cell_order,
+    resolutions,
+    fields,
+) -> tuple[bool, str]:
+    """Is this ``(leaf, window)``'s stored column current? ``(verdict, reason)``.
+
+    The backfill's skip-if-current gate (issue #520; the #397/#417 discipline
+    read off the artifacts, since a column records no ``generation`` block of
+    its own — it has exactly one source, its leaf). Five terms, in cost order:
+
+    1. **Committed** — neither stamp may be missing. An unstamped COLUMN is
+       an interrupted writer's prefix; an unstamped LEAF is D4 debris whose
+       column can be current only by accident. ``hive.read_commit`` returns
+       ``None`` for both, so both are taken by value and neither is
+       dereferenced before the guard (review finding, issue #520).
+    2. **Declaration** — the recorded ``zagg_column`` block's node/cell orders,
+       group set, and per-field provenance (:func:`zagg.column._column_provenance`, which
+       carries the fold law, the digest budget and the §3.3 linkage) must be
+       the ones this run would write. A narrowed, widened or re-classed
+       declaration is exactly the #383 case where the artifact must not
+       outlive the declaration that made it.
+    3. **Structure** — the column's REALIZED arrays
+       (:func:`stored_column_structure`) must be the ones the template this
+       run would write declares (:func:`column_structure`), member for member
+       and metadata for metadata. This is the term that covers what the
+       recorded grammar cannot say, and there are two such things: ``location``
+       / ``temporal`` are not in :func:`zagg.column._column_provenance`, so a digest field
+       re-declared with a companion channel passes term 2 while its stored
+       column is a sibling short in every group; and an exact field's
+       ``dtype`` / ``fill_value`` are not there either, so a re-declaration
+       that moves the element type or what folds to missing passes it too
+       (review finding, issue #520). ``structure`` is what the caller read off
+       the store; an unreadable one (``None``) is drift, which rewrites.
+    4. **Order** — the column's ``written_at`` may not PRECEDE its leaf's: a
+       leaf re-run after its column leaves the column folded from cells that
+       are gone.
+    5. **Granules** — the column's stamp copies the LEAF's ``granule_count``
+       (§4.6), so a re-run that changed the leaf's granule set fails the gate
+       even inside the one-second stamp resolution that defeats term 4.
+
+    Between them terms 2 and 3 cover every key the fold and the template
+    consume. What NO term covers is the leaf's BYTES: nothing here reads a
+    cell, so a leaf whose arrays moved without moving its stamp or its
+    granule count reads as current — terms 4 and 5's business, and their
+    residual below.
+
+    Residual, disclosed rather than papered over: both stamps resolve to whole
+    seconds (the issue #417 term), and a column records no ``run_id`` for its
+    source leaf, so a same-second leaf rewrite at an unchanged granule count
+    reads as current. That is a narrower window than #417's — a backfill runs
+    against a store the fleet is not writing: spec §4.6 names this pass the
+    ONE sanctioned second writer and makes "no aggregation run in flight" an
+    operator precondition of it (:mod:`zagg.column_backfill`, "Who may write a
+    column") — and ``force=True`` is the unconditional rewrite.
+    """
+    if not isinstance(leaf_stamp, dict) or not isinstance(column_stamp, dict):
+        return False, "absent-or-unstamped"
+    block = column_attrs if isinstance(column_attrs, dict) else {}
+    expected = {
+        "spec": COLUMN_SPEC,
+        "order": int(node_order),
+        "source_cell_order": int(cell_order),
+        "groups": sorted(int(r) for r in resolutions),
+        "fields": {n: _column_provenance(m) for n, m in composable_fields(fields).items()},
+    }
+    recorded = {
+        "spec": block.get("spec"),
+        "order": block.get("order"),
+        "source_cell_order": block.get("source_cell_order"),
+        "groups": sorted(int(r) for r in (block.get("groups") or {})),
+        "fields": block.get("fields") or {},
+    }
+    # Round-tripped JSON on one side, freshly derived Python on the other
+    # (``inner_shape`` is a list either way, but an int-keyed group map is not):
+    # compare canonical JSON so a type that survives ``json.loads`` unchanged
+    # cannot read as drift and re-fold the whole store for nothing.
+    if json.dumps(recorded, sort_keys=True) != json.dumps(expected, sort_keys=True):
+        return False, "declaration-drift"
+    wanted = column_structure(fields, node_order=node_order, resolutions=resolutions)
+    if json.dumps(structure or {}, sort_keys=True) != json.dumps(wanted, sort_keys=True):
+        return False, "structure-drift"
+    leaf_at, column_at = leaf_stamp.get("written_at"), column_stamp.get("written_at")
+    if leaf_at is None or column_at is None or str(column_at) < str(leaf_at):
+        return False, "stale"
+    if int(column_stamp.get("granule_count") or 0) != int(leaf_stamp.get("granule_count") or 0):
+        return False, "granule-drift"
+    return True, "current"
+
+
+#: The one instruction every :func:`manifest_column_plan` refusal ends on: a
+#: backfill upgrades a store somebody else declared, so a malformed or absent
+#: declaration is always the operator's to fix, never the pass's to guess at.
+_RE_DECLARE = (
+    "RE-DECLARE FIRST: `python -m zagg.sweep <root> --declare-pyramid <config.yaml> "
+    "--overviews <chunk order>`, then re-run the backfill"
+)
+
+
+class ColumnPlan(NamedTuple):
+    """What one store's manifest says every leaf column must be (issue #520)."""
+
+    node_order: int
+    cell_order: int
+    resolutions: list
+    fields: dict
+
+
+def manifest_column_plan(manifest) -> ColumnPlan:
+    """The column recipe read off a STORE, not a config (issue #520).
+
+    :func:`zagg.column.leaf_column_plan` is the worker's gate: it reads the config the
+    unit carries, because workers never open the manifest (spec §4.6). A
+    backfill has no such config — it upgrades a store somebody else built —
+    so its gate is the manifest's own ``zagg-pyramid/2`` declaration, which
+    is the reader- and sweep-facing contract for exactly this reason. The two
+    gates read the same grammar and must agree: ``overviews`` (already the
+    fully expanded ``(node, cells)`` list, §4.5) through
+    :func:`zagg.column.column_resolutions`, and ``overview.fields`` through
+    :func:`zagg.column.composable_fields`.
+
+    Every refusal is BY NAME and ends on :data:`_RE_DECLARE`, never guesses.
+    The three the ``/1`` -> ``/2`` upgrade actually meets are the point of the
+    issue: a ``/1`` block (an ``orders``/``spacing`` schedule, or the empty
+    ``orders`` that spells declared-off), and a ``/2`` block whose fields are
+    all D24 ``class: "none"`` — the CA ATL03 store's 0.48 build, whose every
+    t-digest field classified ``none``. Under the collapsed grammar those are
+    declaration bugs a backfill must not paper over: it would write a
+    morton-only column, or none at all, and publish it as an upgrade.
+
+    "By name" holds for a MALFORMED block too, which a backfill meets as
+    readily: a manifest is a store's own object and this pass is the first
+    thing to read one nobody validated (review finding, issue #520). So the
+    block, each ``overviews`` level and ``overview.fields`` are shape-checked
+    before they are used — a bare ``[5, 4]`` (the un-normalized
+    ``output.pyramid.overviews`` knob, the likeliest paste into a hand-edited
+    block) refuses here rather than as a ``TypeError`` from
+    :func:`zagg.column.column_resolutions` with no store path in it.
+    """
+    from zagg.pyramid import PYRAMID_SPEC_V2
+
+    if not isinstance(manifest, dict) or any(
+        manifest.get(k) is None for k in ("shard_order", "cell_order")
+    ):
+        raise ValueError(
+            "column backfill needs a hive manifest declaring shard_order/cell_order; "
+            "this is not one"
+        )
+    node_order, cell_order = int(manifest["shard_order"]), int(manifest["cell_order"])
+    block = manifest.get("pyramid")
+    if not isinstance(block, dict) or block.get("spec") != PYRAMID_SPEC_V2:
+        raise ValueError(
+            f"this store declares {(block.get('spec') if isinstance(block, dict) else block)!r}, "
+            f"not {PYRAMID_SPEC_V2!r} — leaf columns exist only under the /2 grammar (spec "
+            f"§4.6). {_RE_DECLARE}"
+        )
+    levels = block.get("overviews")
+    if not isinstance(levels, list) or not levels:
+        raise ValueError(
+            f"the /2 pyramid block carries no `overviews` list — nothing declares which "
+            f"resolutions a leaf column holds. {_RE_DECLARE}"
+        )
+    for level in levels:
+        if not (isinstance(level, dict) and level.get("node") is not None) or not isinstance(
+            level.get("cells"), list
+        ):
+            raise ValueError(
+                f"the /2 pyramid block's `overviews` carries {level!r}, not an expanded "
+                f"`{{'node': ..., 'cells': [...]}}` level — a bare order is the "
+                f"`output.pyramid.overviews` KNOB, which `normalize_overviews` expands "
+                f"before it reaches a manifest (spec §4.5). {_RE_DECLARE}"
+            )
+    resolutions = column_resolutions(levels, node_order)
+    if not resolutions:
+        raise ValueError(
+            f"the declared overviews {levels!r} place no member at the shard order "
+            f"{node_order}, so this declaration asks for no leaf column at all. "
+            f"{_RE_DECLARE}"
+        )
+    overview = block.get("overview")
+    declared = overview.get("fields") if isinstance(overview, dict) else overview
+    declared = {} if declared is None else declared
+    if not isinstance(declared, dict):
+        raise ValueError(
+            f"the /2 pyramid block's `overview.fields` is {declared!r}, not a declaration "
+            f"map — nothing here says which fields a leaf column carries. {_RE_DECLARE}"
+        )
+    fields = composable_fields(declared)
+    if not fields:
+        raise ValueError(
+            f"every declared field is D24 class `none` ({sorted(declared) or 'no fields'}) — "
+            f"a column of none of them is no artifact at all (spec §4.6), so this store's "
+            f"declaration, not its data, is what needs fixing. RE-DECLARE FIRST with the "
+            f"config whose classifiers admit the fields, then re-run the backfill"
+        )
+    return ColumnPlan(node_order, cell_order, resolutions, fields)

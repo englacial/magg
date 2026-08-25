@@ -143,7 +143,7 @@ def _column_path(root, decimal, window=None):
 
 
 def _plan(root):
-    from zagg.column import manifest_column_plan
+    from zagg.column_backfill import manifest_column_plan
     from zagg.hive import read_manifest
 
     return manifest_column_plan(read_manifest(str(root)))
@@ -156,8 +156,8 @@ def _verdict(root, decimal, window=None, **over):
     a verdict here is the one the pass would reach; ``over`` moves whichever
     declaration term the test is exercising.
     """
-    from zagg.column import COLUMN_ATTR, column_is_current
-    from zagg.column_backfill import _column_state, _leaf_stamp
+    from zagg.column import COLUMN_ATTR
+    from zagg.column_backfill import _column_state, _leaf_stamp, column_is_current
 
     shard, plan = morton_word(decimal), _plan(root)
     stamp, attrs, structure = _column_state(str(root), shard, window, {})
@@ -184,7 +184,8 @@ class TestStoredLeafParity:
     def test_recomputed_column_is_byte_identical_per_leaf(
         self, tmp_path, monkeypatch, kitchen_sink
     ):
-        from zagg.column import column_from_leaf, write_column
+        from zagg.column import write_column
+        from zagg.column_backfill import column_from_leaf
         from zagg.hive import read_commit, shard_leaf_path
 
         root = tmp_path / "on"
@@ -232,7 +233,7 @@ class TestStoredLeafParity:
 
     def test_stored_slabs_match_the_staged_sink(self, tmp_path, monkeypatch):
         """The read-back adapter returns the writer's own in-memory values."""
-        from zagg.column import stored_leaf_slabs
+        from zagg.column_backfill import stored_leaf_slabs
         from zagg.hive import shard_leaf_path
 
         captured: dict = {}
@@ -265,7 +266,7 @@ class TestStoredLeafParity:
                 assert np.array_equal(slab, want, equal_nan=slab.dtype.kind == "f")
 
     def test_mixed_order_leaf_refuses(self, tmp_path, monkeypatch):
-        from zagg.column import stored_leaf_slabs
+        from zagg.column_backfill import stored_leaf_slabs
         from zagg.hive import shard_leaf_path
 
         root = tmp_path / "on"
@@ -281,7 +282,7 @@ class TestStoredLeafParity:
 
     def test_absent_declared_field_reads_as_fill(self, tmp_path, monkeypatch):
         """Schema evolution: a field the leaf predates folds as the sink's fill."""
-        from zagg.column import stored_leaf_slabs
+        from zagg.column_backfill import stored_leaf_slabs
         from zagg.hive import shard_leaf_path
 
         root = tmp_path / "on"
@@ -301,7 +302,7 @@ class TestStoredLeafParity:
 
     def test_a_leaf_missing_a_declared_companion_refuses(self, tmp_path, monkeypatch):
         """A channel the leaves predate is a DECLARATION fault, named as one."""
-        from zagg.column import column_from_leaf, stored_leaf_slabs
+        from zagg.column_backfill import column_from_leaf, stored_leaf_slabs
         from zagg.hive import shard_leaf_path
         from zagg.sweep_overview import field_companions
 
@@ -329,7 +330,8 @@ class TestStoredLeafParity:
 
     def test_an_absent_declared_field_folds_as_the_staged_fill(self, tmp_path, monkeypatch):
         """The retrofit's own arm, FOLDED — a slab assertion pins only half of it."""
-        from zagg.column import fold_column, leaf_slabs, stored_leaf_slabs
+        from zagg.column import fold_column, leaf_slabs
+        from zagg.column_backfill import stored_leaf_slabs
         from zagg.hive import shard_leaf_path
 
         root = tmp_path / "on"
@@ -367,7 +369,7 @@ class TestStoredLeafParity:
             assert a[res]["later"].tolist() == [0] * 4 ** (res - plan.node_order)
 
     def test_mismatched_weights_declaration_refuses(self, tmp_path, monkeypatch):
-        from zagg.column import stored_leaf_slabs
+        from zagg.column_backfill import stored_leaf_slabs
         from zagg.hive import shard_leaf_path
 
         root = tmp_path / "on"
@@ -790,7 +792,7 @@ class TestRetrofitDeclaration:
         assert set(block["overview"]["fields"]) == {"count", "h_tdigest"}
 
     def test_the_declaration_makes_the_store_backfillable(self, tmp_path, monkeypatch):
-        from zagg.column import manifest_column_plan
+        from zagg.column_backfill import manifest_column_plan
         from zagg.hive import read_manifest
 
         root, cfg = self._off(tmp_path, monkeypatch)
