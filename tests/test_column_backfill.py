@@ -738,6 +738,58 @@ class TestFamilyRegistration:
         with pytest.raises(SweepRefusedError, match="live-sweep"):
             _backfill(off)
 
+    def test_a_store_wide_fault_raises_instead_of_counting_every_leaf_failed(
+        self, tmp_path, monkeypatch
+    ):
+        """`{"written": 0, "failed": 2721}` is a fault, not a summary.
+
+        Every leaf raising the same exception is what an expired credential
+        or a denied column prefix looks like; returning it as an ordinary
+        summary let the runbook march on to the staged sweep over a
+        column-less store (review finding, issue #520).
+        """
+        import zagg.column as column_mod
+        from zagg.sweep_lease import read_lease
+
+        off, on = tmp_path / "off", tmp_path / "on"
+        _build_store(off, monkeypatch, pyramid=False, shards=SHARDS[:2])
+        _build_store(on, monkeypatch, shards=SHARDS[:2])
+        _install_pyramid(off, _twin_block(on))
+
+        def denied(*_a, **_k):
+            raise PermissionError("403 on the column prefix")
+
+        monkeypatch.setattr(column_mod, "write_column", denied)
+        with pytest.raises(RuntimeError, match="wrote nothing") as e:
+            _backfill(off, shards=SHARDS[:2])
+        assert "PermissionError: 403 on the column prefix" in str(e.value)
+        # Loud, but not torn: the lease is released before the raise.
+        assert read_lease(str(off)) is None
+
+    def test_a_single_failed_leaf_is_counted_loudly_and_still_returns(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """One bad leaf is a leaf fault: counted, logged at ERROR, not fatal."""
+        import zagg.column_backfill as backfill_mod
+
+        off, on = tmp_path / "off", tmp_path / "on"
+        _build_store(off, monkeypatch, pyramid=False, shards=SHARDS[:2])
+        _build_store(on, monkeypatch, shards=SHARDS[:2])
+        _install_pyramid(off, _twin_block(on))
+        first = morton_word(SHARDS[0])
+        real = backfill_mod.column_from_leaf
+
+        def one_bad(store_root, shard_key, *a, **k):
+            if shard_key == first:
+                raise ValueError("digest is corrupt")
+            return real(store_root, shard_key, *a, **k)
+
+        monkeypatch.setattr(backfill_mod, "column_from_leaf", one_bad)
+        with caplog.at_level("ERROR"):
+            summary = _backfill(off, shards=SHARDS[:2])
+        assert summary["written"] == 1 and summary["failed"] == 1
+        assert "must be 0 before the staged sweep" in caplog.text
+
     def test_the_heartbeat_is_thrown_by_the_clock_not_a_leaf_count(self, tmp_path, monkeypatch):
         """A slow pass beats inside the TTL however FEW leaves it has run.
 

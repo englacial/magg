@@ -118,6 +118,20 @@ def backfill_columns(
     posture, and a half-upgraded store is exactly as readable as an
     un-upgraded one, since readers never require a column (§4.6).
 
+    **A store-wide fault is not N leaf faults.** One leaf that cannot be read
+    or folded is counted and skipped, but a pass that ends having written
+    nothing, skipped nothing as current, and FAILED at least one leaf raises,
+    naming the last error. That is the shape an expired credential, a denied
+    column prefix or a region-wide outage takes — every remaining leaf raising
+    the same exception — and returning it as an ordinary
+    ``{"written": 0, "failed": <every leaf>}`` summary would send the runbook
+    straight on to the staged sweep over a store with no columns (review
+    finding, issue #520). A PARTIAL failure still returns, with a
+    ``logger.error``: the operator's gate there is the summary, and
+    ``docs/pyramid_upgrade.md`` step 3 requires ``failed == 0`` before
+    sweeping. Either way the repair is the same, because the pass is
+    idempotent: fix the fault and re-run it.
+
     ``lease=False`` skips admission — for callers that already hold the store's
     sweep lease. Otherwise the pass takes it for its whole duration
     (:mod:`zagg.sweep_lease`), beating on the WALL CLOCK — once a leaf lands
@@ -148,16 +162,37 @@ def backfill_columns(
         held = acquire_lease(store_root, run_id=run_id, store_kwargs=store_kwargs)
     beat_after = int((held or {}).get("ttl_s") or DEFAULT_TTL_S) / HEARTBEAT_FRACTION
     last_beat = time.monotonic()
+    last_error = None
     try:
         for decimal in sorted(by_shard):
             for window in sorted(by_shard[decimal], key=lambda w: (w is not None, w or "")):
-                _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, force=force)
+                failure = _backfill_leaf(
+                    store_root, decimal, window, plan, counts, store_kwargs, force=force
+                )
+                last_error = failure or last_error
                 if held is not None and time.monotonic() - last_beat >= beat_after:
                     held = heartbeat_lease(store_root, held, store_kwargs=store_kwargs)
                     last_beat = time.monotonic()
     finally:
         if held is not None:
             release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs)
+    if counts["failed"]:
+        if not counts["written"] and not counts["current"]:
+            # Raised OUTSIDE the try so the lease is already released: this is a
+            # loud return, not a torn pass.
+            raise RuntimeError(
+                f"column backfill on {store_root} wrote nothing: all {counts['failed']} "
+                f"leaf attempts failed, the last with {last_error}. A whole-store fault "
+                f"(expired credentials, a denied column prefix, an outage) is not N leaf "
+                f"faults — returning it as an ordinary summary would send the /1 -> /2 "
+                f"runbook on to the staged sweep over a column-less store. The pass is "
+                f"idempotent: fix the fault and re-run it"
+            )
+        logger.error(
+            f"column backfill on {store_root}: {counts['failed']} of "
+            f"{sum(len(w) for w in by_shard.values())} leaves FAILED (last: {last_error}). "
+            f"`failed` must be 0 before the staged sweep — the pass is idempotent, re-run it"
+        )
     return {
         **counts,
         "run_id": run_id,
@@ -167,8 +202,12 @@ def backfill_columns(
     }
 
 
-def _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, *, force) -> None:
+def _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, *, force) -> str | None:
     """One ``(leaf, window)``: gate, fold from stored bytes, write. Never raises.
+
+    Returns the failure's text (``None`` on any other outcome) so the driver
+    can name the LAST error when a whole-store fault turns every leaf into a
+    ``failed`` count.
 
     Split out of the driver so a fold that blows up on one leaf costs that
     leaf and nothing else — the ``failed`` count the families sweep reports.
@@ -228,6 +267,8 @@ def _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, *, f
     except Exception as e:
         logger.warning(f"backfill: leaf {decimal} window {window!r} failed ({e})")
         counts["failed"] += 1
+        return f"{type(e).__name__}: {e}"
+    return None
 
 
 def _leaf_stamp(store_root, shard_key, window, store_kwargs):

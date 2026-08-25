@@ -103,6 +103,17 @@ leaf's stored arrays and writes it wholesale under the leaf's node prefix. The
 summary counts `written` / `current` / `empty` (no committed leaf) / `failed`.
 It is idempotent: a second pass writes nothing.
 
+**`failed` must be 0 before step 3.** A leaf that cannot be read or folded is
+counted and skipped rather than aborting the pass, so a partial result comes
+back as an ordinary summary (with a `logger.error`) — and the staged sweep
+would then fold a ladder over whatever columns happened to land, recording the
+gaps only as `source_children` under-coverage in artifacts nobody reads. Check
+the count, fix the leaves it names in the log, and re-run the backfill; it is
+idempotent, so the second pass touches only what is missing. A pass that
+manages to write NOTHING at all does not return a summary: it raises, naming
+the last error, because every leaf failing the same way is a store-wide fault
+(expired credentials, a denied column prefix, an outage), not N leaf faults.
+
 The gate is the **manifest's** declaration, and every refusal names itself:
 
 | Manifest says | What happens |
@@ -119,7 +130,9 @@ python -m zagg.sweep s3://bucket/prefix/product --stages
 ```
 
 Nothing about this step is upgrade-specific — it is the ordinary `/2` staged
-sweep, and it now finds the columns it needs. The resulting ladder is
+sweep, and it now finds the columns it needs. **Only run it once step 2
+reported `failed: 0`**: this step reads the columns, and it cannot tell a leaf
+whose column the backfill never wrote from one whose declaration carries none. The resulting ladder is
 byte-identical to the one a store built pyramid-ON from the same inputs
 produces (the acceptance test in `tests/test_column_backfill.py`; the only
 differences anywhere are the sweep run's own `run_id` and the wall clocks).
