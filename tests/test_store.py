@@ -176,6 +176,25 @@ class TestBucketOwnerAcl:
         _, kwargs = s3_cls.call_args
         assert kwargs["client_options"]["default_headers"] == self.HEADER
 
+    def test_the_ambient_pair_shares_one_credential_provider(self, mock_s3):
+        # The fleet's real branch: no injected credentials, no endpoint_url, so
+        # ``_s3_store_pair`` builds a ``Boto3CredentialProvider`` -- once, and
+        # hands the SAME one to both handles. Its ``__init__`` eagerly walks
+        # the botocore credential chain (~300 ms), so moving the construction
+        # inside ``build()`` (the obvious tidy-up for anyone reading ``build``
+        # as self-contained) would pay it twice on every published open
+        # (issue #287). ``TestObjectStoreCache`` counts providers too, but for
+        # an in-account bucket -- one handle, no twin -- so the pair is pinned
+        # only here. ``tests/test_store_acl_seam.py`` cannot cover it: its
+        # stand-in is reached through ``endpoint_url``, which is the other arm.
+        s3_cls, prov_cls = mock_s3
+        open_store("s3://us-west-2.opendata.source.coop/englacial/zagg/demo/d.zarr")
+        assert s3_cls.call_count == 2, "expected a clean handle and its ACL twin"
+        assert prov_cls.call_count == 1
+        clean, acl = s3_cls.call_args_list
+        assert clean.kwargs["credential_provider"] is prov_cls.return_value
+        assert acl.kwargs["credential_provider"] is prov_cls.return_value
+
     def test_in_account_write_sends_no_acl_header(self, mock_s3):
         # Ambient writes to a bucket we OWN: nothing to hand over, and no
         # client_options are introduced at all. Scoped to ownership, not to
