@@ -11,17 +11,23 @@ from zagg.store import open_object_store, open_store, parse_s3_path
 
 @pytest.fixture
 def mock_s3(monkeypatch):
-    """Patch obstore S3Store / Boto3CredentialProvider / zarr ObjectStore.
+    """Patch obstore S3Store / Boto3CredentialProvider / the zarr adapters.
 
     Returns the (S3Store, Boto3CredentialProvider) mocks so tests can assert
-    on the kwargs ``_open_s3_store`` passes to ``S3Store``.
+    on the kwargs ``_open_s3_store`` passes to ``S3Store``. An external write
+    target builds TWO stores (issue #522: a clean handle and its ACL-bearing
+    twin), so ``call_args`` there is the twin's and ``call_args_list`` holds
+    both, clean first.
     """
     s3_cls = mock.MagicMock(name="S3Store")
     prov_cls = mock.MagicMock(name="Boto3CredentialProvider")
     obj_cls = mock.MagicMock(name="ObjectStore")
     monkeypatch.setattr("obstore.store.S3Store", s3_cls)
     monkeypatch.setattr("obstore.auth.boto3.Boto3CredentialProvider", prov_cls)
-    monkeypatch.setattr("zarr.storage.ObjectStore", obj_cls)
+    # Both zarr adapters are bound as module globals in zagg.store, so they are
+    # patched there rather than on zarr.storage.
+    monkeypatch.setattr("zagg.store.ObjectStore", obj_cls)
+    monkeypatch.setattr("zagg.store._AclWriteObjectStore", mock.MagicMock(name="AclObjectStore"))
     return s3_cls, prov_cls
 
 
@@ -297,10 +303,15 @@ class TestBucketOwnerAcl:
         # obstore rename would leave this class green while the fleet wrote
         # owner-less objects into someone else's bucket. Note the bytes:
         # obstore normalizes header values.
-        from zagg.store import _s3_object_store
+        from zagg.store import _s3_object_store, acl_write_store
 
         s3 = _s3_object_store("s3://external/foo.zarr", credentials=self.CREDS)
-        assert s3.client_options["default_headers"]["x-amz-acl"] == b"bucket-owner-full-control"
+        # The handle the caller holds is clean -- it is the one that lists
+        # (issue #522) -- and the ACL rides its twin.
+        assert s3.client_options is None
+        twin = acl_write_store(s3)
+        assert twin is not s3
+        assert twin.client_options["default_headers"]["x-amz-acl"] == b"bucket-owner-full-control"
 
     def test_a_real_obstore_read_only_store_carries_no_header(self):
         # The issue #223 consumer-input shape, unmocked: no client_options at
@@ -317,6 +328,60 @@ class TestBucketOwnerAcl:
         options = {"default_headers": {"x-custom": "1"}}
         open_store("s3://external/foo.zarr", credentials=self.CREDS, client_options=options)
         assert options == {"default_headers": {"x-custom": "1"}}
+
+
+class TestPutObjectRouting:
+    """Issue #522: object-creating requests, and only those, take the ACL twin."""
+
+    def test_put_object_routes_to_the_twin(self):
+        from zagg.store import _ACL_WRITE_STORE_ATTR, acl_write_store, put_object
+
+        seen = {}
+
+        class FakeStore:
+            pass
+
+        store = FakeStore()
+        twin = FakeStore()
+        setattr(store, _ACL_WRITE_STORE_ATTR, twin)
+        assert acl_write_store(store) is twin
+
+        with mock.patch("obstore.put", lambda s, k, v, **kw: seen.update(store=s, key=k)):
+            put_object(store, "k", b"v")
+        assert seen["store"] is twin
+
+    def test_put_object_is_a_no_op_without_a_twin(self):
+        # In-account and local stores have no twin, so the wrapper is exactly
+        # ``obstore.put`` -- callers never have to know which kind they hold.
+        from zagg.store import put_object
+
+        seen = {}
+
+        class FakeStore:
+            pass
+
+        store = FakeStore()
+        with mock.patch("obstore.put", lambda s, k, v, **kw: seen.update(store=s, kw=kw)):
+            put_object(store, "k", b"v", mode="create")
+        assert seen["store"] is store
+        assert seen["kw"] == {"mode": "create"}
+
+    def test_no_module_calls_obstore_put_directly(self):
+        # The routing only holds if every write goes through put_object. A
+        # direct ``obstore.put`` on a published-bucket handle succeeds and
+        # publishes an object Source Cooperative cannot manage -- silently --
+        # so the seam is enforced here rather than by review.
+        import zagg
+
+        root = Path(zagg.__file__).parent
+        offenders = [
+            f"{path.relative_to(root)}:{n}"
+            for path in sorted(root.rglob("*.py"))
+            if path.name != "store.py"
+            for n, line in enumerate(path.read_text().splitlines(), 1)
+            if "obstore.put(" in line
+        ]
+        assert offenders == [], f"use zagg.store.put_object instead: {offenders}"
 
 
 class TestS3RetryConfig:
@@ -560,8 +625,10 @@ class TestObjectStoreCache:
         open_object_store("s3://bucket/a", credentials=creds)
         open_object_store("s3://bucket/a", credentials=creds)
         # A statically-supplied token must never be cached (it would freeze on a
-        # warm worker) -- each call builds fresh.
-        assert s3_cls.call_count == 2
+        # warm worker) -- each call builds fresh. Two S3Store constructions per
+        # call: explicit credentials against the AWS endpoint are an external
+        # write target, so each store comes with its ACL twin (issue #522).
+        assert s3_cls.call_count == 4
 
     def test_endpoint_bypasses_cache(self, mock_s3):
         s3_cls, _ = mock_s3

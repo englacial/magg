@@ -287,7 +287,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
         write_cover,
     )
     from zagg.grids.morton import morton_words_from_decimals
-    from zagg.store import open_store
+    from zagg.store import open_store, put_object
 
     manifest = read_manifest(store_root, **store_kwargs)
     if manifest is None:
@@ -489,7 +489,7 @@ def refresh_root_coverage(store_root: str, **store_kwargs) -> dict | None:
         time_range=union_time_range(*time_ranges),
         temporal=section,
     )
-    obstore.put(store, ROOT_COVERAGE_NAME, json.dumps(envelope, indent=1).encode())
+    put_object(store, ROOT_COVERAGE_NAME, json.dumps(envelope, indent=1).encode())
     return envelope
 
 
