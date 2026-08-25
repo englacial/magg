@@ -151,3 +151,70 @@ class TestForcedAclDefaultHeader:
         clean = open_object_store(live_prefix)
         keys = [entry["path"] for batch in obstore.list(clean) for entry in batch]
         assert keys == ["probe.txt"]
+
+
+@pytest.fixture
+def published_live(monkeypatch, live_prefix):
+    """Treat the in-account test bucket as a published one, against real S3.
+
+    The regression half of this module: the repro above shows the pre-fix
+    treatment 403ing, and this shows the shipped seam surviving the identical
+    request against the identical bucket, with the ACL still on the writes.
+    """
+    import zagg.store as store_mod
+
+    bucket = store_mod.parse_s3_path(live_prefix)[0]
+    monkeypatch.setattr(store_mod, "_PUBLISHED_BUCKETS", frozenset({bucket}))
+    store_mod._OBJECT_STORE_CACHE.clear()
+    yield live_prefix
+    store_mod._OBJECT_STORE_CACHE.clear()
+
+
+class TestFixedSeamAgainstRealS3:
+    """Issue #522, the shipped fix, exercised on the bucket that rejects it wrong."""
+
+    def test_the_raw_handle_writes_then_lists(self, published_live):
+        import obstore
+
+        from zagg.store import acl_write_store, open_object_store, put_object
+
+        store = open_object_store(published_live)
+        # The handle really is treated as external -- otherwise this test would
+        # pass by never having an ACL in play at all.
+        assert acl_write_store(store) is not store
+
+        put_object(store, "probe.txt", b"issue 522 fixed seam")
+        keys = [entry["path"] for batch in obstore.list(store) for entry in batch]
+        assert keys == ["probe.txt"]
+        assert bytes(obstore.get(store, "probe.txt").bytes()) == b"issue 522 fixed seam"
+
+    def test_a_zarr_store_round_trips(self, published_live):
+        # The worker's own shape: create an array, write a chunk, read it back.
+        # Every one of those steps lists or heads the store, which is what the
+        # fleet died on.
+        import numpy as np
+        import zarr
+
+        from zagg.store import _AclWriteObjectStore, open_store
+
+        zstore = open_store(f"{published_live}/leaf.zarr")
+        assert isinstance(zstore, _AclWriteObjectStore)
+        array = zarr.create_array(
+            store=zstore, name="temp", shape=(4,), chunks=(2,), dtype="i4", zarr_format=3
+        )
+        array[:] = np.arange(4, dtype="i4")
+
+        read_back = zarr.open_array(store=open_store(f"{published_live}/leaf.zarr"), path="temp")
+        assert read_back[:].tolist() == [0, 1, 2, 3]
+
+    def test_the_status_poller_lists_a_published_channel(self, published_live):
+        # The client-side failure: the event transport's poller listing a run's
+        # `.status/` channel. Pre-fix this LIST was the 403.
+        from zagg.client_transport import StatusPoller
+        from zagg.store import open_object_store, put_object
+
+        prefix = f"{published_live}/out.zarr.status/run-e1ebd1c0"
+        put_object(open_object_store(prefix), "shard-0.json", b"{}")
+
+        poller = StatusPoller(store_factory=lambda: open_object_store(prefix), drop_timeout_s=1.0)
+        assert poller._list_keys() == {"shard-0.json"}
