@@ -12,7 +12,10 @@ Standing claims:
 - it is **declaration-driven**: a store still declaring ``/1``, declared-off,
   or ``class: none`` on every field refuses loudly and says re-declare first;
 - **idempotent**: a second pass writes nothing, and a moved declaration or a
-  re-run leaf is not current.
+  re-run leaf is not current. Every one of the gate's verdicts is pinned by a
+  direct call as well as through a pass, because its failure mode is a FALSE
+  SKIP — nothing downstream would notice a store that silently never gets
+  re-columned.
 """
 
 from __future__ import annotations
@@ -563,6 +566,26 @@ class TestBackfill:
                 _plan(off).fields["count"]
             )
             assert _verdict(off, SHARDS[0], fields=fields) == (False, "structure-drift"), moved
+
+    def test_every_verdict_is_reachable_by_name(self, tmp_path, monkeypatch):
+        """One direct call per verdict string, against a real current column."""
+        from zagg.column_backfill import _leaf_stamp
+
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        stamp = _leaf_stamp(str(off), morton_word(SHARDS[0]), None, {})
+        located = {n: dict(m) for n, m in _plan(off).fields.items()}
+        located["h_tdigest"]["location"] = "leaf_id"
+        cases = {
+            "current": {},
+            "absent-or-unstamped": {"column_stamp": None},
+            "declaration-drift": {"resolutions": [5]},
+            "structure-drift": {"fields": located},
+            "stale": {"leaf_stamp": {**stamp, "written_at": "2099-01-01T00:00:00+00:00"}},
+            "granule-drift": {"leaf_stamp": {**stamp, "granule_count": stamp["granule_count"] + 1}},
+        }
+        for reason, over in cases.items():
+            assert _verdict(off, SHARDS[0], **over) == (reason == "current", reason), reason
 
     def test_a_re_run_leaf_is_not_current(self, tmp_path, monkeypatch):
         from zagg.hive import COMMIT_ATTR, shard_leaf_path
