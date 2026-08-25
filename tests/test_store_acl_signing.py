@@ -324,11 +324,13 @@ class TestObstoreDefaultHeaderSigning:
 
     def test_only_the_list_path_leaves_the_acl_unsigned(self, fake_s3):
         # Narrowing the asymmetry, because the fix depends on where the line
-        # falls: keyed GET, HEAD and DELETE all sign the default header (they
-        # are built through object_store's per-key request builder); the
-        # ListObjectsV2 request is the one that does not. That is exactly the
-        # request the fleet died on -- the per-leaf template guard's LIST of
-        # the digit tree, and the status poller's `.status/` listing.
+        # falls. Keyed GET and HEAD sign the default header, and so does the
+        # delete -- which obstore sends not as a keyed DELETE but as a
+        # BUCKET-level bulk `POST /{bucket}?delete` (DeleteObjects). So the
+        # line is not "keyed signs, bucket-level does not": ListObjectsV2 is
+        # the single request that misses. That is exactly the one the fleet
+        # died on -- the per-leaf template guard's LIST of the digit tree, and
+        # the status poller's `.status/` listing.
         import obstore
 
         store = _raw_store(fake_s3, default_headers=ACL_HEADERS)
@@ -337,16 +339,21 @@ class TestObstoreDefaultHeaderSigning:
         obstore.get(store, "k").bytes()
         obstore.head(store, "k")
         list(obstore.list(store))
+        obstore.delete(store, "k")
 
         # Select by unpacking rather than keying a dict: a dict keeps only the
         # last request per verb, so a retry or a stray extra HEAD would vanish
         # from a harness whose whole job is recording what went on the wire.
-        assert len(fake_s3.requests) == 3, fake_s3.requests
+        assert len(fake_s3.requests) == 4, fake_s3.requests
         (keyed_get,) = [r for r in fake_s3.of("GET") if "list-type" not in r.query]
         (listing,) = [r for r in fake_s3.of("GET") if "list-type" in r.query]
         (head,) = fake_s3.of("HEAD")
+        (bulk_delete,) = fake_s3.of("POST")
         assert keyed_get.acl_signed
         assert head.acl_signed
+        assert "delete" in bulk_delete.query and not fake_s3.of("DELETE")
+        assert bulk_delete.acl_signed
+        assert fake_s3.objects == {}  # the bulk delete really deleted
         assert listing.acl == ACL
         assert "x-amz-content-sha256" in listing.signed_headers
         assert not listing.acl_signed
