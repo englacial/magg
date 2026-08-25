@@ -8,7 +8,8 @@ failure WITHOUT touching Source Cooperative: the issue #495 treatment (an
 the signing physics are identical, so the LIST fails the same way.
 
 Skipped unless ``ZAGG_LIVE_S3_PREFIX`` names a writable ``s3://bucket/prefix``
-this account owns, so CI (which has no AWS credentials) never sees it::
+this account owns -- and skipped too if it names a published bucket, which is
+checked, not assumed -- so CI (which has no AWS credentials) never sees it::
 
     AWS_PROFILE=nasa ZAGG_LIVE_S3_PREFIX=s3://sliderule-public/zagg-demo/_acl_repro_20260825 \\
         pytest tests/test_store_acl_live.py -v
@@ -23,9 +24,31 @@ import pytest
 
 LIVE_PREFIX = os.environ.get("ZAGG_LIVE_S3_PREFIX")
 
-pytestmark = pytest.mark.skipif(
-    not LIVE_PREFIX, reason="set ZAGG_LIVE_S3_PREFIX to an owned s3:// prefix to run"
-)
+
+def _names_a_published_bucket() -> bool:
+    """Is ``ZAGG_LIVE_S3_PREFIX`` pointed at a Source Cooperative bucket?
+
+    Makes this module's in-account precondition executable rather than a
+    docstring promise. A published prefix would have the repro writing
+    ACL-bearing objects into the one bucket where stray objects are most
+    expensive, so skip instead of running.
+    """
+    if not LIVE_PREFIX:
+        return False
+    from zagg.store import _PUBLISHED_BUCKETS, parse_s3_path
+
+    return parse_s3_path(LIVE_PREFIX)[0] in _PUBLISHED_BUCKETS
+
+
+pytestmark = [
+    pytest.mark.skipif(
+        not LIVE_PREFIX, reason="set ZAGG_LIVE_S3_PREFIX to an owned s3:// prefix to run"
+    ),
+    pytest.mark.skipif(
+        _names_a_published_bucket(),
+        reason="ZAGG_LIVE_S3_PREFIX must name an IN-ACCOUNT bucket, not a published one",
+    ),
+]
 
 ACL = "bucket-owner-full-control"
 ACL_HEADERS = {"x-amz-acl": ACL}
@@ -40,10 +63,21 @@ def live_prefix():
 
     prefix = f"{LIVE_PREFIX.rstrip('/')}/{uuid.uuid4().hex[:12]}"
     yield prefix
+    # The cleanup handle can list even on a published bucket: since phase 2
+    # ``open_object_store`` always returns the CLEAN store and the canned ACL
+    # rides a twin reached only through ``put_object``, so this LIST is an
+    # ordinary signed request and cannot re-enter the bug under test. The
+    # ``finally`` is belt-and-braces on top of that: whatever was listed before
+    # a mid-stream error still gets deleted, rather than the whole cleanup
+    # being skipped and objects left behind.
     store = open_object_store(prefix)
-    keys = [entry["path"] for batch in obstore.list(store) for entry in batch]
-    for key in keys:
-        obstore.delete(store, key)
+    keys: list[str] = []
+    try:
+        for batch in obstore.list(store):
+            keys.extend(entry["path"] for entry in batch)
+    finally:
+        for key in keys:
+            obstore.delete(store, key)
 
 
 def _forced_acl_store(prefix):
