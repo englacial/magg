@@ -1,5 +1,5 @@
 {
-  "description": "88S reassessment latitude sweep (issue #148): one o9 shard per 0.3-deg latitude band at 85 / 85.5 / 86 / 86.5 / 87 / 87.5 / 88 degrees SOUTH, each run on TWO worker arms -- 4 GB with disk and 8 GB with disk. Every arm is the shipped per-merge sidecar configuration (tdigest, store_layout hive, sidecar read, spill streaming, sharded output, granule_workers=4, no AOI mask) pointed at a ring band instead of the NEON box, so the sweep measures LATITUDE and WORKER SIZE against a pipeline that is otherwise byte-identical to the one that ships. The question it answers is where the tractable band ends: the last recorded fleet result had 85S/8GB completing at 865 s and everything poleward timing out, with the split read 77% / aggregate 22% / write 1% -- read-bound, memory not binding (2.2 GB peak of 8192, spill holding it). Run on demand by explicit --target; this is NOT an every-merge matrix, and a timeout is an expected result here, not a red build.",
+  "description": "88S reassessment latitude sweep (issue #148): one o9 shard per 0.3-deg latitude band at 85 / 85.5 / 86 / 86.5 / 87 / 87.5 / 88 degrees SOUTH, each run on TWO worker arms -- 4 GB with disk and 8 GB with disk. Every arm is the shipped per-merge sidecar configuration (tdigest, store_layout hive, sidecar read, spill streaming, sharded output, granule_workers=4, no AOI mask) pointed at a ring band instead of the NEON box, so the sweep measures LATITUDE and WORKER SIZE against a pipeline that is otherwise byte-identical to the one that ships. The question it answers is where the tractable band ends. Reference result, recorded on zagg 0.36.0 (issue #148, the 2026-07-19 reassessment comment): 85S/8GB completed at 865 s and every band poleward of it timed out, with the winning run splitting read 671 s / aggregate 194 s / write 10 s -- read-bound, memory not binding (2,221 MB peak of 8192, spill holding it). Those figures are a property of that code point, not of the bands: the SAME sweep on 0.35.0 timed out at every band including 85S, and the store-cache fix of issue #287 / PR #288 (675 credential-chain walks per shard down to 1) is what moved it. Re-record them when the sweep is next run. Run on demand by explicit --target; this is NOT an every-merge matrix, and a timeout is an expected result here, not a red build.",
   "temporal": {
     "start": "2018-10-13",
     "end": "2025-06-01",
@@ -25,7 +25,7 @@
         "name": "Antarctic 85S ring"
       },
       "pin": "unpinned",
-      "note": "Band [-85.0, -84.7]. The crossover band on the last fleet run: completed at 865 s / 190M obs on 8 GB with disk, timed out at 4 GB -- the first pole shard ever to fit one worker. UNPINNED here: see _pin_recipe."
+      "note": "Band [-85.0, -84.7]. The crossover band as of zagg 0.36.0 (issue #148, 2026-07-19): completed at 865 s / 189,852,320 obs on 8 GB with disk and timed out at 4 GB -- the first pole shard ever to fit one worker, and on 0.35.0 it did not. UNPINNED here: see _pin_recipe."
     },
     "healpix_o9_85_5s": {
       "aoi": {
@@ -33,7 +33,7 @@
         "name": "Antarctic 85.5S ring"
       },
       "pin": "unpinned",
-      "note": "Band [-85.5, -85.2]. Timed out on both arms on the last fleet run; the granule-concurrency sweep of issue #290 is the lever expected to bring it in. UNPINNED here: see _pin_recipe."
+      "note": "Band [-85.5, -85.2]. Timed out on both arms on 0.36.0; the granule-concurrency sweep of issue #290 is the lever expected to bring it in. UNPINNED here: see _pin_recipe."
     },
     "healpix_o9_86s": {
       "aoi": {
@@ -41,7 +41,7 @@
         "name": "Antarctic 86S ring"
       },
       "pin": "unpinned",
-      "note": "Band [-86.0, -85.7]. Timed out on both arms. UNPINNED here: see _pin_recipe."
+      "note": "Band [-86.0, -85.7]. Timed out on both arms on 0.36.0. UNPINNED here: see _pin_recipe."
     },
     "healpix_o9_86_5s": {
       "aoi": {
@@ -49,7 +49,7 @@
         "name": "Antarctic 86.5S ring"
       },
       "pin": "unpinned",
-      "note": "Band [-86.5, -86.2]. Timed out on both arms. UNPINNED here: see _pin_recipe."
+      "note": "Band [-86.5, -86.2]. Timed out on both arms on 0.36.0. UNPINNED here: see _pin_recipe."
     },
     "healpix_o9_87s": {
       "aoi": {
@@ -57,7 +57,7 @@
         "name": "Antarctic 87S ring"
       },
       "pin": "unpinned",
-      "note": "Band [-87.0, -86.7]. Timed out on both arms. UNPINNED here: see _pin_recipe."
+      "note": "Band [-87.0, -86.7]. Timed out on both arms on 0.36.0. UNPINNED here: see _pin_recipe."
     },
     "healpix_o9_87_5s": {
       "aoi": {
@@ -65,7 +65,7 @@
         "name": "Antarctic 87.5S ring"
       },
       "pin": "unpinned",
-      "note": "Band [-87.5, -87.2]. Timed out on both arms. UNPINNED here: see _pin_recipe."
+      "note": "Band [-87.5, -87.2]. Timed out on both arms on 0.36.0. UNPINNED here: see _pin_recipe."
     },
     "healpix_o9_88s": {
       "path": "shardmaps/sm_healpix_o9_88s.json",
@@ -82,10 +82,10 @@
   "_pin_recipe": {
     "why_unpinned": "A row is dispatchable only once its shard map is built and its densest shard pinned, and the six equatorward bands have no catalog to build from. catalogs/cat_88s.parquet is the CMR result for bbox [-180, -88.0, 180, -87.7] and is NOT a superset of them: every one of its 35,639 granules reaches north of 85S, but a granule that turns at 86S and never reaches 87.7S is simply absent, so an 85S map rebuilt from it would under-count silently rather than fail.",
     "how_to_pin": [
-      "1. Fetch a catalog covering the bands. One union fetch over [-180, -88.0, 180, -84.7] (the union of all seven) prefiltered per band is exact -- complete-ring lat-overlap is an exact test, which is why the ring maps rebuild offline where a box AOI cannot (README, 'Reproducing / re-pinning the NEON maps'). Save it with --catalog-out and point the entry's catalog_parquet at it.",
-      "2. Add path + catalog_parquet to the entry, build the map over the band's own aoi with the recipe in bench_metrics.rebuild_shardmap, and select the pin with bench_metrics.select_pin (densest by granule count, ties to the lowest shard_key).",
-      "3. Prune the written map to the pinned shard and record metadata.pruned -- a full ring map is hundreds of MB of JSON, which is why the 88S maps are committed pruned.",
-      "4. Replace the entry's \"pin\": \"unpinned\" with shard_key + n_granules and move its two targets from pending_targets to targets. test_88s_latitude_sweep asserts the two halves stay consistent, so a half-done pin fails loudly."
+      "(1) Fetch a catalog covering the bands. One union fetch over [-180, -88.0, 180, -84.7] (the union of all seven) prefiltered per band is exact -- complete-ring lat-overlap is an exact test, which is why the ring maps rebuild offline where a box AOI cannot (README, 'Reproducing / re-pinning the NEON maps'). Save it with --catalog-out and point the entry's catalog_parquet at it.",
+      "(2) Add path + catalog_parquet to the entry, build the map over the band's own aoi with the recipe in bench_metrics.rebuild_shardmap, and select the pin with bench_metrics.select_pin (densest by granule count, ties to the lowest shard_key).",
+      "(3) Prune the written map to the pinned shard and record metadata.pruned -- a full ring map is hundreds of MB of JSON, which is why the 88S maps are committed pruned.",
+      "(4) Replace the entry's \"pin\": \"unpinned\" with shard_key + n_granules and move its two targets from pending_targets to targets. test_88s_latitude_sweep asserts the two halves stay consistent, so a half-done pin fails loudly."
     ],
     "open_question": "Where the catalog snapshots live is a size call, not a mechanical one: one union parquet is ~40 MB, seven per-band parquets are ~100 MB, and fetching nothing leaves the sweep re-fetching CMR on every run. Raised on the PR."
   },
