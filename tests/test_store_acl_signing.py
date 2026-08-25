@@ -79,6 +79,7 @@ class FakeS3:
     def __init__(self):
         self.objects: dict[str, bytes] = {}
         self.uploads: dict[str, dict[int, bytes]] = {}
+        self._upload_seq = 0
         self.requests: list[_Recorded] = []
         server = self
         self._lock = threading.Lock()
@@ -170,15 +171,18 @@ class FakeS3:
         # Flat listing only -- obstore.list sends no delimiter, so there is no
         # CommonPrefixes branch to model.
         prefix = (query.get("prefix") or [""])[0]
+        # Sizes are captured with the key set, under one lock: this is a
+        # ThreadingHTTPServer with daemon_threads, so a concurrent PUT or bulk
+        # delete between the two reads would be a KeyError inside a handler.
         with self._lock:
-            contents = sorted(k for k in self.objects if k.startswith(prefix))
+            sizes = {k: len(v) for k, v in self.objects.items() if k.startswith(prefix)}
         root = ET.Element("ListBucketResult", xmlns=_S3_XMLNS)
         ET.SubElement(root, "IsTruncated").text = "false"
-        ET.SubElement(root, "KeyCount").text = str(len(contents))
-        for key in contents:
+        ET.SubElement(root, "KeyCount").text = str(len(sizes))
+        for key in sorted(sizes):
             node = ET.SubElement(root, "Contents")
             ET.SubElement(node, "Key").text = key
-            ET.SubElement(node, "Size").text = str(len(self.objects[key]))
+            ET.SubElement(node, "Size").text = str(sizes[key])
             ET.SubElement(node, "LastModified").text = "2026-08-25T00:00:00.000Z"
             ET.SubElement(node, "ETag").text = '"fake"'
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
@@ -189,7 +193,9 @@ class FakeS3:
         The ``xmlns`` is load-bearing: without it obstore rejects the body with
         ``missing field UploadId`` rather than reading the id back out.
         """
-        upload_id = f"upload-{len(self.requests)}"
+        with self._lock:
+            self._upload_seq += 1
+            upload_id = f"upload-{self._upload_seq}"
         root = ET.Element("InitiateMultipartUploadResult", xmlns=_S3_XMLNS)
         ET.SubElement(root, "Bucket").text = "bkt"
         ET.SubElement(root, "Key").text = key
@@ -227,7 +233,8 @@ class FakeS3:
         return [r for r in self.requests if r.method == method]
 
     def clear(self):
-        self.requests.clear()
+        with self._lock:
+            self.requests.clear()
 
     def close(self):
         self._httpd.shutdown()
