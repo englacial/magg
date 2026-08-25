@@ -2343,6 +2343,25 @@ class TestWeightsDeclaration:
         with pytest.raises(ValueError, match="spec-owned"):
             validate_config(_ragged_cfg(inner_shape=[2], attrs={"weights": "flux"}))
 
+    def test_shipped_gedi_template_refuses_the_pre_424_flat_gain(self):
+        # The seam at TEMPLATE level, which the synthetic cases above do not
+        # reach: take the SHIPPED gedi01b template and revert only its attrs
+        # to the flat pre-#424 keys (gain_name / gain_version / scalar gain)
+        # while `weights: flux` stays declared. validate_config must refuse
+        # it. That mismatch — a declaration whose validator demands a shape
+        # the template does not ship — is the bug this PR's flip had to fix,
+        # and the packaged config is otherwise only ever exercised in its
+        # already-correct form.
+        cfg = default_config("gedi01b_waveform_healpix_hive", validate=False)
+        rx = cfg.aggregation["variables"]["rx_flux"]
+        assert rx["weights"] == "flux"
+        del rx["attrs"]["gain"]
+        rx["attrs"].update(
+            {"gain_name": "unit", "gain_version": "gedi01b-v002-placeholder", "gain": 1.0}
+        )
+        with pytest.raises(ValueError, match="requires calibration provenance"):
+            validate_config(cfg)
+
     def test_signature_carries_weights_only_when_set(self):
         entries = output_field_signature(
             _ragged_cfg(inner_shape=[2], weights="flux", attrs=dict(_FLUX_GAIN))
@@ -3588,14 +3607,6 @@ class TestPackagedConfigsAreDispatchable:
         for name in self._packaged_names():
             cfg = default_config(name)
             json.dumps(asdict(cfg), allow_nan=False)  # must not raise
-
-    def test_every_packaged_config_validates_as_shipped(self):
-        # A packaged template must pass validate_config verbatim — the class
-        # of bug this catches: a declaration whose validator demands a shape
-        # the template does not ship (e.g. `weights: flux` requires the
-        # attrs.gain provenance MAPPING, spec §2.0 / issue #424).
-        for name in self._packaged_names():
-            validate_config(default_config(name, validate=False))
 
     def test_gedi_companions_declare_the_string_form(self):
         cfg = default_config("gedi01b_waveform_healpix_hive")
