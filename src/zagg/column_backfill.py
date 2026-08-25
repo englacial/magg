@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import NamedTuple
 
 from zagg.column import (
@@ -58,10 +59,16 @@ from zagg.column import (
 
 logger = logging.getLogger(__name__)
 
-#: Leaves between lease heartbeats. The pass is one fold + one multi-object
-#: write per leaf, so a store large enough to outlive the TTL is ordinary;
-#: refreshing per leaf would be a PUT per leaf against the intent object.
-HEARTBEAT_EVERY = 64
+#: Share of the lease TTL a beat must land inside — the throttle
+#: :mod:`zagg.sweep_stages` uses, and for the same reason. The beat is thrown
+#: by the WALL CLOCK, never by a leaf count: nothing bounds what one leaf
+#: costs (:func:`zagg.column.write_leaf_column`'s node-order k-way merge is
+#: measured in GB, and this pass reads the whole leaf on top of it), so a
+#: count-based interval is an unenforced assumption about seconds per leaf and
+#: a slow run silently outlives the TTL while still writing (review finding,
+#: issue #520). A ``time.monotonic()`` per leaf costs nothing; a PUT per leaf
+#: against the intent object would not.
+HEARTBEAT_FRACTION = 3
 
 
 def backfill_columns(
@@ -97,8 +104,9 @@ def backfill_columns(
 
     ``lease=False`` skips admission — for callers that already hold the store's
     sweep lease. Otherwise the pass takes it for its whole duration
-    (:mod:`zagg.sweep_lease`), heartbeating every
-    :data:`HEARTBEAT_EVERY` leaves and releasing in a ``finally``.
+    (:mod:`zagg.sweep_lease`), beating on the WALL CLOCK — once a leaf lands
+    more than ``ttl_s`` / :data:`HEARTBEAT_FRACTION` after the last beat — and
+    releasing in a ``finally``.
 
     Returns the family summary the sweep engine records:
     ``written``/``current``/``empty``/``failed`` counts plus the declaration
@@ -106,7 +114,12 @@ def backfill_columns(
     """
     import uuid
 
-    from zagg.sweep_lease import acquire_lease, heartbeat_lease, release_lease
+    from zagg.sweep_lease import (
+        DEFAULT_TTL_S,
+        acquire_lease,
+        heartbeat_lease,
+        release_lease,
+    )
 
     store_kwargs = dict(store_kwargs or {})
     # BEFORE admission: a store that must be re-declared should say so without
@@ -117,14 +130,15 @@ def backfill_columns(
     held = None
     if lease:
         held = acquire_lease(store_root, run_id=run_id, store_kwargs=store_kwargs)
+    beat_after = int((held or {}).get("ttl_s") or DEFAULT_TTL_S) / HEARTBEAT_FRACTION
+    last_beat = time.monotonic()
     try:
-        seen = 0
         for decimal in sorted(by_shard):
             for window in sorted(by_shard[decimal], key=lambda w: (w is not None, w or "")):
                 _backfill_leaf(store_root, decimal, window, plan, counts, store_kwargs, force=force)
-                seen += 1
-                if held is not None and seen % HEARTBEAT_EVERY == 0:
+                if held is not None and time.monotonic() - last_beat >= beat_after:
                     held = heartbeat_lease(store_root, held, store_kwargs=store_kwargs)
+                    last_beat = time.monotonic()
     finally:
         if held is not None:
             release_lease(store_root, run_id=run_id, store_kwargs=store_kwargs)

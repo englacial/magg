@@ -1155,7 +1155,13 @@ re-aggregation. It writes the same artifact under the same discipline, so it
 inherits the single-writer law rather than repealing it, under two conditions
 a reader MAY assume of any store:
 
-- it is serialized against every other sweep by the §4.8 admission lease; and
+- it is serialized against every other sweep by the §4.8 admission lease,
+  held for the whole pass and heartbeated on the **wall clock** (a beat lands
+  within a fixed fraction of `ttl_s` of the last one, however long a single
+  leaf takes). §4.8's expiry rule is the residual and is not repealed here: a
+  holder that stalls past its `ttl_s` without beating is claimable like any
+  other, so what a reader MAY assume is the lease's guarantee, not a stronger
+  one; and
 - it MUST NOT run while an aggregation run may write the same
   `(leaf, window)`. This is the one pass for which §4.8's fleet ∥ sweep
   disjointness does not hold, and no control-plane object can enforce it: it

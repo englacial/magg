@@ -411,12 +411,12 @@ def _twin_block(on_root):
     return read_manifest(str(on_root))["pyramid"]
 
 
-def _backfill(root, **kwargs):
+def _backfill(root, *, shards=SHARDS, **kwargs):
     from zagg.column_backfill import backfill_columns
     from zagg.hive import read_manifest
 
     return backfill_columns(
-        str(root), read_manifest(str(root)), {d: {None} for d in SHARDS}, **kwargs
+        str(root), read_manifest(str(root)), {d: {None} for d in shards}, **kwargs
     )
 
 
@@ -733,6 +733,41 @@ class TestFamilyRegistration:
         acquire_lease(str(off), run_id="live-sweep")
         with pytest.raises(SweepRefusedError, match="live-sweep"):
             _backfill(off)
+
+    def test_the_heartbeat_is_thrown_by_the_clock_not_a_leaf_count(self, tmp_path, monkeypatch):
+        """A slow pass beats inside the TTL however FEW leaves it has run.
+
+        The count-based interval this replaced (``seen % 64``) is an
+        unenforced assumption about seconds per leaf: a two-leaf pass whose
+        leaves each outlast the TTL never beat at all, and kept writing after
+        the intent became claimable (review finding, issue #520). Here the
+        fake clock jumps a full TTL per leaf, so every leaf must beat.
+        """
+        import types
+
+        import zagg.column_backfill as backfill_mod
+        import zagg.sweep_lease as sweep_lease
+
+        off, on = tmp_path / "off", tmp_path / "on"
+        _build_store(off, monkeypatch, pyramid=False, shards=SHARDS[:2])
+        _build_store(on, monkeypatch, shards=SHARDS[:2])
+        _install_pyramid(off, _twin_block(on))
+
+        beats = []
+        real_beat = sweep_lease.heartbeat_lease
+
+        def counting_beat(*args, **kwargs):
+            beats.append(1)
+            return real_beat(*args, **kwargs)
+
+        monkeypatch.setattr(sweep_lease, "heartbeat_lease", counting_beat)
+        ticks = iter(range(0, 10_000 * sweep_lease.DEFAULT_TTL_S, sweep_lease.DEFAULT_TTL_S))
+        monkeypatch.setattr(
+            backfill_mod, "time", types.SimpleNamespace(monotonic=lambda: float(next(ticks)))
+        )
+        summary = _backfill(off, shards=SHARDS[:2])
+        assert summary["written"] == 2
+        assert len(beats) == 2
 
     def test_the_lease_is_released(self, tmp_path, monkeypatch):
         from zagg.sweep_lease import read_lease
