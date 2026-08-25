@@ -104,12 +104,16 @@ def test_band_slug_and_filename_keep_the_committed_naming():
     assert ring.band_slug(85.0) == "85"
 
 
-def test_check_mode_passes_on_the_committed_family_and_writes_nothing(tmp_path):
-    """``--check`` is the guard: it agrees with every committed band, and never writes."""
-    argv = [str(v) for v in SWEEP_LATS]
-    assert ring.main(["--check", *argv]) == 0
-    assert ring.main(["--check", "--out-dir", str(tmp_path), "88"]) == 1
-    assert not list(tmp_path.iterdir())
+def test_check_mode_passes_on_the_committed_family(tmp_path):
+    """``--check`` agrees with every committed band and writes nothing while doing it."""
+    assert ring.main(["--check", *(str(v) for v in SWEEP_LATS)]) == 0
+    assert ring.main(["--check", "--out-dir", str(tmp_path), *(str(v) for v in SWEEP_LATS)]) == 1
+    assert not list(tmp_path.iterdir()), "--check must never write"
+
+
+def test_check_mode_reports_a_band_that_was_never_committed(tmp_path):
+    """A band missing from the tree fails ``--check`` -- the family is incomplete, not fine."""
+    assert ring.main(["--check", "--out-dir", str(tmp_path), "86"]) == 1
 
 
 def test_check_mode_reports_a_band_whose_geometry_moved(tmp_path):
