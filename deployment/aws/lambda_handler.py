@@ -1151,6 +1151,17 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
     run records (the D22 discovery path). Nobody reads this response on the
     Event invoke; errors log and fail open — every rollup is a regenerable
     cache (D9) and ``python -m zagg.sweep`` is the manual backstop.
+
+    ``partition`` and ``families`` are forwarded verbatim (issue #527). The
+    partition block is not decoration: per issue #377 it filters the work set
+    worker-side, **stops the bottom-up walk at the split order**, and defers
+    the ``finish()`` hook — the three things that make concurrent partitions
+    disjoint. Dropping it made a ``discover``-transport partition sweep the
+    WHOLE store in every worker (the CA 2,726-leaf sweep died at the 900 s
+    wall in all 16), and made an inline-partitioned pass write coarse nodes
+    above the split from partial data. ``families`` scopes the pass to a
+    subset of :data:`zagg.sweep.DEFAULT_FAMILIES` (the issue #520 ``columns``
+    backfill is the first caller that needs it).
     """
     from zagg.sweep import discover_leaves, run_sweep
 
@@ -1180,7 +1191,13 @@ def _handle_sweep(event: Dict[str, Any]) -> Dict[str, Any]:
                     }
                 ),
             }
-        summary = run_sweep(event["store_path"], leaves, store_kwargs=store_kwargs)
+        summary = run_sweep(
+            event["store_path"],
+            leaves,
+            store_kwargs=store_kwargs,
+            families=event.get("families"),
+            partition=event.get("partition"),
+        )
         return {
             "statusCode": 200,
             "body": json.dumps(
