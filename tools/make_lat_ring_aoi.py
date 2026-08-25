@@ -83,19 +83,17 @@ def aoi_filename(lat: float) -> str:
 
 
 def sector_ring(
-    lon_beg: float,
-    lon_end: float,
-    lat_south: float,
-    lat_north: float,
-    step: float = LON_STEP_DEG,
+    lon_beg: float, lon_end: float, lat_south: float, lat_north: float
 ) -> list[list[float]]:
     """One sector's closed outer ring: east along the south edge, west back.
 
-    Both edges are sampled every ``step`` degrees of longitude so the filled band
-    tracks the parallels instead of bowing poleward between distant vertices.
+    Both edges are sampled every ``LON_STEP_DEG`` so the filled band tracks the
+    parallels instead of bowing poleward between distant vertices. The spacing is
+    the module constant rather than an argument: the only thing a per-call step
+    could do here is round to a different vertex count than the family shares.
     """
-    n = round((lon_end - lon_beg) / step)
-    lons = [lon_beg + i * step for i in range(n + 1)]
+    n = round((lon_end - lon_beg) / LON_STEP_DEG)
+    lons = [lon_beg + i * LON_STEP_DEG for i in range(n + 1)]
     ring = [[lon, lat_south] for lon in lons]
     ring += [[lon, lat_north] for lon in reversed(lons)]
     ring.append([lon_beg, lat_south])
