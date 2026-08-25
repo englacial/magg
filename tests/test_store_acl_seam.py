@@ -47,6 +47,28 @@ def published(monkeypatch, fake_s3):
     store_mod._OBJECT_STORE_CACHE.clear()
 
 
+@pytest.fixture
+def ambient_credentials(monkeypatch):
+    """Let the AMBIENT branch build without walking the botocore chain.
+
+    ``_s3_store_pair`` constructs a real ``Boto3CredentialProvider`` when no
+    ``credentials``/``endpoint_url`` are passed, and that raises
+    ``ValueError: Received None from session.get_credentials`` wherever there
+    is no AWS identity to find -- which is CI. obstore accepts any zero-arg
+    callable as a credential provider, so a static one keeps the construction
+    assertions exactly as they are while making the test hermetic (it also
+    drops the ~300 ms chain walk these tests otherwise pay locally).
+    """
+    import obstore.auth.boto3
+
+    def static_provider():
+        return {"access_key_id": "A", "secret_access_key": "B", "expires_at": None}
+
+    monkeypatch.setattr(
+        obstore.auth.boto3, "Boto3CredentialProvider", lambda *a, **k: static_provider
+    )
+
+
 def _puts(fake_s3):
     return [r for r in fake_s3.requests if r.method == "PUT"]
 
@@ -159,7 +181,7 @@ class TestTheRequestsThatDied:
         assert poller._list_keys() == {"shard-0.json"}
         assert all(request.acl is None for request in fake_s3.requests)
 
-    def test_an_in_account_handle_is_unchanged(self, monkeypatch):
+    def test_an_in_account_handle_is_unchanged(self, ambient_credentials):
         # The fix must be invisible to every target that never needed the ACL:
         # one handle, no twin, no client_options, and the plain zarr adapter.
         from zarr.storage import ObjectStore
@@ -179,7 +201,7 @@ class TestTheRequestsThatDied:
         zstore = open_store("s3://our-bucket/out.zarr")
         assert type(zstore) is ObjectStore
 
-    def test_a_read_only_published_handle_is_unchanged(self):
+    def test_a_read_only_published_handle_is_unchanged(self, ambient_credentials):
         # ``read_only=True`` was already excluded from the ACL (issue #223), so
         # it must not grow a twin now either.
         from zagg.store import _ACL_WRITE_STORE_ATTR, _s3_object_store
