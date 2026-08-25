@@ -28,6 +28,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+_S3_XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/"
+
 ACL = "bucket-owner-full-control"
 ACL_HEADERS = {"x-amz-acl": ACL}
 
@@ -121,13 +123,20 @@ class FakeS3:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
-            def do_DELETE(self):
+            def do_POST(self):
+                # The two verbs obstore sends as POST. Dispatching them here
+                # (rather than letting BaseHTTPRequestHandler answer a stdlib
+                # 501, which obstore retries ten times over ~4s) keeps the
+                # stand-in fast and legible about what it does not model.
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length)
                 self._record()
-                with server._lock:
-                    server.objects.pop(self._key(), None)
-                self.send_response(204)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                if "uploads" in query:  # CreateMultipartUpload
+                    return self._send(200, server._initiate_upload_xml(self._key()))
+                if "delete" in query:  # DeleteObjects (bucket-level bulk delete)
+                    return self._send(200, server._bulk_delete_xml(body))
+                return self._send(501, b"<Error><Code>NotImplemented</Code></Error>")
 
             def log_message(self, *args):  # silence the stdlib access log
                 pass
@@ -150,7 +159,7 @@ class FakeS3:
                 common.add(prefix + rest.split(delimiter, 1)[0] + delimiter)
             else:
                 contents.append(key)
-        root = ET.Element("ListBucketResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+        root = ET.Element("ListBucketResult", xmlns=_S3_XMLNS)
         ET.SubElement(root, "IsTruncated").text = "false"
         ET.SubElement(root, "KeyCount").text = str(len(contents) + len(common))
         for key in contents:
@@ -161,6 +170,35 @@ class FakeS3:
             ET.SubElement(node, "ETag").text = '"fake"'
         for pfx in sorted(common):
             ET.SubElement(ET.SubElement(root, "CommonPrefixes"), "Prefix").text = pfx
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def _initiate_upload_xml(self, key: str) -> bytes:
+        """Serve ``POST /{bucket}/{key}?uploads`` -- CreateMultipartUpload.
+
+        The ``xmlns`` is load-bearing: without it obstore rejects the body with
+        ``missing field UploadId`` rather than reading the id back out.
+        """
+        upload_id = f"upload-{len(self.requests)}"
+        root = ET.Element("InitiateMultipartUploadResult", xmlns=_S3_XMLNS)
+        ET.SubElement(root, "Bucket").text = "bkt"
+        ET.SubElement(root, "Key").text = key
+        ET.SubElement(root, "UploadId").text = upload_id
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def _bulk_delete_xml(self, body: bytes) -> bytes:
+        """Serve ``POST /{bucket}?delete`` -- what ``obstore.delete`` sends."""
+        # obstore namespaces the request body, so match on the local name.
+        keys = [
+            node.text or ""
+            for node in ET.fromstring(body).iter()
+            if node.tag.rpartition("}")[2] == "Key"
+        ]
+        with self._lock:
+            for key in keys:
+                self.objects.pop(key, None)
+        root = ET.Element("DeleteResult", xmlns=_S3_XMLNS)
+        for key in keys:
+            ET.SubElement(ET.SubElement(root, "Deleted"), "Key").text = key
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     def of(self, method: str) -> list[_Recorded]:
