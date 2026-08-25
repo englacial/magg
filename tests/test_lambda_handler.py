@@ -1858,27 +1858,52 @@ class TestPingMode:
         assert body["probe_delete"] is False
         assert body["probe_key"] == f"s3://bucket/out.zarr.status/{calls['key']}"
 
+    def test_ping_probe_writes_through_the_acl_bearing_handle(self, handler_mod, monkeypatch):
+        # Issue #522: open_object_store hands back the CLEAN handle and the
+        # canned ACL rides a twin reachable only through zagg.store.put_object.
+        # A direct obstore.put here would strand the probe object owner-less
+        # AND stop proving s3:PutObjectAcl -- so the preflight would pass a
+        # grant that 403s on every real write, the "discovered after the
+        # compute" shape it exists to eliminate. The DELETE stays on the clean
+        # handle deliberately (an ACL means nothing on a delete).
+        calls = self._patch_probe(handler_mod, monkeypatch)
+        resp = handler_mod._handle_ping({"mode": "ping", "store_path": "s3://bucket/out.zarr"})
+        assert resp["statusCode"] == 200, resp["body"]
+        assert calls["put_store"] is calls["acl_twin"]
+        assert calls["delete_store"] is calls["clean"]
+
     @staticmethod
     def _patch_probe(handler_mod, monkeypatch, put_error=None, delete_error=None):
-        """Capture the probe's obstore traffic without touching S3."""
+        """Capture the probe's obstore traffic without touching S3.
+
+        The handle handed back mimics an external target after issue #522: the
+        CLEAN store, with the ACL-bearing twin attached under
+        ``zagg.store._ACL_WRITE_STORE_ATTR``. Both are recorded, so which of
+        the two each request lands on is observable rather than assumed.
+        """
         import obstore
 
         import zagg.store as zagg_store
 
-        calls: dict = {"put": [], "deleted": []}
+        clean = MagicMock(name="probe_store")
+        acl_twin = MagicMock(name="probe_store_acl_twin")
+        setattr(clean, zagg_store._ACL_WRITE_STORE_ATTR, acl_twin)
+        calls: dict = {"put": [], "deleted": [], "clean": clean, "acl_twin": acl_twin}
 
         def _open(prefix, **kwargs):
             calls["prefix"] = prefix
             calls["store_kwargs"] = kwargs
-            return MagicMock(name="probe_store")
+            return clean
 
-        def _put(store, key, payload):
+        def _put(store, key, payload, **kwargs):
             calls["key"] = key
+            calls["put_store"] = store
             if put_error is not None:
                 raise put_error
             calls["put"].append((key, payload))
 
         def _delete(store, key):
+            calls["delete_store"] = store
             if delete_error is not None:
                 raise delete_error
             calls["deleted"].append(key)
@@ -2096,16 +2121,33 @@ class TestOutputStoreAcl:
     the worker opens from an event, and must NOT appear on in-account writes."""
 
     @staticmethod
-    def _s3_kwargs(handler_mod, monkeypatch, event):
+    def _s3_calls(handler_mod, monkeypatch, event):
+        """Every ``S3Store`` construction ``open_store`` makes for ``event``.
+
+        Indexed by ROLE rather than by recency: ``_s3_store_pair`` ends in
+        ``return build(read_options), build(write_options)`` and tuple elements
+        evaluate left to right, so ``[0]`` is the clean handle the worker is
+        handed back and ``[-1]`` is the ACL-bearing twin. An in-account target
+        builds one handle and the two indices coincide. Returning the list
+        rather than ``call_args`` keeps a reshaped return from silently
+        inverting which handle a test is asserting about.
+
+        ``_AclWriteObjectStore`` is mocked out (as in
+        ``tests/test_store.py::mock_s3``), so no test in this class exercises
+        the real subclass: what is pinned here is which headers each handle is
+        CONSTRUCTED with. Write routing -- that ``set``/``set_if_not_exists``
+        reach the twin -- lives in ``tests/test_store_acl_seam.py``.
+        """
         s3_cls = MagicMock(name="S3Store")
         monkeypatch.setattr("obstore.store.S3Store", s3_cls)
-        monkeypatch.setattr("zarr.storage.ObjectStore", MagicMock(name="ObjectStore"))
+        # Both zarr adapters are bound as module globals in zagg.store.
+        monkeypatch.setattr("zagg.store.ObjectStore", MagicMock(name="ObjectStore"))
+        monkeypatch.setattr("zagg.store._AclWriteObjectStore", MagicMock(name="AclObjectStore"))
         monkeypatch.setattr("obstore.auth.boto3.Boto3CredentialProvider", MagicMock())
         from zagg.store import open_store
 
         open_store(event["store_path"], **handler_mod._output_store_kwargs(event))
-        _, kwargs = s3_cls.call_args
-        return kwargs
+        return s3_cls.call_args_list
 
     def test_output_credentials_event_sets_the_canned_acl(self, handler_mod, monkeypatch):
         event = {
@@ -2116,15 +2158,84 @@ class TestOutputStoreAcl:
                 "sessionToken": "tok",
             },
         }
-        kwargs = self._s3_kwargs(handler_mod, monkeypatch, event)
-        assert kwargs["client_options"]["default_headers"] == {
+        # An external target builds two handles (issue #522).
+        calls = self._s3_calls(handler_mod, monkeypatch, event)
+        assert len(calls) == 2
+        # The handle the worker HOLDS is the clean one. This is the half issue
+        # #522 is about: it is the handle that LISTs, and an unsigned
+        # x-amz-acl on ListObjectsV2 is the 403 that killed the worker.
+        assert calls[0].kwargs.get("client_options") is None
+        assert calls[-1].kwargs["client_options"]["default_headers"] == {
             "x-amz-acl": "bucket-owner-full-control"
         }
 
     def test_execution_role_event_sends_no_acl(self, handler_mod, monkeypatch):
         event = {"store_path": "s3://our-bucket/out.zarr"}
-        kwargs = self._s3_kwargs(handler_mod, monkeypatch, event)
-        assert "client_options" not in kwargs
+        calls = self._s3_calls(handler_mod, monkeypatch, event)
+        assert len(calls) == 1
+        assert "client_options" not in calls[0].kwargs
+
+
+class TestWriteResultAcl:
+    """Issue #522: the async result envelope rides the ACL-bearing handle.
+
+    ``_write_result`` puts one object per shard under ``<store>.status/`` --
+    2,726 of them on a full run, on the published bucket. ``open_object_store``
+    returns the clean handle now, so a direct ``obstore.put`` would land every
+    one of them owner-less with no 403 and nothing in CloudWatch: the silent
+    shape, not the loud one.
+    """
+
+    def test_result_envelope_goes_through_the_acl_handle(self, handler_mod, monkeypatch):
+        import obstore
+
+        import zagg.store as zagg_store
+
+        clean = MagicMock(name="result_store")
+        acl_twin = MagicMock(name="result_store_acl_twin")
+        setattr(clean, zagg_store._ACL_WRITE_STORE_ATTR, acl_twin)
+        seen: dict = {}
+
+        def _open(prefix, **kwargs):
+            seen["prefix"] = prefix
+            return clean
+
+        def _put(store, key, payload, **kwargs):
+            seen.update(store=store, key=key, payload=payload)
+
+        monkeypatch.setattr(zagg_store, "open_object_store", _open)
+        monkeypatch.setattr(obstore, "put", _put)
+
+        url = "s3://us-west-2.opendata.source.coop/e/z/d.zarr.status/run-1/shard-2.json"
+        event = {"store_path": "s3://us-west-2.opendata.source.coop/e/z/d.zarr"}
+        assert handler_mod._write_result(url, {"statusCode": 200}, event) is True
+        assert seen["prefix"] == "s3://us-west-2.opendata.source.coop/e/z/d.zarr.status/run-1"
+        assert seen["key"] == "shard-2.json"
+        assert json.loads(seen["payload"]) == {"statusCode": 200}
+        assert seen["store"] is acl_twin
+
+    def test_in_account_target_writes_through_the_only_handle(self, handler_mod, monkeypatch):
+        # No twin attached (in-account bucket): put_object falls through to the
+        # store the caller holds, so the envelope still lands.
+        import obstore
+
+        import zagg.store as zagg_store
+
+        clean = MagicMock(name="result_store")
+        # A bare MagicMock would auto-create _zagg_acl_write_store; the real
+        # in-account handle has no such attribute.
+        delattr_target = zagg_store._ACL_WRITE_STORE_ATTR
+        clean.mock_add_spec(["put"])
+        assert not hasattr(clean, delattr_target)
+        seen: dict = {}
+
+        monkeypatch.setattr(zagg_store, "open_object_store", lambda prefix, **kw: clean)
+        monkeypatch.setattr(
+            obstore, "put", lambda store, key, payload, **kw: seen.update(store=store)
+        )
+
+        assert handler_mod._write_result("s3://b/o.zarr.status/r/s.json", {"ok": 1}, {}) is True
+        assert seen["store"] is clean
 
 
 class TestProcessEventMode:

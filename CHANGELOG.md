@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- the sweep Lambda handler forwards the `partition` and `families` blocks (#527)
+  ([#528](https://github.com/englacial/zagg/pull/528))
+  - `_handle_sweep` dropped both blocks on the floor, so a fleet `mode="sweep"`
+    invoke could never be partitioned and could never be scoped to a family
+    subset — `run_sweep` has accepted both since #377/#520, but nothing
+    worker-side ever received them. On the `discover` transport every
+    "partition" worker therefore derived and swept the WHOLE store; the CA
+    ATL03 toc/overview sweep died at the 900 s wall in all 16 workers with
+    nothing written. On the inline transport a partitioned pass walked to the
+    root with only its own subset, so nodes above the split order were written
+    from partial data by racing workers.
+  - Absent keys forward as `None`, so an unpartitioned invoke is behaviourally
+    unchanged. This adds reach, not new behaviour.
+  - Operator note: a partitioned pass writes nothing below the split order and
+    defers `finish()`, so the root `coverage.moc`/`coverage.toc` and the
+    manifest `pyramid.materialized` update are still owed by a subsequent
+    partition-less pass. Pick the width so that
+    `leaves x s_per_leaf / partitions < 900 s`, rounded up to a power of four.
+- published-bucket store handles no longer 403 on reads: the canned ACL rides a
+  separate write handle (#522) ([#523](https://github.com/englacial/zagg/pull/523))
+  - The `x-amz-acl: bucket-owner-full-control` header that issue #495 attached
+    to Source Cooperative handles rode obstore's `client_options.default_headers`,
+    and obstore signs default headers on every request except `ListObjectsV2`.
+    S3 rejects an unsigned `x-amz-acl` outright, so every handle that both
+    published and listed died on its first LIST — the per-leaf template guard
+    and the client status poller included, which blocked all source.coop fleet
+    builds and sweeps.
+  - `zagg.store` now opens two handles for such a target: the one callers hold is
+    clean, and an ACL-bearing twin takes the object-creating requests.
+    `open_store` returns a Zarr store that routes its own writes; raw-obstore
+    writes go through the new `zagg.store.put_object`. Ownership semantics are
+    unchanged — every write still carries `bucket-owner-full-control`, signed.
+  - Reads through `open_object_store` with explicit credentials (the issue #223
+    consumer-input channel, e.g. `temporal.open_dataset`'s NetCDF branch) now
+    send no ACL header at all rather than an inert one.
 - column backfill for pre-column stores: the `/1 -> /2` upgrade bridge ([#520](https://github.com/englacial/zagg/issues/520))
   - A store built before its aggregation fields were declared composable has no
     leaf columns, so it cannot take the `zagg-pyramid/2` staged sweep. A new
@@ -15,10 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     **without re-aggregation**, at the cost of one leaf-reading pass. Being a
     registry entry it needs no new transport or mode — the work-set
     normalization, `--partitions` and discovery are inherited — and it runs
-    in-process today, from the CLI or `run_sweep(families=["columns"])`;
-    fleet execution additionally needs the Lambda handler's sweep arm to
-    forward `families`/`partition` from the event, which is
-    [#519](https://github.com/englacial/zagg/issues/519)'s change. It is
+    in-process from the CLI or `run_sweep(families=["columns"])`, and
+    worker-side too since the handler's sweep arm began forwarding
+    `families`/`partition` from the event
+    ([#528](https://github.com/englacial/zagg/pull/528)). It is
     declaration-driven (a store still declaring `/1`, declared off,
     or `class: "none"` on every field is refused by name and must be
     re-declared first), idempotent, and takes the sweep-admission lease.

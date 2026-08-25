@@ -258,10 +258,13 @@ Resources:
               # the bucket is versioned, so a delete leaves a marker rather
               # than destroying bytes.
               #
-              # PutObjectAcl is load-bearing, not incidental: every write to
-              # this bucket carries x-amz-acl: bucket-owner-full-control
-              # (zagg.store._PUBLISHED_BUCKETS), which S3 evaluates against
-              # s3:PutObjectAcl on both PutObject and CreateMultipartUpload —
+              # PutObjectAcl is load-bearing, not incidental: every WRITE to
+              # this bucket carries x-amz-acl: bucket-owner-full-control —
+              # writes only, signed: since issue #522 the ACL rides the write
+              # handle alone, and reads/lists/deletes use a clean handle
+              # (zagg.store._PUBLISHED_BUCKETS / _s3_store_pair). S3 evaluates
+              # the header against s3:PutObjectAcl on both PutObject and
+              # CreateMultipartUpload —
               # without it the first published PUT is AccessDenied. It is
               # granted HERE ONLY: the header is not sent to our own output
               # bucket or to sliderule-public-cors, whose bucket policy is not

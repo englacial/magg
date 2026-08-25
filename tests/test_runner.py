@@ -5,6 +5,7 @@ import json
 import re
 import warnings
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -2390,7 +2391,9 @@ def _patch_tabular_s3(monkeypatch):
     def _fake_s3store(bucket, **opts):
         captured["bucket"] = bucket
         captured["opts"] = opts
-        return object()
+        # SimpleNamespace, not object(): zagg.store hangs the ACL twin off the
+        # store it builds (issue #522), which needs a __dict__.
+        return SimpleNamespace()
 
     def _fake_put(store, key, payload):
         captured["key"] = key

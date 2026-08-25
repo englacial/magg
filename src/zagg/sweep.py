@@ -447,10 +447,9 @@ def write_leaf_submap(
     (the same fields ``reproject`` strips from derived maps). Written by the
     worker on success, sibling to the stats sidecar — call sites fail open.
     """
-    import obstore
 
     from zagg.hive import _utcnow, shard_leaf_path
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     entries = [dict(g) for g in granules]
     meta = dict(metadata or {})
@@ -477,7 +476,7 @@ def write_leaf_submap(
     }
     leaf = shard_leaf_path(store_root, int(shard_key), window=window)
     prefix, _, name = leaf.rstrip("/").rpartition("/")
-    obstore.put(
+    put_object(
         open_object_store(prefix, **(store_kwargs or {})),
         submap_key(name, spec),
         json.dumps(payload, indent=1).encode(),
@@ -860,14 +859,14 @@ def _write_sweep_record(store, summary: dict) -> str | None:
     """
     from datetime import datetime, timezone
 
-    import obstore
+    from zagg.store import put_object
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     part = summary.get("partition")
     tag = "" if part is None else f"_p{part['index']}of{part['of']}"
     key = f"sweep_stats_{ts}{tag}.json"
     try:
-        obstore.put(store, key, json.dumps({"spec": SWEEP_SPEC, **summary}, indent=1).encode())
+        put_object(store, key, json.dumps({"spec": SWEEP_SPEC, **summary}, indent=1).encode())
     except Exception as e:
         logger.warning(f"sweep: run record write failed (fail-open, D9 — telemetry): {e}")
         return None
@@ -1122,9 +1121,9 @@ def _read_rollup(store, fam, decimal: str) -> dict | None:
 
 
 def _put_rollup(store, fam, decimal: str, envelope: dict) -> None:
-    import obstore
+    from zagg.store import put_object
 
-    obstore.put(store, _rollup_key(fam, decimal), json.dumps(envelope, indent=1).encode())
+    put_object(store, _rollup_key(fam, decimal), json.dumps(envelope, indent=1).encode())
 
 
 # ---------------------------------------------------------------------------

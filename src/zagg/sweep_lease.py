@@ -122,13 +122,13 @@ def acquire_lease(
     import obstore
     from obstore.exceptions import AlreadyExistsError
 
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     store_kwargs = dict(store_kwargs or {})
     store = open_object_store(store_root, **store_kwargs)
     lease = _payload(run_id, scope, ttl_s)
     try:
-        obstore.put(store, LEASE_NAME, json.dumps(lease, indent=1).encode(), mode="create")
+        put_object(store, LEASE_NAME, json.dumps(lease, indent=1).encode(), mode="create")
         return lease
     except AlreadyExistsError:
         pass
@@ -163,7 +163,7 @@ def acquire_lease(
     if prior is not None:
         claim["claimed_from"] = prior
     try:
-        obstore.put(store, LEASE_NAME, json.dumps(claim, indent=1).encode(), mode="create")
+        put_object(store, LEASE_NAME, json.dumps(claim, indent=1).encode(), mode="create")
     except AlreadyExistsError:
         pass
     verify = read_lease(store_root, store_kwargs=store_kwargs)
@@ -177,9 +177,8 @@ def acquire_lease(
 
 def heartbeat_lease(store_root: str, lease: dict, *, store_kwargs: dict | None = None) -> dict:
     """Refresh the holder's heartbeat; refuse if the intent is no longer ours."""
-    import obstore
 
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     store_kwargs = dict(store_kwargs or {})
     current = read_lease(store_root, store_kwargs=store_kwargs)
@@ -193,7 +192,7 @@ def heartbeat_lease(store_root: str, lease: dict, *, store_kwargs: dict | None =
     from zagg.hive import _utcnow
 
     fresh["heartbeat_at"] = _utcnow()
-    obstore.put(
+    put_object(
         open_object_store(store_root, **store_kwargs),
         LEASE_NAME,
         json.dumps(fresh, indent=1).encode(),

@@ -610,10 +610,9 @@ def _update_manifest_pyramid(store_root, folded: dict, store_kwargs) -> bool:
     earlier one, and the declaration is what the NEXT sweep applies, never a
     claim about what is on disk.
     """
-    import obstore
 
     from zagg.hive import MANIFEST_NAME, _utcnow, read_manifest
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     try:
         fresh = read_manifest(store_root, **store_kwargs)
@@ -629,7 +628,7 @@ def _update_manifest_pyramid(store_root, folded: dict, store_kwargs) -> bool:
             "fold_sources": sources,
             "generated_at": _utcnow(),
         }
-        obstore.put(
+        put_object(
             open_object_store(store_root, **store_kwargs),
             MANIFEST_NAME,
             json.dumps(fresh, indent=1).encode(),
@@ -703,11 +702,10 @@ def declare_pyramid(
     grouped form, issue #382) under ``/2``. An empty ``orders`` is ``/1``'s
     declared-off signal, so a ``/2`` summary must not carry the key at all.
     """
-    import obstore
 
     from zagg.hive import MANIFEST_NAME, _frozen_matches, read_manifest
     from zagg.pyramid import retrofit_declaration
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     store_kwargs = dict(store_kwargs or {})
     manifest = read_manifest(store_root, **store_kwargs)
@@ -831,7 +829,7 @@ def declare_pyramid(
         logger.info("declare_pyramid: the manifest already carries this declaration; no write")
         return summary
     fresh["pyramid"] = block
-    obstore.put(
+    put_object(
         open_object_store(store_root, **store_kwargs),
         MANIFEST_NAME,
         json.dumps(fresh, indent=1).encode(),
@@ -1186,7 +1184,7 @@ def sweep_overviews(
     (nothing is folded, so nothing is deferred).
     """
     from zagg.pyramid import PYRAMID_SPEC_V2
-    from zagg.store import open_object_store
+    from zagg.store import open_object_store, put_object
 
     store_kwargs = dict(store_kwargs or {})
     counts: dict = {
@@ -1323,9 +1321,7 @@ def sweep_overviews(
                 "windows": entries,
             }
             if entries and fresh != envelope:
-                import obstore
-
-                obstore.put(
+                put_object(
                     store,
                     f"{_node_rel(node)}/{ENVELOPE_NAME}",
                     json.dumps(fresh, indent=1).encode(),
