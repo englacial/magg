@@ -57,7 +57,9 @@ SWEEP_SPEC = "zagg-sweep/1"
 #: Families swept when the caller does not choose (the four D22 families).
 #: ``moc`` deliberately precedes ``overview``: the overview fold discovers
 #: untouched sibling shards through the root ``coverage.moc``, which the MOC
-#: family refreshes earlier in the same pass.
+#: family refreshes earlier in the same pass. The registered ``columns``
+#: family (issue #520) is deliberately absent: backfilling leaf columns is an
+#: explicit upgrade of a quiesced store, never a routine rollup's side effect.
 DEFAULT_FAMILIES = ("stats", "moc", "submap", "overview")
 
 #: Grid types already warned about as unsupported leaf sub-maps (once-ish, so a
@@ -670,6 +672,33 @@ class OverviewFamily(SweepFamily):
         )
 
 
+class ColumnFamily(SweepFamily):
+    """Leaf-column BACKFILL for pre-column stores (issue #520, the /1 -> /2 bridge).
+
+    The one family that writes a LEAF artifact rather than an ancestor
+    rollup: it recomputes each committed leaf's issue #383 column from that
+    leaf's own stored bytes, so a store built before the D24 classifiers
+    admitted its fields can take the ``/2`` staged sweep without
+    re-aggregation. Like the overview family it overrides :attr:`sweep_store`
+    (its artifact is a zarr, not a per-node JSON rollup); the implementation
+    lives in :mod:`zagg.column_backfill`, which also owns the declaration
+    gate and the sweep lease it takes.
+
+    Deliberately OUT of :data:`DEFAULT_FAMILIES`: a backfill is an explicit
+    upgrade operation on a quiesced store, never something a routine rollup
+    sweep does behind an operator's back. Spell it — ``--families columns``.
+    """
+
+    name = "columns"
+
+    def sweep_store(self, store_root, manifest, by_shard, store_kwargs, min_order=0) -> dict:
+        from zagg.column_backfill import backfill_columns
+
+        return backfill_columns(
+            store_root, manifest, by_shard, store_kwargs=store_kwargs, min_order=min_order
+        )
+
+
 class DebrisFamily(SweepFamily):
     """Debris collection (D22 optional audit-class fifth family) — stub."""
 
@@ -684,7 +713,8 @@ class DebrisFamily(SweepFamily):
 #: Family registry (D22's plug-in point): name -> class. Unavailable entries
 #: are visible slots that :func:`get_family` refuses with their ``reason``.
 FAMILIES: dict[str, type[SweepFamily]] = {
-    cls.name: cls for cls in (StatsFamily, MocFamily, SubmapFamily, OverviewFamily, DebrisFamily)
+    cls.name: cls
+    for cls in (StatsFamily, MocFamily, SubmapFamily, OverviewFamily, ColumnFamily, DebrisFamily)
 }
 
 

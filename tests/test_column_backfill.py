@@ -54,12 +54,20 @@ def _build_store(root, monkeypatch, *, pyramid=None, shards=SHARDS, kitchen_sink
     artifacts the unit writes — which is what makes the phase 4 twins
     comparable.
     """
+    from dataclasses import replace
+
     import zagg.processing as processing
     from zagg import hive
     from zagg.grids import HealpixGrid
 
     gen = _generator()
     cfg = gen._config(kitchen_sink=kitchen_sink, pyramid=pyramid)
+    # The generator's config declares no ``data_source.variables``; the fake
+    # reader never needs them, but ``load_config`` (the CLI retrofit path)
+    # validates every ``source:`` against them, and data_source IS in the
+    # semantic core — so the store must be BUILT with them for a retrofit
+    # config to hash identically.
+    cfg = replace(cfg, data_source={**cfg.data_source, "variables": {"h": "g/h"}})
     grid = HealpixGrid(4, 6, layout="fullsphere", config=cfg, chunk_inner=5, sharded=True)
     root.mkdir(parents=True, exist_ok=True)
     hive.ensure_manifest(
@@ -271,3 +279,252 @@ class TestStoredLeafParity:
                 cell_order=plan.cell_order,
                 n_cells=4 ** (plan.cell_order - plan.node_order),
             )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: the backfill arm — a sweep family, declaration-driven, idempotent.
+# ---------------------------------------------------------------------------
+
+
+def _install_pyramid(root, block):
+    """Hand-install a manifest pyramid block (phase 3 does this properly)."""
+    from zagg.hive import MANIFEST_NAME
+
+    path = root / MANIFEST_NAME
+    manifest = json.loads(path.read_text())
+    if block is None:
+        manifest.pop("pyramid", None)
+    else:
+        manifest["pyramid"] = block
+    path.write_text(json.dumps(manifest, indent=1))
+    return manifest
+
+
+def _twin_block(on_root):
+    from zagg.hive import read_manifest
+
+    return read_manifest(str(on_root))["pyramid"]
+
+
+def _backfill(root, **kwargs):
+    from zagg.column_backfill import backfill_columns
+    from zagg.hive import read_manifest
+
+    return backfill_columns(
+        str(root), read_manifest(str(root)), {d: {None} for d in SHARDS}, **kwargs
+    )
+
+
+class TestDeclarationGate:
+    def test_v1_schedule_refuses_and_says_re_declare(self, tmp_path, monkeypatch):
+        root = tmp_path / "off"
+        _build_store(root, monkeypatch, pyramid={"orders": [3, 2]}, shards=SHARDS[:1])
+        with pytest.raises(ValueError, match="RE-DECLARE FIRST"):
+            _backfill(root)
+
+    def test_declared_off_refuses(self, tmp_path, monkeypatch):
+        root = tmp_path / "off"
+        _build_store(root, monkeypatch, pyramid=False, shards=SHARDS[:1])
+        with pytest.raises(ValueError, match="RE-DECLARE FIRST"):
+            _backfill(root)
+
+    def test_all_none_class_fields_refuse(self, tmp_path, monkeypatch):
+        """The CA ATL03 case: a /2 block whose every field classified `none`."""
+        root = tmp_path / "on"
+        on = tmp_path / "twin"
+        _build_store(root, monkeypatch, pyramid=False, shards=SHARDS[:1])
+        _build_store(on, monkeypatch, shards=SHARDS[:1])
+        block = _twin_block(on)
+        block["overview"]["fields"] = {n: {"class": "none"} for n in block["overview"]["fields"]}
+        _install_pyramid(root, block)
+        with pytest.raises(ValueError, match="class `none`"):
+            _backfill(root)
+
+    def test_absent_block_refuses(self, tmp_path, monkeypatch):
+        root = tmp_path / "off"
+        _build_store(root, monkeypatch, pyramid=False, shards=SHARDS[:1])
+        _install_pyramid(root, None)
+        with pytest.raises(ValueError, match="RE-DECLARE FIRST"):
+            _backfill(root)
+
+    def test_gate_refuses_before_taking_the_lease(self, tmp_path, monkeypatch):
+        from zagg.sweep_lease import read_lease
+
+        root = tmp_path / "off"
+        _build_store(root, monkeypatch, pyramid=False, shards=SHARDS[:1])
+        with pytest.raises(ValueError):
+            _backfill(root)
+        assert read_lease(str(root)) is None
+
+
+class TestBackfill:
+    def _upgraded(self, tmp_path, monkeypatch, *, kitchen_sink=False):
+        """A pyramid-OFF store, re-declared from its pyramid-ON twin."""
+        off, on = tmp_path / "off", tmp_path / "on"
+        _build_store(off, monkeypatch, pyramid=False, kitchen_sink=kitchen_sink)
+        _build_store(on, monkeypatch, kitchen_sink=kitchen_sink)
+        _install_pyramid(off, _twin_block(on))
+        return off, on
+
+    @pytest.mark.parametrize("kitchen_sink", [False, True])
+    def test_backfilled_columns_match_the_pyramid_on_twin(
+        self, tmp_path, monkeypatch, kitchen_sink
+    ):
+        off, on = self._upgraded(tmp_path, monkeypatch, kitchen_sink=kitchen_sink)
+        for decimal in SHARDS:
+            assert not _column_path(off, decimal).exists()
+        summary = _backfill(off)
+        assert summary["written"] == len(SHARDS)
+        assert summary["current"] == summary["empty"] == summary["failed"] == 0
+        assert summary["resolutions"] == [5, 4]
+        for decimal in SHARDS:
+            a = _objects(_column_path(on, decimal))
+            b = _objects(_column_path(off, decimal))
+            assert set(a) == set(b)
+            for key in a:
+                if key == "zarr.json":
+                    assert _sans_timestamps(a[key]) == _sans_timestamps(b[key])
+                else:
+                    assert a[key] == b[key], (decimal, key)
+
+    def test_second_pass_writes_nothing(self, tmp_path, monkeypatch):
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        before = {d: _objects(_column_path(off, d)) for d in SHARDS}
+        summary = _backfill(off)
+        assert summary["current"] == len(SHARDS) and summary["written"] == 0
+        assert {d: _objects(_column_path(off, d)) for d in SHARDS} == before
+
+    def test_force_rewrites_a_current_column(self, tmp_path, monkeypatch):
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        summary = _backfill(off, force=True)
+        assert summary["written"] == len(SHARDS) and summary["current"] == 0
+
+    def test_declaration_drift_is_not_current(self, tmp_path, monkeypatch):
+        """A narrowed declaration must not leave the wider column standing."""
+        off, on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        block = _twin_block(on)
+        block["overview"]["fields"] = {
+            n: m for n, m in block["overview"]["fields"].items() if n != "h_tdigest"
+        }
+        _install_pyramid(off, block)
+        summary = _backfill(off)
+        assert summary["written"] == len(SHARDS)
+        column = zarr.open_group(
+            open_store(str(_column_path(off, SHARDS[0])), read_only=True),
+            path="5",
+            mode="r",
+            zarr_format=3,
+        )
+        assert "h_tdigest" not in dict(column.arrays())
+
+    def test_a_re_run_leaf_is_not_current(self, tmp_path, monkeypatch):
+        from zagg.hive import COMMIT_ATTR, shard_leaf_path
+
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        leaf = shard_leaf_path(str(off), morton_word(SHARDS[0]))
+        group = zarr.open_group(open_store(leaf), path="", mode="r+", zarr_format=3)
+        stamp = dict(group.attrs[COMMIT_ATTR])
+        stamp["written_at"] = "2099-01-01T00:00:00+00:00"
+        group.attrs[COMMIT_ATTR] = stamp
+        summary = _backfill(off)
+        assert summary["written"] == 1 and summary["current"] == len(SHARDS) - 1
+
+    def test_a_changed_granule_count_is_not_current(self, tmp_path, monkeypatch):
+        """The same-second backstop: the column copies the LEAF's count."""
+        from zagg.hive import COMMIT_ATTR, shard_leaf_path
+
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        _backfill(off)
+        leaf = shard_leaf_path(str(off), morton_word(SHARDS[0]))
+        group = zarr.open_group(open_store(leaf), path="", mode="r+", zarr_format=3)
+        group.attrs[COMMIT_ATTR] = {**dict(group.attrs[COMMIT_ATTR]), "granule_count": 7}
+        summary = _backfill(off)
+        assert summary["written"] == 1 and summary["current"] == len(SHARDS) - 1
+
+    def test_uncommitted_leaf_contributes_nothing(self, tmp_path, monkeypatch):
+        from zagg.hive import COMMIT_ATTR, shard_leaf_path
+
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        leaf = shard_leaf_path(str(off), morton_word(SHARDS[0]))
+        group = zarr.open_group(open_store(leaf), path="", mode="r+", zarr_format=3)
+        del group.attrs[COMMIT_ATTR]
+        summary = _backfill(off)
+        assert summary["empty"] == 1 and summary["written"] == len(SHARDS) - 1
+        assert not _column_path(off, SHARDS[0]).exists()
+
+    def test_an_unreadable_leaf_fails_only_itself(self, tmp_path, monkeypatch):
+        from zagg.hive import shard_leaf_path
+
+        off, _on = self._upgraded(tmp_path, monkeypatch)
+        leaf = pathlib.Path(shard_leaf_path(str(off), morton_word(SHARDS[0])))
+        (leaf / "6" / "count" / "zarr.json").write_text("{ not json")
+        summary = _backfill(off)
+        assert summary["failed"] == 1 and summary["written"] == len(SHARDS) - 1
+
+
+class TestFamilyRegistration:
+    def test_registered_but_not_default(self):
+        from zagg.sweep import DEFAULT_FAMILIES, FAMILIES, get_family
+
+        assert "columns" in FAMILIES and "columns" not in DEFAULT_FAMILIES
+        assert get_family("columns").name == "columns"
+
+    def test_rides_run_sweep(self, tmp_path, monkeypatch):
+        from zagg.sweep import run_sweep
+
+        off, on = tmp_path / "off", tmp_path / "on"
+        _build_store(off, monkeypatch, pyramid=False)
+        _build_store(on, monkeypatch)
+        _install_pyramid(off, _twin_block(on))
+        summary = run_sweep(
+            str(off), [(morton_word(d), None) for d in SHARDS], families=["columns"], record=False
+        )
+        assert summary["families"]["columns"]["written"] == len(SHARDS)
+        for decimal in SHARDS:
+            assert _column_path(off, decimal).exists()
+
+    def test_partitions_split_the_work_disjointly(self, tmp_path, monkeypatch):
+        from zagg.sweep import run_sweep
+
+        off, on = tmp_path / "off", tmp_path / "on"
+        _build_store(off, monkeypatch, pyramid=False)
+        _build_store(on, monkeypatch)
+        _install_pyramid(off, _twin_block(on))
+        written = 0
+        for index in range(4):
+            summary = run_sweep(
+                str(off),
+                [(morton_word(d), None) for d in SHARDS],
+                families=["columns"],
+                record=False,
+                partition={"index": index, "of": 4},
+            )
+            written += summary["families"]["columns"]["written"]
+        assert written == len(SHARDS)
+        for decimal in SHARDS:
+            assert _column_path(off, decimal).exists()
+
+    def test_a_live_foreign_lease_refuses_the_pass(self, tmp_path, monkeypatch):
+        from zagg.sweep_lease import SweepRefusedError, acquire_lease
+
+        off, on = tmp_path / "off", tmp_path / "on"
+        _build_store(off, monkeypatch, pyramid=False, shards=SHARDS[:1])
+        _build_store(on, monkeypatch, shards=SHARDS[:1])
+        _install_pyramid(off, _twin_block(on))
+        acquire_lease(str(off), run_id="live-sweep")
+        with pytest.raises(SweepRefusedError, match="live-sweep"):
+            _backfill(off)
+
+    def test_the_lease_is_released(self, tmp_path, monkeypatch):
+        from zagg.sweep_lease import read_lease
+
+        off, on = tmp_path / "off", tmp_path / "on"
+        _build_store(off, monkeypatch, pyramid=False, shards=SHARDS[:1])
+        _build_store(on, monkeypatch, shards=SHARDS[:1])
+        _install_pyramid(off, _twin_block(on))
+        _backfill(off)
+        assert read_lease(str(off)) is None
