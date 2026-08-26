@@ -146,8 +146,12 @@ The notebooks under `notebooks/` run on [Binder](https://mybinder.org/v2/gh/engl
 | `jupyterhub_example.ipynb` | Drive the API from a science hub; read & visualize a published result | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/jupyterhub_example.ipynb) |
 | `cryocloud_example.ipynb` | End-to-end ISMIP6 read + **AWS Lambda fan-out** on CryoCloud | **not Binder-runnable** (needs live AWS + Earthdata credentials) |
 | `cost_reporting.ipynb` | Max / estimated / actual invoke cost + progress-bar dispatch wrapper | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/cost_reporting.ipynb) |
+| `hhdc_viewer.ipynb` | Polygon → MOC → shard → **rotatable paired 3-D view** (ATL03 + GEDI) → numpy tensors | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/hhdc_viewer.ipynb) |
+| `waveform_viewer.ipynb` | The cell-level join: one GEDI footprint against the 2×2 ATL03 cells beneath it, both from stored digests | [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks/waveform_viewer.ipynb) |
 
 `cryocloud_example.ipynb` is the only Lambda demo; it dispatches to a deployed AWS Lambda and reads private-account S3 via the CryoCloud IRSA role, so it cannot run on Binder.
+
+`hhdc_viewer.ipynb` and `waveform_viewer.ipynb` are **reader-only**: they run on `mortie` + `moczarr[zagg]` with no zagg-internal imports, reading the anonymous public [source.coop](https://source.coop/englacial/zagg) demo stores (ICESat-2 ATL03 + GEDI L1B over California and the NEON AOP sites). Each carries its own `%pip install` line, so they run outside Binder unchanged. They are split in two because `hhdc_viewer` needs `%matplotlib widget` for its rotatable 3-D view and `waveform_viewer` needs `%matplotlib inline` — the two backends collide in one kernel.
 
 ## Project Structure
 

@@ -30,3 +30,13 @@ else
     HATCH_VCS_PRETEND_VERSION="0.0.0+binder" \
         python -m pip install --no-cache-dir ".[analysis,catalog,viz]"
 fi
+
+# The reader-only demos (notebooks/hhdc_viewer.ipynb, notebooks/waveform_viewer.ipynb)
+# run on mortie + moczarr and never import zagg internals, so their runtime is NOT a
+# zagg extra -- each notebook carries its own `%pip install` line and stays runnable
+# outside Binder. Two of those packages must be in the IMAGE rather than installed
+# from a cell, because they ship Jupyter frontend extensions that a running kernel
+# cannot pick up: ipympl (the `%matplotlib widget` backend hhdc_viewer's rotatable
+# 3-D view needs) and ipywidgets (the sliders and dropdowns both use). moczarr itself
+# is pure Python, so the notebooks' own `%pip install` covers it either way.
+python -m pip install --no-cache-dir ipympl ipywidgets
