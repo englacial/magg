@@ -294,8 +294,12 @@ class TestTemplateEnvironment:
         # this bucket carries x-amz-acl: bucket-owner-full-control, and S3
         # evaluates that against s3:PutObjectAcl on PutObject AND on
         # CreateMultipartUpload -- without it the first published PUT 403s.
-        # The multipart pair covers the failure path PutObject does not:
-        # obstore's own abort (it holds the UploadId) would otherwise 403 and
+        # The multipart pair is kept although issue #534 made every published
+        # write a single PutObject (an ACL-bearing UploadPart is rejected, so
+        # the ACL handle cannot multipart at all): it is the policy shape
+        # Source Cooperative's own Option 3 documentation asks for, it is what
+        # we sent them, and it still covers the failure path PutObject does not
+        # -- obstore's own abort (it holds the UploadId) would otherwise 403 and
         # leak parts billed to Source Cooperative.
         assert sorted(objects[0]["Action"]) == [
             "s3:AbortMultipartUpload",

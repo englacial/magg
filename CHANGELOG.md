@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- an ACL-bearing write is a single `PutObject`, never a multipart upload (#534)
+  ([#535](https://github.com/englacial/zagg/pull/535))
+  - `x-amz-acl` is legal on `PutObject` and `CreateMultipartUpload` and illegal
+    on `UploadPart`, which S3 answers `400 InvalidArgument` / "The specified
+    header is not valid in this context". obstore attaches the canned ACL as a
+    `client_options.default_headers` entry, so it rode every request the write
+    twin made, and any object over obstore's 5 MiB multipart threshold failed —
+    52 of 60 sampled shards on the CA GEDI build, and a deliberate single-shard
+    test whose store is missing exactly its two ragged chunks.
+  - Both write seams (`_AclWriteObjectStore.set`/`set_if_not_exists` and
+    `put_object`) now pass `use_multipart=False` when the target carries the
+    ACL, leaving `PutObject` as the only request the twin can issue — a
+    property of the handle rather than a list of permitted operations, since
+    enumerating that list once and missing `UploadPart` is how this shipped.
+    In-account targets are untouched and still multipart.
+  - `_SINGLE_PUT_MAX_BYTES` refuses, by key, a payload past S3's 5 GiB
+    `PutObject` ceiling; published chunk objects run 1–17 MB.
+
 - the sweep Lambda handler forwards the `partition` and `families` blocks (#527)
   ([#528](https://github.com/englacial/zagg/pull/528))
   - `_handle_sweep` dropped both blocks on the floor, so a fleet `mode="sweep"`
