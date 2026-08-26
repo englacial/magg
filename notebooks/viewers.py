@@ -14,6 +14,8 @@ carries and what `read_tensors` has always needed.
 
 from __future__ import annotations
 
+import time
+
 import matplotlib.pyplot as plt
 import moczarr as mz
 import numpy as np
@@ -126,6 +128,22 @@ def load(store, field, block_order: int = BLOCK_ORDER) -> dict:
 # --------------------------------------------------------------------------- #
 # the 3-D view
 # --------------------------------------------------------------------------- #
+def _binned_pts(tensor, offset, gain, cap: int = CAP):
+    """Occupied voxels of one block tensor -> (x, y, z, weight), subsampled.
+
+    ``x``/``y`` come back as FRACTIONS of the block edge (the tensor's own
+    ``side`` is its xy shape), so the caller scales them by :data:`SIDE` the
+    same way the exact path does.
+    """
+    side = tensor.shape[0]
+    xs, ys, zs = np.nonzero(tensor)
+    counts = tensor[xs, ys, zs].astype("float64")
+    if len(xs) > cap:
+        keep = np.random.default_rng(0).choice(len(xs), cap, replace=False)
+        xs, ys, zs, counts = xs[keep], ys[keep], zs[keep], counts[keep]
+    return xs / side, ys / side, offset + zs * gain, counts
+
+
 class View:
     """Holds what is on screen so `export` knows which block you mean."""
 
@@ -133,36 +151,82 @@ class View:
     block = None
 
 
-def view3d(handles, shard, block_order: int = BLOCK_ORDER, cap: int = CAP) -> View:
+def view3d(
+    handles,
+    shard,
+    block_order: int = BLOCK_ORDER,
+    cap: int = CAP,
+    n_bins: int = 256,
+    resolution: float = 1.0,
+) -> View:
     """Interactive paired 3-D view. Drag to rotate -- the two panes stay linked.
 
-    ``handles`` is ``{sensor: (leaf_store, field)}``. Returns the :class:`View`
-    the widgets write to, so a later cell can export whatever is on screen.
+    ``handles`` is ``{sensor: (leaf_store, field)}``. Two ways to see the same
+    block, switched by the **binned** box:
+
+    * **binned** (default) -- the fixed ``read_tensors`` voxels, so xy AND z
+      are on the store's own grid and the two sensors share a z window.
+    * **exact** -- the digests read straight through, z the stored float32
+      centroid elevation and xy decoded from the located sibling's word where
+      the field carries one (ATL03, point-exact) or the cell word where it
+      does not (GEDI flux, footprint scale).
+
+    Tensors are read once up front (the default view needs them); the exact
+    centroids are swept lazily on the first unbinned draw, so a reader who
+    never unticks the box never pays for them.
+
+    Returns the :class:`View` the widgets write to, so a later cell can export
+    whatever is on screen.
     """
     view = View()
     view.shard = shard
-    data = {name: load(store, field, block_order) for name, (store, field) in handles.items()}
-    names = list(data)
+    names = list(handles)
+
+    tensors = {
+        name: {
+            b[3]: b
+            for b in mz.read_tensors(
+                store,
+                field,
+                n_bins=n_bins,
+                resolution=resolution,
+                block_order=block_order,
+                fit="degrade_resolution",
+            )
+        }
+        for name, (store, field) in handles.items()
+    }
+    exact: dict = {}  # filled on the first unbinned draw
+
+    def _exact():
+        if not exact:
+            # One whole-shard sweep per sensor, millions of centroids -- say so,
+            # or the first untick reads as a frozen notebook.
+            print("sweeping exact centroids (once, whole shard, both sensors)...", flush=True)
+            t0 = time.perf_counter()
+            for name, (store, field) in handles.items():
+                exact[name] = load(store, field, block_order)
+            print(
+                "  "
+                + ", ".join(f"{len(exact[n]['z']):,} {n}" for n in handles)
+                + f" in {time.perf_counter() - t0:.0f}s",
+                flush=True,
+            )
+        return exact
 
     # Blocks both sensors populate, SORTED, each labelled with how much it holds.
-    joint = sorted(set.intersection(*(set(np.unique(d["blocks"]).tolist()) for d in data.values())))
-    counts = {w: {n: int((data[n]["blocks"] == np.uint64(w)).sum()) for n in names} for w in joint}
+    joint = sorted(set.intersection(*(set(t) for t in tensors.values())))
+    if not joint:
+        raise ValueError(f"shard {shard}: no block is populated in every store")
     options = [
-        (f"{mz.morton_decimal(w)}  (" + ", ".join(f"{counts[w][n]:,} {n}" for n in names) + ")", w)
+        (
+            f"{mz.morton_decimal(w)}  ("
+            + ", ".join(f"{int(tensors[n][w][1].astype(bool).sum()):,} {n} cells" for n in names)
+            + ")",
+            w,
+        )
         for w in joint
     ]
-
-    # Subsample per block once, deterministically, so rotation stays smooth.
-    rng = np.random.default_rng(0)
-    picks = {
-        w: {
-            n: (lambda m: m if len(m) <= cap else m[rng.choice(len(m), cap, replace=False)])(
-                np.flatnonzero(data[n]["blocks"] == np.uint64(w))
-            )
-            for n in names
-        }
-        for w in joint
-    }
 
     dd = Dropdown(options=options, value=joint[0], description="block")
     zmode = Dropdown(
@@ -172,18 +236,47 @@ def view3d(handles, shard, block_order: int = BLOCK_ORDER, cap: int = CAP) -> Vi
     )
     elev_cb = Checkbox(value=False, description="color by elevation (shared)")
     time_cb = Checkbox(value=False, description="color by time (shared)")
+    bin_cb = Checkbox(value=True, description="binned (fixed tensors)")
 
-    def draw(block, by_elev, by_time, zmode):
+    def _panes(block, binned):
+        if binned:
+            out = []
+            for n in names:
+                tensor, _mask, (off, gain), _w = tensors[n][block]
+                x, y, z, wt = _binned_pts(tensor, off, gain, cap)
+                out.append(
+                    {
+                        "x": x * SIDE,
+                        "y": y * SIDE,
+                        "z": z,
+                        "wt": wt,
+                        "t": None,
+                        "label": n,
+                        "xy_note": f"binned ({gain:g} m z)",
+                    }
+                )
+            return out
+        data = _exact()
+        out = []
+        rng = np.random.default_rng(0)
+        for n in names:
+            d = data[n]
+            m = np.flatnonzero(d["blocks"] == np.uint64(block))
+            if len(m) > cap:
+                m = m[rng.choice(len(m), cap, replace=False)]
+            out.append(
+                {
+                    **{k: d[k][m] for k in ("z", "wt", "x", "y")},
+                    "t": None if d["t"] is None else d["t"][m],
+                    "label": n,
+                    "xy_note": d["xy_note"],
+                }
+            )
+        return out
+
+    def draw(block, by_elev, by_time, binned, zmode):
         view.block = block
-        panes = [
-            {
-                **{k: data[n][k][picks[block][n]] for k in ("z", "wt", "x", "y")},
-                "t": None if data[n]["t"] is None else data[n]["t"][picks[block][n]],
-                "label": n,
-                "xy_note": data[n]["xy_note"],
-            }
-            for n in names
-        ]
+        panes = _panes(block, binned)
         zlim = (
             None
             if zmode == "auto"
@@ -224,7 +317,7 @@ def view3d(handles, shard, block_order: int = BLOCK_ORDER, cap: int = CAP) -> Vi
                 fig.colorbar(pts, shrink=0.55, pad=0.10, label="days since 2018-01-01")
             elif by_time:
                 ax.scatter(p["x"], p["y"], p["z"], color="#9498a0", s=1.5, alpha=0.15)
-                note += " — no temporal channel"
+                note += " — no temporal channel" + (" in binned tensors" if binned else "")
             elif by_elev:
                 pts = ax.scatter(
                     p["x"],
@@ -271,14 +364,17 @@ def view3d(handles, shard, block_order: int = BLOCK_ORDER, cap: int = CAP) -> Vi
 
         fig.canvas.mpl_connect("motion_notify_event", _sync)
         fig.suptitle(
-            f"shard {shard} — block {mz.morton_decimal(block)} — exact centroids", fontsize=11
+            f"shard {shard} — block {mz.morton_decimal(block)}"
+            + ("" if binned else " — exact centroids"),
+            fontsize=11,
         )
         plt.show()
 
     out = interactive_output(
-        draw, {"block": dd, "by_elev": elev_cb, "by_time": time_cb, "zmode": zmode}
+        draw,
+        {"block": dd, "by_elev": elev_cb, "by_time": time_cb, "binned": bin_cb, "zmode": zmode},
     )
-    display(VBox([HBox([dd, zmode]), HBox([elev_cb, time_cb]), out]))
+    display(VBox([HBox([dd, zmode]), HBox([elev_cb, time_cb, bin_cb]), out]))
     return view
 
 
