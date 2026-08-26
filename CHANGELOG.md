@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- every `-disk` worker variant gets Lambda's 10240 MB `/tmp` ceiling (#536)
+  ([#537](https://github.com/englacial/zagg/pull/537))
+  - The spill block is **disk-bound at every memory tier**:
+    `_default_block_bytes` is `min(0.2 x memory x K, 0.45 x free_tmp)` and
+    `K = 4 ** (group_order - parent_order)` is 64 on the production grids, so
+    the memory term is 26–102 GiB while the disk term was 2.70–4.50 GiB.
+  - 249 of 2,726 shards on the CA GEDI build raised `SpillOverflowError` at the
+    6144-derived 2.70 GiB cap — the waveform reducers have no cross-block fold
+    law, so the config is exact-single-block-only and refuses rather than
+    approximate. The 10 densest re-ran clean at 10240 MB (peak spill 3.56 GiB
+    against 4.50 GiB, `spill_blocks_closed = 0`).
+  - Supersedes issue #235's `memory + 2048`, under which only the 8192 variant
+    reached the ceiling. Extra ephemeral storage costs $0.08 across a
+    2,726-shard run. This raises the ceiling only: the 900 s timeout still
+    scales with vCPU, so it is not a licence to drop a memory tier.
+
 - an ACL-bearing write is a single `PutObject`, never a multipart upload (#534)
   ([#535](https://github.com/englacial/zagg/pull/535))
   - `x-amz-acl` is legal on `PutObject` and `CreateMultipartUpload` and illegal
