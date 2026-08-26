@@ -367,7 +367,9 @@ class _AclWriteObjectStore(ObjectStore):
     ``set_if_not_exists`` gets it too, although obstore already forces a
     non-multipart upload for any ``mode`` other than ``"overwrite"`` -- relying
     on that would leave the twin's single-operation property resting on an
-    obstore implementation detail that no test of ours would notice changing.
+    obstore implementation detail. The wire cannot tell the two apart, so
+    ``tests/test_store_acl_seam.py`` spies on ``obstore.put_async`` and asserts
+    the argument itself; drop it here and that test goes red.
     """
 
     def __init__(self, store, acl_store, *, read_only: bool = False) -> None:

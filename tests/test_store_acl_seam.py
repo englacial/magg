@@ -163,20 +163,40 @@ class TestOwnershipSemanticsUnchanged:
         assert put.acl_signed
         assert fake_s3.objects["englacial/zagg/demo.zarr/big.parquet"] == payload
 
-    def test_a_conditional_write_is_a_single_put_too(self, published, fake_s3):
+    def test_a_conditional_write_is_a_single_put_too(self, published, fake_s3, monkeypatch):
         # ``set_if_not_exists`` and ``put_object(mode="create")`` -- the sweep
         # lease's claim -- are conditional puts, and obstore already declines
-        # multipart for any mode other than "overwrite". So this shape passed
-        # before the fix, by accident; pin it, so the twin's one-operation
-        # property does not rest on that detail staying true.
+        # multipart for any mode other than "overwrite". So the WIRE cannot
+        # tell the two apart: drop ``use_multipart=False`` from
+        # ``set_if_not_exists`` and the framing below is unchanged. The
+        # observable difference is the argument, so spy on it at the seam --
+        # the way ``tests/test_output.py`` pins ``put_object`` -- and keep the
+        # framing assertions alongside, so the twin's one-operation property
+        # rests on our own request rather than on an obstore detail.
+        import obstore
         from zarr.core.buffer import cpu
         from zarr.core.sync import sync
 
         from zagg.store import open_object_store, open_store, put_object
 
+        real_put_async = obstore.put_async
+        seen = []
+
+        async def _spy(store, key, value, **kwargs):
+            seen.append((key, kwargs))
+            return await real_put_async(store, key, value, **kwargs)
+
+        monkeypatch.setattr(obstore, "put_async", _spy)
+
         zstore = published(open_store)
         sync(zstore.set_if_not_exists("cond", cpu.Buffer.from_bytes(b"y" * (8 * 1024 * 1024))))
         put_object(published(open_object_store), "lease.json", b"{}", mode="create")
+
+        (cond,) = [(key, kwargs) for key, kwargs in seen if key == "cond"]
+        assert cond[1].get("mode") == "create"
+        assert cond[1].get("use_multipart") is False, (
+            f"set_if_not_exists left the framing to obstore: {cond[1]}"
+        )
 
         assert not [r for r in fake_s3.requests if r.method == "POST"]
         assert len(_puts(fake_s3)) == 2
