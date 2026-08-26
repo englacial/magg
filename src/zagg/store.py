@@ -649,7 +649,10 @@ def put_object(store, key, value, **kwargs):
     keep using the store the caller already holds, which is the clean one.
     ``tests/test_store.py`` fails the build if a direct ``obstore.put`` is
     reintroduced, because a missed site publishes an object Source Cooperative
-    cannot manage and says nothing about it.
+    cannot manage and says nothing about it. That guard scans obstore call
+    names only; a boto3 transfer is invisible to it, which is safe exactly
+    while every such transfer stays in-account (``catalog.extract._put_parquet``
+    is the one today).
 
     A write that lands on the ACL twin is forced to a single ``PutObject``
     (issue #534). Most objects on this route are small JSON, but not all of them
