@@ -171,9 +171,9 @@ def view3d(
       the field carries one (ATL03, point-exact) or the cell word where it
       does not (GEDI flux, footprint scale).
 
-    Tensors are read once up front (the default view needs them); the exact
-    centroids are swept lazily on the first unbinned draw, so a reader who
-    never unticks the box never pays for them.
+    Tensors are read once up front (the default view needs them) and REDUCED as
+    they arrive; the exact centroids are swept lazily on the first unbinned
+    draw, so a reader who never unticks the box never pays for them.
 
     Returns the :class:`View` the widgets write to, so a later cell can export
     whatever is on screen.
@@ -182,9 +182,21 @@ def view3d(
     view.shard = shard
     names = list(handles)
 
-    tensors = {
-        name: {
-            b[3]: b
+    # One sweep per sensor, reduced block by block as it goes. A block tensor is
+    # up to 16 MiB and a shard holds ~64 of them per sensor, but the view draws
+    # ONE block at a time and never more than `cap` of its voxels -- so keep the
+    # drawable cloud and the occupancy count, not the tensor. That is ~1.3 GiB
+    # resident versus ~80 MiB, and mybinder.org caps the WHOLE container at 2 GB.
+    print("binning tensors (once, whole shard, both sensors)...", flush=True)
+    t0 = time.perf_counter()
+    voxels: dict = {}
+    for name, (store, field) in handles.items():
+        voxels[name] = {
+            b[3]: {
+                "pts": _binned_pts(b[0], *b[2], cap),
+                "cells": int(b[1].astype(bool).sum()),
+                "gain": b[2][1],
+            }
             for b in mz.read_tensors(
                 store,
                 field,
@@ -194,8 +206,12 @@ def view3d(
                 fit="degrade_resolution",
             )
         }
-        for name, (store, field) in handles.items()
-    }
+    print(
+        "  "
+        + ", ".join(f"{len(voxels[n]):,} {n} blocks" for n in handles)
+        + f" in {time.perf_counter() - t0:.0f}s",
+        flush=True,
+    )
     exact: dict = {}  # filled on the first unbinned draw
 
     def _exact():
@@ -215,13 +231,13 @@ def view3d(
         return exact
 
     # Blocks both sensors populate, SORTED, each labelled with how much it holds.
-    joint = sorted(set.intersection(*(set(t) for t in tensors.values())))
+    joint = sorted(set.intersection(*(set(v) for v in voxels.values())))
     if not joint:
         raise ValueError(f"shard {shard}: no block is populated in every store")
     options = [
         (
             f"{mz.morton_decimal(w)}  ("
-            + ", ".join(f"{int(tensors[n][w][1].astype(bool).sum()):,} {n} cells" for n in names)
+            + ", ".join(f"{voxels[n][w]['cells']:,} {n} cells" for n in names)
             + ")",
             w,
         )
@@ -242,8 +258,8 @@ def view3d(
         if binned:
             out = []
             for n in names:
-                tensor, _mask, (off, gain), _w = tensors[n][block]
-                x, y, z, wt = _binned_pts(tensor, off, gain, cap)
+                rec = voxels[n][block]
+                x, y, z, wt = rec["pts"]
                 out.append(
                     {
                         "x": x * SIDE,
@@ -252,7 +268,7 @@ def view3d(
                         "wt": wt,
                         "t": None,
                         "label": n,
-                        "xy_note": f"binned ({gain:g} m z)",
+                        "xy_note": f"binned ({rec['gain']:g} m z)",
                     }
                 )
             return out
