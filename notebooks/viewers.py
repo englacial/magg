@@ -513,7 +513,17 @@ def waveform_view(
         w, joint, a2, g2 = pairs[pair]  # a2/g2: the notebook's A2/G2, lowercased for N806
         _, _, (_aoff, ag), _ = blocks["atl03"][w]
         _, _, (_goff, gg), _ = blocks["gedi"][w]
-        rank = np.minimum(a2, g2) * joint  # rank joint cells by the weaker side
+        # Rank the joint cells by the weaker side. a2 is ATL03 PHOTON counts and
+        # g2 GEDI PHOTOELECTRONS -- incommensurate units that run two to three
+        # orders of magnitude apart on this store pair, so a raw `np.minimum`
+        # would collapse to a2 on essentially every cell and "the weaker member"
+        # would really mean "the ATL03 count". Scale each side by its own
+        # maximum over the JOINT cells first, so the min picks out whichever
+        # sensor is relatively weaker. (What makes a pick *coincident* at all is
+        # the `joint` mask itself -- both sensors populated -- not this min.)
+        a = a2 / max(int(a2[joint].max()), 1)
+        g = g2 / max(int(g2[joint].max()), 1)
+        rank = np.minimum(a, g) * joint
         order = np.argsort(rank.ravel())[::-1]
         r, c = np.unravel_index(int(order[min(nth, int(joint.sum()) - 1)]), rank.shape)
 
