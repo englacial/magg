@@ -144,7 +144,7 @@ The notebooks under `notebooks/` run on [Binder](https://mybinder.org/v2/gh/engl
 
 They share `notebooks/viewers.py`, which holds the drawing so the notebooks stay about the read path. The two are split because one needs `%matplotlib widget` for its rotatable 3-D view and the other `%matplotlib inline`; the backends collide in a single kernel.
 
-**Archived notebooks.** The earlier examples (`custom_aggregations`, `rasterized_zarr`, `jupyterhub_example`, `cryocloud_example`, `cost_reporting`, `aoi_mask`, `shardmap_viewer`, `tdigest_reader_example`, `sentinel2_fusion`) were written against older APIs and had drifted out of date — stale documentation being worse than none. They are preserved on the [`claude/archive-notebooks-2026-08-26`](https://github.com/englacial/zagg/tree/claude/archive-notebooks-2026-08-26/notebooks) branch and removed from `main`.
+**Archived notebooks.** The earlier examples (`custom_aggregations`, `rasterized_zarr`, `jupyterhub_example`, `cryocloud_example`, `cost_reporting`, `aoi_mask`, `shardmap_viewer`, `tdigest_reader_example`, `sentinel2_fusion`) were written against older APIs and had drifted out of date — stale documentation being worse than none. They are removed from `main` and preserved at [`c56221b4`](https://github.com/englacial/zagg/tree/c56221b4/notebooks), the last commit on `main` that carried them — a commit permalink rather than a branch link, because GitHub keeps a blob URL at an explicit sha forever and there is no ref anyone has to remember not to delete.
 
 ## Project Structure
 
