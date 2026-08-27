@@ -430,23 +430,33 @@ def _mixture(digest, z, sigma):
     return pdf / max(wt.sum(), 1e-9) / (sigma * np.sqrt(2 * np.pi))
 
 
-def _atl03_digests(store, field, w, r, c, gside, block_order=BLOCK_ORDER):
+def _atl03_digests(store, field, w, r, c, chunk_side, chunk_order, block_order=BLOCK_ORDER):
     """The 2x2 finer digests under one coarser cell `(r, c)` of block `w`.
 
     GEDI's chunk grid puts one o12 block in one chunk; ATL03's chunks sit at
-    o13, so the o19 cell has to be resolved to the right o13 child before
-    `cell_index` can address it.
+    `chunk_order` (o13 in these stores), so the o19 cell has to be resolved to
+    the right chunk before `cell_index` can address it.
+
+    `chunk_side` is ATL03's cells across a CHUNK edge, ``2**(19 - 13) = 64``.
+    That is deliberately NOT the caller's `gside`, which is GEDI's cells across
+    a BLOCK edge, ``2**(18 - 12)`` -- also 64, but only for this store pair.
+    Sharing one name would make a change to either sensor's cell order, or to
+    the store's chunk order, address the wrong cell silently rather than raise,
+    and the `except` below would report the damage as "no photons here".
     """
-    kids = generate_morton_children(int(w), block_order + 1)
+    kids = generate_morton_children(int(w), chunk_order)
+    depth = chunk_order - block_order
     out = []
     for dr in (0, 1):
         for dc in (0, 1):
             rr, cc = 2 * r + dr, 2 * c + dc
-            chunk = int(kids[rowcol_to_rank(rr // gside, cc // gside, depth=1)])
+            chunk = int(kids[rowcol_to_rank(rr // chunk_side, cc // chunk_side, depth=depth)])
             try:
                 out.append(
                     mz.read_cell(
-                        store, field, mz.cell_index(store, field, chunk, rr % gside, cc % gside)
+                        store,
+                        field,
+                        mz.cell_index(store, field, chunk, rr % chunk_side, cc % chunk_side),
                     )
                 )
             except (KeyError, ValueError):
@@ -454,14 +464,25 @@ def _atl03_digests(store, field, w, r, c, gside, block_order=BLOCK_ORDER):
     return np.concatenate([k for k in out if len(k)]) if out else np.empty((0, 2))
 
 
-def waveform_view(stores, fields, blocks, pairs, shard, gside: int = 64):
+def waveform_view(
+    stores, fields, blocks, pairs, shard, gside: int = 64, atl03_chunk_order: int = 13
+):
     """Interactive coincident-waveform view.
 
     ``stores``/``fields`` are ``{sensor: ...}``; ``blocks`` is
     ``{sensor: {block_word: read_tensors tuple}}``; ``pairs`` is the sorted
     ``(word, joint_mask, A2, G2)`` list the notebook builds.
+
+    ``gside`` is GEDI's cells across an o12 BLOCK edge. ``atl03_chunk_order``
+    is where ATL03's chunks sit in these stores; ATL03's cells across a CHUNK
+    edge is derived from it and the cell order the field's path already
+    carries (``19/…``), because that is a different quantity that merely also
+    equals 64 here -- see :func:`_atl03_digests`.
     """
     from zagg.stats.tdigest import cdf_from_tdigest  # moczarr[zagg]; see module docstring
+
+    acell_order = int(fields["atl03"].split("/", 1)[0])
+    achunk_side = 2 ** (acell_order - atl03_chunk_order)
 
     live: dict = {}  # the one figure this view keeps open
 
@@ -478,7 +499,15 @@ def waveform_view(stores, fields, blocks, pairs, shard, gside: int = 64):
             fields["gedi"],
             mz.cell_index(stores["gedi"], fields["gedi"], int(w), int(r), int(c)),
         )
-        adigest = _atl03_digests(stores["atl03"], fields["atl03"], w, int(r), int(c), gside)
+        adigest = _atl03_digests(
+            stores["atl03"],
+            fields["atl03"],
+            w,
+            int(r),
+            int(c),
+            achunk_side,
+            atl03_chunk_order,
+        )
 
         lo = min(gdigest[:, 0].min(), adigest[:, 0].min()) - 5
         hi = max(gdigest[:, 0].max(), adigest[:, 0].max()) + 5
