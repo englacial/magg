@@ -133,7 +133,11 @@ def _binned_pts(tensor, offset, gain, cap: int = CAP):
 
     ``x``/``y`` come back as FRACTIONS of the block edge (the tensor's own
     ``side`` is its xy shape), so the caller scales them by :data:`SIDE` the
-    same way the exact path does.
+    same way the exact path does. ``np.nonzero`` gives cell INDICES, so the
+    ``+ 0.5`` that moves a point off the cell corner onto its centre is the
+    same one :func:`grid_xy` applies -- without it, toggling **binned** shifts
+    the whole cloud by half a cell, and by a DIFFERENT half-cell per sensor
+    (6.2 m for ATL03's o19 cells, 12.4 m for GEDI's o18).
     """
     side = tensor.shape[0]
     xs, ys, zs = np.nonzero(tensor)
@@ -141,7 +145,7 @@ def _binned_pts(tensor, offset, gain, cap: int = CAP):
     if len(xs) > cap:
         keep = np.random.default_rng(0).choice(len(xs), cap, replace=False)
         xs, ys, zs, counts = xs[keep], ys[keep], zs[keep], counts[keep]
-    return xs / side, ys / side, offset + zs * gain, counts
+    return (xs + 0.5) / side, (ys + 0.5) / side, offset + zs * gain, counts
 
 
 class View:
