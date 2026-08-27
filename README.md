@@ -135,7 +135,7 @@ uv run jupyter notebook notebooks/hhdc_viewer.ipynb
 
 ## Example Notebooks
 
-The notebooks under `notebooks/` run on [Binder](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks) — no install, no credentials. Both are **reader-only**: they import `mortie` + `moczarr[zagg]` and nothing from zagg itself, reading the anonymous, public [source.coop](https://source.coop/englacial/zagg) demo stores (ICESat-2 ATL03 + GEDI L1B over California and the NEON AOP sites). Each carries its own `%pip install` line, so they run outside Binder unchanged.
+The notebooks under `notebooks/` run on [Binder](https://mybinder.org/v2/gh/englacial/zagg/main?urlpath=lab/tree/notebooks) — no install, no credentials. Both are **reader-only**: they import `mortie` + `moczarr[zagg]` and call no zagg public API — the only zagg code on the path is the t-digest algebra `moczarr` imports rather than vendors, which is exactly what the `[zagg]` extra is for — reading the anonymous, public [source.coop](https://source.coop/englacial/zagg) demo stores (ICESat-2 ATL03 + GEDI L1B over California and the NEON AOP sites). Each carries its own `%pip install` line, so they run outside Binder unchanged.
 
 | Notebook | What it shows | Binder |
 |----------|---------------|--------|
