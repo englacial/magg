@@ -304,6 +304,8 @@ def view3d(
             )
         return out
 
+    live: dict = {}  # the one figure this view keeps open
+
     def draw(block, by_elev, by_time, binned, zmode):
         view.block = block
         panes = _panes(block, binned)
@@ -326,7 +328,17 @@ def view3d(
         ticks = [0.0, SIDE / 2, SIDE]
         labels = [f"{v:.0f} m" for v in ticks]
 
+        # `draw` reruns on EVERY widget change, and `clear_output(wait=True)`
+        # clears the Output widget's display, not matplotlib's figure registry.
+        # An ipympl figure is a live canvas -- it holds its websocket comm and
+        # the `_sync` handler connected below for the kernel's lifetime -- so
+        # without this the 21st interaction warns and every orphan keeps
+        # handling mouse events. Close the PREVIOUS figure, not this one: the
+        # widget backend needs the current canvas alive to render it.
+        if (prev := live.pop("fig", None)) is not None:
+            plt.close(prev)
         fig = plt.figure(figsize=(11, 5.2))
+        live["fig"] = fig
         axes = []
         for k, (p, cmap) in enumerate(zip(panes, ("viridis", "plasma"))):
             ax = fig.add_subplot(1, 2, k + 1, projection="3d")
@@ -451,6 +463,8 @@ def waveform_view(stores, fields, blocks, pairs, shard, gside: int = 64):
     """
     from zagg.stats.tdigest import cdf_from_tdigest  # moczarr[zagg]; see module docstring
 
+    live: dict = {}  # the one figure this view keeps open
+
     def paired_waveform(pair=0, nth=0, binw=1.0):
         w, joint, a2, g2 = pairs[pair]  # a2/g2: the notebook's A2/G2, lowercased for N806
         _, _, (_aoff, ag), _ = blocks["atl03"][w]
@@ -471,7 +485,13 @@ def waveform_view(stores, fields, blocks, pairs, shard, gside: int = 64):
         z = np.linspace(lo, hi, 700)
         amu, awt = adigest[:, 0], adigest[:, 1]
 
+        # Same figure-registry bound as `view3d.draw`: this is an
+        # `interactive_output` callback too, so close the previous figure
+        # rather than accumulating one per widget change.
+        if (prev := live.pop("fig", None)) is not None:
+            plt.close(prev)
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.6), sharey=True)
+        live["fig"] = fig
         ax1.plot(
             _mixture(gdigest, z, gg),
             z,
