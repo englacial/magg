@@ -486,6 +486,29 @@ def waveform_view(
 
     live: dict = {}  # the one figure this view keeps open
 
+    # `binw` is a pure rendering knob, but it shares the `interactive_output`
+    # callback with `pair`/`nth` -- so without this, typing in the bin box
+    # re-runs five S3 round trips (one GEDI `read_cell` plus up to four ATL03)
+    # on digests already in memory. Only `pair` and `nth` change what is READ.
+    cache: dict = {}
+
+    def _digests(pair, r, c, w):
+        key = (pair, r, c)
+        if key not in cache:
+            if len(cache) > 64:  # a session's worth; these are a few KB each
+                cache.clear()
+            cache[key] = (
+                mz.read_cell(
+                    stores["gedi"],
+                    fields["gedi"],
+                    mz.cell_index(stores["gedi"], fields["gedi"], int(w), r, c),
+                ),
+                _atl03_digests(
+                    stores["atl03"], fields["atl03"], w, r, c, achunk_side, atl03_chunk_order
+                ),
+            )
+        return cache[key]
+
     def paired_waveform(pair=0, nth=0, binw=1.0):
         w, joint, a2, g2 = pairs[pair]  # a2/g2: the notebook's A2/G2, lowercased for N806
         _, _, (_aoff, ag), _ = blocks["atl03"][w]
@@ -494,23 +517,18 @@ def waveform_view(
         order = np.argsort(rank.ravel())[::-1]
         r, c = np.unravel_index(int(order[min(nth, int(joint.sum()) - 1)]), rank.shape)
 
-        gdigest = mz.read_cell(
-            stores["gedi"],
-            fields["gedi"],
-            mz.cell_index(stores["gedi"], fields["gedi"], int(w), int(r), int(c)),
-        )
-        adigest = _atl03_digests(
-            stores["atl03"],
-            fields["atl03"],
-            w,
-            int(r),
-            int(c),
-            achunk_side,
-            atl03_chunk_order,
-        )
+        gdigest, adigest = _digests(pair, int(r), int(c), w)
 
-        lo = min(gdigest[:, 0].min(), adigest[:, 0].min()) - 5
-        hi = max(gdigest[:, 0].max(), adigest[:, 0].max()) + 5
+        # `_atl03_digests` can legitimately return nothing: the `joint` mask is
+        # built from the TENSORS (a finite z window, possibly degraded), while
+        # this reads the RAW digests through a different addressing path, and
+        # the two are not guaranteed to agree cell for cell -- which is the case
+        # the `except` in `_atl03_digests` was written for. Make that guard real
+        # by drawing the GEDI side alone and saying so, rather than letting an
+        # empty `.min()` turn "no photons here" into a traceback in the widget.
+        zmu = [gdigest[:, 0]] + ([adigest[:, 0]] if len(adigest) else [])
+        lo = min(a.min() for a in zmu) - 5
+        hi = max(a.max() for a in zmu) + 5
         z = np.linspace(lo, hi, 700)
         amu, awt = adigest[:, 0], adigest[:, 1]
 
@@ -528,13 +546,14 @@ def waveform_view(
             lw=2,
             label=f"GEDI flux ({gdigest[:, 1].sum():.0f} pe)",
         )
-        ax1.plot(
-            _mixture(adigest, z, ag),
-            z,
-            color="#008837",
-            lw=2,
-            label=f"ATL03 signal ({awt.sum():.0f} ph)",
-        )
+        if len(adigest):
+            ax1.plot(
+                _mixture(adigest, z, ag),
+                z,
+                color="#008837",
+                lw=2,
+                label=f"ATL03 signal ({awt.sum():.0f} ph)",
+            )
         ax1.set_xlabel("normalized density")
         ax1.set_ylabel("elevation (m)")
 
@@ -569,7 +588,11 @@ def waveform_view(
         ax1.patch.set_visible(False)
         ax1.set_title(
             f"cell ({r},{c}) @o18 — GEDI {len(gdigest)} centroids "
-            f"vs ATL03 {len(adigest)} (2×2 @o19)",
+            + (
+                f"vs ATL03 {len(adigest)} (2×2 @o19)"
+                if len(adigest)
+                else "— no ATL03 digest under this cell"
+            ),
             fontsize=9,
         )
         ax1.legend(fontsize=8)
@@ -579,9 +602,13 @@ def waveform_view(
         ax2.plot(
             cdf_from_tdigest(gdigest, z) / max(gdigest[:, 1].sum(), 1e-9), z, color="#7b3294", lw=2
         )
-        ax2.plot(
-            cdf_from_tdigest(adigest, z) / max(adigest[:, 1].sum(), 1e-9), z, color="#008837", lw=2
-        )
+        if len(adigest):
+            ax2.plot(
+                cdf_from_tdigest(adigest, z) / max(adigest[:, 1].sum(), 1e-9),
+                z,
+                color="#008837",
+                lw=2,
+            )
         ax2.set_xlim(0, 1)
         ax2.set_xlabel("CDF (probability)")
         ax2.set_title("cumulative", fontsize=10)
