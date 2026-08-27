@@ -58,7 +58,14 @@ def grid_xy(words, block_order: int = BLOCK_ORDER):
     which is the step whose absence used to make the level-28/29 digits decode
     out of range. ``rank_to_rowcol`` is the bit deinterleave (mortie spec
     section 8): it returns ``(row, col) = (y, x)`` with ``[0, 0]`` at the
-    subtree's south corner, so x reads the row and y the col.
+    subtree's south corner -- so the COL is the eastward axis and the ROW the
+    northward one, and this returns them that way round, ``(x, y) = (col,
+    row)``. That is what makes ``view3d``'s "east"/"north" axis labels true.
+
+    Note the tensors ``read_tensors`` (and so ``hhdc_viewer``'s export cells)
+    hand back are indexed ``(row, col, bin)``: the picture's x is the tensor's
+    SECOND axis. :func:`_binned_pts` applies the same swap, so the binned and
+    exact views agree with each other.
 
     A leaf mixes orders -- o29 located words beside coarser merged-centroid
     words, and GEDI's cell words are o18 -- so the ranks are grouped by depth
@@ -74,7 +81,7 @@ def grid_xy(words, block_order: int = BLOCK_ORDER):
         row[m] = np.asarray(r, dtype=float)
         col[m] = np.asarray(c, dtype=float)
     side = 2.0 ** depth.astype(float)  # cells along a block edge
-    return (row + 0.5) / side * SIDE, (col + 0.5) / side * SIDE
+    return (col + 0.5) / side * SIDE, (row + 0.5) / side * SIDE
 
 
 def load(store, field, block_order: int = BLOCK_ORDER) -> dict:
@@ -133,19 +140,22 @@ def _binned_pts(tensor, offset, gain, cap: int = CAP):
 
     ``x``/``y`` come back as FRACTIONS of the block edge (the tensor's own
     ``side`` is its xy shape), so the caller scales them by :data:`SIDE` the
-    same way the exact path does. ``np.nonzero`` gives cell INDICES, so the
-    ``+ 0.5`` that moves a point off the cell corner onto its centre is the
-    same one :func:`grid_xy` applies -- without it, toggling **binned** shifts
-    the whole cloud by half a cell, and by a DIFFERENT half-cell per sensor
-    (6.2 m for ATL03's o19 cells, 12.4 m for GEDI's o18).
+    same way the exact path does, and ``x`` is the tensor's COL axis and ``y``
+    its ROW axis, the same round as :func:`grid_xy`.
+
+    ``np.nonzero`` gives cell INDICES, so the ``+ 0.5`` that moves a point off
+    the cell corner onto its centre is the same one :func:`grid_xy` applies --
+    without it, toggling **binned** shifts the whole cloud by half a cell, and
+    by a DIFFERENT half-cell per sensor (6.2 m for ATL03's o19 cells, 12.4 m
+    for GEDI's o18).
     """
     side = tensor.shape[0]
-    xs, ys, zs = np.nonzero(tensor)
-    counts = tensor[xs, ys, zs].astype("float64")
-    if len(xs) > cap:
-        keep = np.random.default_rng(0).choice(len(xs), cap, replace=False)
-        xs, ys, zs, counts = xs[keep], ys[keep], zs[keep], counts[keep]
-    return (xs + 0.5) / side, (ys + 0.5) / side, offset + zs * gain, counts
+    rows, cols, zs = np.nonzero(tensor)  # the tensor is indexed (row, col, bin)
+    counts = tensor[rows, cols, zs].astype("float64")
+    if len(rows) > cap:
+        keep = np.random.default_rng(0).choice(len(rows), cap, replace=False)
+        rows, cols, zs, counts = rows[keep], cols[keep], zs[keep], counts[keep]
+    return (cols + 0.5) / side, (rows + 0.5) / side, offset + zs * gain, counts
 
 
 class View:
