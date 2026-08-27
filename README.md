@@ -146,8 +146,6 @@ They share `notebooks/viewers.py`, which holds the drawing so the notebooks stay
 
 **Archived notebooks.** The earlier examples (`custom_aggregations`, `rasterized_zarr`, `jupyterhub_example`, `cryocloud_example`, `cost_reporting`, `aoi_mask`, `shardmap_viewer`, `tdigest_reader_example`, `sentinel2_fusion`) were written against older APIs and had drifted out of date — stale documentation being worse than none. They are preserved on the [`claude/archive-notebooks-2026-08-26`](https://github.com/englacial/zagg/tree/claude/archive-notebooks-2026-08-26/notebooks) branch and removed from `main`.
 
-`hhdc_viewer.ipynb` and `waveform_viewer.ipynb` are **reader-only**: they run on `mortie` + `moczarr[zagg]` with no zagg-internal imports, reading the anonymous public [source.coop](https://source.coop/englacial/zagg) demo stores (ICESat-2 ATL03 + GEDI L1B over California and the NEON AOP sites). Each carries its own `%pip install` line, so they run outside Binder unchanged. They are split in two because `hhdc_viewer` needs `%matplotlib widget` for its rotatable 3-D view and `waveform_viewer` needs `%matplotlib inline` — the two backends collide in one kernel.
-
 ## Project Structure
 
 ```
