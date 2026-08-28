@@ -517,7 +517,18 @@ def _atl03_digests(store, field, w, r, c, chunk_side, chunk_order, block_order=B
                 )
             except (KeyError, ValueError):
                 pass  # that quarter holds no photons
-    return np.concatenate([k for k in out if len(k)]) if out else np.empty((0, 2))
+    kept = [k for k in out if len(k)]
+    if not kept:
+        return np.empty((0, 2))
+    # SORT BY MEAN. The four quarters are each a digest sorted on its own, so
+    # concatenating them gives four ascending runs, not one -- and
+    # `cdf_from_tdigest` reads the centroid means as `np.interp`'s x-coordinates,
+    # which numpy documents as nonsense unless they increase. Measured on a
+    # representative 2x2: the CDF drifted by 32% of the cell's total weight, and
+    # still looked monotonic, so it fails silently. The mixture on the left panel
+    # is a weighted sum and does not care, which is why only the CDF was wrong.
+    merged = np.concatenate(kept)
+    return merged[np.argsort(merged[:, 0], kind="stable")]
 
 
 def waveform_view(
@@ -693,7 +704,10 @@ def waveform_view(
         value=0,
         description="block",
     )
-    nth = IntSlider(min=0, max=40, value=0, description="nth joint")
+    # Opens on the 7th coincident cell (0-indexed): on the SERC block this
+    # notebook ships with, that one shows the canopy/ground structure clearly.
+    # Any other AOI will rank differently -- it is a nice default, not a rule.
+    nth = IntSlider(min=0, max=40, value=6, description="nth joint")
     binw = FloatText(value=1.0, step=0.5, description="bin (m)")
     display(
         VBox(
