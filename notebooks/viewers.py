@@ -58,9 +58,14 @@ def grid_xy(words, block_order: int = BLOCK_ORDER):
     which is the step whose absence used to make the level-28/29 digits decode
     out of range. ``rank_to_rowcol`` is the bit deinterleave (mortie spec
     section 8): it returns ``(row, col) = (y, x)`` with ``[0, 0]`` at the
-    subtree's south corner -- so the COL is the eastward axis and the ROW the
-    northward one, and this returns them that way round, ``(x, y) = (col,
-    row)``. That is what makes ``view3d``'s "east"/"north" axis labels true.
+    subtree's south corner, and this returns them as ``(x, y) = (col, row)``
+    so the picture matches the tensors this notebook exports.
+
+    Those axes are NOT east and north. zagg's ``readers/_layout.py`` pins the
+    semantics: "``tensor[0, 0]`` is the subtree's south corner; rows advance
+    toward the north-WEST edge, columns toward the north-EAST edge." A HEALPix
+    face is a diamond, so its two local axes run along the face's edges, not
+    along the compass. ``view3d`` labels them for what they are.
 
     Note the tensors ``read_tensors`` (and so ``hhdc_viewer``'s export cells)
     hand back are indexed ``(row, col, bin)``: the picture's x is the tensor's
@@ -390,8 +395,11 @@ def view3d(
             ax.set_zlabel("elevation (m)")
             ax.set_xticks(ticks, labels, fontsize=7)
             ax.set_yticks(ticks, labels, fontsize=7)
-            ax.set_xlabel("east", fontsize=8, labelpad=-2)
-            ax.set_ylabel("north", fontsize=8, labelpad=-2)
+            # Face-local axes from the block's SOUTH corner: col runs toward the
+            # north-EAST edge, row toward the north-WEST (zagg readers/_layout.py).
+            # A HEALPix face is a diamond -- these are not compass east/north.
+            ax.set_xlabel("→ NE edge", fontsize=8, labelpad=-2)
+            ax.set_ylabel("→ NW edge", fontsize=8, labelpad=-2)
 
         # Linked rotation: only while DRAGGING, and only when the angles moved --
         # a bare hover must not trigger a redraw.
