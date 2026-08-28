@@ -531,16 +531,14 @@ def _atl03_digests(store, field, w, r, c, chunk_side, chunk_order, block_order=B
     return merged[np.argsort(merged[:, 0], kind="stable")]
 
 
-def waveform_view(
-    stores, fields, blocks, pairs, shard, gside: int = 64, atl03_chunk_order: int = 13
-):
+def waveform_view(stores, fields, blocks, pairs, shard, atl03_chunk_order: int = 13):
     """Interactive coincident-waveform view.
 
     ``stores``/``fields`` are ``{sensor: ...}``; ``blocks`` is
     ``{sensor: {block_word: read_tensors tuple}}``; ``pairs`` is the sorted
     ``(word, joint_mask, A2, G2)`` list the notebook builds.
 
-    ``gside`` is GEDI's cells across an o12 BLOCK edge. ``atl03_chunk_order``
+    ``atl03_chunk_order``
     is where ATL03's chunks sit in these stores; ATL03's cells across a CHUNK
     edge is derived from it and the cell order the field's path already
     carries (``19/…``), because that is a different quantity that merely also
