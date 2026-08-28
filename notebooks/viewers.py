@@ -279,7 +279,8 @@ def view3d(
     # sweep this avoids -- so the count moves to the pane title, where it costs
     # nothing because that block has just been read.
     joint = sorted(
-        int(w) for w in generate_morton_children(int(mz.morton_word(shard)), block_order)
+        (int(w) for w in generate_morton_children(int(mz.morton_word(shard)), block_order)),
+        reverse=True,  # descending, so ...444 heads the list
     )
     if not joint:
         raise ValueError(f"shard {shard}: no order-{block_order} blocks beneath it")
