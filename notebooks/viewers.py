@@ -26,6 +26,7 @@ from ipywidgets import (
     FloatText,
     HBox,
     IntSlider,
+    Layout,
     VBox,
     interactive_output,
 )
@@ -44,7 +45,50 @@ SIDE = float(np.sqrt(4 * np.pi / (12 * 4**BLOCK_ORDER)) * 6_371_000)
 #: subsamples deterministically so rotation stays smooth.
 CAP = 20_000
 
-__all__ = ["BLOCK_ORDER", "CAP", "SIDE", "View", "grid_xy", "load", "view3d", "waveform_view"]
+#: What one unit of a sensor's stored WEIGHT is. ATL03 counts photons; GEDI's
+#: flux is scaled to photoelectrons. They are not the same quantity and run two
+#: to three orders of magnitude apart, so every count printed here is labelled.
+UNITS = {"atl03": "ph", "gedi": "pe"}
+
+__all__ = [
+    "BLOCK_ORDER",
+    "CAP",
+    "SIDE",
+    "UNITS",
+    "View",
+    "block_of",
+    "grid_xy",
+    "human_bytes",
+    "load",
+    "view3d",
+    "waveform_view",
+]
+
+
+def _si(n) -> str:
+    """1266765 -> '1.27M'. Counts below a thousand stay exact."""
+    n = float(n)
+    for cut, suffix in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+        if n >= cut:
+            return f"{n / cut:.3g}{suffix}"
+    return f"{n:,.0f}"
+
+
+def human_bytes(n) -> str:
+    """Byte count -> '320.0 MiB' / '1.25 GiB'. Exports print both sides of a write."""
+    return f"{n / 2**30:.2f} GiB" if n >= 2**30 else f"{n / 2**20:.1f} MiB"
+
+
+def block_of(words, block_order: int = BLOCK_ORDER):
+    """Cell word(s) -> their order-`block_order` ancestor word, by truncation.
+
+    A packed area word is ``[prefix | body | 6-bit suffix]`` and the suffix
+    carries the order, so an ancestor is the body truncated to the ancestor's
+    depth with the suffix rewritten -- no decode, and it vectorizes over an
+    array. Only valid for AREA words at or below `block_order`.
+    """
+    sh = np.uint64(6 + 2 * (27 - block_order))
+    return ((np.asarray(words, dtype=np.uint64) >> sh) << sh) | np.uint64(block_order)
 
 
 # --------------------------------------------------------------------------- #
@@ -112,8 +156,7 @@ def load(store, field, block_order: int = BLOCK_ORDER) -> dict:
             locw.append(np.asarray(row[2], dtype=np.uint64))
     z, wt = np.concatenate(zs), np.concatenate(wts)
     cells = np.concatenate(cells)
-    sh = np.uint64(6 + 2 * (27 - block_order))
-    blocks = ((cells >> sh) << sh) | np.uint64(block_order)  # o12 ancestor by truncation
+    blocks = block_of(cells, block_order)
     x, y = grid_xy(np.concatenate(locw) if locname else cells, block_order)
     t = None
     if tname:
@@ -163,6 +206,36 @@ def _binned_pts(tensor, offset, gain, cap: int = CAP):
     return (cols + 0.5) / side, (rows + 0.5) / side, offset + zs * gain, counts
 
 
+def _coverage(recs):
+    """Coarse sensor -> ``(fine sensor, its cells over a fine cell, its cells)``.
+
+    One GEDI o18 footprint tiles exactly 2x2 of ATL03's o19 cells, so "does
+    this GEDI cell see any ICESat-2 photons at all" is a block-reduce of the
+    finer occupancy channel ANDed with the coarser one: two boolean arrays of
+    at most 128x128, and no extra I/O -- `read_tensors` hands the occupancy
+    back beside every tensor it already read.
+
+    Occupancy is `mask == 2` ("observed, digest stored"), never
+    `mask.astype(bool)`: where the leaf carries an exact occupancy sidecar the
+    mask is 3-state and `1` means observed-but-EMPTY, which is precisely the
+    cell this is asking about. Counting it as populated would inflate both the
+    cell counts and this overlap.
+    """
+    occ = {n: r["occ"] for n, r in recs.items() if r["occ"] is not None}
+    if len(occ) < 2:  # a block one sensor missed entirely -- nothing to compare
+        return {}
+    fine = max(occ, key=lambda n: occ[n].shape[0])
+    out = {}
+    for name, o in occ.items():
+        side = o.shape[0]
+        k, rem = divmod(occ[fine].shape[0], side)
+        if name == fine or rem:  # not a whole-cell nesting; say nothing
+            continue
+        over = occ[fine].reshape(side, k, side, k).any(axis=(1, 3))
+        out[name] = (fine, int((over & o).sum()), int(o.sum()))
+    return out
+
+
 class View:
     """Holds what is on screen so `export` knows which block you mean."""
 
@@ -173,6 +246,7 @@ class View:
 def view3d(
     handles,
     shard,
+    tally=None,
     block_order: int = BLOCK_ORDER,
     cap: int = CAP,
     n_bins: int = 256,
@@ -195,6 +269,14 @@ def view3d(
     exact centroids are swept lazily on the first unbinned draw -- so a reader
     who looks at one block pays for one block, and one who never unticks the
     box never pays for the sweep at all.
+
+    `tally` is the optional ``{sensor: {block word: (cells, weight)}}`` the
+    notebook's open-and-sweep cell already accumulated; it labels the block
+    dropdown, and costs nothing because that pass has already been paid for.
+    Those are STORED totals over the whole digest. The counts each read prints,
+    and the ones in the pane titles, are what landed inside the tensor's finite
+    z window and so run lower -- the tails are trimmed at `bottom`/`top` and
+    anything past ``n_bins * gain`` metres of relief has nowhere to go.
 
     Returns the :class:`View` the widgets write to, so a later cell can export
     whatever is on screen.
@@ -235,20 +317,30 @@ def view3d(
                 ),
                 None,
             )
-            hit = (
-                {"pts": None, "cells": 0, "gain": resolution}
-                if got is None  # the block holds nothing in this store
-                else {
+            if got is None:  # the block holds nothing in this store
+                hit = {"pts": None, "cells": 0, "gain": resolution, "occ": None, "obs": 0.0}
+            else:
+                occ = got[1] == 2  # stored digest; see `_coverage` on why not `.astype(bool)`
+                hit = {
                     "pts": _binned_pts(got[0], *got[2], cap),
-                    "cells": int(got[1].astype(bool).sum()),
+                    "cells": int(occ.sum()),
                     "gain": got[2][1],
+                    "occ": occ,
+                    "obs": float(got[0].sum(dtype="float64")),
+                    "bins": got[0].shape[2],
                 }
-            )
             voxels[name][block] = hit
+            # Report what the read actually MOVED, not a resident-memory delta:
+            # cells, the sensor's own weight unit, and the z window they fell in.
             print(
                 f"  {name} {mz.morton_decimal(block)}: "
-                + ("empty" if hit["pts"] is None else f"{hit['cells']:,} cells")
-                + f" in {time.perf_counter() - t0:.1f}s",
+                + (
+                    "empty"
+                    if hit["pts"] is None
+                    else f"{hit['cells']:,} cells, {_si(hit['obs'])} "
+                    f"{UNITS.get(name, 'obs')} in a {hit['bins']} x {hit['gain']:g} m z window"
+                )
+                + f", {time.perf_counter() - t0:.1f}s",
                 flush=True,
             )
         return hit
@@ -285,8 +377,22 @@ def view3d(
     if not joint:
         raise ValueError(f"shard {shard}: no order-{block_order} blocks beneath it")
 
+    def _label(w):
+        """Block label: its decimal id, plus each sensor's stored size if known."""
+        if not tally:
+            return mz.morton_decimal(w)
+        parts = [
+            f"{n} {c:,} cells / {_si(o)} {UNITS.get(n, 'obs')}"
+            for n in names
+            for c, o in [tally.get(n, {}).get(w, (0, 0.0))]
+        ]
+        return mz.morton_decimal(w) + " — " + " · ".join(parts)
+
     dd = Dropdown(
-        options=[(mz.morton_decimal(w), w) for w in joint], value=joint[0], description="block"
+        options=[(_label(w), w) for w in joint],
+        value=joint[0],
+        description="block",
+        layout=Layout(width="640px" if tally else "260px"),
     )
     zmode = Dropdown(
         options=[("independent z", "auto"), *[(f"pin z to {n}", n) for n in names]],
@@ -297,11 +403,23 @@ def view3d(
     time_cb = Checkbox(value=False, description="color by time (shared)")
     bin_cb = Checkbox(value=True, description="binned (fixed tensors)")
 
+    said: set = set()  # blocks whose coarse-over-fine line has already printed
+
     def _panes(block, binned):
         if binned:
+            recs = {n: _voxels(n, block) for n in names}
+            cov = _coverage(recs)
+            if block not in said:
+                said.add(block)
+                for n, (fine, over, total) in cov.items():
+                    print(
+                        f"  {n} over {fine}: {over:,} of {total:,} cells "
+                        f"({100 * over / max(total, 1):.0f}%)",
+                        flush=True,
+                    )
             out = []
             for n in names:
-                rec = _voxels(n, block)
+                rec = recs[n]
                 if rec["pts"] is None:  # nothing stored here for this sensor
                     empty = np.empty(0)
                     out.append(
@@ -317,6 +435,10 @@ def view3d(
                     )
                     continue
                 x, y, z, wt = rec["pts"]
+                note = f"binned ({rec['gain']:g} m z, {rec['cells']:,} cells"
+                if n in cov:
+                    fine, over, total = cov[n]
+                    note += f", {100 * over / max(total, 1):.0f}% over {fine}"
                 out.append(
                     {
                         "x": x * SIDE,
@@ -325,7 +447,7 @@ def view3d(
                         "wt": wt,
                         "t": None,
                         "label": n,
-                        "xy_note": f"binned ({rec['gain']:g} m z, {rec['cells']:,} cells)",
+                        "xy_note": note + ")",
                     }
                 )
             return out
@@ -706,7 +828,12 @@ def waveform_view(stores, fields, blocks, pairs, shard, atl03_chunk_order: int =
     # notebook ships with, that one shows the canopy/ground structure clearly.
     # Any other AOI will rank differently -- it is a nice default, not a rule.
     nth = IntSlider(min=0, max=40, value=6, description="nth joint")
-    binw = FloatText(value=1.0, step=0.5, description="bin (m)")
+    binw = FloatText(
+        value=1.0,
+        step=0.5,
+        description="histogram bin size, ATL03 z (m)",
+        style={"description_width": "initial"},
+    )
     display(
         VBox(
             [
