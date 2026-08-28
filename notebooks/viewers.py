@@ -190,9 +190,11 @@ def view3d(
       the field carries one (ATL03, point-exact) or the cell word where it
       does not (GEDI flux, footprint scale).
 
-    Tensors are read once up front (the default view needs them) and REDUCED as
-    they arrive; the exact centroids are swept lazily on the first unbinned
-    draw, so a reader who never unticks the box never pays for them.
+    Nothing is read until it is drawn. The block list is arithmetic, each
+    block's tensor is fetched the first time you select it and cached, and the
+    exact centroids are swept lazily on the first unbinned draw -- so a reader
+    who looks at one block pays for one block, and one who never unticks the
+    box never pays for the sweep at all.
 
     Returns the :class:`View` the widgets write to, so a later cell can export
     whatever is on screen.
@@ -201,36 +203,56 @@ def view3d(
     view.shard = shard
     names = list(handles)
 
-    # One sweep per sensor, reduced block by block as it goes. A block tensor is
-    # up to 16 MiB and a shard holds ~64 of them per sensor, but the view draws
-    # ONE block at a time and never more than `cap` of its voxels -- so keep the
-    # drawable cloud and the occupancy count, not the tensor. That is ~1.3 GiB
-    # resident versus ~80 MiB, and mybinder.org caps the WHOLE container at 2 GB.
-    print("binning tensors (once, whole shard, both sensors)...", flush=True)
-    t0 = time.perf_counter()
-    voxels: dict = {}
-    for name, (store, field) in handles.items():
-        voxels[name] = {
-            b[3]: {
-                "pts": _binned_pts(b[0], *b[2], cap),
-                "cells": int(b[1].astype(bool).sum()),
-                "gain": b[2][1],
-            }
-            for b in mz.read_tensors(
-                store,
-                field,
-                n_bins=n_bins,
-                resolution=resolution,
-                block_order=block_order,
-                fit="degrade_resolution",
+    # Read ONE block when it is asked for, and keep only what gets drawn.
+    #
+    # A block tensor is up to 16 MiB and a shard holds 64 per sensor, so sweeping
+    # the shard up front cost ~1.3 GiB resident (mybinder caps the container at
+    # 2 GB) and ~148 s before the first frame -- 128 sequential S3 GETs, any one
+    # of which can time out and take the whole viewer with it. The view draws one
+    # block at a time, so `read_tensors(subtree=...)` fetches exactly that block
+    # and `_binned_pts` reduces it to at most `cap` drawable voxels before the
+    # tensor is dropped. First frame is one block per sensor; the rest arrive as
+    # the dropdown is used, and a revisit is free.
+    voxels: dict = {n: {} for n in names}
+
+    def _voxels(name, block):
+        """This sensor's drawable voxels for one block, read once and cached."""
+        hit = voxels[name].get(block)
+        if hit is None:
+            store, field = handles[name]
+            t0 = time.perf_counter()
+            got = next(
+                iter(
+                    mz.read_tensors(
+                        store,
+                        field,
+                        n_bins=n_bins,
+                        resolution=resolution,
+                        block_order=block_order,
+                        fit="degrade_resolution",
+                        subtree=mz.morton_decimal(block),
+                    )
+                ),
+                None,
             )
-        }
-    print(
-        "  "
-        + ", ".join(f"{len(voxels[n]):,} {n} blocks" for n in handles)
-        + f" in {time.perf_counter() - t0:.0f}s",
-        flush=True,
-    )
+            hit = (
+                {"pts": None, "cells": 0, "gain": resolution}
+                if got is None  # the block holds nothing in this store
+                else {
+                    "pts": _binned_pts(got[0], *got[2], cap),
+                    "cells": int(got[1].astype(bool).sum()),
+                    "gain": got[2][1],
+                }
+            )
+            voxels[name][block] = hit
+            print(
+                f"  {name} {mz.morton_decimal(block)}: "
+                + ("empty" if hit["pts"] is None else f"{hit['cells']:,} cells")
+                + f" in {time.perf_counter() - t0:.1f}s",
+                flush=True,
+            )
+        return hit
+
     exact: dict = {}  # filled on the first unbinned draw
 
     def _exact():
@@ -249,21 +271,22 @@ def view3d(
             )
         return exact
 
-    # Blocks both sensors populate, SORTED, each labelled with how much it holds.
-    joint = sorted(set.intersection(*(set(v) for v in voxels.values())))
+    # The block list is ARITHMETIC, not read: an order-`block_order` block is a
+    # descendant of the shard, so `generate_morton_children` enumerates all of
+    # them with no I/O at all. (Checked against this store: the 64 it names are
+    # exactly the 64 the `morton` coordinate reports as populated.) Counting each
+    # block's cells for the label would mean reading every block -- the very
+    # sweep this avoids -- so the count moves to the pane title, where it costs
+    # nothing because that block has just been read.
+    joint = sorted(
+        int(w) for w in generate_morton_children(int(mz.morton_word(shard)), block_order)
+    )
     if not joint:
-        raise ValueError(f"shard {shard}: no block is populated in every store")
-    options = [
-        (
-            f"{mz.morton_decimal(w)}  ("
-            + ", ".join(f"{voxels[n][w]['cells']:,} {n} cells" for n in names)
-            + ")",
-            w,
-        )
-        for w in joint
-    ]
+        raise ValueError(f"shard {shard}: no order-{block_order} blocks beneath it")
 
-    dd = Dropdown(options=options, value=joint[0], description="block")
+    dd = Dropdown(
+        options=[(mz.morton_decimal(w), w) for w in joint], value=joint[0], description="block"
+    )
     zmode = Dropdown(
         options=[("independent z", "auto"), *[(f"pin z to {n}", n) for n in names]],
         value="auto",
@@ -277,7 +300,21 @@ def view3d(
         if binned:
             out = []
             for n in names:
-                rec = voxels[n][block]
+                rec = _voxels(n, block)
+                if rec["pts"] is None:  # nothing stored here for this sensor
+                    empty = np.empty(0)
+                    out.append(
+                        {
+                            "x": empty,
+                            "y": empty,
+                            "z": empty,
+                            "wt": empty,
+                            "t": None,
+                            "label": n,
+                            "xy_note": "no data in this block",
+                        }
+                    )
+                    continue
                 x, y, z, wt = rec["pts"]
                 out.append(
                     {
@@ -287,7 +324,7 @@ def view3d(
                         "wt": wt,
                         "t": None,
                         "label": n,
-                        "xy_note": f"binned ({rec['gain']:g} m z)",
+                        "xy_note": f"binned ({rec['gain']:g} m z, {rec['cells']:,} cells)",
                     }
                 )
             return out
@@ -314,17 +351,23 @@ def view3d(
     def draw(block, by_elev, by_time, binned, zmode):
         view.block = block
         panes = _panes(block, binned)
+        # A block can be empty in one store and not the other (and every pane is
+        # empty if it is empty in both), so every range below is taken over the
+        # NON-empty panes only -- `.min()` and `np.percentile` both raise on an
+        # empty array, which would take the whole view down on a sparse block.
+        filled = [p for p in panes if len(p["z"])]
+        pinned = panes[names.index(zmode)] if zmode != "auto" else None
         zlim = (
-            None
-            if zmode == "auto"
-            else (lambda p: (p["z"].min(), p["z"].max()))(panes[names.index(zmode)])
-        )
-        shared_elev = (
-            plt.Normalize(min(p["z"].min() for p in panes), max(p["z"].max() for p in panes))
-            if by_elev and not by_time
+            (pinned["z"].min(), pinned["z"].max())
+            if pinned is not None and len(pinned["z"])
             else None
         )
-        tv = [p["t"] for p in panes if p["t"] is not None]
+        shared_elev = (
+            plt.Normalize(min(p["z"].min() for p in filled), max(p["z"].max() for p in filled))
+            if by_elev and not by_time and filled
+            else None
+        )
+        tv = [p["t"] for p in panes if p["t"] is not None and len(p["t"])]
         shared_time = (
             plt.Normalize(min(t.min() for t in tv), max(t.max() for t in tv))
             if (by_time and tv)
@@ -349,6 +392,10 @@ def view3d(
             ax = fig.add_subplot(1, 2, k + 1, projection="3d")
             axes.append(ax)
             note = f" — {p['xy_note']}"
+            if not len(p["z"]):  # empty here; label the pane and leave the axes bare
+                ax.set_title(p["label"] + note, fontsize=9)
+                ax.set_zlabel("elevation (m)")
+                continue
             alpha = np.clip(p["wt"] / max(np.percentile(p["wt"], 98), 1e-9), 0.08, 1.0)
             if by_time and p["t"] is not None:
                 pts = ax.scatter(
