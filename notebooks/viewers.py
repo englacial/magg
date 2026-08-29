@@ -86,42 +86,45 @@ def _si(n) -> str:
 def paired_blocks(handles, block_order: int = BLOCK_ORDER, n_bins: int = 256, res: float = 1.0):
     """Read both sensors' block tensors and rank the blocks by coincident cells.
 
-    Returns ``(blocks, pairs)``: the per-sensor ``{block word: read_tensors tuple}``
-    the waveform view draws from, and the sorted ``(word, joint mask, A2, G2)`` list
-    it picks cells out of. `A2` is ATL03's column sums folded 2x2 onto GEDI's o18
+    Returns ``(gains, pairs)``: the per-sensor ``{block word: (offset, gain)}`` z
+    window, and the sorted ``(word, joint mask, A2, G2)`` list the waveform view
+    picks cells out of. `A2` is ATL03's column sums folded 2x2 onto GEDI's o18
     grid -- one GEDI footprint covers exactly four ATL03 cells -- so `joint` marks
     the o18 cells both sensors populate.
+
+    Holds NO tensor. One ATL03 block at these settings is (128, 128, 256) uint32 =
+    16 MiB and a shard has 64 per sensor, so keeping the `read_tensors` tuples was
+    1.25 GiB against mybinder's 2 GB cap. Each tensor is reduced to its column sums
+    (64 KiB) and dropped as it arrives, and the z gain is the only other thing the
+    view ever needed from it -- so peak is one block, not sixty-four.
 
     Totals printed here come from the TENSORS, so they count only what fell inside
     each block's z window and run a few per cent under what the digests hold.
     """
     t0 = time.perf_counter()
-    blocks = {
-        name: {
-            b[3]: b
-            for b in mz.read_tensors(
-                store,
-                field,
-                n_bins=n_bins,
-                resolution=res,
-                block_order=block_order,
-                fit="degrade_resolution",
-            )
-        }
-        for name, (store, field) in handles.items()
-    }
+    gains, cols = {}, {}
+    for name, (store, field) in handles.items():
+        gains[name], cols[name] = {}, {}
+        for tensor, _mask, window, w in mz.read_tensors(
+            store,
+            field,
+            n_bins=n_bins,
+            resolution=res,
+            block_order=block_order,
+            fit="degrade_resolution",
+        ):
+            gains[name][w] = window
+            cols[name][w] = tensor.sum(axis=2)  # the tensor is dropped here
     print(
         f"paired tensors in {time.perf_counter() - t0:.1f}s — "
-        + ", ".join(f"{len(v)} {k} blocks" for k, v in blocks.items())
+        + ", ".join(f"{len(v)} {k} blocks" for k, v in cols.items())
     )
-    gside = None
     pairs = []
-    for w, (gt, _gm, _gz, _) in blocks["gedi"].items():
-        if w not in blocks["atl03"]:
+    for w, g2 in cols["gedi"].items():
+        if w not in cols["atl03"]:
             continue
-        gside = gside or gt.shape[0]
-        a2 = blocks["atl03"][w][0].sum(axis=2).reshape(gside, 2, gside, 2).sum(axis=(1, 3))
-        g2 = gt.sum(axis=2)
+        gside = g2.shape[0]
+        a2 = cols["atl03"][w].reshape(gside, 2, gside, 2).sum(axis=(1, 3))
         joint = (a2 > 0) & (g2 > 0)
         if joint.any():
             pairs.append((w, joint, a2, g2))
@@ -132,7 +135,7 @@ def paired_blocks(handles, block_order: int = BLOCK_ORDER, n_bins: int = 256, re
             f"{int(a2[j].sum()):9,} atl03 ph*   {int(g2[j].sum()):9,} gedi pe*"
         )
     print("  * tensor totals: only what fell inside each block's z window")
-    return blocks, pairs
+    return gains, pairs
 
 
 def viewer_stats(handles, block_order: int = BLOCK_ORDER) -> dict:
@@ -828,12 +831,11 @@ def _block_digests(store, field, block, cell_order, block_order=BLOCK_ORDER):
     return {(int(rows[i]), int(cols[i])): np.asarray(v) for i, (_w, v) in enumerate(got)}
 
 
-def waveform_view(stores, fields, blocks, pairs, shard):
+def waveform_view(stores, fields, gains, pairs, shard):
     """Interactive coincident-waveform view.
 
-    ``stores``/``fields`` are ``{sensor: ...}``; ``blocks`` is
-    ``{sensor: {block_word: read_tensors tuple}}``; ``pairs`` is the sorted
-    ``(word, joint_mask, A2, G2)`` list the notebook builds.
+    ``stores``/``fields`` are ``{sensor: ...}``; ``gains`` and ``pairs`` are what
+    :func:`paired_blocks` returns.
 
     Digests are read a BLOCK at a time and cached, so moving the slider does no
     I/O at all -- see :func:`_block_digests`.
@@ -877,8 +879,8 @@ def waveform_view(stores, fields, blocks, pairs, shard):
 
     def paired_waveform(pair=0, nth=0, binw=1.0):
         w, joint, a2, g2 = pairs[pair]  # a2/g2: the notebook's A2/G2, lowercased for N806
-        _, _, (_aoff, ag), _ = blocks["atl03"][w]
-        _, _, (_goff, gg), _ = blocks["gedi"][w]
+        _aoff, ag = gains["atl03"][w]
+        _goff, gg = gains["gedi"][w]
         # Rank the joint cells by the weaker side. a2 is ATL03 PHOTON counts and
         # g2 GEDI PHOTOELECTRONS -- incommensurate units that run two to three
         # orders of magnitude apart on this store pair, so a raw `np.minimum`
