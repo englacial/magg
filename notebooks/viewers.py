@@ -554,12 +554,17 @@ def view3d(
     # too put 76% of a block's voxels under 0.10 and hid the single-count ones.
     # `shade by weight` puts that cue back deliberately, spanning the slider's
     # value down to a twentieth of it.
+    # `continuous_update=False` here, unlike the waveform's `nth`: this slider
+    # reads nothing (block voxels are cached), so the only cost is the redraw --
+    # ~585 ms for 2 panes of 20k 3-D points. Firing that per drag step queues
+    # frames for a value nobody asked to stop on; on release it is one redraw.
     alpha_sl = FloatSlider(
         min=0.05,
         max=1.0,
         step=0.05,
         value=0.55,
         description="opacity",
+        continuous_update=False,
         readout_format=".2f",
         layout=Layout(width="330px"),
     )
@@ -1008,9 +1013,11 @@ def waveform_view(stores, fields, gains, pairs, shard):
     # notebook ships with, that one shows the canopy/ground structure clearly.
     # Any other AOI will rank differently -- it is a nice default, not a rule.
     #
-    # `continuous_update` left at its default: a drag fires a read per step (up to
-    # five S3 round trips), which is slow, but suppressing it made the control feel
-    # dead. A laggy slider beats one that looks broken.
+    # `continuous_update` left at its default (True), unlike the opacity slider:
+    # since `_block_digests` caches the whole block, moving this reads NOTHING --
+    # a dict lookup and two 2-D line plots -- so there is nothing to suppress.
+    # (It used to cost five S3 round trips a step, ~45 s on a poor link, which is
+    # what made the control look dead.)
     #
     # `max` is re-set per block below. A fixed 0..40 was wrong: 30 of the 64 blocks
     # on this shard hold fewer than 41 coincident cells, and `paired_waveform`
