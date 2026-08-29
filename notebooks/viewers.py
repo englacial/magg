@@ -66,6 +66,7 @@ __all__ = [
     "densest_shard",
     "human_bytes",
     "joint_cells",
+    "paired_blocks",
     "viewer_stats",
     "load",
     "view3d",
@@ -80,6 +81,58 @@ def _si(n) -> str:
         if n >= cut:
             return f"{n / cut:.3g}{suffix}"
     return f"{n:,.0f}"
+
+
+def paired_blocks(handles, block_order: int = BLOCK_ORDER, n_bins: int = 256, res: float = 1.0):
+    """Read both sensors' block tensors and rank the blocks by coincident cells.
+
+    Returns ``(blocks, pairs)``: the per-sensor ``{block word: read_tensors tuple}``
+    the waveform view draws from, and the sorted ``(word, joint mask, A2, G2)`` list
+    it picks cells out of. `A2` is ATL03's column sums folded 2x2 onto GEDI's o18
+    grid -- one GEDI footprint covers exactly four ATL03 cells -- so `joint` marks
+    the o18 cells both sensors populate.
+
+    Totals printed here come from the TENSORS, so they count only what fell inside
+    each block's z window and run a few per cent under what the digests hold.
+    """
+    t0 = time.perf_counter()
+    blocks = {
+        name: {
+            b[3]: b
+            for b in mz.read_tensors(
+                store,
+                field,
+                n_bins=n_bins,
+                resolution=res,
+                block_order=block_order,
+                fit="degrade_resolution",
+            )
+        }
+        for name, (store, field) in handles.items()
+    }
+    print(
+        f"paired tensors in {time.perf_counter() - t0:.1f}s — "
+        + ", ".join(f"{len(v)} {k} blocks" for k, v in blocks.items())
+    )
+    gside = None
+    pairs = []
+    for w, (gt, _gm, _gz, _) in blocks["gedi"].items():
+        if w not in blocks["atl03"]:
+            continue
+        gside = gside or gt.shape[0]
+        a2 = blocks["atl03"][w][0].sum(axis=2).reshape(gside, 2, gside, 2).sum(axis=(1, 3))
+        g2 = gt.sum(axis=2)
+        joint = (a2 > 0) & (g2 > 0)
+        if joint.any():
+            pairs.append((w, joint, a2, g2))
+    pairs.sort(key=lambda p: -int(p[1].sum()))
+    for w, j, a2, g2 in pairs[:8]:
+        print(
+            f"  {mz.morton_decimal(w)}  {int(j.sum()):4,} joint o18 cells   "
+            f"{int(a2[j].sum()):9,} atl03 ph*   {int(g2[j].sum()):9,} gedi pe*"
+        )
+    print("  * tensor totals: only what fell inside each block's z window")
+    return blocks, pairs
 
 
 def viewer_stats(handles, block_order: int = BLOCK_ORDER) -> dict:
