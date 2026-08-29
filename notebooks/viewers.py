@@ -557,7 +557,6 @@ def view3d(
         step=0.05,
         value=0.55,
         description="opacity",
-        continuous_update=False,
         readout_format=".2f",
         layout=Layout(width="330px"),
     )
@@ -1026,16 +1025,15 @@ def waveform_view(stores, fields, blocks, pairs, shard, atl03_chunk_order: int =
     # notebook ships with, that one shows the canopy/ground structure clearly.
     # Any other AOI will rank differently -- it is a nice default, not a rule.
     #
-    # `continuous_update=False`: `nth` changes what is READ (up to five S3 round
-    # trips a step), so a live drag would fire dozens.
-    nth = IntSlider(
-        min=0,
-        max=40,
-        value=6,
-        description="nth joint",
-        continuous_update=False,
-        layout=Layout(width="330px"),
-    )
+    # `continuous_update` left at its default: a drag fires a read per step (up to
+    # five S3 round trips), which is slow, but suppressing it made the control feel
+    # dead. A laggy slider beats one that looks broken.
+    #
+    # `max` is re-set per block below. A fixed 0..40 was wrong: 30 of the 64 blocks
+    # on this shard hold fewer than 41 coincident cells, and `paired_waveform`
+    # clamps with `min(nth, joint.sum() - 1)`, so every position past the count
+    # selected the SAME cell and the view stopped changing.
+    nth = IntSlider(min=0, max=40, value=6, description="nth joint", layout=Layout(width="330px"))
     binw = FloatText(
         value=1.0,
         step=0.5,
@@ -1043,7 +1041,14 @@ def waveform_view(stores, fields, blocks, pairs, shard, atl03_chunk_order: int =
         style={"description_width": "initial"},
         layout=Layout(width="330px"),
     )
+
     # Two rows, every widget sized -- see the HBox note in `view3d`.
+    def _fit_nth(_change=None):
+        """Bound `nth` to the cells this block actually has."""
+        nth.max = max(int(pairs[dd.value][1].sum()) - 1, 0)
+
+    dd.observe(_fit_nth, names="value")
+    _fit_nth()
     display(
         VBox(
             [
