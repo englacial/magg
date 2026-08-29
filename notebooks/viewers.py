@@ -338,16 +338,8 @@ def view3d(
     view.shard = shard
     names = list(handles)
 
-    # Read ONE block when it is asked for, and keep only what gets drawn.
-    #
-    # A block tensor is up to 16 MiB and a shard holds 64 per sensor, so sweeping
-    # the shard up front cost ~1.3 GiB resident (mybinder caps the container at
-    # 2 GB) and ~148 s before the first frame -- 128 sequential S3 GETs, any one
-    # of which can time out and take the whole viewer with it. The view draws one
-    # block at a time, so `read_tensors(subtree=...)` fetches exactly that block
-    # and `_binned_pts` reduces it to at most `cap` drawable voxels before the
-    # tensor is dropped. First frame is one block per sensor; the rest arrive as
-    # the dropdown is used, and a revisit is free.
+    # One block per read, cached. Sweeping the shard up front cost ~1.3 GiB
+    # resident (Binder caps at 2 GB) and ~148 s before the first frame.
     voxels: dict = {n: {} for n in names}
 
     def _voxels(name, block):
@@ -416,19 +408,8 @@ def view3d(
             )
         return exact
 
-    # Which blocks, and in what order.
-    #
-    # With a `tally` the list is the blocks the sweep actually FOUND in the leaf
-    # that is open, which is the only list guaranteed to belong to these
-    # handles. Deriving it from `shard` instead lets the two disagree -- pass
-    # handles opened on one shard and the id of another and every read asks for
-    # a subtree outside the leaf's axis, which `read_tensors` answers with a
-    # warning and an empty yield rather than an error, so the viewer just draws
-    # nothing. The guard below turns that into a sentence.
-    #
-    # Without a tally it falls back to arithmetic: an order-`block_order` block
-    # is a descendant of the shard, so `generate_morton_children` enumerates all
-    # of them with no I/O at all.
+    # Blocks the sweep actually found, so they cannot disagree with the open
+    # leaf; without a tally, arithmetic off the shard word, no I/O.
     within = {int(w) for w in generate_morton_children(int(mz.morton_word(shard)), block_order)}
     if tally:
         found = {w for per in tally.values() for w in per}
@@ -443,10 +424,7 @@ def view3d(
     if not blocks:
         raise ValueError(f"shard {shard}: no order-{block_order} blocks beneath it")
 
-    # Rank by COINCIDENT CELLS -- the count of cells both sensors populate. That
-    # is the quantity the paired views are actually about, it needs no scaling
-    # (cells are cells, unlike photons against photoelectrons), and `joint_cells`
-    # derives it from the sweep for free.
+    # Rank by coincident cells -- no scaling needed, unlike the weights.
     if joint:
         order = sorted(blocks, key=lambda w: (-joint.get(w, 0), -w))
     else:
@@ -478,14 +456,8 @@ def view3d(
     elev_cb = Checkbox(value=False, description="color by elevation (shared)")
     time_cb = Checkbox(value=False, description="color by time (shared)")
     bin_cb = Checkbox(value=True, description="binned (fixed tensors)")
-    # Opacity is a CONTROL, not a derived quantity. Weight is already the colour
-    # (log-normed, with a colorbar), and letting it drive alpha as well used to
-    # erase the sparse returns -- on a representative block 76% of ATL03's
-    # occupied voxels landed on the old 0.08 floor, and 55% of them held exactly
-    # one photon. Single-count voxels are the canopy top and the understory, so
-    # the default is now FLAT: every observation drawn at the same opacity, none
-    # hidden. Tick `shade by weight` to put the density cue back, ramping on
-    # log(weight) from the slider's value up to fully opaque.
+    # Flat by default: weight is already the colour, and letting it drive alpha
+    # too put 76% of a block's voxels under 0.10 and hid the single-count ones.
     alpha_sl = FloatSlider(
         min=0.05,
         max=1.0,
@@ -710,9 +682,8 @@ def view3d(
             "shade": shade_cb,
         },
     )
-    # Three rows, not one. An `HBox` does not wrap, so a row that overruns the
-    # notebook's width gets its widest-shrinkable child squeezed -- which is
-    # always the slider, and it collapses to an undraggable stub.
+    # Three rows: an HBox does not wrap, and an overrun row squeezes the slider
+    # into an undraggable stub.
     display(
         VBox(
             [
@@ -957,9 +928,8 @@ def waveform_view(stores, fields, blocks, pairs, shard, atl03_chunk_order: int =
     # notebook ships with, that one shows the canopy/ground structure clearly.
     # Any other AOI will rank differently -- it is a nice default, not a rule.
     #
-    # `continuous_update=False` so a drag reads once, on release. `nth` is one
-    # of the two knobs that changes what is READ (up to five S3 round trips a
-    # step), so a live drag across the slider would fire dozens of them.
+    # `continuous_update=False`: `nth` changes what is READ (up to five S3 round
+    # trips a step), so a live drag would fire dozens.
     nth = IntSlider(
         min=0,
         max=40,
@@ -975,10 +945,7 @@ def waveform_view(stores, fields, blocks, pairs, shard, atl03_chunk_order: int =
         style={"description_width": "initial"},
         layout=Layout(width="330px"),
     )
-    # Two rows, and every widget sized. An `HBox` does not wrap: put these three
-    # on one row and the total runs past the notebook's width, so flexbox shrinks
-    # whichever child will yield -- and that is the slider, which collapses to a
-    # stub you cannot drag. Widening `binw`'s label is what tipped it over.
+    # Two rows, every widget sized -- see the HBox note in `view3d`.
     display(
         VBox(
             [
