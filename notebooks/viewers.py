@@ -23,6 +23,7 @@ from IPython.display import display
 from ipywidgets import (
     Checkbox,
     Dropdown,
+    FloatSlider,
     FloatText,
     HBox,
     IntSlider,
@@ -45,9 +46,13 @@ SIDE = float(np.sqrt(4 * np.pi / (12 * 4**BLOCK_ORDER)) * 6_371_000)
 #: subsamples deterministically so rotation stays smooth.
 CAP = 20_000
 
-#: What one unit of a sensor's stored WEIGHT is. ATL03 counts photons; GEDI's
-#: flux is scaled to photoelectrons. They are not the same quantity and run two
-#: to three orders of magnitude apart, so every count printed here is labelled.
+#: What one unit of a sensor's stored WEIGHT is. ATL03 counts photons. GEDI's
+#: flux is background-subtracted counts scaled by a named receiver gain, and
+#: this store ships `gain: {name: "unit", value: 1.0}` -- a placeholder -- so
+#: "pe" here is PROPORTIONAL to photoelectrons, not calibrated to them (the
+#: published chain is ~0.4 pe/count; see `waveform_viewer.ipynb`). The two are
+#: not commensurate and run orders of magnitude apart, so every count is
+#: labelled and none are ever summed together.
 UNITS = {"atl03": "ph", "gedi": "pe"}
 
 __all__ = [
@@ -58,7 +63,9 @@ __all__ = [
     "View",
     "block_of",
     "grid_xy",
+    "densest_shard",
     "human_bytes",
+    "joint_cells",
     "load",
     "view3d",
     "waveform_view",
@@ -72,6 +79,51 @@ def _si(n) -> str:
         if n >= cut:
             return f"{n / cut:.3g}{suffix}"
     return f"{n:,.0f}"
+
+
+def densest_shard(root, shards, **s3) -> str:
+    """The shard with the most granules, by the store's own leaf telemetry.
+
+    `read_stats` fetches one leaf's stats sidecar by arithmetic on the manifest
+    -- no LIST, a few KB each -- so ranking a handful of candidates is cheap.
+    This is the rule `demo/06_paired` used (`max` on the GEDI granule count),
+    reproduced here off the published store instead of a local shardmap, so
+    both demos land on the same shard without anyone hardcoding an id.
+    """
+    return max(shards, key=lambda s: (mz.read_stats(root, s, **s3) or {}).get("n_granules", 0))
+
+
+def joint_cells(words, block_order: int = BLOCK_ORDER):
+    """{block word: cells BOTH sensors populate}, from the sweep's words alone.
+
+    The sensors are keyed at different orders -- ATL03 o19, GEDI o18 -- so each
+    side is folded to the COARSER of the two before intersecting: one GEDI
+    footprint covers 2x2 ATL03 cells, and it is joint when any of the four holds
+    a digest. Exact, and free: the open-and-sweep pass already visited every one
+    of these words, so this reads nothing and needs no tensor.
+
+    (Checked against the tensor-derived mask `waveform_viewer` builds -- both
+    give 27 joint cells on block 4331422233444 -- and against the occupancy
+    channel `read_tensors` returns, which agrees to the cell.)
+    """
+    if len(words) < 2:
+        return {}
+    per, coarse = {}, None
+    for name, w in words.items():
+        w = np.asarray(w, dtype=np.uint64)
+        if not len(w):
+            return {}  # a sensor with nothing here has nothing joint anywhere
+        order = int(np.asarray(block_rank(w[:1], block_order)[1]).ravel()[0])
+        per[name] = w
+        coarse = order if coarse is None else min(coarse, order)
+    both = None
+    for w in per.values():
+        folded = np.unique(block_of(w, coarse))
+        both = folded if both is None else np.intersect1d(both, folded, assume_unique=True)
+    if not len(both):
+        return {}
+    blocks, counts = np.unique(block_of(both, block_order), return_counts=True)
+    return {int(b): int(c) for b, c in zip(blocks, counts)}
 
 
 def human_bytes(n) -> str:
@@ -210,7 +262,7 @@ def _coverage(recs):
     """Coarse sensor -> ``(fine sensor, its cells over a fine cell, its cells)``.
 
     One GEDI o18 footprint tiles exactly 2x2 of ATL03's o19 cells, so "does
-    this GEDI cell see any ICESat-2 photons at all" is a block-reduce of the
+    this GEDI cell sit over a stored ATL03 SIGNAL digest" is a block-reduce of the
     finer occupancy channel ANDed with the coarser one: two boolean arrays of
     at most 128x128, and no extra I/O -- `read_tensors` hands the occupancy
     back beside every tensor it already read.
@@ -247,6 +299,7 @@ def view3d(
     handles,
     shard,
     tally=None,
+    joint=None,
     block_order: int = BLOCK_ORDER,
     cap: int = CAP,
     n_bins: int = 256,
@@ -390,41 +443,32 @@ def view3d(
     if not blocks:
         raise ValueError(f"shard {shard}: no order-{block_order} blocks beneath it")
 
-    def _weight(w):
-        """Sort key: blocks where BOTH sensors are well populated come first.
-
-        The two weights are incommensurate -- ATL03 counts photons, GEDI
-        photoelectrons, and they run orders of magnitude apart -- so each is
-        scaled by its own maximum over this shard before the smaller is taken.
-        Ranking on the raw minimum would return the ATL03 count on every block.
-        (`waveform_view` ranks its cells the same way, for the same reason.)
-        """
-        return -min(
-            tally.get(n, {}).get(w, (0, 0.0))[1] / max(peak.get(n) or 1.0, 1e-9) for n in names
-        )
-
-    if tally:
-        peak = {n: max((o for _c, o in per.values()), default=0.0) for n, per in tally.items()}
-        order = sorted(blocks, key=_weight)  # densest coincident block first
+    # Rank by COINCIDENT CELLS -- the count of cells both sensors populate. That
+    # is the quantity the paired views are actually about, it needs no scaling
+    # (cells are cells, unlike photons against photoelectrons), and `joint_cells`
+    # derives it from the sweep for free.
+    if joint:
+        order = sorted(blocks, key=lambda w: (-joint.get(w, 0), -w))
     else:
         order = sorted(blocks, reverse=True)  # descending, so ...444 heads the list
 
     def _label(w):
-        """Block label: its decimal id, plus each sensor's stored size if known."""
-        if not tally:
-            return mz.morton_decimal(w)
-        parts = [
+        """Block label: decimal id, coincident cells, each sensor's stored size."""
+        parts = []
+        if joint is not None:
+            parts.append(f"{joint.get(w, 0):,} joint")
+        parts += [
             f"{n} {c:,} cells / {_si(o)} {UNITS.get(n, 'obs')}"
             for n in names
-            for c, o in [tally.get(n, {}).get(w, (0, 0.0))]
+            for c, o in [(tally or {}).get(n, {}).get(w, (0, 0.0))]
         ]
-        return mz.morton_decimal(w) + " — " + " · ".join(parts)
+        return mz.morton_decimal(w) + (" — " + " · ".join(parts) if tally or joint else "")
 
     dd = Dropdown(
         options=[(_label(w), w) for w in order],
         value=order[0],
         description="block",
-        layout=Layout(width="640px" if tally else "260px"),
+        layout=Layout(width="700px" if (tally or joint) else "260px"),
     )
     zmode = Dropdown(
         options=[("independent z", "auto"), *[(f"pin z to {n}", n) for n in names]],
@@ -434,6 +478,25 @@ def view3d(
     elev_cb = Checkbox(value=False, description="color by elevation (shared)")
     time_cb = Checkbox(value=False, description="color by time (shared)")
     bin_cb = Checkbox(value=True, description="binned (fixed tensors)")
+    # Opacity is a CONTROL, not a derived quantity. Weight is already the colour
+    # (log-normed, with a colorbar), and letting it drive alpha as well used to
+    # erase the sparse returns -- on a representative block 76% of ATL03's
+    # occupied voxels landed on the old 0.08 floor, and 55% of them held exactly
+    # one photon. Single-count voxels are the canopy top and the understory, so
+    # the default is now FLAT: every observation drawn at the same opacity, none
+    # hidden. Tick `shade by weight` to put the density cue back, ramping on
+    # log(weight) from the slider's value up to fully opaque.
+    alpha_sl = FloatSlider(
+        min=0.05,
+        max=1.0,
+        step=0.05,
+        value=0.55,
+        description="opacity",
+        continuous_update=False,
+        readout_format=".2f",
+        layout=Layout(width="330px"),
+    )
+    shade_cb = Checkbox(value=False, description="shade by weight")
 
     said: set = set()  # blocks whose coarse-over-fine line has already printed
 
@@ -503,7 +566,7 @@ def view3d(
 
     live: dict = {}  # the one figure this view keeps open
 
-    def draw(block, by_elev, by_time, binned, zmode):
+    def draw(block, by_elev, by_time, binned, zmode, opacity, shade):
         view.block = block
         panes = _panes(block, binned)
         # A block can be empty in one store and not the other (and every pane is
@@ -551,7 +614,20 @@ def view3d(
                 ax.set_title(p["label"] + note, fontsize=9)
                 ax.set_zlabel("elevation (m)")
                 continue
-            alpha = np.clip(p["wt"] / max(np.percentile(p["wt"], 98), 1e-9), 0.08, 1.0)
+            # Weight is ALREADY the colour, log-normed. Letting it drive opacity
+            # linearly too erased the sparse returns: with a p98 in the hundreds
+            # a single-count voxel landed on the 0.08 floor and vanished, and
+            # single-count voxels are the interesting part of a lidar cloud --
+            # canopy top, understory, anything off the ground return. Ramp on
+            # log(weight) instead, over a narrow band with a high floor, so
+            # density still reads as depth without hiding anything.
+            if shade:
+                ref = max(np.percentile(p["wt"], 98), 1.0)
+                alpha = np.clip(
+                    opacity + (1.0 - opacity) * np.log1p(p["wt"]) / np.log1p(ref), opacity, 1.0
+                )
+            else:
+                alpha = opacity
             if by_time and p["t"] is not None:
                 pts = ax.scatter(
                     p["x"],
@@ -565,7 +641,7 @@ def view3d(
                 )
                 fig.colorbar(pts, shrink=0.55, pad=0.10, label="days since 2018-01-01")
             elif by_time:
-                ax.scatter(p["x"], p["y"], p["z"], color="#9498a0", s=1.5, alpha=0.15)
+                ax.scatter(p["x"], p["y"], p["z"], color="#9498a0", s=1.5, alpha=opacity * 0.4)
                 note += " — no temporal channel" + (" in binned tensors" if binned else "")
             elif by_elev:
                 pts = ax.scatter(
@@ -624,9 +700,29 @@ def view3d(
 
     out = interactive_output(
         draw,
-        {"block": dd, "by_elev": elev_cb, "by_time": time_cb, "binned": bin_cb, "zmode": zmode},
+        {
+            "block": dd,
+            "by_elev": elev_cb,
+            "by_time": time_cb,
+            "binned": bin_cb,
+            "zmode": zmode,
+            "opacity": alpha_sl,
+            "shade": shade_cb,
+        },
     )
-    display(VBox([HBox([dd, zmode]), HBox([elev_cb, time_cb, bin_cb]), out]))
+    # Three rows, not one. An `HBox` does not wrap, so a row that overruns the
+    # notebook's width gets its widest-shrinkable child squeezed -- which is
+    # always the slider, and it collapses to an undraggable stub.
+    display(
+        VBox(
+            [
+                HBox([dd, zmode]),
+                HBox([elev_cb, time_cb, bin_cb]),
+                HBox([alpha_sl, shade_cb]),
+                out,
+            ]
+        )
+    )
     return view
 
 
