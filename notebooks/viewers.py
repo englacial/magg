@@ -549,6 +549,8 @@ def view3d(
     bin_cb = Checkbox(value=True, description="binned (fixed tensors)")
     # Flat by default: weight is already the colour, and letting it drive alpha
     # too put 76% of a block's voxels under 0.10 and hid the single-count ones.
+    # `shade by weight` puts that cue back deliberately, spanning the slider's
+    # value down to a twentieth of it.
     alpha_sl = FloatSlider(
         min=0.05,
         max=1.0,
@@ -685,9 +687,14 @@ def view3d(
             # log(weight) instead, over a narrow band with a high floor, so
             # density still reads as depth without hiding anything.
             if shade:
+                # Ramp DOWN from the slider, not up to opaque: the slider stays the
+                # ceiling for the densest voxels and weight pushes the sparse ones
+                # toward invisible, which is the whole point of ticking the box.
+                # Ticking it never makes anything more opaque than the flat setting.
                 ref = max(np.percentile(p["wt"], 98), 1.0)
+                lo = 0.05 * opacity
                 alpha = np.clip(
-                    opacity + (1.0 - opacity) * np.log1p(p["wt"]) / np.log1p(ref), opacity, 1.0
+                    lo + (opacity - lo) * np.log1p(p["wt"]) / np.log1p(ref), lo, opacity
                 )
             else:
                 alpha = opacity
