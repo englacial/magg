@@ -363,19 +363,51 @@ def view3d(
             )
         return exact
 
-    # The block list is ARITHMETIC, not read: an order-`block_order` block is a
-    # descendant of the shard, so `generate_morton_children` enumerates all of
-    # them with no I/O at all. (Checked against this store: the 64 it names are
-    # exactly the 64 the `morton` coordinate reports as populated.) Counting each
-    # block's cells for the label would mean reading every block -- the very
-    # sweep this avoids -- so the count moves to the pane title, where it costs
-    # nothing because that block has just been read.
-    joint = sorted(
-        (int(w) for w in generate_morton_children(int(mz.morton_word(shard)), block_order)),
-        reverse=True,  # descending, so ...444 heads the list
-    )
-    if not joint:
+    # Which blocks, and in what order.
+    #
+    # With a `tally` the list is the blocks the sweep actually FOUND in the leaf
+    # that is open, which is the only list guaranteed to belong to these
+    # handles. Deriving it from `shard` instead lets the two disagree -- pass
+    # handles opened on one shard and the id of another and every read asks for
+    # a subtree outside the leaf's axis, which `read_tensors` answers with a
+    # warning and an empty yield rather than an error, so the viewer just draws
+    # nothing. The guard below turns that into a sentence.
+    #
+    # Without a tally it falls back to arithmetic: an order-`block_order` block
+    # is a descendant of the shard, so `generate_morton_children` enumerates all
+    # of them with no I/O at all.
+    within = {int(w) for w in generate_morton_children(int(mz.morton_word(shard)), block_order)}
+    if tally:
+        found = {w for per in tally.values() for w in per}
+        if not found & within:
+            raise ValueError(
+                f"the tally holds no block beneath shard {shard} — `handles`/`tally` and "
+                f"`shard` disagree. Open and view the SAME shard (one name, used twice)."
+            )
+        blocks = found & within
+    else:
+        blocks = within
+    if not blocks:
         raise ValueError(f"shard {shard}: no order-{block_order} blocks beneath it")
+
+    def _weight(w):
+        """Sort key: blocks where BOTH sensors are well populated come first.
+
+        The two weights are incommensurate -- ATL03 counts photons, GEDI
+        photoelectrons, and they run orders of magnitude apart -- so each is
+        scaled by its own maximum over this shard before the smaller is taken.
+        Ranking on the raw minimum would return the ATL03 count on every block.
+        (`waveform_view` ranks its cells the same way, for the same reason.)
+        """
+        return -min(
+            tally.get(n, {}).get(w, (0, 0.0))[1] / max(peak.get(n) or 1.0, 1e-9) for n in names
+        )
+
+    if tally:
+        peak = {n: max((o for _c, o in per.values()), default=0.0) for n, per in tally.items()}
+        order = sorted(blocks, key=_weight)  # densest coincident block first
+    else:
+        order = sorted(blocks, reverse=True)  # descending, so ...444 heads the list
 
     def _label(w):
         """Block label: its decimal id, plus each sensor's stored size if known."""
@@ -389,8 +421,8 @@ def view3d(
         return mz.morton_decimal(w) + " — " + " · ".join(parts)
 
     dd = Dropdown(
-        options=[(_label(w), w) for w in joint],
-        value=joint[0],
+        options=[(_label(w), w) for w in order],
+        value=order[0],
         description="block",
         layout=Layout(width="640px" if tally else "260px"),
     )
@@ -823,21 +855,39 @@ def waveform_view(stores, fields, blocks, pairs, shard, atl03_chunk_order: int =
         ],
         value=0,
         description="block",
+        layout=Layout(width="360px"),
     )
     # Opens on the 7th coincident cell (0-indexed): on the SERC block this
     # notebook ships with, that one shows the canopy/ground structure clearly.
     # Any other AOI will rank differently -- it is a nice default, not a rule.
-    nth = IntSlider(min=0, max=40, value=6, description="nth joint")
+    #
+    # `continuous_update=False` so a drag reads once, on release. `nth` is one
+    # of the two knobs that changes what is READ (up to five S3 round trips a
+    # step), so a live drag across the slider would fire dozens of them.
+    nth = IntSlider(
+        min=0,
+        max=40,
+        value=6,
+        description="nth joint",
+        continuous_update=False,
+        layout=Layout(width="330px"),
+    )
     binw = FloatText(
         value=1.0,
         step=0.5,
         description="histogram bin size, ATL03 z (m)",
         style={"description_width": "initial"},
+        layout=Layout(width="330px"),
     )
+    # Two rows, and every widget sized. An `HBox` does not wrap: put these three
+    # on one row and the total runs past the notebook's width, so flexbox shrinks
+    # whichever child will yield -- and that is the slider, which collapses to a
+    # stub you cannot drag. Widening `binw`'s label is what tipped it over.
     display(
         VBox(
             [
-                HBox([dd, nth, binw]),
+                HBox([dd, nth]),
+                binw,
                 interactive_output(paired_waveform, {"pair": dd, "nth": nth, "binw": binw}),
             ]
         )
