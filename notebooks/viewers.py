@@ -66,6 +66,7 @@ __all__ = [
     "densest_shard",
     "human_bytes",
     "joint_cells",
+    "viewer_stats",
     "load",
     "view3d",
     "waveform_view",
@@ -79,6 +80,43 @@ def _si(n) -> str:
         if n >= cut:
             return f"{n / cut:.3g}{suffix}"
     return f"{n:,.0f}"
+
+
+def viewer_stats(handles, block_order: int = BLOCK_ORDER) -> dict:
+    """Sweep each field once and return what the block dropdown needs.
+
+    One pass per sensor over ONE field's stored digests. Nothing is kept -- the
+    viewer reads per block on demand -- but the per-block cell and weight counts,
+    and the count of cells both sensors populate, fall out of the same pass for
+    free. Also prints what that pass cost, which is the price of reading one
+    array of the leaf end to end (this ATL03 leaf holds nine).
+
+    Reading the dense `morton`/`count` sidecars instead is slower, not faster:
+    they span the shard's whole cell space (1,048,576 entries at o19) where this
+    touches only populated cells. Measured 124 s against 74 s.
+    """
+    tally, words = {}, {}
+    for name, (store, field) in handles.items():
+        t0 = time.perf_counter()
+        _, element = mz.open_ragged(store, field)
+        per, seen, centroids, nbytes, obs = {}, [], 0, 0, 0.0
+        for word, value in mz.read_ragged(store, field):
+            v = np.asarray(value)
+            seen.append(word)
+            weight = float(v[:, 1].sum())  # column 1 is the centroid weight
+            block = int(block_of(word, block_order))
+            had_cells, had_obs = per.get(block, (0, 0.0))
+            per[block] = (had_cells + 1, had_obs + weight)
+            centroids, nbytes, obs = centroids + len(v), nbytes + v.nbytes, obs + weight
+        tally[name] = per
+        words[name] = np.asarray(seen, dtype=np.uint64)
+        print(
+            f"{name:6s} swept {field} in {time.perf_counter() - t0:5.1f}s — "
+            f"{len(seen):,} cells over {len(per)} blocks, {centroids:,} centroids, "
+            f"{obs:,.0f} {UNITS.get(name, 'obs')}, {nbytes / 2**20:.1f} MiB decoded"
+        )
+        print(f"       element {element}")
+    return {"tally": tally, "joint": joint_cells(words, block_order)}
 
 
 def densest_shard(root, shards, **s3) -> str:
@@ -298,8 +336,7 @@ class View:
 def view3d(
     handles,
     shard,
-    tally=None,
-    joint=None,
+    stats=None,
     block_order: int = BLOCK_ORDER,
     cap: int = CAP,
     n_bins: int = 256,
@@ -323,9 +360,8 @@ def view3d(
     who looks at one block pays for one block, and one who never unticks the
     box never pays for the sweep at all.
 
-    `tally` is the optional ``{sensor: {block word: (cells, weight)}}`` the
-    notebook's open-and-sweep cell already accumulated; it labels the block
-    dropdown, and costs nothing because that pass has already been paid for.
+    `stats` is what :func:`viewer_stats` returns; it labels and orders the block
+    dropdown, and costs nothing here because that pass has already been paid for.
     Those are STORED totals over the whole digest. The counts each read prints,
     and the ones in the pane titles, are what landed inside the tensor's finite
     z window and so run lower -- the tails are trimmed at `bottom`/`top` and
@@ -337,6 +373,8 @@ def view3d(
     view = View()
     view.shard = shard
     names = list(handles)
+    tally = (stats or {}).get("tally")
+    joint = (stats or {}).get("joint")
 
     # One block per read, cached. Sweeping the shard up front cost ~1.3 GiB
     # resident (Binder caps at 2 GB) and ~148 s before the first frame.
