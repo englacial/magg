@@ -506,7 +506,7 @@ def view3d(
         found = {w for per in tally.values() for w in per}
         if not found & within:
             raise ValueError(
-                f"the tally holds no block beneath shard {shard} — `handles`/`tally` and "
+                f"the stats hold no block beneath shard {shard} — `handles`/`stats` and "
                 f"`shard` disagree. Open and view the SAME shard (one name, used twice)."
             )
         blocks = found & within

@@ -28,9 +28,18 @@ from viewers import BLOCK_ORDER, SIDE, UNITS, human_bytes
 __all__ = ["fit_window", "registered_pair", "voxel_chips"]
 
 
-def _wq(zs, cum, q):
-    """Weighted quantile of pre-sorted `zs` given the cumulative weight `cum`."""
-    return float(np.interp(q * cum[-1], cum, zs))
+def _wq(zs, ws, q):
+    """Weighted quantile of pre-sorted `zs` with weights `ws`.
+
+    Positions are the MIDPOINT of each centroid's weight interval,
+    ``(cumsum - w/2) / total``. Interpolating on the raw cumsum instead biases
+    every quantile low by half a centroid -- the median of two points at 0 and
+    100 comes back 0.
+    """
+    cum = np.cumsum(ws)
+    if cum[-1] <= 0:
+        return float(zs[0])
+    return float(np.interp(q * cum[-1], cum - 0.5 * ws, zs))
 
 
 def fit_window(z, wt, n_bins, dz, first=0.02, step=0.05, max_drop=0.5):
@@ -53,11 +62,15 @@ def fit_window(z, wt, n_bins, dz, first=0.02, step=0.05, max_drop=0.5):
     order = np.argsort(z, kind="stable")
     zs, ws = np.asarray(z)[order], np.asarray(wt)[order]
     span = n_bins * dz
-    if zs[-1] - zs[0] <= span:  # fits as it stands
-        return float(np.floor(zs[0])), 0.0, 0.0, 1.0
+    total = float(ws.sum())
+    z0 = float(np.floor(zs[0]))
+    # Test the window we will ACTUALLY use. `z0` is floored, so it sits up to
+    # 1 m below `zs[0]`; checking `zs[-1] - zs[0] <= span` passes data that then
+    # falls off the top of the window and is dropped while this reports kept=1.
+    if total <= 0 or zs[-1] < z0 + span:
+        return z0, 0.0, 0.0, 1.0
 
-    cum = np.cumsum(ws)
-    med = _wq(zs, cum, 0.5)
+    med = _wq(zs, ws, 0.5)
     drop_high = (zs[-1] - med) >= (med - zs[0])  # start on the far tail
     lo_d = hi_d = 0.0
     cut = first
@@ -67,16 +80,16 @@ def fit_window(z, wt, n_bins, dz, first=0.02, step=0.05, max_drop=0.5):
         else:
             lo_d += cut
         drop_high, cut = not drop_high, step
-        lo, hi = _wq(zs, cum, lo_d), _wq(zs, cum, 1.0 - hi_d)
+        lo, hi = _wq(zs, ws, lo_d), _wq(zs, ws, 1.0 - hi_d)
         if hi - lo <= span:
             # `kept` is what LANDS in the window, not the nominal quantile drop:
             # the window is wider than the trimmed range and recaptures some of it.
             z0 = float(np.floor(lo))
-            return z0, lo_d, hi_d, float(ws[(zs >= z0) & (zs < z0 + span)].sum() / cum[-1])
+            return z0, lo_d, hi_d, float(ws[(zs >= z0) & (zs < z0 + span)].sum() / total)
 
     z0 = float(np.floor(med - span / 2))  # give up trimming; centre on the mass
-    inside = float(ws[(zs >= z0) & (zs < z0 + span)].sum() / cum[-1])
-    return z0, np.nan, np.nan, inside
+    inside = float(ws[(zs >= z0) & (zs < z0 + span)].sum() / total)
+    return z0, None, None, inside  # None, not NaN: `meta.json` has to parse
 
 
 def voxel_chips(handles, block, sensor="atl03", order=22, side=128, path=None):
@@ -114,7 +127,11 @@ def voxel_chips(handles, block, sensor="atl03", order=22, side=128, path=None):
                 if not len(m):
                     continue
                 z0, lo_d, hi_d, frac = fit_window(z[m], wt[m], n_bins, dz)
-                iz = ((z[m] - z0) / dz).astype(np.int64)
+                # np.floor, not a bare cast: `astype` truncates TOWARD ZERO, so a
+                # centroid in [z0 - dz, z0) gives -0.x -> 0, passes `iz >= 0`, and
+                # lands in bin 0 at the wrong height. `fit_window` can put z0 above
+                # the minimum, so this is reachable whenever a chip is trimmed.
+                iz = np.floor((z[m] - z0) / dz).astype(np.int64)
                 keep = (iz >= 0) & (iz < n_bins)
                 trimmed += int(wt[m][~keep].sum())
                 mk, iz = m[keep], iz[keep]
