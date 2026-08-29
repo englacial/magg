@@ -32,7 +32,7 @@ from ipywidgets import (
     interactive_output,
 )
 from matplotlib.colors import LogNorm
-from moczarr.hhdc import block_rank, rank_to_rowcol, rowcol_to_rank
+from moczarr.hhdc import block_rank, rank_to_rowcol
 from mortie import generate_morton_children, toc2time
 
 #: The o12 block the views frame everything in. Cells across a block edge are
@@ -804,93 +804,76 @@ def _mixture(digest, z, sigma):
     return pdf / max(wt.sum(), 1e-9) / (sigma * np.sqrt(2 * np.pi))
 
 
-def _atl03_digests(store, field, w, r, c, chunk_side, chunk_order, block_order=BLOCK_ORDER):
-    """The 2x2 finer digests under one coarser cell `(r, c)` of block `w`.
+def _block_digests(store, field, block, cell_order, block_order=BLOCK_ORDER):
+    """Every stored digest in one block, keyed by its ``(row, col)`` in that block.
 
-    GEDI's chunk grid puts one o12 block in one chunk; ATL03's chunks sit at
-    `chunk_order` (o13 in these stores), so the o19 cell has to be resolved to
-    the right chunk before `cell_index` can address it.
+    ONE `read_ragged(subtree=...)` for the whole block instead of a `read_cell`
+    per cell. Same bytes, one round trip: the per-cell path cost five round trips
+    for every slider step (one GEDI cell plus its four ATL03 quarters), and a
+    single `read_cell` measured a median of 8.9 s on a poor link -- 45 s a step,
+    which is why the view read as frozen. Reading the block up front costs about
+    what one step used to, and every step after it is a dict lookup.
 
-    `chunk_side` is ATL03's cells across a CHUNK edge, ``2**(19 - 13) = 64``.
-    That is deliberately NOT the caller's `gside`, which is GEDI's cells across
-    a BLOCK edge, ``2**(18 - 12)`` -- also 64, but only for this store pair.
-    Sharing one name would make a change to either sensor's cell order, or to
-    the store's chunk order, address the wrong cell silently rather than raise,
-    and the `except` below would report the damage as "no photons here".
+    Keying on ``(row, col)`` also retires the chunk arithmetic the per-cell path
+    needed: `read_cell` had to resolve an o19 cell to its o13 read chunk first,
+    with a `chunk_side` that merely happened to equal GEDI's block side on this
+    store pair. `read_ragged` hands back the cell word, and `block_rank` /
+    `rank_to_rowcol` place it directly.
     """
-    kids = generate_morton_children(int(w), chunk_order)
-    depth = chunk_order - block_order
-    out = []
-    for dr in (0, 1):
-        for dc in (0, 1):
-            rr, cc = 2 * r + dr, 2 * c + dc
-            chunk = int(kids[rowcol_to_rank(rr // chunk_side, cc // chunk_side, depth=depth)])
-            try:
-                out.append(
-                    mz.read_cell(
-                        store,
-                        field,
-                        mz.cell_index(store, field, chunk, rr % chunk_side, cc % chunk_side),
-                    )
-                )
-            except (KeyError, ValueError):
-                pass  # that quarter holds no photons
-    kept = [k for k in out if len(k)]
-    if not kept:
-        return np.empty((0, 2))
-    # SORT BY MEAN. The four quarters are each a digest sorted on its own, so
-    # concatenating them gives four ascending runs, not one -- and
-    # `cdf_from_tdigest` reads the centroid means as `np.interp`'s x-coordinates,
-    # which numpy documents as nonsense unless they increase. Measured on a
-    # representative 2x2: the CDF drifted by 32% of the cell's total weight, and
-    # still looked monotonic, so it fails silently. The mixture on the left panel
-    # is a weighted sum and does not care, which is why only the CDF was wrong.
-    merged = np.concatenate(kept)
-    return merged[np.argsort(merged[:, 0], kind="stable")]
+    got = list(mz.read_ragged(store, field, subtree=mz.morton_decimal(int(block))))
+    if not got:
+        return {}
+    words = np.array([w for w, _v in got], dtype=np.uint64)
+    rows, cols = rank_to_rowcol(block_rank(words, block_order)[0], cell_order - block_order)
+    return {(int(rows[i]), int(cols[i])): np.asarray(v) for i, (_w, v) in enumerate(got)}
 
 
-def waveform_view(stores, fields, blocks, pairs, shard, atl03_chunk_order: int = 13):
+def waveform_view(stores, fields, blocks, pairs, shard):
     """Interactive coincident-waveform view.
 
     ``stores``/``fields`` are ``{sensor: ...}``; ``blocks`` is
     ``{sensor: {block_word: read_tensors tuple}}``; ``pairs`` is the sorted
     ``(word, joint_mask, A2, G2)`` list the notebook builds.
 
-    ``atl03_chunk_order``
-    is where ATL03's chunks sit in these stores; ATL03's cells across a CHUNK
-    edge is derived from it and the cell order the field's path already
-    carries (``19/…``), because that is a different quantity that merely also
-    equals 64 here -- see :func:`_atl03_digests`.
+    Digests are read a BLOCK at a time and cached, so moving the slider does no
+    I/O at all -- see :func:`_block_digests`.
     """
     from zagg.stats.tdigest import cdf_from_tdigest  # moczarr[zagg]; see module docstring
 
-    acell_order = int(fields["atl03"].split("/", 1)[0])
-    achunk_side = 2 ** (acell_order - atl03_chunk_order)
+    orders = {n: int(f.split("/", 1)[0]) for n, f in fields.items()}
 
     live: dict = {}  # the one figure this view keeps open
 
-    # `binw` is a pure rendering knob, but it shares the `interactive_output`
-    # callback with `pair`/`nth` -- so without this, typing in the bin box
-    # re-runs five S3 round trips (one GEDI `read_cell` plus up to four ATL03)
-    # on digests already in memory. Only `pair` and `nth` change what is READ.
+    # Cached per BLOCK, not per cell: only changing the block reads anything, so
+    # `nth` and `binw` are pure rendering. Two blocks kept -- one is a few MB.
     cache: dict = {}
 
-    def _digests(pair, r, c, w):
-        key = (pair, r, c)
-        if key not in cache:
-            if len(cache) > 64:  # a session's worth; these are a few KB each
+    def _block(w):
+        if w not in cache:
+            if len(cache) > 1:
                 cache.clear()
-            cache[key] = (
-                mz.read_cell(
-                    stores["gedi"],
-                    fields["gedi"],
-                    mz.cell_index(stores["gedi"], fields["gedi"], int(w), r, c),
-                ),
-                _atl03_digests(
-                    stores["atl03"], fields["atl03"], w, r, c, achunk_side, atl03_chunk_order
-                ),
-            )
-        return cache[key]
+            cache[w] = {
+                n: _block_digests(stores[n], fields[n], w, orders[n]) for n in ("gedi", "atl03")
+            }
+        return cache[w]
+
+    def _digests(pair, r, c, w):
+        """One GEDI cell and the 2x2 ATL03 cells under it, from the block cache."""
+        cells = _block(w)
+        gdigest = cells["gedi"].get((r, c), np.empty((0, 2)))
+        quarters = [cells["atl03"].get((2 * r + dr, 2 * c + dc)) for dr in (0, 1) for dc in (0, 1)]
+        kept = [q for q in quarters if q is not None and len(q)]
+        if not kept:
+            return gdigest, np.empty((0, 2))
+        # SORT BY MEAN. Each quarter is sorted on its own, so concatenating gives
+        # four ascending runs, not one -- and `cdf_from_tdigest` reads the centroid
+        # means as `np.interp`'s x-coordinates, which numpy documents as nonsense
+        # unless they increase. Measured on a representative 2x2 the CDF drifted by
+        # 32% of the cell's weight while still looking monotonic, so it fails
+        # silently. The mixture is a weighted sum and does not care, which is why
+        # only the CDF was wrong.
+        merged = np.concatenate(kept)
+        return gdigest, merged[np.argsort(merged[:, 0], kind="stable")]
 
     def paired_waveform(pair=0, nth=0, binw=1.0):
         w, joint, a2, g2 = pairs[pair]  # a2/g2: the notebook's A2/G2, lowercased for N806
@@ -912,13 +895,11 @@ def waveform_view(stores, fields, blocks, pairs, shard, atl03_chunk_order: int =
 
         gdigest, adigest = _digests(pair, int(r), int(c), w)
 
-        # `_atl03_digests` can legitimately return nothing: the `joint` mask is
-        # built from the TENSORS (a finite z window, possibly degraded), while
-        # this reads the RAW digests through a different addressing path, and
-        # the two are not guaranteed to agree cell for cell -- which is the case
-        # the `except` in `_atl03_digests` was written for. Make that guard real
-        # by drawing the GEDI side alone and saying so, rather than letting an
-        # empty `.min()` turn "no photons here" into a traceback in the widget.
+        # The ATL03 side can legitimately come back empty: `joint` is built from
+        # the TENSORS (a finite z window, possibly degraded) while this reads the
+        # RAW digests, and the two are not guaranteed to agree cell for cell.
+        # Draw the GEDI side alone and say so, rather than letting an empty
+        # `.min()` turn "no photons here" into a traceback inside the widget.
         zmu = [gdigest[:, 0]] + ([adigest[:, 0]] if len(adigest) else [])
         lo = min(a.min() for a in zmu) - 5
         hi = max(a.max() for a in zmu) + 5
